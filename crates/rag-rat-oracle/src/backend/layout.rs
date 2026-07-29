@@ -506,6 +506,10 @@ fn read_marker_file(path: &Path) -> MarkerVerdict {
     // bracket and never looks further, so trailing content must not condemn the database.
     let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
     match CompilationDatabase::deserialize(&mut deserializer) {
+        // Checked BEFORE the entry count: clangd refuses the file over an unrecognised key however
+        // many good entries sit beside it, so counting them would be reading a database that will
+        // not load as proof that it will.
+        Ok(database) if database.unmodelled_key => MarkerVerdict::Unknown,
         Ok(database) if database.entries > 0 => MarkerVerdict::Loadable,
         Ok(_) => MarkerVerdict::NotLoadable,
         // The error's CATEGORY separates the two failures. `Data` means the document parsed and its
@@ -544,6 +548,9 @@ fn skip_utf8_bom(reader: &mut impl std::io::BufRead) -> bool {
 /// that each one carries what the format requires.
 struct CompilationDatabase {
     entries: usize,
+    /// Whether any entry carried a key outside the modelled format. One is enough: clangd refuses
+    /// the whole file over it, so no other entry can redeem the database.
+    unmodelled_key: bool,
 }
 
 /// One compilation-database entry, with the fields the format REQUIRES. `clangd --check` rejects
@@ -584,6 +591,9 @@ struct CompilationDatabase {
 struct CompilationEntry {
     /// Whether this entry yields a command line clangd can parse.
     configures_a_file: bool,
+    /// Whether it carried a key outside the format this crate models, which makes the whole
+    /// database's fate unknowable here — see [`EntryField::Unmodelled`].
+    unmodelled_key: bool,
 }
 
 /// The entry fields whose shape is constrained. `Other` is every extra key a generator emits
@@ -595,8 +605,9 @@ enum EntryField {
     Directory,
     Command,
     Arguments,
+    Output,
     #[serde(other)]
-    Other,
+    Unmodelled,
 }
 
 impl<'de> Deserialize<'de> for CompilationEntry {
@@ -621,6 +632,7 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
         // order the keys appear in. So a good `command` beside an empty `arguments` configures
         // nothing, and accepting either independently would call that entry usable.
         let (mut command_configures, mut arguments_configure) = (false, None);
+        let mut unmodelled_key = false;
         while let Some(field) = map.next_key::<EntryField>()? {
             match field {
                 EntryField::File => {
@@ -642,8 +654,22 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
                         Some(map.next_value::<JsonSequence>()?.carries_an_argument);
                     invocation = true;
                 },
-                EntryField::Other => {
+                // `output` is part of the format and must be a scalar like the paths are: an
+                // object or array there is refused with `Expected string as value`, discarding the
+                // database exactly as a malformed `command` would.
+                EntryField::Output => {
+                    map.next_value::<JsonScalar>()?;
+                },
+                // A key this crate does not model. clangd's entry schema is CLOSED — measured, an
+                // unrecognised key is refused with `Unknown key` and the whole database falls back
+                // to generic flags — so this is NOT something to swallow. It is reported as
+                // uncertainty rather than as a finding, because the schema is clangd's and an
+                // unrecognised key means this model may simply be behind it. Uncertain is enough
+                // to decline pinning and decline resolving through it, without declaring the
+                // checkout unwarmable on the strength of a list that could be out of date.
+                EntryField::Unmodelled => {
                     map.next_value::<IgnoredAny>()?;
+                    unmodelled_key = true;
                 },
             }
         }
@@ -661,6 +687,7 @@ impl<'de> Visitor<'de> for CompilationEntryVisitor {
         }
         Ok(CompilationEntry {
             configures_a_file: arguments_configure.unwrap_or(command_configures),
+            unmodelled_key,
         })
     }
 }
@@ -777,6 +804,7 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut entries = 0usize;
+        let mut unmodelled_key = false;
         // The first entry `CompilationEntry` rejects ends the read: clangd would refuse the
         // database at that point too, so nothing later in the file could redeem it. An entry with
         // an EMPTY invocation is not such a rejection — it simply does not count, because it
@@ -785,8 +813,9 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor {
             if entry.configures_a_file {
                 entries += 1;
             }
+            unmodelled_key |= entry.unmodelled_key;
         }
-        Ok(CompilationDatabase { entries })
+        Ok(CompilationDatabase { entries, unmodelled_key })
     }
 }
 

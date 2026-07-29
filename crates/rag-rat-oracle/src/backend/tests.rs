@@ -630,6 +630,9 @@ fn an_entrys_shape_is_judged_the_way_clangd_judges_it() {
         r#"[{"directory":"/x","file":"/x/a.c","command":"   "}]"#,
         // An element that is not a scalar makes clangd refuse the database outright.
         r#"[{"directory":"/x","file":"/x/a.c","arguments":[{}]}]"#,
+        // `output` is part of the format, so a composite there is a shape error like any other.
+        r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c","output":{}}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c","output":[]}]"#,
         r#"[{"directory":"/x","file":"/x/a.c","arguments":[["cc"]]}]"#,
     ];
     for database in rejected {
@@ -913,6 +916,59 @@ fn the_invocation_clangd_selects_is_the_one_that_must_configure_the_file() {
     )
     .unwrap();
     assert!(clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)));
+}
+
+#[test]
+fn a_key_outside_the_modelled_format_is_uncertainty_rather_than_acceptance() {
+    // clangd's entry schema is CLOSED. Measured with clangd 19.1.2: an unrecognised key is refused
+    // with `Unknown key`, and the WHOLE database falls back to generic flags — the planted
+    // `-DPROBE_OK=1` disappears from the compiler invocation, while `--check` still exits 0. So
+    // swallowing unknown keys marked such a database loadable, the session was pinned to it, and
+    // files it "governed" were resolved under fallback flags and persisted as trusted evidence.
+    //
+    // The verdict is UNKNOWN rather than not-loadable on purpose. The schema belongs to clangd, and
+    // an unrecognised key means this crate's model of it may simply be behind — enough to decline
+    // pinning and decline resolving through it, not enough to declare the checkout unwarmable on
+    // the strength of a list that could be out of date.
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-unmodelled-key");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+    std::fs::write(
+        dir.join("compile_commands.json"),
+        r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c","extra":"x"}]"#,
+    )
+    .unwrap();
+
+    let layout = clangd.resolve_layout(&dir);
+    assert_eq!(
+        clangd.spawn_args(&["--background-index"], &layout),
+        vec![OsString::from("--background-index")],
+        "a database clangd would refuse must not be pinned",
+    );
+    assert!(
+        !clangd.session_can_resolve(&dir, "src/main.c", &layout),
+        "…nor may a file be resolved through it, which is how fallback flags get persisted",
+    );
+    assert!(
+        clangd.checkout_can_signal_readiness(&dir, &layout),
+        "…but an unrecognised key is not proof the checkout has no project either",
+    );
+
+    // The modelled optional key is genuinely fine, so this is not a blanket refusal of extras.
+    std::fs::write(
+        dir.join("compile_commands.json"),
+        r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c","output":"a.o"}]"#,
+    )
+    .unwrap();
+    let layout = clangd.resolve_layout(&dir);
+    assert!(
+        clangd
+            .spawn_args(&["--background-index"], &layout)
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("--compile-commands-dir=")),
+        "`output` is part of the format and must stay loadable",
+    );
 }
 
 #[test]
