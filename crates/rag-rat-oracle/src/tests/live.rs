@@ -1185,23 +1185,12 @@ mod typescript {
         assert_eq!(ts_run_count(&h.conn), 0);
     }
 
-    #[test]
-    fn an_unmet_prerequisite_is_reported_as_such_not_as_a_missing_tool() {
-        // The two ways a spawn declines are operationally different: a prerequisite block is
-        // permanent until the checkout changes and a human has to act on it, while an absent
-        // server is the ordinary degradation the watcher just keeps retrying. Collapsing them
-        // would leave an operator with a live oracle that silently never runs.
-        let h = Harness::new();
-        match LiveOracleSession::spawn(OracleTool::TsLsp, h.root()) {
-            Err(crate::LiveSpawnBlocked::Prerequisite(hint)) => {
-                assert!(hint.contains("tsconfig.json"), "the hint must name the fix: {hint}");
-            },
-            Err(crate::LiveSpawnBlocked::Unavailable) => {
-                panic!("an empty checkout is blocked by its missing project, not by the binary")
-            },
-            Ok(_) => panic!("a checkout with no TypeScript project must not spawn a session"),
-        }
-    }
+    // A TypeScript spawn declining on its unmet prerequisite rather than on its binary is pinned
+    // by `live::tests::a_checkout_with_neither_a_server_nor_a_project_reports_the_missing_server`,
+    // which supplies availability instead of probing for it. Asserting that through the real
+    // `spawn` made the outcome depend on whether the machine happened to have the server
+    // installed — it read as a prerequisite block on a developer box and as a missing binary
+    // anywhere else.
 
     #[test]
     fn a_ts_pass_leaves_a_sibling_checkout_and_the_other_live_tool_untouched() {

@@ -972,43 +972,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_checkout_with_neither_a_server_nor_a_database_reports_the_missing_server() {
-        // clangd's prerequisite and its binary can be unmet at the same time, and the two are not
-        // equally actionable: telling an operator to generate a compile_commands.json for a
+    fn a_checkout_with_neither_a_server_nor_a_project_reports_the_missing_server() {
+        // A backend's prerequisite and its binary can be unmet at the same time, and the two are
+        // not equally actionable: telling an operator to generate a compilation database for a
         // program that is not installed sends them after the wrong problem, and answering that
         // question at all costs a walk of the whole checkout while the maintenance pass holds the
         // repository write lock — paid on every spawn attempt, none of which can succeed.
-        let scratch = ScratchDir::new("live-preflight");
-        let root = scratch.path();
-        let tool = OracleTool::ClangdLsp;
-        let backend = LiveBackend::for_tool(tool).expect("a live backend");
-        let manifest = ToolManifest::for_tool(tool);
-        let blocked = ToolAvailability::Blocked {
-            tool: tool.as_db_str().to_string(),
-            program: manifest.program.to_string(),
-            hint: manifest.install_hint.to_string(),
-        };
+        //
+        // Availability is supplied rather than probed, so this pins the ORDER on any machine,
+        // whether or not the servers happen to be installed on it. `ra-lsp` is absent from the
+        // table deliberately: it has no checkout prerequisite beyond its binary, so there is no
+        // second gate for the probe to outrank.
+        for (tool, marker, version) in [
+            (OracleTool::ClangdLsp, "compile_commands.json", "clangd-test-1"),
+            (OracleTool::TsLsp, "tsconfig.json", "ts-test-1"),
+        ] {
+            let scratch = ScratchDir::new("live-preflight");
+            let root = scratch.path();
+            let backend = LiveBackend::for_tool(tool).expect("a live backend");
+            let manifest = ToolManifest::for_tool(tool);
+            let blocked = ToolAvailability::Blocked {
+                tool: tool.as_db_str().to_string(),
+                program: manifest.program.to_string(),
+                hint: manifest.install_hint.to_string(),
+            };
 
-        assert_eq!(
-            resolve_preflight(&backend, &manifest, root, blocked).err(),
-            Some(LiveSpawnBlocked::Unavailable),
-            "an absent server outranks the checkout prerequisite it makes moot",
-        );
+            assert_eq!(
+                resolve_preflight(&backend, &manifest, root, blocked).err(),
+                Some(LiveSpawnBlocked::Unavailable),
+                "an absent {tool:?} outranks the checkout prerequisite it makes moot",
+            );
 
-        // Control: the SAME checkout blocks on its prerequisite once the program can run — without
-        // this the assertion above would also pass for a gate that never reports a prerequisite.
-        let available = ToolAvailability::Available {
-            tool: tool.as_db_str().to_string(),
-            program: manifest.program.to_string(),
-            version: "clangd-test-1".to_string(),
-        };
-        match resolve_preflight(&backend, &manifest, root, available) {
-            Err(LiveSpawnBlocked::Prerequisite(hint)) => {
-                assert!(hint.contains("compile_commands.json"), "the hint names the fix: {hint}");
-            },
-            Err(LiveSpawnBlocked::Unavailable) =>
-                panic!("a runnable program plus no database is a prerequisite block"),
-            Ok(_) => panic!("a checkout with no compilation database must not spawn a session"),
+            // Control: the SAME checkout blocks on its prerequisite once the program can run —
+            // without this the assertion above would also pass for a gate that never reports a
+            // prerequisite at all. The two ways a spawn declines stay operationally distinct: a
+            // prerequisite block is permanent until the checkout changes and a human has to act on
+            // it, while an absent server is the degradation the watcher just keeps retrying.
+            let available = ToolAvailability::Available {
+                tool: tool.as_db_str().to_string(),
+                program: manifest.program.to_string(),
+                version: version.to_string(),
+            };
+            match resolve_preflight(&backend, &manifest, root, available) {
+                Err(LiveSpawnBlocked::Prerequisite(hint)) => {
+                    assert!(hint.contains(marker), "the {tool:?} hint names the fix: {hint}");
+                },
+                Err(LiveSpawnBlocked::Unavailable) =>
+                    panic!("a runnable {tool:?} plus no project is a prerequisite block"),
+                Ok(_) => panic!("a checkout with no {marker} must not spawn a {tool:?} session"),
+            }
         }
     }
 
