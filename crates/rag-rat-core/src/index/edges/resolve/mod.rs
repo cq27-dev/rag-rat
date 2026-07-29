@@ -843,6 +843,10 @@ pub(crate) fn resolve_symbol<'a>(
     // [`ReceiverTypeIdentity`]): only Local identities resolve here — External and Ambiguous
     // never bind to local symbols. A qualified local hint additionally earns the conservative
     // tail fallback below; a bare one IS its own tail.
+    let has_local_receiver_type = matches!(
+        request.receiver_type,
+        Some(ReceiverTypeIdentity::LocalQualified(_) | ReceiverTypeIdentity::LocalUnqualified(_))
+    );
     let receiver_type = match request.receiver_type {
         Some(ReceiverTypeIdentity::LocalQualified(path)) => Some((path, true)),
         Some(ReceiverTypeIdentity::LocalUnqualified(name)) => Some((name, false)),
@@ -851,7 +855,7 @@ pub(crate) fn resolve_symbol<'a>(
     };
     if let Some((type_hint, qualified)) = receiver_type {
         let target = format!("{type_hint}::{}", request.name);
-        let target_normalized = normalized_scope_path(&target);
+        let target_normalized = normalized_scope_path(&target, request.source_language);
 
         // One receiver target, two surfaces. Exact: the raw scope map (reason `receiver_type`).
         // Normalized: BOTH maps — plain-scope symbols live only in `by_scope_path` (skipped when
@@ -874,7 +878,7 @@ pub(crate) fn resolve_symbol<'a>(
                     return Some((scope_exact[0], "receiver_type")),
                 _ => {},
             }
-            let target_normalized = normalized_scope_path(target);
+            let target_normalized = normalized_scope_path(target, request.source_language);
             let scope_normalized = index
                 .by_scope_path
                 .get(target_normalized.as_ref())
@@ -914,39 +918,44 @@ pub(crate) fn resolve_symbol<'a>(
             }
         }
 
-        let scope_suffix = format!("::{target}");
-        let scope_normalized_suffix = format!("::{target_normalized}");
-        let receiver_suffix_matches = index
-            .by_name
-            .get(short_name(request.name))
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|symbol| {
-                kind_matches(symbol)
-                    && (symbol.scope_path.ends_with(&scope_suffix)
-                        || normalized_scope_path(&symbol.scope_path)
-                            .ends_with(&scope_normalized_suffix))
-            })
-            .collect::<Vec<_>>();
-        match receiver_suffix_matches.as_slice() {
-            [symbol] => {
-                let reason = if symbol.scope_path.ends_with(&scope_suffix) {
-                    "receiver_type"
-                } else {
-                    "scope_degeneric"
-                };
-                return Some((*symbol, EdgeConfidence::Syntactic, reason));
-            },
-            [_, ..] if same_logical_symbol(&receiver_suffix_matches) => {
-                let reason = if receiver_suffix_matches[0].scope_path.ends_with(&scope_suffix) {
-                    "receiver_type"
-                } else {
-                    "scope_degeneric"
-                };
-                return Some((receiver_suffix_matches[0], EdgeConfidence::Syntactic, reason));
-            },
-            _ => {},
+        // A suffix retry is meaningful only for an already-qualified LOCAL identity. Applying it
+        // to a bare root-module `Worker` would let it bind `inner::Worker::run`, undoing the
+        // lexical canonicalization that keeps same-tail owners isolated.
+        if qualified {
+            let scope_suffix = format!("::{target}");
+            let scope_normalized_suffix = format!("::{target_normalized}");
+            let receiver_suffix_matches = index
+                .by_name
+                .get(short_name(request.name))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|symbol| {
+                    kind_matches(symbol)
+                        && (symbol.scope_path.ends_with(&scope_suffix)
+                            || normalized_scope_path(&symbol.scope_path, Some(&symbol.language))
+                                .ends_with(&scope_normalized_suffix))
+                })
+                .collect::<Vec<_>>();
+            match receiver_suffix_matches.as_slice() {
+                [symbol] => {
+                    let reason = if symbol.scope_path.ends_with(&scope_suffix) {
+                        "receiver_type"
+                    } else {
+                        "scope_degeneric"
+                    };
+                    return Some((*symbol, EdgeConfidence::Syntactic, reason));
+                },
+                [_, ..] if same_logical_symbol(&receiver_suffix_matches) => {
+                    let reason = if receiver_suffix_matches[0].scope_path.ends_with(&scope_suffix) {
+                        "receiver_type"
+                    } else {
+                        "scope_degeneric"
+                    };
+                    return Some((receiver_suffix_matches[0], EdgeConfidence::Syntactic, reason));
+                },
+                _ => {},
+            }
         }
     }
     if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
@@ -977,7 +986,7 @@ pub(crate) fn resolve_symbol<'a>(
                 return Some((scope_exact[0], EdgeConfidence::Syntactic, "logical_variant")),
             _ => {},
         }
-        let qualified_normalized = normalized_scope_path(qualified);
+        let qualified_normalized = normalized_scope_path(qualified, request.source_language);
         let scope_normalized = index
             .by_scope_path
             .get(qualified_normalized.as_ref())
@@ -1053,6 +1062,15 @@ pub(crate) fn resolve_symbol<'a>(
         ) {
             return None;
         }
+    }
+    // A typed receiver that did not match its owner is negative evidence for repository-wide
+    // bare-name resolution. A qualified target still gets its stronger scope-path pass above,
+    // which preserves `self.default_method()` calls in traits without letting `Worker::run`
+    // drift onto an unrelated same-tail owner.
+    let trait_self_fallback = request.source_language == Some(Language::Rust.as_str())
+        && matches!(request.receiver_hint, Some("self" | "Self"));
+    if has_local_receiver_type && !trait_self_fallback {
+        return None;
     }
     let short = short_name(request.name);
     // A reference that carried a qualifier or a receiver has already had its qualified shape tried

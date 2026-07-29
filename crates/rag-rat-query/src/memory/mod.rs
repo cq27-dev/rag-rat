@@ -534,10 +534,13 @@ pub(crate) struct ChunkAnchor {
 pub(crate) struct EdgeAnchor {
     edge_id: i64,
     fingerprint: String,
-    /// The pre-#567 8-field fingerprint — `Some` only when the live edge carries a
-    /// `receiver_type_hint`, so bindings persisted before the hint existed still match their
-    /// unchanged call site (see `edge_anchor_row`).
+    /// The pre-#567 8-field compatibility fingerprint. Present for every live edge because a
+    /// legacy binding cannot encode whether receiver inference would produce a hint today.
     legacy_fingerprint: Option<String>,
+    /// The lookup matched the compatibility fingerprint rather than the current versioned
+    /// identity. Validation must demote this to relocated: legacy identity cannot prove the
+    /// receiver owner stayed unchanged.
+    matched_legacy_fingerprint: bool,
     path: String,
     start_line: i64,
     end_line: i64,

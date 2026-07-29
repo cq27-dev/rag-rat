@@ -583,10 +583,12 @@ pub(crate) fn edge_by_fingerprint(
     )?;
     let rows = stmt.query_map([], edge_anchor_row)?;
     for row in rows {
-        let edge = row?;
-        if edge.fingerprint == fingerprint
-            || edge.legacy_fingerprint.as_deref() == Some(fingerprint)
-        {
+        let mut edge = row?;
+        if edge.fingerprint == fingerprint {
+            return Ok(Some(edge));
+        }
+        if edge.legacy_fingerprint.as_deref() == Some(fingerprint) {
+            edge.matched_legacy_fingerprint = true;
             return Ok(Some(edge));
         }
     }
@@ -620,6 +622,7 @@ pub(crate) fn edge_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeA
         // `legacy_edge_fingerprint`): they must find their unchanged call site (relocated),
         // not report `gone`.
         legacy_fingerprint: Some(legacy_edge_fingerprint(parts)),
+        matched_legacy_fingerprint: false,
         path,
         start_line,
         end_line,
@@ -676,8 +679,7 @@ pub(crate) fn legacy_edge_fingerprint(parts: EdgeFingerprintParts<'_>) -> String
 /// name/kind/target identity a moved-line edge is re-found by.
 pub(crate) struct LiveEdgeMatch {
     pub(crate) fingerprint: String,
-    /// Pre-#567 8-field fingerprint; `Some` only when the live edge carries a
-    /// `receiver_type_hint` (see `edge_anchor_row`).
+    /// Pre-#567 8-field compatibility fingerprint, present for every live edge.
     pub(crate) legacy_fingerprint: Option<String>,
     pub(crate) from_name: Option<String>,
     pub(crate) to_name: String,

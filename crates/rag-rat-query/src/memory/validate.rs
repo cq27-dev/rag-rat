@@ -314,7 +314,7 @@ pub(crate) fn validate_call_path_binding(
     // that edge is gone.
     let mut stmt = conn.prepare(
         "
-        SELECT edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name
+        SELECT ordinal, edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name
         FROM repo_memory_call_path_edges
         WHERE memory_id = ?1 AND edge_sequence_hash = ?2
         ORDER BY ordinal
@@ -323,11 +323,12 @@ pub(crate) fn validate_call_path_binding(
     let edges = stmt
         .query_map(params![binding.memory_id, binding.binding_id], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -347,8 +348,22 @@ pub(crate) fn validate_call_path_binding(
     let total = edges.len();
     let mut relocated = 0usize;
     let mut gone = 0usize;
-    for (fingerprint, from_name, to_name, edge_kind, target) in &edges {
-        if edge_by_fingerprint(conn, fingerprint)?.is_some() {
+    // The live v2 identity of every edge that matched one, in `ordinal` order. Complete ⇔ the
+    // whole path still resolves edge-for-edge, which is the only state the upgrade below may act
+    // on: an edge that matched only its loose identity has no live fingerprint to converge to.
+    let mut live_fingerprints = Vec::with_capacity(total);
+    let mut matched_legacy = false;
+    for (ordinal, fingerprint, from_name, to_name, edge_kind, target) in &edges {
+        if let Some(edge) = edge_by_fingerprint(conn, fingerprint)? {
+            if edge.matched_legacy_fingerprint {
+                // The v1 identity has no receiver type. It proves the call site survived, but not
+                // that receiver-aware resolution still targets the same owner, so this validation
+                // reports relocated — once. The convergence below then rewrites the stored
+                // identity so later validations compare the full receiver-aware fingerprint.
+                relocated += 1;
+                matched_legacy = true;
+            }
+            live_fingerprints.push((*ordinal, edge.fingerprint));
             continue;
         }
         if call_path_edge_relocatable(
@@ -364,6 +379,10 @@ pub(crate) fn validate_call_path_binding(
         }
     }
 
+    if matched_legacy && live_fingerprints.len() == total {
+        converge_call_path_identity(conn, binding, &live_fingerprints)?;
+    }
+
     Ok(if gone == total {
         "gone"
     } else if gone > 0 {
@@ -374,6 +393,59 @@ pub(crate) fn validate_call_path_binding(
         "current"
     }
     .to_string())
+}
+
+/// Migrate one pre-versioned call-path binding onto the current edge identity, in full.
+///
+/// A binding is keyed by `edge_sequence_hash` — the hash OF its ordered edge fingerprints — so
+/// rewriting the member fingerprints without rewriting the key would leave a row that no longer
+/// re-derives its own id, and `call_path_memories_for_crossed` (which looks memories up by the
+/// hash it computes from LIVE fingerprints) would keep missing it: the memory would validate
+/// `current` yet never surface on the traversal it was recorded for. So both move together, and
+/// `binding.binding_id` is re-pointed as well — `stamp_validated_binding` writes it back, the
+/// same mechanism a relocated symbol binding uses.
+///
+/// Runs only when every edge of the path matched a live edge, so the recomputed hash describes
+/// the same call path the binding already named.
+fn converge_call_path_identity(
+    conn: &Connection,
+    binding: &mut RepoMemoryBinding,
+    live_fingerprints: &[(i64, String)],
+) -> anyhow::Result<()> {
+    let converged =
+        compute_edge_sequence_hash(live_fingerprints.iter().map(|(_, value)| value.as_str()));
+    if converged == binding.binding_id {
+        return Ok(());
+    }
+    // Both tables are keyed `(memory_id, edge_sequence_hash)`. If the memory already carries a
+    // binding under the converged hash — the same path re-bound after the upgrade — re-keying
+    // would collide with it, so leave the legacy row alone rather than trade one broken identity
+    // for a constraint failure. Rebinding is the way out of that (rare) duplicate.
+    let taken: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM repo_memory_call_paths WHERE memory_id = ?1 AND edge_sequence_hash \
+         = ?2",
+        params![binding.memory_id, converged],
+        |row| row.get(0),
+    )?;
+    if taken > 0 {
+        return Ok(());
+    }
+    for (ordinal, fingerprint) in live_fingerprints {
+        conn.execute(
+            "UPDATE repo_memory_call_path_edges
+             SET edge_fingerprint = ?1, edge_sequence_hash = ?2
+             WHERE memory_id = ?3 AND edge_sequence_hash = ?4 AND ordinal = ?5",
+            params![fingerprint, converged, binding.memory_id, binding.binding_id, ordinal],
+        )?;
+    }
+    conn.execute(
+        "UPDATE repo_memory_call_paths
+         SET edge_sequence_hash = ?1
+         WHERE memory_id = ?2 AND edge_sequence_hash = ?3",
+        params![converged, binding.memory_id, binding.binding_id],
+    )?;
+    binding.binding_id = converged;
+    Ok(())
 }
 
 /// Is there still an edge matching this one's loose identity (names/kind/target), ignoring line
@@ -1078,7 +1150,7 @@ mod call_path_receiver_type_hint_tests {
         seed_memory(&c, "m1", "r");
         let mut binding = RepoMemoryBinding {
             binding_kind: "edge".to_string(),
-            binding_id: legacy,
+            binding_id: legacy.clone(),
             ..call_path_binding("m1", "unused")
         };
         binding.memory_id = "m1".to_string();
@@ -1092,6 +1164,126 @@ mod call_path_receiver_type_hint_tests {
             ..call_path_binding("m1", "unused")
         };
         assert_eq!(validate_edge_binding(&c, &mut missing).unwrap(), "gone");
+
+        c.execute(
+            "INSERT INTO repo_memory_call_paths(memory_id, edge_sequence_hash, path_summary, \
+             created_at_ms) VALUES ('m1', 'legacy-path', 'caller -> run', 0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, receiver_hint) VALUES ('m1', \
+             'legacy-path', 0, ?1, 'caller', 'run', 'calls_name', 'recv')",
+            [legacy.as_str()],
+        )
+        .unwrap();
+        let mut call_path = call_path_binding("m1", "legacy-path");
+        assert_eq!(
+            validate_call_path_binding(&c, &mut call_path).unwrap(),
+            "relocated",
+            "legacy identity proves the site survived but cannot prove its receiver owner"
+        );
+        // Convergence moves the WHOLE binding, not just its member fingerprints: the key is the
+        // hash OF those fingerprints, so a half-migrated row would no longer re-derive its own id,
+        // and `call_path_memories_for_crossed` — which looks memories up by the hash it computes
+        // from LIVE fingerprints — would never surface this memory again.
+        assert_ne!(call_path.binding_id, "legacy-path", "the binding id re-points to the v2 hash");
+        let (upgraded, key): (String, String) = c
+            .query_row(
+                "SELECT edge_fingerprint, edge_sequence_hash FROM repo_memory_call_path_edges
+                 WHERE memory_id = 'm1' AND ordinal = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(upgraded, legacy, "validation converges the stored identity to v2");
+        assert_eq!(key, call_path.binding_id, "the edge rows follow the binding to its new key");
+        assert_eq!(
+            compute_edge_sequence_hash([upgraded.as_str()]),
+            call_path.binding_id,
+            "the converged binding re-derives its own id from its stored fingerprints"
+        );
+        let reachable: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM repo_memory_call_paths
+                 WHERE memory_id = 'm1' AND edge_sequence_hash = ?1",
+                [call_path.binding_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reachable, 1, "the call-path row is re-keyed too, so nothing is orphaned");
+        assert_eq!(
+            validate_call_path_binding(&c, &mut call_path).unwrap(),
+            "current",
+            "the converged v2 identity is no longer permanently hint-blind"
+        );
+    }
+
+    /// Convergence rewrites the binding's identity, so it may only run when the recomputed hash
+    /// describes the SAME call path: every edge must have matched a live edge. An edge that
+    /// survives only by its loose identity has no live fingerprint to fold in, and re-keying on
+    /// the remainder would silently redefine which path the memory names.
+    #[test]
+    fn a_partly_gone_call_path_keeps_its_legacy_identity() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint, \
+             receiver_type_hint, source_file_id, source_start_line, source_end_line) VALUES \
+             ('caller','run','calls_name','exact','recv','Alpha',?1,10,10)",
+            [file_id],
+        )
+        .unwrap();
+        let legacy =
+            crate::memory::resolve::legacy_edge_fingerprint(crate::memory::EdgeFingerprintParts {
+                path: "src/lib.rs",
+                start_line: 10,
+                end_line: 10,
+                from_name: Some("caller"),
+                to_name: Some("run"),
+                edge_kind: "calls_name",
+                target_qualified_name: None,
+                receiver_hint: Some("recv"),
+                receiver_type_hint: None,
+            });
+
+        seed_memory(&c, "m1", "r");
+        c.execute(
+            "INSERT INTO repo_memory_call_paths(memory_id, edge_sequence_hash, path_summary, \
+             created_at_ms) VALUES ('m1', 'legacy-path', 'caller -> run -> vanished', 0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, receiver_hint) VALUES ('m1', \
+             'legacy-path', 0, ?1, 'caller', 'run', 'calls_name', 'recv')",
+            [legacy.as_str()],
+        )
+        .unwrap();
+        // A second hop whose edge no longer exists in any form.
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind) VALUES ('m1', 'legacy-path', 1, \
+             'no-such-fingerprint', 'run', 'vanished', 'calls_name')",
+            [],
+        )
+        .unwrap();
+
+        let mut binding = call_path_binding("m1", "legacy-path");
+        assert_eq!(validate_call_path_binding(&c, &mut binding).unwrap(), "stale");
+        assert_eq!(binding.binding_id, "legacy-path", "a partial path keeps its stored identity");
+        let stored: String = c
+            .query_row(
+                "SELECT edge_fingerprint FROM repo_memory_call_path_edges
+                 WHERE memory_id = 'm1' AND edge_sequence_hash = 'legacy-path' AND ordinal = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, legacy, "no member is converged while the path is incomplete");
     }
 
     #[test]

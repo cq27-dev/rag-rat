@@ -723,6 +723,107 @@ fn external_receiver_type_hint_never_binds_locally() {
 }
 
 #[test]
+fn bare_root_receiver_does_not_suffix_match_nested_owner() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "src/lib.rs::run".to_string();
+    run.scope_path = "inner::Worker::run".to_string();
+    let symbols = [run];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: None,
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("w.run()"),
+            receiver_hint: Some("w"),
+            receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+        },
+        &index,
+    );
+    assert!(resolved.is_none(), "root Worker must not bind inner::Worker::run by suffix");
+}
+
+#[test]
+fn typed_self_receiver_keeps_trait_default_qualified_resolution() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "src/lib.rs::run".to_string();
+    run.scope_path = "WorkerExt::run".to_string();
+    let symbols = [run];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: Some("WorkerExt::run"),
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("self.run()"),
+            receiver_hint: Some("self"),
+            receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+        },
+        &index,
+    )
+    .expect("the trait-qualified target remains stronger than an unmatched receiver owner");
+    assert_eq!(resolved.0.id, symbols[0].id);
+    assert_eq!(resolved.2, "scope_exact");
+
+    let bare = resolve_symbol(
+        ResolveSymbolRequest {
+            target_qualified_name: None,
+            ..ResolveSymbolRequest {
+                name: "run",
+                target_qualified_name: Some("WorkerExt::run"),
+                edge_kind: EdgeKind::CallsName,
+                evidence: Some("self.run()"),
+                receiver_hint: Some("self"),
+                receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+                source_file_id: 1,
+                source_language: Some(Language::Rust.as_str()),
+                imported_external: false,
+            }
+        },
+        &index,
+    )
+    .expect("a unique trait default method remains available through self");
+    assert_eq!(bare.0.id, symbols[0].id);
+    assert_eq!(bare.2, "target_name_fallback");
+}
+
+#[test]
+fn cpp_operator_scopes_are_never_rust_degenericized() {
+    let mut less = preferred_candidate(1, Language::Cpp, "function");
+    less.name = "operator<".to_string();
+    less.qualified_name = "src/lib.cpp::operator<".to_string();
+    less.scope_path = "Foo::operator<".to_string();
+    let symbols = [less];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "operator<<",
+            target_qualified_name: Some("Foo::operator<<"),
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("value << other"),
+            receiver_hint: None,
+            receiver_type: None,
+            source_file_id: 1,
+            source_language: Some(Language::Cpp.as_str()),
+            imported_external: false,
+        },
+        &index,
+    );
+    assert!(resolved.is_none(), "C++ operator< must not normalize into operator<<");
+}
+
+#[test]
 fn receiver_type_identity_classification() {
     let external = |root: &str| root == "url" || root == "Url";
     // Qualified with a local root.
