@@ -976,6 +976,7 @@ mod git_history_reload;
 mod graph_edges;
 mod head_move_carry;
 mod index_paths;
+mod lens_clones;
 mod migration_gate_wiring;
 mod multi_repo_scope;
 mod orientation_healing;

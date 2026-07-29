@@ -219,6 +219,10 @@ fn mcp_stdio_serves_dormant_without_a_config() {
     // The server is still alive after those calls — a further request is answered.
     send(&mut stdin, json!({"jsonrpc": "2.0", "id": 5, "method": "tools/list"}));
     assert_eq!(recv(&mut reader)["id"], 5, "the dormant server stays alive across calls");
+    assert!(
+        !root.join(".rag-rat/sockets/lens.json").exists(),
+        "a dormant MCP lifecycle must not publish lens discovery"
+    );
 
     stop(child);
 }

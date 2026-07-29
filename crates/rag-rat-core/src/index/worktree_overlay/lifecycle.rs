@@ -126,6 +126,7 @@ impl IndexDatabase {
         let result = (|| -> anyhow::Result<()> {
             self.refresh_packages(&source_root)?;
             self.resolve_overlay_edges(&worktree_id)?;
+            self.bump_lens_enrichment_revision()?;
             Ok(())
         })();
         match result {
@@ -243,6 +244,19 @@ impl IndexDatabase {
             // review).
             self.resolve_overlay_edges(worktree_id)?;
         }
+        if counts.any_changed() || manifest_changed {
+            self.bump_lens_enrichment_revision()?;
+        }
+        Ok(())
+    }
+
+    fn bump_lens_enrichment_revision(&self) -> anyhow::Result<()> {
+        self.storage.connection().execute(
+            "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, '1')
+             ON CONFLICT(repo_id, key) DO UPDATE SET
+                 value = CAST(COALESCE(value, '0') AS INTEGER) + 1",
+            params![self.active_repo_id, rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META],
+        )?;
         Ok(())
     }
 

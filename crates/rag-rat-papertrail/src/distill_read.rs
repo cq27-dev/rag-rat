@@ -99,6 +99,14 @@ pub struct DriveByRecord {
     pub record: DistilledRecord,
 }
 
+/// A selected distilled record anchored to one current file. Symbol anchors carry their current
+/// display line; file anchors use `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathDistilledRecord {
+    pub record: DistilledRecord,
+    pub line: Option<i64>,
+}
+
 impl DriveByRecord {
     pub fn new(record: DistilledRecord) -> Self {
         Self { unreviewed: true, record }
@@ -136,14 +144,13 @@ pub fn distilled_record_for_thread(
 /// loaded directly for the anchor's OWN record-owning thread (no coalesce redirect — the anchor
 /// always sits on the thread that owns the record). Repo-scoped.
 ///
-/// LIMITATION (eventual consistency): the anchor's stored token is a snapshot of the symbol's id at
-/// mining time and is NOT rewritten by the logical-id relocation engine (which covers only the
-/// memory/moniker tables). A code reindex that REMAPS a logical id can leave the token stale until
-/// that thread's next distill regeneration refreshes it (the distill input hash includes the token,
-/// so a re-extract on mirror sync heals it). In that window a moved symbol may miss its record, or
-/// — if an id is reused — a stale anchor may surface the PREVIOUS occupant's record. The drive-by
-/// is labeled unreviewed/best-effort; the durable fix (extend the relocation engine to the anchor
-/// token, or validate at the caller) is tracked separately.
+/// RELOCATION: the anchor stores the logical id as the opaque `sym_<hex>` TEXT handle rather than
+/// the i64 every other reference column holds, which is exactly why an early remap pass skipped it
+/// and a stale token could surface the previous occupant's record (#810). It is now rewritten with
+/// every other durable reference when an id is remapped, and cleared to NULL with `resolved = 0`
+/// when the remap has no winner — so a `selected` and `resolved` anchor names the symbol it was
+/// mined for. The drive-by is still labeled unreviewed because the record's text is
+/// model-distilled, not because the anchor might point somewhere else.
 pub fn records_for_symbol(
     conn: &Connection,
     repo_id: &str,
@@ -195,6 +202,71 @@ pub fn records_for_symbol(
         // between the SELECT and this load could otherwise return a coalesced partner's record.
         if let Some(record) = load_record(conn, repo_id, &key)? {
             records.push(record);
+        }
+    }
+    Ok(records)
+}
+
+/// Distilled records selected for a current file, either through an exact file anchor or a symbol
+/// anchor whose logical-symbol member currently belongs to that file. Repo-scoped and newest first.
+///
+/// A symbol anchor is admitted only when it is `resolved = 1` AND its token still joins a LIVE
+/// `logical_symbol_members` row whose symbol sits in the requested file, so the returned `line` is
+/// that symbol's position in the current index rather than a mining-time snapshot. That check plus
+/// the remap rewrite described on [`records_for_symbol`] is what keeps a decision off a file it no
+/// longer belongs to: an anchor whose symbol moved away simply stops matching here.
+pub fn records_for_path(
+    conn: &Connection,
+    repo_id: &str,
+    path: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<PathDistilledRecord>> {
+    if limit == 0 || !rag_rat_db::schema::table_exists(conn, "papertrail_distill")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "WITH requested AS MATERIALIZED (
+             SELECT id FROM files WHERE path = ?2
+         )
+         SELECT anchor.tracker, anchor.project, anchor.item_kind, anchor.item_key,
+                MIN(CASE WHEN anchor.anchor_kind = 'symbol' THEN symbol.start_line END) AS line
+         FROM papertrail_distill_anchors anchor
+         JOIN papertrail_distill record
+           ON record.repo_id = anchor.repo_id AND record.tracker = anchor.tracker
+          AND record.project = anchor.project AND record.item_kind = anchor.item_kind
+          AND record.item_key = anchor.item_key
+         LEFT JOIN logical_symbol_members member
+           ON anchor.anchor_kind = 'symbol'
+          AND anchor.logical_symbol_id = 'sym_' || format('%x', member.logical_symbol_id)
+         LEFT JOIN symbols symbol
+           ON symbol.id = member.symbol_id AND symbol.file_id IN (SELECT id FROM requested)
+         WHERE anchor.repo_id = ?1 AND anchor.selected = 1
+           AND EXISTS (SELECT 1 FROM requested)
+           AND (
+               (anchor.anchor_kind = 'file' AND anchor.file_path = ?2)
+               OR (anchor.anchor_kind = 'symbol' AND anchor.resolved = 1 AND symbol.id IS NOT NULL)
+           )
+         GROUP BY anchor.tracker, anchor.project, anchor.item_kind, anchor.item_key
+         ORDER BY MAX(record.distilled_at_ms) DESC, anchor.tracker, anchor.project,
+                  anchor.item_kind, anchor.item_key
+         LIMIT ?3",
+    )?;
+    let keys = stmt.query_map(params![repo_id, path, i64::try_from(limit)?], |row| {
+        Ok((
+            RecordKey {
+                tracker: row.get(0)?,
+                project: row.get(1)?,
+                item_kind: row.get(2)?,
+                item_key: row.get(3)?,
+            },
+            row.get::<_, Option<i64>>(4)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for key in keys {
+        let (key, line) = key?;
+        if let Some(record) = load_record(conn, repo_id, &key)? {
+            records.push(PathDistilledRecord { record, line });
         }
     }
     Ok(records)

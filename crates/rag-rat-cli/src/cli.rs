@@ -3,6 +3,7 @@
 //! the typed result. The global `--config` defaults to governing-path discovery and may appear
 //! before or after the subcommand.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -80,6 +81,9 @@ pub(crate) enum Command {
 
     /// Run the stdio MCP server.
     Mcp,
+
+    /// Serve the authenticated editor Lens HTTP API.
+    Serve(ServeArgs),
 
     /// Inspect and re-anchor source-anchored repo memories.
     Memory(MemoryArgs),
@@ -184,6 +188,48 @@ pub(crate) enum AgentHookHarnessArg {
     Auto,
     Cursor,
     Vscode,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ServeArgs {
+    /// Address to bind. Non-loopback interfaces require --token-env and --allow-origin.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind: IpAddr,
+    /// TCP port to bind. Use 0 to let the operating system choose an available port.
+    #[arg(long, default_value_t = 18120)]
+    pub port: u16,
+    /// Environment variable containing the bearer token. Loopback serving generates a token when
+    /// omitted; non-loopback serving requires an explicit token variable.
+    #[arg(long, value_name = "ENV_VAR")]
+    pub token_env: Option<String>,
+    /// Exact browser Origin allowed to call the API (`scheme://host[:port]`, no path). Repeat
+    /// for multiple trusted origins.
+    #[arg(long, value_name = "ORIGIN", value_parser = parse_lens_origin)]
+    pub allow_origin: Vec<String>,
+}
+
+/// clap `value_parser` for `--allow-origin`: an Origin header is `scheme://host[:port]` with no
+/// path, query, or fragment. A trailing slash is normalized away; anything else that would
+/// silently never match the header is rejected at parse time.
+fn parse_lens_origin(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let parsed = url::Url::parse(trimmed)
+        .map_err(|_| format!("origin `{raw}` must look like scheme://host[:port]"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("origin scheme must be http or https: `{raw}`"));
+    }
+    if parsed.host().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(format!(
+            "origin must not contain credentials, a path, query, or fragment: `{raw}`"
+        ));
+    }
+    Ok(parsed.origin().ascii_serialization())
 }
 
 #[derive(Debug, Args)]
@@ -1015,6 +1061,55 @@ mod tests {
             Command::AgentHook(args) => assert_eq!(args.harness, AgentHookHarnessArg::Auto),
             other => panic!("expected agent-hook, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn serve_defaults_to_loopback_and_accepts_port_zero() {
+        let defaults = Cli::try_parse_from(["rag-rat", "serve"]).expect("parse");
+        match defaults.command {
+            Command::Serve(args) => {
+                assert!(args.bind.is_loopback());
+                assert_eq!(args.port, 18120);
+                assert!(args.token_env.is_none());
+                assert!(args.allow_origin.is_empty());
+            },
+            other => panic!("expected serve, got {other:?}"),
+        }
+
+        let ephemeral = Cli::try_parse_from(["rag-rat", "serve", "--port", "0"]).expect("parse");
+        match ephemeral.command {
+            Command::Serve(args) => assert_eq!(args.port, 0),
+            other => panic!("expected serve, got {other:?}"),
+        }
+
+        let hosted = Cli::try_parse_from([
+            "rag-rat",
+            "serve",
+            "--bind",
+            "0.0.0.0",
+            "--token-env",
+            "LENS_TOKEN",
+            "--allow-origin",
+            "HTTPS://Lens.Example:443/",
+        ])
+        .expect("parse");
+        match hosted.command {
+            Command::Serve(args) => {
+                assert_eq!(args.token_env.as_deref(), Some("LENS_TOKEN"));
+                assert_eq!(args.allow_origin, ["https://lens.example"]);
+            },
+            other => panic!("expected serve, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "rag-rat",
+                "serve",
+                "--allow-origin",
+                "https://lens.example/path",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

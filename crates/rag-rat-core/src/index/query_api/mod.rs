@@ -18,6 +18,7 @@ mod global_status;
 mod graph;
 mod history;
 mod importance;
+mod lens;
 mod memory;
 mod oracle_runs;
 mod search;
@@ -47,6 +48,16 @@ pub use global_status::{
     RepoFreshness, RepoPapertrail, RepoStatus, WorktreeOverlay,
 };
 pub use importance::ImportantSymbolsRequest;
+pub use lens::clones::{
+    LensCloneGraphMeta, LensClonePartner, LensCloneRefine, LensCloneRegion, LensFileClones,
+};
+pub use lens::{
+    LensCallees, LensCallers, LensChunkText, LensCloneGraphCache, LensCouplingPartner,
+    LensDecisionRecord, LensDispatchDetail, LensFileCoupling, LensFileGraph, LensFileMemories,
+    LensFileMemory, LensFilePapertrail, LensFileSymbolGraph, LensFileSymbols,
+    LensGraphCallerCounts, LensPapertrailRef, LensStatus, LensSymbol, LensSymbolHop, LensTreemap,
+    LensTreemapFile, LensVersion,
+};
 pub use memory::SyncCatchUpReport;
 pub use oracle_runs::OracleShaSnapshots;
 pub use search::SearchRequest;

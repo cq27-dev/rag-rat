@@ -20,6 +20,23 @@ pub const WATCH_SHUTDOWN_RECONCILE_PENDING_META: &str = "watch_shutdown_reconcil
 /// without one watcher process masking another's (see `record_watch_placement_failures`).
 pub const WATCH_PLACEMENT_FAILURES_META: &str = "watch_placement_failures";
 pub const BASE_SCOPE_DISCOVERED_META: &str = "files_base_scope_discovered";
+/// Monotonic per-repo clock maintained by schema triggers and transactional bulk writers for
+/// Lens-visible enrichment rows.
+pub const LENS_ENRICHMENT_REVISION_META: &str = "lens_enrichment_revision";
+
+/// Advance the per-repo Lens enrichment write clock once for one logical transaction.
+pub fn bump_lens_enrichment_revision(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, '1')
+         ON CONFLICT(repo_id, key) DO UPDATE SET
+             value = CAST(COALESCE(value, '0') AS INTEGER) + 1",
+        params![repo_id, LENS_ENRICHMENT_REVISION_META],
+    )?;
+    Ok(())
+}
 
 pub fn target_scope_fingerprint(targets: &[ResolvedTarget]) -> String {
     let mut input = String::new();

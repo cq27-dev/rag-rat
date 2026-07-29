@@ -10,6 +10,7 @@
 //! [`CloneCompleteness::stale_members`]: super::types::CloneCompleteness::stale_members
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rag_rat_clones::NORM_VERSION;
 use rusqlite::{Connection, OptionalExtension};
@@ -35,6 +36,18 @@ pub(crate) fn build_class(
     conn: &Connection,
     pin: Option<i64>,
 ) -> anyhow::Result<Option<CandidateCloneClass>> {
+    let cancelled = AtomicBool::new(false);
+    build_class_cancellable(component, by_id, conn, pin, &cancelled)
+}
+
+pub(crate) fn build_class_cancellable(
+    component: &[i64],
+    by_id: &BTreeMap<i64, &SymbolBag>,
+    conn: &Connection,
+    pin: Option<i64>,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<Option<CandidateCloneClass>> {
+    ensure_not_cancelled(cancelled)?;
     let bags: Vec<&SymbolBag> = component.iter().filter_map(|id| by_id.get(id).copied()).collect();
     if bags.len() != component.len() {
         return Ok(None);
@@ -58,6 +71,7 @@ pub(crate) fn build_class(
     let mut sim_sums = vec![0.0_f64; metric_n]; // for medoid selection
 
     for i in 0..metric_n {
+        ensure_not_cancelled(cancelled)?;
         for j in (i + 1)..metric_n {
             let ov = overlap(metric_bags[i], metric_bags[j]);
             let max_len = metric_bags[i].token_len.max(metric_bags[j].token_len);
@@ -100,6 +114,9 @@ pub(crate) fn build_class(
     // Min similarity of any member to the medoid (within metric_bags).
     let mut similarity_medoid_min = f64::MAX;
     for (i, bag) in metric_bags.iter().enumerate() {
+        if i.is_multiple_of(32) {
+            ensure_not_cancelled(cancelled)?;
+        }
         if i == medoid_idx {
             continue;
         }
@@ -134,6 +151,7 @@ pub(crate) fn build_class(
     // member orderings byte-for-byte identical.
     let mut raw_members: Vec<(i64, i64, CloneMember)> = Vec::with_capacity(total_members);
     for chunk in component.chunks(HYDRATION_CHUNK) {
+        ensure_not_cancelled(cancelled)?;
         let id_placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
         let version_placeholder = format!("?{}", chunk.len() + 1);
         let sql = format!(
@@ -164,10 +182,14 @@ pub(crate) fn build_class(
                 language: row.get(6)?,
             }))
         })?;
-        for row in rows {
+        for (index, row) in rows.enumerate() {
+            if index.is_multiple_of(256) {
+                ensure_not_cancelled(cancelled)?;
+            }
             raw_members.push(row?);
         }
     }
+    ensure_not_cancelled(cancelled)?;
     // Restore the deterministic `symbols.id ASC` order the single-statement path produced.
     raw_members.sort_unstable_by_key(|(symbol_id, _, _)| *symbol_id);
 
@@ -211,6 +233,7 @@ pub(crate) fn build_class(
         .map(|(_, _, m)| format!("{}@{}:{}-{}", m.r#ref, m.path, m.start_line, m.end_line))
         .collect();
     let class_key = class_key_for(&key_material);
+    ensure_not_cancelled(cancelled)?;
 
     // Canonical-ordered member refs (#215 Plan 4b): the qualified `ref` of each member in the SAME
     // canonical `(struct_hash, path, start_byte)` order, capped at the same `MEMBER_VALUE_CAP`,
@@ -255,6 +278,7 @@ pub(crate) fn build_class(
             canonical_member_order_key(a.0, a.1, a.2)
                 .cmp(&canonical_member_order_key(b.0, b.1, b.2))
         });
+        ensure_not_cancelled(cancelled)?;
         ordered.into_iter().take(MEMBER_VALUE_CAP).map(|(_, _, _, r)| r).collect()
     };
 
@@ -289,20 +313,26 @@ pub(crate) fn build_class(
     // Load-bearing factor: 1 + ln(1 + max_fan_in_score) over members. Fan-in proxy via
     // `scoped_weighted_fan_in` (heuristic-only, no oracle data at this call site).
     let oracle = rag_rat_query::load_bearing::OracleContext::none();
-    let max_importance = component
-        .iter()
-        .filter_map(|&id| {
-            rag_rat_query::load_bearing::scoped_weighted_fan_in(conn, id, &oracle)
-                .ok()
-                .flatten()
-                .map(|e| e.score)
-        })
-        .fold(0.0_f64, f64::max);
+    let mut max_importance = 0.0_f64;
+    for (index, &id) in component.iter().enumerate() {
+        if index.is_multiple_of(32) {
+            ensure_not_cancelled(cancelled)?;
+        }
+        if let Some(score) = rag_rat_query::load_bearing::scoped_weighted_fan_in(conn, id, &oracle)
+            .ok()
+            .flatten()
+            .map(|entry| entry.score)
+        {
+            max_importance = max_importance.max(score);
+        }
+    }
     let load_bearing_factor = 1.0 + max_importance.ln_1p();
 
     // Median token_len across all bags in the component.
     let mut token_lens: Vec<i64> = bags.iter().map(|b| b.token_len).collect();
+    ensure_not_cancelled(cancelled)?;
     token_lens.sort_unstable();
+    ensure_not_cancelled(cancelled)?;
     let median_token_len = token_lens[token_lens.len() / 2];
 
     let roi = cross_module_spread as f64
@@ -350,6 +380,11 @@ pub(crate) fn build_class(
         anti_unify_coverage: None,
         canonical_member_refs: Some(canonical_member_refs),
     }))
+}
+
+fn ensure_not_cancelled(cancelled: &AtomicBool) -> anyhow::Result<()> {
+    anyhow::ensure!(!cancelled.load(Ordering::Acquire), "lens request cancelled");
+    Ok(())
 }
 
 /// Count DISTINCT member file paths in `classes` whose on-disk content no longer matches the

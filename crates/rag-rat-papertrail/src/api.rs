@@ -765,7 +765,7 @@ pub fn refs_for_path(
          source_commit, source_text
         FROM papertrail_refs
         WHERE source_path = ?1 AND repo_id = ?3
-        ORDER BY id DESC
+        ORDER BY discovered_at_ms DESC, id DESC
         LIMIT ?2
         ",
     )?;

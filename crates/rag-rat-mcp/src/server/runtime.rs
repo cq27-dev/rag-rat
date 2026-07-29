@@ -22,7 +22,8 @@ pub async fn run_stdio(
         // Keep the index fresh while a session is connected; dropping the watcher on shutdown
         // runs a final timeout-skip pass. (Hot-upgrade is Unix-only.)
         let _watcher = rag_rat_core::watch::Watcher::spawn(config.clone());
-        let service = RagRatService::new(config, output_format).serve(stdio()).await?;
+        let service = RagRatService::new(config.clone(), output_format).serve(stdio()).await?;
+        let _lens_server = crate::lens_server::spawn(config);
         service.waiting().await?;
         Ok(())
     }
@@ -40,9 +41,8 @@ pub async fn run_stdio_dormant(output_format: rag_rat_core::OutputFormat) -> any
     Ok(())
 }
 
-/// Aborts a spawned task when dropped. Used to tear down the hook listener on normal EOF
-/// shutdown so its socket + election lock release promptly (a hot-`exec` replaces the process
-/// image instead, so the task vanishes and the successor re-elects).
+/// Aborts the Unix hook-listener task on shutdown. A hot-`exec` replaces the process image instead,
+/// and the successor re-elects after close-on-exec releases the descriptors.
 #[cfg(unix)]
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -101,6 +101,11 @@ async fn run_stdio_unix(
     // aborts the task so the socket + election lock release promptly; on a hot-`exec` the process
     // image is replaced (task vanishes) and the new process re-elects.
     let _hook_listener = AbortOnDrop(crate::agent_hook::spawn_listener(config.clone()));
+
+    // The loopback editor API belongs to the same ACTIVE lifecycle as the watcher and hook
+    // listener. The task fails open: election, bind, or publication errors are warnings and never
+    // terminate the stdio MCP service.
+    let _lens_server = crate::lens_server::spawn(config.clone());
 
     // Arm the SIGUSR1 hot-upgrade handler only when an install target is configured.
     if let Some(install_path) = install_path {

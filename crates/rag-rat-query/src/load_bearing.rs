@@ -21,9 +21,9 @@
 //! per-symbol verdict scan); when no oracle run exists for the active checkout the factor is `1.0`
 //! (pure heuristic) and costs nothing — the caller gates on a run existing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params_from_iter};
 use serde::Serialize;
 
 use crate::pagerank::{COMPILER_FACTOR, EdgeOracleEffect, confidence_factor, edge_weight};
@@ -259,6 +259,64 @@ pub fn scoped_weighted_fan_in(
     }))
 }
 
+/// Batched sibling of [`scoped_weighted_fan_in`]. It preserves the same active-scope, visibility,
+/// weighting, and oracle semantics while loading requested symbols' in-edges in bounded queries.
+pub fn scoped_weighted_fan_in_many(
+    conn: &Connection,
+    symbol_ids: &[i64],
+    oracle: &OracleContext<'_>,
+) -> anyhow::Result<HashMap<i64, ImportanceEnrichment>> {
+    if symbol_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let unique_symbol_ids = symbol_ids.iter().copied().collect::<BTreeSet<_>>();
+    let unique_symbol_ids = unique_symbol_ids.into_iter().collect::<Vec<_>>();
+    let mut scores: HashMap<i64, (f64, bool)> = HashMap::new();
+    for symbol_chunk in unique_symbol_ids.chunks(900) {
+        let marks = symbol_chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT d.id, d.to_symbol_id, ek.value, cf.value
+             FROM edges_data d
+             JOIN files ON files.id = d.source_file_id
+             JOIN name_strings ek ON ek.id = d.edge_kind_id
+             JOIN name_strings cf ON cf.id = d.confidence_id
+             WHERE d.to_symbol_id IN ({marks}) AND d.hidden = 0"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(symbol_chunk), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (edge_id, symbol_id, kind, confidence) = row?;
+            let Some(contribution) =
+                in_edge_contribution(&kind, &confidence, edge_id, symbol_id, oracle)
+            else {
+                continue;
+            };
+            let score = scores.entry(symbol_id).or_default();
+            score.0 += contribution.weight;
+            score.1 |= contribution.compiler;
+        }
+    }
+    Ok(scores
+        .into_iter()
+        .map(|(symbol_id, (score, compiler))| {
+            (symbol_id, ImportanceEnrichment {
+                label: ImportanceEnrichment::LABEL,
+                signal: ImportanceEnrichment::SIGNAL,
+                score: crate::round_score(score),
+                bucket: LoadBearingBucket::from_score(score),
+                oracle_tier: compiler.then_some(OracleTier::Compiler),
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use rag_rat_core::index::install_scope_view;
@@ -423,6 +481,20 @@ mod tests {
         let leaf = add_symbol(&conn, f, "leaf", "a::leaf");
         install_scope_view(&conn, "c", "").unwrap();
         assert!(fan_in(&conn, leaf).is_none(), "a symbol nothing depends on has no fan-in");
+    }
+
+    #[test]
+    fn batched_fan_in_accepts_more_than_sqlites_variable_limit() {
+        let conn = scoped_conn();
+        let file = add_file(&conn, "a.rs", "c", "");
+        let caller = add_symbol(&conn, file, "caller", "a::caller");
+        let target = add_symbol(&conn, file, "target", "a::target");
+        add_edge(&conn, file, caller, target, "calls_name", "Exact");
+        install_scope_view(&conn, "c", "").unwrap();
+        let targets = (1..=40_000).collect::<Vec<_>>();
+
+        let scores = scoped_weighted_fan_in_many(&conn, &targets, &OracleContext::none()).unwrap();
+        assert_eq!(scores.get(&target).map(|score| score.score), Some(1.0));
     }
 
     #[test]

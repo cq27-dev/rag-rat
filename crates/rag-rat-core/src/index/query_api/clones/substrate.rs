@@ -11,7 +11,9 @@
 //! (arbitrary-text clone check) child modules reuse, guaranteeing the persisted / text-checked set
 //! equals the live [`candidate_pairs_from_bags`] set.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rag_rat_clones::NORM_VERSION;
 use rayon::prelude::*;
@@ -75,20 +77,76 @@ pub(crate) struct TokenPosting {
 /// caller's `min_similarity` widens (or narrows) candidate generation to match the requested
 /// floor, instead of generating at the const [`THETA`] and post-filtering.
 pub(crate) fn candidate_pairs_from_bags(bags: &[SymbolBag], theta: f64) -> Vec<(i64, i64)> {
-    let mut pairs: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
+    let mut pairs: BTreeSet<(i64, i64)> = BTreeSet::new();
     add_struct_hash_pairs(bags, &mut pairs);
     let candidate = sub_block_candidate_pairs(bags, theta);
     let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
-    // Verify candidates in parallel: `verified_clone` is pure token math (no DB, no shared
-    // mutation; `by_id` is read-only), so the candidate set — the bulk of candidate-gen cost —
-    // fans out across cores. Output stays deterministic: the verified pairs land in the sorted
-    // `pairs` BTreeSet regardless of completion order.
     let verified: Vec<(i64, i64)> = candidate
         .into_par_iter()
         .filter(|&(a, b)| verified_clone(by_id[&a], by_id[&b], theta))
         .collect();
     pairs.extend(verified);
     pairs.into_iter().collect()
+}
+
+pub(crate) fn candidate_pairs_from_bags_cancellable(
+    bags: &[SymbolBag],
+    theta: f64,
+    cancelled: &AtomicBool,
+) -> Option<Vec<(i64, i64)>> {
+    let mut pairs: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
+    if !add_struct_hash_pairs_cancellable(bags, &mut pairs, cancelled) {
+        return None;
+    }
+    let candidate = sub_block_candidate_pairs_cancellable(bags, theta, cancelled)?;
+    let by_id: BTreeMap<i64, &SymbolBag> = bags.iter().map(|b| (b.symbol_id, b)).collect();
+    // Verify candidates in parallel: `verified_clone` is pure token math (no DB, no shared
+    // mutation; `by_id` is read-only), so the candidate set — the bulk of candidate-gen cost —
+    // fans out across cores. The indexed parallel iterator preserves the already-sorted candidate
+    // order, so the final exact+verified union can use a cancellable linear merge.
+    let verified: Vec<(i64, i64)> = candidate
+        .into_par_iter()
+        .filter(|&(a, b)| {
+            !cancelled.load(Ordering::Relaxed) && verified_clone(by_id[&a], by_id[&b], theta)
+        })
+        .collect();
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    merge_sorted_pairs_cancellable(pairs, verified, cancelled)
+}
+
+fn merge_sorted_pairs_cancellable(
+    exact: BTreeSet<(i64, i64)>,
+    verified: Vec<(i64, i64)>,
+    cancelled: &AtomicBool,
+) -> Option<Vec<(i64, i64)>> {
+    let mut exact = exact.into_iter().peekable();
+    let mut verified = verified.into_iter().peekable();
+    let mut merged = Vec::new();
+    let mut visits = 0usize;
+    while exact.peek().is_some() || verified.peek().is_some() {
+        if visits.is_multiple_of(1024) && cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        visits += 1;
+        let next = match (exact.peek().copied(), verified.peek().copied()) {
+            (Some(a), Some(b)) if a < b => exact.next().expect("peeked exact pair"),
+            (Some(a), Some(b)) if b < a => verified.next().expect("peeked verified pair"),
+            (Some(a), Some(_)) => {
+                exact.next();
+                verified.next();
+                a
+            },
+            (Some(_), None) => exact.next().expect("peeked exact pair"),
+            (None, Some(_)) => verified.next().expect("peeked verified pair"),
+            (None, None) => break,
+        };
+        if merged.last() != Some(&next) {
+            merged.push(next);
+        }
+    }
+    Some(merged)
 }
 
 /// Candidate pairs for a query: the persisted clone-graph FAST PATH (#286) when one is eligible
@@ -296,9 +354,22 @@ pub(crate) fn add_struct_hash_pairs(
     bags: &[SymbolBag],
     pairs: &mut std::collections::BTreeSet<(i64, i64)>,
 ) {
+    let cancelled = AtomicBool::new(false);
+    let completed = add_struct_hash_pairs_cancellable(bags, pairs, &cancelled);
+    debug_assert!(completed);
+}
+
+fn add_struct_hash_pairs_cancellable(
+    bags: &[SymbolBag],
+    pairs: &mut std::collections::BTreeSet<(i64, i64)>,
+    cancelled: &AtomicBool,
+) -> bool {
     // Key: (struct_hash, language) — only same-language symbols can be struct-hash clones.
     let mut by_hash: BTreeMap<(&str, &str), Vec<i64>> = BTreeMap::new();
     for bag in bags {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
         by_hash
             .entry((bag.struct_hash.as_str(), bag.language.as_str()))
             .or_default()
@@ -306,11 +377,18 @@ pub(crate) fn add_struct_hash_pairs(
     }
     for ids in by_hash.values() {
         for (i, &a) in ids.iter().enumerate() {
-            for &b in &ids[i + 1..] {
+            if cancelled.load(Ordering::Relaxed) {
+                return false;
+            }
+            for (offset, &b) in ids[i + 1..].iter().enumerate() {
+                if offset.is_multiple_of(1024) && cancelled.load(Ordering::Relaxed) {
+                    return false;
+                }
                 pairs.insert((a.min(b), a.max(b)));
             }
         }
     }
+    true
 }
 
 /// Build the inverted index over sub-block tokens only and emit candidate pairs `(a < b)` for every
@@ -329,28 +407,21 @@ pub(crate) fn add_struct_hash_pairs(
 /// of completion order (returns a sorted `Vec`, not a `BTreeSet`, to keep the merge parallel — a
 /// 4.5M-element `BTreeSet` build is sequential).
 pub(crate) fn sub_block_candidate_pairs(bags: &[SymbolBag], theta: f64) -> Vec<(i64, i64)> {
-    // id → language for the partition guard applied at pair-emit time.
     let lang_of: BTreeMap<i64, &str> =
         bags.iter().map(|b| (b.symbol_id, b.language.as_str())).collect();
-
     let mut inverted: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     for bag in bags {
         for token_hash in sub_block_tokens(bag, theta) {
             inverted.entry(token_hash).or_default().push(bag.symbol_id);
         }
     }
-
     let mut candidate: Vec<(i64, i64)> = inverted
         .par_iter()
-        // #271: a token in more than HOT_TOKEN_POSTINGS_CAP sub-blocks is non-discriminating — its
-        // K²/2 pairs are noise that fails verify, and real clones are still found via their rarer
-        // shared tokens. Skip it to bound candidate generation on dense corpora.
         .filter(|(_token, ids)| ids.len() <= HOT_TOKEN_POSTINGS_CAP)
         .flat_map_iter(|(_token, ids)| {
-            let mut local: Vec<(i64, i64)> = Vec::new();
+            let mut local = Vec::new();
             for (i, &a) in ids.iter().enumerate() {
                 for &b in &ids[i + 1..] {
-                    // Language partition: skip cross-language pairs.
                     if lang_of[&a] == lang_of[&b] {
                         local.push((a.min(b), a.max(b)));
                     }
@@ -362,6 +433,91 @@ pub(crate) fn sub_block_candidate_pairs(bags: &[SymbolBag], theta: f64) -> Vec<(
     candidate.par_sort_unstable();
     candidate.dedup();
     candidate
+}
+
+fn sub_block_candidate_pairs_cancellable(
+    bags: &[SymbolBag],
+    theta: f64,
+    cancelled: &AtomicBool,
+) -> Option<Vec<(i64, i64)>> {
+    // id → language for the partition guard applied at pair-emit time.
+    let lang_of: BTreeMap<i64, &str> =
+        bags.iter().map(|b| (b.symbol_id, b.language.as_str())).collect();
+
+    let mut inverted: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    for bag in bags {
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        for token_hash in sub_block_tokens(bag, theta) {
+            inverted.entry(token_hash).or_default().push(bag.symbol_id);
+        }
+    }
+
+    let candidate: Vec<(i64, i64)> = inverted
+        .par_iter()
+        // #271: a token in more than HOT_TOKEN_POSTINGS_CAP sub-blocks is non-discriminating — its
+        // K²/2 pairs are noise that fails verify, and real clones are still found via their rarer
+        // shared tokens. Skip it to bound candidate generation on dense corpora.
+        .filter(|(_token, ids)| ids.len() <= HOT_TOKEN_POSTINGS_CAP)
+        .flat_map_iter(|(_token, ids)| {
+            let mut local: Vec<(i64, i64)> = Vec::new();
+            for (i, &a) in ids.iter().enumerate() {
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+                for &b in &ids[i + 1..] {
+                    // Language partition: skip cross-language pairs.
+                    if lang_of[&a] == lang_of[&b] {
+                        local.push((a.min(b), a.max(b)));
+                    }
+                }
+            }
+            local
+        })
+        .collect();
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    sort_dedup_pairs_cancellable(candidate, cancelled)
+}
+
+fn sort_dedup_pairs_cancellable(
+    mut pairs: Vec<(i64, i64)>,
+    cancelled: &AtomicBool,
+) -> Option<Vec<(i64, i64)>> {
+    const SORT_CHUNK: usize = 65_536;
+    pairs.par_chunks_mut(SORT_CHUNK).for_each(|chunk| {
+        if !cancelled.load(Ordering::Relaxed) {
+            chunk.sort_unstable();
+        }
+    });
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+
+    let mut heap = BinaryHeap::new();
+    for chunk in 0..pairs.len().div_ceil(SORT_CHUNK) {
+        let index = chunk * SORT_CHUNK;
+        heap.push(Reverse((pairs[index], chunk, index)));
+    }
+    let mut sorted = Vec::with_capacity(pairs.len());
+    let mut visits = 0usize;
+    while let Some(Reverse((pair, chunk, index))) = heap.pop() {
+        if visits.is_multiple_of(1024) && cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        visits += 1;
+        if sorted.last() != Some(&pair) {
+            sorted.push(pair);
+        }
+        let next = index + 1;
+        let chunk_end = ((chunk + 1) * SORT_CHUNK).min(pairs.len());
+        if next < chunk_end {
+            heap.push(Reverse((pairs[next], chunk, next)));
+        }
+    }
+    Some(sorted)
 }
 
 /// A symbol's sub-block: the distinct token hashes whose occurrences reach into the first `p`
@@ -446,6 +602,15 @@ pub(crate) fn overlap(a: &SymbolBag, b: &SymbolBag) -> i64 {
 
 /// Union-find the pairs into components of size >= 2 (sorted for determinism).
 pub(crate) fn components_from_pairs(pairs: &[(i64, i64)]) -> Vec<Vec<i64>> {
+    let cancelled = AtomicBool::new(false);
+    components_from_pairs_cancellable(pairs, &cancelled)
+        .expect("a permanently-clear cancellation flag cannot cancel")
+}
+
+pub(crate) fn components_from_pairs_cancellable(
+    pairs: &[(i64, i64)],
+    cancelled: &AtomicBool,
+) -> Option<Vec<Vec<i64>>> {
     use std::collections::BTreeMap;
 
     fn find(parent: &mut BTreeMap<i64, i64>, x: i64) -> i64 {
@@ -468,7 +633,10 @@ pub(crate) fn components_from_pairs(pairs: &[(i64, i64)]) -> Vec<Vec<i64>> {
     }
 
     let mut parent: BTreeMap<i64, i64> = BTreeMap::new();
-    for &(a, b) in pairs {
+    for (index, &(a, b)) in pairs.iter().enumerate() {
+        if index.is_multiple_of(1024) && cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
         parent.entry(a).or_insert(a);
         parent.entry(b).or_insert(b);
         let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
@@ -478,18 +646,23 @@ pub(crate) fn components_from_pairs(pairs: &[(i64, i64)]) -> Vec<Vec<i64>> {
     }
     let mut groups: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     let members: Vec<i64> = parent.keys().copied().collect(); // collect keys first: find() needs &mut parent
-    for member in members {
+    for (index, member) in members.into_iter().enumerate() {
+        if index.is_multiple_of(1024) && cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
         let root = find(&mut parent, member);
         groups.entry(root).or_default().push(member);
     }
-    groups
-        .into_values()
-        .filter(|g| g.len() >= 2)
-        .map(|mut g| {
-            g.sort_unstable();
-            g
-        })
-        .collect()
+    Some(
+        groups
+            .into_values()
+            .filter(|g| g.len() >= 2)
+            .map(|mut g| {
+                g.sort_unstable();
+                g
+            })
+            .collect(),
+    )
 }
 
 /// The `subject` symbol's connected component + its verified θ-edges, computed by a BFS from the
@@ -594,18 +767,34 @@ pub(crate) fn bucket_edges_by_component(
     pairs: &[(i64, i64)],
     components: &[Vec<i64>],
 ) -> Vec<Vec<(i64, i64)>> {
+    let cancelled = AtomicBool::new(false);
+    bucket_edges_by_component_cancellable(pairs, components, &cancelled)
+        .expect("a permanently-clear cancellation flag cannot cancel")
+}
+
+pub(crate) fn bucket_edges_by_component_cancellable(
+    pairs: &[(i64, i64)],
+    components: &[Vec<i64>],
+    cancelled: &AtomicBool,
+) -> Option<Vec<Vec<(i64, i64)>>> {
     let mut node_to_component: BTreeMap<i64, usize> = BTreeMap::new();
     for (idx, component) in components.iter().enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
         for &node in component {
             node_to_component.insert(node, idx);
         }
     }
     let mut edges_by_component: Vec<Vec<(i64, i64)>> = vec![Vec::new(); components.len()];
-    for &(a, b) in pairs {
+    for (index, &(a, b)) in pairs.iter().enumerate() {
+        if index.is_multiple_of(1024) && cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
         if let Some(&idx) = node_to_component.get(&a) {
             // `a` and `b` are unioned into the same component, so indexing by `a` is correct.
             edges_by_component[idx].push((a, b));
         }
     }
-    edges_by_component
+    Some(edges_by_component)
 }

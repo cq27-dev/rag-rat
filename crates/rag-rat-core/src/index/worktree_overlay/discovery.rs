@@ -56,7 +56,7 @@ pub struct WorktreeOverlayReport {
 /// derived. Shared by the delta computation (path rebasing) and the read step (source root) so the
 /// two can't drift (#219 review).
 fn linked_config_subdir_and_root(
-    config: &Config,
+    config_root: &Path,
     base_repo: &gix::Repository,
     linked_repo: &gix::Repository,
     linked_path: &Path,
@@ -71,11 +71,20 @@ fn linked_config_subdir_and_root(
             base_workdir.canonicalize().unwrap_or_else(|_| base_workdir.to_path_buf())
         })
         .and_then(|base_workdir| {
-            config.root.strip_prefix(&base_workdir).ok().map(Path::to_path_buf)
+            config_root.strip_prefix(&base_workdir).ok().map(Path::to_path_buf)
         })
         .unwrap_or_default();
     let linked_config_root = linked_workdir.join(&config_subdir);
     (config_subdir, linked_config_root)
+}
+
+pub(crate) fn linked_source_root(
+    config_root: &Path,
+    linked_path: &Path,
+) -> anyhow::Result<PathBuf> {
+    let base_repo = rag_rat_base::repo_discover::discover_repo(config_root)?;
+    let linked_repo = rag_rat_base::repo_discover::discover_repo(linked_path)?;
+    Ok(linked_config_subdir_and_root(config_root, &base_repo, &linked_repo, linked_path).1)
 }
 
 /// A linked-worktree overlay's resolved identity plus the opened repositories it was resolved
@@ -110,7 +119,7 @@ pub(super) fn resolve_overlay_scope(
     let base_repo = rag_rat_base::repo_discover::discover_repo(&config.root)?;
     let linked_repo = rag_rat_base::repo_discover::discover_repo(linked_path)?;
     let (config_subdir, source_root) =
-        linked_config_subdir_and_root(config, &base_repo, &linked_repo, linked_path);
+        linked_config_subdir_and_root(&config.root, &base_repo, &linked_repo, linked_path);
     Ok(Some(ResolvedOverlayScope {
         base_sha,
         worktree_id,

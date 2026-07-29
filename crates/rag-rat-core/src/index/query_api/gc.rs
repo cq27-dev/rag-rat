@@ -180,7 +180,14 @@ impl IndexDatabase {
         // keyed by `(commit_sha, worktree_id)` directly — nothing cascades it either — so
         // prune a dead checkout's run rows with the SAME live sets, so a run and the
         // edges it produced are dropped together.
-        rag_rat_oracle::prune_edge_oracle_without_live_edge(conn)?;
+        // The Lens enrichment clock is advanced by the writer, not by a per-row `edge_oracle`
+        // trigger: an Oracle pass writes one verdict per resolved edge and gets its single bump
+        // from the `oracle_runs` row it commits alongside them. This sweep writes no run row, so
+        // it advances the clock itself — once, and only when it actually retired a verdict a
+        // connected editor could still be showing.
+        if rag_rat_oracle::prune_edge_oracle_without_live_edge(conn)? > 0 {
+            rag_rat_db::meta::bump_lens_enrichment_revision(conn, &self.active_repo_id)?;
+        }
         // Per-repo (A5): `prune_oracle_runs_outside_scope` now filters `oracle_runs.repo_id` (its
         // own column since V042), so it deletes only THIS repo's run rows that fall outside THIS
         // repo's live sets — a sibling repo's runs are legitimately absent from this repo's live

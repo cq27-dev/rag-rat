@@ -210,6 +210,7 @@ impl IndexDatabase {
             config: None,
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
+            lens_clone_graph_cache: std::sync::Arc::default(),
             edge_rewrite_capture: std::sync::atomic::AtomicBool::new(false),
             logical_rederive_capture: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -237,6 +238,7 @@ impl IndexDatabase {
             config: Some(config.clone()),
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
+            lens_clone_graph_cache: std::sync::Arc::default(),
             edge_rewrite_capture: std::sync::atomic::AtomicBool::new(false),
             logical_rederive_capture: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -418,6 +420,7 @@ impl IndexDatabase {
             config: Some(config.clone()),
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
+            lens_clone_graph_cache: std::sync::Arc::default(),
             edge_rewrite_capture: std::sync::atomic::AtomicBool::new(false),
             logical_rederive_capture: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -582,6 +585,7 @@ impl IndexDatabase {
             config: None,
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
+            lens_clone_graph_cache: std::sync::Arc::default(),
             edge_rewrite_capture: std::sync::atomic::AtomicBool::new(false),
             logical_rederive_capture: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

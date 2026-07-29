@@ -29,6 +29,9 @@
 //! real small cliques, while a genuinely dense ≥200-member clique (every pair ≥ θ) still collapses
 //! to one class. NO member is lost — every θ-edge endpoint lands in at least its own seed clique.
 
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
+
 /// Budget on the number of GROWN maximal cliques before the cover stops growing and falls back to
 /// emitting the remaining θ-edges as ungrown 2-member cliques (#256). It bounds the superlinear
 /// maximal-subset-removal pass (O(grown² × n)) — to a sub-second budget (256² × n) on a
@@ -119,6 +122,21 @@ pub fn coherence_split(
     edges: &[(i64, i64)],
     similarity: impl Fn(i64, i64) -> f64,
 ) -> Vec<Vec<i64>> {
+    coherence_split_cancellable(component, edges, similarity, || false)
+        .expect("a permanently-false cancellation predicate cannot cancel")
+}
+
+/// Cancellation-aware form used by latency-bounded editor reads. Returns `None` without exposing
+/// a partial clique cover when the caller's request has expired.
+pub fn coherence_split_cancellable(
+    component: &[i64],
+    edges: &[(i64, i64)],
+    similarity: impl Fn(i64, i64) -> f64,
+    cancelled: impl Fn() -> bool,
+) -> Option<Vec<Vec<i64>>> {
+    if cancelled() {
+        return None;
+    }
     // 1. Sort ascending (determinism).
     let mut members: Vec<i64> = component.to_vec();
     members.sort_unstable();
@@ -134,17 +152,16 @@ pub fn coherence_split(
     // ≥ θ edges (verified by `candidate_pairs_from_bags` at the call site), so there is no
     // all-pairs similarity scan here — that scan was the reason for the removed `SPLIT_MAX`
     // member cap.
-    let mut coherent_edges: Vec<(i64, i64)> = edges
-        .iter()
-        .filter_map(|&(a, b)| {
-            if a == b || !member_set.contains(&a) || !member_set.contains(&b) {
-                return None;
-            }
-            Some((a.min(b), a.max(b)))
-        })
-        .collect();
-    coherent_edges.sort_unstable();
-    coherent_edges.dedup();
+    let mut coherent_edges = Vec::with_capacity(edges.len());
+    for (index, &(a, b)) in edges.iter().enumerate() {
+        if index.is_multiple_of(1024) && cancelled() {
+            return None;
+        }
+        if a != b && member_set.contains(&a) && member_set.contains(&b) {
+            coherent_edges.push((a.min(b), a.max(b)));
+        }
+    }
+    let coherent_edges = sort_dedup_edges_cancellable(coherent_edges, &cancelled)?;
 
     // 2a. Adjacency set over the canonical θ-edges, for the O(1) GROW coherence check (#258).
     //
@@ -178,7 +195,13 @@ pub fn coherence_split(
     //   two grows are byte-identical — the production invariant the issue assumed, and what the
     //   `coherence_split_edge_adjacency_equals_similarity_recompute_when_edges_are_theta_set` test
     //   pins on `edges == exactly the ≥ θ set`.
-    let adjacency: std::collections::HashSet<(i64, i64)> = coherent_edges.iter().copied().collect();
+    let mut adjacency = std::collections::HashSet::with_capacity(coherent_edges.len());
+    for (index, &edge) in coherent_edges.iter().enumerate() {
+        if index.is_multiple_of(1024) && cancelled() {
+            return None;
+        }
+        adjacency.insert(edge);
+    }
 
     // 2b. Seed high-similarity edges FIRST so tight real cliques grow WITHIN the MAX_SPLIT_GROUPS
     // budget instead of falling into the bare-pair tail (#256 R-A). On the dogfood a true 7-member
@@ -190,12 +213,17 @@ pub fn coherence_split(
     // since they are the over-merge noise, not real clones. Similarity is computed ONCE per
     // edge here (O(edges)), NOT in the comparator. The descending-sim + `(a, b)` tie-break
     // keeps the seed order deterministic.
-    let mut seeds: Vec<(f64, i64, i64)> =
-        coherent_edges.iter().map(|&(a, b)| (similarity(a, b), a, b)).collect();
+    let mut seeds = Vec::with_capacity(coherent_edges.len());
+    for (index, &(a, b)) in coherent_edges.iter().enumerate() {
+        if index.is_multiple_of(1024) && cancelled() {
+            return None;
+        }
+        seeds.push((similarity(a, b), a, b));
+    }
     // `total_cmp` (not `partial_cmp(...).unwrap_or(Equal)`): a guaranteed TOTAL order so the sort
     // can never panic on a non-total comparator. similarity() cannot produce NaN today (both call
     // sites guard `max_len == 0 → 1.0`), but total_cmp removes that footgun for any future caller.
-    seeds.sort_by(|x, y| y.0.total_cmp(&x.0).then_with(|| (x.1, x.2).cmp(&(y.1, y.2))));
+    let seeds = sort_seeds_cancellable(seeds, &cancelled)?;
 
     // 3. Greedy maximal clique cover: for each coherent edge not already fully inside some emitted
     // group, grow a maximal coherent group from {a, b} by adding any remaining member (in id order)
@@ -232,7 +260,10 @@ pub fn coherence_split(
     let mut covered: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut budget_tripped = false;
 
-    for &(_sim, a, b) in &seeds {
+    for (seed_index, &(_sim, a, b)) in seeds.iter().enumerate() {
+        if seed_index.is_multiple_of(256) && cancelled() {
+            return None;
+        }
         if budget_tripped {
             // Over budget: emit this θ-edge as a 2-member clique ONLY if it covers a
             // still-uncovered member (#282). Emitting EVERY remaining edge (the old
@@ -266,7 +297,10 @@ pub fn coherence_split(
         // dense clique, #256).
         let mut group: Vec<i64> = vec![a, b];
         let mut group_set: std::collections::HashSet<i64> = group.iter().copied().collect();
-        for &m in &members {
+        for (member_index, &m) in members.iter().enumerate() {
+            if member_index.is_multiple_of(256) && cancelled() {
+                return None;
+            }
             if group_set.contains(&m) {
                 continue;
             }
@@ -277,7 +311,17 @@ pub fn coherence_split(
             // `similarity(m, g) >= theta` (see the `adjacency` construction above). This removes
             // the O(token_len) factor from the grow, making a dense (near-)clique
             // component O(n²) lookups instead of O(n² · token_len) overlap recomputes.
-            if group.iter().all(|&g| adjacency.contains(&(m.min(g), m.max(g)))) {
+            let mut coherent = true;
+            for (group_index, &g) in group.iter().enumerate() {
+                if group_index.is_multiple_of(1024) && cancelled() {
+                    return None;
+                }
+                if !adjacency.contains(&(m.min(g), m.max(g))) {
+                    coherent = false;
+                    break;
+                }
+            }
+            if coherent {
                 group.push(m);
                 group_set.insert(m);
             }
@@ -309,10 +353,33 @@ pub fn coherence_split(
         groups
     } else {
         let mut kept: Vec<Vec<i64>> = Vec::new();
-        for g in &groups {
-            let is_subset = groups
-                .iter()
-                .any(|other| other.len() > g.len() && g.iter().all(|x| other.contains(x)));
+        for (group_index, g) in groups.iter().enumerate() {
+            if group_index.is_multiple_of(32) && cancelled() {
+                return None;
+            }
+            let mut is_subset = false;
+            for other in &groups {
+                if cancelled() {
+                    return None;
+                }
+                if other.len() <= g.len() {
+                    continue;
+                }
+                let mut contained = true;
+                for (member_index, member) in g.iter().enumerate() {
+                    if member_index.is_multiple_of(256) && cancelled() {
+                        return None;
+                    }
+                    if !other.contains(member) {
+                        contained = false;
+                        break;
+                    }
+                }
+                if contained {
+                    is_subset = true;
+                    break;
+                }
+            }
             if !is_subset {
                 kept.push(g.clone());
             }
@@ -330,12 +397,160 @@ pub fn coherence_split(
     // 8. Sort by lowest member id (determinism).
     maximal.sort_by_key(|g| g[0]);
 
-    maximal
+    Some(maximal)
+}
+
+fn sort_dedup_edges_cancellable(
+    mut edges: Vec<(i64, i64)>,
+    cancelled: &impl Fn() -> bool,
+) -> Option<Vec<(i64, i64)>> {
+    const SORT_CHUNK: usize = 65_536;
+    for chunk in edges.chunks_mut(SORT_CHUNK) {
+        if cancelled() {
+            return None;
+        }
+        chunk.sort_unstable();
+    }
+    let mut heap = BinaryHeap::new();
+    for chunk in 0..edges.len().div_ceil(SORT_CHUNK) {
+        let index = chunk * SORT_CHUNK;
+        heap.push(Reverse((edges[index], chunk, index)));
+    }
+    let mut sorted = Vec::with_capacity(edges.len());
+    let mut visits = 0usize;
+    while let Some(Reverse((edge, chunk, index))) = heap.pop() {
+        if visits.is_multiple_of(1024) && cancelled() {
+            return None;
+        }
+        visits += 1;
+        if sorted.last() != Some(&edge) {
+            sorted.push(edge);
+        }
+        let next = index + 1;
+        let chunk_end = ((chunk + 1) * SORT_CHUNK).min(edges.len());
+        if next < chunk_end {
+            heap.push(Reverse((edges[next], chunk, next)));
+        }
+    }
+    Some(sorted)
+}
+
+type Seed = (f64, i64, i64);
+
+fn seed_order(a: &Seed, b: &Seed) -> Ordering {
+    b.0.total_cmp(&a.0).then_with(|| (a.1, a.2).cmp(&(b.1, b.2)))
+}
+
+/// One chunk's current head during the merge below. `Seed` holds an `f64` and the merge is ordered
+/// by `seed_order`, so the heap needs an explicit `Ord`: inverted, because `BinaryHeap` pops the
+/// greatest element and the merge wants the seed that sorts first.
+#[derive(Debug)]
+struct SeedHead {
+    seed: Seed,
+    chunk: usize,
+    index: usize,
+}
+
+impl Ord for SeedHead {
+    fn cmp(&self, other: &Self) -> Ordering {
+        seed_order(&other.seed, &self.seed)
+    }
+}
+
+impl PartialOrd for SeedHead {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for SeedHead {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for SeedHead {}
+
+fn sort_seeds_cancellable(
+    mut seeds: Vec<Seed>,
+    cancelled: &impl Fn() -> bool,
+) -> Option<Vec<Seed>> {
+    const SORT_CHUNK: usize = 65_536;
+    for chunk in seeds.chunks_mut(SORT_CHUNK) {
+        if cancelled() {
+            return None;
+        }
+        chunk.sort_by(seed_order);
+    }
+    // Merge the sorted chunks through a heap, like the edge sorter above: a component with millions
+    // of verified edges spans many chunks, and rescanning every chunk head per emitted seed would
+    // cost O(seeds × chunks) comparisons instead of O(seeds × log chunks).
+    let chunk_count = seeds.len().div_ceil(SORT_CHUNK);
+    let mut heap = BinaryHeap::with_capacity(chunk_count);
+    for chunk in 0..chunk_count {
+        let index = chunk * SORT_CHUNK;
+        heap.push(SeedHead { seed: seeds[index], chunk, index });
+    }
+    let mut sorted = Vec::with_capacity(seeds.len());
+    while let Some(SeedHead { seed, chunk, index }) = heap.pop() {
+        if sorted.len().is_multiple_of(1024) && cancelled() {
+            return None;
+        }
+        sorted.push(seed);
+        let next = index + 1;
+        let chunk_end = ((chunk + 1) * SORT_CHUNK).min(seeds.len());
+        if next < chunk_end {
+            heap.push(SeedHead { seed: seeds[next], chunk, index: next });
+        }
+    }
+    Some(sorted)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    #[test]
+    fn coherence_split_cancellation_discards_partial_work() {
+        let members: Vec<i64> = (0..100).collect();
+        let edges: Vec<(i64, i64)> = members
+            .iter()
+            .enumerate()
+            .flat_map(|(index, &a)| members[index + 1..].iter().map(move |&b| (a, b)))
+            .collect();
+        let checks = AtomicUsize::new(0);
+
+        let result = coherence_split_cancellable(
+            &members,
+            &edges,
+            |_, _| 1.0,
+            || checks.fetch_add(1, Ordering::Relaxed) >= 3,
+        );
+
+        assert!(result.is_none());
+    }
+
+    /// Seeds beyond one sort chunk are merged through a heap; the result must stay exactly what a
+    /// single global sort produces, including across the partial final chunk.
+    #[test]
+    fn seed_sort_merges_chunks_in_seed_order() {
+        let count = 2 * 65_536 + 1_234;
+        let seeds: Vec<Seed> = (0..count)
+            .map(|index| {
+                // Deterministic scatter so chunk-local order differs from the global order.
+                let scattered = (index as u64).wrapping_mul(2_654_435_761) % 10_007;
+                (scattered as f64 / 10_007.0, index as i64, index as i64 + 1)
+            })
+            .collect();
+
+        let merged = sort_seeds_cancellable(seeds.clone(), &|| false).expect("not cancelled");
+
+        let mut expected = seeds;
+        expected.sort_by(seed_order);
+        assert_eq!(merged, expected);
+    }
 
     /// One parity fixture for `coherence_split_edge_adjacency_equals_similarity_recompute_*`:
     /// `(shape_name, component members, explicit symmetric similarity pairs)`.

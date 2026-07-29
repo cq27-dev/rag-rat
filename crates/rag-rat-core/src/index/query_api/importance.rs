@@ -485,7 +485,7 @@ impl IndexDatabase {
     /// verdict map `important_symbols` uses (a single existence probe short-circuits the
     /// no-oracle-ever path), and hold it for the whole pass so no symbol triggers its own verdict
     /// scan. The returned owned map is borrowed into an [`OracleContext`] per symbol below.
-    fn load_bearing_oracle_effects(
+    pub(super) fn load_bearing_oracle_effects(
         &self,
     ) -> anyhow::Result<
         Option<std::collections::HashMap<i64, rag_rat_query::pagerank::EdgeOracleEffect>>,

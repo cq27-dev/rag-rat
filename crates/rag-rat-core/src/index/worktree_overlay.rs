@@ -30,7 +30,7 @@ pub use discovery::WorktreeOverlayReport;
 use discovery::fold_status_candidates;
 use discovery::resolve_overlay_scope;
 pub(crate) use discovery::{
-    CommittedDeltaSource, ResolvedOverlayScope, compute_linked_worktree_delta,
+    CommittedDeltaSource, ResolvedOverlayScope, compute_linked_worktree_delta, linked_source_root,
 };
 
 /// `repo_meta` key prefix for a linked worktree's overlay refresh basis (#577): one key per

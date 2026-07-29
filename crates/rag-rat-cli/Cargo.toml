@@ -36,9 +36,10 @@ rag-rat-query.workspace = true
 rag-rat-mcp = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "signal"] }
 tracing.workspace = true
 rusqlite.workspace = true
+url.workspace = true
 # Minting the persisted sync node key (OS CSPRNG) and scrubbing the in-memory copy.
 getrandom.workspace = true
 zeroize.workspace = true

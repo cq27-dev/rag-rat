@@ -77,6 +77,161 @@ fn git_history_append_rebuilds_desynced_commit_fts() {
 }
 
 #[test]
+fn history_import_materializes_coupling_and_bumps_lens_once() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let config = git_history_test_config(&root);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    // A sibling checkout overlay and a sibling repo share the database. History publication for
+    // the active repo must preserve both while replacing only its own derived coupling rows.
+    conn.execute(
+        "INSERT INTO main.files(
+             path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
+             indexed_revision, commit_sha, worktree_id, has_test_code, repo_id, generation
+         ) SELECT 'src/linked_overlay.rs', language, kind, sha256, modified_at_ms, generated,
+                  indexed_at_ms, indexed_revision, '', 'linked-worktree', has_test_code, repo_id,
+                  generation
+             FROM main.files WHERE repo_id = ?1 LIMIT 1",
+        [&db.active_repo_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+         VALUES ('coupling-sibling', 'coupling sibling', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO git_change_couplings(
+             repo_id, path_a, path_b, co_change_count, path_a_change_count,
+             path_b_change_count, window_commit_count, last_co_change_at_s, computed_at_ms
+         ) VALUES ('coupling-sibling', 'a.rs', 'b.rs', 2, 2, 2, 2, 1, 99)",
+        [],
+    )
+    .unwrap();
+
+    for revision in 0..2 {
+        fs::write(root.join("docs/search.md"), format!("# Title\ncoupling docs {revision}\n"))
+            .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            format!("pub fn tracked_symbol() -> usize {{ {revision} }}\n"),
+        )
+        .unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", &format!("Coupled change {revision}")]);
+    }
+    for revision in 0..4 {
+        fs::create_dir_all(root.join("misc")).unwrap();
+        fs::write(root.join(format!("misc/a-{revision}")), "a\n").unwrap();
+        fs::write(root.join(format!("misc/b-{revision}")), "b\n").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", &format!("Filler change {revision}")]);
+    }
+
+    let before_revision = db
+        .repo_meta(rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META)
+        .unwrap()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    let plan = crate::index::git_history::prepare_plan(conn, &root);
+    let prepared = crate::index::git_history::prepare_with_plan(&root, plan).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (_status, cursors) =
+        crate::index::git_history::apply_prepared_deferring_cursors(conn, &root, prepared).unwrap();
+    let before_cursor_publication = db
+        .repo_meta(rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META)
+        .unwrap()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    assert_eq!(
+        before_cursor_publication, before_revision,
+        "staged history rows remain inert until their cursors publish"
+    );
+    crate::index::git_history::record_history_cursors(
+        conn,
+        &cursors.expect("git history returns cursors"),
+    )
+    .unwrap();
+    let after_revision = db
+        .repo_meta(rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META)
+        .unwrap()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    assert_eq!(after_revision, before_revision + 1, "one bulk import advances Lens once");
+    conn.execute_batch("COMMIT").unwrap();
+
+    let (co_changes, computed_at_ms): (i64, i64) = conn
+        .query_row(
+            "SELECT co_change_count, computed_at_ms FROM git_change_couplings
+             WHERE repo_id = ?1 AND path_a = 'docs/search.md' AND path_b = 'src/lib.rs'",
+            [&db.active_repo_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(co_changes, 3);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM main.files
+             WHERE repo_id = ?1 AND worktree_id = 'linked-worktree'",
+            [&db.active_repo_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1,
+        "active history publication preserves a sibling checkout overlay"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT computed_at_ms FROM git_change_couplings
+             WHERE repo_id = 'coupling-sibling' AND path_a = 'a.rs' AND path_b = 'b.rs'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        99,
+        "active history publication preserves a sibling repo's coupling"
+    );
+
+    // The production incremental transaction publishes matching file rows with history. This
+    // focused history test bypassed file indexing, so advance its base-row scope to the same HEAD
+    // before opening the real read-only checkout scope.
+    let imported_head = git_output(&root, &["rev-parse", "HEAD"]);
+    conn.execute(
+        "UPDATE main.files SET commit_sha = ?1
+         WHERE repo_id = ?2 AND worktree_id = ''",
+        rusqlite::params![imported_head, db.active_repo_id],
+    )
+    .unwrap();
+
+    drop(db);
+    let read_only = IndexDatabase::try_open_config_read_only(&config).unwrap().expect("read-only");
+    let coupling = read_only.lens_file_coupling("docs/search.md").unwrap().coupling;
+    assert!(coupling.iter().any(|partner| partner.path == "src/lib.rs"));
+    let persisted_after_reads: i64 = read_only
+        .storage
+        .connection()
+        .query_row(
+            "SELECT computed_at_ms FROM git_change_couplings
+             WHERE repo_id = ?1 AND path_a = 'docs/search.md' AND path_b = 'src/lib.rs'",
+            [&read_only.active_repo_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        persisted_after_reads, computed_at_ms,
+        "read-only Lens uses the persisted fast path"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn git_history_falls_back_when_append_rows_are_already_present() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);

@@ -89,10 +89,18 @@ struct PairAcc {
     last_at_s: i64,
 }
 
+pub(crate) struct CurrentCoupledFile {
+    pub other_path: String,
+    pub co_change_count: i64,
+    pub this_change_count: i64,
+    pub confidence: f64,
+    pub last_co_change_at_s: i64,
+}
+
 /// Recompute-if-stale gate: the `DerivedIndex` self-heal, mirroring `ensure_fts_fresh` /
-/// `cached_blame`. Cheap stamp SELECT, then a full recompute on mismatch. Idempotent — concurrent
-/// writers serialize on SQLite's write lock and last-writer-wins an identical result; readers see
-/// old-or-new rows, never a mix (the recompute is one transaction).
+/// `cached_blame`. Cheap stamp SELECT, then a full recompute on mismatch. Normal history imports
+/// call this after publishing their cursor in the same write transaction; the lazy path remains for
+/// old databases and out-of-band history writes.
 pub(crate) fn ensure_coupling_fresh(conn: &Connection, now_ms: i64) -> anyhow::Result<()> {
     let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     if coupling_stamp_current(conn, &repo_id)? {
@@ -117,66 +125,159 @@ fn coupling_stamp_current(conn: &Connection, repo_id: &str) -> anyhow::Result<bo
     Ok(stored.as_deref() == Some(coupling_stamp_value(conn, repo_id)?.as_str()))
 }
 
+/// Read current coupling data without requiring a write-capable connection. The persisted table is
+/// the fast path; when its lazy-derived stamp is stale, derive the same bounded history window in
+/// memory so read-only consumers never return cold or outdated rows.
+pub(crate) fn current_coupled_files_for_path(
+    conn: &Connection,
+    repo_id: &str,
+    path: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<CurrentCoupledFile>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if coupling_stamp_current(conn, repo_id)? {
+        return Ok(rag_rat_query::coupling::coupled_files_for_path(conn, repo_id, path, limit)?
+            .into_iter()
+            .map(|partner| CurrentCoupledFile {
+                other_path: partner.other_path,
+                co_change_count: partner.co_change_count,
+                this_change_count: partner.this_change_count,
+                confidence: partner.confidence,
+                last_co_change_at_s: partner.last_co_change_at_s,
+            })
+            .collect());
+    }
+
+    let window_commit_count = eligible_window_commit_count(conn, repo_id)?;
+    let (pairs, path_window_count, paths) = accumulate_window_pairs(conn, repo_id)?;
+    let Some(path_id) =
+        paths.iter().position(|candidate| candidate == path).and_then(|id| u32::try_from(id).ok())
+    else {
+        return Ok(Vec::new());
+    };
+    let this_change_count = path_window_count.get(&path_id).copied().unwrap_or(0);
+    let mut candidates = prune_pairs(pairs, &path_window_count, window_commit_count)
+        .into_iter()
+        .filter_map(|pair| {
+            let other_id = if pair.lo == path_id {
+                pair.hi
+            } else if pair.hi == path_id {
+                pair.lo
+            } else {
+                return None;
+            };
+            Some(CurrentCoupledFile {
+                other_path: paths[other_id as usize].clone(),
+                co_change_count: pair.count,
+                this_change_count,
+                confidence: if this_change_count > 0 {
+                    pair.count as f64 / this_change_count as f64
+                } else {
+                    0.0
+                },
+                last_co_change_at_s: pair.last_at_s,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        b.confidence
+            .total_cmp(&a.confidence)
+            .then_with(|| b.co_change_count.cmp(&a.co_change_count))
+            .then_with(|| a.other_path.cmp(&b.other_path))
+    });
+
+    let mut partner_is_live =
+        conn.prepare("SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 AND generated = 0)")?;
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut current = Vec::with_capacity(limit.min(candidates.len()));
+    for candidate in candidates {
+        let exists: bool = partner_is_live.query_row([&candidate.other_path], |row| row.get(0))?;
+        if exists {
+            current.push(candidate);
+            if current.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok(current)
+}
+
 /// Full recompute for one repo: read the window, accumulate pair + endpoint counts in memory, prune
 /// (support + lift floors — both pure git history), then `DELETE` + batched `INSERT` + stamp in one
-/// transaction. Never patches incrementally — the window slides under append and a history
-/// full-replace invalidates everything anyway, so a bounded full recompute is the simple correct
-/// choice (see the module header).
+/// transaction. When the caller already owns the history publication transaction, the writes join
+/// it rather than opening a nested transaction. Never patches incrementally — the window slides
+/// under append and a history full-replace invalidates everything anyway, so a bounded full
+/// recompute is the simple correct choice (see the module header).
 pub(crate) fn recompute_couplings(
     conn: &Connection,
     repo_id: &str,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    // Stamp value is captured against the CURRENT head before we write, so a head move mid-flight
-    // is caught by the next read (this recompute stamps the head it actually read).
-    let stamp = coupling_stamp_value(conn, repo_id)?;
+    loop {
+        // Compute outside a new write transaction to avoid holding the shared writer lock across
+        // the bounded history scan. Callers already inside a transaction naturally use its stable
+        // snapshot instead.
+        let stamp = coupling_stamp_value(conn, repo_id)?;
+        let window_commit_count = eligible_window_commit_count(conn, repo_id)?;
+        let (pairs, path_window_count, paths) = accumulate_window_pairs(conn, repo_id)?;
+        let surviving = prune_pairs(pairs, &path_window_count, window_commit_count);
 
-    // The window size actually used (shallow repos have fewer commits) — the base-rate population N
-    // for lift, counted from the eligible-commit CTE directly (by `changed_file_count`). Pure git
-    // history, matching the accumulation below.
-    let window_commit_count = eligible_window_commit_count(conn, repo_id)?;
-
-    let (pairs, path_window_count, paths) = accumulate_window_pairs(conn, repo_id)?;
-
-    let surviving = prune_pairs(pairs, &path_window_count, window_commit_count);
-
-    let tx = conn.unchecked_transaction()?;
-    conn.execute("DELETE FROM git_change_couplings WHERE repo_id = ?1", params![repo_id])?;
-    {
-        let mut insert = conn.prepare(
-            "INSERT INTO git_change_couplings(
-                 repo_id, path_a, path_b, co_change_count, path_a_change_count,
-                 path_b_change_count, window_commit_count, last_co_change_at_s, computed_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
-        for pair in &surviving {
-            // Canonicalize by PATH STRING (the `path_a < path_b` BINARY invariant), not by interned
-            // id — the interner assigns ids in first-seen order, which is unrelated to path order.
-            let path_lo = &paths[pair.lo as usize];
-            let path_hi = &paths[pair.hi as usize];
-            let (path_a, id_a, path_b, id_b) = if path_lo < path_hi {
-                (path_lo, pair.lo, path_hi, pair.hi)
-            } else {
-                (path_hi, pair.hi, path_lo, pair.lo)
-            };
-            let a_count = path_window_count.get(&id_a).copied().unwrap_or(0);
-            let b_count = path_window_count.get(&id_b).copied().unwrap_or(0);
-            insert.execute(params![
-                repo_id,
-                path_a,
-                path_b,
-                pair.count,
-                a_count,
-                b_count,
-                window_commit_count,
-                pair.last_at_s,
-                now_ms,
-            ])?;
+        let tx = if conn.is_autocommit() {
+            Some(rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?)
+        } else {
+            None
+        };
+        // A history writer may have published after the scan but before BEGIN IMMEDIATE. Never
+        // replace its newer coupling with our stale snapshot; release the lock and derive again.
+        if tx.is_some() && coupling_stamp_value(conn, repo_id)? != stamp {
+            drop(tx);
+            continue;
         }
+
+        conn.execute("DELETE FROM git_change_couplings WHERE repo_id = ?1", params![repo_id])?;
+        {
+            let mut insert = conn.prepare(
+                "INSERT INTO git_change_couplings(
+                     repo_id, path_a, path_b, co_change_count, path_a_change_count,
+                     path_b_change_count, window_commit_count, last_co_change_at_s, computed_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for pair in &surviving {
+                // Canonicalize by PATH STRING (the `path_a < path_b` BINARY invariant), not by
+                // interned id — first-seen id order is unrelated to path order.
+                let path_lo = &paths[pair.lo as usize];
+                let path_hi = &paths[pair.hi as usize];
+                let (path_a, id_a, path_b, id_b) = if path_lo < path_hi {
+                    (path_lo, pair.lo, path_hi, pair.hi)
+                } else {
+                    (path_hi, pair.hi, path_lo, pair.lo)
+                };
+                let a_count = path_window_count.get(&id_a).copied().unwrap_or(0);
+                let b_count = path_window_count.get(&id_b).copied().unwrap_or(0);
+                insert.execute(params![
+                    repo_id,
+                    path_a,
+                    path_b,
+                    pair.count,
+                    a_count,
+                    b_count,
+                    window_commit_count,
+                    pair.last_at_s,
+                    now_ms,
+                ])?;
+            }
+        }
+        set_repo_meta(conn, repo_id, COUPLING_STAMP_META, &stamp)?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
+        return Ok(());
     }
-    set_repo_meta(conn, repo_id, COUPLING_STAMP_META, &stamp)?;
-    tx.commit()?;
-    Ok(())
 }
 
 /// Count the eligible commits in the window (`changed_file_count BETWEEN 2 AND cap`, capped at

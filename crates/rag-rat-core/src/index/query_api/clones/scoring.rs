@@ -11,6 +11,7 @@
 //! ([`build_completeness`]).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rag_rat_clones::NORM_VERSION;
 
@@ -58,8 +59,21 @@ pub(crate) fn canonical_member_order_key<'a>(
 /// returns several equal-size groups containing the subject, the most internally-cohesive wins).
 /// A 1-member (or empty) class has no pairs → cohesion 1.0 (vacuously fully coherent).
 pub(crate) fn min_pairwise_cohesion(class: &[i64], by_id: &BTreeMap<i64, &SymbolBag>) -> f64 {
+    let cancelled = AtomicBool::new(false);
+    min_pairwise_cohesion_cancellable(class, by_id, &cancelled)
+        .expect("a permanently-clear cancellation flag cannot cancel")
+}
+
+pub(crate) fn min_pairwise_cohesion_cancellable(
+    class: &[i64],
+    by_id: &BTreeMap<i64, &SymbolBag>,
+    cancelled: &AtomicBool,
+) -> Option<f64> {
     let mut min = f64::MAX;
     for i in 0..class.len() {
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
         for j in (i + 1)..class.len() {
             if let (Some(ba), Some(bb)) = (by_id.get(&class[i]), by_id.get(&class[j])) {
                 let max_len = ba.token_len.max(bb.token_len);
@@ -70,7 +84,7 @@ pub(crate) fn min_pairwise_cohesion(class: &[i64], by_id: &BTreeMap<i64, &Symbol
             }
         }
     }
-    if min == f64::MAX { 1.0 } else { min }
+    Some(if min == f64::MAX { 1.0 } else { min })
 }
 
 /// Anti-unify coverage below which a refined class is strongly penalized in the ROI sort (#256). A

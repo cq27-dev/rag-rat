@@ -118,18 +118,21 @@ use rag_rat_clones::refine::cache::{
 };
 use rag_rat_clones::refine::split::coherence_split;
 
-use self::build::{build_class, count_stale_member_paths};
+use self::build::count_stale_member_paths;
+pub(crate) use self::build::{build_class, build_class_cancellable};
 use self::refine_load::{
     load_refine_rows, load_source_discriminators, oracle_callee_coverage_exists,
 };
 use self::resolve::{classify_ineligibility_reason, resolve_selector_to_symbol_id};
 use self::scoring::{
-    apply_refinement, build_completeness, canonical_member_order_key,
-    dampen_unrefined_member_count, min_pairwise_cohesion,
+    apply_refinement, build_completeness, canonical_member_order_key, dampen_unrefined_member_count,
 };
-use self::substrate::{
-    SymbolBag, bucket_edges_by_component, components_from_pairs, load_scoped_baseline_bags,
-    overlap, pairs_for_query, subject_component_bfs,
+pub(crate) use self::scoring::{min_pairwise_cohesion, min_pairwise_cohesion_cancellable};
+pub(crate) use self::substrate::{
+    SymbolBag, bucket_edges_by_component, bucket_edges_by_component_cancellable,
+    candidate_pairs_from_bags_cancellable, components_from_pairs,
+    components_from_pairs_cancellable, load_scoped_baseline_bags, overlap, pairs_for_query,
+    subject_component_bfs,
 };
 use crate::index::IndexDatabase;
 
@@ -441,6 +444,58 @@ impl IndexDatabase {
         Ok(FindClonesResult { classes, completeness })
     }
 
+    fn clone_refinement_cache_key(
+        &self,
+        conn: &Connection,
+        class_ids: &[i64],
+        by_id: &BTreeMap<i64, &SymbolBag>,
+        class: &CandidateCloneClass,
+    ) -> anyhow::Result<Option<(String, RefineMode)>> {
+        // Build the content-addressed key from persisted fingerprints and exact source
+        // discriminators. Missing data makes the class unrefinable; never key a partial set.
+        let struct_hashes: Vec<String> = class_ids
+            .iter()
+            .filter_map(|id| by_id.get(id).map(|b| b.struct_hash.clone()))
+            .collect();
+        if struct_hashes.len() != class_ids.len() {
+            return Ok(None);
+        }
+        let Some(source_discriminators) = load_source_discriminators(conn, class_ids)? else {
+            return Ok(None);
+        };
+        let mode = if oracle_callee_coverage_exists(
+            conn,
+            class_ids,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )? {
+            RefineMode::Scip
+        } else {
+            RefineMode::Baseline
+        };
+        let key = refinement_key(&class.language, mode, &struct_hashes, &source_discriminators);
+        Ok(Some((key, mode)))
+    }
+
+    /// Attach an already-persisted refinement without reparsing source or writing. Lens reads use
+    /// this bounded probe; a cache miss deliberately leaves the class unrefined.
+    pub(crate) fn refine_class_from_cache(
+        &self,
+        conn: &Connection,
+        class_ids: &[i64],
+        by_id: &BTreeMap<i64, &SymbolBag>,
+        class: &mut CandidateCloneClass,
+    ) -> anyhow::Result<()> {
+        let Some((key, mode)) = self.clone_refinement_cache_key(conn, class_ids, by_id, class)?
+        else {
+            return Ok(());
+        };
+        if let Some(refinement) = refine_lookup(conn, &key, mode)? {
+            apply_refinement(class, refinement);
+        }
+        Ok(())
+    }
+
     /// Refine one candidate class IN PLACE (#215 Plan 4a): load the class's refine inputs (re-read,
     /// re-parse, and re-normalize each member to its ordered baseline token sequence), compute the
     /// content-addressed refinement (read-through `clone_refinements` cache), set the
@@ -453,7 +508,7 @@ impl IndexDatabase {
     /// `class_ids` is the class's component (the coherent sub-class) symbol ids; `by_id` supplies
     /// each member's persisted `struct_hash` for the content-addressed key (no extra DB
     /// round-trip).
-    fn refine_class_in_place(
+    pub(crate) fn refine_class_in_place(
         &self,
         conn: &Connection,
         class_ids: &[i64],
@@ -464,63 +519,10 @@ impl IndexDatabase {
         // cell-bounded. Warm cache hits return BEFORE the compute, so they never consume it.
         global_refine_cells: &mut u64,
     ) -> anyhow::Result<()> {
-        // ── Phase 0 (CHEAP, NO RE-PARSE): build the content-addressed key from each member's
-        // persisted struct_hash already in `by_id` — no file I/O, no tree-sitter parse.
-        // If a class member's struct_hash is somehow absent from `by_id` (shouldn't happen for a
-        // coherent class, but defend anyway) the key would be over an incomplete multiset, which
-        // could alias a different class. Fall back to leaving this class un-refined rather than
-        // computing a wrong refinement.
-        let struct_hashes: Vec<String> = class_ids
-            .iter()
-            .filter_map(|id| by_id.get(id).map(|b| b.struct_hash.clone()))
-            .collect();
-        if struct_hashes.len() != class_ids.len() {
-            // Defensive: a member's bag is missing — skip rather than key over a partial multiset.
-            return Ok(());
-        }
-
-        // ── Source discriminators (cheap SELECT, NO RE-PARSE): pin each member's EXACT source
-        // bytes so the content-addressed key discriminates two classes that share a
-        // struct_hash multiset (the NORMALIZED token sequence) but differ in real source.
-        // The 4b cached payload (template, per-member values, signature) is
-        // SOURCE-SPECIFIC; a structure-only key would serve one class's payload to a
-        // structurally-identical-but-source-different class (cache poisoning).
-        // `"{file_sha256}:{start}-{end}"` pins the file content hash + body range →
-        // together they uniquely determine the raw source. This is a SELECT (the same symbols/files
-        // join the bags path already touches), so the warm-probe-before-reparse stays a probe.
-        // If any member's discriminator can't be fetched, leave the class un-refined rather than
-        // key over a partial/structure-only multiset (which could alias a different class).
-        let Some(source_discriminators) = load_source_discriminators(conn, class_ids)? else {
+        let Some((key, mode)) = self.clone_refinement_cache_key(conn, class_ids, by_id, class)?
+        else {
             return Ok(());
         };
-
-        // Refine mode (#275, Plan 3): scip when any member file has CURRENT oracle callee
-        // coverage, else baseline. Probed BEFORE the key because the mode is folded into it — the
-        // two modes address disjoint cache namespaces, so an oracle run can invalidate every
-        // scip-mode row (`invalidate_scip_refinements`) without touching baseline rows. Cheap
-        // (one EXISTS per hydration chunk), so the warm probe stays a probe.
-        let mode = if oracle_callee_coverage_exists(
-            conn,
-            class_ids,
-            &self.active_commit_sha,
-            &self.active_worktree_id,
-        )? {
-            RefineMode::Scip
-        } else {
-            RefineMode::Baseline
-        };
-
-        // Content-addressed key over the member struct_hash multiset + the per-member source
-        // discriminators — NOT the read-side `class.class_key` (location-derived). Two classes with
-        // the same structural content AND the same exact source bodies share a refinement; the key
-        // survives a reindex that reassigns rowids.
-        //
-        // For coherent classes exceeding METRIC_SAMPLE_CAP members, `class.similarity_min` was
-        // derived from the first `METRIC_SAMPLE_CAP` members only (the metric-sample path in
-        // `build_class`), while `key` spans the FULL struct_hash multiset. The gap is not a
-        // determinism break — the sample is id-ASC stable — but Plan-4b should compute confidence
-        // over the full set or fold the sample into the key.
-        let key = refinement_key(&class.language, mode, &struct_hashes, &source_discriminators);
 
         // ── Phase 1 (PURE READ — warm path): probe the content-addressed cache. A SELECT is safe
         // on the MCP's read-only connection; a WARM cache hit never takes the write lock and never

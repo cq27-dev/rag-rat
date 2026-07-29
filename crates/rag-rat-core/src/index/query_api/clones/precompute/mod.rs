@@ -38,10 +38,11 @@ mod schedule;
 mod storage;
 
 pub(super) use build::make_edge;
-pub(super) use read::precomputed_pairs_if_eligible;
+pub(crate) use read::{build_anchor_index, precomputed_pairs_if_eligible};
+pub(crate) use storage::live_generation_row;
 pub(super) use storage::{
     clone_df_epoch_exists, clone_df_epoch_serves, clone_generation_scope_clause, insert_edge_rows,
-    insert_posting_groups, live_generation_row,
+    insert_posting_groups,
 };
 
 /// θ the graph is precomputed at — the default `find_clones` threshold. Queries at θ ≥ this read
@@ -112,10 +113,10 @@ pub(super) struct PostingGroup {
     pub(super) tokens: Vec<i64>,
 }
 
-pub(super) struct GenerationRow {
-    pub(super) generation: i64,
-    pub(super) source_revision: String,
-    pub(super) normalizer_version: i64,
+pub(crate) struct GenerationRow {
+    pub(crate) generation: i64,
+    pub(crate) source_revision: String,
+    pub(crate) normalizer_version: i64,
     cursor_symbol_id: i64,
     edges_written: u64,
     /// Whether this generation is POSTINGS-AWARE (#296 phase 2): its `clone_subblock_postings` are
@@ -130,7 +131,7 @@ pub(super) struct GenerationRow {
     /// signal: past [`CLONE_GRAPH_DRIFT_REBUILD_FILES`] the quiet gate schedules a full rebuild to
     /// restore sub-block selectivity (df is frozen at the build's epoch, so long-lived generations
     /// slowly lose candidate-pruning efficiency — never correctness).
-    pub(super) delta_files_applied: i64,
+    pub(crate) delta_files_applied: i64,
 }
 
 /// How many delta-absorbed files a live generation tolerates before the background tail owes a

@@ -54,6 +54,9 @@ toon-format.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
+# Unicode caseless matching for editor paths on case-insensitive volumes: `to_lowercase` is not
+# case folding (Greek `ς`/`σ` stay distinct) and SQLite's `NOCASE` collation folds ASCII only.
+unicase = "2.9"
 ureq.workspace = true
 # Dictionary-trained zstd compression of stored chunk text (#77 Phase 2). One shared dictionary
 # trained on a corpus sample (zdict_builder) + bulk one-shot compress/decompress per chunk blob.

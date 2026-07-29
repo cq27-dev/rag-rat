@@ -1379,6 +1379,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_091_ID => Some(91),
             MIGRATION_092_ID => Some(92),
             MIGRATION_093_ID => Some(93),
+            MIGRATION_094_ID => Some(94),
             _ => None,
         })
         .max()
@@ -1481,6 +1482,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_091_ID
             | MIGRATION_092_ID
             | MIGRATION_093_ID
+            | MIGRATION_094_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1580,6 +1582,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_091_ID => migration.checksum != MIGRATION_091_CHECKSUM,
         MIGRATION_092_ID => migration.checksum != MIGRATION_092_CHECKSUM,
         MIGRATION_093_ID => migration.checksum != MIGRATION_093_CHECKSUM,
+        MIGRATION_094_ID => migration.checksum != MIGRATION_094_CHECKSUM,
         _ => false,
     }
 }
@@ -6208,6 +6211,106 @@ pub fn apply_account_candidate_reservation_targets(conn: &Connection) -> rusqlit
     Ok(())
 }
 
+/// V093: maintain one O(1) Lens enrichment revision per repository. The revision is deliberately
+/// a counter, not a timestamp: multiple writes in one millisecond, in-place promotions, and clone
+/// graph publication must still invalidate connected editors.
+pub fn apply_lens_enrichment_revision(conn: &Connection) -> rusqlite::Result<()> {
+    // History imports and Oracle passes advance the clock once at their transaction boundary
+    // instead of once per written row. Both write their table in bulk inside a single
+    // transaction — an Oracle run rewrites a verdict for every resolved edge, hundreds of
+    // thousands of them on a large index — and Lens freshness only needs the one revision change
+    // the publication makes visible. `edge_oracle` gets that bump from the `oracle_runs` row its
+    // run commits alongside the verdicts; the dead-checkout verdict sweep, which writes no run
+    // row, bumps the clock itself. Always remove the per-row triggers so replaying this migration
+    // repairs a database initialized by an older build.
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS git_file_changes_lens_revision_insert;
+         DROP TRIGGER IF EXISTS git_file_changes_lens_revision_delete;
+         DROP TRIGGER IF EXISTS git_file_changes_lens_revision_update;
+         DROP TRIGGER IF EXISTS edge_oracle_lens_revision_insert;
+         DROP TRIGGER IF EXISTS edge_oracle_lens_revision_delete;
+         DROP TRIGGER IF EXISTS edge_oracle_lens_revision_update;",
+    )?;
+    for (table, trigger_prefix) in [
+        ("repo_memories", "memories_lens_revision"),
+        ("repo_memory_bindings", "memory_bindings_lens_revision"),
+        ("memory_reality", "memory_reality_lens_revision"),
+        ("memory_summaries", "memory_summaries_lens_revision"),
+        ("papertrail_items", "papertrail_items_lens_revision"),
+        ("papertrail_refs", "papertrail_refs_lens_revision"),
+        ("papertrail_distill", "papertrail_distill_lens_revision"),
+        ("papertrail_distill_anchors", "papertrail_distill_anchors_lens_revision"),
+        ("clone_refinements", "clone_refinements_lens_revision"),
+        ("oracle_runs", "oracle_runs_lens_revision"),
+    ] {
+        create_repo_scoped_lens_revision_triggers(conn, table, trigger_prefix)?;
+    }
+
+    let key = crate::meta::LENS_ENRICHMENT_REVISION_META;
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS clone_graph_generations_lens_revision_insert;
+         DROP TRIGGER IF EXISTS clone_graph_generations_lens_revision_delete;
+         DROP TRIGGER IF EXISTS clone_graph_generations_lens_revision_update;",
+    )?;
+    if column_exists(conn, "clone_graph_generations", "repo_id")? {
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER clone_graph_generations_lens_revision_insert
+             AFTER INSERT ON clone_graph_generations
+             WHEN EXISTS (
+                 SELECT 1 FROM repo_meta
+                 WHERE repo_id = NEW.repo_id AND key = 'clone_graph_live_generation'
+                   AND CAST(value AS INTEGER) = NEW.generation
+             )
+             BEGIN
+                 INSERT INTO repo_meta(repo_id, key, value) VALUES (NEW.repo_id, '{key}', '1')
+                 ON CONFLICT(repo_id, key) DO UPDATE SET
+                     value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+             END;
+         CREATE TRIGGER clone_graph_generations_lens_revision_delete
+             AFTER DELETE ON clone_graph_generations
+             WHEN EXISTS (
+                 SELECT 1 FROM repo_meta
+                 WHERE repo_id = OLD.repo_id AND key = 'clone_graph_live_generation'
+                   AND CAST(value AS INTEGER) = OLD.generation
+             )
+             BEGIN
+                 INSERT INTO repo_meta(repo_id, key, value) VALUES (OLD.repo_id, '{key}', '1')
+                 ON CONFLICT(repo_id, key) DO UPDATE SET
+                     value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+             END;
+         CREATE TRIGGER clone_graph_generations_lens_revision_update
+             AFTER UPDATE ON clone_graph_generations
+             BEGIN
+                 INSERT INTO repo_meta(repo_id, key, value)
+                 SELECT NEW.repo_id, '{key}', '1'
+                 WHERE EXISTS (
+                     SELECT 1 FROM repo_meta
+                     WHERE repo_id = NEW.repo_id AND key = 'clone_graph_live_generation'
+                       AND CAST(value AS INTEGER) = NEW.generation
+                 )
+                 ON CONFLICT(repo_id, key) DO UPDATE SET
+                     value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+                 INSERT INTO repo_meta(repo_id, key, value)
+                 SELECT OLD.repo_id, '{key}', '1'
+                 WHERE (OLD.repo_id != NEW.repo_id OR OLD.generation != NEW.generation)
+                   AND EXISTS (
+                       SELECT 1 FROM repo_meta
+                       WHERE repo_id = OLD.repo_id AND key = 'clone_graph_live_generation'
+                         AND CAST(value AS INTEGER) = OLD.generation
+                   )
+                  ON CONFLICT(repo_id, key) DO UPDATE SET
+                      value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+             END;"
+        ))?;
+    }
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS clone_graph_pointer_lens_revision_insert;
+         DROP TRIGGER IF EXISTS clone_graph_pointer_lens_revision_delete;
+         DROP TRIGGER IF EXISTS clone_graph_pointer_lens_revision_update;",
+    )?;
+    Ok(())
+}
+
 /// V092 (#949): stop duplicating every enrollment receipt in the invite row.
 ///
 /// Each consumed invite used to store the complete signed account bootstrap (`receipt_bytes`),
@@ -6340,6 +6443,58 @@ pub fn apply_table_sync_projection_state(conn: &Connection) -> rusqlite::Result<
              WHERE pending_reason IS NOT NULL;",
     )?;
     tx.commit()
+}
+
+fn create_repo_scoped_lens_revision_triggers(
+    conn: &Connection,
+    table: &str,
+    trigger_prefix: &str,
+) -> rusqlite::Result<()> {
+    let key = crate::meta::LENS_ENRICHMENT_REVISION_META;
+    conn.execute_batch(&format!(
+        "DROP TRIGGER IF EXISTS {trigger_prefix}_insert;
+         DROP TRIGGER IF EXISTS {trigger_prefix}_delete;
+         DROP TRIGGER IF EXISTS {trigger_prefix}_update;"
+    ))?;
+    if !column_exists(conn, table, "repo_id")? {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER {trigger_prefix}_insert
+                  AFTER INSERT ON {table}
+                 BEGIN
+                     INSERT INTO repo_meta(repo_id, key, value)
+                     SELECT NEW.repo_id, '{key}', '1'
+                     WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = NEW.repo_id)
+                     ON CONFLICT(repo_id, key) DO UPDATE SET
+                         value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+                 END;
+             CREATE TRIGGER {trigger_prefix}_delete
+                 AFTER DELETE ON {table}
+                 BEGIN
+                     INSERT INTO repo_meta(repo_id, key, value)
+                     SELECT OLD.repo_id, '{key}', '1'
+                     WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = OLD.repo_id)
+                     ON CONFLICT(repo_id, key) DO UPDATE SET
+                         value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+                 END;
+             CREATE TRIGGER {trigger_prefix}_update
+                 AFTER UPDATE ON {table}
+                 BEGIN
+                     INSERT INTO repo_meta(repo_id, key, value)
+                     SELECT NEW.repo_id, '{key}', '1'
+                     WHERE EXISTS (SELECT 1 FROM repos WHERE repo_id = NEW.repo_id)
+                     ON CONFLICT(repo_id, key) DO UPDATE SET
+                         value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+                     INSERT INTO repo_meta(repo_id, key, value)
+                     SELECT OLD.repo_id, '{key}', '1'
+                     WHERE OLD.repo_id != NEW.repo_id
+                       AND EXISTS (SELECT 1 FROM repos WHERE repo_id = OLD.repo_id)
+                     ON CONFLICT(repo_id, key) DO UPDATE SET
+                         value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+                  END;"
+    ))?;
+    Ok(())
 }
 
 #[cfg(test)]

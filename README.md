@@ -384,6 +384,26 @@ Optional git hooks (`rag-rat hooks install`) keep the index current on checkout/
 One watcher per worktree and one writer at a time are enforced with file locks (unreliable on
 NFS / WSL2 `/mnt` mounts).
 
+## Editor Lens HTTP API
+
+An active `rag-rat mcp` process also elects one authenticated Lens HTTP server per worktree. It
+publishes the loopback URL and bearer token to `.rag-rat/sockets/lens.json`; the credential file is
+owner-readable only on Unix. Set `RAG_RAT_NO_LENS=1` to disable this embedded server, or set
+`RAG_RAT_LENS_ORIGINS` to a comma-separated exact browser-origin allowlist.
+
+Run `rag-rat serve` when the HTTP API needs its own lifecycle. Loopback serving generates a token;
+clients read it from the discovery file. A non-loopback bind requires both an explicit token
+environment variable and at least one trusted browser origin:
+
+```bash
+LENS_TOKEN="$(openssl rand -hex 32)" rag-rat serve \
+  --bind 0.0.0.0 --token-env LENS_TOKEN --allow-origin https://lens.example.com
+```
+
+Every non-preflight request uses `Authorization: Bearer <token>`. Allowed origins are matched
+exactly; wildcard CORS is never emitted. The built-in listener is plain HTTP, so terminate TLS in a
+trusted reverse proxy or tunnel before exposing a non-loopback server across an untrusted network.
+
 By default every repo's index and memories live in **one consolidated database per machine**
 (`$XDG_DATA_HOME/rag-rat/rag-rat.sqlite`; override with `RAG_RAT_DATA_DIR`), so a deleted checkout or
 `git clean -fdx` no longer loses your authored memories. Set an explicit `[index] database` to keep a
@@ -507,6 +527,7 @@ rag-rat consolidate                # import a legacy per-repo index into the glo
 rag-rat hooks install              # git maintenance hooks
 rag-rat gc                         # prune rows for dead git contexts
 rag-rat eval [--json|--update-baseline]   # CI search-quality gate; requires a `--features eval` build (absent from the released binary)
+rag-rat serve                      # authenticated editor Lens HTTP API
 rag-rat mcp                        # start the STDIO server
 ```
 

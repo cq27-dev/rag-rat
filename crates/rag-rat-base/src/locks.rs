@@ -588,6 +588,15 @@ pub fn socket_lock_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
     base_dir.join("locks").join(format!("{}.socket.lock", worktree_hash(worktree_root)))
 }
 
+/// Election lock for the editor lens HTTP server. It lives beside the database, not under the
+/// disposable workspace discovery directory, so deleting `.rag-rat/` cannot unlink a held lock
+/// and elect a second server for the same worktree.
+pub fn lens_server_lock_path_for(config: &Config, worktree_root: &Path) -> PathBuf {
+    let base =
+        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
+    base.join("locks").join(format!("{}.lens.lock", worktree_hash(worktree_root)))
+}
+
 /// Where the elected listener binds. Prefers a `sockets/` sibling of `locks/` under the shared
 /// DB dir; diverts to `$XDG_RUNTIME_DIR/rag-rat/` then the OS temp dir when the result would
 /// exceed the `sun_path` budget. Hook clients compute the same path independently, so this must

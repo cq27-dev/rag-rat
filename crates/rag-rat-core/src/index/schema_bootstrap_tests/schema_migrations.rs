@@ -1475,8 +1475,6 @@ fn migration_092_normalizes_invite_receipts() {
 /// one-way stream id hashes away, and the column set each anti-echo hash covers.
 #[test]
 fn migration_093_adds_table_sync_projection_state() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 93, "move this pin with the next schema migration");
-
     // Absence is asserted against the PRE-V093 DDL in isolation, never against the full ladder
     // (which now ends at V093 and would make the check vacuous).
     let bare = rusqlite::Connection::open_in_memory().unwrap();
@@ -1580,4 +1578,177 @@ fn migration_091_adds_account_candidate_reservation_targets() {
         )
         .unwrap();
     assert_eq!(recorded, 1, "the forward migration records V091");
+}
+
+#[test]
+fn migration_094_tracks_lens_enrichment_changes_in_constant_time() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 94, "move this pin with the next schema migration");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    conn.execute(
+        "INSERT INTO papertrail_refs(
+             tracker, project, item_key, item_kind, ref_kind, source_kind, source_path,
+             source_text, discovered_at_ms, repo_id
+         ) VALUES ('github', 'owner/repo', '1', 'issue', 'reference', 'path', 'src/lib.rs',
+                   'mentions #1', 1, '__unassigned__')",
+        [],
+    )
+    .unwrap();
+    let revision = || {
+        conn.query_row(
+            "SELECT CAST(value AS INTEGER) FROM repo_meta
+             WHERE repo_id = '__unassigned__' AND key = ?1",
+            [rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(revision(), 1);
+
+    conn.execute(
+        "UPDATE papertrail_refs SET ref_kind = 'closing' WHERE repo_id = '__unassigned__'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(revision(), 2, "an in-place promotion increments the clock");
+    conn.execute("DELETE FROM papertrail_refs WHERE repo_id = '__unassigned__'", []).unwrap();
+    assert_eq!(revision(), 3, "deletion increments the clock");
+
+    let trigger_count = |prefix: &str| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE ?1",
+            [format!("{prefix}%")],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        trigger_count("git_file_changes_lens_revision_"),
+        0,
+        "bulk history writes must not carry per-row Lens triggers"
+    );
+    conn.execute(
+        "INSERT INTO git_commits(
+             hash, author_name, author_email, authored_at_s, committed_at_s,
+             subject, body, changed_file_count, repo_id
+         ) VALUES ('bulk', 'a', 'a@b', 1, 1, 'bulk', '', 2, '__unassigned__')",
+        [],
+    )
+    .unwrap();
+    for path in ["src/a.rs", "src/b.rs"] {
+        conn.execute(
+            "INSERT INTO git_file_changes(
+                 commit_hash, path, additions, deletions, change_kind, repo_id
+             ) VALUES ('bulk', ?1, 0, 0, 'modified', '__unassigned__')",
+            [path],
+        )
+        .unwrap();
+    }
+    assert_eq!(revision(), 3, "history rows are clocked by their transactional writer");
+
+    conn.execute(
+        "INSERT INTO oracle_runs(
+             repo_id, tool, tool_version, commit_sha, worktree_id, started_at, status, stats_json
+         ) VALUES ('__unassigned__', 'scip', '1', 'head', 'active-wt', 1, 'complete', '{}')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(revision(), 4, "a zero-verdict Oracle run invalidates Lens");
+    conn.execute("UPDATE oracle_runs SET status = 'failed' WHERE repo_id = '__unassigned__'", [])
+        .unwrap();
+    assert_eq!(revision(), 5, "Oracle run updates invalidate Lens");
+    conn.execute("DELETE FROM oracle_runs WHERE repo_id = '__unassigned__'", []).unwrap();
+    assert_eq!(revision(), 6, "Oracle run deletion invalidates Lens");
+
+    conn.execute(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+         VALUES ('oracle-sibling', 'oracle sibling', 0)",
+        [],
+    )
+    .unwrap();
+    rag_rat_db::meta::set_repo_meta(
+        &conn,
+        "oracle-sibling",
+        rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+        "20",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO oracle_runs(
+             repo_id, tool, tool_version, commit_sha, worktree_id, started_at, status, stats_json
+         ) VALUES ('oracle-sibling', 'scip', '1', 'branch-head', 'linked-wt', 2, 'complete', '{}')",
+        [],
+    )
+    .unwrap();
+    let sibling_revision: i64 = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM repo_meta
+             WHERE repo_id = 'oracle-sibling' AND key = ?1",
+            [rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sibling_revision, 21, "the run clocks its owning repo");
+    assert_eq!(revision(), 6, "a sibling repo's linked-worktree run stays isolated");
+
+    schema::apply_lens_enrichment_revision(&conn).unwrap();
+    assert_eq!(trigger_count("oracle_runs_lens_revision_"), 3);
+    assert_eq!(trigger_count("git_file_changes_lens_revision_"), 0);
+    conn.execute(
+        "INSERT INTO oracle_runs(
+             repo_id, tool, tool_version, commit_sha, worktree_id, started_at, status, stats_json
+         ) VALUES ('__unassigned__', 'scip', '2', 'head', 'active-wt', 3, 'complete', '{}')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(revision(), 7, "V093 replay must not duplicate Oracle triggers");
+
+    // An Oracle pass writes one `edge_oracle` verdict per resolved edge inside the transaction
+    // that commits its run row. Clocking those rows individually would advance the revision
+    // hundreds of thousands of times for one publication, so the verdicts carry no trigger at all
+    // and the run row is what Lens sees.
+    assert_eq!(
+        trigger_count("edge_oracle_lens_revision_"),
+        0,
+        "bulk verdict writes must not carry per-row Lens triggers"
+    );
+    let before_verdicts = revision();
+    for callee_start in 0..64 {
+        conn.execute(
+            "INSERT INTO edge_oracle(
+                 repo_id, source_path, source_start_byte, source_end_byte,
+                 callee_start_byte, callee_end_byte, edge_kind, file_sha,
+                 tool, tool_version, resolved_symbol_id, scip_symbol, kind, computed_at
+             ) VALUES ('__unassigned__', 'src/a.rs', 0, 1, ?1, ?1, 'calls_name', 'sha',
+                       'scip', '1', NULL, 'sym', 'confirm', 0)",
+            [callee_start],
+        )
+        .unwrap();
+    }
+    conn.execute("UPDATE edge_oracle SET kind = 'upgrade' WHERE repo_id = '__unassigned__'", [])
+        .unwrap();
+    conn.execute("DELETE FROM edge_oracle WHERE repo_id = '__unassigned__'", []).unwrap();
+    assert_eq!(
+        revision(),
+        before_verdicts,
+        "verdict rows are clocked by their transactional writer, not one bump per edge"
+    );
+
+    conn.execute(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+         VALUES ('retired', 'retired', 0)",
+        [],
+    )
+    .unwrap();
+    rag_rat_db::meta::set_repo_meta(&conn, "retired", "clone_graph_live_generation", "7").unwrap();
+    rag_rat_db::meta::set_repo_meta(
+        &conn,
+        "retired",
+        rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+        "1",
+    )
+    .unwrap();
+    conn.execute("DELETE FROM repos WHERE repo_id = 'retired'", [])
+        .expect("retiring a repo with Lens metadata must not reinsert rows during FK cascade");
 }

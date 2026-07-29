@@ -94,6 +94,13 @@ fn add_fillers(conn: &Connection, repo_id: &str, count: usize, start_ts: i64) {
     }
 }
 
+fn invalidate_coupling_stamp(conn: &Connection, repo_id: &str) {
+    conn.execute("DELETE FROM repo_meta WHERE repo_id = ?1 AND key = 'git_coupling_stamp'", [
+        repo_id,
+    ])
+    .unwrap();
+}
+
 /// `(path_a, path_b, co, a_count, b_count, window, last_at_s)` rows for a repo, ordered by pair.
 fn coupling_rows(
     conn: &Connection,
@@ -713,6 +720,7 @@ fn impact_report_surfaces_and_gates_coupling_section() {
     add_commit(conn, &repo_id, "c2", 20, &["src/store.rs", "src/helper.rs"]);
     add_commit(conn, &repo_id, "c3", 30, &["ext_a.rs", "ext_b.rs"]);
     add_commit(conn, &repo_id, "c4", 40, &["ext_c.rs", "ext_d.rs"]);
+    invalidate_coupling_stamp(conn, &repo_id);
 
     let selector = rag_rat_query::symbol::SymbolSelector {
         logical_symbol_id: None,
@@ -783,6 +791,7 @@ fn dirty_co_changed_file_counts_toward_stale_files() {
     add_commit(conn, &repo_id, "c2", 20, &["src/store.rs", "src/helper.rs"]);
     add_commit(conn, &repo_id, "c3", 30, &["ext_a.rs", "ext_b.rs"]);
     add_commit(conn, &repo_id, "c4", 40, &["ext_c.rs", "ext_d.rs"]);
+    invalidate_coupling_stamp(conn, &repo_id);
 
     // Dirty the coupled file on disk AFTER indexing — its content hash now differs from the index.
     fs::write(root.join("src/helper.rs"), "pub fn helper_fn() { let _changed = 1; }\n").unwrap();

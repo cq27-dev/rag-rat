@@ -37,10 +37,28 @@ pub(crate) fn record_history_cursors(
     )?;
     let complete = if cursors.complete { "1" } else { "0" };
     set_repo_meta(conn, &repo_id, GIT_HISTORY_INDEXED_COMPLETE_META, complete)?;
+    // Coupling's stamp includes the complete cursor snapshot, so materialize only after all four
+    // cursor keys are published. Production callers own the surrounding history transaction.
+    crate::index::change_coupling::ensure_coupling_fresh(conn, rag_rat_base::time::now_ms())?;
+    bump_lens_enrichment_revision(conn, &repo_id)?;
     Ok(())
 }
 
 pub(crate) fn apply_prepared(
+    conn: &Connection,
+    root: &Path,
+    prepared: PreparedGitHistory,
+) -> anyhow::Result<GitHistoryIndexStatus> {
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction()?;
+        let status = apply_prepared_in_transaction(conn, root, prepared)?;
+        tx.commit()?;
+        return Ok(status);
+    }
+    apply_prepared_in_transaction(conn, root, prepared)
+}
+
+fn apply_prepared_in_transaction(
     conn: &Connection,
     root: &Path,
     prepared: PreparedGitHistory,
@@ -353,5 +371,7 @@ fn clear(conn: &Connection) -> anyhow::Result<()> {
     ] {
         delete_repo_meta(conn, &repo_id, key)?;
     }
+    crate::index::change_coupling::ensure_coupling_fresh(conn, rag_rat_base::time::now_ms())?;
+    bump_lens_enrichment_revision(conn, &repo_id)?;
     Ok(())
 }

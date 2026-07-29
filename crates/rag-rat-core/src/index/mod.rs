@@ -78,13 +78,19 @@ pub use query_api::{
     CloneIneligibilityReason, CloneMember, CloneSymbolSelector, ClonesForSymbolResult,
     DatabaseFileHealth, FindClonesOptions, FindClonesResult, FreelistReclaim,
     FreelistReclaimReport, GcReport, GlobalFtsStatus, GlobalStatus, ImportantSymbolsRequest,
-    MemoryCounts, MemoryKindCounts, OracleShaSnapshots, PapertrailCursor, RepoContent,
-    RepoFreshness, RepoPapertrail, RepoStatus, RoiFactors, SearchRequest, SyncCatchUpReport,
-    TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport, WorktreeOverlay,
-    reclaim_freelist_at,
+    LensCallees, LensCallers, LensChunkText, LensCloneGraphCache, LensCloneGraphMeta,
+    LensClonePartner, LensCloneRefine, LensCloneRegion, LensCouplingPartner, LensDecisionRecord,
+    LensDispatchDetail, LensFileClones, LensFileCoupling, LensFileGraph, LensFileMemories,
+    LensFileMemory, LensFilePapertrail, LensFileSymbolGraph, LensFileSymbols,
+    LensGraphCallerCounts, LensPapertrailRef, LensStatus, LensSymbol, LensSymbolHop, LensTreemap,
+    LensTreemapFile, LensVersion, MemoryCounts, MemoryKindCounts, OracleShaSnapshots,
+    PapertrailCursor, RepoContent, RepoFreshness, RepoPapertrail, RepoStatus, RoiFactors,
+    SearchRequest, SyncCatchUpReport, TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES,
+    WalCheckpointReport, WorktreeOverlay, reclaim_freelist_at,
 };
 pub use schema::RegisteredRepo;
 pub(crate) use util::*;
+pub(crate) use worktree_overlay::linked_source_root;
 pub use worktree_overlay::{
     OverlayBasisUpdate, OverlayLogicalRebuild, OverlayRefreshTail, WorktreeOverlayReport,
 };
@@ -199,6 +205,25 @@ pub struct IndexDatabase {
     /// connection, so batch tests can assert the once-per-pass rebuild cardinality.
     #[cfg(test)]
     pub(crate) logical_symbol_rebuilds: AtomicUsize,
+    /// #216 lens: a bounded set of filtered clone edge sets + components keyed by generation,
+    /// scope, content, and theta. Treemap and file-clone requests commonly use different theta
+    /// values, so retaining several immutable variants avoids alternating repository-wide scans.
+    pub(crate) lens_clone_graph_cache: std::sync::Arc<query_api::LensCloneGraphCache>,
+}
+
+/// Narrow cancellation capability for a query running on an [`IndexDatabase`] connection.
+pub struct DatabaseInterruptHandle(rusqlite::InterruptHandle);
+
+impl DatabaseInterruptHandle {
+    pub fn interrupt(&self) {
+        self.0.interrupt();
+    }
+}
+
+impl IndexDatabase {
+    pub fn interrupt_handle(&self) -> DatabaseInterruptHandle {
+        DatabaseInterruptHandle(self.storage.connection().get_interrupt_handle())
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -143,9 +143,23 @@ fn migration_038_forward_migrates_a_v037_index() {
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
 
-    // Revert to the V037 shape: drop children before the parent (FK), then drop the ledger row.
-    conn.execute_batch("DROP TABLE repo_meta; DROP TABLE repo_roots; DROP TABLE repos;")
-        .expect("revert to V037 shape");
+    // Revert to the V037 shape: remove future triggers before their repo_meta target, drop
+    // children before the parent (FK), then drop the ledger rows.
+    conn.execute_batch(
+        "DROP TRIGGER memory_bindings_lens_revision_insert;
+         DROP TRIGGER memory_bindings_lens_revision_delete;
+         DROP TRIGGER memory_bindings_lens_revision_update;
+         DROP TRIGGER papertrail_items_lens_revision_insert;
+         DROP TRIGGER papertrail_items_lens_revision_delete;
+         DROP TRIGGER papertrail_items_lens_revision_update;
+         DROP TRIGGER papertrail_refs_lens_revision_insert;
+         DROP TRIGGER papertrail_refs_lens_revision_delete;
+         DROP TRIGGER papertrail_refs_lens_revision_update;
+         DROP TABLE repo_meta;
+         DROP TABLE repo_roots;
+         DROP TABLE repos;",
+    )
+    .expect("revert to V037 shape");
     truncate_schema_to(&conn, 37);
     assert_eq!(
         schema::status(&conn).unwrap().state,

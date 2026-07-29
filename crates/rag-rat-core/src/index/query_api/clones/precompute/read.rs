@@ -17,7 +17,7 @@ use super::*;
 /// `overlap = token_len`, so they survive every θ). A present-but-STALE generation
 /// (content_revision drifted) is still served — the "mildly stale OK" contract; per-edge staleness
 /// is dropped by the `file_sha` join.
-pub(in super::super) fn precomputed_pairs_if_eligible(
+pub(crate) fn precomputed_pairs_if_eligible(
     conn: &Connection,
     by_id: &BTreeMap<i64, &SymbolBag>,
     theta: f64,
@@ -99,7 +99,9 @@ pub(in super::super) fn precomputed_pairs_if_eligible(
 /// `(path, start_byte) -> (symbol_id, file_sha)` over the scoped non-generated symbols — the
 /// inverse of [`resolve_symbol_anchors`], used by the read fast path to resolve content-anchored
 /// edges in RAM (one scan + hash lookups) instead of a per-edge SQL join.
-fn build_anchor_index(conn: &Connection) -> anyhow::Result<HashMap<(String, i64), (i64, String)>> {
+pub(crate) fn build_anchor_index(
+    conn: &Connection,
+) -> anyhow::Result<HashMap<(String, i64), (i64, String)>> {
     let mut stmt = conn.prepare(
         "SELECT s.id, f.path, s.start_byte, f.sha256
            FROM symbols s JOIN files f ON f.id = s.file_id

@@ -51,6 +51,7 @@ rag-rat-core = { version = "0.21.1", path = "crates/rag-rat-core", default-featu
 rag-rat-mcp = { version = "0.21.1", path = "crates/rag-rat-mcp", default-features = false }
 rag-rat-sync = { version = "0.21.1", path = "crates/rag-rat-sync", default-features = false }
 anyhow = "1.0"
+axum = "0.8"
 # ed25519 device-identity signing for the op-log's signed entry envelope (§C4 layer-1). Default
 # features (incl. `zeroize`, which zeroizes a `SigningKey`'s seed on drop) are kept; the `rand_core`
 # CSPRNG-keygen feature stays OFF — device keys derive deterministically from a seed via
@@ -88,6 +89,16 @@ getrandom = "0.4"
 gix = { version = "0.86.0", default-features = false, features = ["status", "parallel", "sha1", "sha256", "revision", "blob-diff", "blame"] }
 httpdate = "1.0"
 libc = "0.2"
+# Win32 bindings for the Lens discovery credential's owner-only DACL. Unix keeps the token private
+# with mode bits; Windows has no equivalent, so the ACL has to be written through advapi32. Already
+# in the tree transitively (tokio, gix); this only adds the security feature modules.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
 # Separator-aware path→forward-slash conversion. Unlike a raw `\`→`/` replace, it only rewrites the
 # actual path SEPARATOR — so a literal backslash in a Unix filename is preserved. Used where a path
 # becomes a string for a non-filesystem consumer (a `node`/`npx` command arg, a TOML value).

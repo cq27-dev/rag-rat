@@ -131,9 +131,7 @@ pub(in super::super) fn clone_generation_scope_clause(conn: &Connection) -> anyh
 }
 
 /// The live (Complete) generation row, if one is published.
-pub(in super::super) fn live_generation_row(
-    conn: &Connection,
-) -> anyhow::Result<Option<GenerationRow>> {
+pub(crate) fn live_generation_row(conn: &Connection) -> anyhow::Result<Option<GenerationRow>> {
     let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     let Some(live) = rag_rat_db::meta::repo_meta(conn, &repo_id, "clone_graph_live_generation")?
     else {

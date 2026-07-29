@@ -28,8 +28,8 @@ pub use distill::{
     AnchorKind, DistillEdgeKind, EpistemicStatus, FixEdgeSource, OutcomeStatus, ThreadShape,
 };
 pub use distill_read::{
-    CoalescedThread, DistilledRecord, DriveByRecord, RecordKey, RejectedAlternative,
-    distilled_record_for_thread, records_for_symbol,
+    CoalescedThread, DistilledRecord, DriveByRecord, PathDistilledRecord, RecordKey,
+    RejectedAlternative, distilled_record_for_thread, records_for_path, records_for_symbol,
 };
 pub use distill_status::{EffectiveStatusInputs, effective_status, no_fix_edge};
 pub use evidence::{refs, *};
