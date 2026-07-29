@@ -1,6 +1,7 @@
 pub(in crate::index) mod extract;
 mod helpers;
 mod imports;
+pub(crate) use imports::{UseRoot, use_binding_root};
 mod intern;
 mod resolve;
 
@@ -576,8 +577,12 @@ pub(crate) fn degeneric_path(path: &str) -> String {
 /// contains `::` (see the Rust `scope_segment`), so per-`::`-segment splitting is sound.
 /// Borrowed ⇔ the path needs no normalization — the hot rebuild path allocates nothing for the
 /// plain-scope majority.
-pub(crate) fn normalized_scope_path(path: &str) -> std::borrow::Cow<'_, str> {
-    if !path.contains('<') && !path.contains(" as ") {
+pub(crate) fn normalized_scope_path<'a>(
+    path: &'a str,
+    language: Option<&str>,
+) -> std::borrow::Cow<'a, str> {
+    if language != Some(Language::Rust.as_str()) || (!path.contains('<') && !path.contains(" as "))
+    {
         return std::borrow::Cow::Borrowed(path);
     }
     let degeneric = degeneric_path(path);
@@ -630,7 +635,9 @@ impl<'a> SymbolIndex<'a> {
             // ⇔ changed) — a plain scope is already reachable through `by_scope_path`, and
             // skipping it avoids one String per symbol on the hot rebuild path. Lookups consult
             // BOTH maps.
-            if let std::borrow::Cow::Owned(normalized) = normalized_scope_path(&symbol.scope_path) {
+            if let std::borrow::Cow::Owned(normalized) =
+                normalized_scope_path(&symbol.scope_path, Some(&symbol.language))
+            {
                 by_normalized_scope_path.entry(normalized).or_default().push(symbol);
             }
             by_name.entry(symbol.name.as_str()).or_default().push(symbol);

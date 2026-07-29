@@ -276,6 +276,95 @@ pub(crate) fn parse_use(use_text: &str) -> Option<(String, Vec<String>)> {
     Some((root.to_string(), leaves))
 }
 
+/// Whether a Rust `use` statement binds one exact name, without allocating the full leaf list.
+/// Receiver inference asks a membership question on a hot per-call path; rebuilding
+/// [`parse_use`]'s `Vec<String>` there multiplied work by every inferred method call.
+pub(crate) fn use_binds_name(use_text: &str, name: &str) -> bool {
+    let Some(rest) = strip_use_visibility(use_text.trim()) else { return false };
+    let tree = rest.strip_suffix(';').unwrap_or(rest).trim();
+    let tree = tree.strip_prefix("::").unwrap_or(tree);
+    use_tree_binds_name(tree, name)
+}
+
+/// Which crate a `use` reaches into: `Local` for a `crate::`/`self::`/`super::` root (this crate,
+/// addressed relatively), `External` for anything else — a dependency, or a sibling workspace
+/// crate, which extraction cannot tell apart without package locality.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum UseRoot {
+    Local,
+    External,
+}
+
+/// The root of the `use` that binds `name`, or `None` when this declaration does not bind it.
+pub(crate) fn use_binding_root(use_text: &str, name: &str) -> Option<UseRoot> {
+    if !use_binds_name(use_text, name) {
+        return None;
+    }
+    let rest = strip_use_visibility(use_text.trim())?;
+    let tree = rest.strip_suffix(';').unwrap_or(rest).trim();
+    let tree = tree.strip_prefix("::").unwrap_or(tree);
+    let root = tree
+        .split("::")
+        .next()
+        .and_then(|segment| segment.split_whitespace().next())
+        .unwrap_or_default();
+    Some(if matches!(root, "crate" | "self" | "super") {
+        UseRoot::Local
+    } else {
+        UseRoot::External
+    })
+}
+
+fn use_tree_binds_name(tree: &str, name: &str) -> bool {
+    let tree = tree.trim();
+    match tree.find('{') {
+        None => single_use_binds_name(tree, name),
+        Some(open) => {
+            let prefix = tree[..open].trim_end().trim_end_matches(':');
+            use_group_binds_name(brace_inner(&tree[open..]), prefix, name)
+        },
+    }
+}
+
+fn single_use_binds_name(path: &str, name: &str) -> bool {
+    if let Some((_, alias)) = path.split_once(" as ") {
+        let alias = alias.trim();
+        return alias != "_" && alias == name;
+    }
+    path.rsplit("::")
+        .next()
+        .map(str::trim)
+        .is_some_and(|leaf| !matches!(leaf, "" | "*" | "self") && leaf == name)
+}
+
+fn use_group_binds_name(inner: &str, prefix: &str, name: &str) -> bool {
+    let mut depth = 0u32;
+    let mut start = 0usize;
+    for (index, byte) in inner.bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                if use_group_entry_binds_name(&inner[start..index], prefix, name) {
+                    return true;
+                }
+                start = index + 1;
+            },
+            _ => {},
+        }
+    }
+    use_group_entry_binds_name(&inner[start..], prefix, name)
+}
+
+fn use_group_entry_binds_name(entry: &str, prefix: &str, name: &str) -> bool {
+    let entry = entry.trim();
+    if entry == "self" {
+        prefix.rsplit("::").next().is_some_and(|parent| parent == name)
+    } else {
+        !entry.is_empty() && use_tree_binds_name(entry, name)
+    }
+}
+
 /// Strip an optional leading visibility modifier and the `use ` keyword, returning the use TREE
 /// (everything after `use `). `None` when the statement isn't a `use` (e.g. a `mod foo;` Imports
 /// edge), so the caller records nothing.
@@ -712,6 +801,21 @@ mod tests {
         assert_eq!(parse_use("use foo::*;"), Some(("foo".to_string(), Vec::new())));
         assert_eq!(parsed("use ::external::X;"), Some(("external".into(), s(&["X"]))));
         assert_eq!(parse_use("mod foo;"), None);
+    }
+
+    #[test]
+    fn use_membership_matches_bound_leaves_without_materializing_them() {
+        let declaration = "use crate::outer::{self, nested::{Worker as Alias, Other}, *};";
+        for bound in ["outer", "Alias", "Other"] {
+            assert!(use_binds_name(declaration, bound), "{bound} is bound");
+        }
+        for unbound in ["crate", "nested", "Worker", "Missing"] {
+            assert!(!use_binds_name(declaration, unbound), "{unbound} is not bound");
+        }
+        assert_eq!(use_binding_root(declaration, "Alias"), Some(UseRoot::Local));
+        assert_eq!(use_binding_root(declaration, "Missing"), None);
+        assert_eq!(use_binding_root("use url::Url;", "Url"), Some(UseRoot::External));
+        assert_eq!(use_binding_root("use super::a::Helper;", "Helper"), Some(UseRoot::Local));
     }
 
     #[test]

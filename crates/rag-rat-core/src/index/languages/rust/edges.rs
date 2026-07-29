@@ -427,7 +427,7 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
                     if is_reassigned(node, binding_start, call_start, recv, text) {
                         return None;
                     }
-                    return canonical_receiver_type(type_name, call_node, text);
+                    return Some(type_name);
                 },
                 VisibleBinding::Shadowed => return None,
                 VisibleBinding::Missing => {},
@@ -456,28 +456,28 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
             if !match_simple_pattern(pattern, text, recv) {
                 return None;
             }
-            let type_name = param.child_by_field_name("type").and_then(|type_node| {
-                clean_rust_type_name(&node_text(type_node, text), &fn_generic_refs)
-            })?;
+            let type_node = param.child_by_field_name("type")?;
+            let type_name = clean_rust_type_name(&node_text(type_node, text), &fn_generic_refs)?;
+            let type_name = canonical_receiver_type(type_name, type_node, text)?;
             if is_reassigned(function_node, param.start_byte(), call_start, recv, text) {
                 return None;
             }
-            return canonical_receiver_type(type_name, call_node, text);
+            return Some(type_name);
         }
     }
 
     None
 }
 
-/// The ONE canonicalization point for let/param/constructor-derived hints: resolve the
-/// as-written type against the call's lexical module (`mod inner { fn f(w: Worker) }` →
-/// `inner::Worker`), so a bare hint can never exact-match a same-tail owner in a DIFFERENT
-/// module (#567 review). `Self` routes through the impl's own context instead.
-fn canonical_receiver_type(type_name: String, call_node: Node<'_>, text: &str) -> Option<String> {
+/// Resolve an as-written type against the lexical context where that type was declared. This must
+/// happen before the hint crosses into receiver inference: a constructor declared as returning
+/// `Worker` in `mod factory` means `factory::Worker` even when called from another module.
+/// `Self` routes through the enclosing impl's own context.
+fn canonical_receiver_type(type_name: String, context: Node<'_>, text: &str) -> Option<String> {
     if type_name == "Self" {
-        infer_self_type_hint(call_node, text)
+        infer_self_type_hint(context, text)
     } else {
-        module_qualified_type_path(call_node, &type_name, text)
+        module_qualified_type_path(context, &type_name, text)
     }
 }
 
@@ -515,6 +515,7 @@ fn visible_let_binding(
         }
         let type_name = if let Some(type_node) = child.child_by_field_name("type") {
             clean_rust_type_name(&node_text(type_node, text), fn_generics)
+                .and_then(|type_name| canonical_receiver_type(type_name, type_node, text))
         } else {
             constructor_owner(child.child_by_field_name("value"), text, fn_generics)
         };
@@ -541,17 +542,18 @@ fn constructor_owner(value: Option<Node<'_>>, text: &str, fn_generics: &[&str]) 
     // `Self`, so `from`/`with_*` (routinely builder- or conversion-shaped) are declined
     // outright, and `new`/`default` are verified against the constructor's DECLARED return type
     // whenever it is visible in this file — a same-file `Factory::new() -> Worker` re-types the
-    // hint to `Worker`; an opaque or unit return declines. Only a constructor defined in
-    // another file falls back to the naming convention (#567).
+    // hint to `Worker`; an opaque or unit return declines. A constructor defined in another file
+    // also declines: Rust does not require `new` or `default` to return `Self`, so the owner name
+    // alone is not type evidence (#567).
     if !matches!(method_name, "new" | "default") {
         return None;
     }
     let owner = clean_rust_type_name(type_part, fn_generics)?;
-    match same_file_constructor_return(value, text, &owner, method_name, fn_generics) {
-        CtorReturn::SelfLike => Some(owner),
+    let owner_canonical = canonical_receiver_type(owner.clone(), value, text)?;
+    match same_file_constructor_return(value, text, &owner_canonical, method_name, fn_generics) {
+        CtorReturn::SelfLike => Some(owner_canonical),
         CtorReturn::Other(declared) => Some(declared),
-        CtorReturn::Opaque => None,
-        CtorReturn::Unknown => Some(owner),
+        CtorReturn::Opaque | CtorReturn::Unknown => None,
     }
 }
 
@@ -562,7 +564,8 @@ enum CtorReturn {
     Other(String),
     /// Declared something this inference cannot name (generics chains, unit, `impl Trait`).
     Opaque,
-    /// The constructor is not defined in this file — the declaration is not visible here.
+    /// The constructor is not defined in this file — without its return declaration, inference
+    /// must decline rather than assume a constructor-like name returns the owner.
     Unknown,
 }
 
@@ -583,9 +586,11 @@ fn same_file_constructor_return(
     // tail match would classify `a::Factory::new()` through module b's constructor. Candidates
     // the canonicalization cannot tell apart (either side undecidable) still count — and MORE
     // THAN ONE surviving candidate is ambiguity, which must decline rather than fall back to
-    // the naming convention (only a MISSING same-file definition keeps the convention).
+    // the naming convention. Missing or ambiguous same-file definitions decline the hint.
     let owner_tail = qn_tail(owner);
-    let owner_canonical = module_qualified_type_path(node, owner, text);
+    // `constructor_owner` already resolved this against the call's lexical module. Re-applying
+    // module qualification here would turn `a::Factory` into `a::a::Factory`.
+    let owner_canonical = Some(owner.to_string());
     let mut candidates: Vec<CtorReturn> = Vec::new();
     let mut stack = vec![root];
     while let Some(current) = stack.pop() {
@@ -598,15 +603,21 @@ fn same_file_constructor_return(
                     if qn_tail(degeneric_path(&impl_type).trim()) != owner_tail {
                         continue;
                     }
-                    let Some(classified) =
-                        classify_constructor_return(child, text, ctor, owner_tail, fn_generics)
-                    else {
-                        continue; // this impl does not define the constructor
-                    };
                     let impl_canonical = module_qualified_type_path(child, &impl_type, text);
                     match (&owner_canonical, &impl_canonical) {
                         (Some(owner_path), Some(impl_path)) if owner_path != impl_path => {},
-                        _ => candidates.push(classified),
+                        _ => {
+                            let Some(classified) = classify_constructor_return(
+                                child,
+                                text,
+                                ctor,
+                                impl_canonical.as_deref(),
+                                fn_generics,
+                            ) else {
+                                continue; // this impl does not define the constructor
+                            };
+                            candidates.push(classified);
+                        },
                     }
                 },
                 // Constructors can sit inside inline modules; anything else cannot contain an
@@ -629,7 +640,7 @@ fn classify_constructor_return(
     impl_node: Node<'_>,
     text: &str,
     ctor: &str,
-    owner_tail: &str,
+    impl_canonical: Option<&str>,
     fn_generics: &[&str],
 ) -> Option<CtorReturn> {
     let body = impl_node.child_by_field_name("body")?;
@@ -644,12 +655,19 @@ fn classify_constructor_return(
         };
         let declared = node_text(return_node, text);
         let trimmed = declared.trim();
-        if trimmed == "Self" || qn_tail(&degeneric_path(trimmed)) == owner_tail {
+        if trimmed == "Self" {
             return Some(CtorReturn::SelfLike);
         }
-        return Some(match clean_rust_type_name(trimmed, fn_generics) {
-            Some(declared) => CtorReturn::Other(declared),
-            None => CtorReturn::Opaque,
+        let Some(declared) = clean_rust_type_name(trimmed, fn_generics) else {
+            return Some(CtorReturn::Opaque);
+        };
+        let Some(declared_canonical) = module_qualified_type_path(item, &declared, text) else {
+            return Some(CtorReturn::Opaque);
+        };
+        return Some(if impl_canonical == Some(declared_canonical.as_str()) {
+            CtorReturn::SelfLike
+        } else {
+            CtorReturn::Other(declared_canonical)
         });
     }
     None
@@ -666,6 +684,21 @@ fn module_qualified_type_path(context: Node<'_>, raw_type: &str, text: &str) -> 
     let cleaned = degeneric.trim();
     if cleaned.is_empty() || cleaned.starts_with('<') || cleaned.contains(" as ") {
         return None;
+    }
+    // An imported bare name denotes the item at the USE's path — which is somewhere else. The
+    // lexical module chain below cannot describe it: inside `mod inner`, `use
+    // crate::workers::Worker` would canonicalize `Worker` to `inner::Worker`, a module that
+    // does not hold the type, and a same-tail type in `inner` would then capture the call. A
+    // potentially-external import declines outright (extraction does not own Cargo/package
+    // locality); a known-local one keeps the BARE name, which is exactly the container-based
+    // scope a top-level declaration carries — unqualified, so it earns neither the tail retry
+    // nor the suffix fallback at resolution.
+    if !cleaned.contains("::") {
+        match lexical_scope_import_root(context, cleaned, text) {
+            Some(UseRoot::External) => return None,
+            Some(UseRoot::Local) => return Some(cleaned.to_string()),
+            None => {},
+        }
     }
     let mut modules = enclosing_module_path(context, text);
     let relative = if let Some(rest) = cleaned.strip_prefix("crate::") {
@@ -686,6 +719,42 @@ fn module_qualified_type_path(context: Node<'_>, raw_type: &str, text: &str) -> 
     }
     modules.extend(relative.split("::").map(str::to_string));
     Some(modules.join("::"))
+}
+
+/// The root of the innermost enclosing `use` that introduces `name`, scanning outward through
+/// every import scope (block, inline module, file root). `None` when nothing imports the name.
+fn lexical_scope_import_root(context: Node<'_>, name: &str, text: &str) -> Option<UseRoot> {
+    let mut current = Some(context);
+    while let Some(scope) = current {
+        let is_import_scope = scope.kind() == "block"
+            || scope.kind() == "source_file"
+            || (scope.kind() == "declaration_list"
+                && scope.parent().is_some_and(|parent| parent.kind() == "mod_item"));
+        if is_import_scope && let Some(root) = scope_import_root(scope, name, text) {
+            return Some(root);
+        }
+        current = scope.parent();
+    }
+    None
+}
+
+fn scope_import_root(scope: Node<'_>, name: &str, text: &str) -> Option<UseRoot> {
+    let mut cursor = scope.walk();
+    scope.named_children(&mut cursor).find_map(|item| {
+        if item.kind() != "use_declaration" {
+            return None;
+        }
+        let declaration = &text[item.byte_range()];
+        // Most scopes have no relevant import. Avoid the full use-tree walk unless the
+        // declaration can contain this exact identifier.
+        if !declaration
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+            .any(|part| part == name)
+        {
+            return None;
+        }
+        crate::index::edges::use_binding_root(declaration, name)
+    })
 }
 
 /// Enclosing `mod` names of `node`, outermost first.
@@ -738,7 +807,9 @@ fn let_condition_binds(condition: Node<'_>, text: &str, recv: &str) -> bool {
 
 fn pattern_binds_name(pattern: Node<'_>, text: &str, recv: &str) -> bool {
     rag_rat_base::stack::grow_stack(|| {
-        if pattern.kind() == "identifier" && node_text(pattern, text).trim() == recv {
+        if matches!(pattern.kind(), "identifier" | "shorthand_field_identifier")
+            && node_text(pattern, text).trim() == recv
+        {
             return true;
         }
         let mut cursor = pattern.walk();
@@ -881,7 +952,7 @@ mod receiver_type_hint_tests {
     }
 
     #[test]
-    fn test_associated_new_initializer() {
+    fn test_constructor_without_visible_declaration_declined() {
         let code = r#"
             fn test() {
                 let w = Worker::new();
@@ -889,7 +960,7 @@ mod receiver_type_hint_tests {
             }
         "#;
         let hints = extract_call_hints(code);
-        assert_eq!(hints, vec![None, Some("Worker".to_string())]);
+        assert_eq!(hints, vec![None, None]);
     }
 
     #[test]
@@ -920,6 +991,23 @@ mod receiver_type_hint_tests {
             }
         "#;
         assert_eq!(extract_call_hints(code), vec![None, Some("Worker".to_string())]);
+    }
+
+    #[test]
+    fn test_self_constructor_resolves_against_enclosing_impl() {
+        let code = r#"
+            impl Worker {
+                fn new() -> Self { Worker }
+                fn make() {
+                    let worker = Self::new();
+                    worker.run();
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![
+            Some("Worker".to_string()),
+            Some("Worker".to_string())
+        ]);
     }
 
     #[test]
@@ -971,6 +1059,48 @@ mod receiver_type_hint_tests {
         // same-tail impl must not classify it, and the produced hint is canonical against the
         // call's lexical module. Calls: Factory::new(), worker.run().
         assert_eq!(extract_call_hints(code), vec![None, Some("a::WorkerA".to_string())]);
+    }
+
+    #[test]
+    fn test_constructor_return_with_same_tail_uses_full_path() {
+        let code = r#"
+            mod a {
+                impl Factory {
+                    fn new() -> crate::b::Factory { crate::b::Factory }
+                }
+            }
+            mod b {
+                struct Factory;
+            }
+            fn make() {
+                let factory = a::Factory::new();
+                factory.run();
+            }
+        "#;
+        // The declaration returns `b::Factory`, which is not self-like merely because its tail
+        // matches `a::Factory`. Calls: a::Factory::new(), factory.run().
+        assert_eq!(extract_call_hints(code), vec![None, Some("b::Factory".to_string())]);
+    }
+
+    #[test]
+    fn test_constructor_relative_return_uses_declaration_module() {
+        let code = r#"
+            mod a {
+                struct Worker;
+                impl Factory {
+                    fn new() -> Worker { Worker }
+                }
+            }
+            mod c {
+                fn make() {
+                    let worker = crate::a::Factory::new();
+                    worker.run();
+                }
+            }
+        "#;
+        // `Worker` is written in module a's constructor declaration, not at the call in module c.
+        // Calls: crate::a::Factory::new(), worker.run().
+        assert_eq!(extract_call_hints(code), vec![None, Some("a::Worker".to_string())]);
     }
 
     #[test]
@@ -1072,6 +1202,102 @@ mod receiver_type_hint_tests {
         "#;
         let hints = extract_call_hints(code);
         assert_eq!(hints, vec![None]);
+    }
+
+    #[test]
+    fn test_struct_pattern_shorthand_shadow_declined() {
+        let code = r#"
+            fn test(x: &Alpha) {
+                let Point { x, y: _ } = point;
+                x.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None]);
+    }
+
+    #[test]
+    fn test_if_let_struct_pattern_shorthand_shadow_declined() {
+        let code = r#"
+            fn test(x: &Alpha) {
+                if let Point { x, .. } = point {
+                    x.run();
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None]);
+    }
+
+    #[test]
+    fn test_inline_module_external_import_declines_receiver_hint() {
+        let code = r#"
+            mod inner {
+                use url::Url;
+                fn test(url: &Url) {
+                    url.join("child");
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None]);
+    }
+
+    #[test]
+    fn test_impl_method_sees_module_level_external_import() {
+        let code = r#"
+            use url::Url;
+            struct Client;
+            impl Client {
+                fn join(u: Url) {
+                    u.join("next");
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None]);
+    }
+
+    /// A `crate::`-rooted import is KNOWN local, but that does not make the lexical module its
+    /// owner: prefixing the module chain here would produce `inner::Worker`, a module that does
+    /// not hold the type, and a same-tail `Worker` inside `inner` would then capture the call.
+    /// The imported name keeps its BARE form — the scope a top-level declaration actually carries.
+    #[test]
+    fn test_inline_module_local_import_drops_the_lexical_module_prefix() {
+        let code = r#"
+            mod inner {
+                use crate::workers::Worker;
+                fn test(w: &Worker) {
+                    w.run();
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![Some("Worker".to_string())]);
+    }
+
+    /// `self::`/`super::` roots are resolved against the USE's module, not the reference's, so
+    /// they get the same treatment as `crate::`.
+    #[test]
+    fn test_relative_local_imports_keep_the_bare_name() {
+        for import in ["use self::workers::Worker;", "use super::workers::Worker;"] {
+            let code = format!("mod inner {{ {import} fn test(w: &Worker) {{ w.run(); }} }}");
+            assert_eq!(
+                extract_call_hints(&code),
+                vec![Some("Worker".to_string())],
+                "{import} must not pick up the lexical module prefix"
+            );
+        }
+    }
+
+    /// An explicitly-written local path is NOT an import — it names its own owner verbatim, so it
+    /// still earns the fully qualified hint. This is the boundary the rule above must not cross.
+    #[test]
+    fn test_inline_module_explicit_path_still_earns_a_qualified_hint() {
+        let code = r#"
+            mod inner {
+                use crate::workers::Worker;
+                fn test(w: &crate::workers::Worker) {
+                    w.run();
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![Some("workers::Worker".to_string())]);
     }
 
     #[test]

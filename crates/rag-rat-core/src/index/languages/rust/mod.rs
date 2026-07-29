@@ -59,7 +59,8 @@ impl ParserBackend for Rust {
                 return match node.child_by_field_name("trait") {
                     Some(trait_node) => {
                         let trait_text = parser::node_text(trait_node, text)?;
-                        let tail = trait_text.rsplit("::").next().unwrap_or(&trait_text).trim();
+                        let trait_path = crate::index::edges::degeneric_path(&trait_text);
+                        let tail = trait_path.rsplit("::").next().unwrap_or(&trait_path).trim();
                         Some(if tail.is_empty() { segment } else { format!("{segment} as {tail}") })
                     },
                     None => Some(segment),
@@ -95,14 +96,36 @@ impl ParserBackend for Rust {
     }
 }
 
+/// The node naming the type an `impl` block is FOR — never the trait it implements.
+///
+/// `impl Trait for Type` puts the trait in the `trait` field and the owner in the `type` field.
+/// When the owner is not a plain nominal type (`impl Display for &Foo`, `for (A, B)`, `for [T]`,
+/// `for dyn X`) there is no name to take, and a positional scan over the children would hand
+/// back the TRAIT instead — collapsing `impl Display for &Foo` and `impl Display for &Bar` onto
+/// one owner, the exact leak trait-qualified scopes exist to prevent. Reference and pointer
+/// wrappers are unwrapped (`&mut Foo` is still owned by `Foo`); anything else declines.
 fn impl_name(node: Node<'_>) -> Option<Node<'_>> {
     if let Some(target_type) = node.child_by_field_name("type") {
-        return Some(target_type);
+        return unwrap_impl_type(target_type);
     }
+    // No `type` field at all (a partial parse): scan positionally, but never adopt the trait.
+    let trait_id = node.child_by_field_name("trait").map(|node| node.id());
     let mut cursor = node.walk();
-    node.named_children(&mut cursor).find(|child| {
-        matches!(child.kind(), "type_identifier" | "generic_type" | "scoped_type_identifier")
-    })
+    node.named_children(&mut cursor)
+        .find(|child| is_impl_type_node(child.kind()) && Some(child.id()) != trait_id)
+}
+
+/// Peel `&`/`&mut`/`*const`/`*mut` off an impl target, then keep it only if it names a type.
+fn unwrap_impl_type(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    while matches!(current.kind(), "reference_type" | "pointer_type") {
+        current = current.child_by_field_name("type")?;
+    }
+    is_impl_type_node(current.kind()).then_some(current)
+}
+
+fn is_impl_type_node(kind: &str) -> bool {
+    matches!(kind, "type_identifier" | "generic_type" | "scoped_type_identifier")
 }
 
 fn attribute_is_test(attribute: &str) -> bool {
@@ -218,4 +241,62 @@ fn is_external_root(value: &str) -> bool {
             | "HashSet"
             | "BTreeSet"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use rag_rat_base::language::Language;
+
+    use super::*;
+
+    #[test]
+    fn generic_trait_scope_uses_the_degenericized_trait_tail() {
+        let parsed = parser::parse_file(
+            Path::new("src/lib.rs"),
+            Language::Rust,
+            "impl crate::traits::Runs<Item> for Worker { fn run(&self) {} }",
+        )
+        .expect("Rust parses");
+        let run = parsed.symbols.iter().find(|symbol| symbol.name == "run").expect("method symbol");
+        assert_eq!(run.scope_path, "Worker as Runs::run");
+    }
+
+    fn scope_paths(source: &str, method: &str) -> Vec<String> {
+        parser::parse_file(Path::new("src/lib.rs"), Language::Rust, source)
+            .expect("Rust parses")
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.name == method)
+            .map(|symbol| symbol.scope_path.clone())
+            .collect()
+    }
+
+    /// `impl Trait for &Type` puts a `reference_type` in the impl's `type` field. Taking the first
+    /// nominal child instead would hand back the TRAIT, giving every `impl Display for &_` in a
+    /// file the same owner — the collapse trait-qualified scopes exist to prevent.
+    #[test]
+    fn a_reference_impl_target_keeps_its_own_owner() {
+        let scopes = scope_paths(
+            "struct Alpha;\nstruct Beta;\nimpl std::fmt::Display for &Alpha { fn fmt(&self) {} \
+             }\nimpl std::fmt::Display for &Beta { fn fmt(&self) {} }\n",
+            "fmt",
+        );
+        assert_eq!(scopes, vec!["Alpha as Display::fmt", "Beta as Display::fmt"]);
+    }
+
+    /// An impl target with no name to take (unit, tuple, slice, `dyn`) must yield NO owner rather
+    /// than borrow the trait's.
+    #[test]
+    fn a_non_nominal_impl_target_claims_no_owner() {
+        for target in ["()", "(Alpha, Beta)", "[Alpha]", "dyn Runs"] {
+            let source = format!("impl std::fmt::Display for {target} {{ fn fmt(&self) {{}} }}");
+            assert_eq!(
+                scope_paths(&source, "fmt"),
+                vec!["fmt".to_string()],
+                "`impl Display for {target}` must not adopt `Display` as its owner"
+            );
+        }
+    }
 }
