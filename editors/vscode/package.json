@@ -1,0 +1,199 @@
+{
+  "name": "rag-rat-lens",
+  "displayName": "rag-rat Lens",
+  "description": "Read-only lens over the rag-rat repo index: clone classes, repo memories, call-graph trust data, co-change coupling, tracker rationale. VS Code + Cursor, desktop and web.",
+  "version": "0.0.1",
+  "publisher": "rag-rat",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cq27-dev/rag-rat",
+    "directory": "editors/vscode"
+  },
+  "bugs": "https://github.com/cq27-dev/rag-rat/issues",
+  "homepage": "https://github.com/cq27-dev/rag-rat#readme",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/node/extension.js",
+  "browser": "./dist/web/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Automatic server discovery reads a workspace-local credential file."
+    },
+    "virtualWorkspaces": {
+      "supported": true
+    }
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "rag-rat-lens",
+          "title": "rag-rat Lens",
+          "icon": "media/lens.svg"
+        }
+      ]
+    },
+    "views": {
+      "rag-rat-lens": [
+        {
+          "id": "rag-rat-lens.cloneClasses",
+          "name": "Clone Classes"
+        },
+        {
+          "id": "rag-rat-lens.memories",
+          "name": "Memories"
+        },
+        {
+          "id": "rag-rat-lens.papertrail",
+          "name": "Issues & Decisions"
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "rag-rat-lens.toggleOverlays",
+          "group": "rag-rat@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "rag-rat-lens.showCallers",
+          "when": "false"
+        },
+        {
+          "command": "rag-rat-lens.showDispatch",
+          "when": "false"
+        },
+        {
+          "command": "rag-rat-lens.showCoupling",
+          "when": "false"
+        },
+        {
+          "command": "rag-rat-lens.showRefs",
+          "when": "false"
+        },
+        {
+          "command": "rag-rat-lens.showDecision",
+          "when": "false"
+        },
+        {
+          "command": "rag-rat-lens.showExtract",
+          "when": "false"
+        },
+        {
+          "command": "rag-rat-lens.showMemories",
+          "when": "false"
+        },
+        {
+          "command": "rag-rat-lens.openLocation",
+          "when": "false"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "rag-rat-lens.toggleOverlays",
+        "title": "rag-rat Lens: Toggle Overlays"
+      },
+      {
+        "command": "rag-rat-lens.refresh",
+        "title": "rag-rat Lens: Refresh Overlays"
+      },
+      {
+        "command": "rag-rat-lens.configureServer",
+        "title": "rag-rat Lens: Configure Server"
+      },
+      {
+        "command": "rag-rat-lens.showLog",
+        "title": "rag-rat Lens: Show Log"
+      },
+      {
+        "command": "rag-rat-lens.showCallers",
+        "title": "rag-rat Lens: Show Callers"
+      },
+      {
+        "command": "rag-rat-lens.showDispatch",
+        "title": "rag-rat Lens: Show Dispatch"
+      },
+      {
+        "command": "rag-rat-lens.showCoupling",
+        "title": "rag-rat Lens: Show Coupling"
+      },
+      {
+        "command": "rag-rat-lens.showRefs",
+        "title": "rag-rat Lens: Show Issue/PR Refs"
+      },
+      {
+        "command": "rag-rat-lens.showDecision",
+        "title": "rag-rat Lens: Show Decision Record"
+      },
+      {
+        "command": "rag-rat-lens.showExtract",
+        "title": "rag-rat Lens: Show Extract Helper Preview"
+      },
+      {
+        "command": "rag-rat-lens.showMemories",
+        "title": "rag-rat Lens: Show Memories"
+      },
+      {
+        "command": "rag-rat-lens.openLocation",
+        "title": "rag-rat Lens: Open Location"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "rag-rat-lens.toggleOverlays",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r"
+      }
+    ],
+    "configuration": {
+      "title": "rag-rat Lens",
+      "properties": {
+        "rag-rat-lens.serverUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Hosted Lens server URL. Leave empty to discover the authenticated server from .rag-rat/sockets/lens.json; use 'rag-rat Lens: Configure Server' to store its bearer token securely."
+        },
+        "rag-rat-lens.cloneTheta": {
+          "type": "number",
+          "default": 0.9,
+          "minimum": 0.7,
+          "maximum": 1,
+          "description": "Similarity floor for clone overlays (find_clones' min_similarity). 0.7 = recall (boilerplate-heavy), 0.9 = near-clones only."
+        },
+        "rag-rat-lens.cloneMinTokens": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 0,
+          "description": "Hide clone classes whose medoid body is smaller than this many tokens. ~100 keeps only actionable (refactor-worthy) duplication; enum matchers and trivial accessors sit at 28-86. 0 shows everything."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "npm run check-types && node esbuild.js --production",
+    "check-types": "tsc --noEmit",
+    "test": "node --test test/*.test.cjs"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.6.0"
+  }
+}
