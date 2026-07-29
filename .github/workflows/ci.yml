@@ -139,9 +139,11 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
-      # Strict typecheck, dual Node/web production bundles, transport tests, and a clean
-      # dependency audit — the whole TS tree is otherwise invisible to CI (#216).
-      - run: npm ci && npm run package && npm test && npm audit --audit-level=moderate
+      # Strict typecheck, dual Node/web production bundles, promise-safety lint, transport tests,
+      # and a clean dependency audit — the whole TS tree is otherwise invisible to CI (#216).
+      # `lint` runs after `package` so a type error reports as a type error rather than as the
+      # type-aware rules failing to resolve.
+      - run: npm ci && npm run package && npm run lint && npm test && npm audit --audit-level=moderate
         working-directory: editors/vscode
       # Packaging smoke: the published VSIX must build from a clean checkout with no runtime
       # dependencies (both Node and web bundles are pre-built by `vscode:prepublish`).

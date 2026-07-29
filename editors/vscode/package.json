@@ -189,11 +189,14 @@
     "watch": "node esbuild.js --watch",
     "package": "npm run check-types && node esbuild.js --production",
     "check-types": "tsc --noEmit",
+    "lint": "eslint src",
     "test": "node --test test/*.test.cjs"
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0",
     "esbuild": "^0.28.1",
-    "typescript": "^5.6.0"
+    "eslint": "^10.8.0",
+    "typescript": "^5.6.0",
+    "typescript-eslint": "^8.65.0"
   }
 }
