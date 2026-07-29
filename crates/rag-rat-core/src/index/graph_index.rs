@@ -815,11 +815,15 @@ impl IndexDatabase {
             "
         ))?;
         let mut rows = stmt.query(params![self.active_repo_id, self.active_generation])?;
+        // SQL keeps `(language, path)` contiguous. Normalize and sort ONE file partition at a
+        // time: `path` is part of LogicalSymbolKey, so no group can cross this boundary. This
+        // preserves the exact normalized-key ordering without retaining the whole corpus's symbol
+        // strings in Rust memory.
         let mut members_sorted = Vec::new();
         while let Some(row) = rows.next()? {
             let language: String = row.get(2)?;
             let scope_path = logical_scope_path(&language, row.get(5)?);
-            members_sorted.push(LogicalSymbolMemberRow {
+            let member = LogicalSymbolMemberRow {
                 symbol_id: row.get(0)?,
                 path: row.get(1)?,
                 language,
@@ -831,14 +835,25 @@ impl IndexDatabase {
                 start_line: row.get(8)?,
                 end_line: row.get(9)?,
                 file_id: row.get(10)?,
-            });
+            };
+            if members_sorted.last().is_some_and(|previous: &LogicalSymbolMemberRow| {
+                previous.language != member.language || previous.path != member.path
+            }) {
+                Self::insert_logical_partition(conn, &self.active_repo_id, &mut members_sorted)?;
+            }
+            members_sorted.push(member);
         }
-        // The SQL ORDER BY sorts the RAW scope, but grouping compares the NORMALIZED one — and
-        // equal-normalized rows need not be raw-adjacent (`Foo<A> as Runs::f`, `Foo<A>::f`,
-        // `Foo<B> as Runs::f`: the inherent method splits the trait pair). A split group derives
-        // the SAME stable id twice and the second insert dies on the primary key, so re-sort on
-        // the exact tuple the group-boundary comparison uses (spans/id only as deterministic
-        // member order within a group).
+        Self::insert_logical_partition(conn, &self.active_repo_id, &mut members_sorted)
+    }
+
+    /// Sort and insert one `(language, path)` partition using the exact normalized logical key.
+    fn insert_logical_partition(
+        conn: &rusqlite::Connection,
+        repo_id: &str,
+        members_sorted: &mut Vec<LogicalSymbolMemberRow>,
+    ) -> anyhow::Result<()> {
+        // SQL orders the RAW scope, while grouping compares the NORMALIZED one. Re-sort this file
+        // partition so equal-normalized rows are adjacent; spans/id are deterministic member order.
         members_sorted.sort_by(|a, b| {
             (&a.language, &a.path, &a.name, &a.qualified_name, &a.scope_path, &a.kind)
                 .cmp(&(&b.language, &b.path, &b.name, &b.qualified_name, &b.scope_path, &b.kind))
@@ -852,7 +867,7 @@ impl IndexDatabase {
                 })
         });
         let mut current: Option<(LogicalSymbolKey, Vec<LogicalSymbolMemberRow>)> = None;
-        for member in members_sorted {
+        for member in members_sorted.drain(..) {
             // Compare the member's key fields against the current group WITHOUT allocating a key
             // per row (only per group, on a boundary).
             let same_group = current.as_ref().is_some_and(|(key, _)| {
@@ -868,14 +883,14 @@ impl IndexDatabase {
                 current.as_mut().expect("same_group implies Some").1.push(member);
             } else {
                 if let Some((key, members)) = current.take() {
-                    Self::insert_logical_group(conn, &self.active_repo_id, &key, &members)?;
+                    Self::insert_logical_group(conn, repo_id, &key, &members)?;
                 }
                 let key = LogicalSymbolKey::from(&member);
                 current = Some((key, vec![member]));
             }
         }
         if let Some((key, members)) = current.take() {
-            Self::insert_logical_group(conn, &self.active_repo_id, &key, &members)?;
+            Self::insert_logical_group(conn, repo_id, &key, &members)?;
         }
         Ok(())
     }
@@ -1605,7 +1620,14 @@ impl IndexDatabase {
     }
 
     pub(super) fn ensure_graph_index_current(&self) -> anyhow::Result<()> {
-        if self.repo_meta("graph_index_version")?.as_deref() == Some(GRAPH_INDEX_VERSION) {
+        let graph_current =
+            self.repo_meta("graph_index_version")?.as_deref() == Some(GRAPH_INDEX_VERSION);
+        let logical_current =
+            self.repo_meta(LOGICAL_KEY_VERSION_KEY)?.as_deref() == Some(LOGICAL_KEY_VERSION);
+        // A logical-key mismatch by itself is handled by the normal full-rederive gate. This
+        // on-open path owns the graph-version migration only; when both versions lag together it
+        // must refresh symbol extraction before that full regroup.
+        if graph_current {
             return Ok(());
         }
         let Some(root) = self.storage.source_root().map(Path::to_path_buf) else {
@@ -1644,15 +1666,34 @@ impl IndexDatabase {
             // package at load time (`load_package_roots_into_scope`) from those rows.
             self.refresh_packages(&root)?;
             let files = self.graph_reindex_files()?;
+            // Files whose persisted scope could NOT be refreshed to the current key shape. A
+            // heal repopulates the whole repo+generation edge set, so it walks rows belonging to
+            // sibling commits/worktrees too — their paths need not exist under THIS root, and a
+            // row can outlive its file between an edit and the next index pass. None of that is
+            // a heal failure: extraction already emits the new shape, so each such file re-lands
+            // its scope the next time it is indexed. Failing the open instead would brick every
+            // subsequent open on an index that merely holds one unreadable or edited path.
+            let mut unrefreshed = 0usize;
             for file in files {
-                if file.kind == TargetKind::Generated || file.language == Language::Markdown {
-                    continue;
-                }
                 let full_path = root.join(&file.path);
+                let needs_scope_refresh = !logical_current && file.language == Language::Rust;
                 let Ok(text) = fs::read_to_string(full_path) else {
+                    unrefreshed += usize::from(needs_scope_refresh);
                     continue;
                 };
-                if text.len() > edges::MAX_GRAPH_PARSE_BYTES {
+                // Above the parse limit there are no persisted symbols to refresh at all
+                // (`prepare_index_content_from_text` skips the same bound), so the scope shape
+                // is vacuously current for this file.
+                if needs_scope_refresh
+                    && text.len() <= edges::MAX_GRAPH_PARSE_BYTES
+                    && !self.refresh_symbol_scopes(file.id, Path::new(&file.path), &text)?
+                {
+                    unrefreshed += 1;
+                }
+                if file.kind == TargetKind::Generated
+                    || file.language == Language::Markdown
+                    || text.len() > edges::MAX_GRAPH_PARSE_BYTES
+                {
                     continue;
                 }
                 edges::index_file_edges(
@@ -1662,6 +1703,13 @@ impl IndexDatabase {
                     file.language,
                     &text,
                 )?;
+            }
+            if unrefreshed > 0 {
+                tracing::warn!(
+                    files = unrefreshed,
+                    "graph heal could not refresh symbol scopes for every Rust file; their \
+                     logical grouping stays on the previous key shape until they are reindexed"
+                );
             }
             self.resolve_edges()?;
             // A lagging `logical_key_version` must not survive an on-open graph heal: without
@@ -1688,12 +1736,55 @@ impl IndexDatabase {
         self.set_repo_meta("graph_index_version", GRAPH_INDEX_VERSION)
     }
 
+    /// Refresh symbol fields whose extraction semantics changed without rewriting chunks or
+    /// embeddings. Version 2 changes Rust impl scope shape (`Type as Trait`), and logical
+    /// regrouping is only correct after persisted symbols carry that new scope.
+    ///
+    /// Returns whether EVERY persisted symbol of the file was refreshed. Rows are matched on
+    /// their exact byte span, so a file edited since it was indexed matches only the symbols
+    /// ahead of the edit — an ordinary state between an edit and the next watcher pass, and one
+    /// the next index of that file resolves on its own. The caller reports the shortfall rather
+    /// than failing the open on it.
+    fn refresh_symbol_scopes(&self, file_id: i64, path: &Path, text: &str) -> anyhow::Result<bool> {
+        let Some(parsed) = parser::parse_file(path, Language::Rust, text) else {
+            return Ok(false);
+        };
+        let expected: i64 = self.storage.connection().query_row(
+            "SELECT COUNT(*) FROM main.symbols WHERE file_id = ?1",
+            [file_id],
+            |row| row.get(0),
+        )?;
+        let mut update = self.storage.connection().prepare_cached(
+            "UPDATE main.symbols
+             SET scope_path = ?1
+             WHERE file_id = ?2 AND start_byte = ?3 AND end_byte = ?4 AND name = ?5 AND kind = ?6",
+        )?;
+        let mut refreshed = 0usize;
+        for symbol in parsed.symbols {
+            refreshed += update.execute(params![
+                symbol.scope_path,
+                file_id,
+                i64::try_from(symbol.start_byte)?,
+                i64::try_from(symbol.end_byte)?,
+                symbol.name,
+                symbol.kind,
+            ])?;
+        }
+        Ok(i64::try_from(refreshed)? == expected)
+    }
+
     fn graph_reindex_files(&self) -> anyhow::Result<Vec<GraphReindexFile>> {
-        let mut stmt = self
-            .storage
-            .connection()
-            .prepare("SELECT id, path, language, kind FROM files ORDER BY path")?;
-        let rows = stmt.query_map([], |row| {
+        // `kind != 'deleted'` mirrors the scoped `files` view this reads around (A6 needs the
+        // repo+generation predicate, which the view cannot supply on a bare open). Deletion
+        // tombstones (`mark_file_deleted`) carry `language='unknown', kind='deleted'` — neither
+        // parses, so letting one through would turn every open into a hard error.
+        let mut stmt = self.storage.connection().prepare(
+            "SELECT id, path, language, kind
+                 FROM main.files
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![self.active_repo_id, self.active_generation], |row| {
             let language: String = row.get(2)?;
             let kind: String = row.get(3)?;
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, language, kind))
@@ -1701,12 +1792,16 @@ impl IndexDatabase {
         let mut files = Vec::new();
         for row in rows {
             let (id, path, language, kind) = row?;
-            files.push(GraphReindexFile {
-                id,
-                path,
-                language: language.parse()?,
-                kind: kind.parse()?,
-            });
+            // A marker row this build cannot name is a row to LEAVE ALONE, not a reason to fail
+            // the open. `ensure_graph_index_current` is on the open path, so an unparseable
+            // language/kind here would wedge the database for every later open too.
+            let (Ok(language), Ok(kind)) =
+                (language.parse::<Language>(), kind.parse::<TargetKind>())
+            else {
+                tracing::warn!(path = %path, "skipping unrecognized file row during graph heal");
+                continue;
+            };
+            files.push(GraphReindexFile { id, path, language, kind });
         }
         Ok(files)
     }
