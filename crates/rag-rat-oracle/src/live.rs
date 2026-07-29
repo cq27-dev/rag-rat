@@ -371,11 +371,14 @@ pub struct LivePassInput<'a> {
 
 /// Why a live pass ended early, when it did.
 ///
-/// The distinction is operational, not cosmetic: a layout change means the checkout's projects
-/// moved under the session, which is the one event that can make a file the pass skipped as
-/// unconfigurable resolvable — every other early exit leaves that answer exactly as it was. Callers
-/// branch on this rather than on [`LivePassReport::status`], whose wording is operator-facing text
-/// and not a contract.
+/// THAT a pass aborted is the contract callers act on — every abort drops the session, because
+/// neither a dead transport nor an argv derived from a layout that has since moved can be
+/// corrected in place. Callers read this rather than [`LivePassReport::status`], whose wording is
+/// operator-facing text and not something to parse.
+///
+/// The variants separate the two causes because they are diagnosed and reproduced differently, and
+/// because a caller that ever needs to tell "the checkout changed under us" from "the server died"
+/// must not have to infer it from a string. Today nothing branches on which one it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LivePassAbort {
     /// The checkout now pins a DIFFERENT compilation database than the one this session's argv was

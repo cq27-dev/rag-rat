@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use rag_rat_base::config::Config;
 use rag_rat_base::time::now_ms;
-use rag_rat_oracle::{LiveBackend, LiveOracleSession, LivePassAbort, LivePassReport};
+use rag_rat_oracle::{LiveBackend, LiveOracleSession, LivePassReport};
 
 use crate::index::IndexDatabase;
 
@@ -178,8 +178,8 @@ struct LiveBackendTail {
     backlog: Vec<String>,
     /// Paths a pass skipped because the session could not configure their files, held HERE rather
     /// than in `backlog`: a non-empty backlog is what schedules the next pass, and these can only
-    /// be skipped again until the checkout's project layout changes. Moved into the backlog when a
-    /// pass reports that it did — see [`LiveBackendTail::retain_unconfigured`].
+    /// be skipped again until the checkout's project layout changes. They ride along with the next
+    /// worklist that has real work in it — see [`assemble_worklist`].
     ///
     /// Bounded by being a SET fed only from worklists this backend actually ran: it holds at most
     /// one entry per distinct file of this backend's languages the watcher has seen change, and a
@@ -290,30 +290,13 @@ impl LiveBackendTail {
         );
     }
 
-    /// Fold one pass's unconfigurable skips into the retained set, and requeue that whole set when
-    /// the pass reports the layout change that can make those files resolvable.
+    /// Fold one pass's unconfigurable skips into the retained set.
     ///
-    /// Without this an operator who does exactly what [`Self::note_unconfigured`] asked of them —
-    /// consolidate the checkout's compilation databases — sees nothing happen: a pass admits only
-    /// this backend's changed paths plus the backlog, so editing the layout cannot requeue the
-    /// sources it just made resolvable, and they stay without live evidence until someone edits
-    /// them again.
-    ///
-    /// An ordinary abort (a dead or wedged server) does NOT requeue them: the checkout's layout is
-    /// exactly what it was, so a replacement session would skip them again. Some may still ride
-    /// `unfinished_paths` — an abort defers every candidate-bearing path after the file it stopped
-    /// on, unconfigurable ones included — which is harmless: one re-skip and they drop back out of
-    /// the backlog and into this set.
+    /// A path this pass CARRIED and did not skip is either configurable now or carries no
+    /// candidates at all; either way it stops being retained. That is what makes the ride-along in
+    /// [`assemble_worklist`] settle: parked paths join a worklist that already has real work, and
+    /// each pass either resolves them or puts them back.
     fn retain_unconfigured(&mut self, worklist: &[String], report: &LivePassReport) {
-        if report.abort == Some(LivePassAbort::LayoutChanged) {
-            // Moved, not copied: the next session answers "can I configure this?" afresh, and
-            // whatever it still cannot configure comes back here from its own pass. A path the
-            // aborted worklist already put in the backlog collapses in `assemble_worklist`.
-            self.backlog.extend(std::mem::take(&mut self.unconfigured_paths));
-            return;
-        }
-        // A path this pass carried and did not skip is either configurable now or carries no
-        // candidates at all; either way it no longer belongs here.
         for path in worklist {
             self.unconfigured_paths.remove(path);
         }
@@ -337,8 +320,12 @@ impl LiveBackendTail {
         // The worklist: backlog first (older edits wait longest), then this pass's changed paths
         // in this backend's language, deduped. `changed_paths` is `None` on a heal/bootstrap — no
         // reliable superset, so only the backlog rides.
-        let worklist =
-            assemble_worklist(std::mem::take(&mut self.backlog), changed_paths, &self.backend);
+        let worklist = assemble_worklist(
+            std::mem::take(&mut self.backlog),
+            &mut self.unconfigured_paths,
+            changed_paths,
+            &self.backend,
+        );
         let idle_shutdown_due = self.lifecycle.idle_shutdown_due(
             !worklist.is_empty(),
             Duration::from_secs(live_cfg.idle_shutdown_secs),
@@ -505,6 +492,7 @@ fn should_idle_shutdown(
 /// server cannot resolve.
 fn assemble_worklist(
     backlog: Vec<String>,
+    parked: &mut BTreeSet<String>,
     changed_paths: Option<&BTreeSet<String>>,
     backend: &LiveBackend,
 ) -> Vec<String> {
@@ -522,11 +510,38 @@ fn assemble_worklist(
             }
         }
     }
+    // Paths this backend could not configure ride ALONG with real work — never on their own.
+    //
+    // Retrying them cannot help until the checkout's project layout changes, so they must not be
+    // what SCHEDULES a pass: a non-empty backlog is exactly what makes the watcher wake, and
+    // parking them there would spin it forever on work every pass can only re-skip. But a pass
+    // that is happening anyway re-answers "can I configure this?" for free — the session's layout
+    // is already resolved, and an unconfigurable path is skipped before the request budget is
+    // touched. So an operator who does what the unconfigured warning asked and consolidates the
+    // checkout's compilation databases gets those sources resolved by the next pass, instead of
+    // only if one happens to abort on the layout change.
+    //
+    // What this deliberately does NOT do is let a `compile_commands.json` edit trigger a pass by
+    // itself: that edit contributes no path in this backend's languages, so the worklist stays
+    // empty and the parked paths wait for the next source edit. Closing that needs a layout signal
+    // independent of the worklist — see #996.
+    if worklist.is_empty() {
+        return worklist;
+    }
+    // Drained, not copied: whatever the pass still cannot configure comes back through
+    // `retain_unconfigured`, and anything it resolves is simply gone.
+    for path in std::mem::take(parked) {
+        if seen.insert(path.clone()) {
+            worklist.push(path);
+        }
+    }
     worklist
 }
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_oracle::LivePassAbort;
+
     use super::*;
 
     fn backend(tool: rag_rat_oracle::OracleTool) -> LiveBackend {
@@ -542,7 +557,7 @@ mod tests {
             "src/c.rs".to_string(),
             "Cargo.toml".to_string(),
         ]);
-        let worklist = assemble_worklist(backlog, Some(&changed), &rust);
+        let worklist = assemble_worklist(backlog, &mut BTreeSet::new(), Some(&changed), &rust);
         // Backlog order first, then new changed paths; duplicates collapse; non-Rust dropped.
         assert_eq!(worklist, vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
     }
@@ -552,8 +567,8 @@ mod tests {
         let rust = backend(rag_rat_oracle::OracleTool::RaLsp);
         let backlog = vec!["src/a.rs".to_string()];
         // A heal/bootstrap pass (None) contributes no paths.
-        assert_eq!(assemble_worklist(backlog, None, &rust), vec!["src/a.rs"]);
-        assert!(assemble_worklist(Vec::new(), None, &rust).is_empty());
+        assert_eq!(assemble_worklist(backlog, &mut BTreeSet::new(), None, &rust), vec!["src/a.rs"]);
+        assert!(assemble_worklist(Vec::new(), &mut BTreeSet::new(), None, &rust).is_empty());
     }
 
     #[test]
@@ -570,6 +585,7 @@ mod tests {
         assert_eq!(
             assemble_worklist(
                 Vec::new(),
+                &mut BTreeSet::new(),
                 Some(&changed),
                 &backend(rag_rat_oracle::OracleTool::RaLsp)
             ),
@@ -578,6 +594,7 @@ mod tests {
         assert_eq!(
             assemble_worklist(
                 Vec::new(),
+                &mut BTreeSet::new(),
                 Some(&changed),
                 &backend(rag_rat_oracle::OracleTool::TsLsp)
             ),
@@ -755,27 +772,90 @@ mod tests {
     }
 
     #[test]
-    fn only_a_layout_change_requeues_the_paths_the_session_could_not_configure() {
+    fn a_parked_path_rides_along_with_real_work_but_never_causes_a_pass() {
+        // The operator fix this exists for — consolidating the checkout's compilation databases —
+        // changes no file in this backend's languages, so it can never build a worklist of its own.
+        // Waiting for a pass to ABORT on the layout change is too narrow a trigger: an ordinary
+        // pass re-answers "can I configure this?" against a freshly resolved layout just as well,
+        // and costs nothing extra because an unconfigurable path is skipped before the request
+        // budget is touched.
         let mut tail = LiveBackendTail::new(backend(rag_rat_oracle::OracleTool::ClangdLsp));
-        let worklist = vec!["b/main.c".to_string()];
-        tail.retain_unconfigured(&worklist, &all_skipped_report(&worklist));
+        let parked = vec!["b/main.c".to_string()];
+        tail.retain_unconfigured(&parked, &all_skipped_report(&parked));
 
-        // A wedged server is not a layout change: the checkout is exactly as it was, so the file
-        // is exactly as unconfigurable and a requeue would buy nothing but another skip.
-        tail.retain_unconfigured(&[], &aborted_report(LivePassAbort::Server));
-        assert!(tail.backlog.is_empty(), "a server abort must not requeue an unconfigurable path");
-        assert_eq!(tail.unconfigured_paths.len(), 1, "…and must not drop it either");
-
-        // A layout change does. This is the operator having fixed exactly what the warning asked
-        // for, and the whole point is that something happens when they do.
-        tail.retain_unconfigured(&[], &aborted_report(LivePassAbort::LayoutChanged));
-        assert_eq!(tail.backlog, vec!["b/main.c".to_string()]);
-        assert!(tail.unconfigured_paths.is_empty(), "moved into the backlog, not copied");
+        // Alone, it still schedules nothing — parking these in the backlog would spin the watcher
+        // forever on work every pass can only re-skip. Driven through `assemble_worklist`, which
+        // is the ONE place a pass's worklist is built, so this covers the wiring and not just a
+        // helper the pass might not call.
+        let empty = assemble_worklist(
+            Vec::new(),
+            &mut tail.unconfigured_paths,
+            Some(&BTreeSet::new()),
+            &tail.backend,
+        );
+        assert!(empty.is_empty(), "a parked path must not manufacture a worklist");
+        assert_eq!(tail.unconfigured_paths.len(), 1, "…and must not be consumed by trying");
         assert_eq!(
             tail.next_wake_in(Duration::from_secs(600), Instant::now()),
-            Some(LIVE_ORACLE_RETRY_INTERVAL),
-            "the requeued work schedules the pass that resolves it",
+            None,
+            "what is parked here must not schedule a pass on its own",
         );
+
+        // But any pass that is happening anyway carries it.
+        let changed = BTreeSet::from(["a/other.c".to_string()]);
+        let worklist = assemble_worklist(
+            Vec::new(),
+            &mut tail.unconfigured_paths,
+            Some(&changed),
+            &tail.backend,
+        );
+        assert_eq!(worklist, vec!["a/other.c".to_string(), "b/main.c".to_string()]);
+        assert!(tail.unconfigured_paths.is_empty(), "drained into the worklist, not copied");
+
+        // Still unconfigurable → parked again, and the cycle settles rather than growing.
+        tail.retain_unconfigured(&worklist, &all_skipped_report(&parked));
+        assert_eq!(tail.unconfigured_paths, BTreeSet::from(["b/main.c".to_string()]));
+
+        // Resolvable now → the pass carries it without skipping, and it is simply gone.
+        let worklist = assemble_worklist(
+            Vec::new(),
+            &mut tail.unconfigured_paths,
+            Some(&changed),
+            &tail.backend,
+        );
+        tail.retain_unconfigured(&worklist, &LivePassReport::default());
+        assert!(tail.unconfigured_paths.is_empty());
+        assert!(tail.backlog.is_empty(), "resolving a parked path leaves nothing behind");
+    }
+
+    #[test]
+    fn a_parked_path_is_not_dropped_by_an_abort_that_never_reached_it() {
+        // An abort requeues the whole worklist through `unfinished_paths`, so a parked path the
+        // pass was carrying rides the backlog rather than the parked set. It must not be lost in
+        // the handover: `retain_unconfigured` clears carried paths, and the backlog is what brings
+        // this one back.
+        let mut tail = LiveBackendTail::new(backend(rag_rat_oracle::OracleTool::ClangdLsp));
+        let parked = vec!["b/main.c".to_string()];
+        tail.retain_unconfigured(&parked, &all_skipped_report(&parked));
+
+        let changed = BTreeSet::from(["a/other.c".to_string()]);
+        let worklist = assemble_worklist(
+            Vec::new(),
+            &mut tail.unconfigured_paths,
+            Some(&changed),
+            &tail.backend,
+        );
+        let mut aborted = aborted_report(LivePassAbort::Server);
+        aborted.unfinished_paths = worklist.clone();
+        tail.backlog = aborted.unfinished_paths.clone();
+        tail.retain_unconfigured(&worklist, &aborted);
+
+        assert!(
+            tail.backlog.contains(&"b/main.c".to_string()),
+            "a parked path the pass never reached must survive the abort: {:?}",
+            tail.backlog,
+        );
+        assert!(tail.unconfigured_paths.is_empty(), "it is in the backlog, not parked twice");
     }
 
     #[test]

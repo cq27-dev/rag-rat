@@ -585,6 +585,54 @@ fn one_malformed_entry_anywhere_makes_the_whole_database_unusable() {
 }
 
 #[test]
+fn the_invocations_json_type_is_checked_exactly_where_clangd_checks_it() {
+    // A present-but-wrong-typed invocation discards the whole database exactly like a missing key,
+    // so presence alone is not enough. Measured with clangd 19.1.2: `"command"` as an array gives
+    // `Expected string as value`, `"arguments"` as a string gives `Expected sequence as value`,
+    // and both fall back to generic flags for every file.
+    //
+    // The path fields are the other half of the same discipline: clangd COERCES them (the same
+    // version loads `"directory": 7` and runs the command in a directory named `7`), so requiring
+    // strings there would reject a database the server accepts — a false negative costs a checkout
+    // its live evidence, which is worse than the malformed input it would catch. This check agrees
+    // with the server rather than improving on it, in both directions.
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-entry-types");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+
+    let rejected = [
+        r#"[{"directory":"/x","file":"/x/a.c","command":["cc","-c","a.c"]}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":"cc -c a.c"}]"#,
+    ];
+    for database in rejected {
+        std::fs::write(dir.join("compile_commands.json"), database).unwrap();
+        assert!(
+            !clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            "clangd refuses to load {database}, so it configures nothing",
+        );
+    }
+
+    let accepted = [
+        // Each invocation in its own correct form, including an empty argument list, which clangd
+        // loads rather than rejecting.
+        r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c"}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":["cc","-c","a.c"]}]"#,
+        r#"[{"directory":"/x","file":"/x/a.c","arguments":[]}]"#,
+        // Coerced path fields: clangd loads these, so this check must not be stricter.
+        r#"[{"directory":7,"file":"/x/a.c","command":"cc -c a.c"}]"#,
+        r#"[{"directory":"/x","file":7,"command":"cc -c a.c"}]"#,
+    ];
+    for database in accepted {
+        std::fs::write(dir.join("compile_commands.json"), database).unwrap();
+        assert!(
+            clangd.checkout_can_signal_readiness(&dir, &clangd.resolve_layout(&dir)),
+            "clangd loads {database}, so this check must not refuse it",
+        );
+    }
+}
+
+#[test]
 fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
     // Checking every entry makes the cost scale with the database, and this runs while the
     // maintenance pass holds the repository write lock — so the size a large C++ project actually
@@ -694,6 +742,47 @@ fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
         clangd.spawn_args(&["--background-index"], &layout),
         vec![OsString::from("--background-index")],
         "an unusable second database disqualifies pinning too",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_marker_search_does_not_follow_a_symlink_out_of_the_checkout() {
+    // Following directory symlinks is what makes a symlinked `build/` discoverable, but a link
+    // pointing OUT of the checkout (`sdk -> /opt/sdk`, `external -> ..`) is not part of it. Walking
+    // through one costs an unrelated tree's traversal while the maintenance pass holds the
+    // repository write lock, and — worse — counts a database found out there as this checkout's,
+    // which flips the pinning decision for files that have nothing to do with it.
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let outside = rag_rat_base::test_scratch::ScratchDir::new("clangd-outside-tree");
+    std::fs::create_dir_all(outside.join("vendor/build")).unwrap();
+    std::fs::write(outside.join("vendor/build/compile_commands.json"), COMPDB).unwrap();
+
+    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-escaping-link");
+    std::fs::create_dir_all(dir.join("build")).unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+    // The escape: a link to a tree that holds its own database.
+    std::os::unix::fs::symlink(outside.path(), dir.join("sdk")).unwrap();
+
+    let layout = clangd.resolve_layout(&dir);
+    assert!(
+        clangd
+            .spawn_args(&["--background-index"], &layout)
+            .contains(&compdb_arg(&dir.join("build"))),
+        "the checkout has exactly one database; a link out of it must not make that two",
+    );
+
+    // Control: the same shape INSIDE the checkout is a second database and does disqualify
+    // pinning — so the assertion above cannot pass by the walk simply never descending.
+    std::fs::create_dir_all(dir.join("inside/build")).unwrap();
+    std::fs::write(dir.join("inside/build/compile_commands.json"), COMPDB).unwrap();
+    let layout = clangd.resolve_layout(&dir);
+    assert_eq!(
+        clangd.spawn_args(&["--background-index"], &layout),
+        vec![OsString::from("--background-index")],
+        "a second database inside the checkout still counts",
     );
 }
 

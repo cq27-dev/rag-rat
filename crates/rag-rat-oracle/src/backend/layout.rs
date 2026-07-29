@@ -153,6 +153,9 @@ fn is_searchable_for_marker(path: &Path, name: &str) -> bool {
 pub(super) fn marker_sites(root: &Path, marker: &str) -> Vec<MarkerSite> {
     let mut search = MarkerSearch {
         marker,
+        // The scope the walk may not leave. A root that will not canonicalize is used as given:
+        // the containment check then simply admits less, which is the safe direction.
+        scope: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
         visited_links: HashSet::new(),
         recorded_markers: HashSet::new(),
         found: Vec::new(),
@@ -172,6 +175,13 @@ const MARKER_SEARCH_MAX_DEPTH: u32 = 24;
 /// files it has already visited, and the sites found so far.
 struct MarkerSearch<'a> {
     marker: &'a str,
+    /// The canonical checkout root the walk may not leave. Following directory symlinks is what
+    /// makes a symlinked `build/` discoverable, but a link like `sdk -> /opt/sdk` or
+    /// `external -> ..` points OUT of the checkout: without this the walk would recurse through an
+    /// unrelated tree — to the depth limit, while the maintenance pass holds the repository write
+    /// lock — and count any `compile_commands.json` it found there as this checkout's, changing
+    /// both the pinning decision and the prerequisite verdict.
+    scope: PathBuf,
     /// Canonical paths of the SYMLINKED directories already descended into. Following directory
     /// symlinks is what makes a symlinked build directory discoverable, and it is also the only
     /// way this walk can revisit a directory — so recording just those targets bounds the
@@ -248,13 +258,15 @@ impl MarkerSearch<'_> {
         }
         // `file_type` describes the LINK, and on Linux it is answered from the readdir result where
         // the filesystem reports it — so ordinary directories cost nothing here and only the rare
-        // symlink is canonicalized. Skipping a target already walked is what makes a checkout with
-        // several self-referential links terminate quickly instead of exploring every path through
-        // them; a link that cannot be canonicalized is not descended into at all.
-        if entry.file_type().is_ok_and(|kind| kind.is_symlink())
-            && !self.visited_links.insert(path.canonicalize().ok()?)
-        {
-            return None;
+        // symlink is canonicalized. An ordinary subdirectory cannot leave the checkout, so only a
+        // link is checked against `scope`; skipping a target already walked is what makes a
+        // checkout with several self-referential links terminate quickly instead of exploring every
+        // path through them. A link that cannot be canonicalized is not descended into at all.
+        if entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+            let target = path.canonicalize().ok()?;
+            if !target.starts_with(&self.scope) || !self.visited_links.insert(target) {
+                return None;
+            }
         }
         Some(path)
     }
@@ -325,17 +337,76 @@ struct CompilationDatabase {
 /// "arguments"`) and falls back to generic flags for the whole checkout, so an entry naming only a
 /// file is not a usable database however well-formed its JSON is.
 ///
-/// Only the PRESENCE of each field is checked, so every payload is discarded while parsing —
-/// `file` and `directory` are required by their types, and the invocation is checked in
-/// [`CompilationDatabaseVisitor`] because either form satisfies it.
+/// The invocation's TYPE is checked, not just its presence: measured with clangd 19.1.2, a
+/// `"command"` that is not a string is rejected with `Expected string as value`, and an
+/// `"arguments"` that is not an array with `Expected sequence as value` — each discarding the whole
+/// database, exactly like a missing key. Which of the two forms is present is checked in
+/// [`CompilationDatabaseVisitor`], because either satisfies the format.
+///
+/// `file` and `directory` are deliberately presence-only. clangd COERCES them: the same version
+/// loads `"directory": 7` and runs the command in a directory literally named `7`. Requiring a
+/// string there would reject databases the server accepts — a false negative that silently costs a
+/// checkout its live evidence, which is worse than the malformed input it would catch.
+///
+/// Every payload is discarded while parsing, so nothing here allocates per entry.
 #[derive(Deserialize)]
 struct CompilationEntry {
     #[allow(dead_code)]
     file: IgnoredAny,
     #[allow(dead_code)]
     directory: IgnoredAny,
-    command: Option<IgnoredAny>,
-    arguments: Option<IgnoredAny>,
+    command: Option<JsonString>,
+    arguments: Option<JsonArray>,
+}
+
+/// A JSON string whose CONTENT is discarded — the type is the whole check. Deserializing into
+/// `String` would allocate once per entry across a database with hundreds of thousands of them.
+struct JsonString;
+
+impl<'de> Deserialize<'de> for JsonString {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_str(JsonScalarVisitor)
+    }
+}
+
+struct JsonScalarVisitor;
+
+impl<'de> Visitor<'de> for JsonScalarVisitor {
+    type Value = JsonString;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a compile command as a string")
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(JsonString)
+    }
+}
+
+/// A JSON array whose ELEMENTS are discarded — as with [`JsonString`], only the type is checked.
+struct JsonArray;
+
+impl<'de> Deserialize<'de> for JsonArray {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_seq(JsonArrayVisitor)
+    }
+}
+
+struct JsonArrayVisitor;
+
+impl<'de> Visitor<'de> for JsonArrayVisitor {
+    type Value = JsonArray;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("compile arguments as an array")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        // An EMPTY array is accepted on purpose: clangd loads such a database rather than
+        // rejecting it, and this check exists to agree with the server, not to improve on it.
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(JsonArray)
+    }
 }
 
 impl<'de> Deserialize<'de> for CompilationDatabase {
