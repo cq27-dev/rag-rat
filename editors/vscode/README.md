@@ -38,7 +38,11 @@ SecretStorage. The same command records which repository AND which checkout that
 the opened workspace — a repository's linked worktrees share one identity, and every line a server
 reports belongs to the working tree it indexed — and asks for the indexed root: leave it empty to
 follow the server's own metadata, or answer `.` when the opened folder is already the indexed
-subdirectory. All of it is stored per (server, workspace) pair, so a second workspace or endpoint
+subdirectory. Spell that path with `/` on every platform, including Windows, and match the local
+directory's casing exactly: a hosted server may run on a filesystem with the opposite case rules,
+so the extension compares against the opened folder rather than guessing, and a mismatch shows no
+signals instead of resolving against a different directory.
+All of it is stored per (server, workspace) pair, so a second workspace or endpoint
 never inherits the first one's mapping, and a server that moves to another checkout stops being
 served rather than reporting another tree's lines.
 Browser extension hosts (vscode.dev, Codespaces

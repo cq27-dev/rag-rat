@@ -4,6 +4,7 @@ import * as vscode from 'vscode';
 import { LensClient } from './client';
 import {
   associateHostedWorkspace,
+  INDEXED_ROOT_ERROR,
   LensEndpointResolver,
   normalizeServerUrl,
   obsoleteServerTokenSecret,
@@ -18,6 +19,7 @@ import { logError, logInfo, showLog } from './output';
 import { LensOverlays } from './overlays';
 import { registerSidebar } from './sidebar';
 import { FileStore } from './store';
+import { normalizeIndexedRootOverride } from './workspace_paths';
 
 const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
@@ -380,9 +382,16 @@ export function activate(context: vscode.ExtensionContext): void {
           .catch(() => undefined);
         const indexedRoot = await vscode.window.showInputBox({
           prompt:
-            'Indexed root relative to this workspace (empty to use server metadata; "." when the opened folder is already the indexed root)',
+            'Indexed root relative to this workspace, "/"-separated on every platform (empty to use server metadata; "." when the opened folder is already the indexed root)',
           value: previousRoot ?? '',
           ignoreFocusOut: true,
+          // Checked while it is typed, not only when it is stored: an override this validator
+          // refuses would otherwise match no document and leave every lens lane silent for the
+          // workspace, with nothing on screen to connect the silence to what was entered.
+          validateInput: (value) =>
+            normalizeIndexedRootOverride(value.trim()) === undefined
+              ? INDEXED_ROOT_ERROR
+              : undefined,
         });
         if (indexedRoot === undefined) {
           return;

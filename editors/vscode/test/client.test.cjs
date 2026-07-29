@@ -335,11 +335,98 @@ test('case-insensitive prefixes fold like the filesystem, not like lowercasing',
   assert.equal(indexedPath('ß/src/lib.rs', 'SS', true), 'src/lib.rs');
 });
 
+test('a literal backslash names a file, it does not separate directories', async () => {
+  const { indexedPath, indexedRootPrefixForDiscovery, workspacePath, workspaceRelativePath } =
+    await loadSourceModule('workspace_paths.ts');
+
+  // `src/foo\bar.rs` and `src/foo/bar.rs` are two different documents on a Unix checkout. Folding
+  // the first onto the second shows one file's signals over the other when both are indexed, and
+  // silences every lane when only the backslash-named one is.
+  assert.equal(indexedPath('crate/foo\\bar.rs', 'crate'), 'foo\\bar.rs');
+  assert.equal(indexedPath('crate/foo/bar.rs', 'crate'), 'foo/bar.rs');
+  assert.equal(workspacePath('foo\\bar.rs', 'crate'), 'crate/foo\\bar.rs');
+  // A backslash inside a segment belongs to that segment's name, so it cannot match the prefix.
+  assert.equal(indexedPath('crate\\foo/bar.rs', 'crate'), undefined);
+  assert.equal(indexedRootPrefixForDiscovery('crate', 'crate\\sub'), undefined);
+  assert.equal(indexedRootPrefixForDiscovery('crate\\sub', 'crate'), undefined);
+
+  // Absolute paths in either host's spelling are refused, never rewritten into relative ones.
+  for (const absolute of [
+    '/repo/src/lib.rs',
+    '\\\\server\\share\\lib.rs',
+    'C:/repo/src/lib.rs',
+    'C:\\repo\\src\\lib.rs',
+  ]) {
+    assert.equal(indexedPath(absolute, ''), undefined, absolute);
+    assert.equal(workspacePath(absolute, ''), undefined, absolute);
+  }
+  // Traversal stays refused under EITHER separator. Refusing costs at most one file's signals,
+  // while accepting a segment a Windows host would read as `..` resolves it outside the workspace.
+  assert.equal(indexedPath('crate/..\\lib.rs', 'crate'), undefined);
+  assert.equal(indexedPath('crate/sub\\..\\lib.rs', 'crate'), undefined);
+  assert.equal(workspacePath('..\\lib.rs', 'crate'), undefined);
+
+  // The workspace-folder strip happens in URI space for the same reason.
+  assert.equal(workspaceRelativePath('/repo', '/repo/src/foo\\bar.rs'), 'src/foo\\bar.rs');
+  assert.equal(workspaceRelativePath('/repo/', '/repo/src/lib.rs'), 'src/lib.rs');
+  assert.equal(workspaceRelativePath('/repo', '/repo'), undefined);
+  assert.equal(workspaceRelativePath('/repo', '/other/src/lib.rs'), undefined);
+  // A Windows client's `file:` URI path is `/c:/repo` — still `/`-separated, still matches.
+  assert.equal(workspaceRelativePath('/c:/repo', '/c:/repo/src/lib.rs'), 'src/lib.rs');
+  // Both operands are client URIs and `getWorkspaceFolder` has already matched them, which on a
+  // case-insensitive client it does whatever the prefix's casing is. The strip folds so a document
+  // opened through a differently-cased path keeps its signals; nothing here selects a folder.
+  assert.equal(workspaceRelativePath('/c:/repo', '/c:/Repo/src/lib.rs'), 'src/lib.rs');
+  assert.equal(workspaceRelativePath('/c:/Repo', '/c:/repo/src/lib.rs'), 'src/lib.rs');
+  // Folding the prefix is not folding the remainder: what is stripped is the folder, and the rest
+  // of the path is returned verbatim for the indexed-root comparison to judge.
+  assert.equal(workspaceRelativePath('/c:/Repo', '/c:/repo/Src/lib.rs'), 'Src/lib.rs');
+});
+
+test('a leading drive letter is only absolute when a separator follows it', async () => {
+  const { indexedPath, workspacePath } = await loadSourceModule('workspace_paths.ts');
+
+  // `R:notes.md` is a legal file name on a Unix checkout and the server renders it verbatim, so
+  // reading a bare letter-colon as a Windows drive would silence a file that exists — the same
+  // "treat a legal POSIX name as Windows syntax" mistake as folding `\` into a separator.
+  assert.equal(indexedPath('R:notes.md', ''), 'R:notes.md');
+  assert.equal(workspacePath('R:notes.md', ''), 'R:notes.md');
+  assert.equal(indexedPath('crate/R:notes.md', 'crate'), 'R:notes.md');
+  assert.equal(workspacePath('R:notes.md', 'crate'), 'crate/R:notes.md');
+  assert.equal(indexedPath('a:b/lib.rs', ''), 'a:b/lib.rs');
+});
+
+test('the typed indexed root is the one value validated for host spellings', async () => {
+  const { normalizeIndexedRootOverride } = await loadSourceModule('workspace_paths.ts');
+
+  // Every other path in the pipeline is `/`-separated by construction — `vscode.Uri.path` on any
+  // host, and the server's own rendering of a repository path. A typed one is not: a Windows user
+  // spells the boundary `\`, and storing `crate\sub` would leave a prefix that matches no document
+  // at all, silencing every lane for the whole workspace with no error anywhere.
+  assert.equal(normalizeIndexedRootOverride('crate/sub'), 'crate/sub');
+  assert.equal(normalizeIndexedRootOverride(''), '');
+  assert.equal(normalizeIndexedRootOverride('.'), '');
+  for (const rejected of [
+    'crate\\sub',
+    'crate\\',
+    '\\crate',
+    'C:sub',
+    'C:/repo/crate',
+    'C:\\repo\\crate',
+    '/repo/crate',
+    '../elsewhere',
+    'crate//sub',
+  ]) {
+    assert.equal(normalizeIndexedRootOverride(rejected), undefined, rejected);
+  }
+});
+
 test('indexed-root workspace discovers the worktree file and maps navigation', async () => {
   const fakeUri = (uriPath) => ({
     scheme: 'file',
     path: uriPath,
     toString: () => `file://${uriPath}`,
+    with: ({ path: replacement }) => fakeUri(replacement),
   });
   const folder = { uri: fakeUri('/repo/crate') };
   const reads = [];
@@ -375,7 +462,11 @@ test('indexed-root workspace discovers the worktree file and maps navigation', a
         },
       },
       getWorkspaceFolder: () => folder,
-      asRelativePath: (uri) => path.posix.relative(folder.uri.path, uri.path),
+      // Relative paths come from `Uri.path`, never from `asRelativePath`, which answers with the
+      // host's separators and so cannot distinguish a directory boundary from a `\` in a name.
+      asRelativePath: () => {
+        throw new Error('asRelativePath must not be consulted for indexed paths');
+      },
     },
   };
   const { LensEndpointResolver } = await loadSourceModule('discovery.ts', vscode);
@@ -396,11 +487,137 @@ test('indexed-root workspace discovers the worktree file and maps navigation', a
   assert.equal(resolver.uriOf('src/lib.rs').path, '/repo/crate/src/lib.rs');
 });
 
+/**
+ * A discovery-backed resolver whose workspace folder sits at the indexed root, parameterised by the
+ * folder's URI path so the same assertions run for a POSIX host (`/repo`) and a Windows one
+ * (`/c:/repo`, which is what `Uri.file('c:\\repo').path` produces).
+ */
+async function loopbackResolver(folderPath, discoveryOverrides = {}) {
+  const fakeUri = (uriPath, scheme = 'file') => ({
+    scheme,
+    path: uriPath,
+    authority: '',
+    toString: () => `${scheme}://${uriPath}`,
+    with: ({ path: replacement }) => fakeUri(replacement, scheme),
+  });
+  const folder = { uri: fakeUri(folderPath) };
+  const vscode = {
+    Uri: {
+      joinPath: (base, ...segments) => fakeUri(path.posix.resolve(base.path, ...segments)),
+    },
+    workspace: {
+      workspaceFolders: [folder],
+      isTrusted: true,
+      fs: {
+        readFile: async (uri) => {
+          if (uri.path !== `${folderPath}/.rag-rat/sockets/lens.json`) {
+            throw new Error('not found');
+          }
+          return new TextEncoder().encode(
+            JSON.stringify({
+              schema: 'rag-rat-lens-discovery',
+              version: 1,
+              url: 'http://127.0.0.1:18120',
+              indexed_root: '',
+              case_insensitive_paths: false,
+              ownership_token: 'owner',
+              ...discoveryOverrides,
+            }),
+          );
+        },
+        stat: async (uri) => {
+          if (uri.path === `${folderPath}/.git`) {
+            return { type: 1 };
+          }
+          throw new Error('not found');
+        },
+      },
+      getWorkspaceFolder: (uri) => (uri.path.startsWith(`${folderPath}/`) ? folder : undefined),
+      asRelativePath: () => {
+        throw new Error('asRelativePath must not be consulted for indexed paths');
+      },
+    },
+  };
+  const { LensEndpointResolver } = await loadSourceModule('discovery.ts', vscode);
+  const resolver = new LensEndpointResolver(
+    { inspect: () => ({ globalValue: '' }) },
+    { get: async () => undefined },
+  );
+  await resolver.resolve();
+  return { resolver, fakeUri };
+}
+
+test('document paths stay in URI space on both a POSIX and a Windows host', async () => {
+  for (const folderPath of ['/repo', '/c:/repo']) {
+    const { resolver, fakeUri } = await loopbackResolver(folderPath);
+
+    // The two names are distinct documents and must map to distinct indexed paths, in both
+    // directions. Rewriting `\` as a separator collapses them onto one.
+    assert.equal(
+      resolver.pathOf({ uri: fakeUri(`${folderPath}/src/foo\\bar.rs`) }),
+      'src/foo\\bar.rs',
+      folderPath,
+    );
+    assert.equal(
+      resolver.pathOf({ uri: fakeUri(`${folderPath}/src/foo/bar.rs`) }),
+      'src/foo/bar.rs',
+      folderPath,
+    );
+    assert.equal(resolver.uriOf('src/foo\\bar.rs').path, `${folderPath}/src/foo\\bar.rs`);
+    assert.equal(resolver.uriOf('src/foo/bar.rs').path, `${folderPath}/src/foo/bar.rs`);
+    assert.equal(resolver.uriOf('src/lib.rs').path, `${folderPath}/src/lib.rs`);
+
+    // Unsaved buffers, documents outside the folder, and a document whose URI belongs to another
+    // scheme all still answer nothing.
+    assert.equal(
+      resolver.pathOf({ uri: fakeUri(`${folderPath}/src/lib.rs`), isDirty: true }),
+      undefined,
+    );
+    assert.equal(resolver.pathOf({ uri: fakeUri('/elsewhere/src/lib.rs') }), undefined);
+    assert.equal(
+      resolver.pathOf({ uri: fakeUri(`${folderPath}/src/lib.rs`, 'vscode-vfs') }),
+      undefined,
+    );
+
+    if (folderPath === '/repo') {
+      // Windows forbids `:` in a file name, so this one can only exist on a Unix checkout — where
+      // it is ordinary, and where reading its leading `R:` as a drive would map it to nothing.
+      assert.equal(resolver.pathOf({ uri: fakeUri('/repo/R:notes.md') }), 'R:notes.md');
+      assert.equal(resolver.uriOf('R:notes.md').path, '/repo/R:notes.md');
+    }
+  }
+});
+
+test('an embedded loopback server still governs case folding for client paths', async () => {
+  // Loopback discovery reads a file on this machine and refuses a non-loopback URL, so the
+  // server's filesystem IS the client's and its flag describes both.
+  const folded = await loopbackResolver('/repo', {
+    indexed_root: 'Crate',
+    case_insensitive_paths: true,
+  });
+  assert.equal(
+    folded.resolver.pathOf({ uri: folded.fakeUri('/repo/crate/src/lib.rs') }),
+    'src/lib.rs',
+  );
+
+  const exact = await loopbackResolver('/repo', {
+    indexed_root: 'Crate',
+    case_insensitive_paths: false,
+  });
+  assert.equal(exact.resolver.pathOf({ uri: exact.fakeUri('/repo/crate/src/lib.rs') }), undefined);
+  assert.equal(
+    exact.resolver.pathOf({ uri: exact.fakeUri('/repo/Crate/src/lib.rs') }),
+    'src/lib.rs',
+  );
+});
+
 test('hosted indexed-root overrides stay scoped to one workspace association', async (t) => {
   const fakeUri = (uriPath) => ({
     scheme: 'vscode-vfs',
     path: uriPath,
+    authority: '',
     toString: () => `vscode-vfs://${uriPath}`,
+    with: ({ path: replacement }) => fakeUri(replacement),
   });
   const atIndexedRoot = { uri: fakeUri('/repo-a') };
   const atWorktreeTop = { uri: fakeUri('/repo-b') };
@@ -411,7 +628,9 @@ test('hosted indexed-root overrides stay scoped to one workspace association', a
         return [folder];
       },
       getWorkspaceFolder: () => folder,
-      asRelativePath: (uri) => path.posix.relative(folder.uri.path, uri.path),
+      asRelativePath: () => {
+        throw new Error('asRelativePath must not be consulted for indexed paths');
+      },
     },
   };
   const previousFetch = global.fetch;
@@ -461,8 +680,21 @@ test('hosted indexed-root overrides stay scoped to one workspace association', a
 
   const fromTop = new LensEndpointResolver(config, secrets);
   assert.deepEqual(await fromTop.resolve(), { baseUrl, token: 'hosted-token' });
-  assert.equal(fromTop.pathOf({ uri: fakeUri('/repo-b/Crate/src/lib.rs') }), 'src/lib.rs');
+  assert.equal(fromTop.pathOf({ uri: fakeUri('/repo-b/crate/src/lib.rs') }), 'src/lib.rs');
+  // `/api/status` reports `case_insensitive_paths: true`, but that describes the SERVER's
+  // filesystem. A hosted server can be another machine, so a differently-cased local directory
+  // must NOT be accepted as the indexed root — that would strip the prefix and resolve the
+  // remainder against a different directory, painting its signals over the wrong files.
+  assert.equal(fromTop.pathOf({ uri: fakeUri('/repo-b/Crate/src/lib.rs') }), undefined);
   assert.equal(fromTop.pathOf({ uri: fakeUri('/repo-b/src/lib.rs') }), undefined);
+  // That rule governs the indexed-root prefix ONLY. The workspace-folder strip above it compares
+  // two client URIs whose containment VS Code has already decided — `getWorkspaceFolder` returned
+  // this folder for this document, which on a case-insensitive client it does for a URI built
+  // outside the explorer (a terminal link, a compiler diagnostic) carrying different casing.
+  // Applying the hosted rule there would empty every lane for that document with no error and
+  // nothing to set: the indexed-root override cannot correct a folder-prefix mismatch.
+  assert.equal(fromTop.pathOf({ uri: fakeUri('/Repo-B/crate/src/lib.rs') }), 'src/lib.rs');
+  assert.equal(fromTop.pathOf({ uri: fakeUri('/Repo-B/Crate/src/lib.rs') }), undefined);
 
   folder = atIndexedRoot;
   const fromIndexedRoot = new LensEndpointResolver(config, secrets);
@@ -471,6 +703,27 @@ test('hosted indexed-root overrides stay scoped to one workspace association', a
 
   await assert.rejects(
     associateHostedWorkspace(baseUrl, 'hosted-token', secrets, '../elsewhere'),
+    /safe workspace-relative path/,
+  );
+  // An override spelled the host's way is refused where it is typed. Storing one would leave a
+  // prefix no document can match: the mapping compares against `/`-separated URI paths, so
+  // `crate\sub` is a single segment named `crate\sub` and every lane goes quiet, permanently and
+  // silently, for the whole workspace.
+  for (const hostSpelled of ['crate\\sub', 'crate\\', 'C:sub', 'C:\\repo\\crate']) {
+    await assert.rejects(
+      associateHostedWorkspace(baseUrl, 'hosted-token', secrets, hostSpelled),
+      /safe workspace-relative path/,
+      hostSpelled,
+    );
+  }
+  // A stored override that predates that check fails loudly at resolve time instead of mapping
+  // nothing, so the user is told to re-run "rag-rat Lens: Configure Server".
+  stored.set(
+    hostedRepoAssociationSecret(baseUrl, atIndexedRoot.uri.toString()),
+    JSON.stringify({ repoId: 'repo-a', worktreeId: '', indexedRoot: 'crate\\sub' }),
+  );
+  await assert.rejects(
+    new LensEndpointResolver(config, secrets).resolve(),
     /safe workspace-relative path/,
   );
   stored.set(

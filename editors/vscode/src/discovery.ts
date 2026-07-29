@@ -2,8 +2,10 @@ import * as vscode from 'vscode';
 import {
   indexedPath,
   indexedRootPrefixForDiscovery,
+  normalizeIndexedRootOverride,
   normalizeRelativePath,
   workspacePath,
+  workspaceRelativePath,
 } from './workspace_paths';
 
 export interface LensEndpoint {
@@ -25,6 +27,11 @@ interface LensServerStatus {
   /** The checkout the server indexes — empty for a main worktree, the linked worktree otherwise. */
   worktree_id: string;
   indexed_root: string;
+  /**
+   * The SERVER's filesystem semantics. Only usable for comparisons over CLIENT paths when the two
+   * are the same machine, which the extension can establish for loopback discovery and not for a
+   * hosted server — see `resolveUncached`.
+   */
   case_insensitive_paths: boolean;
 }
 
@@ -51,6 +58,15 @@ interface HostedAssociation {
 
 const DISCOVERY_TTL_MS = 2_000;
 
+/**
+ * Shared by the input box that collects the indexed-root override and the two places that refuse a
+ * bad one, so a user who typed `crate\sub` reads the same sentence while typing as they would after
+ * the fact. The separator clause is load-bearing guidance, not decoration: `\` is what a Windows
+ * user reaches for, and it is the spelling nothing downstream can match.
+ */
+export const INDEXED_ROOT_ERROR =
+  'Lens indexed root must be a safe workspace-relative path, "/"-separated on every platform';
+
 /** A discovery file pointing off-loopback is a hard boundary violation, never "try next folder". */
 class NonLoopbackDiscoveryError extends Error {}
 
@@ -71,7 +87,6 @@ interface ConfiguredMapping {
   baseUrl: string;
   workspace: string;
   indexedRootPrefix: string;
-  caseInsensitivePaths: boolean;
 }
 
 /**
@@ -154,7 +169,19 @@ export class LensEndpointResolver {
       return {
         endpoint: { baseUrl, token },
         indexedRootPrefix: mapping.indexedRootPrefix,
-        caseInsensitivePaths: mapping.caseInsensitivePaths,
+        // Exact comparisons, whatever `/api/status` reports. `case_insensitive_paths` describes
+        // the SERVER's filesystem, while the one comparison it governs — a client document path
+        // against the indexed-root prefix — is decided on the CLIENT, and a hosted server can be
+        // another machine with the opposite semantics. The extension cannot answer the question
+        // for itself either: it runs in a web worker as well as a Node host, and on a virtual or
+        // remote workspace there may be no local filesystem to probe — which is exactly where a
+        // hosted server is most likely. The failure directions are not symmetric: accepting a
+        // differently-cased prefix strips it and resolves the rest against a DIFFERENT directory,
+        // showing that directory's memories and clones over these files, while refusing one only
+        // costs signals for a path the user can correct through "rag-rat Lens: Configure Server".
+        // Loopback discovery keeps the server's flag below, where server and client are provably
+        // the same machine.
+        caseInsensitivePaths: false,
         configuredMapping: mapping,
       };
     }
@@ -204,6 +231,8 @@ export class LensEndpointResolver {
           return {
             endpoint: { baseUrl, token: discovery.ownership_token },
             indexedRootPrefix: prefix,
+            // Sound here and only here: the discovery file was read from this machine's filesystem
+            // and its URL is required to be loopback, so the server's semantics are the client's.
             caseInsensitivePaths: discovery.case_insensitive_paths,
             // Automatic discovery carries no hosted association to remember.
             configuredMapping: undefined,
@@ -236,18 +265,27 @@ export class LensEndpointResolver {
    * these bytes, so the honest answer is silence until the file is saved and reindexed.
    */
   pathOf(document: vscode.TextDocument): string | undefined {
+    const folder = vscode.workspace.getWorkspaceFolder(document.uri);
+    if (vscode.workspace.workspaceFolders?.length !== 1 || !folder || document.isDirty) {
+      return undefined;
+    }
+    // Same scheme and authority, then a URI-space strip. `asRelativePath` would answer this too,
+    // but with the HOST's separators, which makes a literal `\` in a Unix filename look like a
+    // directory boundary; URI paths are `/`-separated everywhere and carry no such ambiguity.
     if (
-      vscode.workspace.workspaceFolders?.length !== 1 ||
-      !vscode.workspace.getWorkspaceFolder(document.uri) ||
-      document.isDirty
+      folder.uri.scheme !== document.uri.scheme ||
+      folder.uri.authority !== document.uri.authority
     ) {
       return undefined;
     }
-    return indexedPath(
-      vscode.workspace.asRelativePath(document.uri, false),
-      this.indexedRootPrefix,
-      this.caseInsensitivePaths,
-    );
+    // No case argument: this strip compares two CLIENT URIs whose containment `getWorkspaceFolder`
+    // has already decided, so the server's semantics have no bearing on it. Only the indexed-root
+    // prefix below — a value from the server or the user — is compared under them.
+    const relative = workspaceRelativePath(folder.uri.path, document.uri.path);
+    if (relative === undefined) {
+      return undefined;
+    }
+    return indexedPath(relative, this.indexedRootPrefix, this.caseInsensitivePaths);
   }
 
   uriOf(path: string): vscode.Uri | undefined {
@@ -255,10 +293,12 @@ export class LensEndpointResolver {
       ? vscode.workspace.workspaceFolders[0]
       : undefined;
     const relative = workspacePath(path, this.indexedRootPrefix);
-    if (!folder || relative === undefined) {
+    if (!folder || !relative) {
       return undefined;
     }
-    return vscode.Uri.joinPath(folder.uri, ...relative.split('/'));
+    // Joined in URI space rather than with `Uri.joinPath`, which routes `file:` URIs through the
+    // host's path module and would read a `\` in a Unix filename as a directory boundary.
+    return folder.uri.with({ path: `${folder.uri.path.replace(/\/+$/, '')}/${relative}` });
   }
 }
 
@@ -345,7 +385,7 @@ async function configuredWorkspaceMapping(
   secrets: vscode.SecretStorage,
   baseUrl: string,
   token: string | undefined,
-): Promise<{ baseUrl: string; indexedRootPrefix: string; caseInsensitivePaths: boolean }> {
+): Promise<{ baseUrl: string; indexedRootPrefix: string }> {
   const status = await fetchServerStatus(baseUrl, token);
   const association = await readHostedAssociation(baseUrl, secrets);
   if (!association) {
@@ -361,15 +401,18 @@ async function configuredWorkspaceMapping(
       'hosted Lens server no longer serves the checkout this workspace was associated with; run "rag-rat Lens: Configure Server"',
     );
   }
-  const indexedRootPrefix = normalizeRelativePath(association.indexedRoot ?? status.indexed_root);
+  // Two validators, because the two sources are different: the override was typed by a person and
+  // is the only value that can carry a host separator or drive letter, while `indexed_root` is the
+  // server's own `/`-separated rendering. A stored override predating that check fails loudly here
+  // rather than silently matching nothing.
+  const indexedRootPrefix =
+    association.indexedRoot === undefined
+      ? normalizeRelativePath(status.indexed_root)
+      : normalizeIndexedRootOverride(association.indexedRoot);
   if (indexedRootPrefix === undefined) {
-    throw new Error('Lens indexed root must be a safe workspace-relative path');
+    throw new Error(INDEXED_ROOT_ERROR);
   }
-  return {
-    baseUrl,
-    indexedRootPrefix,
-    caseInsensitivePaths: status.case_insensitive_paths,
-  };
+  return { baseUrl, indexedRootPrefix };
 }
 
 async function fetchServerStatus(
@@ -447,9 +490,9 @@ export async function associateHostedWorkspace(
   const status = await fetchServerStatus(baseUrl, token);
   if (
     indexedRootOverride !== undefined &&
-    normalizeRelativePath(indexedRootOverride) === undefined
+    normalizeIndexedRootOverride(indexedRootOverride) === undefined
   ) {
-    throw new Error('Lens indexed root must be a safe workspace-relative path');
+    throw new Error(INDEXED_ROOT_ERROR);
   }
   const association: HostedAssociation = {
     repoId: status.repo_id,
