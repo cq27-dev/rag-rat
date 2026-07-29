@@ -16,6 +16,11 @@ fn owe_both_heals(db: &IndexDatabase) {
         .connection()
         .execute("DELETE FROM repo_meta WHERE key = 'logical_key_version'", [])
         .unwrap();
+    // These tests rewind the version meta behind a connection that has already run passes, so a
+    // drift snapshot memoized while the version still read CURRENT (i.e. `None`, nothing to heal)
+    // can still be pending. A genuine pre-upgrade open carries no memo; drop it so the heal
+    // captures the snapshot itself, which is also what decides whether it may stamp.
+    *db.drift_snapshot.lock().expect("drift snapshot lock") = None;
 }
 
 fn indexed_root(files: &[(&str, &str)]) -> (ScratchRoot, rag_rat_base::config::Config) {
@@ -62,6 +67,13 @@ fn a_deletion_tombstone_does_not_wedge_the_graph_heal() {
         db.repo_meta("graph_index_version").unwrap().as_deref(),
         Some(GRAPH_INDEX_VERSION),
         "the heal ran to completion and stamped its version"
+    );
+    // Tombstones are filtered before the loop, so every row this heal walked was covered — the
+    // one shape that may stamp the key version and let later passes take the scoped re-derive.
+    assert_eq!(
+        db.repo_meta("logical_key_version").unwrap().as_deref(),
+        Some(LOGICAL_KEY_VERSION),
+        "full coverage stamps the key version"
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -210,10 +222,66 @@ fn a_graph_heal_does_not_rewrite_a_sibling_worktrees_edges() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+/// A row the digest gate skips keeps its OLD `scope_path`, and `regroup_logical_symbols` reads
+/// raw `main.files` across every scope — so that stale scope does not merely lag, it changes
+/// IDENTITY: the cross-scope group splits, the stale row keeps the original `stable_id`, and the
+/// refreshed row gets a new one. Stamping the key version over that would also disarm the two
+/// mechanisms built to recover from it (the drift snapshot, and the scoped-re-derive gate, which
+/// by construction never revisits untouched rows). So partial coverage must DEFER the stamp.
+#[test]
+fn partial_coverage_defers_the_logical_key_stamp() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(
+        main.join("src/shared.rs"),
+        "pub struct S;\nimpl Greet for S { fn hello(&self) {} }\n",
+    )
+    .unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    // A branch whose copy of the path differs, so its row can never be vouched for from here.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(
+        linked.join("src/shared.rs"),
+        "pub struct S;\nimpl Greet for S { fn hello(&self) {} }\npub fn only_here() {}\n",
+    )
+    .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    set_base_scope(&mut db, &main);
+    owe_both_heals(&db);
+    db.ensure_graph_index_current().unwrap();
+
+    assert_eq!(
+        db.repo_meta("graph_index_version").unwrap().as_deref(),
+        Some(GRAPH_INDEX_VERSION),
+        "the graph pass itself ran to completion"
+    );
+    assert_ne!(
+        db.repo_meta("logical_key_version").unwrap().as_deref(),
+        Some(LOGICAL_KEY_VERSION),
+        "a row whose scope could not be refreshed must leave the key version unstamped, so the \
+         drift heal and the full-rederive gate stay armed"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 /// The flip side of the digest gate: it must not turn the heal into a no-op. With a linked
 /// worktree's rows in the same database, the ACTIVE checkout's own rows still hash to their
 /// source, so the heal re-derives them — a gate that read the wrong column, or compared against
 /// a normalized form of the text, would quietly skip everything and leave the graph unbuilt.
+/// Full coverage must also STAMP the key version, or every later pass pays a whole-corpus regroup.
 #[test]
 fn a_graph_heal_still_repopulates_the_active_checkouts_rows() {
     let main = unique_temp_root();

@@ -1067,11 +1067,28 @@ pub(crate) fn resolve_symbol<'a>(
     // bare-name resolution. A qualified target still gets its stronger scope-path pass above,
     // which preserves `self.default_method()` calls in traits without letting `Worker::run`
     // drift onto an unrelated same-tail owner.
+    //
+    // `self`/`Self` is the ONE case that must still reach here: a trait's default method is
+    // owned by the trait, not by the impl type the receiver hint names, so no scope pass above
+    // can find it. That escape hatch used to re-open the WHOLE bare-name pool, which is how
+    // `self.clone()` in a `#[derive(Clone)]` type — where the derive mints no symbol to find —
+    // bound the single unrelated `clone` body anywhere in the workspace. The receiver type is
+    // still evidence when it fails: it rules out any candidate that a DIFFERENT concrete type
+    // demonstrably owns. `receiver_type_admits_owner` below is that filter.
     let trait_self_fallback = request.source_language == Some(Language::Rust.as_str())
         && matches!(request.receiver_hint, Some("self" | "Self"));
     if has_local_receiver_type && !trait_self_fallback {
         return None;
     }
+    let receiver_owner_tail = has_local_receiver_type
+        .then(|| match request.receiver_type {
+            Some(
+                ReceiverTypeIdentity::LocalQualified(path)
+                | ReceiverTypeIdentity::LocalUnqualified(path),
+            ) => Some(qn_tail(path)),
+            _ => None,
+        })
+        .flatten();
     let short = short_name(request.name);
     // A reference that carried a qualifier or a receiver has already had its qualified shape tried
     // above; reaching the bare-name fallback means that shape found nothing. Some target kinds are
@@ -1097,7 +1114,11 @@ pub(crate) fn resolve_symbol<'a>(
         .into_iter()
         .flatten()
         .copied()
-        .filter(|symbol| kind_matches(symbol) && bare_shape_ok(symbol))
+        .filter(|symbol| {
+            kind_matches(symbol)
+                && bare_shape_ok(symbol)
+                && receiver_type_admits_owner(receiver_owner_tail, symbol)
+        })
         .collect::<Vec<_>>();
     let preferred = preferred_matches(request.edge_kind, request.source_language, &matches);
     // Language policy decides whether a type-position reference may bind a value declaration.
@@ -1139,6 +1160,32 @@ pub(crate) fn resolve_symbol<'a>(
         [] => None,
     }
 }
+/// Whether a bare-name candidate is compatible with a receiver type that failed the scope passes.
+///
+/// `None` (no local receiver type) admits everything — the fallback is unchanged for references
+/// that carried no type evidence. With a receiver type, a candidate is admitted only when its
+/// scope does not name a CONFLICTING concrete owner:
+/// - a scope with no trait-impl marker (`WorkerExt::run`, a trait's own default method, or a plain
+///   module-level fn) is admitted: the receiver may well implement that trait;
+/// - a trait-impl scope (`Type as Trait::method`) is admitted only when `Type` is the receiver's
+///   own type, because `Other as Trait::method` is demonstrably a different type's impl.
+///
+/// This is what keeps the `self`/`Self` escape hatch from re-opening the whole pool. Tails are
+/// compared (not full paths) because the hint is canonicalized per-file while the scope is a
+/// container chain — matching the tolerance the tail retry above already applies.
+fn receiver_type_admits_owner(receiver_owner_tail: Option<&str>, symbol: &IndexedSymbol) -> bool {
+    let Some(receiver_tail) = receiver_owner_tail else {
+        return true;
+    };
+    let Some((owner, _)) = symbol.scope_path.rsplit_once("::") else {
+        return true;
+    };
+    match owner.split_once(" as ") {
+        Some((concrete_owner, _)) => qn_tail(concrete_owner.trim_end()) == receiver_tail,
+        None => true,
+    }
+}
+
 /// Whether a set of same-name candidate symbols are all the SAME logical symbol — so the resolver
 /// may pick `matches[0]` and label it `Syntactic` (`logical_variant`) instead of bailing on
 /// ambiguity. This must hold ONLY for genuine variants of one item (e.g. a forward declaration +

@@ -1717,18 +1717,39 @@ impl IndexDatabase {
                     unverified,
                     unrefreshed,
                     "graph heal skipped file rows this checkout could not vouch for; their graph \
-                     stays on the previous extraction and this heal will not revisit them (#1014)"
+                     stays on the previous extraction, and the logical-key stamp is deferred so \
+                     later passes keep trying (#1014)"
                 );
             }
+            // `resolve_edges` and `rebuild_logical_symbols` are SIBLINGS, not a chain: both
+            // consume `symbols.scope_path`, and neither consumes the other's output
+            // (`same_logical_symbol` compares in-memory `IndexedSymbol` fields, not
+            // `logical_symbols` rows — edge resolution never reads that table). What is
+            // load-bearing is that the refresh loop above completed for the whole corpus first;
+            // their relative order here is free.
             self.resolve_edges()?;
             // A lagging `logical_key_version` must not survive an on-open graph heal: without
             // this, an index upgraded across a key-derivation change (e.g. scope_path joining
             // the key) keeps its OLD merged/split logical ids until some unrelated source
             // mutation triggers a rebuilding pass — memory bindings and symbol surfaces keep
-            // leaking across owners indefinitely on an otherwise idle repo. The rebuild heals
-            // drifted durable references and stamps the current version itself.
+            // leaking across owners indefinitely on an otherwise idle repo.
+            //
+            // Stamp the new key version only when this pass actually refreshed EVERY row. The
+            // regroup reads raw `main.files` across every scope, so a row whose scope stayed on
+            // the old shape does not merely lag — it changes IDENTITY: a cross-scope group that
+            // was one logical symbol splits, the stale row keeps the original `stable_id`, and
+            // the refreshed row gets a new one. Stamping that as current would also disarm the
+            // two mechanisms built to recover from it — `logical_key_drift_snapshot` goes quiet
+            // and `can_scope_logical_rederive` starts allowing the scoped re-derive, which by
+            // construction never revisits the untouched rows. Deferring keeps both armed, at the
+            // cost of a whole-corpus regroup on later passes until coverage completes (#1014).
             if self.repo_meta(LOGICAL_KEY_VERSION_KEY)?.as_deref() != Some(LOGICAL_KEY_VERSION) {
-                self.rebuild_logical_symbols(KeyVersionStamp::FullRederive)?;
+                let stamp = if unverified == 0 && unrefreshed == 0 {
+                    KeyVersionStamp::FullRederive
+                } else {
+                    KeyVersionStamp::Defer
+                };
+                self.rebuild_logical_symbols(stamp)?;
             }
             self.mark_graph_index_current()?;
             Ok(())
