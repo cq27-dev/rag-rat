@@ -14,31 +14,77 @@ import type {
 import type { FileStore } from './store';
 
 const DOC_SCHEME = 'rag-rat-doc';
-const docContents = new Map<string, string>();
 const DOC_CACHE_LIMIT = 200;
-let docSeq = 0;
 
+/** Shown in place of a document whose server is gone — see `LensDocProvider.withdraw`. */
+const WITHDRAWN_DOC = [
+  '# Unavailable',
+  '',
+  'The Lens server that produced this is no longer being served.',
+  'Re-run the command once the server is reachable again.',
+].join('\n');
+
+/**
+ * Backing store for the read-only `rag-rat-doc:` documents — decision records and extraction
+ * proposals opened from a CodeLens.
+ *
+ * The contents belong to the PROVIDER rather than the module, so their lifetime is the registered
+ * provider's and a test can exercise one without reaching into shared state.
+ */
 export class LensDocProvider implements vscode.TextDocumentContentProvider {
+  private readonly contents = new Map<string, string>();
+  private readonly changed = new vscode.EventEmitter<vscode.Uri>();
+  readonly onDidChange = this.changed.event;
+  private sequence = 0;
+
   provideTextDocumentContent(uri: vscode.Uri): string {
-    return docContents.get(uri.path) ?? 'not found';
+    return this.contents.get(uri.path) ?? 'not found';
+  }
+
+  /** Render `markdown` as a new document and show it beside the editor. */
+  open(title: string, markdown: string): Thenable<void> {
+    const key = `/${this.sequence++}-${encodeURIComponent(title)}.md`;
+    this.contents.set(key, markdown);
+    // Evict the oldest entry (Map preserves insertion order) so a long session's quick-pick docs
+    // cannot grow the map without bound.
+    if (this.contents.size > DOC_CACHE_LIMIT) {
+      const oldest = this.contents.keys().next().value;
+      if (oldest) {
+        this.contents.delete(oldest);
+      }
+    }
+    return vscode.workspace
+      .openTextDocument(vscode.Uri.parse(`${DOC_SCHEME}:${key}`))
+      .then((doc) => vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside, true))
+      .then(() => undefined);
+  }
+
+  /**
+   * Withdraw every open `rag-rat-doc:` document.
+   *
+   * These render a decision record or an extraction proposal from ONE server and one checkout, and
+   * unlike every other surface they are never refetched — the command that produced them has
+   * already returned. An endpoint change or an outage would otherwise leave them presenting the
+   * previous server's answer indefinitely, after everything around them has been cleared. Replaced
+   * rather than deleted, because an absent key already means "no such document".
+   */
+  withdraw(): void {
+    for (const key of [...this.contents.keys()]) {
+      this.contents.set(key, WITHDRAWN_DOC);
+      this.changed.fire(vscode.Uri.parse(`${DOC_SCHEME}:${key}`));
+    }
   }
 }
 
+/** The registered provider, so the extension can withdraw its documents on an endpoint change. */
+let lensDocs: LensDocProvider | undefined;
+
+export function withdrawLensDocuments(): void {
+  lensDocs?.withdraw();
+}
+
 function openDoc(title: string, markdown: string): Thenable<void> {
-  const key = `/${docSeq++}-${encodeURIComponent(title)}.md`;
-  docContents.set(key, markdown);
-  // Evict the oldest entry (Map preserves insertion order) so a long session's quick-pick docs
-  // cannot grow the map without bound.
-  if (docContents.size > DOC_CACHE_LIMIT) {
-    const oldest = docContents.keys().next().value;
-    if (oldest) {
-      docContents.delete(oldest);
-    }
-  }
-  return vscode.workspace
-    .openTextDocument(vscode.Uri.parse(`${DOC_SCHEME}:${key}`))
-    .then((doc) => vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside, true))
-    .then(() => undefined);
+  return lensDocs ? lensDocs.open(title, markdown) : Promise.resolve();
 }
 
 export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Disposable {
@@ -177,7 +223,7 @@ export function registerSignalCommands(
   };
 
   context.subscriptions.push(
-    vscode.workspace.registerTextDocumentContentProvider(DOC_SCHEME, new LensDocProvider()),
+    vscode.workspace.registerTextDocumentContentProvider(DOC_SCHEME, (lensDocs = new LensDocProvider())),
 
     vscode.commands.registerCommand('rag-rat-lens.showCallers', async (qname: string, name: string) => {
       const rows = (await client.symbolCallers(qname)) as CallerRow[];

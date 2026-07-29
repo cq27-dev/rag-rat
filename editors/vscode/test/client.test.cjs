@@ -1559,3 +1559,40 @@ test('the memory picker routes through the revalidating open, not the captured o
   await showMemoriesQuickPick([captured], 'src/lib.rs', documents);
   assert.match(messages.at(-1), /not answering/);
 });
+
+test('open rag-rat-doc documents are withdrawn when the server they came from is gone', async () => {
+  const vscode = {
+    EventEmitter: class {
+      fire() {}
+      get event() {
+        return () => ({ dispose() {} });
+      }
+      dispose() {}
+    },
+    Uri: { parse: (value) => ({ path: value.split(':').slice(1).join(':'), toString: () => value }) },
+    Range: class {},
+    CodeLens: class {},
+    ThemeIcon: class {},
+    ViewColumn: { Beside: 2 },
+    window: { showTextDocument: async () => undefined },
+    workspace: {
+      openTextDocument: async (uri) => ({ uri }),
+      registerTextDocumentContentProvider: () => ({ dispose() {} }),
+    },
+    commands: { registerCommand: () => ({ dispose() {} }), executeCommand: async () => undefined },
+  };
+  const module = await loadSourceModule('lenses.ts', vscode);
+  const provider = new module.LensDocProvider();
+
+  // Stand in for a decision record or extraction preview the user opened.
+  await provider.open('Extract helper', '# Proposal\n\nlift this into a helper');
+  const uri = { path: '/0-Extract%20helper.md' };
+  assert.match(provider.provideTextDocumentContent(uri), /lift this into a helper/);
+
+  provider.withdraw();
+  const withdrawn = provider.provideTextDocumentContent(uri);
+  assert.match(withdrawn, /no longer being served/);
+  assert.doesNotMatch(withdrawn, /lift this into a helper/, "the old server's answer must be gone");
+  // Withdrawal is not deletion: an unknown key still reads as absent.
+  assert.equal(provider.provideTextDocumentContent({ path: '/never.md' }), 'not found');
+});

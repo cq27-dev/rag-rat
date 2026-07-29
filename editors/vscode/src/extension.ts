@@ -12,7 +12,7 @@ import {
 } from './discovery';
 import { LensDiagnostics } from './diagnostics';
 import { GraphHoverProvider } from './hover';
-import { registerSignalCommands, SignalLensProvider } from './lenses';
+import { registerSignalCommands, SignalLensProvider, withdrawLensDocuments } from './lenses';
 import { MEMORY_DOC_SCHEME, MemoryCodeLensProvider, MemoryDocProvider, showMemoriesQuickPick } from './memories';
 import { logError, logInfo, showLog } from './output';
 import { LensOverlays } from './overlays';
@@ -258,10 +258,13 @@ export function activate(context: vscode.ExtensionContext): void {
       overlays.clear(editor);
     }
     diagnostics.clear();
-    // Open memory documents are signals too. They are the one surface where staleness leaves no
-    // trace — a decoration on a moved line looks wrong, a rendered memory body does not — so they
-    // have to be withdrawn on the same path, not left showing an unreachable server's claim.
+    // Open documents are signals too. They are the surfaces where staleness leaves no trace — a
+    // decoration on a moved line looks wrong, a rendered memory body or extraction proposal does
+    // not — so they are withdrawn on the same path rather than left showing an unreachable
+    // server's claim. `rag-rat-doc:` documents especially: nothing ever refetches them, because
+    // the command that produced them has already returned.
     memoryDocs.withdraw();
+    withdrawLensDocuments();
   }
 
   let streamController = new AbortController();

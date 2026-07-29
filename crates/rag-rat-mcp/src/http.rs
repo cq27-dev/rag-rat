@@ -267,16 +267,23 @@ async fn status(
 const VERSION_CACHE_TTL: Duration = Duration::from_secs(1);
 
 async fn cached_lens_version(
-    state: HttpState,
+    mut state: HttpState,
 ) -> Result<rag_rat_core::index::LensVersion, ApiError> {
-    // Keep the async mutex through the bounded worker call so aligned SSE pollers share one fill.
+    // Keep the async mutex through the bounded worker call so aligned SSE pollers share one fill,
+    // and charge the wait for it against the request's own deadline exactly as the treemap does.
+    // A fill whose `run_db` sits behind two occupied workers can hold this lock for the full
+    // permit timeout; without the charge every queued `/api/version` and opening `/api/events`
+    // would then start a FRESH full-length attempt, so latency grows by one timeout per waiting
+    // client instead of staying bounded by `ServeOptions::timeout`.
     let version_cache = state.version_cache.clone();
-    let mut cache = version_cache.lock().await;
+    let (mut cache, remaining) =
+        acquire_within_budget(&version_cache, state.options.timeout).await?;
     if let Some((computed_at, version)) = cache.as_ref()
         && computed_at.elapsed() < VERSION_CACHE_TTL
     {
         return Ok(version.clone());
     }
+    state.options.timeout = remaining;
     let version = run_db(state, |db, _, _| Ok(db.lens_version()?)).await?;
     *cache = Some((Instant::now(), version.clone()));
     Ok(version)
