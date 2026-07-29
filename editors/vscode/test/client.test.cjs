@@ -1490,14 +1490,54 @@ test('data that arrives after its document went dirty is withheld, not drawn', a
   assert.equal(loaded.path, 'src/lib.rs');
 });
 
-test('a sidebar load that resolves after the active editor moved on re-aims at the new one', async () => {
-  const uriFor = (value) => ({ toString: () => value });
-  const first = { document: { uri: uriFor('file:///repo/src/first.rs') } };
-  const second = { document: { uri: uriFor('file:///repo/src/second.rs') } };
-  const active = { editor: first };
+/** Everything the three sidebar views render, tagged so each one's source file is identifiable. */
+function sidebarData(name) {
+  return {
+    at: 0,
+    symbols: [],
+    coupling: [],
+    clones: [
+      { start_line: 1, end_line: 2, class_id: 1, max_similarity: 0.9, symbol: `clone_of_${name}`, partners: [] },
+    ],
+    cloneGraph: { eligible: true },
+    memories: [{ title: `memory_of_${name}`, kind: 'Invariant', line: 1 }],
+    refs: [
+      {
+        item_key: '1',
+        title: `ref_of_${name}`,
+        item_kind: 'issue',
+        ref_kind: 'mention',
+        source_text: '',
+        state_normalized: 'open',
+        url: null,
+      },
+    ],
+    decisions: [],
+  };
+}
+
+const sidebarEditor = (name) => ({
+  document: { uri: { toString: () => `file:///repo/src/${name}` } },
+});
+
+/** Let every queued microtask and the pump's own continuation run. */
+async function settle() {
+  for (let tick = 0; tick < 5; tick += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+/** The three views wired to a fake window, with the store's async surface under test control. */
+async function sidebarHarness(store) {
+  const active = { editor: undefined };
+  const listeners = [];
+  const providers = new Map();
+  const fires = [];
   const vscode = {
     EventEmitter: class {
-      fire() {}
+      fire(value) {
+        fires.push(value);
+      }
       get event() {
         return () => ({ dispose() {} });
       }
@@ -1518,43 +1558,192 @@ test('a sidebar load that resolves after the active editor moved on re-aims at t
       get activeTextEditor() {
         return active.editor;
       },
+      registerTreeDataProvider: (id, provider) => {
+        providers.set(id, provider);
+        return { dispose() {} };
+      },
+      onDidChangeActiveTextEditor: (listener) => {
+        listeners.push(listener);
+        return { dispose() {} };
+      },
     },
   };
-  const { CloneClassesView } = await loadSourceModule('sidebar.ts', vscode);
-  const gate = deferred();
-  const asked = [];
-  const store = {
-    async dataFor(document) {
-      const uri = document.uri.toString();
-      asked.push(uri);
-      if (uri.endsWith('first.rs')) {
-        // Hold the first load open so the user can switch editors while it is in flight.
-        await gate.promise;
-        return {
-          path: 'src/first.rs',
-          data: { clones: [{ symbol: 'from_first', partners: [] }], cloneGraph: { eligible: true } },
-        };
+  const { registerSidebar } = await loadSourceModule('sidebar.ts', vscode);
+  const sidebar = registerSidebar({ subscriptions: [] }, store);
+  return {
+    refresh: () => sidebar.refresh(),
+    /** Make `editor` active, as the host does before it delivers the change event. */
+    focus(editor) {
+      active.editor = editor;
+    },
+    activate(editor) {
+      active.editor = editor;
+      for (const listener of listeners) {
+        listener(editor);
       }
-      return {
-        path: 'src/second.rs',
-        data: { clones: [{ symbol: 'from_second', partners: [] }], cloneGraph: { eligible: true } },
-      };
     },
-    pathOf: () => 'src/whatever.rs',
+    /** What one view is showing right now — a synchronous read, as VS Code performs it. */
+    shown(view = 'cloneClasses') {
+      const items = providers.get(`rag-rat-lens.${view}`).getChildren();
+      assert.ok(Array.isArray(items), 'getChildren must answer synchronously');
+      return JSON.stringify(items);
+    },
+    /** How many times the views have told VS Code to re-read — one per view per publication. */
+    published: () => fires.length,
   };
-  const view = new CloneClassesView(store);
+}
 
-  const pending = view.getChildren();
-  active.editor = second;
+test('a sidebar load that settles after a newer one cannot overwrite it', async () => {
+  const gates = { 'first.rs': deferred(), 'second.rs': deferred() };
+  const asked = [];
+  const harness = await sidebarHarness({
+    dataEpoch: () => 0,
+    pathOf: () => 'src/whatever.rs',
+    async dataFor(document) {
+      const name = document.uri.toString().split('/').pop();
+      asked.push(name);
+      await gates[name].promise;
+      return { path: `src/${name}`, data: sidebarData(name) };
+    },
+  });
+
+  harness.activate(sidebarEditor('first.rs'));
+  // Both loads are now in flight: the user switched while the first was still running.
+  harness.activate(sidebarEditor('second.rs'));
+  assert.deepEqual(asked, ['first.rs', 'second.rs']);
+  // The first file's tree came down with the switch. Holding it up until the new one arrives
+  // would state one file's clone classes about another, which is the whole defect.
+  assert.match(harness.shown(), /loading/);
+  assert.doesNotMatch(harness.shown(), /from_first|clone_of_first/);
+
+  gates['second.rs'].resolve();
+  await settle();
+  assert.match(harness.shown(), /clone_of_second\.rs/);
+  assert.match(harness.shown('memories'), /memory_of_second\.rs/);
+  assert.match(harness.shown('papertrail'), /ref_of_second\.rs/);
+  const published = harness.published();
+
+  // The OLDER load settles last. `getChildren` has no way to decline to publish, so under the
+  // previous shape whichever invocation settled last decided what the sidebar showed; here the
+  // load itself declines, and publishes nothing at all.
+  gates['first.rs'].resolve();
+  await settle();
+  assert.match(harness.shown(), /clone_of_second\.rs/);
+  assert.doesNotMatch(harness.shown(), /clone_of_first\.rs/);
+  assert.equal(harness.published(), published, 'a superseded load must not publish anything');
+});
+
+test('a sidebar load settling between the editor moving and the event arriving is dropped', async () => {
+  const gate = deferred();
+  const harness = await sidebarHarness({
+    dataEpoch: () => 0,
+    pathOf: () => 'src/first.rs',
+    async dataFor(document) {
+      const name = document.uri.toString().split('/').pop();
+      await gate.promise;
+      return { path: `src/${name}`, data: sidebarData(name) };
+    },
+  });
+
+  harness.activate(sidebarEditor('first.rs'));
+  const published = harness.published();
+  // `activeTextEditor` is updated by the host before the change event reaches an extension, so a
+  // load can settle inside that window — with nothing having told the pump to reload yet, which
+  // is the one thing a generation counter cannot see.
+  harness.focus(sidebarEditor('second.rs'));
   gate.resolve();
+  await settle();
+  assert.doesNotMatch(harness.shown(), /clone_of_first/, 'not a tree for a file that moved off');
+  assert.equal(harness.published(), published);
 
-  const items = await pending;
-  assert.deepEqual(asked, ['file:///repo/src/first.rs', 'file:///repo/src/second.rs']);
-  // Not the stale file, and NOT empty: a load settling late must not blank the tree a newer one
-  // filled, so it answers about wherever the user actually is.
-  assert.equal(items.length, 1);
-  assert.match(JSON.stringify(items), /from_second/);
-  assert.doesNotMatch(JSON.stringify(items), /from_first/);
+  // The event arrives and the sidebar fills for the file the user is actually on.
+  harness.activate(sidebarEditor('second.rs'));
+  await settle();
+  assert.match(harness.shown(), /clone_of_second/);
+});
+
+test('a same-document sidebar load that settles last cannot put the older payload back', async () => {
+  const gates = [deferred(), deferred()];
+  let started = 0;
+  const harness = await sidebarHarness({
+    dataEpoch: () => 0,
+    pathOf: () => 'src/lib.rs',
+    async dataFor() {
+      const load = started++;
+      await gates[load].promise;
+      return { path: 'src/lib.rs', data: sidebarData(`load_${load}`) };
+    },
+  });
+
+  // Two loads for the SAME document under the SAME index state, and they can still disagree: the
+  // store re-points and reloads wholly against a replacement endpoint without moving its epoch, so
+  // the earlier request can be carrying an older server's answer. Neither the document nor the
+  // epoch separates them — only which request is the newest.
+  harness.activate(sidebarEditor('lib.rs'));
+  harness.refresh();
+  gates[1].resolve();
+  await settle();
+  assert.match(harness.shown(), /clone_of_load_1/);
+  const published = harness.published();
+
+  gates[0].resolve();
+  await settle();
+  assert.match(harness.shown(), /clone_of_load_1/);
+  assert.doesNotMatch(harness.shown(), /clone_of_load_0/, 'the overtaken load must not publish');
+  assert.equal(harness.published(), published);
+});
+
+test('an invalidation while a sidebar load runs neither blanks the tree nor republishes', async () => {
+  const epoch = { value: 0 };
+  const gate = { current: deferred() };
+  const answer = { name: 'index_1' };
+  const harness = await sidebarHarness({
+    dataEpoch: () => epoch.value,
+    pathOf: () => 'src/lib.rs',
+    async dataFor() {
+      const started = epoch.value;
+      await gate.current.promise;
+      // What the real store does: a payload computed under a superseded epoch is not returned,
+      // and neither is one for a server that did not answer. The caller sees the same `undefined`.
+      return started === epoch.value && answer.name
+        ? { path: 'src/lib.rs', data: sidebarData(answer.name) }
+        : undefined;
+    },
+  });
+
+  harness.activate(sidebarEditor('lib.rs'));
+  gate.current.resolve();
+  await settle();
+  assert.match(harness.shown(), /clone_of_index_1/);
+  const published = harness.published();
+
+  // The index moves while the next load is in flight. Its answer is withheld by the store, and
+  // rendering that withholding as an outage would clear a tree over an ordinary reindex.
+  gate.current = deferred();
+  harness.refresh();
+  epoch.value += 1;
+  gate.current.resolve();
+  await settle();
+  assert.match(harness.shown(), /clone_of_index_1/, 'an overtaken load must not blank the tree');
+  assert.doesNotMatch(harness.shown(), /offline/);
+  assert.equal(harness.published(), published, 'an overtaken load must not publish anything');
+
+  // The refresh that every invalidation is paired with is what repaints, from the new index state.
+  answer.name = 'index_2';
+  gate.current = deferred();
+  harness.refresh();
+  gate.current.resolve();
+  await settle();
+  assert.match(harness.shown(), /clone_of_index_2/);
+
+  // Withholding is for a superseded premise only: a server that stops answering under a stable
+  // index state still has to be reported, or the sidebar would show the last good tree forever.
+  answer.name = '';
+  gate.current = deferred();
+  harness.refresh();
+  gate.current.resolve();
+  await settle();
+  assert.match(harness.shown(), /lens server offline/);
 });
 
 test('open memory documents are withdrawn when the server stops answering', async () => {

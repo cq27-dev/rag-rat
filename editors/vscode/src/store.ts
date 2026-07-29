@@ -121,6 +121,19 @@ export class FileStore {
     this.forgetServedState();
   }
 
+  /**
+   * Which index state the store is serving, as an opaque counter that moves on every
+   * `invalidate` / `reset` / reachability change.
+   *
+   * A caller that awaits data and then writes it to a surface reads this before and after: `data`
+   * already REFUSES to return a payload computed under a superseded epoch, but the caller still
+   * has to tell that refusal apart from a server that did not answer — both read as `undefined` —
+   * and rendering the second over the first turns an ordinary index refresh into a cleared surface.
+   */
+  dataEpoch(): number {
+    return this.epoch;
+  }
+
   /** The last load's error, if any — present for a partial load too, so the caller can log it. */
   failure(path: string): unknown {
     return this.paths.get(path)?.failure;
