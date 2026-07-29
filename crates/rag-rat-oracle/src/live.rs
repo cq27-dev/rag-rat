@@ -89,6 +89,46 @@ pub enum LiveSpawnBlocked {
     Unavailable,
 }
 
+/// What a spawn learns about the checkout before any process exists: the probed version its
+/// verdicts are stamped with, and the project layout its argv is built from.
+struct SpawnPreflight {
+    version: String,
+    layout: ProjectLayout,
+}
+
+/// The gates a spawn passes before it starts a process, in the order that costs the least and
+/// diagnoses the best.
+///
+/// Availability is decided FIRST — the same order [`ToolManifest::probe_runnable_in`] applies, and
+/// for the same two reasons. Resolving the layout walks the whole checkout, and spawn attempts are
+/// made from the maintenance pass while it holds the repository write lock, so a checkout with no
+/// language server must not pay for that walk on every attempt. It is also the better diagnosis: in
+/// a checkout with neither the server nor a project, the absent server is what the operator has to
+/// act on, and being told to add a compilation database for a program that cannot run sends them
+/// after the wrong problem.
+///
+/// The layout is then resolved ONCE and shared by the prerequisite gate, the spawn argv, and every
+/// later pass. Resolving it twice would both double the walk and let the gate and the argv observe
+/// different layouts if a database moved between the two scans.
+///
+/// The prerequisite gate is not cosmetic for these backends: a checkout with no project emits no
+/// readiness signal at all, so the session could only ever sit in `Warming`.
+fn resolve_preflight(
+    backend: &LiveBackend,
+    manifest: &ToolManifest,
+    checkout_root: &Path,
+    availability: ToolAvailability,
+) -> Result<SpawnPreflight, LiveSpawnBlocked> {
+    let ToolAvailability::Available { version, .. } = availability else {
+        return Err(LiveSpawnBlocked::Unavailable);
+    };
+    let layout = backend.resolve_layout(checkout_root);
+    match manifest.prerequisite_blocked_with(checkout_root, Some(&layout)) {
+        Some(hint) => Err(LiveSpawnBlocked::Prerequisite(hint)),
+        None => Ok(SpawnPreflight { version, layout }),
+    }
+}
+
 /// Test seam: the state [`LiveOracleSession::spawn`] derives from the checkout, supplied directly
 /// so a test can drive the pass's layout-dependent branches — the per-file "can this session
 /// configure that file" gate, and the age-out re-resolve that ends a session whose pinned database
@@ -120,16 +160,13 @@ impl LiveOracleSession {
             return Err(LiveSpawnBlocked::Unavailable);
         };
         let manifest = ToolManifest::for_tool(tool);
-        // ONE layout scan per spawn, reused by the gate, the argv, and every later pass. The
-        // prerequisite gate is not cosmetic for these backends: a checkout with no project emits
-        // no readiness signal at all, so the session could only ever sit in `Warming`.
-        let layout = backend.resolve_layout(checkout_root);
-        if let Some(hint) = manifest.prerequisite_blocked_with(checkout_root, Some(&layout)) {
-            return Err(LiveSpawnBlocked::Prerequisite(hint));
-        }
-        let ToolAvailability::Available { version, .. } = manifest.probe_in(checkout_root) else {
-            return Err(LiveSpawnBlocked::Unavailable);
-        };
+        // The probe is this call's ARGUMENT, so the checkout walk inside can never precede it.
+        let SpawnPreflight { version, layout } = resolve_preflight(
+            &backend,
+            &manifest,
+            checkout_root,
+            manifest.probe_in(checkout_root),
+        )?;
         let Some(root_uri) = root_uri_for(checkout_root) else {
             return Err(LiveSpawnBlocked::Unavailable);
         };
@@ -332,6 +369,23 @@ pub struct LivePassInput<'a> {
     pub started_at_ms: i64,
 }
 
+/// Why a live pass ended early, when it did.
+///
+/// The distinction is operational, not cosmetic: a layout change means the checkout's projects
+/// moved under the session, which is the one event that can make a file the pass skipped as
+/// unconfigurable resolvable — every other early exit leaves that answer exactly as it was. Callers
+/// branch on this rather than on [`LivePassReport::status`], whose wording is operator-facing text
+/// and not a contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivePassAbort {
+    /// The checkout now pins a DIFFERENT compilation database than the one this session's argv was
+    /// derived from. The session cannot be corrected in place and has to be replaced.
+    LayoutChanged,
+    /// The language server died, wedged, or errored — mid-pass or at the pass-entry readiness
+    /// check. The checkout is unchanged.
+    Server,
+}
+
 /// Outcome of one live pass, mirroring `OracleReport`'s shape. Persisted opaquely as the run
 /// row's `stats_json` (when a run is recorded).
 #[derive(Debug, Clone, Default, Serialize)]
@@ -376,6 +430,19 @@ pub struct LivePassReport {
     /// Worklist paths the request budget didn't reach — the caller's backlog into the next pass.
     #[serde(skip)]
     pub unfinished_paths: Vec<String>,
+    /// Worklist paths skipped WHOLE because this session could not configure them — the files
+    /// `skipped_unconfigured` counted candidates in, at most one entry per worklist path.
+    ///
+    /// Deliberately not `unfinished_paths`: retrying cannot help until the checkout's layout
+    /// changes, and a caller that reads a backlog as "schedule another pass" would then spin on
+    /// work every pass can only skip again. The caller holds these aside instead and requeues them
+    /// when a pass reports [`LivePassAbort::LayoutChanged`].
+    #[serde(skip)]
+    pub skipped_unconfigured_paths: Vec<String>,
+    /// Why the pass ended early, if it did. `status` carries the same fact as operator-facing
+    /// text; this is the half a caller branches on.
+    #[serde(skip)]
+    pub abort: Option<LivePassAbort>,
     pub status: String,
 }
 
@@ -395,6 +462,7 @@ pub fn live_oracle_pass(
     // was derived from the old layout, so it cannot be corrected in place.
     if !session.layout_still_holds(input.checkout_root) {
         report.unfinished_paths = input.worklist.to_vec();
+        report.abort = Some(LivePassAbort::LayoutChanged);
         report.status =
             "Aborted: the checkout now points at a different compilation database".to_string();
         return Ok(report);
@@ -413,6 +481,7 @@ pub fn live_oracle_pass(
         },
         Err(err) => {
             report.unfinished_paths = input.worklist.to_vec();
+            report.abort = Some(LivePassAbort::Server);
             report.status = format!("Aborted: {err}");
             return Ok(report);
         },
@@ -502,8 +571,11 @@ pub fn live_oracle_pass(
         // cross-translation-unit call to the callee's HEADER DECLARATION — a wrong verdict, not a
         // missing one, and the covered-skip budget would never revisit it. Skip rather than
         // resolve, and do NOT defer: retrying cannot help until the checkout's layout changes.
+        // RETAINED for the caller instead, so the layout change that makes the file resolvable can
+        // bring it back — without a backlog entry that would schedule passes able only to re-skip.
         if !session.can_resolve_path(input.checkout_root, path) {
             report.skipped_unconfigured += callees.len() as u64;
+            report.skipped_unconfigured_paths.push(path.clone());
             continue;
         }
         // Budget gate: nothing left → every candidate-bearing path from here rides the backlog.
@@ -800,6 +872,11 @@ pub fn live_oracle_pass(
         }
     }
 
+    // Every early exit reachable from here is the server's — a dead transport or a readiness
+    // error. A layout change returns above, before any file is touched.
+    if aborted.is_some() {
+        report.abort = Some(LivePassAbort::Server);
+    }
     // A run row is recorded for a pass that WROTE verdicts OR migrated the tool version: the
     // migration is what makes the new `tool_version` current for the currency gate, and without
     // a backing run row the migrated rows stay invisible (the gate keys on the LATEST run).
@@ -890,7 +967,50 @@ fn path_from_uri(root_uri: &str, uri: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_base::test_scratch::ScratchDir;
+
     use super::*;
+
+    #[test]
+    fn a_checkout_with_neither_a_server_nor_a_database_reports_the_missing_server() {
+        // clangd's prerequisite and its binary can be unmet at the same time, and the two are not
+        // equally actionable: telling an operator to generate a compile_commands.json for a
+        // program that is not installed sends them after the wrong problem, and answering that
+        // question at all costs a walk of the whole checkout while the maintenance pass holds the
+        // repository write lock — paid on every spawn attempt, none of which can succeed.
+        let scratch = ScratchDir::new("live-preflight");
+        let root = scratch.path();
+        let tool = OracleTool::ClangdLsp;
+        let backend = LiveBackend::for_tool(tool).expect("a live backend");
+        let manifest = ToolManifest::for_tool(tool);
+        let blocked = ToolAvailability::Blocked {
+            tool: tool.as_db_str().to_string(),
+            program: manifest.program.to_string(),
+            hint: manifest.install_hint.to_string(),
+        };
+
+        assert_eq!(
+            resolve_preflight(&backend, &manifest, root, blocked).err(),
+            Some(LiveSpawnBlocked::Unavailable),
+            "an absent server outranks the checkout prerequisite it makes moot",
+        );
+
+        // Control: the SAME checkout blocks on its prerequisite once the program can run — without
+        // this the assertion above would also pass for a gate that never reports a prerequisite.
+        let available = ToolAvailability::Available {
+            tool: tool.as_db_str().to_string(),
+            program: manifest.program.to_string(),
+            version: "clangd-test-1".to_string(),
+        };
+        match resolve_preflight(&backend, &manifest, root, available) {
+            Err(LiveSpawnBlocked::Prerequisite(hint)) => {
+                assert!(hint.contains("compile_commands.json"), "the hint names the fix: {hint}");
+            },
+            Err(LiveSpawnBlocked::Unavailable) =>
+                panic!("a runnable program plus no database is a prerequisite block"),
+            Ok(_) => panic!("a checkout with no compilation database must not spawn a session"),
+        }
+    }
 
     #[cfg(unix)]
     #[test]

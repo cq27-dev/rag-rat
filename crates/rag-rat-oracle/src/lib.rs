@@ -49,7 +49,8 @@ pub use library_usage::{
     LibraryUsageStatus, check_library_usage,
 };
 pub use live::{
-    LiveOracleSession, LivePassInput, LivePassReport, LiveSpawnBlocked, live_oracle_pass,
+    LiveOracleSession, LivePassAbort, LivePassInput, LivePassReport, LiveSpawnBlocked,
+    live_oracle_pass,
 };
 // LSP position conversion (line/char <-> byte under an encoding) — consumed by the engine's
 // corpus fixtures; the rest of `lsp` stays private.

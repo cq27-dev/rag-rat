@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use rag_rat_base::config::Config;
 use rag_rat_base::time::now_ms;
-use rag_rat_oracle::{LiveBackend, LiveOracleSession, LivePassReport};
+use rag_rat_oracle::{LiveBackend, LiveOracleSession, LivePassAbort, LivePassReport};
 
 use crate::index::IndexDatabase;
 
@@ -176,6 +176,16 @@ struct LiveBackendTail {
     backend: LiveBackend,
     session: Option<LiveOracleSession>,
     backlog: Vec<String>,
+    /// Paths a pass skipped because the session could not configure their files, held HERE rather
+    /// than in `backlog`: a non-empty backlog is what schedules the next pass, and these can only
+    /// be skipped again until the checkout's project layout changes. Moved into the backlog when a
+    /// pass reports that it did — see [`LiveBackendTail::retain_unconfigured`].
+    ///
+    /// Bounded by being a SET fed only from worklists this backend actually ran: it holds at most
+    /// one entry per distinct file of this backend's languages the watcher has seen change, and a
+    /// path leaves again as soon as a pass carries it without skipping it. Re-editing the same
+    /// unconfigurable file does not grow it.
+    unconfigured_paths: BTreeSet<String>,
     lifecycle: LiveOracleLifecycle,
     /// Whether this backend's unmet checkout prerequisite has already been reported. The block is
     /// permanent until the checkout changes, so it is worth saying — once, not on every retry.
@@ -206,6 +216,7 @@ impl LiveBackendTail {
             backend,
             session: None,
             backlog: Vec::new(),
+            unconfigured_paths: BTreeSet::new(),
             lifecycle: LiveOracleLifecycle::default(),
             prerequisite_reported: false,
             warming_passes: 0,
@@ -277,6 +288,36 @@ impl LiveBackendTail {
              database, or put each file's database in one of its ancestor directories or that \
              directory's `build/`."
         );
+    }
+
+    /// Fold one pass's unconfigurable skips into the retained set, and requeue that whole set when
+    /// the pass reports the layout change that can make those files resolvable.
+    ///
+    /// Without this an operator who does exactly what [`Self::note_unconfigured`] asked of them —
+    /// consolidate the checkout's compilation databases — sees nothing happen: a pass admits only
+    /// this backend's changed paths plus the backlog, so editing the layout cannot requeue the
+    /// sources it just made resolvable, and they stay without live evidence until someone edits
+    /// them again.
+    ///
+    /// An ordinary abort (a dead or wedged server) does NOT requeue them: the checkout's layout is
+    /// exactly what it was, so a replacement session would skip them again. Some may still ride
+    /// `unfinished_paths` — an abort defers every candidate-bearing path after the file it stopped
+    /// on, unconfigurable ones included — which is harmless: one re-skip and they drop back out of
+    /// the backlog and into this set.
+    fn retain_unconfigured(&mut self, worklist: &[String], report: &LivePassReport) {
+        if report.abort == Some(LivePassAbort::LayoutChanged) {
+            // Moved, not copied: the next session answers "can I configure this?" afresh, and
+            // whatever it still cannot configure comes back here from its own pass. A path the
+            // aborted worklist already put in the backlog collapses in `assemble_worklist`.
+            self.backlog.extend(std::mem::take(&mut self.unconfigured_paths));
+            return;
+        }
+        // A path this pass carried and did not skip is either configurable now or carries no
+        // candidates at all; either way it no longer belongs here.
+        for path in worklist {
+            self.unconfigured_paths.remove(path);
+        }
+        self.unconfigured_paths.extend(report.skipped_unconfigured_paths.iter().cloned());
     }
 
     /// This backend's share of one pass: resolve pending work, or shut an otherwise-workless
@@ -372,10 +413,12 @@ impl LiveBackendTail {
                 // backends that run after this one see a real remainder.
                 *budget = budget.saturating_sub(report.requests_used);
                 self.backlog = report.unfinished_paths.clone();
-                // An aborted pass means the server died or wedged mid-resolution: drop the
-                // session so the next pass respawns a clean one instead of reusing a broken
-                // transport (the aborted files are already requeued in `unfinished_paths`).
-                if report.status.starts_with("Aborted:")
+                self.retain_unconfigured(&worklist, &report);
+                // An aborted pass means the server died or wedged mid-resolution, or the checkout
+                // moved out from under the session: drop it so the next pass respawns a clean one
+                // instead of reusing a broken transport or a stale argv (the aborted files are
+                // already requeued in `unfinished_paths`).
+                if report.abort.is_some()
                     && let Some(_aborted_session) = self.session.take()
                 {
                     // Let the binding hard-kill on Drop; graceful shutdown would attempt another
@@ -667,6 +710,72 @@ mod tests {
         // …and the streak is cleared, so a later all-skipped pass reports afresh.
         let again = captured_warnings(|| tail.note_unconfigured(&all_skipped()));
         assert_eq!(occurrences(&again), 1, "a new dry spell must be reported: {again:?}");
+    }
+
+    /// A pass that skipped `paths` because the session could not configure their files.
+    fn all_skipped_report(paths: &[String]) -> LivePassReport {
+        LivePassReport {
+            skipped_unconfigured: paths.len() as u64,
+            skipped_unconfigured_paths: paths.to_vec(),
+            ..LivePassReport::default()
+        }
+    }
+
+    /// A pass that ended early for `abort` without reaching any file.
+    fn aborted_report(abort: LivePassAbort) -> LivePassReport {
+        LivePassReport { abort: Some(abort), ..LivePassReport::default() }
+    }
+
+    #[test]
+    fn a_path_the_session_cannot_configure_is_retained_without_scheduling_another_pass() {
+        // The skip is deliberately not deferred, and a non-empty backlog is exactly what makes the
+        // watcher schedule another pass — so parking these in the backlog would spin it forever on
+        // work every pass can only skip again. They still have to be kept somewhere, or the layout
+        // change that makes them resolvable has nothing to bring back.
+        let mut tail = LiveBackendTail::new(backend(rag_rat_oracle::OracleTool::ClangdLsp));
+        let worklist = vec!["b/main.c".to_string()];
+        tail.retain_unconfigured(&worklist, &all_skipped_report(&worklist));
+
+        assert!(tail.backlog.is_empty(), "a permanently-skipped path must not ride the backlog");
+        assert_eq!(tail.unconfigured_paths, BTreeSet::from(["b/main.c".to_string()]));
+        assert_eq!(
+            tail.next_wake_in(Duration::from_secs(600), Instant::now()),
+            None,
+            "what is retained here must not schedule a pass on its own",
+        );
+
+        // Deduped across passes: re-editing the same unconfigurable file cannot grow the set.
+        tail.retain_unconfigured(&worklist, &all_skipped_report(&worklist));
+        assert_eq!(tail.unconfigured_paths.len(), 1);
+
+        // A pass that carries the path and does NOT skip it drops it again — whatever it is now,
+        // it is no longer a file waiting on a layout change.
+        tail.retain_unconfigured(&worklist, &LivePassReport::default());
+        assert!(tail.unconfigured_paths.is_empty());
+    }
+
+    #[test]
+    fn only_a_layout_change_requeues_the_paths_the_session_could_not_configure() {
+        let mut tail = LiveBackendTail::new(backend(rag_rat_oracle::OracleTool::ClangdLsp));
+        let worklist = vec!["b/main.c".to_string()];
+        tail.retain_unconfigured(&worklist, &all_skipped_report(&worklist));
+
+        // A wedged server is not a layout change: the checkout is exactly as it was, so the file
+        // is exactly as unconfigurable and a requeue would buy nothing but another skip.
+        tail.retain_unconfigured(&[], &aborted_report(LivePassAbort::Server));
+        assert!(tail.backlog.is_empty(), "a server abort must not requeue an unconfigurable path");
+        assert_eq!(tail.unconfigured_paths.len(), 1, "…and must not drop it either");
+
+        // A layout change does. This is the operator having fixed exactly what the warning asked
+        // for, and the whole point is that something happens when they do.
+        tail.retain_unconfigured(&[], &aborted_report(LivePassAbort::LayoutChanged));
+        assert_eq!(tail.backlog, vec!["b/main.c".to_string()]);
+        assert!(tail.unconfigured_paths.is_empty(), "moved into the backlog, not copied");
+        assert_eq!(
+            tail.next_wake_in(Duration::from_secs(600), Instant::now()),
+            Some(LIVE_ORACLE_RETRY_INTERVAL),
+            "the requeued work schedules the pass that resolves it",
+        );
     }
 
     #[test]

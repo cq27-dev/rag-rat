@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::live::{LiveOracleSession, LivePassInput, live_oracle_pass};
+use crate::live::{LiveOracleSession, LivePassAbort, LivePassInput, live_oracle_pass};
 use crate::lsp::client::test_support::client_with_server;
 
 const LIVE_VERSION: &str = "ra-test-1";
@@ -985,6 +985,10 @@ fn live_pass_aborts_best_effort_when_the_server_dies_mid_pass() {
     let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
     assert!(report.status.starts_with("Aborted:"), "{}", report.status);
+    // A dead server is reported as the SERVER's abort, not the checkout's: the layout is exactly
+    // what it was, so the paths a session skipped as unconfigurable are as unresolvable as before
+    // and the watcher must not requeue them off the back of this.
+    assert_eq!(report.abort, Some(LivePassAbort::Server));
     assert_eq!(report.rows_written, 0);
     // The failed file is REQUEUED (not dropped): the watcher rides it into the next pass with a
     // freshly spawned session.
@@ -1549,8 +1553,10 @@ mod clangd {
         let report =
             live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
-        // The watcher drops the session on the "Aborted:" PREFIX and on nothing else, so the
-        // prefix is the contract this branch depends on — not the wording after it.
+        // The typed abort is the contract, not the wording: the watcher drops the session for any
+        // abort but requeues the paths it could not configure for THIS one only, and a status
+        // string is operator-facing text nobody should be parsing to tell those apart.
+        assert_eq!(report.abort, Some(LivePassAbort::LayoutChanged));
         assert!(report.status.starts_with("Aborted:"), "{}", report.status);
         assert_eq!(report.unfinished_paths, worklist, "the whole worklist rides the next pass");
         assert_eq!(report.rows_written, 0);
@@ -1613,6 +1619,11 @@ mod clangd {
             "an unconfigurable path must not ride the backlog: {:?}",
             report.unfinished_paths,
         );
+        // Retained for the caller instead — the FILE, once, not its two candidates. Without this
+        // the path is simply lost, and the layout change that makes it resolvable has nothing to
+        // bring back: it would stay without live evidence until someone edited it again.
+        assert_eq!(report.skipped_unconfigured_paths, vec!["b/main.c".to_string()]);
+        assert_eq!(report.abort, None, "skipping a file is not an abort");
         // The server never even sees the document it cannot be configured for: with fallback flags
         // its answer would be wrong rather than absent, and a wrong verdict is what this skip
         // exists to prevent.
