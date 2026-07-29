@@ -50,18 +50,19 @@ impl ParserBackend for Rust {
             "mod_item" | "trait_item" => parser::child_name(node)?,
             "impl_item" => {
                 let segment = parser::node_text(impl_name(node)?, text)?;
-                // `impl Trait for Type`: keep the trait's tail in the scope segment
-                // (`Type as Trait`) so two traits' same-named, same-signature methods on one
-                // type stay DISTINCT logical symbols instead of collapsing into one. Resolution
-                // folds the ` as Trait` marker away (`normalized_scope_path`), so the receiver
-                // surface both traits expose is still `Type::method` — and a call that could hit
-                // either declines as ambiguous (#567).
+                // `impl Trait for Type`: keep the trait in the scope segment (`Type as Trait`)
+                // so two traits' same-named, same-signature methods on one type stay DISTINCT
+                // logical symbols instead of collapsing into one. Resolution folds the
+                // ` as Trait` marker away (`normalized_scope_path`), so the receiver surface both
+                // traits expose is still `Type::method` — and a call that could hit either
+                // declines as ambiguous (#567).
                 return match node.child_by_field_name("trait") {
                     Some(trait_node) => {
                         let trait_text = parser::node_text(trait_node, text)?;
-                        let trait_path = crate::index::edges::degeneric_path(&trait_text);
-                        let tail = trait_path.rsplit("::").next().unwrap_or(&trait_path).trim();
-                        Some(if tail.is_empty() { segment } else { format!("{segment} as {tail}") })
+                        Some(match trait_marker(&trait_text) {
+                            Some(marker) => format!("{segment} as {marker}"),
+                            None => segment,
+                        })
                     },
                     None => Some(segment),
                 };
@@ -94,6 +95,37 @@ impl ParserBackend for Rust {
     fn is_plumbing_node(&self, node: Node<'_>) -> bool {
         node.kind().contains("comment") || node.kind() == "use_declaration"
     }
+}
+
+/// The trait half of a `Type as Trait` scope marker: the trait's WHOLE path, generics folded,
+/// whitespace and a leading `::` stripped, and `::` rewritten to `.`.
+///
+/// The whole path, because a tail alone gives `impl a::Runs for Worker` and `impl b::Runs for
+/// Worker` the same scope — collapsing two distinct traits' identically-signatured methods into
+/// one logical symbol, the exact leak trait-qualified scopes exist to prevent. `.` for `::`,
+/// because the marker has to stay ONE `::`-segment: `normalized_scope_path` folds ` as Trait`
+/// away by splitting the scope on `::` and then on " as ", and a trait path that kept its own
+/// `::` would be indistinguishable from the segments that follow it. Whitespace and the leading
+/// `::` go because this is raw source text on an IDENTITY field: `impl a :: Runs` and
+/// `impl a::Runs` name one trait and must not become two logical symbols.
+///
+/// What this does NOT canonicalize, deliberately, because extraction cannot resolve a trait path
+/// to its declaration:
+/// - Import spelling. `use std::fmt; impl fmt::Display for X` and `impl std::fmt::Display for X`
+///   yield different markers, so two cfg variants of one impl spelled differently SPLIT into two
+///   logical symbols. Splitting is the safe direction (a handle answers for less than it should,
+///   rather than for something it should not), and it is the same direction the rest of this PR's
+///   inference chooses when it cannot prove an identity.
+/// - Generic arguments. `degeneric_path` folds them, so `impl TryFrom<&str> for Cfg` and `impl
+///   TryFrom<String> for Cfg` share `Cfg as TryFrom` and their same-signature associated types
+///   still collapse. Keeping them here would not help — `logical_scope_path` degenericks the scope
+///   AGAIN for the logical key, on purpose, so that cfg variants with different binder names group.
+///   Closing that needs alpha-normalized binders (#1012), not a wider marker.
+fn trait_marker(trait_text: &str) -> Option<String> {
+    let degeneric = crate::index::edges::degeneric_path(trait_text);
+    let dense = degeneric.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+    let marker = dense.strip_prefix("::").unwrap_or(&dense).replace("::", ".");
+    (!marker.is_empty()).then_some(marker)
 }
 
 /// The node naming the type an `impl` block is FOR — never the trait it implements.
@@ -252,7 +284,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generic_trait_scope_uses_the_degenericized_trait_tail() {
+    fn generic_trait_scope_uses_the_degenericized_trait_path() {
         let parsed = parser::parse_file(
             Path::new("src/lib.rs"),
             Language::Rust,
@@ -260,7 +292,7 @@ mod tests {
         )
         .expect("Rust parses");
         let run = parsed.symbols.iter().find(|symbol| symbol.name == "run").expect("method symbol");
-        assert_eq!(run.scope_path, "Worker as Runs::run");
+        assert_eq!(run.scope_path, "Worker as crate.traits.Runs::run");
     }
 
     fn scope_paths(source: &str, method: &str) -> Vec<String> {
@@ -283,7 +315,74 @@ mod tests {
              }\nimpl std::fmt::Display for &Beta { fn fmt(&self) {} }\n",
             "fmt",
         );
-        assert_eq!(scopes, vec!["Alpha as Display::fmt", "Beta as Display::fmt"]);
+        assert_eq!(scopes, vec!["Alpha as std.fmt.Display::fmt", "Beta as std.fmt.Display::fmt"]);
+    }
+
+    /// Two same-tailed traits from different modules are two traits. Reducing both to `Runs`
+    /// would give their identically-signatured methods one scope — and, with `scope_path` in the
+    /// logical key, ONE logical symbol, so a memory or graph handle bound to either would answer
+    /// for both. The whole trait path is what keeps them apart; `::` becomes `.` so the marker
+    /// stays a single `::`-segment for `normalized_scope_path` to fold.
+    #[test]
+    fn same_tailed_traits_on_one_type_keep_separate_scopes() {
+        let scopes = scope_paths(
+            "struct Worker;\nimpl a::Runs for Worker { fn run(&self) {} }\nimpl b::Runs for \
+             Worker { fn run(&self) {} }\n",
+            "run",
+        );
+        assert_eq!(scopes, vec!["Worker as a.Runs::run", "Worker as b.Runs::run"]);
+    }
+
+    /// The receiver surface must be unchanged by the wider marker: resolution folds ` as Trait`
+    /// away, so both impls' methods still answer to `Worker::run`.
+    ///
+    /// This drives the fold with EMITTED scopes, not literals — the fold itself is unchanged
+    /// code, so a test that hand-writes `Worker as a.Runs::run` passes no matter what
+    /// `trait_marker` emits. Going through the parser is what makes this fail if the marker ever
+    /// regresses to carrying its own `::`, which would leave the fold unable to tell the trait
+    /// path from the segments after it.
+    #[test]
+    fn every_emitted_trait_marker_folds_to_the_plain_receiver_scope() {
+        let sources = [
+            "impl a::Runs for Worker { fn run(&self) {} }",
+            "impl std::fmt::Display for Worker { fn run(&self) {} }",
+            "impl ::a::b::Runs for Worker { fn run(&self) {} }",
+            "impl crate::traits::Runs<Item> for Worker { fn run(&self) {} }",
+            "impl Runs for Worker { fn run(&self) {} }",
+        ];
+        for source in sources {
+            let scope = scope_paths(source, "run").pop().expect("a method scope");
+            assert!(
+                scope.starts_with("Worker as ") && scope.ends_with("::run"),
+                "{source} must emit one trait-marked segment, got {scope}"
+            );
+            assert_eq!(
+                scope.matches("::").count(),
+                1,
+                "the marker must stay ONE ::-segment, got {scope}"
+            );
+            let folded =
+                crate::index::edges::normalized_scope_path(&scope, Some(Language::Rust.as_str()));
+            assert_eq!(folded.as_ref(), "Worker::run", "{source} folded to {folded}");
+        }
+    }
+
+    /// The marker is raw source text on an IDENTITY field, so cosmetic spelling must not split one
+    /// trait into two logical symbols. Interior whitespace and a leading `::` are normalized away.
+    #[test]
+    fn cosmetic_trait_path_spelling_does_not_change_the_marker() {
+        for source in [
+            "impl a::Runs for Worker { fn run(&self) {} }",
+            "impl a :: Runs for Worker { fn run(&self) {} }",
+            "impl ::a::Runs for Worker { fn run(&self) {} }",
+            "impl a::\n    Runs for Worker { fn run(&self) {} }",
+        ] {
+            assert_eq!(
+                scope_paths(source, "run"),
+                vec!["Worker as a.Runs::run".to_string()],
+                "{source} must normalize to the same marker"
+            );
+        }
     }
 
     /// An impl target with no name to take (unit, tuple, slice, `dyn`) must yield NO owner rather
