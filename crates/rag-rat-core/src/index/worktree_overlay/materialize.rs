@@ -239,19 +239,14 @@ impl IndexDatabase {
         let mut removal_candidates = Vec::new();
         for path in paths {
             // Rebase to the config-root-relative key (the spelling every overlay row + target match
-            // uses), retrying against the CANONICAL source root for a symlinked spelling; then
-            // reject a `..`-escape. A path not under the source root is dropped
+            // uses) through the SHARED `root_relative_path`, which retries a failed lexical strip
+            // against the CANONICAL source root for a symlinked spelling while keeping the LEAF
+            // verbatim — resolving the leaf would rewrite a symlink-replaced file into its target,
+            // so the tombstone / removal branches below would never see the path they must
+            // shadow. Then reject a `..`-escape. A path not under the source root is dropped
             // (defensive).
-            let raw = match path.strip_prefix(&source_root) {
-                Ok(rel) => rel.to_path_buf(),
-                Err(_) => {
-                    let Some(rel) = canonicalize_nearest_ancestor(path).and_then(|canonical| {
-                        canonical.strip_prefix(&canonical_source).ok().map(Path::to_path_buf)
-                    }) else {
-                        continue;
-                    };
-                    rel
-                },
+            let Some(raw) = root_relative_path(path, &source_root, &canonical_source) else {
+                continue;
             };
             let Some(rel) = lexically_normalized_within_root(&raw) else { continue };
             let full = source_root.join(&rel);

@@ -984,16 +984,20 @@ async fn get_json(app: &axum::Router, uri: &str) -> Value {
     body
 }
 
+/// A fixture repo root plus a `Config` rooted at it. The returned root is the CANONICAL spelling
+/// the `Config` carries (`Config::load` canonicalizes, so a fixture must too): handing back the raw
+/// `temp_dir()` spelling alongside a canonical `config.root` would leave the caller writing its
+/// files through a second name for the same directory — the divergence that hides root-spelling
+/// bugs on the platforms where temp is symlinked (#1027).
 fn test_config() -> (PathBuf, Config) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = std::env::temp_dir().join(format!(
-        "rag-rat-http-test-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let config_root = rag_rat_base::test_scratch::canonical_config_root(root.clone());
-    let mut config =
-        Config::minimal_for_database(config_root.join("index.sqlite"), config_root.clone());
+    let root =
+        rag_rat_base::test_scratch::canonical_config_root(std::env::temp_dir().join(format!(
+            "rag-rat-http-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+    let mut config = Config::minimal_for_database(root.join("index.sqlite"), root.clone());
     config.database_key_pinned = true;
     config.targets = vec![ResolvedTarget {
         name: "rust".into(),

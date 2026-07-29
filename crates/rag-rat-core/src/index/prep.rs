@@ -205,25 +205,10 @@ pub(crate) fn explicit_index_files_and_changes(
     let mut manifest_in_change_set = false;
     for path in paths {
         let raw_relative = if path.is_absolute() {
-            match path.strip_prefix(&config.root) {
-                Ok(relative) => relative.to_path_buf(),
-                // A LEXICAL strip fails when the caller spells the path (or the checkout root)
-                // through a DIFFERENT symlink than `config.root` (macOS `/tmp` vs `/private/tmp`,
-                // a symlinked editor `$PWD`), even for a file genuinely inside the checkout. Retry
-                // against the CANONICAL root before giving up, so the valid edit is not silently
-                // dropped; a strip that still fails is a real outside / linked-worktree path the
-                // caller routes elsewhere (#659 review).
-                Err(_) => {
-                    let Some(relative) =
-                        canonicalize_nearest_ancestor(path).and_then(|canonical| {
-                            canonical.strip_prefix(&canonical_root).ok().map(Path::to_path_buf)
-                        })
-                    else {
-                        continue;
-                    };
-                    relative
-                },
-            }
+            let Some(relative) = root_relative_path(path, &config.root, &canonical_root) else {
+                continue; // a real outside / linked-worktree path the caller routes elsewhere
+            };
+            relative
         } else {
             path.clone()
         };
@@ -356,13 +341,42 @@ pub(crate) fn path_crosses_symlink(root: &Path, relative: &Path) -> bool {
     })
 }
 
+/// An ABSOLUTE `path`'s `root`-relative spelling: a lexical strip against `root`, retried against
+/// `canonical_root` when the caller spells the path (or the checkout root) through a DIFFERENT
+/// symlink than `root` (macOS `/tmp` vs `/private/tmp`, a symlinked editor `$PWD`, a Windows 8.3
+/// alias) — without the retry a file genuinely inside the checkout is silently dropped. `None` when
+/// the path is really outside the root (a linked-worktree edit the caller routes elsewhere).
+///
+/// The retry canonicalizes only the path's ANCESTORS and re-appends the LEAF verbatim. The leaf is
+/// the indexed row's IDENTITY, so resolving it rewrites the caller's path into a different file:
+/// `src/a.rs` REPLACED by a symlink to `src/b.rs` would come back as `src/b.rs`, leaving the stale
+/// row for `src/a.rs` un-tombstoned while `src/b.rs` is re-indexed in its place, and an ESCAPING
+/// link would
+/// resolve outside the root and drop the path before the deletion branch ever ran. Whether the leaf
+/// is INDEXABLE is decided afterwards by [`resolves_within_root`] / [`path_crosses_symlink`]; this
+/// only fixes the root SPELLING. Shared by the base explicit flow and the path-scoped linked
+/// overlay so both rebase identically (#659/#679/#1027).
+pub(crate) fn root_relative_path(
+    path: &Path,
+    root: &Path,
+    canonical_root: &Path,
+) -> Option<PathBuf> {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Some(relative.to_path_buf());
+    }
+    let leaf = path.file_name()?;
+    let canonical_parent = canonicalize_nearest_ancestor(path.parent()?)?;
+    canonical_parent.join(leaf).strip_prefix(canonical_root).ok().map(Path::to_path_buf)
+}
+
 /// Canonicalize `path` by canonicalizing its nearest EXISTING ancestor (the file — or even its
 /// parent dir — may be gone in a deletion, or not yet created) and re-appending the missing suffix,
 /// so the result is SYMLINK-RESOLVED even for a path that doesn't exist. `None` when nothing on the
 /// ancestor chain canonicalizes (effectively unreachable for a real absolute path — the filesystem
-/// root always resolves). Shared by containment ([`resolves_within_root`]), the absolute-path
-/// rebase in [`explicit_index_files_and_changes`] (a symlinked checkout-root spelling must compare
-/// canonically or a valid in-repo edit is dropped), and the worktree routing in `watch::overlay`.
+/// root always resolves). Shared by containment ([`resolves_within_root`]), the root-spelling
+/// rebase in [`root_relative_path`] (which passes the PARENT — the leaf must not be resolved
+/// there), and the worktree routing in `watch::overlay`. Every other caller wants the leaf
+/// resolved: containment must see where a symlinked leaf actually points.
 pub(crate) fn canonicalize_nearest_ancestor(path: &Path) -> Option<PathBuf> {
     let mut ancestor = path;
     loop {

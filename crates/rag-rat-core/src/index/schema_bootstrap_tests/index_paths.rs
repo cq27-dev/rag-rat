@@ -299,6 +299,74 @@ fn reindex_paths_does_not_index_a_symlinked_linked_path() {
     let _ = fs::remove_dir_all(&linked);
 }
 
+/// #1027: the path-scoped linked overlay rebases a supplied path spelled through a DIFFERENT
+/// symlink than the resolved source root (macOS `/var` vs `/private/var`, a symlinked editor
+/// `$PWD`, a watcher event carrying the watched spelling) — and that rebase must keep the LEAF
+/// verbatim. A branch-only file REPLACED by a symlink still has to lose its stale overlay row;
+/// resolving the leaf hands the pass the link's TARGET instead, so the replaced file is never
+/// classified at all and its row survives indefinitely (this pass skips the global prune).
+#[cfg(unix)]
+#[test]
+fn overlay_paths_rebases_a_symlink_replaced_branch_file_without_following_its_leaf() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn a_base() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Two BRANCH-ONLY files (absent from base), so each carries an overlay row with no base row
+    // behind it — the removal branch, not the tombstone branch.
+    fs::write(linked.join("src/branch.rs"), "pub fn branch_fn() {}\n").unwrap();
+    fs::write(linked.join("src/other.rs"), "pub fn other_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert_eq!(
+        overlay_rows(&config, "src/branch.rs"),
+        1,
+        "the branch-only file is overlay-indexed"
+    );
+
+    // Replace the branch-only file with a symlink to its sibling, then supply it through an ALIAS
+    // spelling of the worktree — the second spelling of one directory that macOS and Windows hand
+    // over for free.
+    fs::remove_file(linked.join("src/branch.rs")).unwrap();
+    std::os::unix::fs::symlink(linked.join("src/other.rs"), linked.join("src/branch.rs")).unwrap();
+    let alias = unique_temp_root();
+    let _ = fs::remove_dir_all(&alias);
+    std::os::unix::fs::symlink(linked.as_path(), alias.as_path()).unwrap();
+
+    db.index_worktree_overlay_paths(
+        &config,
+        &linked,
+        &[alias.join("src/branch.rs")],
+        crate::index::OverlayLogicalRebuild::Inline,
+        &mut |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(
+        overlay_rows(&config, "src/branch.rs"),
+        0,
+        "the symlink-replaced branch-only file's stale overlay row is removed, not left behind",
+    );
+    assert_eq!(
+        overlay_rows(&config, "src/other.rs"),
+        1,
+        "the link's target is untouched — it was never the supplied path",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 /// #679 review: a BRANCH-ONLY file (absent from base) that was overlay-indexed and is then deleted
 /// must have its stale overlay row REMOVED by a path-scoped pass — there is no base row to shadow
 /// (so a tombstone is wrong) and this pass skips the global prune, so it must remove the row per
@@ -1201,13 +1269,13 @@ fn index_paths_tombstones_a_regular_file_replaced_by_a_symlink() {
     // to true — the exact case a sha/is_file check would mis-treat as "restored").
     fs::remove_file(root.join("src/a.rs")).unwrap();
     std::os::unix::fs::symlink(root.join("src/b.rs"), root.join("src/a.rs")).unwrap();
-    // Supply the path spelled from `config.root`: the fixture canonicalizes its root like
-    // `Config::load`, and a supplied path spelled from the raw scratch root is a DIFFERENT
-    // (non-canonical) name for the same file wherever temp is symlinked. `index --paths`
-    // re-resolves such a path by canonicalizing it, which for a symlink leaf follows to its
-    // TARGET — so the raw spelling would silently supply `src/b.rs` and this test would stop
-    // exercising the tombstone path at all (#1027).
-    let db = IndexDatabase::index_paths(&config, &[config.root.join("src/a.rs")]).unwrap();
+    // Spelled from the RAW scratch root, which is a different (non-canonical) name for the same
+    // directory than the canonicalized `config.root` — exactly what a caller hands over on macOS
+    // (`/var` vs `/private/var`) or through a symlinked `$PWD`. That drives the non-canonical-root
+    // retry in `explicit_index_files_and_changes`, which must rebase the path WITHOUT resolving
+    // the symlink LEAF: resolving it would turn this into `src/b.rs` and the stale row for
+    // `src/a.rs` would never be tombstoned (#1027).
+    let db = IndexDatabase::index_paths(&config, &[root.join("src/a.rs")]).unwrap();
 
     assert_eq!(
         db.indexed_file_count().unwrap(),
@@ -1289,10 +1357,11 @@ fn index_paths_tombstones_a_regular_file_replaced_by_an_escaping_symlink() {
     fs::remove_file(root.join("src/a.rs")).unwrap();
     std::os::unix::fs::symlink(outside.join("evil.rs"), root.join("src/a.rs")).unwrap();
 
-    // Spelled from `config.root` for the same reason as the in-repo symlink case above: the raw
-    // scratch spelling would be re-resolved by following the symlink LEAF, landing outside the
-    // root, and the path would be dropped before the deletion branch ran (#1027).
-    let db = IndexDatabase::index_paths(&config, &[config.root.join("src/a.rs")]).unwrap();
+    // Spelled from the RAW scratch root for the same reason as the in-repo symlink case above:
+    // the non-canonical spelling drives the rebase retry, which must not follow the symlink LEAF —
+    // following it lands OUTSIDE the root and the path is dropped before the deletion branch ever
+    // runs, silently leaving the stale row behind (#1027).
+    let db = IndexDatabase::index_paths(&config, &[root.join("src/a.rs")]).unwrap();
     // Count 1 proves BOTH: a.rs's stale row is tombstoned AND the external evil.rs is not indexed
     // (an external read would have reindexed src/a.rs, keeping the count at 2).
     assert_eq!(

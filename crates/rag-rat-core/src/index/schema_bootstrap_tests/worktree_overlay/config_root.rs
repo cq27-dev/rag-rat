@@ -103,8 +103,10 @@ fn a_symlinked_config_root_keeps_sibling_worktree_overlays_isolated() {
     assert!(path_in_scope(&db, "src/second.rs"));
     assert!(!path_in_scope(&db, "src/first.rs"), "a sibling worktree's overlay is not visible");
 
-    // Back to the FIRST worktree: its overlay survived the sibling's refresh.
-    db.set_context(&first.worktree_id.clone(), &first.worktree_id).ok();
+    // The FIRST worktree's overlay rows survived the sibling's refresh. Read them by their own
+    // `(worktree_id, commit_sha)` key rather than through the connection's installed scope — the
+    // connection is still scoped to the SECOND worktree, and re-scoping it would only re-test what
+    // `path_in_scope` above already covers.
     let scoped = db.storage.connection();
     let rows: Vec<String> = scoped
         .prepare("SELECT path FROM main.files WHERE worktree_id = ?1 AND commit_sha = ''")

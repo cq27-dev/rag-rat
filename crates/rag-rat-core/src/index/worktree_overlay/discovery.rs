@@ -61,6 +61,12 @@ pub struct WorktreeOverlayReport {
 /// `/private/var`, a Windows 8.3 name. Normalizing here is a no-op for a root that already holds
 /// the invariant and repairs one that does not.
 ///
+/// `ignore_rules::base_under_worktree` solves the same representation mismatch for the gitignore
+/// base, but deliberately returns the ancestor in the ROOT's own spelling (its callers need a
+/// textual prefix of the paths they strip). This one wants the CANONICAL subdir instead: the subdir
+/// is re-joined onto the LINKED checkout's workdir, and git reports that checkout's tree-diff and
+/// status paths in their real form — a symlinked segment of the base root has no meaning there.
+///
 /// ERRORS rather than falling back when the subdir still cannot be derived (#1027). The former
 /// fallback — an empty subdir, the linked workdir as the source root — makes the whole refresh
 /// scope the repo root instead of the config root: every candidate path keeps a `crate/` prefix
