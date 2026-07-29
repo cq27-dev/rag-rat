@@ -38,7 +38,13 @@ use crate::op::OpMeta;
 /// spec, a new row-op kind — because that is exactly when retained entries become projectable and
 /// when previously recorded anti-echo hashes stop covering the current column set. Forgetting the
 /// bump leaves pending entries unreplayed (data that arrived is never applied); it cannot corrupt,
-/// because the per-row `projector_version` still marks stale hashes as not comparable.
+/// because the per-row `spec_version` still marks stale hashes as not comparable.
+///
+/// This is NOT left to discipline for the registry-driven cases. It equals the length of
+/// [`super::registry::PROJECTOR_GENERATIONS`], whose last entry must match the live registry — so
+/// registering a table or widening a spec forces an append, and an append is the bump. A widening
+/// that is not a registry change (a new row-op kind) still has to append a generation by hand,
+/// repeating the previous snapshot.
 pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 1;
 
 const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
@@ -161,14 +167,16 @@ fn replay_pending_entry(
     // it. Leaving the entry pending costs nothing: once the producer authors that edit (at a
     // lamport above this entry's, since authoring counts parked entries), a later replay lands
     // and loses on the merits.
-    if apply::row_has_unsent_local_change(tx, spec, &context.repo_id, op.pk())? {
+    if apply::row_has_unsent_local_change(tx, spec, &context.repo_id, pending.stream_id, op.pk())? {
         return Ok(());
     }
     let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
     match apply::apply_row_op(tx, spec, &context.repo_id, &op, meta)? {
-        // Folded. `Applied` also covers "deliberately lost" — superseded by a newer winner, or
-        // suppressed by a tombstone — which are correct folds, not outstanding work.
-        ApplyOutcome::Applied => store::clear_entry_pending(tx, &pending.entry_hash),
+        // Folded. `Superseded` — outranked by a newer winner, or suppressed by a tombstone — is
+        // equally a correct fold and equally not outstanding work: the entry was evaluated and
+        // lost on the merits, and no later binary changes that.
+        ApplyOutcome::Applied | ApplyOutcome::Superseded =>
+            store::clear_entry_pending(tx, &pending.entry_hash),
         // Terminal, so it stops being outstanding: a type mismatch or a constraint violation is a
         // BROKEN PRODUCER — the values do not fit the declared column types or the table's
         // constraints, and no future binary makes them fit. (A missing column is NOT this case: it
@@ -260,7 +268,7 @@ fn stored_projector_version(conn: &Connection) -> anyhow::Result<Option<i64>> {
 mod tests {
     use super::*;
     use crate::table_sync::engine::{self, IngestOutcome, SyncCtx};
-    use crate::table_sync::registry::{ColumnSpec, ValueType};
+    use crate::table_sync::registry::{ColumnSpec, DefaultValue, ValueType};
     use crate::table_sync::row_op::{Cell, RowOp, TypedValue};
     use crate::table_sync::scope_stream::scope_stream_id;
     use crate::{AccountId, LocalDevice};
@@ -272,19 +280,23 @@ mod tests {
     const OLD: TableSpec = TableSpec {
         name: "t_demo",
         scope_id: "demo/1",
-        pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-        columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }],
+        spec_version: 1,
+        pk: &[ColumnSpec::required("id", ValueType::Text)],
+        columns: &[ColumnSpec::required("title", ValueType::Text)],
         local_columns: &["later_col"],
         repo_column: None,
     };
     const NEW: TableSpec = TableSpec {
         name: "t_demo",
         scope_id: "demo/1",
-        pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-        columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }, ColumnSpec {
-            name: "later_col",
-            value_type: ValueType::Text,
-        }],
+        // A LATER column set: `later_col` was added, so ops from the older spec fill it from the
+        // declared default (the physical column has no DEFAULT clause, hence `Null`).
+        spec_version: 2,
+        pk: &[ColumnSpec::required("id", ValueType::Text)],
+        columns: &[
+            ColumnSpec::required("title", ValueType::Text),
+            ColumnSpec::added("later_col", ValueType::Text, 2, DefaultValue::Null),
+        ],
         local_columns: &[],
         repo_column: None,
     };
@@ -404,10 +416,11 @@ mod tests {
         let mut b = Device::new();
         let entries = author_wide_row(&mut a);
 
-        // B (old registry) cannot project the op: it is retained and marked, NOT partially applied.
+        // B (old registry) cannot project an op from a NEWER column set: retained and marked, never
+        // partially applied.
         b.enroll(a.pubkey().fingerprint());
         assert_eq!(b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey()), vec![
-            IngestOutcome::Retained(PendingReason::UnknownColumn.as_db_str())
+            IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
         ],);
         assert_eq!(b.row(), None, "nothing is written for an op we cannot fully project");
         assert_eq!(b.pending_count(), 1, "the entry is marked for replay");
@@ -438,13 +451,6 @@ mod tests {
             .unwrap();
         assert_eq!(a.produce(OLD_REGISTRY, "repo").len(), 1, "published under the old column set");
 
-        // Stamp the published row as recorded by an older projector (what an upgrade looks like).
-        a.conn
-            .execute("UPDATE sync_published_rows SET projector_version = ?1", params![
-                TABLE_SYNC_PROJECTOR_VERSION - 1
-            ])
-            .unwrap();
-
         assert!(
             a.produce(NEW_REGISTRY, "repo").is_empty(),
             "a wider column set alone must not re-author a single row"
@@ -461,12 +467,6 @@ mod tests {
             .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'v1', NULL)", [])
             .unwrap();
         a.produce(OLD_REGISTRY, "repo");
-        a.conn
-            .execute("UPDATE sync_published_rows SET projector_version = ?1", params![
-                TABLE_SYNC_PROJECTOR_VERSION - 1
-            ])
-            .unwrap();
-
         a.conn.execute("DELETE FROM t_demo WHERE id = 'r1'", []).unwrap();
         assert_eq!(a.produce(NEW_REGISTRY, "repo").len(), 1, "the delete is authored");
     }
@@ -488,13 +488,6 @@ mod tests {
             .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'mine', NULL)", [])
             .unwrap();
         assert_eq!(b.produce(OLD_REGISTRY, "repo").len(), 1, "the local edit is authored");
-        // Published by the OLD binary, so its hash covers the old column set (the single projector
-        // const cannot express two binaries; stamping models it, as the storm test does).
-        b.conn
-            .execute("UPDATE sync_published_rows SET projector_version = ?1", params![
-                TABLE_SYNC_PROJECTOR_VERSION - 1
-            ])
-            .unwrap();
 
         assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
         assert_eq!(
@@ -503,6 +496,199 @@ mod tests {
             "the replayed entry loses to the causally later local edit"
         );
         assert_eq!(b.pending_count(), 0, "and it stops being outstanding either way");
+    }
+
+    #[test]
+    fn the_refold_never_overwrites_an_unsent_edit_on_a_row_published_under_an_older_column_set() {
+        // THE CROSS-COLUMN-SET PROTECTIVE ARM. The row IS published (so the never-published guard
+        // does not fire) but under a NARROWER column set, so the anti-echo hashes are not directly
+        // comparable and the only way to tell an unsent edit from an untouched row is to project
+        // the row's winning entry and compare. If that arm answers "no unsent change", the refold
+        // replays A's higher-lamport entry straight over work no peer has ever seen.
+        //
+        // This is not a hypothetical: with the arm returning `false` the assertion below fails with
+        // the row holding A's value instead of the local edit. Nothing else in the suite reaches
+        // this arm with a non-`Unchanged` verdict — the neighbouring tests hit the never-published
+        // arm, the absent-row arm, or an AUTHORED edit (which settles as `Unchanged`).
+        let mut a = Device::new();
+        let mut b = Device::new();
+
+        // B publishes r1 FIRST, under the old column set, at lamport 0.
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'mine', NULL)", [])
+            .unwrap();
+        assert_eq!(b.produce(OLD_REGISTRY, "repo").len(), 1, "r1 is published under the old spec");
+
+        // B then edits it RAW — no authoring, so no clock advance and no peer has seen it.
+        b.conn.execute("UPDATE t_demo SET title = 'edited' WHERE id = 'r1'", []).unwrap();
+
+        // A authors the same row three times under the wider spec, so its winning lamport (2)
+        // strictly beats B's clock (0) — no fingerprint tie deciding this by accident.
+        a.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'a1', 'wide')", [])
+            .unwrap();
+        let mut entries = a.produce(NEW_REGISTRY, "repo");
+        for title in ["a2", "a3"] {
+            a.conn.execute("UPDATE t_demo SET title = ?1 WHERE id = 'r1'", [title]).unwrap();
+            entries.extend(a.produce(NEW_REGISTRY, "repo"));
+        }
+        assert_eq!(entries.len(), 3, "three authored generations, lamports 0..2");
+
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey());
+        assert_eq!(b.pending_count(), 3, "all three park — B cannot project the wider spec");
+
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(
+            b.row().unwrap().0,
+            "edited",
+            "the unsent local edit must survive the replay of a strictly higher-lamport entry"
+        );
+        assert_eq!(b.pending_count(), 3, "the entries stay outstanding rather than landing");
+    }
+
+    #[test]
+    fn authoring_that_cannot_win_its_own_self_apply_fails_instead_of_looping() {
+        // A locally-authored op takes the stream's `MAX(lamport) + 1`, so while a row's clock was
+        // set by an op on THIS stream it cannot lose. A clock holding a lamport the stream cannot
+        // reach therefore means the row's bookkeeping and the stream have come apart — the shape a
+        // changed scope or account leaves behind, since `sync_row_clocks` is keyed only by
+        // `(repo_id, table_name, row_pk)` and survives a move its lamports have no meaning after.
+        //
+        // Folded into `Applied`, that reads as settlement: no publication record is written, so the
+        // next pass re-derives the identical delta and signs it again — unbounded log growth, and
+        // every peer discards the entries too. Fail attributably instead.
+        let mut b = Device::new();
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'v', NULL)", [])
+            .unwrap();
+        assert_eq!(b.produce(OLD_REGISTRY, "repo").len(), 1, "published on this stream");
+
+        // A clock from a stream this one cannot catch: nothing local can outrank it.
+        b.conn
+            .execute("UPDATE sync_row_clocks SET lamport = 9_999 WHERE table_name = 't_demo'", [])
+            .unwrap();
+        b.conn.execute("UPDATE t_demo SET title = 'edited' WHERE id = 'r1'", []).unwrap();
+
+        let tx = b.conn.transaction().unwrap();
+        let ctx = SyncCtx {
+            repo_id: "repo",
+            account_id: account(),
+            device: &b.local,
+            registry: OLD_REGISTRY,
+            now_ms: 0,
+        };
+        let err = engine::produce_and_author(&tx, &ctx)
+            .expect_err("a self-apply that cannot win must not be reported as settled");
+        assert!(
+            err.to_string().contains("lost its own self-apply"),
+            "the error names the condition: {err}"
+        );
+    }
+
+    #[test]
+    fn a_winner_lookup_that_lands_on_another_rows_entry_resolves_to_unknown() {
+        // The lookup keys on `(stream, device, lamport)`, which identifies an entry uniquely WITHIN
+        // a stream — so it is this row's op only while the row's clock and the queried stream are
+        // the same stream. Moving a table to another scope re-derives the stream while the clocks
+        // survive, and the same `(device, lamport)` then belongs to some other op entirely.
+        //
+        // The dangerous outcome is not a wrong `LocallyChanged` (conservative anyway) but a wrong
+        // `Unchanged`, so both rows are given the SAME synced cells: the foreign op then projects
+        // to exactly what this row holds, and an unverified lookup reports "untouched" for a row
+        // that actually carries an unsent edit — which is a licence to replay over it.
+        let mut b = Device::new();
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'x', NULL)", [])
+            .unwrap();
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r2', 'shared', NULL)", [])
+            .unwrap();
+        assert_eq!(b.produce(OLD_REGISTRY, "repo").len(), 2, "both rows are published");
+
+        // r1 now holds an unsent edit that happens to equal r2's published content.
+        b.conn.execute("UPDATE t_demo SET title = 'shared' WHERE id = 'r1'", []).unwrap();
+
+        let stream = scope_stream_id("repo", account(), "demo/1");
+        let (r2_lamport, r2_device): (i64, String) = b
+            .conn
+            .query_row(
+                "SELECT lamport, device_fingerprint FROM sync_row_clocks
+                  WHERE table_name = 't_demo' AND row_pk = ?1",
+                [&row_op::row_pk_string(&[TypedValue::Text("r2".into())])],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        // Repoint r1's clock at r2's entry — the shape a stream change produces.
+        b.conn
+            .execute(
+                "UPDATE sync_row_clocks SET lamport = ?1, device_fingerprint = ?2
+                  WHERE table_name = 't_demo' AND row_pk = ?3",
+                params![
+                    r2_lamport,
+                    r2_device,
+                    row_op::row_pk_string(&[TypedValue::Text("r1".into())])
+                ],
+            )
+            .unwrap();
+
+        let tx = b.conn.transaction().unwrap();
+        let verdict = apply::stale_row_disposition(
+            &tx,
+            &OLD,
+            "repo",
+            stream,
+            &[TypedValue::Text("r1".into())],
+            &[Cell { column: "title".to_string(), value: TypedValue::Text("shared".into()) }],
+        )
+        .unwrap();
+        assert_eq!(
+            verdict,
+            apply::StaleRow::Unknown,
+            "an entry that is not this row's op must not produce a verdict about this row"
+        );
+    }
+
+    #[test]
+    fn the_refold_defers_when_the_rows_winner_cannot_be_resolved_at_all() {
+        // The UNPROVABLE arm of the same guard. When a row's winning entry cannot be resolved, the
+        // projection comparison is unavailable and there is no way to tell an untouched row from an
+        // unsent edit — so the refold must refuse to replay, exactly as it does for a proven edit.
+        // Answering "no unsent change" here silently destroys the edit.
+        //
+        // The entry is deleted to model what entry retention/GC will do once it lands: it MUST
+        // refresh a row's publication record before dropping that row's winner, or every such row
+        // enters this state. (The producer's half of that contract is to author on the same verdict
+        // rather than also deferring — otherwise the row would be stuck from both sides forever.)
+        let mut a = Device::new();
+        let mut b = Device::new();
+
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'mine', NULL)", [])
+            .unwrap();
+        assert_eq!(b.produce(OLD_REGISTRY, "repo").len(), 1, "r1 is published under the old spec");
+        b.conn.execute("UPDATE t_demo SET title = 'edited' WHERE id = 'r1'", []).unwrap();
+        // Drop B's own winning entry, leaving the row's clock pointing at nothing.
+        b.conn.execute("DELETE FROM table_sync_entries", []).unwrap();
+
+        a.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'a1', 'wide')", [])
+            .unwrap();
+        let mut entries = a.produce(NEW_REGISTRY, "repo");
+        for title in ["a2", "a3"] {
+            a.conn.execute("UPDATE t_demo SET title = ?1 WHERE id = 'r1'", [title]).unwrap();
+            entries.extend(a.produce(NEW_REGISTRY, "repo"));
+        }
+
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey());
+
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(
+            b.row().unwrap().0,
+            "edited",
+            "an unresolvable winner must not license replaying over the row"
+        );
     }
 
     #[test]
@@ -541,25 +727,27 @@ mod tests {
         const SCOPED_OLD: TableSpec = TableSpec {
             name: "t_scoped",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "repo_id", value_type: ValueType::Text }, ColumnSpec {
-                name: "id",
-                value_type: ValueType::Text,
-            }],
-            columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[
+                ColumnSpec::required("repo_id", ValueType::Text),
+                ColumnSpec::required("id", ValueType::Text),
+            ],
+            columns: &[ColumnSpec::required("title", ValueType::Text)],
             local_columns: &["later_col"],
             repo_column: Some("repo_id"),
         };
         const SCOPED_NEW: TableSpec = TableSpec {
             name: "t_scoped",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "repo_id", value_type: ValueType::Text }, ColumnSpec {
-                name: "id",
-                value_type: ValueType::Text,
-            }],
-            columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }, ColumnSpec {
-                name: "later_col",
-                value_type: ValueType::Text,
-            }],
+            spec_version: 1,
+            pk: &[
+                ColumnSpec::required("repo_id", ValueType::Text),
+                ColumnSpec::required("id", ValueType::Text),
+            ],
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::required("later_col", ValueType::Text),
+            ],
             local_columns: &[],
             repo_column: Some("repo_id"),
         };
@@ -713,11 +901,12 @@ mod tests {
     }
 
     #[test]
-    fn an_older_producers_partial_row_parks_and_is_replayed_when_the_gap_closes() {
-        // The mirror of the unknown-column case: a row that is COMPLETE under the author's narrower
-        // spec is PARTIAL under a wider one. Whole-row LWW cannot apply it, but it is a version gap
-        // — redeemed from the sender's side — so it parks and stays on the worklist rather than
-        // being quarantined off it.
+    fn an_older_producers_row_applies_with_its_missing_columns_defaulted() {
+        // The unfreeze. A row that is COMPLETE under the author's narrower spec is PARTIAL under a
+        // wider one, and before the op stated its version the receiver could only park it forever —
+        // nothing on the receiving side could ever redeem it. Now the version says "this predates
+        // `later_col`", so the column it predates is filled from its declared default and the row
+        // applies immediately.
         let mut a = Device::new();
         let mut b = Device::new();
         a.conn
@@ -726,27 +915,195 @@ mod tests {
         let narrow = a.produce(OLD_REGISTRY, "repo");
         assert_eq!(narrow.len(), 1, "authored under the narrow spec");
 
-        // B knows the wider column set, so the op is missing one of B's synced columns.
         b.enroll(a.pubkey().fingerprint());
-        assert_eq!(b.ingest(NEW_REGISTRY, "repo", &narrow, &a.pubkey()), vec![
+        assert_eq!(
+            b.ingest(NEW_REGISTRY, "repo", &narrow, &a.pubkey()),
+            vec![IngestOutcome::Applied],
+            "an older producer's row is no longer frozen out",
+        );
+        assert_eq!(
+            b.row(),
+            Some(("narrow".to_string(), None)),
+            "the column the op predates takes its declared default"
+        );
+        assert_eq!(b.pending_count(), 0, "nothing is left outstanding");
+        // And the applied row is published under THIS spec, so the producer has nothing to say.
+        assert!(b.produce(NEW_REGISTRY, "repo").is_empty());
+    }
+
+    #[test]
+    fn a_column_without_a_declared_default_still_parks_an_older_op() {
+        // Default-fill is opt-in per column: a column with no declared default cannot be invented,
+        // so an op omitting it is still a partial after-image. That is what keeps a genuinely
+        // broken producer from being silently completed.
+        const NO_DEFAULT: TableSpec = TableSpec {
+            name: "t_demo",
+            scope_id: "demo/1",
+            spec_version: 2,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::required("later_col", ValueType::Text),
+            ],
+            local_columns: &[],
+            repo_column: None,
+        };
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'narrow', NULL)", [])
+            .unwrap();
+        let narrow = a.produce(OLD_REGISTRY, "repo");
+        b.enroll(a.pubkey().fingerprint());
+        assert_eq!(b.ingest(&[NO_DEFAULT], "repo", &narrow, &a.pubkey()), vec![
             IngestOutcome::Retained(PendingReason::PartialAfterImage.as_db_str())
         ],);
-        assert_eq!(b.row(), None, "a partial after-image writes nothing");
-        assert_eq!(b.pending_count(), 1, "and stays outstanding, not quarantined off the worklist");
+        assert_eq!(b.row(), None, "nothing is invented for a column with no declared default");
+    }
 
-        // Still outstanding after a refold that cannot close the gap either — only the SENDER's
-        // side can (declared column defaults, #1002), so the entry must not be dropped meanwhile.
-        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
-        assert_eq!(b.pending_count(), 1, "a sender-side gap survives a receiver-side refold");
-        let quarantined: i64 = b
+    #[test]
+    fn a_stale_version_row_edited_locally_is_authored_rather_than_frozen() {
+        // The dead zone, closed. Before the op stated its version, a row published under an older
+        // column set could never be re-authored — its hash was not comparable, so even a genuine
+        // local edit produced nothing and the change could never reach a peer. Now the row is
+        // settled against the op that established it: different means a real local change, and it
+        // is authored.
+        let mut a = Device::new();
+        a.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'v1', NULL)", [])
+            .unwrap();
+        assert_eq!(a.produce(OLD_REGISTRY, "repo").len(), 1, "published under the old column set");
+
+        // The binary learns `later_col`, and the user edits the row before anything re-publishes
+        // it.
+        a.conn.execute("UPDATE t_demo SET title = 'edited' WHERE id = 'r1'", []).unwrap();
+
+        let ops = a.produce(NEW_REGISTRY, "repo");
+        assert_eq!(ops.len(), 1, "the edit is authored, not frozen out");
+        match authored_op(&ops[0]) {
+            RowOp::Upsert { spec_version, cells, .. } => {
+                assert_eq!(spec_version, NEW.spec_version, "authored under the current spec");
+                assert!(
+                    cells.iter().any(
+                        |c| c.column == "title" && c.value == TypedValue::Text("edited".into())
+                    ),
+                    "and carries the local edit"
+                );
+            },
+            other => panic!("expected an upsert, got {other:?}"),
+        }
+    }
+
+    /// Decode the row op inside one authored entry's signed wire bytes.
+    fn authored_op(signed_bytes: &[u8]) -> RowOp {
+        let signed = crate::entry::decode_signed(signed_bytes).unwrap();
+        match crate::table_sync::row_op::decode(&signed.entry.op_bytes).unwrap() {
+            crate::table_sync::row_op::DecodedRowOp::Known(op) => op,
+            other => panic!("expected a known op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_untouched_stale_version_row_is_restamped_without_authoring() {
+        // The other half: a row that has NOT changed since it landed is simply restamped, so it
+        // becomes comparable again without a signed entry. Re-authoring it instead would put every
+        // row of the table back on the wire on every upgrading device.
+        let mut a = Device::new();
+        a.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'v1', NULL)", [])
+            .unwrap();
+        a.produce(OLD_REGISTRY, "repo");
+
+        assert!(
+            a.produce(NEW_REGISTRY, "repo").is_empty(),
+            "nothing to say about an untouched row"
+        );
+        let version: i64 = a
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM table_sync_entries WHERE quarantine_reason IS NOT NULL",
+            .query_row("SELECT spec_version FROM sync_published_rows", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, i64::from(NEW.spec_version), "and it is comparable again");
+        // Comparable means an ordinary later edit is authored by the ordinary path.
+        a.conn.execute("UPDATE t_demo SET title = 'later' WHERE id = 'r1'", []).unwrap();
+        assert_eq!(a.produce(NEW_REGISTRY, "repo").len(), 1);
+    }
+
+    #[test]
+    fn a_remove_crosses_a_spec_version_skew_unimpeded() {
+        // A remove names only the row identity, so no column set is involved and its version is
+        // never acted on. Gating it would delay deletions across a skew for no benefit.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'v', 'wide')", [])
+            .unwrap();
+        let created = a.produce(NEW_REGISTRY, "repo");
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(NEW_REGISTRY, "repo", &created, &a.pubkey());
+        assert!(b.row().is_some());
+
+        a.conn.execute("DELETE FROM t_demo WHERE id = 'r1'", []).unwrap();
+        let removed = a.produce(NEW_REGISTRY, "repo");
+        assert_eq!(removed.len(), 1);
+        // B is on the OLDER spec — the delete still lands.
+        assert_eq!(b.ingest(OLD_REGISTRY, "repo", &removed, &a.pubkey()), vec![
+            IngestOutcome::Applied
+        ],);
+        assert_eq!(b.row(), None, "a newer-spec remove still deletes on an older peer");
+    }
+
+    #[test]
+    fn devices_at_different_spec_versions_converge_in_both_directions() {
+        // The property the whole change rests on. An op's projection is a pure function of (op,
+        // receiver registry) — never of prior row state — so whole-row LWW lands every receiver on
+        // the same result regardless of arrival order or who authored last.
+        let mut old_dev = Device::new();
+        let mut new_dev = Device::new();
+        old_dev.enroll(new_dev.pubkey().fingerprint());
+        old_dev.enroll(old_dev.local.fingerprint());
+        new_dev.enroll(old_dev.pubkey().fingerprint());
+        new_dev.enroll(new_dev.local.fingerprint());
+
+        // NEWER authors first; the older peer cannot project it and parks.
+        new_dev
+            .conn
+            .execute(
+                "INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'from-new', 'wide')",
                 [],
-                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(quarantined, 0, "a version gap is never recorded as a terminal rejection");
+        let from_new = new_dev.produce(NEW_REGISTRY, "repo");
+        assert_eq!(old_dev.ingest(OLD_REGISTRY, "repo", &from_new, &new_dev.pubkey()), vec![
+            IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        ],);
+
+        // OLDER then authors its own row; the newer peer APPLIES it, filling the column it
+        // predates.
+        old_dev
+            .conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'from-old', NULL)", [])
+            .unwrap();
+        let from_old = old_dev.produce(OLD_REGISTRY, "repo");
+        assert_eq!(
+            new_dev.ingest(NEW_REGISTRY, "repo", &from_old, &old_dev.pubkey()),
+            vec![IngestOutcome::Applied],
+            "older→newer is no longer frozen",
+        );
+
+        // The older device's write is causally later (authoring counts the parked entry), so it
+        // wins on the newer device — and the newer device's row reflects it with the column
+        // defaulted.
+        assert_eq!(new_dev.row(), Some(("from-old".to_string(), None)));
+
+        // Once the older device upgrades, the parked entry replays and loses on the merits, so both
+        // devices agree on the same winner.
+        assert!(refold_stale_projections_against(&old_dev.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(
+            old_dev.row(),
+            new_dev.row(),
+            "the two devices converge on the same row once both understand the column set"
+        );
+        assert_eq!(old_dev.pending_count(), 0, "and nothing is left outstanding");
     }
 
     #[test]
@@ -900,6 +1257,7 @@ mod tests {
         let mut a = Device::new();
         let mut b = Device::new();
         let two_key = RowOp::Upsert {
+            spec_version: 1,
             table: "t_demo".to_string(),
             pk: vec![TypedValue::Text("r1".to_string()), TypedValue::Text("extra".to_string())],
             cells: vec![Cell { column: "title".to_string(), value: TypedValue::Text("v".into()) }],
@@ -943,7 +1301,11 @@ mod tests {
         // it. This path has no caller to return an outcome to.
         let mut a = Device::new();
         let mut b = Device::new();
+        // Stamped at the WIDER spec, consistent with carrying `later_col` — a v1 stamp on an op
+        // that names a column introduced at v2 is self-contradictory and parks as a mis-stamp
+        // before any type check runs, which would test something else entirely.
         let mistyped = RowOp::Upsert {
+            spec_version: 2,
             table: "t_demo".to_string(),
             pk: vec![TypedValue::Text("r1".to_string())],
             cells: vec![
@@ -962,7 +1324,7 @@ mod tests {
 
         b.enroll(a.pubkey().fingerprint());
         assert_eq!(b.ingest(OLD_REGISTRY, "repo", &[signed], &a.pubkey()), vec![
-            IngestOutcome::Retained(PendingReason::UnknownColumn.as_db_str())
+            IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
         ],);
 
         assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
@@ -997,10 +1359,26 @@ mod tests {
         // that derives them) silently reclassifies every row a prior binary wrote. Pin them
         // literally — the derive keeps write and parse in step, this keeps the values themselves
         // from moving.
-        assert_eq!(PendingReason::UnknownColumn.as_db_str(), "unknown_column");
-        assert_eq!(PendingReason::PartialAfterImage.as_db_str(), "partial_after_image");
-        assert_eq!(PendingReason::UnknownOpKind.as_db_str(), "unknown_op_kind");
-        assert_eq!(PendingReason::UndecodablePayload.as_db_str(), "undecodable_payload");
-        assert_eq!(PendingReason::TableNotInScope.as_db_str(), "table_not_in_scope");
+        //
+        // Pinned as the WHOLE SET, not variant by variant: a per-variant list silently omits any
+        // variant added later (`NewerSpecVersion` was added and left unpinned exactly that way),
+        // which is the case that most needs the pin. Adding a variant now fails here until it is
+        // listed.
+        let pinned: Vec<(PendingReason, &str)> = <PendingReason as strum::IntoEnumIterator>::iter()
+            .map(|reason| (reason, reason.as_db_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pinned,
+            vec![
+                (PendingReason::UnknownColumn, "unknown_column"),
+                (PendingReason::NewerSpecVersion, "newer_spec_version"),
+                (PendingReason::PartialAfterImage, "partial_after_image"),
+                (PendingReason::MisstampedSpecVersion, "misstamped_spec_version"),
+                (PendingReason::UnknownOpKind, "unknown_op_kind"),
+                (PendingReason::UndecodablePayload, "undecodable_payload"),
+                (PendingReason::TableNotInScope, "table_not_in_scope"),
+            ],
+            "a stored classification token moved, or a new variant is unpinned"
+        );
     }
 }

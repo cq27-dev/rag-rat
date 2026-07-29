@@ -27,7 +27,7 @@ pub use migrations::{
     apply_repo_id_core_scoping, apply_repo_id_periphery_scoping, apply_repos_registry,
     apply_scip_moniker_anchors, apply_sync_invites, apply_sync_invites_normalized_receipts,
     apply_sync_origin_and_edge_tombstone, apply_table_sync_projection_state,
-    apply_table_sync_tables,
+    apply_table_sync_spec_version, apply_table_sync_tables,
 };
 pub use migrations::{column_exists, rebuild_repo_memory_fts_with_repo_id, table_exists};
 pub use purge::{RepoRowCounts, count_repo_rows, purge_repo_rows, repo_scoped_table_names};
@@ -50,7 +50,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 94;
+pub const LATEST_SCHEMA_VERSION: u32 = 95;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -717,6 +717,14 @@ const MIGRATION_094_DESCRIPTION: &str =
      git-history imports and Oracle verdict passes — increment the same clock once at their \
      transaction boundary instead of once per row. The Lens SSE freshness probe reads only O(1) \
      indexed rows instead of rescanning enrichment and files tables every polling interval";
+
+const MIGRATION_095_ID: &str = "095_table_sync_spec_version";
+const MIGRATION_095_CHECKSUM: &str = "sha256:rag-rat-table-sync-spec-version-v95";
+const MIGRATION_095_DESCRIPTION: &str =
+    "Per-table spec versioning for table-sync (#1002): sync_published_rows records the TABLE's \
+     spec_version rather than the store-global projector version, so an unrelated projector bump \
+     no longer marks every table's rows incomparable. The table is necessarily empty (no table is \
+     registered), so it is rebuilt into its final shape rather than carrying a dead column";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1477,6 +1485,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_094_CHECKSUM,
         description: MIGRATION_094_DESCRIPTION,
         apply: MigrationFn::Plain(apply_lens_enrichment_revision),
+    },
+    Migration {
+        id: MIGRATION_095_ID,
+        checksum: MIGRATION_095_CHECKSUM,
+        description: MIGRATION_095_DESCRIPTION,
+        apply: MigrationFn::Plain(apply_table_sync_spec_version),
     },
 ];
 

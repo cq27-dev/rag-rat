@@ -1380,6 +1380,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_092_ID => Some(92),
             MIGRATION_093_ID => Some(93),
             MIGRATION_094_ID => Some(94),
+            MIGRATION_095_ID => Some(95),
             _ => None,
         })
         .max()
@@ -1483,6 +1484,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_092_ID
             | MIGRATION_093_ID
             | MIGRATION_094_ID
+            | MIGRATION_095_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1583,6 +1585,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_092_ID => migration.checksum != MIGRATION_092_CHECKSUM,
         MIGRATION_093_ID => migration.checksum != MIGRATION_093_CHECKSUM,
         MIGRATION_094_ID => migration.checksum != MIGRATION_094_CHECKSUM,
+        MIGRATION_095_ID => migration.checksum != MIGRATION_095_CHECKSUM,
         _ => false,
     }
 }
@@ -6423,12 +6426,21 @@ pub fn apply_table_sync_projection_state(conn: &Connection) -> rusqlite::Result<
     add_column_if_missing(&tx, "table_sync_entries", "pending_reason", "TEXT")?;
     add_column_if_missing(&tx, "table_sync_entries", "pending_projector_version", "INTEGER")?;
     add_column_if_missing(&tx, "table_sync_entries", "quarantine_reason", "TEXT")?;
-    add_column_if_missing(
-        &tx,
-        "sync_published_rows",
-        "projector_version",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
+    // V095 REPLACED this column with the per-table `spec_version`. `schema::apply` — the
+    // `index --full` recovery — re-runs the WHOLE ladder over an existing store, so without this
+    // check a store already at V095 would get the dead column back on every full reindex, and V095
+    // (which can only restore its shape by rebuilding the table) would have to DROP a table that by
+    // then holds live publication state. Losing that state is not merely churn: `produce_row_ops`
+    // finds a locally-deleted row by its surviving published record, so wiping the table strands
+    // every unsent deletion and leaves peers holding the row forever.
+    if !column_exists(&tx, "sync_published_rows", "spec_version")? {
+        add_column_if_missing(
+            &tx,
+            "sync_published_rows",
+            "projector_version",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS table_sync_streams(
              stream_id  BLOB NOT NULL PRIMARY KEY,
@@ -6495,6 +6507,59 @@ fn create_repo_scoped_lens_revision_triggers(
                   END;"
     ))?;
     Ok(())
+}
+
+/// V095 (#1002): per-TABLE spec versioning, plus a direct pointer from a row to its winning entry.
+///
+/// `sync_published_rows.spec_version` replaces V093's `projector_version`. The anti-echo hash
+///   covers one TABLE's synced column set, so recording the store-global projector version was too
+///   coarse: registering an unrelated table (or learning a new op-kind) bumps that version and
+/// would   mark EVERY table's rows incomparable, freezing their producers and forcing needless
+/// winner   lookups. The projector version keeps its own job — deciding when parked entries are
+/// replayed. The row's winning entry is NOT denormalized onto the clock: `sync_row_clocks` already
+/// carries `(lamport, device_fingerprint)`, and `table_sync_entries` is UNIQUE on
+/// `(stream_id, device_fingerprint, lamport)`, so the producer resolves it exactly once it knows
+/// the stream — which it derives from the account it is already syncing. The only cost is
+/// reconciling the two encodings of a fingerprint (hex TEXT on the clock, BLOB on the entry), which
+/// the fingerprint type already round-trips.
+///
+/// The table is necessarily EMPTY: no table is registered (`SYNCABLE_TABLES` is empty) and there
+/// is no transport, so nothing has ever written either. The published-rows table is therefore
+/// rebuilt into its final shape rather than accumulating a dead column, and no backfill is owed.
+pub fn apply_table_sync_spec_version(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    // The rebuild PRESERVES rows rather than dropping them, even though the table is provably empty
+    // at this transition today. Emptiness is an emergent property of another crate
+    // (`SYNCABLE_TABLES` has no entries yet) and the one-shot-ness depends on V093 declining to
+    // re-add the column it replaced — a conjunction spanning two files that nothing enforces. A
+    // bare DROP would make this migration's data safety rest on that conjunction holding
+    // forever, and the failure would be silent and severe: `produce_row_ops` finds a
+    // locally-deleted row by its surviving published record, so a wiped table strands every
+    // unsent deletion and leaves peers holding the row. Copying instead demotes the guard below
+    // to a performance detail, and costs nothing on an empty table.
+    //
+    // `spec_version` backfills to 0, which is below every real spec version (the registry lint
+    // bounds those at >= 1), so a carried row reads as "column set unknown" — the not-comparable
+    // path that resolves itself on the next produce. That is strictly better than deleting it.
+    if !column_exists(&tx, "sync_published_rows", "spec_version")? {
+        tx.execute_batch(
+            "ALTER TABLE sync_published_rows RENAME TO sync_published_rows_pre_v095;
+             CREATE TABLE sync_published_rows(
+                 repo_id      TEXT    NOT NULL,
+                 table_name   TEXT    NOT NULL,
+                 row_pk       TEXT    NOT NULL,
+                 synced_hash  TEXT    NOT NULL,
+                 spec_version INTEGER NOT NULL,
+                 PRIMARY KEY(repo_id, table_name, row_pk)
+             ) STRICT;
+             INSERT INTO sync_published_rows(repo_id, table_name, row_pk, synced_hash, \
+             spec_version)
+                 SELECT repo_id, table_name, row_pk, synced_hash, 0
+                   FROM sync_published_rows_pre_v095;
+             DROP TABLE sync_published_rows_pre_v095;",
+        )?;
+    }
+    tx.commit()
 }
 
 #[cfg(test)]

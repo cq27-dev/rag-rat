@@ -66,7 +66,7 @@ pub(crate) fn produce_and_author(
         // (repo_id, account_id, scope_id) one-way, so without the directory a retained entry could
         // never be replayed by a later binary (see [`super::refold`]).
         store::record_stream_context(tx, stream, ctx.repo_id, ctx.account_id, spec.scope_id)?;
-        for op in produce::produce_row_ops(tx, spec, ctx.repo_id)? {
+        for op in produce::produce_row_ops(tx, spec, ctx.repo_id, stream)? {
             let signed = store::author_row_entry(tx, stream, ctx.device.secret(), &op, ctx.now_ms)?;
             let meta =
                 OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
@@ -80,6 +80,33 @@ pub(crate) fn produce_and_author(
             // copy: surface it and do NOT transmit the junk op.
             match apply::apply_row_op(tx, spec, ctx.repo_id, &op, meta)? {
                 apply::ApplyOutcome::Applied => authored.push(signed.signed_bytes),
+                // A locally-authored op CANNOT lose its own self-apply while the row's bookkeeping
+                // belongs to this stream: the entry took `MAX(lamport) + 1` over the whole stream,
+                // so it outranks every clock any op on it could have set. Losing therefore proves
+                // the row's clock came from a DIFFERENT stream — the shape a changed scope or
+                // account leaves behind, where `sync_row_clocks` (keyed only by
+                // `(repo_id, table_name, row_pk)`) survives a move its lamports have no meaning
+                // after.
+                //
+                // FAIL rather than accept it. A superseded self-apply writes no published record,
+                // so the next pass re-derives the identical delta and signs it again — growing the
+                // log without bound and broadcasting entries every peer will also discard, until
+                // the new stream's lamport happens to climb past the stale clock. Bailing rolls
+                // back the entry `author_row_entry` just inserted, exactly as the quarantine arm
+                // below does, and leaves an attributable error instead of silent churn.
+                // No `debug_assert` here, unlike the arm below: that one is provably unreachable
+                // (the lint rejects every shape that quarantines), so asserting is a dev-time
+                // tripwire for a lint gap. This one is REACHABLE whenever a row's bookkeeping and
+                // its stream come apart, which is precisely the condition worth reporting — a
+                // panic would replace a diagnosable error with a crash.
+                apply::ApplyOutcome::Superseded => {
+                    anyhow::bail!(
+                        "table-sync: a locally-produced op lost its own self-apply on `{}` — the \
+                         row's write clock carries a lamport from another stream, so authoring \
+                         cannot settle it",
+                        spec.name
+                    );
+                },
                 // A locally-produced op failing to self-apply is UNREACHABLE for a registered
                 // table: the lint rejects every shape that would quarantine (nullable pk, cross-row
                 // constraint, ValueType/physical-type mismatch), the producer reads well-typed
@@ -148,7 +175,9 @@ pub(crate) fn ingest(
                     return Ok(IngestOutcome::Parked("table not in scope"));
                 };
                 match apply::apply_row_op(tx, spec, ctx.repo_id, &op, meta)? {
-                    ApplyOutcome::Applied => IngestOutcome::Applied,
+                    // A received op that lost on the merits still landed: the entry is
+                    // stored, nothing is outstanding, and redelivery stays idempotent.
+                    ApplyOutcome::Applied | ApplyOutcome::Superseded => IngestOutcome::Applied,
                     // Durably recorded as well as returned: the caller sees this one, but nothing
                     // later could tell a rejected payload from a projected one without the mark.
                     ApplyOutcome::Quarantined(why) => {
@@ -186,8 +215,9 @@ mod tests {
     const SPEC: TableSpec = TableSpec {
         name: "t_demo",
         scope_id: "demo/1",
-        pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-        columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }],
+        spec_version: 1,
+        pk: &[ColumnSpec::required("id", ValueType::Text)],
+        columns: &[ColumnSpec::required("title", ValueType::Text)],
         local_columns: &[],
         repo_column: None,
     };
@@ -326,16 +356,18 @@ mod tests {
         const TA: TableSpec = TableSpec {
             name: "t_a",
             scope_id: "multi/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("v", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
         const TB: TableSpec = TableSpec {
             name: "t_b",
             scope_id: "multi/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("v", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };

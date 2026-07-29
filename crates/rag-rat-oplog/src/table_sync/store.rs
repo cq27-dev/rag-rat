@@ -55,12 +55,25 @@ pub(crate) enum PendingReason {
     /// applying the known subset would leave a row NO device ever authored, and publishing that row
     /// lets the producer re-author the hole at a winning lamport (see [`super::apply`]).
     UnknownColumn,
-    /// The op omits a column this registry requires — an OLDER producer, whose complete row under
-    /// its narrower spec is a partial after-image under ours. Whole-row LWW needs the full
-    /// after-image, so nothing is written. Unlike a broken producer this is a version gap, and it
-    /// is redeemed from the SENDER's side: #1002's declared column defaults rebuild the missing
-    /// cells into a complete row, at which point the replay lands it.
+    /// The op was authored against a NEWER synced column set than this binary knows. We cannot know
+    /// what a later spec means — and the op may name columns we lack — so nothing is written until
+    /// a binary that understands it replays the entry.
+    NewerSpecVersion,
+    /// The op omits a column its OWN claimed version was obliged to carry. Whole-row LWW needs the
+    /// full after-image, so nothing is written.
+    ///
+    /// Since #1002 this no longer means "an older producer": an op that genuinely predates a column
+    /// is completed from that column's declared default and applies inline, never reaching here.
+    /// What remains is a BROKEN or mis-stamped producer, which under additive-only evolution no
+    /// future binary can redeem on its own — the sender has to fix its bug and author again (a new
+    /// entry; redelivery of this one short-circuits on `entry_exists`). It parks rather than
+    /// quarantining because a forgotten `spec_version` bump is the likeliest cause and parking is
+    /// what keeps that operator error recoverable, but do not expect the entry itself to clear.
     PartialAfterImage,
+    /// The op carries a cell for a column introduced AFTER the version it claims — self-
+    /// contradictory, so the stamp cannot be trusted to decide what the op predates. The one half
+    /// of the advisory version a receiver can check against its own registry.
+    MisstampedSpecVersion,
     /// The op-kind is outside this binary's row-op vocabulary.
     UnknownOpKind,
     /// The op bytes do not decode at all.
@@ -413,6 +426,45 @@ pub(crate) fn clear_entry_pending(
     Ok(())
 }
 
+/// The op of the entry that currently WINS a row — located by the clock's `(device, lamport)`,
+/// which `table_sync_entries` is UNIQUE on within a stream, so at most one entry can match.
+///
+/// The clock stores the fingerprint as lowercase hex while the entry log stores raw bytes; the
+/// fingerprint type round-trips between them, and an unparseable value simply resolves to nothing.
+/// Returns `None` when the entry is absent or its payload no longer decodes to a known op.
+pub(crate) fn winning_entry_op(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    device_hex: &str,
+    lamport: u64,
+) -> anyhow::Result<Option<RowOp>> {
+    let Ok(device) = device_hex.parse::<DeviceFingerprint>() else {
+        return Ok(None);
+    };
+    let signed_bytes: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT signed_bytes FROM table_sync_entries
+              WHERE stream_id = ?1 AND device_fingerprint = ?2 AND lamport = ?3",
+            params![
+                stream.to_bytes().as_slice(),
+                device.to_bytes().as_slice(),
+                i64::try_from(lamport)?
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(signed_bytes) = signed_bytes else {
+        return Ok(None);
+    };
+    let Ok(signed) = entry::decode_signed(&signed_bytes) else {
+        return Ok(None);
+    };
+    Ok(match row_op::decode(&signed.entry.op_bytes) {
+        Ok(DecodedRowOp::Known(op)) => Some(op),
+        _ => None,
+    })
+}
+
 /// One retained-but-unprojected entry, with everything replay needs except its apply context (which
 /// comes from [`stream_context`], since the stream id hashes that away).
 pub(crate) struct PendingEntry {
@@ -546,7 +598,11 @@ mod tests {
     }
 
     fn op(id: &str) -> RowOp {
-        RowOp::Remove { table: "t".to_string(), pk: vec![TypedValue::Text(id.to_string())] }
+        RowOp::Remove {
+            spec_version: 1,
+            table: "t".to_string(),
+            pk: vec![TypedValue::Text(id.to_string())],
+        }
     }
 
     #[test]

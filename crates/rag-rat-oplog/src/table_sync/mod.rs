@@ -15,6 +15,7 @@ mod produce;
 mod refold;
 mod registry;
 mod row_op;
+mod schema_facts;
 mod scope_stream;
 mod store;
 

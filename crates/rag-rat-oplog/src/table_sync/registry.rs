@@ -15,6 +15,8 @@ use std::collections::BTreeSet;
 
 use rusqlite::Connection;
 
+use super::schema_facts::{self, CheckVerdict, PhysicalColumn};
+
 /// The storage/wire type of a synced column. A cell whose runtime value disagrees with its column's
 /// declared type is quarantined by the applier rather than silently coerced.
 ///
@@ -30,12 +32,65 @@ pub(crate) enum ValueType {
     Blob,
 }
 
-/// One synced, non-pk column: its name and wire type. Merge is whole-row (all synced columns move
-/// together under the row's write clock), so a column carries no per-column merge policy.
+/// A column's declared default — the value an op authored BEFORE this column existed contributes
+/// when it is projected here (#1002). Literal forms only: a non-literal SQL default
+/// (`CURRENT_TIMESTAMP`, `unixepoch()`) is per-device non-deterministic, so two receivers filling
+/// the same op would produce different rows. That is the determinism requirement, not a style rule.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum DefaultValue {
+    Null,
+    Bool(bool),
+    I64(i64),
+    Text(&'static str),
+    Blob(&'static [u8]),
+}
+
+/// When a column entered the spec, and what an op authored before that contributes for it. The
+/// version is what makes the default SAFE to apply: without it, an op merely older than the CURRENT
+/// spec would have every added column defaulted, including ones that already existed in the op's
+/// own version — so a broken producer that dropped a column it was obliged to send would have that
+/// column silently reset to its default on every receiver instead of parking as the partial it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AddedColumn {
+    /// The spec version that introduced the column. An op stamped BELOW this predates the column
+    /// and legitimately omits it; an op stamped at or above it was obliged to send it.
+    pub in_version: u32,
+    pub default: DefaultValue,
+}
+
+/// One synced, non-pk column: its name, wire type, and — for a column added after the table's first
+/// spec version — when it arrived plus the value an older producer's op contributes for it. Merge
+/// is whole-row (all synced columns move together under the row's write clock), so a column carries
+/// no per-column merge policy.
+///
+/// `added` is `None` for a column that has existed since the table's first version: no op can ever
+/// legitimately omit it, so there is nothing to fill, and demanding a default would force a
+/// meaningless one onto an original `NOT NULL` column. It also keeps failure contained — an op
+/// missing such a column is a genuinely broken partial, and parks rather than being silently
+/// filled.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ColumnSpec {
     pub name: &'static str,
     pub value_type: ValueType,
+    pub added: Option<AddedColumn>,
+}
+
+impl ColumnSpec {
+    /// A column every op must carry — the shape for pk columns and for any column present since the
+    /// table's first spec version.
+    pub const fn required(name: &'static str, value_type: ValueType) -> Self {
+        Self { name, value_type, added: None }
+    }
+
+    /// A column introduced in `in_version`, carrying the value an op older than that contributes.
+    pub const fn added(
+        name: &'static str,
+        value_type: ValueType,
+        in_version: u32,
+        default: DefaultValue,
+    ) -> Self {
+        Self { name, value_type, added: Some(AddedColumn { in_version, default }) }
+    }
 }
 
 /// One syncable table. `pk` names the identity columns (encoded as the row op's `pk`); `columns`
@@ -48,6 +103,34 @@ pub(crate) struct ColumnSpec {
 pub(crate) struct TableSpec {
     pub name: &'static str,
     pub scope_id: &'static str,
+    /// Which synced column set this binary authors against — stamped into every op it produces, so
+    /// a receiver can tell an OLDER producer's complete row from a NEWER producer's partial
+    /// one (#1002). BUMP whenever `columns` changes; `local_columns` never cross the wire, so
+    /// they do not count.
+    ///
+    /// EVOLUTION IS ADDITIVE ONLY. A column may be ADDED (with a bump and a declared default);
+    /// removing, renaming, or retyping one means a NEW TABLE. Default-fill closes older→newer for
+    /// additions alone — an older op naming a column the current spec dropped parks forever, and
+    /// no future binary redeems it. This cannot be linted (it needs registry history), so it
+    /// is an invariant on whoever edits a spec.
+    ///
+    /// The version is largely ADVISORY, and the asymmetry matters. A receiver CAN reject an
+    /// OVER-stamp (a version above its own → park) and a *partial* under-stamp (a cell for a
+    /// column introduced after the claimed version is self-contradictory → park, since
+    /// `in_version` is a fixed historical fact under additive-only evolution). What it CANNOT
+    /// detect is a WHOLE-CLOTH under-stamp: an op carrying only the columns its claimed
+    /// version had, stamped lower than the producer actually authored against. That case is
+    /// indistinguishable from an honest un-upgraded peer, and it is the DESTRUCTIVE direction
+    /// — every column added since the claimed version is reset to its default on every
+    /// receiver, at a winning lamport, silently.
+    ///
+    /// That is not privilege escalation (an authorized writer can already write any value into
+    /// those columns under whole-row LWW, and the reset is the deliberate meaning of a whole-row
+    /// write from a device that does not know the column), but it does mean a buggy producer
+    /// degrades data fleet-wide rather than failing loudly. STAMP CORRECTLY; the rest of the rule
+    /// assumes it. A mis-stamp PARKS rather than quarantining because a forgotten bump is the
+    /// likeliest cause and parking is what lets the next binary redeem it.
+    pub spec_version: u32,
     /// The identity columns, with types — the applier validates each incoming pk value against its
     /// declared type so SQLite affinity can't coerce a mismatched pk (e.g. `I64(1)` onto a `TEXT`
     /// key `'1'`) and split a row's bookkeeping.
@@ -76,12 +159,62 @@ impl TableSpec {
 /// nothing here is load-bearing yet — the mechanism is proven against a synthetic spec in tests.
 pub(crate) const SYNCABLE_TABLES: &[TableSpec] = &[];
 
+/// One table's REPLICATED CONTRACT within a projector generation — everything that decides what
+/// this binary can project from the wire, and nothing that does not.
+///
+/// `scope_id` is part of it, not decoration: it selects the stream a table rides, so moving a table
+/// between scopes turns entries the old registry parked as `TableNotInScope` into entries the new
+/// one understands. Omitting it would let that edit land without a projector bump, and those
+/// entries would never be retried. `pk` and each column's `ValueType` are recorded for a different
+/// reason — changing either means a NEW TABLE under the additive-only rule, which is stated as an
+/// un-lintable invariant precisely because a single binary has no history to check against. A
+/// generation list IS that history, so the cross-generation test can enforce part of it.
+///
+/// `local_columns` is deliberately absent: it never crosses the wire, so changing it widens
+/// nothing and must not force a generation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TableGeneration {
+    pub table: &'static str,
+    pub scope_id: &'static str,
+    pub spec_version: u32,
+    pub repo_column: Option<&'static str>,
+    /// `(column, value_type)` per identity column, in registry order.
+    pub pk: &'static [(&'static str, ValueType)],
+    /// `(column, value_type, added)` per synced column, in registry order. `added` is `None` for a
+    /// column present since the table's first version.
+    pub columns: &'static [(&'static str, ValueType, Option<AddedColumn>)],
+}
+
+/// The registry as of EACH projector generation, oldest first: a generation's index + 1 is the
+/// [`TABLE_SYNC_PROJECTOR_VERSION`] it describes, and the LAST entry must equal the live registry.
+///
+/// This is the mechanical coupling between a registry change and a projector bump, and it is
+/// load-bearing rather than documentation. A refold is owed only when the store's stamp is behind
+/// the current projector version, or some entry was parked by an older one — so if the registry
+/// widens (a table registered, a column added) WITHOUT the version moving, a store already stamped
+/// at that version keeps entries parked as `TableNotInScope` / `NewerSpecVersion` with a
+/// `pending_projector_version` equal to the current one. Neither trigger fires, they are never
+/// replayed, and redelivery cannot rescue them because it short-circuits on `entry_exists`. The
+/// payload is simply lost.
+///
+/// A pinned copy of the current registry cannot enforce this: updating the pin to match a change is
+/// exactly as easy as making the change. Recording a generation PER VERSION can, because the live
+/// registry must equal the last entry — so widening the registry forces an APPEND, and appending
+/// moves `len()`, which is the version. Widenings that are not registry changes (a new op-kind)
+/// append a generation that repeats the previous snapshot.
+///
+/// Entries here are HISTORY. Append only; never edit a landed generation.
+pub(crate) const PROJECTOR_GENERATIONS: &[&[TableGeneration]] = &[
+    // v1: the engine exists; no table is registered yet.
+    &[],
+];
+
 /// Assert a spec classifies EVERY physical column of its table exactly once — as pk, a synced
 /// column, or a local column — and names no column the table doesn't have. This is the invariant
 /// that stops a new column being silently unclassified: it is either replicated or deliberately
 /// local, never neither. Returns a human-readable diff on mismatch.
 pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> Result<(), String> {
-    let columns = physical_column_info(conn, spec.name)
+    let columns = schema_facts::physical_column_info(conn, spec.name)
         .map_err(|err| format!("cannot read columns of `{}`: {err}", spec.name))?;
     let physical: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
 
@@ -193,7 +326,7 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
     // predicates, but `row_op::row_pk_string` encodes them as DIFFERENT bookkeeping identities
     // — so one physical row would carry two write clocks / published hashes and diverge (or
     // suppress the wrong update).
-    if let Some(col) = pk_column_with_non_binary_collation(conn, spec.name)
+    if let Some(col) = schema_facts::pk_column_with_non_binary_collation(conn, spec.name)
         .map_err(|err| format!("cannot read the pk collation of `{}`: {err}", spec.name))?
     {
         return Err(format!(
@@ -210,7 +343,7 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
     // quarantined, and WHICH loses depends on order), so peers diverge with no dirty-local edit. A
     // foreign key is the same class (a delete/insert can fail against another row). Reject both
     // until a deterministic cross-row conflict rule exists.
-    if table_has_foreign_key(conn, spec.name)
+    if schema_facts::table_has_foreign_key(conn, spec.name)
         .map_err(|err| format!("cannot read foreign keys of `{}`: {err}", spec.name))?
     {
         return Err(format!(
@@ -222,7 +355,7 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
     // The inbound direction is the same hazard: a table REFERENCED by another's FK can have a
     // `Remove` blocked (FK RESTRICT) on a peer that holds a child row but not on one that doesn't →
     // the delete quarantines on one side, applies on the other, and the replicas diverge.
-    if table_is_referenced_by_foreign_key(conn, spec.name)
+    if schema_facts::table_is_referenced_by_foreign_key(conn, spec.name)
         .map_err(|err| format!("cannot scan foreign keys referencing `{}`: {err}", spec.name))?
     {
         return Err(format!(
@@ -235,7 +368,7 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
     // deterministic: an INSERT/UPDATE/DELETE trigger can adjust the row (or others) from local
     // derived state, so the SAME received op folds to different physical results on two devices,
     // and apply_upsert then publishes each divergent result — the replicas stay divergent.
-    if let Some(trigger) = table_trigger(conn, spec.name)
+    if let Some(trigger) = schema_facts::table_trigger(conn, spec.name)
         .map_err(|err| format!("cannot read triggers of `{}`: {err}", spec.name))?
     {
         return Err(format!(
@@ -244,7 +377,7 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             spec.name
         ));
     }
-    if let Some(index) = non_pk_unique_index(conn, spec.name)
+    if let Some(index) = schema_facts::non_pk_unique_index(conn, spec.name)
         .map_err(|err| format!("cannot read indexes of `{}`: {err}", spec.name))?
     {
         return Err(format!(
@@ -255,6 +388,127 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
         ));
     }
 
+    // A synced column's DECLARED default must equal its physical SQL default, exactly (#1002).
+    //
+    // This is a CONVERGENCE check for the upgrade path, not hygiene. `ALTER TABLE ADD COLUMN`
+    // backfills existing rows with the SQL default, while the applier fills a column an older op
+    // omits with the DECLARED one. If the two disagree, a device that applied an op BEFORE
+    // upgrading and one that applied the same op AFTER hold different rows AT THE SAME CLOCK —
+    // silent divergence with no local edit to signal it, and nothing to repair it while the
+    // authoring entry is unavailable.
+    //
+    // KNOW ITS LIMIT. The real invariant is "the migration that introduces the column backfills
+    // existing rows with the DECLARED default", and this reads `PRAGMA table_info.dflt_value` — the
+    // DEFAULT CLAUSE. Those coincide only for `ALTER TABLE ADD COLUMN … DEFAULT x`. They do NOT
+    // coincide for a table REBUILD (`CREATE new; INSERT INTO new SELECT …, <expr> FROM old; DROP;
+    // RENAME`), which is a routine migration idiom in this repo: the `SELECT` expression is
+    // invisible here, so a rebuild that backfills anything other than the declared default passes
+    // this check while violating the invariant. INTRODUCE A SYNCED COLUMN WITH `ADD COLUMN …
+    // DEFAULT x`, which satisfies it structurally. A rebuild that computes per-row values is not
+    // wrong, but it is new content peers have not seen, and it re-authors the whole table once on
+    // every device — budget for that deliberately rather than discovering it.
+    //
+    // A declared default must also match its column's `ValueType`: the fill goes straight into the
+    // row, so a mistyped default would write a value the applier would have quarantined on the
+    // wire.
+    // An IDENTITY column can never be `added`. The declared default is unreachable for it: an op
+    // authored before the key grew carries fewer pk values, and `apply_row_op`'s arity check
+    // quarantines it TERMINALLY before projection ever runs — so the evolution the `added` shape
+    // promises simply does not exist here, and declaring it would advertise a redemption path that
+    // silently drops every older op instead. A changed primary key is a new table identity.
+    for key in spec.pk {
+        if key.added.is_some() {
+            return Err(format!(
+                "`{}`: identity column `{}` declares an introduction version — a primary key \
+                 cannot grow (an older op carries fewer pk values and is quarantined on arity \
+                 before its default could apply); a changed key means a NEW TABLE",
+                spec.name, key.name
+            ));
+        }
+    }
+
+    // Read and lex the table's DDL ONCE: its declarations and constraints are a fact about the
+    // table, not about each column.
+    let ddl = schema_facts::read_table_ddl(conn, spec.name)
+        .map_err(|err| format!("cannot read the DDL of `{}`: {err}", spec.name))?;
+    for column in spec.columns {
+        let Some(added) = column.added else {
+            continue;
+        };
+        let declared = added.default;
+        let Some(physical) = columns.iter().find(|c| c.name == column.name) else {
+            continue; // an unknown column name is already reported by the exhaustiveness diff above.
+        };
+        // The introducing version must sit inside this spec's history. `1` is the first version, so
+        // a column "added" there was present from the start and is `required`; a version above the
+        // spec's own names a column this binary carries but does not announce — a forgotten bump,
+        // which would make the fill window wrong in both directions.
+        if added.in_version < 2 || added.in_version > spec.spec_version {
+            return Err(format!(
+                "`{}`: column `{}` claims to be added in spec version {} — it must be between 2 \
+                 and the spec's own version {} (a column present since version 1 is `required`)",
+                spec.name, column.name, added.in_version, spec.spec_version
+            ));
+        }
+        if !default_matches_value_type(declared, column.value_type) {
+            return Err(format!(
+                "`{}`: column `{}` declares a {declared:?} default, which is not a {:?} value",
+                spec.name, column.name, column.value_type
+            ));
+        }
+        // A NOT NULL column cannot be filled with NULL. The declared default goes straight into the
+        // row, so this would fail the constraint at INSERT and quarantine the op TERMINALLY —
+        // older→newer replication for the table would be dead, with nothing to redeem it. The
+        // SQL-default check below does not catch it: a NOT NULL column with no DEFAULT clause reads
+        // as an absent physical default, which a declared `Null` matches.
+        if physical.not_null && matches!(declared, DefaultValue::Null) {
+            return Err(format!(
+                "`{}`: column `{}` is NOT NULL but declares a Null default — filling an older op \
+                 from it would fail the constraint and quarantine the op permanently",
+                spec.name, column.name
+            ));
+        }
+        // The column must ACCEPT its own declared default, and its constraints must depend on
+        // nothing but this column. Both are decided by rebuilding the column alone and attempting
+        // the insert the applier would perform — see `schema_facts::default_satisfies_check`.
+        //
+        // Both failures end the same way and are equally silent: the applier fills this column from
+        // the default while every other column comes from the OP, so a constraint the default
+        // violates (or one whose other inputs the op supplies) fails at INSERT and the op is
+        // QUARANTINED — terminally, so older→newer replication for the table simply stops.
+        match schema_facts::default_satisfies_check(&ddl, spec.name, column.name, declared) {
+            CheckVerdict::Satisfied => {},
+            CheckVerdict::Violated(why) => {
+                return Err(format!(
+                    "`{}`: column `{}` declares default {declared:?}, which the column itself \
+                     REJECTS ({why}) — every op older than the column would be filled with a \
+                     value the table refuses, and quarantined terminally",
+                    spec.name, column.name
+                ));
+            },
+            CheckVerdict::NotSelfContained(why) => {
+                return Err(format!(
+                    "`{}`: column `{}` has a declared default but its constraints read something \
+                     other than that column ({why}) — the default supplies this column while the \
+                     OP supplies the rest, so a constraint can fail for a valid older op and \
+                     quarantine it terminally. Keep a synced column's CHECK self-contained.",
+                    spec.name, column.name
+                ));
+            },
+        }
+        let physical_default = physical.default_sql.as_deref();
+        if !default_matches_sql(declared, physical_default) {
+            return Err(format!(
+                "`{}`: column `{}` declares default {declared:?} but the table's DEFAULT is {} — \
+                 they must agree exactly, or a row backfilled by the migration and a row rebuilt \
+                 from an older op differ at the same write clock",
+                spec.name,
+                column.name,
+                physical_default.unwrap_or("absent")
+            ));
+        }
+    }
+
     // Every local (never-replicated) column must be nullable or carry a DB default: a remote upsert
     // INSERTs only the pk + synced columns (a local column is re-derived here, not sent), so a NOT
     // NULL local column with no default makes that insert fail and the applier quarantine the op —
@@ -262,7 +516,7 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
     for local in spec.local_columns {
         if let Some(col) = columns.iter().find(|c| c.name == *local)
             && col.not_null
-            && !col.has_default
+            && col.default_sql.is_none()
         {
             return Err(format!(
                 "`{}`: local column `{local}` is NOT NULL without a default, so a remote insert \
@@ -277,7 +531,24 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
     // type — which would make the post-write `synced_row_hash` read-back throw and wedge ingest
     // after the row was already written. It also makes pk columns NOT NULL. It is the schema
     // convention for every new table regardless.
-    if !table_is_strict(conn, spec.name)
+    // A GENERATED column is invisible to the rest of this lint and to the applier alike:
+    // `PRAGMA table_info` omits it, so the exhaustiveness diff never classifies it, and the
+    // applier never supplies it. It is not inert, though — its expression can read a synced column,
+    // and its own NOT NULL and CHECK constraints then apply to a value derived from whatever the
+    // applier filled in. That makes a constraint reachable through it depend on this column
+    // transitively, which the probe models by name and therefore cannot see.
+    if let Some(generated) = schema_facts::generated_column(conn, spec.name)
+        .map_err(|err| format!("cannot read the columns of `{}`: {err}", spec.name))?
+    {
+        return Err(format!(
+            "`{}`: column `{generated}` is GENERATED — it is absent from `PRAGMA table_info`, so \
+             it can be neither replicated nor classified as local, and a constraint on it depends \
+             on the synced columns its expression reads. Derive it outside the table.",
+            spec.name
+        ));
+    }
+
+    if !schema_facts::table_is_strict(conn, spec.name)
         .map_err(|err| format!("cannot read the schema of `{}`: {err}", spec.name))?
     {
         return Err(format!(
@@ -303,22 +574,6 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
         }
     }
     Ok(())
-}
-
-/// Whether `table` is a STRICT table. SQLite exposes no pragma for this, so read the table options
-/// that follow the column-list's closing `)` (all column-level parens nest inside it, so the LAST
-/// `)` is always that closer) and look for the `STRICT` keyword.
-fn table_is_strict(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
-    let sql: String = conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        [table],
-        |row| row.get(0),
-    )?;
-    let options = sql.rsplit(')').next().unwrap_or_default();
-    Ok(options
-        .to_ascii_uppercase()
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .any(|token| token == "STRICT"))
 }
 
 /// Whether a declared `ValueType` matches a physical STRICT column type. `Bool` and `I64` both
@@ -352,152 +607,71 @@ pub(crate) fn assert_registry_consistent(registry: &[TableSpec]) -> Result<(), S
     Ok(())
 }
 
-/// One physical column of a table, from `PRAGMA table_info` (`conn.pragma` quotes the table name,
-/// so a spec name never needs manual escaping). `pk_position` is the 1-based position within the
-/// primary key, or `0` for a non-key column. `decl_type` is the declared column type (uppercased) —
-/// on a STRICT table one of `INT`/`INTEGER`/`REAL`/`TEXT`/`BLOB`/`ANY`.
-struct PhysicalColumn {
-    name: String,
-    decl_type: String,
-    not_null: bool,
-    has_default: bool,
-    pk_position: i64,
+/// Whether a declared default is a value of the column's declared wire type.
+fn default_matches_value_type(default: DefaultValue, value_type: ValueType) -> bool {
+    matches!(
+        (default, value_type),
+        (DefaultValue::Null, _)
+            | (DefaultValue::Bool(_), ValueType::Bool)
+            | (DefaultValue::I64(_), ValueType::I64)
+            | (DefaultValue::Text(_), ValueType::Text)
+            | (DefaultValue::Blob(_), ValueType::Blob)
+    )
 }
 
-/// Whether `table` declares any foreign key (`PRAGMA foreign_key_list` returns a row per FK).
-fn table_has_foreign_key(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
-    let mut any = false;
-    conn.pragma(None, "foreign_key_list", table, |_row| {
-        any = true;
-        Ok(())
-    })?;
-    Ok(any)
-}
-
-/// The name of `table`'s first UNIQUE index that is NOT the primary key, if any (a cross-row
-/// constraint). `PRAGMA index_list` columns: 0 seq, 1 name, 2 unique, 3 origin, 4 partial; `origin`
-/// is `pk` for the primary key's implicit index, `u` for a UNIQUE constraint, `c` for a
-/// `CREATE UNIQUE INDEX`.
-fn non_pk_unique_index(conn: &Connection, table: &str) -> rusqlite::Result<Option<String>> {
-    let mut found = None;
-    conn.pragma(None, "index_list", table, |row| {
-        let unique: i64 = row.get(2)?;
-        let origin: String = row.get(3)?;
-        if unique != 0 && origin != "pk" && found.is_none() {
-            found = Some(row.get::<_, String>(1)?);
-        }
-        Ok(())
-    })?;
-    Ok(found)
-}
-
-/// The first pk column that uses a non-BINARY collation, if any. Reads the primary key's index
-/// (`PRAGMA index_list` origin=`pk` → `index_xinfo`, whose col 2 is the column name — NULL for the
-/// implicit rowid — and col 4 the collation). An INTEGER-rowid pk has no such index (integers have
-/// no collation), so it returns `None`.
-fn pk_column_with_non_binary_collation(
-    conn: &Connection,
-    table: &str,
-) -> rusqlite::Result<Option<String>> {
-    let mut pk_index = None;
-    conn.pragma(None, "index_list", table, |row| {
-        if row.get::<_, String>(3)? == "pk" {
-            pk_index = Some(row.get::<_, String>(1)?);
-        }
-        Ok(())
-    })?;
-    let Some(index) = pk_index else { return Ok(None) };
-    let mut offending = None;
-    conn.pragma(None, "index_xinfo", &index, |row| {
-        // index_xinfo columns: 0 seqno, 1 cid, 2 name (NULL for the rowid), 3 desc, 4 coll, 5 key.
-        let name: Option<String> = row.get(2)?;
-        let collation: String = row.get(4)?;
-        if let Some(name) = name
-            && !collation.eq_ignore_ascii_case("BINARY")
-            && offending.is_none()
-        {
-            offending = Some(name);
-        }
-        Ok(())
-    })?;
-    Ok(offending)
-}
-
-/// The name of the first trigger on `table`, if any (`sqlite_master` type='trigger'). A trigger can
-/// mutate the row (or other rows) from local/derived state, so the SAME received op could fold to
-/// different physical results on two devices — divergence the whole-row fold can't detect.
-fn table_trigger(conn: &Connection, table: &str) -> rusqlite::Result<Option<String>> {
-    let mut stmt =
-        conn.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1")?;
-    let mut rows = stmt.query([table])?;
-    match rows.next()? {
-        Some(row) => Ok(Some(row.get(0)?)),
-        None => Ok(None),
+/// Whether a declared default equals the column's physical `DEFAULT` clause.
+///
+/// SQLite reports `dflt_value` as the literal AS WRITTEN, so this compares against the canonical
+/// spelling of each literal form. Anything else — an expression, a function call, a differently
+/// spelled literal — does NOT match and is reported: a non-literal default is per-device
+/// non-deterministic, and two receivers filling the same op from it would produce different rows.
+/// `DefaultValue::Null` corresponds to an absent DEFAULT clause (SQLite's own default) as well as
+/// an explicit `DEFAULT NULL`.
+fn default_matches_sql(declared: DefaultValue, physical: Option<&str>) -> bool {
+    let physical = physical.map(str::trim);
+    match declared {
+        DefaultValue::Null => matches!(physical, None | Some("NULL") | Some("null")),
+        DefaultValue::Bool(b) => physical == Some(if b { "1" } else { "0" }),
+        DefaultValue::I64(n) => physical.is_some_and(|sql| sql.parse::<i64>() == Ok(n)),
+        // SQLite reports a text default with its quotes; compare the unquoted content so an
+        // embedded quote (doubled in SQL) still round-trips. It must be exactly ONE literal — see
+        // `single_quoted_literal`.
+        DefaultValue::Text(text) => physical
+            .and_then(schema_facts::single_quoted_literal)
+            .is_some_and(|inner| inner == text),
+        // A blob default is written as X'..' — compare the hex, case-insensitively. Unlike text,
+        // the comparison already cannot admit an expression: a concatenation carries quotes and
+        // pipes, and the target is pure hex of a fixed length, so it can never compare equal. The
+        // digit check states that rather than leaving it to be re-derived.
+        DefaultValue::Blob(bytes) => physical
+            .and_then(|sql| {
+                let hex = sql.strip_prefix("X'").or_else(|| sql.strip_prefix("x'"))?;
+                hex.strip_suffix('\'')
+            })
+            .is_some_and(|hex| {
+                hex.len() == bytes.len() * 2
+                    && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                    && hex.eq_ignore_ascii_case(
+                        &bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                    )
+            }),
     }
-}
-
-/// Whether any OTHER table declares a foreign key REFERENCING `table` (an inbound reference). Scans
-/// every base table's `PRAGMA foreign_key_list` (col 2 is the referenced table).
-fn table_is_referenced_by_foreign_key(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
-    let mut tables = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-        )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        for row in rows {
-            tables.push(row?);
-        }
-    }
-    for other in tables {
-        if other == table {
-            continue;
-        }
-        let mut references = false;
-        conn.pragma(None, "foreign_key_list", &other, |row| {
-            // foreign_key_list columns: 0 id, 1 seq, 2 table (the referenced table), 3 from, 4 to.
-            if row.get::<_, String>(2)? == table {
-                references = true;
-            }
-            Ok(())
-        })?;
-        if references {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn physical_column_info(conn: &Connection, table: &str) -> rusqlite::Result<Vec<PhysicalColumn>> {
-    let mut cols = Vec::new();
-    conn.pragma(None, "table_info", table, |row| {
-        // PRAGMA table_info columns: 0 cid, 1 name, 2 type, 3 notnull, 4 dflt_value, 5 pk.
-        cols.push(PhysicalColumn {
-            name: row.get::<_, String>(1)?,
-            decl_type: row.get::<_, String>(2)?.to_ascii_uppercase(),
-            not_null: row.get::<_, i64>(3)? != 0,
-            has_default: row.get::<_, Option<String>>(4)?.is_some(),
-            pk_position: row.get::<_, i64>(5)?,
-        });
-        Ok(())
-    })?;
-    Ok(cols)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const DEMO_PK: &[ColumnSpec] = &[ColumnSpec { name: "id", value_type: ValueType::Text }];
-    const DEMO_COLUMNS: &[ColumnSpec] =
-        &[ColumnSpec { name: "title", value_type: ValueType::Text }, ColumnSpec {
-            name: "count",
-            value_type: ValueType::I64,
-        }];
+    const DEMO_PK: &[ColumnSpec] = &[ColumnSpec::required("id", ValueType::Text)];
+    const DEMO_COLUMNS: &[ColumnSpec] = &[
+        ColumnSpec::required("title", ValueType::Text),
+        ColumnSpec::required("count", ValueType::I64),
+    ];
     const DEMO_LOCAL: &[&str] = &["resolved_rowid"];
     const DEMO_SPEC: TableSpec = TableSpec {
         name: "t_demo",
         scope_id: "demo/1",
+        spec_version: 1,
         pk: DEMO_PK,
         columns: DEMO_COLUMNS,
         local_columns: DEMO_LOCAL,
@@ -518,9 +692,1382 @@ mod tests {
         conn
     }
 
+    /// The comparable shape of one generation: `(table, spec_version, [(column, in_version,
+    /// default)])`, table order preserved.
+    /// One table's replicated contract, in a shape both a recorded generation and the live registry
+    /// can be reduced to.
+    type TableShape = (
+        &'static str,                                        // table
+        &'static str,                                        // scope_id
+        u32,                                                 // spec_version
+        Option<&'static str>,                                // repo_column
+        Vec<(&'static str, ValueType)>,                      // pk
+        Vec<(&'static str, ValueType, Option<AddedColumn>)>, // synced columns
+    );
+    type Snapshot = Vec<TableShape>;
+
+    fn snapshot_of_generation(generation: &[TableGeneration]) -> Snapshot {
+        generation
+            .iter()
+            .map(|t| {
+                (
+                    t.table,
+                    t.scope_id,
+                    t.spec_version,
+                    t.repo_column,
+                    t.pk.to_vec(),
+                    t.columns.to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    fn snapshot_of_live_registry() -> Snapshot {
+        SYNCABLE_TABLES
+            .iter()
+            .map(|spec| {
+                (
+                    spec.name,
+                    spec.scope_id,
+                    spec.spec_version,
+                    spec.repo_column,
+                    spec.pk.iter().map(|c| (c.name, c.value_type)).collect(),
+                    spec.columns.iter().map(|c| (c.name, c.value_type, c.added)).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_registry_change_cannot_land_without_a_projector_generation() {
+        // The coupling that makes a widened registry actually reach parked entries. A refold is
+        // owed only when the store's stamp is behind or an entry was parked by an OLDER projector,
+        // so registering a table (or widening a spec) without moving the version leaves a store
+        // already stamped at that version with entries it will never retry — and redelivery
+        // short-circuits on `entry_exists`, so the payload is gone.
+        //
+        // A pin of the CURRENT registry cannot enforce this: editing the pin is exactly as easy as
+        // making the change it is supposed to guard. Requiring the live registry to equal the LAST
+        // recorded generation does, because the only way to satisfy it after a change is to append
+        // — and the version IS the number of generations.
+        assert_eq!(
+            usize::try_from(super::super::refold::TABLE_SYNC_PROJECTOR_VERSION).unwrap(),
+            PROJECTOR_GENERATIONS.len(),
+            "the projector version is the count of recorded generations — append one, do not \
+             renumber"
+        );
+        assert_eq!(
+            snapshot_of_generation(PROJECTOR_GENERATIONS.last().expect("at least one generation")),
+            snapshot_of_live_registry(),
+            "the live registry differs from the newest recorded generation — APPEND a generation \
+             (which bumps the projector version), rather than editing the last one"
+        );
+    }
+
+    #[test]
+    fn each_generation_only_extends_the_one_before_it() {
+        // EVOLUTION IS ADDITIVE ONLY, enforced across history rather than asserted in prose. A
+        // single binary cannot check this — it has no past registry to compare against — which is
+        // why the rule is documented as un-lintable. The generation list IS that past, so every
+        // consecutive pair can be checked.
+        //
+        // Both directions of "additive" matter, and they fail differently:
+        //
+        // - A column that DISAPPEARS (dropped or renamed) strands every stored or received op
+        //   naming it on `project_cells`' `UnknownColumn` path — parked forever, since no future
+        //   binary reintroduces the name, and redelivery short-circuits on `entry_exists`.
+        // - A column that CHANGES its type or introduction tuple diverges silently. A declared
+        //   default is the value every receiver synthesizes for an op predating the column, so
+        //   changing it — even in step with the table's SQL default, which keeps the schema lint
+        //   happy because that lint only ever sees the CURRENT schema — makes a device that folded
+        //   an op before the change and one that folded it after hold different rows AT THE SAME
+        //   CLOCK, with no local edit to signal it. `in_version` decides WHICH ops a column is
+        //   filled for, so moving it retroactively rewrites what every stored op means.
+        //
+        // An accumulate-and-compare map catches only the second: a key that never reappears is
+        // never revisited. Comparing each generation against its predecessor catches both.
+        for (index, pair) in PROJECTOR_GENERATIONS.windows(2).enumerate() {
+            let (previous, next) = (pair[0], pair[1]);
+            let version = index + 2;
+            for old in previous {
+                let Some(new) = next.iter().find(|t| t.table == old.table) else {
+                    panic!(
+                        "`{}` disappeared from the registry by generation {version} — ops already \
+                         stored for it would park as `TableNotInScope` with nothing to redeem \
+                         them. Retiring a table is a deliberate act, not a registry edit.",
+                        old.table
+                    );
+                };
+                assert_eq!(
+                    old.pk, new.pk,
+                    "`{}` changed its primary key by generation {version} — the identity is what \
+                     every clock, tombstone and published record is keyed on; a changed identity \
+                     means a NEW TABLE, not a new spec version",
+                    old.table
+                );
+                // The scope selects the STREAM, and a projector bump cannot repair a move. Three
+                // separate things break, none of them recoverable by replay:
+                //   - a retained entry resolves its spec by the scope RECORDED ON THE ENTRY
+                //     (`refold::replay_pending_entry`), so every stored op for this table reparks
+                //     as `TableNotInScope` forever, whatever the projector version becomes;
+                //   - `sync_row_clocks` / tombstones / `sync_published_rows` are keyed `(repo_id,
+                //     table_name, row_pk)` with NO stream component, so they carry across silently
+                //     and now hold lamports from a stream nobody writes — a locally-authored op
+                //     starts from the NEW stream's max and loses its own self-apply;
+                //   - the winner lookup keys on `(stream, device, lamport)`, so it lands on some
+                //     sibling table's entry (guarded, but only down to "cannot resolve").
+                // Moving a table between scopes is a data migration, not a registry edit.
+                assert_eq!(
+                    old.scope_id, new.scope_id,
+                    "`{}` moved from scope `{}` to `{}` by generation {version} — its stream, and \
+                     with it every retained entry and row clock, is derived from that scope; a \
+                     scope change means a NEW TABLE",
+                    old.table, old.scope_id, new.scope_id
+                );
+                // The repo dimension decides WHICH rows this table replicates and which incoming
+                // ops are accepted, while the bookkeeping it writes stays keyed by the caller's
+                // repo either way. Dropping it to `None` is the sharp case: `read_all_rows` stops
+                // filtering, so every physical row is emitted into EVERY repo's stream, and the
+                // applier's repo-identity gate stops rejecting foreign ops — while one physical row
+                // now collects an independent clock per repo. That is cross-repo leakage and
+                // divergence at once, and no replay repairs it.
+                assert_eq!(
+                    old.repo_column, new.repo_column,
+                    "`{}` changed its repo column from {:?} to {:?} by generation {version} — the \
+                     repo dimension selects what replicates and what is accepted, but the clocks \
+                     and published records it writes are keyed the same either way; changing it \
+                     means a NEW TABLE",
+                    old.table, old.repo_column, new.repo_column
+                );
+                assert!(
+                    new.spec_version >= old.spec_version,
+                    "`{}`'s spec version went backwards by generation {version}",
+                    old.table
+                );
+                for (column, value_type, added) in old.columns {
+                    let carried = new.columns.iter().find(|(name, ..)| name == column);
+                    let Some((_, new_type, new_added)) = carried else {
+                        panic!(
+                            "`{}`.`{column}` disappeared by generation {version} — every op that \
+                             names it would park as `UnknownColumn` forever. Removing or renaming \
+                             a synced column means a NEW TABLE.",
+                            old.table
+                        );
+                    };
+                    assert_eq!(
+                        (new_type, new_added),
+                        (value_type, added),
+                        "`{}`.`{column}` changed its type or introduction tuple by generation \
+                         {version} — both are history the projection of older ops depends on",
+                        old.table
+                    );
+                }
+                // A column that APPEARS must be fillable for every op the previous generation could
+                // have authored, or older→newer replication stops for this table. The schema lint
+                // cannot see this: it bounds `in_version` against the CURRENT spec version and
+                // skips `required` columns entirely, both of which are judgements about one
+                // generation in isolation. Only the predecessor says which versions are still out
+                // there.
+                for (column, _, added) in new.columns {
+                    if old.columns.iter().any(|(name, ..)| name == column) {
+                        continue;
+                    }
+                    let Some(added) = added else {
+                        panic!(
+                            "`{}`.`{column}` was added in generation {version} as a REQUIRED \
+                             column — an op from spec version {} omits it and parks as \
+                             `PartialAfterImage` forever. A column added to a live table needs \
+                             `ColumnSpec::added` with a declared default.",
+                            old.table, old.spec_version
+                        );
+                    };
+                    assert!(
+                        added.in_version > old.spec_version,
+                        "`{}`.`{column}` was added in generation {version} claiming to exist \
+                         since spec version {}, but the previous generation shipped spec version \
+                         {} — an op stamped {} omits the column yet is not old enough to have it \
+                         filled, so it parks forever. Its introduction version must FOLLOW the \
+                         previous spec.",
+                        old.table,
+                        added.in_version,
+                        old.spec_version,
+                        old.spec_version
+                    );
+                    assert!(
+                        added.in_version <= new.spec_version,
+                        "`{}`.`{column}` claims an introduction version above the spec version \
+                         that introduces it ({} > {})",
+                        old.table,
+                        added.in_version,
+                        new.spec_version
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_spec_that_classifies_every_column_passes() {
         assert!(assert_spec_covers_schema(&demo_conn(), &DEMO_SPEC).is_ok());
+    }
+
+    /// A table with a later column, matching what an `ALTER TABLE ADD COLUMN` leaves behind.
+    fn widened_conn(default_clause: &str) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later TEXT{default_clause},
+                 resolved_rowid INTEGER
+             ) STRICT;"
+        ))
+        .unwrap();
+        conn
+    }
+
+    macro_rules! widened_spec {
+        ($later:expr) => {
+            TableSpec {
+                name: "t_demo",
+                scope_id: "demo/1",
+                spec_version: 2,
+                pk: DEMO_PK,
+                columns: &[
+                    ColumnSpec::required("title", ValueType::Text),
+                    ColumnSpec::required("count", ValueType::I64),
+                    $later,
+                ],
+                local_columns: DEMO_LOCAL,
+                repo_column: None,
+            }
+        };
+    }
+
+    #[test]
+    fn a_declared_default_must_equal_the_physical_default() {
+        // THE CONVERGENCE GUARANTEE, not hygiene. Adding a column backfills existing rows with the
+        // SQL default, while the applier fills a column an older op omits with the DECLARED one. If
+        // the two disagree, a device that applied an op before upgrading and one that applied the
+        // same op after hold DIFFERENT ROWS AT THE SAME CLOCK — silent divergence, with no local
+        // edit to signal it.
+        const MATCHING: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::Text("x")));
+        assert!(assert_spec_covers_schema(&widened_conn(" DEFAULT 'x'"), &MATCHING).is_ok());
+
+        const DISAGREES: TableSpec = widened_spec!(ColumnSpec::added(
+            "later",
+            ValueType::Text,
+            2,
+            DefaultValue::Text("other")
+        ));
+        let err = assert_spec_covers_schema(&widened_conn(" DEFAULT 'x'"), &DISAGREES)
+            .expect_err("a declared default that disagrees with the schema is refused");
+        assert!(err.contains("later"), "the error names the column: {err}");
+
+        // An absent DEFAULT clause is SQLite's own NULL, and matches a declared Null.
+        const NULL_DEFAULT: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::Null));
+        assert!(assert_spec_covers_schema(&widened_conn(""), &NULL_DEFAULT).is_ok());
+        assert!(assert_spec_covers_schema(&widened_conn(" DEFAULT 'x'"), &NULL_DEFAULT).is_err());
+    }
+
+    #[test]
+    fn a_non_literal_default_is_refused() {
+        // A per-device non-deterministic default would have two receivers fill the same op with
+        // different values — divergence by construction. The lint cannot match it, so it refuses.
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::Text("x")));
+        assert!(
+            assert_spec_covers_schema(&widened_conn(" DEFAULT (unixepoch())"), &SPEC).is_err(),
+            "a non-literal default cannot be honored deterministically"
+        );
+    }
+
+    #[test]
+    fn a_declared_default_must_match_the_columns_type() {
+        // The fill goes straight into the row, so a mistyped default would write a value the
+        // applier would have quarantined had it arrived on the wire.
+        const MISTYPED: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::I64(7)));
+        assert!(assert_spec_covers_schema(&widened_conn(" DEFAULT 7"), &MISTYPED).is_err());
+    }
+
+    #[test]
+    fn each_default_type_is_matched_against_its_own_sql_spelling() {
+        // One case per `DefaultValue` variant, each asserted BOTH ways. Testing only `Text` left
+        // every other arm of `default_matches_sql` free to return `true` unconditionally — i.e. a
+        // declared default could disagree with the migration's backfill for any non-text column and
+        // the lint that exists to catch exactly that would pass.
+        for (declared, value_type, agrees, disagrees) in [
+            (DefaultValue::Bool(true), ValueType::Bool, " DEFAULT 1", " DEFAULT 0"),
+            (DefaultValue::I64(7), ValueType::I64, " DEFAULT 7", " DEFAULT 8"),
+            (DefaultValue::Text("x"), ValueType::Text, " DEFAULT 'x'", " DEFAULT 'y'"),
+            (DefaultValue::Blob(&[0xab]), ValueType::Blob, " DEFAULT X'ab'", " DEFAULT X'cd'"),
+        ] {
+            let sql_type = match value_type {
+                ValueType::Bool | ValueType::I64 => "INTEGER",
+                ValueType::Text => "TEXT",
+                ValueType::Blob => "BLOB",
+            };
+            let conn = |clause: &str| {
+                let conn = Connection::open_in_memory().unwrap();
+                conn.execute_batch(&format!(
+                    "CREATE TABLE t_demo(
+                         id TEXT PRIMARY KEY,
+                         title TEXT NOT NULL,
+                         count INTEGER NOT NULL,
+                         later {sql_type}{clause},
+                         resolved_rowid INTEGER
+                     ) STRICT;"
+                ))
+                .unwrap();
+                conn
+            };
+            let spec = TableSpec {
+                name: "t_demo",
+                scope_id: "demo/1",
+                spec_version: 2,
+                pk: DEMO_PK,
+                // `columns` is `&'static`, and these vary per iteration — leaking a test-sized
+                // array is simpler than a const per type.
+                columns: Box::leak(Box::new([
+                    ColumnSpec::required("title", ValueType::Text),
+                    ColumnSpec::required("count", ValueType::I64),
+                    ColumnSpec::added("later", value_type, 2, declared),
+                ])),
+                local_columns: DEMO_LOCAL,
+                repo_column: None,
+            };
+            assert!(
+                assert_spec_covers_schema(&conn(agrees), &spec).is_ok(),
+                "{declared:?} must match the SQL default `{agrees}`"
+            );
+            assert!(
+                assert_spec_covers_schema(&conn(disagrees), &spec).is_err(),
+                "{declared:?} must NOT match the SQL default `{disagrees}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_text_default_must_be_one_literal_not_an_expression() {
+        // SQLite strips the outer parentheses from a parenthesized default, so `DEFAULT ('x'||'y')`
+        // comes back as `'x'||'y'` — quoted at both ends, but a CONCATENATION. Matching on the
+        // outer quotes alone would accept it while SQLite backfills `xy` and the applier
+        // synthesizes the raw text, which is the exact divergence the check exists to prevent.
+        assert_eq!(schema_facts::single_quoted_literal("'x'"), Some("x".to_string()));
+        assert_eq!(schema_facts::single_quoted_literal("'it''s'"), Some("it's".to_string()));
+        assert_eq!(schema_facts::single_quoted_literal("''"), Some(String::new()));
+        assert_eq!(
+            schema_facts::single_quoted_literal("'x'||'y'"),
+            None,
+            "a concatenation is not a literal"
+        );
+        assert_eq!(schema_facts::single_quoted_literal("'a'||b"), None);
+        assert_eq!(schema_facts::single_quoted_literal("unixepoch()"), None);
+
+        // End to end: the spec declaring exactly what SQLite would evaluate is still refused,
+        // because the physical default is not a literal at all.
+        const SPEC: TableSpec = widened_spec!(ColumnSpec::added(
+            "later",
+            ValueType::Text,
+            2,
+            DefaultValue::Text("x'||'y")
+        ));
+        assert!(
+            assert_spec_covers_schema(&widened_conn(" DEFAULT ('x'||'y')"), &SPEC).is_err(),
+            "an expression default cannot be honored deterministically"
+        );
+
+        // Blobs need no equivalent case: a concatenation carries quotes and pipes, which cannot
+        // compare equal to fixed-length pure hex, so the expression form is excluded already.
+        const BLOB: TableSpec = widened_spec!(ColumnSpec::added(
+            "later",
+            ValueType::Blob,
+            2,
+            DefaultValue::Blob(&[0xab])
+        ));
+        assert!(assert_spec_covers_schema(&blob_conn(" DEFAULT X'ab'"), &BLOB).is_ok());
+        assert!(
+            assert_spec_covers_schema(&blob_conn(" DEFAULT (X'ab'||X'cd')"), &BLOB).is_err(),
+            "an expression default is refused whatever it would evaluate to"
+        );
+    }
+
+    /// `widened_conn`, but the later column is a BLOB.
+    fn blob_conn(default_clause: &str) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later BLOB{default_clause},
+                 resolved_rowid INTEGER
+             ) STRICT;"
+        ))
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_default_that_violates_its_own_check_is_refused() {
+        // The sharp case, and the one a static reading of the constraint cannot decide: the CHECK
+        // names ONLY this column, so it looks self-contained, and every other lint passes — the
+        // declared default matches the SQL default, matches the ValueType, and is not Null on a
+        // NOT NULL column. It is simply a value the table rejects. Every op older than the column
+        // would be filled with it, fail the constraint at INSERT, and be quarantined TERMINALLY.
+        //
+        // `ALTER TABLE ... ADD COLUMN later INTEGER NOT NULL DEFAULT 0 CHECK(later > 0)` is
+        // accepted by SQLite on an empty table, so this schema is reachable, not hypothetical.
+        let violates = Connection::open_in_memory().unwrap();
+        violates
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later INTEGER NOT NULL DEFAULT 0 CHECK(later > 0),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        let err = assert_spec_covers_schema(&violates, &SPEC)
+            .expect_err("a default its own CHECK rejects cannot be a default");
+        assert!(err.contains("REJECTS"), "the error says what is wrong: {err}");
+
+        // The same shape with a default the constraint accepts is fine — the lint DECIDES the
+        // question rather than refusing the shape.
+        let satisfied = Connection::open_in_memory().unwrap();
+        satisfied
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later INTEGER NOT NULL DEFAULT 1 CHECK(later > 0),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        const OK_SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(1)));
+        assert!(assert_spec_covers_schema(&satisfied, &OK_SPEC).is_ok());
+    }
+
+    #[test]
+    fn the_probe_honors_the_columns_collation_and_sqlites_truth_semantics() {
+        // Both cases are ones an EVALUATED expression gets wrong, silently and in opposite
+        // directions — which is why the probe re-declares the column instead.
+
+        // COLLATION. A bare expression compares BINARY, so `'x' <> 'X'` reads true and the default
+        // looks fine; the real column is NOCASE, where it is FALSE and the insert is refused. Under
+        // an expression-based probe this schema would be accepted and then quarantine every older
+        // op.
+        let nocase = Connection::open_in_memory().unwrap();
+        nocase
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later TEXT COLLATE NOCASE NOT NULL DEFAULT 'x' CHECK(later <> 'X'),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        const COLLATED: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::Text("x")));
+        assert!(
+            assert_spec_covers_schema(&nocase, &COLLATED).is_err(),
+            "the column's own collation decides, not BINARY"
+        );
+
+        // TRUTH SEMANTICS. SQLite violates a CHECK only when it evaluates to ZERO, so a REAL 0.5 is
+        // satisfied. Reading the expression's result as an integer would fail to decode and refuse
+        // a schema that works.
+        let real = Connection::open_in_memory().unwrap();
+        real.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later INTEGER NOT NULL DEFAULT 0
+                     CHECK(CASE WHEN later = 0 THEN 0.5 ELSE 1 END),
+                 resolved_rowid INTEGER
+             ) STRICT;",
+        )
+        .unwrap();
+        const REAL_TRUTHY: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        assert!(
+            assert_spec_covers_schema(&real, &REAL_TRUTHY).is_ok(),
+            "a non-zero REAL satisfies a CHECK, so the default is fine"
+        );
+    }
+
+    #[test]
+    fn a_check_keywords_case_does_not_hide_it() {
+        // The keyword's case is not normalised in `sqlite_master.sql`, and locating the body by
+        // trimming the literal text `CHECK` drops a mixed-case constraint SILENTLY — the
+        // false-negative direction, where an unsafe default sails through.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later INTEGER NOT NULL DEFAULT 0,
+                 resolved_rowid INTEGER,
+                 ChEcK(later > 0)
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        let err = assert_spec_covers_schema(&conn, &SPEC)
+            .expect_err("a mixed-case CHECK is still a CHECK");
+        assert!(err.contains("REJECTS"), "the default is caught violating it: {err}");
+    }
+
+    #[test]
+    fn a_column_may_be_named_like_a_keyword_or_the_rowid() {
+        // A QUOTED head is always a column name, never the keyword; and a table that DECLARES a
+        // column called `rowid` shadows the implicit alias, so the name is an ordinary reference
+        // rather than per-device state. Both were refused as impossible.
+        let quoted = Connection::open_in_memory().unwrap();
+        quoted
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     \"check\" INTEGER NOT NULL DEFAULT 0 CHECK(\"check\" >= 0),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        const QUOTED: TableSpec = TableSpec {
+            name: "t_demo",
+            scope_id: "demo/1",
+            spec_version: 2,
+            pk: DEMO_PK,
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::required("count", ValueType::I64),
+                ColumnSpec::added("check", ValueType::I64, 2, DefaultValue::I64(0)),
+            ],
+            local_columns: DEMO_LOCAL,
+            repo_column: None,
+        };
+        assert!(
+            assert_spec_covers_schema(&quoted, &QUOTED).is_ok(),
+            "`\"check\"` is a column, not a constraint"
+        );
+
+        let shadowing = Connection::open_in_memory().unwrap();
+        shadowing
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     rowid INTEGER NOT NULL DEFAULT 0 CHECK(rowid >= 0),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        const SHADOWING: TableSpec = TableSpec {
+            name: "t_demo",
+            scope_id: "demo/1",
+            spec_version: 2,
+            pk: DEMO_PK,
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::required("count", ValueType::I64),
+                ColumnSpec::added("rowid", ValueType::I64, 2, DefaultValue::I64(0)),
+            ],
+            local_columns: DEMO_LOCAL,
+            repo_column: None,
+        };
+        assert!(
+            assert_spec_covers_schema(&shadowing, &SHADOWING).is_ok(),
+            "a declared `rowid` column shadows the implicit alias"
+        );
+    }
+
+    #[test]
+    fn a_named_constraint_is_still_a_check() {
+        // `CONSTRAINT c CHECK(...)` is the same constraint as a bare `CHECK(...)`. Missing the
+        // named form drops it silently — the false-negative direction, where the unsafe default is
+        // simply accepted.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later INTEGER NOT NULL DEFAULT 0,
+                 resolved_rowid INTEGER,
+                 CONSTRAINT later_is_positive CHECK(later > 0)
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        let err = assert_spec_covers_schema(&conn, &SPEC)
+            .expect_err("a named constraint is still a constraint");
+        assert!(err.contains("REJECTS"), "the default is caught violating it: {err}");
+    }
+
+    #[test]
+    fn a_double_quoted_column_reference_is_not_read_as_a_string() {
+        // SQLite's double-quoted-string misfeature: `"later"` falls back to a STRING LITERAL when
+        // no such column is in scope. Asking "does this resolve WITHOUT the column?" first would
+        // therefore see it resolve and call the constraint irrelevant — accepting an unsafe
+        // default. Asking "does it resolve with ONLY the column?" first settles it correctly.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later INTEGER NOT NULL DEFAULT 0,
+                 resolved_rowid INTEGER,
+                 CHECK(\"later\" > 10)
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        let err = assert_spec_covers_schema(&conn, &SPEC)
+            .expect_err("a quoted reference to the column is a reference, not a string");
+        assert!(err.contains("REJECTS"), "the default is caught violating it: {err}");
+    }
+
+    #[test]
+    fn a_check_whose_result_can_differ_between_devices_is_refused() {
+        // Self-contained and satisfiable, yet worthless as a guarantee: the identical replicated op
+        // can be accepted on one peer and quarantined on another, which is divergence with no local
+        // edit to signal it.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later INTEGER NOT NULL DEFAULT 0,
+                 resolved_rowid INTEGER,
+                 CHECK(later >= 0 AND random() <> 0)
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        let err = assert_spec_covers_schema(&conn, &SPEC)
+            .expect_err("a non-deterministic constraint cannot be relied on");
+        assert!(err.contains("random"), "the error names the function: {err}");
+
+        // A QUOTED function name is still a call: matching only bare words would let it past.
+        let quoted_fn = Connection::open_in_memory().unwrap();
+        quoted_fn
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later INTEGER NOT NULL DEFAULT 0,
+                     resolved_rowid INTEGER,
+                     CHECK(later >= 0 AND \"random\"() <> 0)
+                 ) STRICT;",
+            )
+            .unwrap();
+        let err = assert_spec_covers_schema(&quoted_fn, &SPEC)
+            .expect_err("a quoted function name is still a call");
+        assert!(err.contains("random"), "the error names the function: {err}");
+
+        // A date/time call is deterministic in its INPUTS; only an environment-dependent argument
+        // reads the device. Refusing the whole family would block a legitimate schema.
+        let dated = Connection::open_in_memory().unwrap();
+        dated
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later TEXT NOT NULL DEFAULT '2020-01-01'
+                         CHECK(date(later) >= date('2000-01-01')),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        const DATED: TableSpec = widened_spec!(ColumnSpec::added(
+            "later",
+            ValueType::Text,
+            2,
+            DefaultValue::Text("2020-01-01")
+        ));
+        assert!(
+            assert_spec_covers_schema(&dated, &DATED).is_ok(),
+            "date() over the column's own value is deterministic"
+        );
+
+        // ...but the same function reading the clock is refused.
+        let clock = Connection::open_in_memory().unwrap();
+        clock
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later TEXT NOT NULL DEFAULT '2020-01-01'
+                         CHECK(date(later) <= date('now')),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        assert!(
+            assert_spec_covers_schema(&clock, &DATED).is_err(),
+            "date('now') reads the device clock"
+        );
+
+        // The environment literal must be an ARGUMENT of the date/time call, not merely present
+        // somewhere in the constraint: here `'now'` is a value the column is compared against.
+        let unrelated = Connection::open_in_memory().unwrap();
+        unrelated
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later TEXT NOT NULL DEFAULT '2020-01-01'
+                         CHECK(date(later) IS NOT NULL AND later <> 'now'),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        assert!(
+            assert_spec_covers_schema(&unrelated, &DATED).is_ok(),
+            "a `'now'` outside the call's arguments does not make it clock-reading"
+        );
+
+        // A comment inside the call's arguments is not an argument. Scanning the raw text would
+        // read it as one.
+        let commented = Connection::open_in_memory().unwrap();
+        commented
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later TEXT NOT NULL DEFAULT '2020-01-01'
+                         CHECK(date(later /* not 'now' */) IS NOT NULL),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        assert!(
+            assert_spec_covers_schema(&commented, &DATED).is_ok(),
+            "a commented-out `'now'` is not an argument"
+        );
+
+        // A build-varying function is refused even though SQLite flags it DETERMINISTIC: that flag
+        // means "same answer for the same arguments within this build", which is not the question.
+        // `fts5_source_id()` satisfies it and still returns a different string on a peer compiled
+        // against another SQLite — which is why the rule is an allowlist rather than a denylist.
+        let build_varying = Connection::open_in_memory().unwrap();
+        build_varying
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later INTEGER NOT NULL DEFAULT 0
+                         CHECK(later = 0 AND fts5_source_id() IS NOT NULL),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        const ZERO: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        let err = assert_spec_covers_schema(&build_varying, &ZERO)
+            .expect_err("a build-varying function is not a shared guarantee");
+        assert!(err.contains("fts5_source_id"), "the error names it: {err}");
+
+        // A DETERMINISTIC builtin is fine — the rule is about per-device variation, not calls.
+        let ok = Connection::open_in_memory().unwrap();
+        ok.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later TEXT NOT NULL DEFAULT 'ab' CHECK(length(later) = 2),
+                 resolved_rowid INTEGER
+             ) STRICT;",
+        )
+        .unwrap();
+        const DETERMINISTIC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::Text("ab")));
+        assert!(assert_spec_covers_schema(&ok, &DETERMINISTIC).is_ok());
+    }
+
+    #[test]
+    fn a_sibling_named_after_a_keyword_does_not_break_the_probe() {
+        // The probe's "does this resolve without the column" world lists the OTHER columns by name.
+        // A column may legally be named after a keyword, and splicing such a name in bare fails
+        // that CREATE on syntax — refusing a valid schema for a reason unrelated to the
+        // constraint.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 \"order\" INTEGER NOT NULL,
+                 later INTEGER NOT NULL DEFAULT 0,
+                 resolved_rowid INTEGER,
+                 CHECK(title <> '')
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec = TableSpec {
+            name: "t_demo",
+            scope_id: "demo/1",
+            spec_version: 2,
+            pk: DEMO_PK,
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::required("order", ValueType::I64),
+                ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)),
+            ],
+            local_columns: DEMO_LOCAL,
+            repo_column: None,
+        };
+        assert!(
+            assert_spec_covers_schema(&conn, &SPEC).is_ok(),
+            "a sibling's name is quoted into the probe, so a keyword name is harmless"
+        );
+    }
+
+    #[test]
+    fn a_check_sharing_a_segment_with_another_constraint_is_still_found() {
+        // SQLite does not require a comma between table constraints, so a CHECK can share a segment
+        // with a PRIMARY KEY. Dispatching on the segment's HEAD dropped that check entirely — the
+        // verdict turned on where the author happened to put a comma.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later INTEGER NOT NULL DEFAULT 0,
+                 resolved_rowid INTEGER,
+                 PRIMARY KEY(id) CHECK(later >= count)
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        let err = assert_spec_covers_schema(&conn, &SPEC)
+            .expect_err("a CHECK is a CHECK wherever it is written");
+        assert!(
+            err.contains("read something other than that column"),
+            "refused as cross-column: {err}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_line_comment_does_not_break_the_probe() {
+        // A declaration is spliced VERBATIM into the probe's DDL, so one ending in a `--` comment
+        // would comment out everything after it on that line and the CREATE would fail as
+        // incomplete input — refusing a perfectly ordinary table.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 resolved_rowid INTEGER,
+                 later INTEGER NOT NULL DEFAULT 0 CHECK(later >= 0) -- how many
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        assert!(
+            assert_spec_covers_schema(&conn, &SPEC).is_ok(),
+            "a comment on the declaration is not a defect in the table"
+        );
+    }
+
+    #[test]
+    fn a_generated_column_is_refused() {
+        // A generated column is absent from `PRAGMA table_info`, so the exhaustiveness diff cannot
+        // classify it as synced or local, and the applier never supplies it — yet it is not inert.
+        // Its expression reads synced columns, so its own NOT NULL and CHECK constraints apply to a
+        // value derived from whatever the applier filled in. Here `CHECK(derived > count)` fails
+        // for a valid older op carrying `count = 5`, and the probe — which models the other columns
+        // by NAME — cannot see the dependency that runs through `derived`. Refuse the shape.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later INTEGER NOT NULL DEFAULT 0,
+                 resolved_rowid INTEGER,
+                 derived INTEGER GENERATED ALWAYS AS (later) VIRTUAL CHECK(derived > count)
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec = TableSpec {
+            name: "t_demo",
+            scope_id: "demo/1",
+            spec_version: 2,
+            pk: DEMO_PK,
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::required("count", ValueType::I64),
+                ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)),
+            ],
+            local_columns: DEMO_LOCAL,
+            repo_column: None,
+        };
+        let err = assert_spec_covers_schema(&conn, &SPEC)
+            .expect_err("a generated column cannot be classified or modelled");
+        assert!(
+            err.contains("GENERATED") && err.contains("derived"),
+            "refused for being generated, not incidentally: {err}"
+        );
+    }
+
+    #[test]
+    fn an_inline_check_on_a_sibling_column_is_still_a_constraint() {
+        // An inline CHECK constrains the ROW, not the column it happens to be attached to. Reading
+        // only table-level constraints plus the added column's own declaration therefore misses one
+        // written on a SIBLING — and a valid older op carrying `count = 5` would be filled with
+        // `later = 0`, rejected by SQLite, and quarantined terminally.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL CHECK(later >= count),
+                 later INTEGER NOT NULL DEFAULT 0,
+                 resolved_rowid INTEGER
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        let err = assert_spec_covers_schema(&conn, &SPEC)
+            .expect_err("where the constraint is WRITTEN does not change what it constrains");
+        assert!(
+            err.contains("read something other than that column"),
+            "refused as cross-column: {err}"
+        );
+
+        // A sibling's inline CHECK that does NOT read this column is still irrelevant to it.
+        let unrelated = Connection::open_in_memory().unwrap();
+        unrelated
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL CHECK(count >= 0),
+                     later INTEGER NOT NULL DEFAULT 0,
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        assert!(
+            assert_spec_covers_schema(&unrelated, &SPEC).is_ok(),
+            "a sibling constraint that never reads this column does not concern it"
+        );
+    }
+
+    #[test]
+    fn a_clock_reading_date_call_is_refused_by_the_probe() {
+        // Omitting the time value IS `'now'`: `date()` means `date('now')`, and `strftime('%s')` —
+        // one argument, the format — reads the clock too.
+        //
+        // Nothing in this lint decides that. SQLite refuses a clock-reading date/time call inside a
+        // CHECK at INSERT, which is exactly what the probe performs, so the verdict comes back as
+        // not-self-contained on its own. That is why the date/time family sits on the allowlist:
+        // SQLite draws the line more precisely than this lint could — it also catches a
+        // `'localtime'` modifier, and it correctly permits `date(column, 'now')`, which is not a
+        // clock read. This test pins that reliance so a future change cannot quietly lose it.
+        let table = |constraint: &str| {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later TEXT NOT NULL DEFAULT '2020-01-01' CHECK({constraint}),
+                     resolved_rowid INTEGER
+                 ) STRICT;"
+            ))
+            .unwrap();
+            conn
+        };
+        const SPEC: TableSpec = widened_spec!(ColumnSpec::added(
+            "later",
+            ValueType::Text,
+            2,
+            DefaultValue::Text("2020-01-01")
+        ));
+
+        // The WHOLE boundary is pinned, not just the two forms that prompted it: this lint now
+        // depends on where SQLite draws the line, so a change in that line must fail here rather
+        // than silently widen or narrow what the lint accepts.
+        for constraint in [
+            "later <= date()",                   // time value omitted
+            "later <= strftime('%s')",           // format only, time value omitted
+            "later <= date('now')",              // the clock, explicitly
+            "later <= date(later, 'localtime')", // the device's timezone
+        ] {
+            let err = assert_spec_covers_schema(&table(constraint), &SPEC)
+                .expect_err("a clock-reading call cannot be a shared guarantee");
+            assert!(
+                err.contains("non-deterministic use"),
+                "refused because SQLite itself will not evaluate it: {err}"
+            );
+        }
+
+        // ...and the forms SQLite permits stay permitted. `date(column, 'now')` is the sharp one:
+        // `'now'` in a MODIFIER position is not a clock read, and a hand-rolled rule that scanned
+        // for the literal would wrongly refuse it.
+        for constraint in [
+            "date(later) >= date('2000-01-01')",
+            "strftime('%Y', later) >= '2000'",
+            "date(later, '+1 day') > date('2000-01-01')",
+            "date(later, 'now') > date('2000-01-01')",
+        ] {
+            assert!(
+                assert_spec_covers_schema(&table(constraint), &SPEC).is_ok(),
+                "deterministic in its inputs, so it is a shared guarantee: {constraint}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_connection_configurable_operator_is_refused() {
+        // `PRAGMA case_sensitive_like` changes both `a LIKE b` and `like(a, b)`, so the constraint
+        // means different things on two peers. The OPERATOR form is the one a call-shaped scan
+        // cannot see.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later TEXT NOT NULL DEFAULT 'ab' CHECK(later NOT LIKE 'Z%'),
+                 resolved_rowid INTEGER
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::Text("ab")));
+        let err = assert_spec_covers_schema(&conn, &SPEC)
+            .expect_err("LIKE is connection state, not a property of its operands");
+        assert!(err.contains("like"), "the error names it: {err}");
+    }
+
+    #[test]
+    fn per_device_references_are_refused_in_every_form_they_take() {
+        // The call-shaped scan and the bare-word rowid scan each missed a form. Neither gap is
+        // visible from inside the other, and both are silent: the probe passes at ITS values, then
+        // the same op is quarantined on a peer whose clock or insertion order differs.
+        let table = |constraint: &str| {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later INTEGER NOT NULL DEFAULT 2 CHECK({constraint}),
+                     resolved_rowid INTEGER
+                 ) STRICT;"
+            ))
+            .unwrap();
+            conn
+        };
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(2)));
+
+        // A QUOTED rowid alias resolves to the implicit rowid exactly as a bare one does. The
+        // default passes at the probe's rowid 1 and fails on a peer whose row lands at rowid 2.
+        let quoted = table("later <> \"rowid\"");
+        let err = assert_spec_covers_schema(&quoted, &SPEC)
+            .expect_err("a quoted rowid alias is still the rowid");
+        assert!(err.contains("assigned per device"), "refused for the rowid rule: {err}");
+
+        // A clock KEYWORD takes no parentheses, so a scan shaped around calls never reaches it.
+        let clock = table("later > 0 AND CURRENT_TIMESTAMP IS NOT NULL");
+        let err =
+            assert_spec_covers_schema(&clock, &SPEC).expect_err("a clock keyword reads the device");
+        assert!(err.contains("current_timestamp"), "the error names what reads the device: {err}");
+    }
+
+    #[test]
+    fn a_check_reading_the_implicit_rowid_is_refused() {
+        // The rowid resolves in ANY rowid table — including the probe — so a constraint reading it
+        // looks self-contained and passes. It is also per-device, assigned by insertion order, so
+        // the same op lands at a different rowid on every peer.
+        //
+        // The body is deliberately one the default SATISFIES at the probe's rowid (1): a body that
+        // merely fails there would be reported as `Violated` and the test would pass off SQLite's
+        // own error text without ever exercising the rowid rule — which is how the first version of
+        // this test was vacuous.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later INTEGER NOT NULL DEFAULT 0 CHECK(later = 0 AND rowid < 10),
+                 resolved_rowid INTEGER
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        let err = assert_spec_covers_schema(&conn, &SPEC)
+            .expect_err("a rowid-dependent constraint cannot be proven safe");
+        assert!(
+            err.contains("assigned per device"),
+            "refused for the rowid rule, not incidentally: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_constraint_is_not_dragged_into_the_probe() {
+        // Which constraints involve the column is SQLite's answer, not a token match. `text` here
+        // is a TYPE NAME inside a CAST, and the constraint does not read the `text` column at all —
+        // a token match would import it into the probe, where `other` fails to resolve and the
+        // schema is refused for a constraint that never concerned it.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 text TEXT NOT NULL DEFAULT '',
+                 CHECK(CAST(title AS text) <> 'zz')
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec = TableSpec {
+            name: "t_demo",
+            scope_id: "demo/1",
+            spec_version: 2,
+            pk: DEMO_PK,
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::required("count", ValueType::I64),
+                ColumnSpec::added("text", ValueType::Text, 2, DefaultValue::Text("")),
+            ],
+            local_columns: &[],
+            repo_column: None,
+        };
+        assert!(
+            assert_spec_covers_schema(&conn, &SPEC).is_ok(),
+            "a constraint that does not read the column must not decide its fate"
+        );
+    }
+
+    #[test]
+    fn a_table_qualified_self_reference_is_self_contained() {
+        // `t_demo.later` names this very column. The probe rebuilds the column under the real
+        // table's NAME so the qualification still resolves; otherwise a legal, genuinely
+        // self-contained constraint would read as cross-column.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later INTEGER NOT NULL DEFAULT 0,
+                 resolved_rowid INTEGER,
+                 CHECK(t_demo.later >= 0)
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        assert!(
+            assert_spec_covers_schema(&conn, &SPEC).is_ok(),
+            "a qualified reference to the column itself is self-contained"
+        );
+    }
+
+    #[test]
+    fn a_function_call_is_not_a_cross_column_reference() {
+        // A built-in whose name matches a column of the table is not a reference to that column.
+        // Token comparison alone cannot tell them apart; evaluation can, because SQLite resolves
+        // `length(...)` as a function regardless of what the table's columns are called.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 length INTEGER NOT NULL DEFAULT 0,
+                 later INTEGER NOT NULL DEFAULT 0 CHECK(later <= length('abc')),
+                 resolved_rowid INTEGER
+             ) STRICT;",
+        )
+        .unwrap();
+        const SPEC: TableSpec = TableSpec {
+            name: "t_demo",
+            scope_id: "demo/1",
+            spec_version: 2,
+            pk: DEMO_PK,
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::required("count", ValueType::I64),
+                ColumnSpec::required("length", ValueType::I64),
+                ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)),
+            ],
+            local_columns: DEMO_LOCAL,
+            repo_column: None,
+        };
+        assert!(
+            assert_spec_covers_schema(&conn, &SPEC).is_ok(),
+            "`length(...)` is a call, not a reference to the `length` column"
+        );
+    }
+
+    #[test]
+    fn an_added_column_may_not_participate_in_a_cross_column_check() {
+        // The default and the other columns come from different places — the applier synthesizes
+        // this one and takes the rest from the OP — so a constraint relating them can fail for a
+        // perfectly valid older op and quarantine it TERMINALLY, ending older→newer replication.
+        let cross = Connection::open_in_memory().unwrap();
+        cross
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later INTEGER NOT NULL DEFAULT 0 CHECK(later >= count),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        const CROSS: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::I64, 2, DefaultValue::I64(0)));
+        let err = assert_spec_covers_schema(&cross, &CROSS)
+            .expect_err("a default cannot satisfy a constraint that depends on the op's values");
+        assert!(err.contains("later") && err.contains("count"), "names both sides: {err}");
+
+        // A SELF-CONTAINED check is fine: it constrains only the synthesized value, statically.
+        let alone = Connection::open_in_memory().unwrap();
+        alone
+            .execute_batch(
+                "CREATE TABLE t_demo(
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     count INTEGER NOT NULL,
+                     later INTEGER NOT NULL DEFAULT 0 CHECK(later IN (0, 1)),
+                     resolved_rowid INTEGER
+                 ) STRICT;",
+            )
+            .unwrap();
+        assert!(
+            assert_spec_covers_schema(&alone, &CROSS).is_ok(),
+            "a check on the added column alone is decidable and allowed"
+        );
+    }
+
+    #[test]
+    fn an_identity_column_may_not_declare_an_introduction_version() {
+        // `added` promises a redemption path that does not exist for a key: an op authored before
+        // the key grew carries fewer pk values, so `apply_row_op`'s arity check quarantines it
+        // TERMINALLY before any default could apply. Declaring it would advertise older→newer
+        // replication while silently dropping every older op.
+        const GROWN_KEY: TableSpec = TableSpec {
+            name: "t_demo",
+            scope_id: "demo/1",
+            spec_version: 2,
+            pk: &[
+                ColumnSpec::required("id", ValueType::Text),
+                ColumnSpec::added("shard", ValueType::Text, 2, DefaultValue::Text("d")),
+            ],
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::required("count", ValueType::I64),
+            ],
+            local_columns: DEMO_LOCAL,
+            repo_column: None,
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT NOT NULL,
+                 shard TEXT NOT NULL DEFAULT 'd',
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 resolved_rowid INTEGER,
+                 PRIMARY KEY(id, shard)
+             ) STRICT;",
+        )
+        .unwrap();
+        let err = assert_spec_covers_schema(&conn, &GROWN_KEY)
+            .expect_err("a primary key cannot grow within a table's life");
+        assert!(err.contains("shard") && err.contains("NEW TABLE"), "names the remedy: {err}");
+    }
+
+    #[test]
+    fn a_not_null_column_may_not_declare_a_null_default() {
+        // Filling an older op from a Null default on a NOT NULL column fails the constraint at
+        // INSERT, and the applier quarantines the op TERMINALLY — older→newer replication for the
+        // table would be dead with nothing to redeem it. The SQL-default check cannot catch this:
+        // a NOT NULL column with no DEFAULT clause reads as an absent physical default, which a
+        // declared Null matches.
+        const NULL_ON_NOT_NULL: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::Null));
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t_demo(
+                 id TEXT PRIMARY KEY,
+                 title TEXT NOT NULL,
+                 count INTEGER NOT NULL,
+                 later TEXT NOT NULL,
+                 resolved_rowid INTEGER
+             ) STRICT;",
+        )
+        .unwrap();
+        let err = assert_spec_covers_schema(&conn, &NULL_ON_NOT_NULL)
+            .expect_err("a Null default on a NOT NULL column is refused");
+        assert!(err.contains("later") && err.contains("NOT NULL"), "the error is specific: {err}");
+
+        // The same declaration is fine once the column is nullable — the fill can succeed.
+        assert!(assert_spec_covers_schema(&widened_conn(""), &NULL_ON_NOT_NULL).is_ok());
+    }
+
+    #[test]
+    fn an_added_columns_version_must_sit_inside_the_specs_history() {
+        // `1` is the first version, so a column "added" there was present from the start and is
+        // `required`; a version above the spec's own names a column this binary carries but does
+        // not announce — a forgotten bump, which puts the fill window wrong in both directions.
+        const AT_VERSION_1: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::Text, 1, DefaultValue::Text("x")));
+        let err = assert_spec_covers_schema(&widened_conn(" DEFAULT 'x'"), &AT_VERSION_1)
+            .expect_err("a column added in version 1 is `required`, not `added`");
+        assert!(err.contains("later"), "the error names the column: {err}");
+
+        // `widened_spec!` is spec_version 2, so 3 is beyond this spec's own history.
+        const BEYOND_THE_SPEC: TableSpec =
+            widened_spec!(ColumnSpec::added("later", ValueType::Text, 3, DefaultValue::Text("x")));
+        assert!(
+            assert_spec_covers_schema(&widened_conn(" DEFAULT 'x'"), &BEYOND_THE_SPEC).is_err(),
+            "a column introduced beyond the spec's own version is a forgotten bump"
+        );
     }
 
     #[test]
@@ -556,6 +2103,7 @@ mod tests {
         const DOUBLED: TableSpec = TableSpec {
             name: "t_demo",
             scope_id: "demo/1",
+            spec_version: 1,
             pk: DEMO_PK,
             // `title` is both a synced column and (wrongly) a local column.
             columns: DEMO_COLUMNS,
@@ -574,8 +2122,9 @@ mod tests {
         const BAD: TableSpec = TableSpec {
             name: "t_x",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "repo_id", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("repo_id", ValueType::Text)],
             local_columns: &[],
             repo_column: Some("repo_id"), /* a synced column, not a pk — the ingest gate would
                                            * miss it */
@@ -597,10 +2146,11 @@ mod tests {
         const KEY_ONLY: TableSpec = TableSpec {
             name: "t_members",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "group_id", value_type: ValueType::Text }, ColumnSpec {
-                name: "member_id",
-                value_type: ValueType::Text,
-            }],
+            spec_version: 1,
+            pk: &[
+                ColumnSpec::required("group_id", ValueType::Text),
+                ColumnSpec::required("member_id", ValueType::Text),
+            ],
             columns: &[],
             local_columns: &[],
             repo_column: None,
@@ -626,11 +2176,12 @@ mod tests {
         const WRONG_PK: TableSpec = TableSpec {
             name: "t_pk",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "a", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "b", value_type: ValueType::Text }, ColumnSpec {
-                name: "v",
-                value_type: ValueType::Text,
-            }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("a", ValueType::Text)],
+            columns: &[
+                ColumnSpec::required("b", ValueType::Text),
+                ColumnSpec::required("v", ValueType::Text),
+            ],
             local_columns: &[],
             repo_column: None,
         };
@@ -653,8 +2204,9 @@ mod tests {
         const NN_LOCAL: TableSpec = TableSpec {
             name: "t_nn_local",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "syn", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("syn", ValueType::Text)],
             local_columns: &["loc"],
             repo_column: None,
         };
@@ -678,8 +2230,9 @@ mod tests {
         const DEF_LOCAL: TableSpec = TableSpec {
             name: "t_def_local",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "syn", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("syn", ValueType::Text)],
             local_columns: &["loc"],
             repo_column: None,
         };
@@ -695,8 +2248,9 @@ mod tests {
         const NP: TableSpec = TableSpec {
             name: "t_np",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("v", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
@@ -718,11 +2272,12 @@ mod tests {
         const FK: TableSpec = TableSpec {
             name: "t_fk",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }, ColumnSpec {
-                name: "p",
-                value_type: ValueType::Text,
-            }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[
+                ColumnSpec::required("v", ValueType::Text),
+                ColumnSpec::required("p", ValueType::Text),
+            ],
             local_columns: &[],
             repo_column: None,
         };
@@ -742,8 +2297,9 @@ mod tests {
         const U: TableSpec = TableSpec {
             name: "t_u",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "email", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("email", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
@@ -760,8 +2316,9 @@ mod tests {
         const NS: TableSpec = TableSpec {
             name: "t_ns",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("v", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
@@ -778,8 +2335,9 @@ mod tests {
         const TM: TableSpec = TableSpec {
             name: "t_tm",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "n", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("n", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
@@ -795,16 +2353,18 @@ mod tests {
         const A: TableSpec = TableSpec {
             name: "t_dup",
             scope_id: "scope-a/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("v", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
         const B: TableSpec = TableSpec {
             name: "t_dup",
             scope_id: "scope-b/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("v", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
@@ -826,11 +2386,12 @@ mod tests {
         const RI: TableSpec = TableSpec {
             name: "t_ri",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "rid", value_type: ValueType::I64 }, ColumnSpec {
-                name: "id",
-                value_type: ValueType::Text,
-            }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[
+                ColumnSpec::required("rid", ValueType::I64),
+                ColumnSpec::required("id", ValueType::Text),
+            ],
+            columns: &[ColumnSpec::required("v", ValueType::Text)],
             local_columns: &[],
             repo_column: Some("rid"),
         };
@@ -853,8 +2414,9 @@ mod tests {
         const REF: TableSpec = TableSpec {
             name: "t_ref",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("v", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
@@ -874,8 +2436,9 @@ mod tests {
         const CI: TableSpec = TableSpec {
             name: "t_ci",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("v", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
@@ -898,11 +2461,12 @@ mod tests {
         const TRIG: TableSpec = TableSpec {
             name: "t_trig",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }, ColumnSpec {
-                name: "n",
-                value_type: ValueType::I64,
-            }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[
+                ColumnSpec::required("v", ValueType::Text),
+                ColumnSpec::required("n", ValueType::I64),
+            ],
             local_columns: &[],
             repo_column: None,
         };

@@ -16,10 +16,11 @@
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{OptionalExtension, Transaction, params_from_iter};
 
-use super::registry::{TableSpec, ValueType};
+use super::registry::{DefaultValue, TableSpec, ValueType};
 use super::row_op::{self, Cell, RowOp, TypedValue};
 use super::store::PendingReason;
 use crate::op::OpMeta;
+use crate::stream::StreamId;
 
 /// The result of applying one row op.
 ///
@@ -34,6 +35,17 @@ use crate::op::OpMeta;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ApplyOutcome {
     Applied,
+    /// The op landed but did NOT take effect: a newer write already owns the row, or a tombstone
+    /// suppresses it. A correct fold, not outstanding work — receivers treat it exactly like
+    /// `Applied`.
+    ///
+    /// It is separate from `Applied` for ONE caller. A locally-authored op takes the stream's
+    /// `MAX(lamport) + 1`, so while a row's bookkeeping belongs to the stream being authored on it
+    /// cannot lose — which makes this outcome, at the produce seam, proof that the two have come
+    /// apart (a row clock carrying a lamport from another stream). Folded into `Applied` that reads
+    /// as settlement while nothing is published, so the producer re-derives the same delta and
+    /// re-signs it on every pass.
+    Superseded,
     Quarantined(String),
     Unprojectable(PendingReason),
 }
@@ -48,6 +60,22 @@ pub(crate) fn apply_row_op(
     meta: OpMeta,
 ) -> anyhow::Result<ApplyOutcome> {
     debug_assert_eq!(op.table(), spec.name, "caller resolves the spec from the op's table");
+    // "We do not understand this generation" OUTRANKS "this op looks malformed to us", so the
+    // version gate goes before every structural check below — those all return `Quarantined`, which
+    // is TERMINAL. A newer producer's UPSERT that happens to trip one of them would be discarded
+    // for good rather than parked for the binary that understands it, which is the exact
+    // failure this version exists to prevent. The additive-only rule makes that unreachable
+    // today (pk shape and types cannot change within a table's life), but that rule is
+    // explicitly un-lintable, so it must not be what stands between a recoverable payload and
+    // permanent loss.
+    //
+    // `Remove` is EXCLUDED, and must stay excluded: it names only the row identity, so no column
+    // set is involved and there is nothing a later binary would understand better. Parking one
+    // would delay a deletion across a version skew for no benefit, and a row deleted after a column
+    // change would become permanently undeletable — a convergence wedge.
+    if matches!(op, RowOp::Upsert { .. }) && op.spec_version() > spec.spec_version {
+        return Ok(ApplyOutcome::Unprojectable(PendingReason::NewerSpecVersion));
+    }
     let pk_vals = op.pk();
     if pk_vals.len() != spec.pk.len() {
         return Ok(ApplyOutcome::Quarantined(format!(
@@ -90,8 +118,12 @@ pub(crate) fn apply_row_op(
         )));
     }
     match op {
+        // A remove names only the row identity, so no column set is involved: its `spec_version` is
+        // carried for wire symmetry and diagnostics, never acted on. Gating a deletion on a version
+        // skew would delay it for no benefit.
         RowOp::Remove { .. } => apply_remove(tx, spec, repo_id, pk_vals, meta),
-        RowOp::Upsert { cells, .. } => apply_upsert(tx, spec, repo_id, pk_vals, cells, meta),
+        RowOp::Upsert { spec_version, cells, .. } =>
+            apply_upsert(tx, spec, repo_id, pk_vals, *spec_version, cells, meta),
     }
 }
 
@@ -137,7 +169,96 @@ fn apply_remove(
     // Raise the tombstone only once the remove has actually applied (the row was deleted, or a
     // newer write kept it): the tombstone guards against an older upsert resurrecting the row.
     raise_tombstone(tx, repo_id, spec.name, row_pk, meta.lamport, device_hex)?;
-    Ok(ApplyOutcome::Applied)
+    // The tombstone is raised either way, but a delete a newer write outranks did not delete
+    // anything — and, crucially, left the published record in place. Say so.
+    Ok(if survives { ApplyOutcome::Superseded } else { ApplyOutcome::Applied })
+}
+
+/// What an op's cells resolve to under THIS registry.
+#[derive(Debug, PartialEq)]
+enum Projection {
+    /// A full after-image: every synced column, in registry order.
+    Complete(Vec<(&'static str, TypedValue)>),
+    /// Not projectable YET — a version gap a later binary (or a later sender) redeems.
+    Park(PendingReason),
+    /// Not projectable EVER — the values do not fit the declared types.
+    Quarantine(String),
+}
+
+/// Resolve an upsert's cells into the complete after-image this registry expects, from the payload
+/// alone (#1002). The single place the spec-version rule lives, shared by the applier and by the
+/// producer's stale-row comparison — any divergence between those two would be a convergence bug.
+///
+/// - **Op NEWER than this binary** → park. We cannot know what a later column set means, and the op
+///   may name columns we lack. #1001's refold replays it once this binary catches up.
+/// - **Op EQUAL** → strict full after-image, as before.
+/// - **Op OLDER** → columns it predates are filled from their DECLARED defaults, yielding a
+///   complete row. That is what unfreezes older→newer replication.
+///
+/// The fill window is PER COLUMN — an op is completed only for the columns its own version
+/// predates. A column absent from an op old enough to lack it is filled; a column absent from an op
+/// whose version already had it is a partial after-image and parks, rather than being invented.
+///
+/// Whole-row semantics are preserved deliberately: an older producer's winning op resets a
+/// newly-added column to its default on every receiver. That is what a whole-row write from a
+/// device that does not know the column MEANS — deterministic and convergent. Letting the receiver
+/// keep its own value there would be a per-column merge, which this engine does not do.
+fn project_cells(spec: &TableSpec, op_spec_version: u32, cells: &[Cell]) -> Projection {
+    if op_spec_version > spec.spec_version {
+        return Projection::Park(PendingReason::NewerSpecVersion);
+    }
+    // A cell naming a column we do not know, at or below our own version, is a producer that
+    // mis-stamped (most likely a forgotten bump) — park, so the binary that stamps correctly
+    // redeems it, rather than quarantining the likeliest operator error terminally.
+    for cell in cells {
+        let Some(column) = spec.columns.iter().find(|column| column.name == cell.column) else {
+            return Projection::Park(PendingReason::UnknownColumn);
+        };
+        // A cell for a column introduced AFTER the version the op claims. The op contradicts
+        // itself — a producer at version V cannot have known a column added at V+1 — so the stamp
+        // is wrong, and trusting it would default-fill every column the (understated) version
+        // predates, resetting them for every receiver. This is the one half of the advisory stamp a
+        // receiver CAN check without registry history, because `in_version` is a fixed historical
+        // fact under additive-only evolution. Park, like every other mis-stamp.
+        if column.added.is_some_and(|added| op_spec_version < added.in_version) {
+            return Projection::Park(PendingReason::MisstampedSpecVersion);
+        }
+    }
+    let mut complete = Vec::with_capacity(spec.columns.len());
+    for column in spec.columns {
+        match cells.iter().find(|cell| cell.column == column.name) {
+            Some(cell) => {
+                if !value_matches(&cell.value, column.value_type) {
+                    return Projection::Quarantine(format!(
+                        "cell `{}` value does not match declared type on `{}`",
+                        cell.column, spec.name
+                    ));
+                }
+                complete.push((column.name, cell.value.clone()));
+            },
+            // Absent. Filled from the declared default only if the op PREDATES THE COLUMN — its
+            // own introducing version, not merely the spec's current one. An op stamped at or
+            // above that version was obliged to carry the column, so its absence is a partial
+            // after-image and parks. (Keying on the spec's current version instead would, once a
+            // table reached a third version, silently default a column the op's own version
+            // already had — resetting it for every receiver under whole-row LWW.)
+            None => match column.added.filter(|added| op_spec_version < added.in_version) {
+                Some(added) => complete.push((column.name, default_as_value(added.default))),
+                None => return Projection::Park(PendingReason::PartialAfterImage),
+            },
+        }
+    }
+    Projection::Complete(complete)
+}
+
+fn default_as_value(default: DefaultValue) -> TypedValue {
+    match default {
+        DefaultValue::Null => TypedValue::Null,
+        DefaultValue::Bool(b) => TypedValue::Bool(b),
+        DefaultValue::I64(n) => TypedValue::I64(n),
+        DefaultValue::Text(text) => TypedValue::Text(text.to_string()),
+        DefaultValue::Blob(bytes) => TypedValue::Blob(bytes.to_vec()),
+    }
 }
 
 fn apply_upsert(
@@ -145,26 +266,17 @@ fn apply_upsert(
     spec: &TableSpec,
     repo_id: &str,
     pk_vals: &[TypedValue],
+    op_spec_version: u32,
     cells: &[Cell],
     meta: OpMeta,
 ) -> anyhow::Result<ApplyOutcome> {
-    // FORWARD COMPATIBILITY, decided on the PAYLOAD ALONE (before any row state is read): an op
-    // naming a column this registry does not know cannot be projected into a complete after-image.
-    // PARK it — store the entry, write NOTHING — rather than applying the subset we understand.
-    //
-    // Applying the known cells and skipping the rest would leave a row that NO device ever authored
-    // ({known: new, unknown: whatever this row already held}), and recording its anti-echo hash
-    // would then claim that chimera as a complete projection. Two failures follow: the skipped
-    // value is unrecoverable locally (redelivery short-circuits on `entry_exists`), and after an
-    // upgrade that learns the column the producer re-authors the row with the HOLE at a fresh
-    // winning lamport — destroying the real value on every peer. Parking makes the incomplete
-    // projection unrepresentable instead of containing it after the fact (#1001).
-    if let Some(unknown) =
-        cells.iter().find(|cell| !spec.columns.iter().any(|known| known.name == cell.column))
-    {
-        debug_assert!(!unknown.column.is_empty());
-        return Ok(ApplyOutcome::Unprojectable(PendingReason::UnknownColumn));
-    }
+    // Resolve the payload into the full after-image THIS registry expects, decided on the PAYLOAD
+    // ALONE — before any row state is read, so the decision is deterministic and idempotent.
+    let known = match project_cells(spec, op_spec_version, cells) {
+        Projection::Complete(cells) => cells,
+        Projection::Park(reason) => return Ok(ApplyOutcome::Unprojectable(reason)),
+        Projection::Quarantine(why) => return Ok(ApplyOutcome::Quarantined(why)),
+    };
 
     let row_pk = &row_op::row_pk_string(pk_vals);
     let device_hex = &meta.device.to_string();
@@ -175,40 +287,7 @@ fn apply_upsert(
     if let Some((t_lamport, t_device)) = current_tombstone(tx, repo_id, spec.name, row_pk)?
         && !beats(meta.lamport, device_hex, t_lamport, &t_device)
     {
-        return Ok(ApplyOutcome::Applied);
-    }
-
-    // Type-check each cell. Every cell's column is known here — an unknown one parked the whole op
-    // above, before any row state was touched. A type mismatch quarantines the op before any write.
-    let mut known: Vec<(&str, &TypedValue)> = Vec::new();
-    for cell in cells {
-        let Some(column) = spec.columns.iter().find(|c| c.name == cell.column) else {
-            debug_assert!(false, "an unknown column parks the op before any cell is classified");
-            return Ok(ApplyOutcome::Unprojectable(PendingReason::UnknownColumn));
-        };
-        if !value_matches(&cell.value, column.value_type) {
-            return Ok(ApplyOutcome::Quarantined(format!(
-                "cell `{}` value does not match declared type on `{}`",
-                cell.column, spec.name
-            )));
-        }
-        known.push((column.name, &cell.value));
-    }
-
-    // Whole-row LWW requires a full after-image: a winning op replaces the ENTIRE row, so an op
-    // missing a synced column would leave that column at a stale value under the winning clock —
-    // two peers with different prior values there would diverge. The producer always emits every
-    // synced column (`read_all_rows`), so a partial op is malformed or a version-skew op that
-    // cannot cleanly replace this binary's row; quarantine it rather than half-apply. (Decode
-    // rejects duplicate columns and an unknown column parks the op, so `known` holds distinct
-    // synced columns — a full count means all are present.)
-    // PARK, not quarantine: the overwhelmingly likely cause is an OLDER producer whose complete row
-    // under its narrower spec is a partial one under ours — a version gap, redeemed from the
-    // sender's side by #1002's declared column defaults, not a broken producer whose data can never
-    // fit. Quarantining would drop it off the refold's worklist permanently; parking keeps it
-    // outstanding so the binary that can rebuild the missing cells lands it.
-    if known.len() != spec.columns.len() {
-        return Ok(ApplyOutcome::Unprojectable(PendingReason::PartialAfterImage));
+        return Ok(ApplyOutcome::Superseded);
     }
 
     // Whole-row LWW: the op wins the ENTIRE row iff it beats the row's write clock (or the row is
@@ -219,7 +298,7 @@ fn apply_upsert(
         None => true, // no prior write — this op establishes the row.
     };
     if !wins {
-        return Ok(ApplyOutcome::Applied);
+        return Ok(ApplyOutcome::Superseded);
     }
 
     // The winner replaces the whole row in ONE statement (so a constraint failure can't leave a
@@ -246,7 +325,7 @@ fn apply_upsert(
     // Anti-echo: the winning op now owns the whole current row state, so record its synced hash.
     // (A losing op returned above without touching the published hash.)
     if let Some(hash) = synced_row_hash(tx, spec, pk_vals)? {
-        record_published(tx, repo_id, spec.name, row_pk, &hash)?;
+        record_published(tx, repo_id, spec.name, row_pk, &hash, spec.spec_version)?;
     }
     Ok(ApplyOutcome::Applied)
 }
@@ -440,7 +519,7 @@ fn insert_row(
     tx: &Transaction<'_>,
     spec: &TableSpec,
     pk_vals: &[TypedValue],
-    winning: &[(&str, &TypedValue)],
+    winning: &[(&'static str, TypedValue)],
 ) -> anyhow::Result<()> {
     let mut columns: Vec<String> = spec.pk.iter().map(|c| quote_ident(c.name)).collect();
     let mut values: Vec<SqlValue> = pk_vals.iter().map(sql_value).collect();
@@ -463,7 +542,7 @@ fn insert_row(
 fn update_row(
     tx: &Transaction<'_>,
     spec: &TableSpec,
-    cells: &[(&str, &TypedValue)],
+    cells: &[(&'static str, TypedValue)],
     pk_vals: &[TypedValue],
 ) -> anyhow::Result<()> {
     let assignments = cells
@@ -527,15 +606,91 @@ pub(crate) fn published_hash(
     repo_id: &str,
     table: &str,
     row_pk: &str,
-) -> anyhow::Result<Option<(String, i64)>> {
-    Ok(tx
+) -> anyhow::Result<Option<(String, u32)>> {
+    let row = tx
         .query_row(
-            "SELECT synced_hash, projector_version FROM sync_published_rows
+            "SELECT synced_hash, spec_version FROM sync_published_rows
              WHERE repo_id = ?1 AND table_name = ?2 AND row_pk = ?3",
             rusqlite::params![repo_id, table, row_pk],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )
-        .optional()?)
+        .optional()?;
+    row.map(|(hash, version)| Ok((hash, u32::try_from(version)?))).transpose()
+}
+
+/// How a row whose published record predates the current spec version compares against the op that
+/// actually established it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StaleRow {
+    /// The row still matches its winning op, projected under the current spec — untouched since it
+    /// landed, so its bookkeeping can simply be restamped.
+    Unchanged,
+    /// The row differs from its winning op: a local change nothing has authored yet.
+    LocallyChanged,
+    /// Nothing can be concluded — the winning entry is gone, or does not project here.
+    Unknown,
+}
+
+/// Compare a stale-version row against its own winning op, projected under the CURRENT spec.
+///
+/// This is what lets a column-set change resolve instead of freezing. The published hash and the
+/// current hash cover different cell lists, so comparing them proves nothing — but the row's
+/// WINNING ENTRY is the exact op that produced the row, and projecting it under today's registry
+/// (filling columns it predates from their declared defaults) yields what the row SHOULD look like
+/// now. Equal means untouched; different means a genuine local change.
+///
+/// Deliberately a comparison and NOT a re-apply: re-applying the winner through the LWW gates
+/// writes nothing (its clock equals the row's by definition, so it never beats it), and bypassing
+/// those gates to force it would overwrite exactly the local changes this exists to detect.
+pub(crate) fn stale_row_disposition(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    stream: StreamId,
+    pk_vals: &[TypedValue],
+    current: &[Cell],
+) -> anyhow::Result<StaleRow> {
+    let row_pk = row_op::row_pk_string(pk_vals);
+    let Some((lamport, device_hex)) = current_row_clock(tx, repo_id, spec.name, &row_pk)? else {
+        return Ok(StaleRow::Unknown);
+    };
+    let Some(op) = super::store::winning_entry_op(tx, stream, &device_hex, lamport)? else {
+        // The entry is gone. Nothing prunes today; when retention lands it must refresh a row
+        // before dropping that row's winner, or this arm becomes a permanent stale state.
+        return Ok(StaleRow::Unknown);
+    };
+    // The entry is located by `(stream, device, lamport)`, which identifies it uniquely WITHIN a
+    // stream — so the hit is this row's op only while the row's clock and the stream being queried
+    // belong to the same stream. That holds today, but it is not an enforced property: a table's
+    // stream is derived from `(repo_id, account_id, scope_id)`, and moving a registered table to a
+    // different scope is an ordinary registry edit. The row's clock would then carry a lamport
+    // allocated on the OLD stream, and the same `(device, lamport)` on the new one belongs to some
+    // SIBLING table's op. Verify the identity rather than trusting the derivation: a mismatch must
+    // read as "cannot resolve" (and be handled conservatively), never as a verdict about this row.
+    // Without this, two tables with coincidentally similar columns can project `Complete` and
+    // return `Unchanged` for a row that actually holds an unsent edit — which lets the refold
+    // replay straight over it.
+    if op.table() != spec.name || op.pk() != pk_vals {
+        return Ok(StaleRow::Unknown);
+    }
+    // A winning REMOVE clears the row clock, so a live clock can only ever point at an upsert.
+    let RowOp::Upsert { spec_version, cells, .. } = &op else {
+        return Ok(StaleRow::Unknown);
+    };
+    match project_cells(spec, *spec_version, cells) {
+        Projection::Complete(projected) => {
+            let as_cells: Vec<Cell> = projected
+                .into_iter()
+                .map(|(column, value)| Cell { column: column.to_string(), value })
+                .collect();
+            Ok(if row_op::cells_hash(&as_cells) == row_op::cells_hash(current) {
+                StaleRow::Unchanged
+            } else {
+                StaleRow::LocallyChanged
+            })
+        },
+        Projection::Park(_) | Projection::Quarantine(_) => Ok(StaleRow::Unknown),
+    }
 }
 
 /// Whether this row holds a local change that has not been authored yet, so a caller replaying an
@@ -558,6 +713,7 @@ pub(crate) fn row_has_unsent_local_change(
     tx: &Transaction<'_>,
     spec: &TableSpec,
     repo_id: &str,
+    stream: StreamId,
     pk_vals: &[TypedValue],
 ) -> anyhow::Result<bool> {
     // A malformed key never reached `apply_row_op`'s arity check (an entry parked as out-of-scope
@@ -569,18 +725,26 @@ pub(crate) fn row_has_unsent_local_change(
         return Ok(false);
     }
     let row_pk = row_op::row_pk_string(pk_vals);
-    let Some(current) = synced_row_hash(tx, spec, pk_vals)? else {
+    let Some(current_cells) = read_synced_cells(tx, spec, pk_vals)? else {
         // No row — but a surviving published identity means the row was DELETED locally and not yet
         // authored. That is precisely what the producer's `Remove` branch keys on, so replaying an
         // upsert here would recreate the row and discard the unsent deletion for good.
         return Ok(published_hash(tx, repo_id, spec.name, &row_pk)?.is_some());
     };
+    let current = row_op::cells_hash(&current_cells);
     Ok(match published_hash(tx, repo_id, spec.name, &row_pk)? {
         // Comparable: a differing hash is a demonstrably unsent local change.
-        Some((published, version)) if version == super::refold::TABLE_SYNC_PROJECTOR_VERSION =>
-            published != current,
-        // Published under a different column set — not comparable, so nothing is proven either way.
-        Some(_) => false,
+        Some((published, version)) if version == spec.spec_version => published != current,
+        // Published under a different column set, so the hashes cannot be compared — but the row's
+        // WINNING op can be, projected under this spec. This proof path is required, not an
+        // optimization: once an older-spec op can be filled from declared defaults (#1002) a parked
+        // entry can WIN over an unsent raw edit here, where before it could not apply at all.
+        // Unprovable stays conservative: refuse to replay rather than risk overwriting.
+        Some(_) => match stale_row_disposition(tx, spec, repo_id, stream, pk_vals, &current_cells)?
+        {
+            StaleRow::LocallyChanged | StaleRow::Unknown => true,
+            StaleRow::Unchanged => false,
+        },
         // A live row no apply ever published is purely local: the only content there came from this
         // device, and no peer has seen it.
         None => true,
@@ -588,28 +752,23 @@ pub(crate) fn row_has_unsent_local_change(
 }
 
 /// Claim `row_pk` as a COMPLETE projection: `hash` covers every synced column this binary knows,
-/// stamped with the projector version that defines that column set.
+/// stamped with the TABLE's spec version, which is what defines that column set. Deliberately not
+/// the store-global projector version — that would make an unrelated table's registration mark this
+/// row incomparable.
 pub(crate) fn record_published(
     tx: &Transaction<'_>,
     repo_id: &str,
     table: &str,
     row_pk: &str,
     hash: &str,
+    spec_version: u32,
 ) -> anyhow::Result<()> {
     tx.execute(
-        "INSERT INTO sync_published_rows(repo_id, table_name, row_pk, synced_hash,
-                                         projector_version)
+        "INSERT INTO sync_published_rows(repo_id, table_name, row_pk, synced_hash, spec_version)
          VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(repo_id, table_name, row_pk) DO UPDATE
-             SET synced_hash = excluded.synced_hash,
-                 projector_version = excluded.projector_version",
-        rusqlite::params![
-            repo_id,
-            table,
-            row_pk,
-            hash,
-            super::refold::TABLE_SYNC_PROJECTOR_VERSION
-        ],
+             SET synced_hash = excluded.synced_hash, spec_version = excluded.spec_version",
+        rusqlite::params![repo_id, table, row_pk, hash, spec_version],
     )?;
     Ok(())
 }
@@ -701,8 +860,9 @@ mod tests {
     const SPEC: TableSpec = TableSpec {
         name: "t_demo",
         scope_id: "demo/1",
-        pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-        columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }],
+        spec_version: 1,
+        pk: &[ColumnSpec::required("id", ValueType::Text)],
+        columns: &[ColumnSpec::required("title", ValueType::Text)],
         local_columns: &["resolved_rowid"],
         repo_column: None,
     };
@@ -723,6 +883,7 @@ mod tests {
 
     fn upsert(cells: &[(&str, TypedValue)]) -> RowOp {
         RowOp::Upsert {
+            spec_version: 1,
             table: "t_demo".to_string(),
             pk: vec![TypedValue::Text("r1".to_string())],
             cells: cells
@@ -767,11 +928,12 @@ mod tests {
         const TWO_COL: TableSpec = TableSpec {
             name: "t_two",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }, ColumnSpec {
-                name: "count",
-                value_type: ValueType::I64,
-            }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::required("count", ValueType::I64),
+            ],
             local_columns: &[],
             repo_column: None,
         };
@@ -782,6 +944,7 @@ mod tests {
         )
         .unwrap();
         let full = |title: &str, count: i64| RowOp::Upsert {
+            spec_version: 1,
             table: "t_two".to_string(),
             pk: vec![TypedValue::Text("r1".into())],
             cells: vec![
@@ -797,11 +960,12 @@ mod tests {
         })
         .unwrap();
         // ...a lower-lamport op editing a different column loses the WHOLE row, not just `title`.
-        apply_row_op(&tx, &TWO_COL, "repo", &full("B", 2), OpMeta {
+        let out = apply_row_op(&tx, &TWO_COL, "repo", &full("B", 2), OpMeta {
             lamport: 5,
             device: device(1),
         })
         .unwrap();
+        assert_eq!(out, ApplyOutcome::Superseded, "outranked by the row's write clock");
         tx.commit().unwrap();
         let row: (String, i64) = c
             .query_row("SELECT title, count FROM t_two WHERE id = 'r1'", [], |r| {
@@ -906,11 +1070,12 @@ mod tests {
         const TWO_COL: TableSpec = TableSpec {
             name: "t_two",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }, ColumnSpec {
-                name: "count",
-                value_type: ValueType::I64,
-            }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::required("count", ValueType::I64),
+            ],
             local_columns: &[],
             repo_column: None,
         };
@@ -922,6 +1087,7 @@ mod tests {
         .unwrap();
         let tx = c.transaction().unwrap();
         let partial = RowOp::Upsert {
+            spec_version: 1,
             table: "t_two".to_string(),
             pk: vec![TypedValue::Text("r1".into())],
             cells: vec![Cell {
@@ -942,6 +1108,159 @@ mod tests {
         );
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM t_two", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 0, "nothing was written");
+    }
+
+    #[test]
+    fn a_newer_op_parks_on_its_version_alone_even_carrying_only_known_columns() {
+        // The version gate must do work the unknown-column gate does not. Every "newer" fixture
+        // elsewhere ALSO names a column the receiver lacks, so deleting the version check entirely
+        // only changed a reason string — the op parked either way. Here the op is well within this
+        // registry's vocabulary and is refused purely for claiming a later generation, which is the
+        // whole point: a later spec may mean something by these same columns that we cannot know.
+        assert_eq!(
+            project_cells(&SPEC, SPEC.spec_version + 1, &[Cell {
+                column: "title".into(),
+                value: TypedValue::Text("known".into()),
+            }]),
+            Projection::Park(PendingReason::NewerSpecVersion),
+            "a newer generation parks on the version alone"
+        );
+        // And the converse, so the gate cannot simply park everything.
+        assert!(matches!(
+            project_cells(&SPEC, SPEC.spec_version, &[Cell {
+                column: "title".into(),
+                value: TypedValue::Text("known".into()),
+            }]),
+            Projection::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn a_cell_newer_than_the_ops_own_claimed_version_is_a_misstamp() {
+        // Self-contradictory: a producer at v1 cannot have known a column introduced at v2. Left
+        // unchecked, the understated version would default-fill every column it claims to predate,
+        // resetting them on every receiver — so this is the one half of the advisory stamp a
+        // receiver can verify against its own registry.
+        const WIDE: TableSpec = TableSpec {
+            name: "t_demo",
+            scope_id: "demo/1",
+            spec_version: 2,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::Text("d")),
+            ],
+            local_columns: &[],
+            repo_column: None,
+        };
+        let cells = |version: u32| {
+            project_cells(&WIDE, version, &[
+                Cell { column: "later".into(), value: TypedValue::Text("v".into()) },
+                Cell { column: "title".into(), value: TypedValue::Text("t".into()) },
+            ])
+        };
+        assert_eq!(
+            cells(1),
+            Projection::Park(PendingReason::MisstampedSpecVersion),
+            "claiming v1 while carrying a v2 column is a mis-stamp, not an old complete row"
+        );
+        assert!(matches!(cells(2), Projection::Complete(_)), "the honest stamp projects");
+    }
+
+    #[test]
+    fn every_default_variant_fills_its_own_typed_value() {
+        // One case per `DefaultValue` variant. Without this, only `Text` and `Null` were exercised,
+        // and collapsing `Bool`/`I64`/`Blob` to `TypedValue::Null` passed the whole suite — which
+        // on a NOT NULL column quarantines the op terminally, and on a nullable one
+        // diverges from the migration's backfill at the same clock.
+        const TYPED: TableSpec = TableSpec {
+            name: "t_typed",
+            scope_id: "demo/1",
+            spec_version: 2,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[
+                ColumnSpec::added("flag", ValueType::Bool, 2, DefaultValue::Bool(true)),
+                ColumnSpec::added("count", ValueType::I64, 2, DefaultValue::I64(7)),
+                ColumnSpec::added("note", ValueType::Text, 2, DefaultValue::Text("d")),
+                ColumnSpec::added("raw", ValueType::Blob, 2, DefaultValue::Blob(&[1, 2])),
+                ColumnSpec::added("empty", ValueType::Text, 2, DefaultValue::Null),
+            ],
+            local_columns: &[],
+            repo_column: None,
+        };
+        assert_eq!(
+            project_cells(&TYPED, 1, &[]),
+            Projection::Complete(vec![
+                ("flag", TypedValue::Bool(true)),
+                ("count", TypedValue::I64(7)),
+                ("note", TypedValue::Text("d".into())),
+                ("raw", TypedValue::Blob(vec![1, 2])),
+                ("empty", TypedValue::Null),
+            ]),
+            "each declared default fills as its own typed value, not as NULL"
+        );
+    }
+
+    #[test]
+    fn the_default_fill_window_is_per_column_not_merely_older_than_the_spec() {
+        // Once a table reaches a THIRD version, "older than the current spec" stops being a safe
+        // test for "predates this column". A v2 op that omits a column v2 already had is a broken
+        // partial, and must park — filling it would reset that column to its default for EVERY
+        // receiver under whole-row LWW, silently and with no local edit to signal it. Only an op
+        // older than the column's OWN introducing version may be filled.
+        const THREE: TableSpec = TableSpec {
+            name: "t_three",
+            scope_id: "demo/1",
+            spec_version: 3,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[
+                ColumnSpec::required("title", ValueType::Text),
+                ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::Text("v2-default")),
+                ColumnSpec::added("latest", ValueType::Text, 3, DefaultValue::Text("v3-default")),
+            ],
+            local_columns: &[],
+            repo_column: None,
+        };
+        let project = |version: u32, cells: &[(&str, &str)]| {
+            let cells: Vec<Cell> = cells
+                .iter()
+                .map(|(c, v)| Cell {
+                    column: (*c).to_string(),
+                    value: TypedValue::Text((*v).to_string()),
+                })
+                .collect();
+            project_cells(&THREE, version, &cells)
+        };
+
+        // v1 predates BOTH added columns — each is filled from its own declared default.
+        assert_eq!(
+            project(1, &[("title", "t")]),
+            Projection::Complete(vec![
+                ("title", TypedValue::Text("t".into())),
+                ("later", TypedValue::Text("v2-default".into())),
+                ("latest", TypedValue::Text("v3-default".into())),
+            ]),
+            "an op older than both columns is completed from both defaults"
+        );
+
+        // v2 predates only `latest`; `later` existed in v2, so a v2 op carrying it is complete.
+        assert_eq!(
+            project(2, &[("title", "t"), ("later", "sent")]),
+            Projection::Complete(vec![
+                ("title", TypedValue::Text("t".into())),
+                ("later", TypedValue::Text("sent".into())),
+                ("latest", TypedValue::Text("v3-default".into())),
+            ]),
+            "only the column the op's own version predates is filled"
+        );
+
+        // THE REGRESSION: a v2 op omitting `later` is a broken partial, not an old complete row.
+        assert_eq!(
+            project(2, &[("title", "t")]),
+            Projection::Park(PendingReason::PartialAfterImage),
+            "a column the op's own version already had must never be defaulted — the op is a \
+             partial and parks"
+        );
     }
 
     #[test]
@@ -1036,7 +1355,7 @@ mod tests {
         .unwrap();
         let row_pk = row_op::row_pk_string(&[TypedValue::Text("r1".to_string())]);
         let (_, version) = published_hash(&tx, "repo", "t_demo", &row_pk).unwrap().unwrap();
-        assert_eq!(version, super::super::refold::TABLE_SYNC_PROJECTOR_VERSION);
+        assert_eq!(version, SPEC.spec_version);
     }
 
     #[test]
@@ -1055,7 +1374,11 @@ mod tests {
             &tx,
             &SPEC,
             "repo",
-            &RowOp::Remove { table: "t_demo".into(), pk: vec![TypedValue::Text("r1".into())] },
+            &RowOp::Remove {
+                spec_version: 1,
+                table: "t_demo".into(),
+                pk: vec![TypedValue::Text("r1".into())],
+            },
             OpMeta { lamport: 2, device: device(2) },
         )
         .unwrap();
@@ -1067,7 +1390,11 @@ mod tests {
     }
 
     fn remove() -> RowOp {
-        RowOp::Remove { table: "t_demo".to_string(), pk: vec![TypedValue::Text("r1".to_string())] }
+        RowOp::Remove {
+            spec_version: 1,
+            table: "t_demo".to_string(),
+            pk: vec![TypedValue::Text("r1".to_string())],
+        }
     }
 
     #[test]
@@ -1083,8 +1410,15 @@ mod tests {
         )
         .unwrap();
         // A delete older than the row's cell clock loses — the row survives.
-        apply_row_op(&tx, &SPEC, "repo", &remove(), OpMeta { lamport: 3, device: device(2) })
-            .unwrap();
+        let out =
+            apply_row_op(&tx, &SPEC, "repo", &remove(), OpMeta { lamport: 3, device: device(2) })
+                .unwrap();
+        assert_eq!(
+            out,
+            ApplyOutcome::Superseded,
+            "the delete landed but did not delete: reported distinctly from a delete that took \
+             effect, because a locally-authored op can never legitimately land here"
+        );
         tx.commit().unwrap();
         assert_eq!(title(&c).as_deref(), Some("keep"), "a stale delete cannot remove a newer row");
     }
@@ -1096,7 +1430,7 @@ mod tests {
         apply_row_op(&tx, &SPEC, "repo", &remove(), OpMeta { lamport: 5, device: device(2) })
             .unwrap();
         // An insert older than the tombstone is suppressed.
-        apply_row_op(
+        let out = apply_row_op(
             &tx,
             &SPEC,
             "repo",
@@ -1104,6 +1438,7 @@ mod tests {
             OpMeta { lamport: 3, device: device(2) },
         )
         .unwrap();
+        assert_eq!(out, ApplyOutcome::Superseded, "suppressed by the tombstone, not applied");
         tx.commit().unwrap();
         assert_eq!(title(&c), None, "an insert older than the delete cannot resurrect the row");
     }
@@ -1199,8 +1534,9 @@ mod tests {
         const HASHED: TableSpec = TableSpec {
             name: "t_io",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "hash", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("hash", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
@@ -1209,12 +1545,16 @@ mod tests {
         c.execute_batch("CREATE TABLE t_io(id TEXT PRIMARY KEY, hash TEXT) STRICT;").unwrap();
         let tx = c.transaction().unwrap();
         let io_upsert = RowOp::Upsert {
+            spec_version: 1,
             table: "t_io".to_string(),
             pk: vec![TypedValue::Text("r".into())],
             cells: vec![Cell { column: "hash".into(), value: TypedValue::Text("h".into()) }],
         };
-        let io_remove =
-            RowOp::Remove { table: "t_io".to_string(), pk: vec![TypedValue::Text("r".into())] };
+        let io_remove = RowOp::Remove {
+            spec_version: 1,
+            table: "t_io".to_string(),
+            pk: vec![TypedValue::Text("r".into())],
+        };
 
         apply_row_op(&tx, &HASHED, "repo", &io_upsert, OpMeta { lamport: 5, device: device(2) })
             .unwrap();
@@ -1237,11 +1577,12 @@ mod tests {
         const SCOPED: TableSpec = TableSpec {
             name: "t_scoped",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "repo_id", value_type: ValueType::Text }, ColumnSpec {
-                name: "id",
-                value_type: ValueType::Text,
-            }],
-            columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[
+                ColumnSpec::required("repo_id", ValueType::Text),
+                ColumnSpec::required("id", ValueType::Text),
+            ],
+            columns: &[ColumnSpec::required("title", ValueType::Text)],
             local_columns: &[],
             repo_column: Some("repo_id"),
         };
@@ -1255,6 +1596,7 @@ mod tests {
         .unwrap();
         let tx = c.transaction().unwrap();
         let foreign = RowOp::Upsert {
+            spec_version: 1,
             table: "t_scoped".to_string(),
             pk: vec![TypedValue::Text("B".into()), TypedValue::Text("r1".into())],
             cells: vec![Cell { column: "title".into(), value: TypedValue::Text("x".into()) }],
@@ -1268,6 +1610,7 @@ mod tests {
         assert_eq!(count, 0, "no cross-repo row was written");
         // The matching-repo op applies.
         let own = RowOp::Upsert {
+            spec_version: 1,
             table: "t_scoped".to_string(),
             pk: vec![TypedValue::Text("A".into()), TypedValue::Text("r1".into())],
             cells: vec![Cell { column: "title".into(), value: TypedValue::Text("x".into()) }],
@@ -1284,6 +1627,7 @@ mod tests {
         let mut c = conn();
         let tx = c.transaction().unwrap();
         let op = RowOp::Upsert {
+            spec_version: 1,
             table: "t_demo".to_string(),
             pk: vec![TypedValue::Null],
             cells: vec![Cell { column: "title".to_string(), value: TypedValue::Text("x".into()) }],
@@ -1303,6 +1647,7 @@ mod tests {
         let mut c = conn();
         let tx = c.transaction().unwrap();
         let op = RowOp::Upsert {
+            spec_version: 1,
             table: "t_demo".to_string(),
             pk: vec![TypedValue::I64(1)],
             cells: vec![Cell { column: "title".to_string(), value: TypedValue::Text("x".into()) }],
@@ -1325,8 +1670,9 @@ mod tests {
         const NOT_NULL: TableSpec = TableSpec {
             name: "t_nn",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "title", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("title", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
@@ -1338,6 +1684,7 @@ mod tests {
         // A well-typed NULL cell (Text column, Null value) passes the type check but violates the
         // table's NOT NULL constraint on insert.
         let op = RowOp::Upsert {
+            spec_version: 1,
             table: "t_nn".to_string(),
             pk: vec![TypedValue::Text("r".into())],
             cells: vec![Cell { column: "title".to_string(), value: TypedValue::Null }],
@@ -1360,8 +1707,9 @@ mod tests {
         const FLAG: TableSpec = TableSpec {
             name: "t_flag",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "active", value_type: ValueType::Bool }],
-            columns: &[ColumnSpec { name: "label", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("active", ValueType::Bool)],
+            columns: &[ColumnSpec::required("label", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
@@ -1381,6 +1729,7 @@ mod tests {
 
         // The op the producer would sign applies cleanly on a peer (the typed-pk check passes).
         let op = RowOp::Upsert {
+            spec_version: 1,
             table: "t_flag".to_string(),
             pk: rows[0].0.clone(),
             cells: rows[0].1.clone(),
@@ -1406,8 +1755,9 @@ mod tests {
         const FLAGGED: TableSpec = TableSpec {
             name: "t_flagged",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "flag", value_type: ValueType::Bool }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("flag", ValueType::Bool)],
             local_columns: &[],
             repo_column: None,
         };
@@ -1430,8 +1780,9 @@ mod tests {
         const PARENT: TableSpec = TableSpec {
             name: "parent",
             scope_id: "demo/1",
-            pk: &[ColumnSpec { name: "id", value_type: ValueType::Text }],
-            columns: &[ColumnSpec { name: "v", value_type: ValueType::Text }],
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("v", ValueType::Text)],
             local_columns: &[],
             repo_column: None,
         };
@@ -1447,8 +1798,11 @@ mod tests {
         )
         .unwrap();
         let tx = c.transaction().unwrap();
-        let op =
-            RowOp::Remove { table: "parent".to_string(), pk: vec![TypedValue::Text("r".into())] };
+        let op = RowOp::Remove {
+            spec_version: 1,
+            table: "parent".to_string(),
+            pk: vec![TypedValue::Text("r".into())],
+        };
         let out = apply_row_op(&tx, &PARENT, "repo", &op, OpMeta { lamport: 1, device: device(2) })
             .unwrap();
         assert!(

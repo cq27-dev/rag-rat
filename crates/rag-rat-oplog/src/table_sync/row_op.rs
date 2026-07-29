@@ -54,10 +54,19 @@ pub enum TypedValue {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RowOp {
     /// Insert-or-update the row identified by `pk` with `cells` (the synced columns). The applier
-    /// resolves insert-vs-update by row existence and merges each cell under per-column LWW.
-    Upsert { table: String, pk: Vec<TypedValue>, cells: Vec<Cell> },
+    /// resolves insert-vs-update by row existence, and the WHOLE row moves as a unit under its
+    /// write clock — there is no per-column merge.
+    ///
+    /// `spec_version` states which synced column set the author wrote against, so a receiver can
+    /// tell an OLDER producer's complete row (fill the columns it predates from their declared
+    /// defaults) from a NEWER producer's partial one (park until this binary catches up).
+    Upsert { table: String, spec_version: u32, pk: Vec<TypedValue>, cells: Vec<Cell> },
     /// Delete the row identified by `pk` (and its LWW clock rows).
-    Remove { table: String, pk: Vec<TypedValue> },
+    ///
+    /// `spec_version` is carried for wire symmetry and diagnostics but NOT acted on: a remove names
+    /// only the row identity, so no column set is involved and no default can apply. Gating a
+    /// deletion on a version skew would delay it for no benefit.
+    Remove { table: String, spec_version: u32, pk: Vec<TypedValue> },
 }
 
 impl RowOp {
@@ -72,6 +81,13 @@ impl RowOp {
     pub fn pk(&self) -> &[TypedValue] {
         match self {
             Self::Upsert { pk, .. } | Self::Remove { pk, .. } => pk,
+        }
+    }
+
+    /// The synced column set this op was authored against.
+    pub fn spec_version(&self) -> u32 {
+        match self {
+            Self::Upsert { spec_version, .. } | Self::Remove { spec_version, .. } => *spec_version,
         }
     }
 
@@ -113,15 +129,17 @@ pub fn encode(op: &RowOp) -> Vec<u8> {
 /// Write the op-specific payload as exactly ONE CBOR item (the envelope's element 2).
 fn encode_payload(enc: &mut VecEncoder<'_>, op: &RowOp) {
     match op {
-        RowOp::Upsert { table, pk, cells } => {
-            enc.array(3).expect(INFALLIBLE);
+        RowOp::Upsert { table, spec_version, pk, cells } => {
+            enc.array(4).expect(INFALLIBLE);
             enc.str(table).expect(INFALLIBLE);
+            enc.u32(*spec_version).expect(INFALLIBLE);
             encode_values(enc, pk);
             encode_cells(enc, cells);
         },
-        RowOp::Remove { table, pk } => {
-            enc.array(2).expect(INFALLIBLE);
+        RowOp::Remove { table, spec_version, pk } => {
+            enc.array(3).expect(INFALLIBLE);
             enc.str(table).expect(INFALLIBLE);
+            enc.u32(*spec_version).expect(INFALLIBLE);
             encode_values(enc, pk);
         },
     }
@@ -181,17 +199,19 @@ fn decode_envelope(bytes: &[u8]) -> Result<DecodedRowOp, CborError> {
     let kind = d.str()?.to_string();
     let known = match kind.as_str() {
         "upsert" => {
-            cbor::expect_array(&mut d, 3)?;
+            cbor::expect_array(&mut d, 4)?;
             let table = d.str()?.to_string();
+            let spec_version = d.u32()?;
             let pk = decode_values(&mut d)?;
             let cells = decode_cells(&mut d)?;
-            Some(RowOp::Upsert { table, pk, cells })
+            Some(RowOp::Upsert { table, spec_version, pk, cells })
         },
         "remove" => {
-            cbor::expect_array(&mut d, 2)?;
+            cbor::expect_array(&mut d, 3)?;
             let table = d.str()?.to_string();
+            let spec_version = d.u32()?;
             let pk = decode_values(&mut d)?;
-            Some(RowOp::Remove { table, pk })
+            Some(RowOp::Remove { table, spec_version, pk })
         },
         // A future op-kind this binary doesn't know — retained opaque, canonicity checked below.
         _ => None,
@@ -337,6 +357,7 @@ mod tests {
 
     fn sample_upsert() -> RowOp {
         RowOp::Upsert {
+            spec_version: 1,
             table: "t_demo".to_string(),
             pk: vec![TypedValue::Text("r".to_string()), TypedValue::I64(7)],
             // Deliberately out of column order — encode must canonicalize.
@@ -364,14 +385,34 @@ mod tests {
         assert_eq!(encode(&decoded), bytes);
     }
 
-    #[test]
-    fn remove_round_trips() {
-        let op = RowOp::Remove {
+    fn sample_remove() -> RowOp {
+        // `spec_version` deliberately differs from the array arity and from the upsert sample, so a
+        // field-order swap or a hardcoded version cannot round-trip or match the golden bytes.
+        RowOp::Remove {
+            spec_version: 7,
             table: "t_demo".to_string(),
             pk: vec![TypedValue::Text("r".to_string()), TypedValue::I64(7)],
-        };
+        }
+    }
+
+    #[test]
+    fn remove_round_trips() {
+        let op = sample_remove();
         let bytes = encode(&op);
         assert_eq!(decode(&bytes).unwrap(), DecodedRowOp::Known(op));
+    }
+
+    /// Golden vector for `Remove`, held to the same discipline as [`upsert_golden_vector`].
+    ///
+    /// A round-trip alone pins NOTHING about the format: `decode(encode(op)) == op` holds under any
+    /// symmetric change — reordering the payload, dropping `spec_version`, retyping it — so half
+    /// the wire was unprotected while the other half was pinned. #1002 changed this payload's
+    /// arity from 2 to 3 and inserted an element in the MIDDLE, which is exactly the kind of
+    /// change a round-trip cannot see.
+    #[test]
+    fn remove_golden_vector() {
+        let bytes = encode(&sample_remove());
+        assert_eq!(rag_rat_base::hash::hex_lower(&bytes), GOLDEN_REMOVE_HEX);
     }
 
     #[test]
@@ -384,8 +425,9 @@ mod tests {
             enc.array(3).unwrap();
             enc.str(DOMAIN).unwrap();
             enc.str("upsert").unwrap();
-            enc.array(3).unwrap();
+            enc.array(4).unwrap();
             enc.str("t_demo").unwrap();
+            enc.u32(1).unwrap(); // spec_version
             enc.array(0).unwrap(); // empty pk
             enc.array(2).unwrap();
             enc.array(2).unwrap();
@@ -395,7 +437,12 @@ mod tests {
             enc.str("a").unwrap(); // duplicate column
             enc.i64(2).unwrap();
         }
-        assert!(decode(&buf).is_err(), "a duplicate column is not canonical");
+        // Assert the REASON, not merely `is_err()`. A hand-built fixture drifts out of shape
+        // whenever the payload arity changes, and a bare `is_err()` then passes on the arity gate
+        // while the rule it names goes untested — which is what happened when #1002 widened this
+        // payload from 3 elements to 4.
+        let err = decode(&buf).expect_err("a duplicate column is not canonical").to_string();
+        assert!(err.contains("not sorted or duplicated"), "rejected for the stated reason: {err}");
     }
 
     #[test]
@@ -453,20 +500,56 @@ mod tests {
             enc.array(3).unwrap();
             enc.str(DOMAIN).unwrap();
             enc.str("upsert").unwrap();
-            enc.array(3).unwrap();
+            enc.array(4).unwrap();
             enc.str("t").unwrap();
+            enc.u32(1).unwrap(); // spec_version
             enc.array(1_000_000_000).unwrap(); // absurd declared pk length, no elements follow
         }
-        assert!(decode(&buf).is_err(), "an oversized array length is capped, not allocated");
+        // Assert the CAP is what rejected it. A bare `is_err()` here proves nothing: the array is
+        // truncated, so decoding would fail on end-of-input even with no cap at all — the test
+        // passed with `MAX_ROW_OP_ELEMENTS` raised to `u64::MAX`. The whole point is that the
+        // attacker-controlled length header is refused BEFORE it sizes an allocation.
+        let err = decode(&buf).expect_err("an oversized array length is refused").to_string();
+        assert!(err.contains("exceeds the protocol cap"), "refused by the cap, not by EOF: {err}");
+    }
+
+    #[test]
+    fn an_array_length_at_the_cap_is_not_refused_by_the_cap() {
+        // The other side of the boundary: the cap must reject only what is ABOVE it, or a
+        // legitimate op near the limit would be unparseable. Declared length == the cap,
+        // still truncated, so it must fail on the CONTENT rather than the header.
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("upsert").unwrap();
+            enc.array(4).unwrap();
+            enc.str("t").unwrap();
+            enc.u32(1).unwrap();
+            enc.array(MAX_ROW_OP_ELEMENTS).unwrap();
+        }
+        let err = decode(&buf).expect_err("still truncated, so it cannot decode").to_string();
+        assert!(!err.contains("exceeds the protocol cap"), "the cap is exclusive: {err}");
     }
 
     /// Golden vector: the exact canonical bytes of `sample_upsert`. A change here is a wire-format
     /// change — bump `DOMAIN` deliberately, never edit this hex to make the test pass.
+    ///
+    /// This hex WAS edited once, when #1002 added `spec_version` to the payload, WITHOUT a domain
+    /// bump. That was sound exactly once and is not a precedent: at the time no released binary
+    /// could ever have produced or read a table op — `SYNCABLE_TABLES` had been empty since the
+    /// engine was written and no transport carried the format — so `/1` had never existed on a wire
+    /// or in a store, and bumping would have asserted a compatibility generation that never was.
+    /// That is no longer true. Any FURTHER change to these bytes bumps the domain.
     #[test]
     fn upsert_golden_vector() {
         let bytes = encode(&sample_upsert());
         assert_eq!(rag_rat_base::hash::hex_lower(&bytes), GOLDEN_UPSERT_HEX);
     }
 
-    const GOLDEN_UPSERT_HEX: &str = "83727261672d7261742f7461626c652d6f702f31667570736572748366745f64656d6f82617207848265636f756e74038264646f6e65f582646e6f7465f682657469746c65626869";
+    const GOLDEN_REMOVE_HEX: &str =
+        "83727261672d7261742f7461626c652d6f702f316672656d6f76658366745f64656d6f0782617207";
+
+    const GOLDEN_UPSERT_HEX: &str = "83727261672d7261742f7461626c652d6f702f31667570736572748466745f64656d6f0182617207848265636f756e74038264646f6e65f582646e6f7465f682657469746c65626869";
 }

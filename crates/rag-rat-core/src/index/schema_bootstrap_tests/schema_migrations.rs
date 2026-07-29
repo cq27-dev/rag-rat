@@ -1471,6 +1471,122 @@ fn migration_092_normalizes_invite_receipts() {
     assert_eq!(recorded, 1, "the forward migration records V092");
 }
 
+/// V095 (#1002) records the TABLE's spec version on each published row, so an unrelated projector
+/// bump no longer marks every table's rows incomparable.
+#[test]
+fn migration_095_records_the_table_spec_version() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 95, "move this pin with the next schema migration");
+
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply_table_sync_tables(&bare).unwrap();
+    schema::apply_table_sync_projection_state(&bare).unwrap();
+    assert!(
+        schema::column_exists(&bare, "sync_published_rows", "projector_version").unwrap(),
+        "V093 records the store-global projector version"
+    );
+
+    use rusqlite::OptionalExtension;
+    // A row published under V093 must SURVIVE the rebuild, not be dropped with the old table.
+    bare.execute(
+        "INSERT INTO sync_published_rows(repo_id, table_name, row_pk, synced_hash, \
+         projector_version)
+         VALUES ('repo', 't', 'carried', 'h0', 1)",
+        [],
+    )
+    .unwrap();
+
+    schema::apply_table_sync_spec_version(&bare).unwrap();
+    schema::apply_table_sync_spec_version(&bare).expect("replay is a no-op");
+    let carried: Option<i64> = bare
+        .query_row(
+            "SELECT spec_version FROM sync_published_rows WHERE row_pk = 'carried'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(
+        carried,
+        Some(0),
+        "the rebuild carries existing records across, stamped as an unknown column set — dropping \
+         a published record would strand that row's unsent deletion permanently"
+    );
+    assert!(schema::column_exists(&bare, "sync_published_rows", "spec_version").unwrap());
+    assert!(
+        !schema::column_exists(&bare, "sync_published_rows", "projector_version").unwrap(),
+        "the store-global version is replaced, not left behind as a dead column"
+    );
+
+    // The rebuilt table keeps its identity and its NOT NULL version.
+    bare.execute(
+        "INSERT INTO sync_published_rows(repo_id, table_name, row_pk, synced_hash, spec_version)
+         VALUES ('repo', 't', 'r', 'h', 2)",
+        [],
+    )
+    .unwrap();
+    let duplicate = bare.execute(
+        "INSERT INTO sync_published_rows(repo_id, table_name, row_pk, synced_hash, spec_version)
+         VALUES ('repo', 't', 'r', 'other', 2)",
+        [],
+    );
+    assert!(duplicate.is_err(), "one published record per row identity");
+    let missing_version = bare.execute(
+        "INSERT INTO sync_published_rows(repo_id, table_name, row_pk, synced_hash)
+         VALUES ('repo', 't', 'r2', 'h')",
+        [],
+    );
+    assert!(missing_version.is_err(), "a published hash always states the column set it covers");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '095_table_sync_spec_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V095");
+
+    // `schema::apply` is the `index --full` recovery, and it re-runs the WHOLE ladder over an
+    // EXISTING store — so V093 would re-add the column V095 replaced, and V095 can only restore its
+    // shape by REBUILDING the table. Both halves of that must hold: the replay converges on the
+    // fresh schema, and it does not destroy publication state on the way. The second is the sharp
+    // one — `produce_row_ops` finds a locally-deleted row by its surviving published record, so a
+    // dropped table strands every unsent deletion and leaves peers holding the row forever.
+    conn.execute(
+        "INSERT INTO sync_published_rows(repo_id, table_name, row_pk, synced_hash, spec_version)
+         VALUES ('repo', 't', 'live', 'hash', 3)",
+        [],
+    )
+    .unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("the ladder replays");
+    assert!(
+        schema::column_exists(&conn, "sync_published_rows", "spec_version").unwrap(),
+        "the replayed ladder still ends at the V095 shape"
+    );
+    assert!(
+        !schema::column_exists(&conn, "sync_published_rows", "projector_version").unwrap(),
+        "V093's column must not come back on a full-ladder replay — the recovery path has to \
+         converge on the same schema as a fresh install"
+    );
+    let survivor: Option<i64> = conn
+        .query_row(
+            "SELECT spec_version FROM sync_published_rows WHERE row_pk = 'live'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(
+        survivor,
+        Some(3),
+        "the replay must not rebuild a populated table — a dropped published record reads as an \
+         unsent deletion that can never be authored"
+    );
+}
+
 /// V093 (#1001) records what the table-sync projector could not project, the apply context the
 /// one-way stream id hashes away, and the column set each anti-echo hash covers.
 #[test]
@@ -1582,8 +1698,6 @@ fn migration_091_adds_account_candidate_reservation_targets() {
 
 #[test]
 fn migration_094_tracks_lens_enrichment_changes_in_constant_time() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 94, "move this pin with the next schema migration");
-
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     conn.execute(
