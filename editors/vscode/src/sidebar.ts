@@ -4,6 +4,7 @@
 // per-file FileStore (no per-view fetching).
 import * as vscode from 'vscode';
 import type { CloneRegion, DecisionRecord, PapertrailRef } from './client';
+import { logError } from './output';
 import type { FileData, FileStore } from './store';
 
 class Item extends vscode.TreeItem {
@@ -38,6 +39,48 @@ class Item extends vscode.TreeItem {
 }
 
 /**
+ * What the sidebar is showing: one file's data, or the reason there is none.
+ *
+ * A state rather than a rendered list, because the pump decides what is TRUE and each view decides
+ * how to say it. That split is what lets the three views agree by construction, and it is where a
+ * new truth goes — a further reason the data cannot be shown, or a qualification on data that can
+ * (which lane of it is a carried-forward fallback, whether the file has moved under the answer) is
+ * a member here plus a rendering arm, not a special case threaded through the load path.
+ */
+type SidebarState =
+  | { kind: 'loading' }
+  /** No active editor, or a buffer with no indexed path — an unsaved one, or outside the repo. */
+  | { kind: 'unindexed' }
+  | { kind: 'offline' }
+  /** The load itself failed. Distinct from `offline`: nothing was learned about the server. */
+  | { kind: 'failed' }
+  | { kind: 'file'; path: string; data: FileData };
+
+type SidebarMessage = Exclude<SidebarState, { kind: 'file' }>;
+
+/** The one row a message state renders as. Built per view: a `TreeItem` belongs to one tree. */
+function messageItem(state: SidebarMessage): Item {
+  switch (state.kind) {
+    case 'loading':
+      return new Item('loading…', { icon: new vscode.ThemeIcon('loading~spin') });
+    case 'unindexed':
+      return new Item('open a file in the indexed repo', { icon: new vscode.ThemeIcon('info') });
+    case 'offline':
+      return new Item('lens server offline', { icon: new vscode.ThemeIcon('cloud-offline') });
+    case 'failed':
+      return new Item('lens data unavailable', {
+        description: 'see the rag-rat Lens log',
+        icon: new vscode.ThemeIcon('warning', new vscode.ThemeColor('editorWarning.foreground')),
+      });
+    default: {
+      // Adding a state without a row is a compile error, not a blank tree at runtime.
+      const unhandled: never = state;
+      throw new Error(`unhandled sidebar state: ${JSON.stringify(unhandled)}`);
+    }
+  }
+}
+
+/**
  * One of the three trees. It holds what it is showing; the pump is the only writer.
  *
  * `getChildren` is deliberately SYNCHRONOUS. `TreeDataProvider.getChildren` has no cancellation
@@ -52,7 +95,11 @@ class Item extends vscode.TreeItem {
 abstract class FileView implements vscode.TreeDataProvider<Item> {
   private readonly emitter = new vscode.EventEmitter<Item | undefined>();
   readonly onDidChangeTreeData = this.emitter.event;
-  private items: Item[] = [];
+  /**
+   * `loading`, never `[]`. The views exist before the first load can have answered, and an empty
+   * tree is a claim — "this file has nothing" — that nothing has established yet.
+   */
+  private items: Item[] = [messageItem({ kind: 'loading' })];
 
   getTreeItem(element: Item): vscode.TreeItem {
     return element;
@@ -62,7 +109,15 @@ abstract class FileView implements vscode.TreeDataProvider<Item> {
     return element ? element.children ?? [] : this.items;
   }
 
-  /** Replace what this view shows and make VS Code re-read it. The pump is the only caller. */
+  /**
+   * This view's rows for `state`. PURE — it shows nothing on its own, so the pump can render all
+   * three views before committing any of them.
+   */
+  render(state: SidebarState): Item[] {
+    return state.kind === 'file' ? this.roots(state.path, state.data) : [messageItem(state)];
+  }
+
+  /** Show already-rendered rows and make VS Code re-read them. The pump is the only caller. */
   publish(items: Item[]): void {
     this.items = items;
     this.emitter.fire(undefined);
@@ -72,28 +127,23 @@ abstract class FileView implements vscode.TreeDataProvider<Item> {
    * This view's tree for one file's data. The contract is unchanged by the pump — only its caller
    * moved out of `getChildren`, so it now runs once a load is entitled to publish.
    */
-  abstract roots(path: string, data: FileData): Item[];
+  protected abstract roots(path: string, data: FileData): Item[];
 }
-
-const loading = (): Item => new Item('loading…', { icon: new vscode.ThemeIcon('loading~spin') });
-
-const noIndexedFile = (): Item =>
-  new Item('open a file in the indexed repo', { icon: new vscode.ThemeIcon('info') });
-
-const serverOffline = (): Item =>
-  new Item('lens server offline', { icon: new vscode.ThemeIcon('cloud-offline') });
 
 /**
  * Loads the sidebar's data and publishes it to the three views.
  *
- * Everything the views show describes ONE document — whichever editor is active — so which
- * document a load was aimed at is part of its answer, and an answer about another document is
- * wrong however good the data is. This is where that is checked: the document and the store's data
- * epoch are captured before the await and re-read after it, and the result is written only if this
- * is still the newest load, still aimed at the active editor, and still under the index state it
- * started from. Anything else is dropped rather than published — whatever superseded it publishes
- * its own answer, which is why every `invalidate`/`reset` in the extension is paired with a
- * `refresh`.
+ * Everything the views show describes ONE document, loaded from ONE data source — so the premise a
+ * load ran under is part of its answer, and an answer under another premise is wrong however good
+ * the data is. This is where that is checked, on both sides of the await:
+ *
+ * - AFTER it, before publishing: the result is written only if this is still the newest load, still
+ *   aimed at the active editor, and still under the index state it started from. Anything else is
+ *   dropped rather than published — whatever superseded it publishes its own answer, which is why
+ *   every `invalidate`/`reset` in the extension is paired with a `refresh`.
+ * - BEFORE it, over what is already on screen: content whose premise no longer holds comes down
+ *   immediately rather than standing until a replacement arrives, which can take as long as the
+ *   request timeout.
  *
  * One pump for all three views rather than one each: they sit stacked in a single container, so a
  * slow view left describing the previous file beside two describing the current one is the same
@@ -101,8 +151,12 @@ const serverOffline = (): Item =>
  */
 class SidebarPump {
   private generation = 0;
-  /** The document the views describe, `undefined` when no editor is active. */
-  private document: string | undefined;
+  /**
+   * The premise the views' current CONTENT answers: which document it describes, and which data
+   * source it came from. `undefined` while they hold a message — a message describes no file, so
+   * no change of premise can falsify it.
+   */
+  private shown: { document: string; source: number } | undefined;
 
   constructor(
     private readonly store: FileStore,
@@ -111,27 +165,37 @@ class SidebarPump {
 
   /** Reload for whatever editor is active now. */
   refresh(): void {
-    void this.load();
+    // The load reports its own failures; this is the backstop for a throw inside that reporting.
+    void this.load().catch((error: unknown) => logError('sidebar', error));
   }
 
   private async load(): Promise<void> {
     const generation = ++this.generation;
     const editor = vscode.window.activeTextEditor;
-    const document = editor?.document.uri.toString();
-    const switched = document !== this.document;
-    this.document = document;
     if (!editor) {
-      this.publishMessage(noIndexedFile);
+      this.publish({ kind: 'unindexed' });
       return;
     }
-    if (switched) {
-      // The views still hold the previous file's tree, and leaving it up asserts it about the file
-      // now on screen. Only a document CHANGE clears: an index refresh reloads the same document,
-      // and emptying its tree on every version event would flicker for no gain.
-      this.publishMessage(loading);
+    const document = editor.document.uri.toString();
+    const source = this.store.sourceEpoch();
+    if (this.shown && (this.shown.document !== document || this.shown.source !== source)) {
+      // What is on screen answers a question nobody is asking any more — a different document, or a
+      // server/repository the store has declared unusable — and leaving it up asserts it about the
+      // file now on screen. Both premises are known to have changed BEFORE the load, so the tree
+      // comes down now rather than when a replacement happens to arrive.
+      //
+      // Only a CHANGED premise clears. An ordinary index invalidation reloads the same document
+      // from the same source, and emptying its tree on every version event would flicker for no
+      // gain.
+      this.publish({ kind: 'loading' });
     }
     const epoch = this.store.dataEpoch();
-    const loaded = await this.store.dataFor(editor.document);
+    // Settle the load into a value, the way `probeStatus` does: a rejection has to pass the same
+    // entitlement checks as an answer before it may say anything.
+    const settled = await this.store.dataFor(editor.document).then(
+      (loaded) => ({ ok: true as const, loaded }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
     if (
       // A newer load owns the views. Same document and same epoch are not enough to make two loads
       // interchangeable: the store re-points to a replacement endpoint and reloads without moving
@@ -146,27 +210,52 @@ class SidebarPump {
     ) {
       return;
     }
-    if (!loaded) {
-      // Distinguish "nothing to show for this buffer" from "the server did not answer": an
-      // unsaved buffer has no indexed path, and reporting that as an outage would be wrong.
-      this.publishMessage(this.store.pathOf(editor.document) ? serverOffline : noIndexedFile);
+    if (!settled.ok) {
+      // Nothing is known about this file, and a spinner left up forever says the opposite.
+      logError('sidebar', settled.error);
+      this.publish({ kind: 'failed' });
       return;
     }
-    for (const view of this.views) {
-      view.publish(view.roots(loaded.path, loaded.data));
+    if (!settled.loaded) {
+      // Distinguish "nothing to show for this buffer" from "the server did not answer": an
+      // unsaved buffer has no indexed path, and reporting that as an outage would be wrong.
+      this.publish(
+        this.store.pathOf(editor.document) ? { kind: 'offline' } : { kind: 'unindexed' },
+      );
+      return;
     }
+    this.publish({ kind: 'file', path: settled.loaded.path, data: settled.loaded.data }, document);
   }
 
-  /** The same message in all three views, built per view: a `TreeItem` belongs to one tree. */
-  private publishMessage(item: () => Item): void {
-    for (const view of this.views) {
-      view.publish([item()]);
+  /**
+   * Show `state` in all three views. `document` is the document a `file` state answers about, and
+   * recording it is what lets a later load tell whether the views still describe anything.
+   */
+  private publish(state: SidebarState, document?: string): void {
+    let rendered: readonly (readonly [FileView, Item[]])[];
+    try {
+      // Render every view BEFORE committing any: a payload one view's builder cannot turn into
+      // rows would otherwise leave the other two describing it, which is exactly the disagreement
+      // a single pump exists to prevent.
+      rendered = this.views.map((view) => [view, view.render(state)] as const);
+    } catch (error) {
+      logError('sidebar', error);
+      if (state.kind !== 'failed') {
+        this.publish({ kind: 'failed' });
+      }
+      return;
+    }
+    // Read the source HERE, after the load: one that re-points mid-flight answers from the source
+    // serving now, not the one it started under.
+    this.shown = document === undefined ? undefined : { document, source: this.store.sourceEpoch() };
+    for (const [view, items] of rendered) {
+      view.publish(items);
     }
   }
 }
 
 export class CloneClassesView extends FileView {
-  roots(path: string, data: FileData): Item[] {
+  protected roots(path: string, data: FileData): Item[] {
     const out: Item[] = [];
     const unavailable = cloneGraphUnavailableReason(data.cloneGraph);
     if (unavailable) {
@@ -254,7 +343,7 @@ function regionItem(path: string, r: CloneRegion): Item {
 }
 
 export class MemoriesView extends FileView {
-  roots(path: string, data: FileData): Item[] {
+  protected roots(path: string, data: FileData): Item[] {
     const memories = data.memories;
     if (!memories.length) {
       return [new Item('no memories bound to this file', { icon: new vscode.ThemeIcon('check') })];
@@ -273,7 +362,7 @@ export class MemoriesView extends FileView {
 }
 
 export class PapertrailView extends FileView {
-  roots(_path: string, data: FileData): Item[] {
+  protected roots(_path: string, data: FileData): Item[] {
     const { refs, decisions } = data;
     const out: Item[] = [];
     if (decisions.length) {

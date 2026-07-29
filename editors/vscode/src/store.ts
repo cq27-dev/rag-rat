@@ -88,6 +88,8 @@ export class FileStore {
    */
   private lastGoodEndpoint: string | undefined;
   private epoch = 0;
+  /** See [`sourceEpoch`](FileStore#sourceEpoch) — moves only when the served identity changes. */
+  private source = 0;
   private online = false;
 
   constructor(
@@ -132,6 +134,22 @@ export class FileStore {
    */
   dataEpoch(): number {
     return this.epoch;
+  }
+
+  /**
+   * WHERE the store is serving from, as an opaque counter that moves whenever everything fetched
+   * so far stops being attributable to the server now answering: a `reset`, or a discovery
+   * re-point observed while loading.
+   *
+   * Deliberately not `dataEpoch`, which also moves on every ordinary index invalidation. A caller
+   * holding a rendered copy of a payload needs the two apart. The index moving means its copy is
+   * merely out of date, and the replacement is already on its way — taking it down would flicker
+   * every surface on every reindex. The SOURCE moving means its copy describes a different
+   * repository or a different server, so it is not out of date but wrong, and it has to come down
+   * NOW rather than stand for as long as the replacement request takes.
+   */
+  sourceEpoch(): number {
+    return this.source;
   }
 
   /** The last load's error, if any — present for a partial load too, so the caller can log it. */
@@ -259,13 +277,7 @@ export class FileStore {
         // Nothing arrived at all: that is a file-level failure, and the caller clears its signals.
         return this.recordFailure(path, rejected[0].reason);
       }
-      if (endpoint !== this.lastGoodEndpoint) {
-        for (const state of this.paths.values()) {
-          state.lastGood = undefined;
-          state.laneAt = undefined;
-        }
-        this.lastGoodEndpoint = endpoint;
-      }
+      this.noteServedEndpoint(endpoint);
       const entry = this.state(path);
       // A rejected lane keeps the last value that arrived for it, for a while. An empty array would
       // be a claim — "no memories on this file" — that the caller acts on by clearing diagnostics
@@ -351,6 +363,30 @@ export class FileStore {
       state.laneAt = undefined;
     }
     this.lastGoodEndpoint = undefined;
+    this.source += 1;
+  }
+
+  /**
+   * Attribute what is about to be stored to the endpoint that answered it, dropping the fallbacks
+   * of any earlier one.
+   *
+   * Both of the store's own writers of the served identity move `source` — this one and
+   * `forgetServedState` — so a consumer holding rendered data learns that it now describes a
+   * different server WITHOUT having to know which of the extension's actions can re-point
+   * discovery. A stream failure is the case that makes that matter: it re-resolves the endpoint
+   * but reloads without an explicit reset, so a server that came back on another port changes the
+   * identity with nothing having declared it.
+   */
+  private noteServedEndpoint(endpoint: string): void {
+    if (endpoint === this.lastGoodEndpoint) {
+      return;
+    }
+    for (const state of this.paths.values()) {
+      state.lastGood = undefined;
+      state.laneAt = undefined;
+    }
+    this.lastGoodEndpoint = endpoint;
+    this.source += 1;
   }
 
   /**
