@@ -1366,3 +1366,71 @@ fn name_only_recovery_rate_excludes_exact_upgrades() {
 // `oracle_runs`. All deterministic against the synthetic harness conn (no
 // rust-analyzer, no `.scip` subprocess).
 // ---------------------------------------------------------------------------
+
+/// The batch sibling-collision question (#1042 stage 4): when two checkouts share content, they
+/// share ONE `edge_oracle` row — the content key is the identity, and the per-checkout scope join
+/// cannot separate rows that are physically the same. Does one checkout's authoritative clear
+/// therefore destroy a sibling's verdict?
+///
+/// It does not, and the reason is that the clear is `(tool, tool_version)`-scoped. A sibling whose
+/// currency still selects the OLD version keeps its rows, because the clear only ever removes the
+/// version the running checkout is establishing. When both checkouts ARE on that version the row is
+/// removed for both — which is correct rather than a collision: the verdict is about the content,
+/// the content is identical, and the run that cleared it is authoritative for exactly that
+/// `(tool, version, content)` triple.
+///
+/// This pins the property so a future change to the clear's scope cannot quietly reintroduce the
+/// hazard the live path guards against by copying rather than relabelling
+/// (`migrate_live_verdicts_to_version`).
+#[test]
+fn a_batch_clear_cannot_erase_a_sibling_whose_currency_is_another_version() {
+    let h = Harness::new();
+    // Two checkouts, SAME path and SAME recorded sha (`add_file_in_scope` derives the sha from the
+    // worktree, and both are the clean worktree) with the SAME edge spans — so their content keys
+    // COLLIDE and any verdict they hold is one shared row.
+    let active_file = h.add_file_in_scope("a.rs", COMMIT, WORKTREE);
+    let sibling_file = h.add_file_in_scope("a.rs", OTHER_COMMIT, OTHER_WORKTREE);
+    let active_edge = h.add_edge(active_file, "target", 14, 20, "NameOnly", None);
+    let sibling_edge = h.add_edge(sibling_file, "target", 14, 20, "NameOnly", None);
+    let sha = h.file_sha_for_commit("a.rs", COMMIT);
+    assert_eq!(sha, h.file_sha_for_commit("a.rs", OTHER_COMMIT), "the fixture shares content");
+
+    // The sibling's verdict is at an OLDER tool version than the one the active run establishes.
+    let key = h.edge_content_key(sibling_edge);
+    store::write_edge_oracle(&h.conn, TOOL, "old-version", &store::EdgeOracleRow {
+        source_path: &key.source_path,
+        source_start_byte: key.source_start_byte,
+        source_end_byte: key.source_end_byte,
+        callee_start_byte: key.callee_start_byte,
+        callee_end_byte: key.callee_end_byte,
+        edge_kind: &key.edge_kind,
+        file_sha: &sha,
+        resolved_symbol_id: None,
+        scip_symbol: "s",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+    // The active checkout's own verdict, at the version its run is establishing. Same content key,
+    // different version — so this is a SECOND row, and version is what separates them.
+    h.write_verdict(active_edge, &sha, None, "s", OracleResolutionKind::Upgrade);
+
+    let versions = || -> Vec<String> {
+        let mut stmt =
+            h.conn.prepare("SELECT tool_version FROM edge_oracle ORDER BY tool_version").unwrap();
+        let rows: Vec<String> =
+            stmt.query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+        rows
+    };
+    assert_eq!(versions(), vec!["old-version".to_string(), VERSION.to_string()]);
+
+    // The active checkout clears authoritatively for the version it is establishing.
+    store::clear_edge_oracle_for_tool(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+
+    assert_eq!(
+        versions(),
+        vec!["old-version".to_string()],
+        "the sibling's older-version verdict survives a clear it shares content with: the clear \
+         only ever removes the version the running checkout is establishing",
+    );
+    let _ = sibling_edge;
+}
