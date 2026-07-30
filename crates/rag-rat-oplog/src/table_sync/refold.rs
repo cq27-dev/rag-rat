@@ -76,6 +76,23 @@ const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
 /// with at ingest, so after the upgrade it reads as a version gap at the current version — no
 /// trigger owns it, and it is stranded exactly the way #1005 exists to prevent. One full pass
 /// re-derives every pending entry's reason under the current vocabulary, which is all it takes.
+///
+/// One store-global stamp is enough, and it is worth saying why, because "an older binary shares
+/// this store and could re-create the legacy state after we stamped" is the obvious objection.
+/// There are exactly TWO writers of a pending mark, and neither can:
+///
+/// - **Ingest** ([`super::engine`]) marks from `ApplyOutcome::Unprojectable`, which is
+///   [`super::apply::PayloadVerdict::Gap`] — decided on the payload alone, so it is a version gap
+///   by construction and never a deferral, whatever the row holds. It cannot write a misclassified
+///   mark, in any binary.
+/// - **[`repark`]** only runs inside a pass, and a pass is gated on [`refold_owed`]. An older
+///   binary's triggers are all version-based, so once the projector stamp is current and every
+///   pending entry sits at that version, its refold does not run at all — which is precisely the
+///   state this stamp is written in.
+///
+/// So the legacy shape can only be created by a refold that predates this vocabulary, and that
+/// refold cannot run again once the vocabulary is stamped. Binding the vocabulary per mark (a
+/// migration) would buy nothing over dominating the one path that writes stale classifications.
 const TABLE_SYNC_DEFERRAL_VOCABULARY: i64 = 1;
 
 const TABLE_SYNC_DEFERRAL_VOCABULARY_KEY: &str = "table_sync_deferral_vocabulary";
@@ -1814,6 +1831,35 @@ mod tests {
         assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1);
         assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
         assert_eq!(b.pending_count(), 0);
+    }
+
+    #[test]
+    fn ingest_classifies_on_the_payload_alone_and_never_writes_a_deferral() {
+        // What makes ONE store-global vocabulary stamp sufficient. The worry it has to answer is an
+        // older binary sharing the store and re-creating the legacy state after we stamped; the
+        // answer is that only a refold pass can write a stale classification, and an older binary's
+        // pass cannot run once the projector stamp and every pending mark are current.
+        //
+        // That argument rests on the OTHER writer — ingest — never producing a deferral, which it
+        // cannot, because it classifies from the payload alone and never looks at the row. This
+        // pins that: the row here holds an unsent local edit, so a row-aware ingest would have
+        // something to find, and finding it would silently break the reachability argument above.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let entries = author_wide_row(&mut a);
+        b.enroll(a.pubkey().fingerprint());
+
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'unsent', NULL)", [])
+            .unwrap();
+        b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey());
+
+        let (reason, version) = b.pending_mark().expect("the entry parked");
+        assert_eq!(
+            (PendingReason::from_db_str(&reason).map(PendingReason::is_deferral), version),
+            (Some(false), TABLE_SYNC_PROJECTOR_VERSION),
+            "ingest marks a version gap at the current version — never a deferral",
+        );
     }
 
     #[test]
