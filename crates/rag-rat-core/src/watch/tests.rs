@@ -73,10 +73,20 @@ fn placement_counters() -> WatchPlacementCounters {
 
 /// A single-Rust-target `Config` rooted at `root` watching `target_dirs` — the inline builder
 /// the real-watcher placement tests share so they can call `watch_created_dirs` (which needs a
-/// `&Config` for the target-relation gate, #332).
-fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> Config {
+/// `&Config` for the target-relation gate, #332) — paired with the CANONICAL spelling of that
+/// root the returned `Config` actually carries.
+///
+/// Handing the canonical root back is the point of the pair, not a convenience. `Config::load`
+/// canonicalizes its root, and the watcher classifies an event by stripping `config.root` off the
+/// event path, so a fixture that keeps deriving event paths, ignore matchers and expectations from
+/// its OWN spelling of the root is comparing against a root production never produces: the strip
+/// misses and no pass is ever dispatched. Linux was the one platform where the two spellings
+/// coincided — macOS resolves `/var` → `/private/var`, Windows expands 8.3 names, and the scratch
+/// namespace now hands paths out through a symlinked ancestor so Linux carries the divergence too
+/// (#1027). Bind the second element and derive every other path in the test from it.
+fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> (Config, PathBuf) {
     let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
-    Config {
+    let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
         sync: Default::default(),
@@ -101,7 +111,53 @@ fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> Config {
         log: Default::default(),
         source_root_reanchored_from: None,
         allow_empty: false,
-    }
+    };
+    let canonical_root = config.root.clone();
+    (config, canonical_root)
+}
+
+/// The prologue almost every event-loop test shares: a scratch checkout holding one Rust source
+/// file under `src/`, its single-target [`whole_root_config`], and the CANONICAL root spelling
+/// that `Config` carries. The scratch guard comes back so the caller can keep the directory alive;
+/// nothing hands the caller the fixture's own spelling of the root, which is the point.
+///
+/// Rooted on the scratch guard rather than `tempfile::TempDir` deliberately. A `tempfile` root is
+/// already canonical on Linux, so a test that keeps its own copy of the root compares against the
+/// same string `Config::load` would produce and stays green — while the identical fixture on macOS
+/// (`/var` → `/private/var`) or Windows (8.3 names) diverges and the watcher's `config.root` strip
+/// never matches the event path. Scratch paths reach their directory through a symlinked ancestor,
+/// so the per-PR Linux matrix carries that divergence too (#1027).
+fn src_checkout_config(tag: &str) -> (ScratchRoot, Config, PathBuf) {
+    let scratch = scratch_root(tag);
+    std::fs::create_dir_all(scratch.join("src")).unwrap();
+    std::fs::write(scratch.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let (config, root) = whole_root_config(&scratch, &[PathBuf::from("src")]);
+    (scratch, config, root)
+}
+
+/// The fixture's own spelling of the root and `config.root` must be two names for ONE directory —
+/// the shape `Config::load` produces wherever the system temp is reached through a symlink (macOS
+/// `/var` → `/private/var`) or an 8.3 alias (Windows `RUNNER~1`). Rooting the event-loop fixtures
+/// at a bare `tempfile::TempDir` degenerates the canonicalization to a no-op on Linux, and a test
+/// that kept its own copy of the root would then be indistinguishable from one deriving every path
+/// from `config.root` on the only platform the per-PR matrix runs — which is how a mis-scoped
+/// root reached the cross-platform legs unnoticed (#1027).
+#[cfg(unix)]
+#[test]
+fn the_watch_fixture_config_root_diverges_from_its_scratch_spelling() {
+    let (scratch, config, root) = src_checkout_config("watch-root-spelling");
+    assert_ne!(
+        config.root,
+        scratch.as_path(),
+        "the fixture must reach its root through a symlinked ancestor, or root-spelling bugs stay \
+         invisible on the per-PR matrix",
+    );
+    assert_eq!(
+        config.root,
+        scratch.as_path().canonicalize().unwrap(),
+        "both spellings name the same directory",
+    );
+    assert_eq!(root, config.root, "the returned root is the one the Config carries");
 }
 
 /// #427: a maintenance/watch pass on a first-time-empty config DEFERS — the core refuses the
@@ -111,9 +167,10 @@ fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> Config {
 /// coverage).
 #[test]
 fn maintenance_pass_defers_on_a_first_time_empty_config() {
-    let tmp = tempfile::TempDir::new().unwrap();
+    let scratch = scratch_root("watch-empty-first-time");
+    std::fs::create_dir_all(scratch.as_path()).unwrap();
     // A single rust target with NO directories → discovers nothing → first-time-empty.
-    let config = whole_root_config(tmp.path(), &[]);
+    let (config, _) = whole_root_config(&scratch, &[]);
     let result = maintenance_pass(&config, false);
     assert!(result.is_ok(), "an empty first-time config must defer, not error: {result:?}");
     assert!(!config.database.exists(), "deferring must register no empty index");
@@ -296,11 +353,7 @@ fn a_watch_failure_on_an_absent_directory_is_not_counted() {
 /// `watcher_main` uses the real notify watcher and isn't unit-drivable).
 #[test]
 fn shutdown_flush_persists_watch_placement_failures() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, config, root) = src_checkout_config("watch-shutdown-flush");
     IndexDatabase::rebuild(&config).unwrap();
 
     // A fresh index has recorded nothing; a flush with zero failures stays a no-op.
@@ -333,11 +386,7 @@ fn shutdown_flush_persists_watch_placement_failures() {
 /// and that it routes through the lightweight config-scoped persist (no `open_config` heals).
 #[test]
 fn a_nonblocking_flush_persists_the_count_when_the_write_lock_is_free() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, config, root) = src_checkout_config("watch-nonblocking-flush");
     IndexDatabase::rebuild(&config).unwrap();
 
     let counters = WatchPlacementCounters::default();
@@ -362,13 +411,9 @@ fn a_nonblocking_flush_persists_the_count_when_the_write_lock_is_free() {
 /// (#658 review).
 #[test]
 fn a_flush_on_a_checkout_without_an_index_creates_no_db_file() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
     // A source file exists (so the later rebuild has something to index), but no index has been
     // built yet — a source file on disk does not create the `.rag-rat/index.sqlite`.
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, config, root) = src_checkout_config("watch-flush-no-index");
     assert!(!config.database.exists(), "precondition: no index file yet");
 
     // Record real placement failures, then flush — as the shutdown path would.
@@ -406,11 +451,7 @@ fn a_flush_on_a_checkout_without_an_index_creates_no_db_file() {
 /// consolidated DB; `busy_timeout = 0` turns the contended write into an immediate SKIP.
 #[test]
 fn a_nonblocking_flush_skips_a_busy_database_instead_of_blocking() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, config, root) = src_checkout_config("watch-busy-flush");
     IndexDatabase::rebuild(&config).unwrap();
 
     // Persist an initial count (lock free) so we can prove a later busy flush does NOT overwrite
@@ -472,11 +513,7 @@ fn a_nonblocking_flush_skips_a_busy_database_instead_of_blocking() {
 /// resync would, after the pass persisted), wakes the loop, and asserts the drain persisted it.
 #[test]
 fn the_event_loop_drain_persists_a_placement_failure_while_running() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, mut config, root) = src_checkout_config("watch-drain-flush");
     config.watch.periodic_sweep_secs = 0; // the exact case the drain must cover.
     IndexDatabase::rebuild(&config).unwrap();
 
@@ -767,7 +804,7 @@ fn maintenance_pass_or_skip_runs_when_lock_is_available() {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/lib.rs"), "pub fn maintenance_target() {}\n").unwrap();
     let root = root.canonicalize().unwrap();
-    let config = whole_root_config(&root, &[PathBuf::from("src")]);
+    let (config, root) = whole_root_config(&root, &[PathBuf::from("src")]);
 
     assert!(
         maintenance_pass_or_skip(&config, false).unwrap(),
@@ -799,7 +836,7 @@ fn startup_catchup_retries_existing_base_embedding_backlog() {
     .unwrap();
     let root = root.canonicalize().unwrap();
 
-    let mut config = whole_root_config(&root, &[PathBuf::from("src")]);
+    let (mut config, root) = whole_root_config(&root, &[PathBuf::from("src")]);
     config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -862,7 +899,7 @@ fn overlay_only_pass_skips_base_tail_but_still_validates_memories() {
     git(&main, &["worktree", "add", "-q", "-b", "feature", &linked_arg]);
 
     let main_root = main.canonicalize().unwrap();
-    let config = whole_root_config(&main_root, &[PathBuf::from("src")]);
+    let (config, main_root) = whole_root_config(&main_root, &[PathBuf::from("src")]);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let created = db
         .memory_create(RepoMemoryCreate {
@@ -945,7 +982,7 @@ fn startup_catchup_skips_ephemeral_backlog_scan_without_query_endpoint() {
     .unwrap();
     let root = root.canonicalize().unwrap();
 
-    let mut config = whole_root_config(&root, &[PathBuf::from("src")]);
+    let (mut config, root) = whole_root_config(&root, &[PathBuf::from("src")]);
     config.llm.embedding.backend = FASTEMBED_MODEL_ID.parse().unwrap();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -991,7 +1028,7 @@ fn startup_catchup_reconciles_shutdown_discovered_content() {
     .unwrap();
     let root = root.canonicalize().unwrap();
 
-    let mut config = whole_root_config(&root, &[PathBuf::from("src")]);
+    let (mut config, root) = whole_root_config(&root, &[PathBuf::from("src")]);
     config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
 
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -1062,7 +1099,7 @@ fn startup_catchup_keeps_shutdown_marker_when_reconcile_is_blocked() {
     .unwrap();
     let root = root.canonicalize().unwrap();
 
-    let config = whole_root_config(&root, &[PathBuf::from("src")]);
+    let (config, root) = whole_root_config(&root, &[PathBuf::from("src")]);
     let db = IndexDatabase::rebuild(&config).unwrap();
     db.mark_watch_shutdown_reconcile_pending().unwrap();
     drop(db);
@@ -1096,7 +1133,7 @@ fn wal_checkpoint_runs_at_every_pass_terminal_gated_by_size_alone() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/a.rs"), "pub fn wal_probe() -> i32 { 1 }\n").unwrap();
-    let config = whole_root_config(&root, &[PathBuf::from("src")]);
+    let (config, root) = whole_root_config(&root, &[PathBuf::from("src")]);
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     // Put frames in the WAL so there is something to truncate (any meta write serves).
@@ -1131,7 +1168,7 @@ fn initial_watch_state_places_base_gitignore_and_fleet_surfaces() {
     std::fs::create_dir_all(root.join("bin")).unwrap();
     let root = root.canonicalize().unwrap();
 
-    let config = whole_root_config(&root, &[PathBuf::from("src")]);
+    let (config, root) = whole_root_config(&root, &[PathBuf::from("src")]);
     let target_dirs = config.target_directories();
     let ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
     let mut watcher = RecordingWatcher::default();
@@ -1182,7 +1219,7 @@ fn event_maintenance_helpers_place_dirs_recompile_and_refresh_linked_state() {
     std::fs::create_dir_all(root.join("src/fresh")).unwrap();
     let root = root.canonicalize().unwrap();
 
-    let config = whole_root_config(&root, &[PathBuf::from("src")]);
+    let (config, root) = whole_root_config(&root, &[PathBuf::from("src")]);
     let target_dirs = config.target_directories();
     let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
     let mut linked_worktrees = LinkedWorktreeWatches::default();
@@ -1248,7 +1285,7 @@ fn event_maintenance_helper_requests_pass_for_relevant_and_registry_events() {
     std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
     let root = root.canonicalize().unwrap();
 
-    let config = whole_root_config(&root, &[PathBuf::from("src")]);
+    let (config, root) = whole_root_config(&root, &[PathBuf::from("src")]);
     let target_dirs = config.target_directories();
     let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
     let mut linked_worktrees = LinkedWorktreeWatches::default();
@@ -1313,7 +1350,7 @@ fn initial_watch_state_places_worktree_registry() {
     git(&main, &["worktree", "add", "-q", "-b", "feature", &linked_arg]);
 
     let main = main.canonicalize().unwrap();
-    let config = whole_root_config(&main, &[PathBuf::from("src")]);
+    let (config, main) = whole_root_config(&main, &[PathBuf::from("src")]);
     let target_dirs = config.target_directories();
     let ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
     let mut watcher = RecordingWatcher::default();
@@ -1348,7 +1385,7 @@ fn initial_watch_state_places_worktree_registry() {
 fn watch_created_dirs_ignores_non_appearance_events() {
     let root = PathBuf::from("/repo");
     let target_dirs = vec![PathBuf::from("src")];
-    let config = whole_root_config(&root, &target_dirs);
+    let (config, root) = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
     let mut watcher = RecordingWatcher::default();
     let access = Event::new(EventKind::Access(AccessKind::Any)).add_path(root.join("src/fresh"));
@@ -1399,7 +1436,7 @@ fn missing_config_root_bootstrap_dirs_use_existing_ancestor_chain() {
 fn created_dir_placement_classifies_target_ancestors_and_subtrees() {
     let root = PathBuf::from("/repo");
     let nested = vec![PathBuf::from("src/generated")];
-    let config = whole_root_config(&root, &nested);
+    let (config, root) = whole_root_config(&root, &nested);
 
     assert_eq!(
         created_dir_placement(&config, &nested, &PathBuf::from("/elsewhere/src"), None),
@@ -1427,7 +1464,7 @@ fn created_dir_placement_classifies_target_ancestors_and_subtrees() {
     );
 
     let whole_root = vec![PathBuf::from(".")];
-    let whole_config = whole_root_config(&root, &whole_root);
+    let (whole_config, root) = whole_root_config(&root, &whole_root);
     assert_eq!(
         created_dir_placement(&whole_config, &whole_root, &root.join("anything"), None),
         CreatedDirPlacement::TargetSubtree,
@@ -1435,7 +1472,7 @@ fn created_dir_placement_classifies_target_ancestors_and_subtrees() {
 
     let checkout = PathBuf::from("/checkout");
     let subdir_root = checkout.join("packages/crate");
-    let subdir_config = whole_root_config(&subdir_root, &nested);
+    let (subdir_config, subdir_root) = whole_root_config(&subdir_root, &nested);
     assert_eq!(
         created_dir_placement(&subdir_config, &nested, &checkout.join("packages"), Some(&checkout)),
         CreatedDirPlacement::TargetAncestor,
@@ -1559,7 +1596,7 @@ fn event_touches_worktree_attributes_the_touched_checkout_roots() {
     // #577: the hint names WHICH linked checkouts an event implicates, so the dispatched pass
     // refreshes those overlays instead of sweeping the fleet; registry changes and rescans are
     // unattributable and widen to AllWorktrees.
-    let config = whole_root_config(&PathBuf::from("/main"), &[PathBuf::from("src")]);
+    let (config, _) = whole_root_config(&PathBuf::from("/main"), &[PathBuf::from("src")]);
     let wt_a = PathBuf::from("/wt/a");
     let wt_b = PathBuf::from("/wt/b");
     let registry = PathBuf::from("/main/.git/worktrees");
@@ -1662,7 +1699,7 @@ fn linked_worktree_events_honor_its_ignore_rules() {
     let worktree = worktree.canonicalize().unwrap();
     std::fs::write(worktree.join(".gitignore"), "ignored_dir/\ntarget/\n").unwrap();
 
-    let config = whole_root_config(&worktree, &[PathBuf::from(".")]);
+    let (config, worktree) = whole_root_config(&worktree, &[PathBuf::from(".")]);
     let mut watcher = RecordingWatcher::default();
     let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
         worktree.clone(),
@@ -1741,7 +1778,7 @@ fn linked_worktree_watch_placement_uses_configured_pruned_targets() {
     let worktree = worktree.canonicalize().unwrap();
     std::fs::write(worktree.join(".gitignore"), "src/ignored_dir/\ntarget/\n").unwrap();
 
-    let config = whole_root_config(&worktree, &[PathBuf::from("src")]);
+    let (config, worktree) = whole_root_config(&worktree, &[PathBuf::from("src")]);
     let mut watcher = RecordingWatcher::default();
     let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
         worktree.clone(),
@@ -1787,8 +1824,8 @@ fn linked_worktree_watch_set_sync_rebuilds_existing_root_state() {
     std::fs::create_dir_all(worktree.join("extra")).unwrap();
     let worktree = worktree.canonicalize().unwrap();
 
-    let src_config = whole_root_config(&worktree, &[PathBuf::from("src")]);
-    let extra_config = whole_root_config(&worktree, &[PathBuf::from("extra")]);
+    let (src_config, worktree) = whole_root_config(&worktree, &[PathBuf::from("src")]);
+    let (extra_config, _) = whole_root_config(&worktree, &[PathBuf::from("extra")]);
     let mut watcher = RecordingWatcher::default();
     let mut worktrees = LinkedWorktreeWatches::default();
     worktrees.sync(&mut watcher, &placement_counters(), &src_config, vec![worktree.clone()]);
@@ -1815,7 +1852,7 @@ fn linked_worktree_watch_set_handles_created_dirs_and_recompile() {
     let worktree = worktree.canonicalize().unwrap();
     std::fs::write(worktree.join(".gitignore"), "").unwrap();
 
-    let config = whole_root_config(&worktree, &[PathBuf::from("src")]);
+    let (config, worktree) = whole_root_config(&worktree, &[PathBuf::from("src")]);
     let mut watcher = RecordingWatcher::default();
     let mut worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
         worktree.clone(),
@@ -1855,7 +1892,7 @@ fn linked_worktree_watch_set_handles_created_target_ancestors() {
     std::fs::write(worktree.join(".gitignore"), "").unwrap();
 
     let target_dirs = vec![PathBuf::from("src/generated")];
-    let config = whole_root_config(&worktree, &target_dirs);
+    let (config, worktree) = whole_root_config(&worktree, &target_dirs);
     let mut watcher = RecordingWatcher::default();
     let mut worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
         worktree.clone(),
@@ -1904,7 +1941,7 @@ fn linked_worktree_target_ancestor_gitignore_is_compiled() {
     std::fs::write(worktree.join("src/sibling/.gitignore"), "marker.rs\n").unwrap();
 
     let target_dirs = vec![PathBuf::from("src/generated")];
-    let config = whole_root_config(&worktree, &target_dirs);
+    let (config, worktree) = whole_root_config(&worktree, &target_dirs);
     let mut watcher = RecordingWatcher::default();
     let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
         worktree.clone(),
@@ -1948,7 +1985,7 @@ fn linked_subdir_root_watch_placement_keeps_checkout_root_when_config_root_missi
     let checkout = checkout.canonicalize().unwrap();
     let config_root = repo.join("packages/crate").canonicalize().unwrap();
     let target_dirs = vec![PathBuf::from("src")];
-    let config = whole_root_config(&config_root, &target_dirs);
+    let (config, _) = whole_root_config(&config_root, &target_dirs);
 
     let mut watcher = RecordingWatcher::default();
     let worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
@@ -1988,7 +2025,7 @@ fn watch_created_dirs_reinstalls_watches_for_recreated_config_root() {
     std::fs::write(root.join(".gitignore"), "").unwrap();
     let root = root.canonicalize().unwrap();
     let target_dirs = vec![PathBuf::from("src")];
-    let config = whole_root_config(&root, &target_dirs);
+    let (config, root) = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
     let mut watcher = RecordingWatcher::default();
     let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(root.clone());
@@ -2037,7 +2074,7 @@ fn watch_created_dirs_bootstraps_missing_linked_subdir_root_ancestors() {
     let checkout = checkout.canonicalize().unwrap();
     let packages = checkout.join("packages");
     let target_dirs = vec![PathBuf::from("src")];
-    let config = whole_root_config(&packages.join("crate"), &target_dirs);
+    let (config, _) = whole_root_config(&packages.join("crate"), &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&config.root, &target_dirs);
     let mut watcher = RecordingWatcher::default();
     let create_packages =
@@ -2098,7 +2135,7 @@ fn linked_created_target_dir_requests_maintenance_when_directory_event_is_not_re
     std::fs::write(worktree.join(".gitignore"), "").unwrap();
 
     let target_dirs = vec![PathBuf::from("src")];
-    let config = whole_root_config(&worktree, &target_dirs);
+    let (config, worktree) = whole_root_config(&worktree, &target_dirs);
     let mut watcher = RecordingWatcher::default();
     let mut worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
         worktree.clone(),
@@ -2142,7 +2179,7 @@ fn linked_created_dir_watch_signal_does_not_short_circuit_state_updates() {
     let second = second.canonicalize().unwrap();
 
     let target_dirs = vec![PathBuf::from("src")];
-    let config = whole_root_config(&first, &target_dirs);
+    let (config, first) = whole_root_config(&first, &target_dirs);
     let mut watcher = RecordingWatcher::default();
     let mut worktrees = watch_linked_worktrees(&mut watcher, &placement_counters(), &config, vec![
         first.clone(),
@@ -2188,7 +2225,7 @@ fn watch_created_dirs_skips_dirs_ignored_before_or_after_recompile() {
     std::fs::write(root.join(".gitignore"), "src/already_ignored/\n").unwrap();
 
     let target_dirs = vec![PathBuf::from("src")];
-    let config = whole_root_config(&root, &target_dirs);
+    let (config, root) = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
     let mut watcher = RecordingWatcher::default();
 
@@ -2751,14 +2788,10 @@ fn pass_worker_runs_requests_in_order_and_reports_completion() {
 /// the completion until the end.
 #[test]
 fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let (_scratch, mut config, root) = src_checkout_config("watch-pass-in-flight");
     let fleet_bin = root.join("rag-rat-506-test-bin");
     std::fs::write(&fleet_bin, b"binary").unwrap();
 
-    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
     config.watch.debounce_ms = 10;
     config.watch.max_latency_ms = 50;
     config.watch.periodic_sweep_secs = 0;
@@ -2853,12 +2886,8 @@ fn a_pass_in_flight_does_not_starve_events_or_the_fleet_trigger() {
 /// must wait it out (counted from pass COMPLETION) and then dispatch.
 #[test]
 fn events_during_a_pass_do_not_redispatch_until_the_cooldown_elapses() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let (_scratch, mut config, root) = src_checkout_config("watch-cooldown");
 
-    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
     config.watch.debounce_ms = 10;
     config.watch.max_latency_ms = 50;
     config.watch.periodic_sweep_secs = 0;
@@ -2946,12 +2975,8 @@ fn events_during_a_pass_do_not_redispatch_until_the_cooldown_elapses() {
 /// dispatches on time.
 #[test]
 fn a_due_periodic_sweep_overrides_the_pass_cooldown() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let (_scratch, mut config, _) = src_checkout_config("watch-sweep-cooldown");
 
-    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
     // No debounce fires (nothing event-driven); the sweep is due every second while the
     // cooldown would hold event-driven dispatch for an hour.
     config.watch.debounce_ms = 60_000;
@@ -3225,7 +3250,7 @@ fn watcher_main_routes_gitignore_mutations_through_central_helpers() {
     git(&root, &["commit", "-qm", "seed"]);
     let root = root.canonicalize().unwrap();
 
-    let mut config = whole_root_config(&root, &[PathBuf::from("src")]);
+    let (mut config, root) = whole_root_config(&root, &[PathBuf::from("src")]);
     config.watch.debounce_ms = 20;
     config.watch.max_latency_ms = 50;
     config.watch.periodic_sweep_secs = 0;
@@ -3363,7 +3388,7 @@ fn newly_created_non_ignored_dir_gets_watched() {
         return; // no watcher backend available (sandboxed CI) — nothing to assert.
     };
     let target_dirs = vec![PathBuf::from(".")];
-    let config = whole_root_config(&root, &target_dirs);
+    let (config, root) = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
     watch_tree_pruned(&mut w, &placement_counters(), &root, &ignore);
 
@@ -3472,7 +3497,7 @@ fn a_directory_moved_into_a_target_is_watched() {
         return; // no watcher backend available (sandboxed CI) — nothing to assert.
     };
     let target_dirs = vec![PathBuf::from(".")];
-    let config = whole_root_config(&root, &target_dirs);
+    let (config, root) = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
     watch_tree_pruned(&mut w, &placement_counters(), &root, &ignore);
     // Simulate `mv` landing a directory into the target: create it, then feed a rename-To
@@ -3568,7 +3593,7 @@ fn a_symlink_to_a_directory_is_not_followed_into_watches() {
         return; // no watcher backend available (sandboxed CI) — nothing to assert.
     };
     let target_dirs = vec![PathBuf::from(".")];
-    let config = whole_root_config(&root, &target_dirs);
+    let (config, root) = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
     watch_tree_pruned(&mut w, &placement_counters(), &root, &ignore);
 
@@ -3620,7 +3645,7 @@ fn a_non_target_top_level_dir_is_not_watched() {
         return; // no watcher backend available (sandboxed CI) — nothing to assert.
     };
     let target_dirs = vec![PathBuf::from("src")];
-    let config = whole_root_config(&root, &target_dirs);
+    let (config, root) = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
     // Watch the target subtree + (mirroring watcher_main) config.root itself non-recursively,
     // so a top-level create is delivered here exactly as it would be in production.
@@ -3699,7 +3724,7 @@ fn a_moved_in_dir_with_a_nested_gitignore_prunes_against_it() {
         return; // no watcher backend available (sandboxed CI) — nothing to assert.
     };
     let target_dirs = vec![PathBuf::from(".")];
-    let config = whole_root_config(&root, &target_dirs);
+    let (config, root) = whole_root_config(&root, &target_dirs);
     let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
     watch_tree_pruned(&mut w, &placement_counters(), &root, &ignore);
     drain_until_quiet(&rx, 100, 1000);
@@ -3741,15 +3766,11 @@ fn a_moved_in_dir_with_a_nested_gitignore_prunes_against_it() {
 
 #[test]
 fn watcher_spawn_is_disabled_when_watch_is_off_or_env_opt_out_is_set() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, mut config, root) = src_checkout_config("watch-spawn-optout");
     config.watch.enabled = false;
     assert!(Watcher::spawn(config).is_none(), "disabled watch config must not spawn a thread");
 
-    let mut enabled = whole_root_config(root, &[PathBuf::from("src")]);
+    let (mut enabled, _) = whole_root_config(&root, &[PathBuf::from("src")]);
     enabled.watch.enabled = true;
     // SAFETY: this test is the only one touching RAG_RAT_NO_WATCH in this process.
     unsafe {
@@ -3763,11 +3784,7 @@ fn watcher_spawn_is_disabled_when_watch_is_off_or_env_opt_out_is_set() {
 
 #[test]
 fn event_loop_ignores_fs_errors_and_exits_on_disconnect() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, mut config, _) = src_checkout_config("watch-fs-errors");
     config.watch.debounce_ms = 50;
     config.watch.max_latency_ms = 200;
     config.watch.periodic_sweep_secs = 0;
@@ -3816,11 +3833,7 @@ fn event_loop_ignores_fs_errors_and_exits_on_disconnect() {
 
 #[test]
 fn periodic_sweep_dispatches_all_overlay_scope() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, mut config, _) = src_checkout_config("watch-sweep-scope");
     config.watch.debounce_ms = 60_000;
     config.watch.max_latency_ms = 60_000;
     config.watch.periodic_sweep_secs = 1;
@@ -3875,11 +3888,7 @@ fn periodic_sweep_dispatches_all_overlay_scope() {
 
 #[test]
 fn live_oracle_deadline_dispatches_without_events_or_periodic_sweeps() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, mut config, _) = src_checkout_config("watch-oracle-deadline");
     config.watch.periodic_sweep_secs = 0;
     config.watch.pass_cooldown_secs = 3_600;
     let target_dirs = config.target_directories();
@@ -3937,11 +3946,7 @@ fn live_oracle_deadline_dispatches_without_events_or_periodic_sweeps() {
 
 #[test]
 fn shutdown_discover_skips_when_write_lock_is_held() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, config, _) = src_checkout_config("watch-shutdown-discover");
     let lock_repo = rag_rat_base::locks::write_lock_repo_id(&config);
     let holder_config = config.clone();
     let holder_repo = lock_repo.clone();
@@ -4011,9 +4016,8 @@ fn papertrail_scheduler_single_flights_and_coalesces_max_wins() {
 
 #[test]
 fn papertrail_tick_interval_requires_bindings_and_takes_the_tightest_cadence() {
-    let tmp = tempfile::TempDir::new().unwrap();
     // No `[[tracker]]` bindings and no git remote to auto-detect one from → disabled.
-    let mut config = whole_root_config(tmp.path(), &[PathBuf::from("src")]);
+    let (_scratch, mut config, _) = src_checkout_config("watch-papertrail-cadence");
     assert_eq!(papertrail_tick_interval(&config), None);
 
     config.trackers = vec![rag_rat_base::config::TrackerConfig {
@@ -4032,11 +4036,7 @@ fn papertrail_tick_interval_requires_bindings_and_takes_the_tightest_cadence() {
 
 #[test]
 fn idle_watcher_enqueues_papertrail_evaluation_without_filesystem_activity() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, mut config, _) = src_checkout_config("watch-idle-papertrail");
     config.watch.debounce_ms = 60_000;
     config.watch.max_latency_ms = 60_000;
     config.watch.periodic_sweep_secs = 0;
@@ -4088,11 +4088,7 @@ fn idle_watcher_enqueues_papertrail_evaluation_without_filesystem_activity() {
 
 #[test]
 fn papertrail_deadline_fires_during_an_in_flight_pass_and_ticks_coalesce() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let root = tmp.path();
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    let mut config = whole_root_config(root, &[PathBuf::from("src")]);
+    let (_scratch, mut config, root) = src_checkout_config("watch-papertrail-deadline");
     config.watch.debounce_ms = 10;
     config.watch.max_latency_ms = 50;
     config.watch.periodic_sweep_secs = 0;

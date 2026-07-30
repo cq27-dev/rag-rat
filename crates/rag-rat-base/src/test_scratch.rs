@@ -658,7 +658,14 @@ mod tests {
         let dir = ScratchDir::new("normal-tag");
         // The parent is the namespace, reached through the non-canonical alias on Unix.
         assert_eq!(dir.path().parent(), Some(aliased_root(&scratch_root()).as_path()));
-        assert_eq!(canonical_config_root(dir.path()).parent(), Some(scratch_root().as_path()));
+        // Both sides canonical: [`scratch_root`] is `std::env::temp_dir()`-derived and therefore
+        // NOT canonical itself on macOS (`/var` → `/private/var`) or Windows (`\\?\` verbatim, 8.3
+        // expansion). Comparing a canonicalized left against a raw right is the very defect #1027
+        // exists to remove — it would pass only on a Linux box with a canonical `$TMPDIR`.
+        assert_eq!(
+            canonical_config_root(dir.path()).parent(),
+            Some(canonical_config_root(scratch_root()).as_path()),
+        );
         let name = dir.path().file_name().and_then(|n| n.to_str()).unwrap_or_default();
         assert!(name.starts_with("normal-tag-"), "unexpected scratch name {name:?}");
     }
@@ -681,7 +688,12 @@ mod tests {
         // Same directory, two spellings: a file written through one is visible through the other.
         std::fs::write(dir.path().join("probe"), "payload").unwrap();
         assert_eq!(std::fs::read_to_string(canonical.join("probe")).unwrap(), "payload");
-        assert!(canonical.starts_with(scratch_root()), "the canonical form stays in the namespace");
+        // Canonical against canonical: a raw `scratch_root()` here would carry the system temp's
+        // own non-canonical spelling on macOS/Windows and never match (#1027).
+        assert!(
+            canonical.starts_with(canonical_config_root(scratch_root())),
+            "the canonical form stays in the namespace",
+        );
     }
 
     /// [`canonical_config_root`] must match `Config::load`'s `canonicalize()` for an EXISTING root
