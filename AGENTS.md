@@ -15,8 +15,8 @@ Reach for these first:
 
 - **`semantic_search`** — "where is this concept implemented?" Returns current source chunks with
   inline graph (callers/callees), git, and GitHub papertrail, all validated against current source.
-- **`symbol_lookup`** — exact/fuzzy symbol resolution (Rust/TS/Kotlin/C/C++/Python), with any bound
-  memories attached.
+- **`symbol_lookup`** — exact/fuzzy symbol resolution (Rust/TS/Kotlin/C/C++/Python/Swift/Go), with
+  any bound memories attached.
 - **`impact_surface`** — the coding preflight before editing a symbol: graph callers/callees,
   tests, git history, papertrail, and **repo memories** crossing the call path. Run it before
   changing anything non-trivial.

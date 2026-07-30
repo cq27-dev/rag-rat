@@ -22,8 +22,8 @@ Prefer these over `grep`/`cat`/file sweeps when browsing or understanding code:
 
 - **`semantic_search`** — "where is this concept implemented?" Current source chunks with inline
   graph, git, and papertrail.
-- **`symbol_lookup`** — exact/fuzzy symbol resolution (Rust/TS/Kotlin/C/C++/Python), with any bound
-  memories attached.
+- **`symbol_lookup`** — exact/fuzzy symbol resolution (Rust/TS/Kotlin/C/C++/Python/Swift/Go), with
+  any bound memories attached.
 - **`impact_surface`** — the **coding preflight before editing any non-trivial symbol**: callers,
   callees, tests, git history, papertrail, and the repo memories crossing that call path. Run it
   before you change something load-bearing — it's how you avoid missing an invariant.

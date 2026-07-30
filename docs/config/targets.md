@@ -10,11 +10,13 @@ rust = ["crates/app/src"]
 typescript = ["apps/mobile/src"]
 kotlin = ["apps/wear-bridge/src"]
 cpp = ["include", "src"]
+go = ["cmd", "internal"]
 markdown = ["docs"]
 ```
 
 A simple binding indexes each language's default extensions in the listed directories
-(`rust` → `.rs`, `typescript` → `.ts`/`.tsx`, `python` → `.py`/`.pyi`, `c` → `.c`/`.h`, etc.).
+(`rust` → `.rs`, `typescript` → `.ts`/`.tsx`, `python` → `.py`/`.pyi`, `c` → `.c`/`.h`,
+`go` → `.go`, etc.).
 The one ambiguous case is the `.h` header: with no binding it is detected as **C** (the safe
 default), but an explicit `cpp` binding also claims `.h` in its directories and indexes those headers
 as **C++**. This is what lets a C++ library whose API lives in `.h` files (most of them) get header
@@ -33,14 +35,14 @@ include = ["**/*.ts"]
 exclude = ["**/*.map"]
 ```
 
-Supported languages are `rust`, `typescript`, `kotlin`, `c`, `cpp`, `python`, `swift`, and
-`markdown`. Rust, TypeScript/TSX, Kotlin, C, C++, Python, and Swift source use tree-sitter structural
-indexing when files are under the parser size cap.
+Supported languages are `rust`, `typescript`, `kotlin`, `c`, `cpp`, `python`, `swift`, `go`, and
+`markdown`. Rust, TypeScript/TSX, Kotlin, C, C++, Python, Swift, and Go source use tree-sitter
+structural indexing when files are under the parser size cap.
 Markdown uses heading-section chunking and does not use tree-sitter. Supported target kinds are
 `source`, `generated`, `docs`, and `tests`; generated targets are indexed with coarse chunks and
 still obey `include_generated` filtering.
 
-Parser grammar dependencies are exact-pinned in `Cargo.toml`: `tree-sitter` 0.26.9,
+Parser grammar dependencies are exact-pinned in `Cargo.toml`: `tree-sitter` 0.26.11,
 `tree-sitter-rust` 0.24.2, `tree-sitter-typescript` 0.23.2, `tree-sitter-kotlin-ng` 1.1.0,
-`tree-sitter-c` 0.24.2, `tree-sitter-cpp` 0.23.4, `tree-sitter-python` 0.25.0, and
-`tree-sitter-swift` 0.7.3.
+`tree-sitter-c` 0.24.2, `tree-sitter-cpp` 0.23.4, `tree-sitter-python` 0.25.0,
+`tree-sitter-swift` 0.7.3, and `tree-sitter-go` 0.25.0.

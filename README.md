@@ -39,7 +39,7 @@ sequenceDiagram
   are *not* assistant memory: they are versioned, local, source-anchored facts about **this**
   repository that any future agent retrieves with evidence.
 - **A real code graph.** tree-sitter callers/callees/imports across Rust, TypeScript/TSX, Kotlin,
-  C/C++, Python, and Swift — with an optional [compiler-grade SCIP oracle](docs/oracle.md) for
+  C/C++, Python, Swift, and Go — with an optional [compiler-grade SCIP oracle](docs/oracle.md) for
   configured toolchains that upgrades edges to `Compiler` confidence and ranks the load-bearing
   symbols.
 - **History as evidence.** Git history, lazy chunk blame, and cached GitHub issue/PR/review
