@@ -34,7 +34,11 @@ pub use query::{
 };
 
 const GIT_HISTORY_INDEXED_HEAD_META: &str = "git_history_indexed_head";
-const GIT_HISTORY_INDEXED_ROOT_META: &str = "git_history_indexed_root";
+/// The one cursor of the four whose value is a PATH (`root_key` = `config.root`'s spelling), so the
+/// V096 path-spelling rekey has to rewrite it. Declared in `rag-rat-db` and referenced here rather
+/// than spelled twice — the migration lives below this crate and a drifted literal there is a
+/// silent miss, not a compile error.
+const GIT_HISTORY_INDEXED_ROOT_META: &str = rag_rat_db::meta::GIT_HISTORY_INDEXED_ROOT_META;
 const GIT_HISTORY_INDEXED_SHALLOW_META: &str = "git_history_indexed_shallow";
 const GIT_HISTORY_INDEXED_COMPLETE_META: &str = "git_history_indexed_complete";
 

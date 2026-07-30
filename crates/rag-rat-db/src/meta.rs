@@ -23,6 +23,22 @@ pub const BASE_SCOPE_DISCOVERED_META: &str = "files_base_scope_discovered";
 /// Monotonic per-repo clock maintained by schema triggers and transactional bulk writers for
 /// Lens-visible enrichment rows.
 pub const LENS_ENRICHMENT_REVISION_META: &str = "lens_enrichment_revision";
+/// Prefix of the per-worktree overlay refresh-basis key; the SUFFIX is a `worktree_id`, so the key
+/// carries a checkout path.
+///
+/// Declared here rather than beside its runtime reads because the V096 rekey (#1048) must find
+/// these keys to rewrite a stale Windows path spelling, and lives below the crate that reads them.
+/// One literal, shared, so the migration and the reader cannot drift into a silent miss.
+pub const WORKTREE_OVERLAY_BASIS_META_PREFIX: &str = "worktree_overlay_basis:";
+/// Per-repo git-history reload cursor whose VALUE is the indexed root — the `config.root` spelling
+/// the history rows were read at, compared TEXTUALLY against a freshly canonicalized root. Its
+/// siblings (`_head`, `_shallow`, `_complete`) are a commit hash and two flags, so this is the only
+/// one of the four that carries a path.
+///
+/// Declared here for the same reason as [`WORKTREE_OVERLAY_BASIS_META_PREFIX`]: the V096 rekey
+/// (#1048) must rewrite this value and lives below the crate that reads it. One literal, shared, so
+/// the migration and the reader cannot drift into a silent miss.
+pub const GIT_HISTORY_INDEXED_ROOT_META: &str = "git_history_indexed_root";
 
 /// Advance the per-repo Lens enrichment write clock once for one logical transaction.
 pub fn bump_lens_enrichment_revision(

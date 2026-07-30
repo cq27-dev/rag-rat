@@ -1382,6 +1382,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_094_ID => Some(94),
             MIGRATION_095_ID => Some(95),
             MIGRATION_096_ID => Some(96),
+            MIGRATION_097_ID => Some(97),
             _ => None,
         })
         .max()
@@ -1487,6 +1488,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_094_ID
             | MIGRATION_095_ID
             | MIGRATION_096_ID
+            | MIGRATION_097_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1589,6 +1591,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_094_ID => migration.checksum != MIGRATION_094_CHECKSUM,
         MIGRATION_095_ID => migration.checksum != MIGRATION_095_CHECKSUM,
         MIGRATION_096_ID => migration.checksum != MIGRATION_096_CHECKSUM,
+        MIGRATION_097_ID => migration.checksum != MIGRATION_097_CHECKSUM,
         _ => false,
     }
 }
@@ -6625,6 +6628,434 @@ pub fn apply_table_sync_gapped_entries(conn: &Connection) -> rusqlite::Result<()
                  stream_id, prev_hash, device_fingerprint, entry_hash);",
     )?;
     tx.commit()
+}
+
+/// Every table whose `worktree_id` column holds a CHECKOUT PATH — the scope key `worktree_id_of`
+/// derives by canonicalizing a checkout directory. `files` is the load-bearing one (its
+/// `(commit_sha, worktree_id)` pair is the active-scope view every read goes through); the other
+/// three are keyed the same way, and GC prunes all four off the same live worktree set.
+///
+/// `migration_096_covers_every_worktree_id_column_in_the_schema` pins this list against the live
+/// schema, so a table that grows a `worktree_id` cannot silently miss the rekey.
+pub const V097_WORKTREE_ID_SCOPED_TABLES: &[&str] =
+    &["files", "packages", "oracle_runs", "external_symbols"];
+
+/// The `repo_meta` key prefix whose SUFFIX is a `worktree_id` — the overlay refresh basis, THE
+/// same constant `rag-rat-core`'s overlay reads and writes. Rekeying the row's VALUE is not enough
+/// here: the worktree identity is in the KEY, so a stale key is a basis record the rekeyed scope
+/// can never find.
+const V097_WORKTREE_OVERLAY_BASIS_PREFIX: &str = crate::meta::WORKTREE_OVERLAY_BASIS_META_PREFIX;
+
+/// Every meta key whose VALUE is a checkout path — the `repo_meta` / `index_meta` rows a freshly
+/// canonicalized root is compared against TEXTUALLY.
+///
+/// Deliberately NOT here, having been checked one by one: `git_history_indexed_head` and
+/// `git_commit` (commit hashes), `git_history_indexed_shallow` / `_complete` (flags),
+/// `local_crate_roots` (Cargo crate NAMES), and everything model/embedding/FTS-related (ids,
+/// versions, counters). `files.path` and `packages.manifest_dir` are stored RELATIVE to the root,
+/// so a root respelling never reaches them.
+const V097_PATH_VALUED_META_KEYS: &[&str] =
+    &["source_root", crate::meta::GIT_HISTORY_INDEXED_ROOT_META];
+
+/// V097 (#1048): rewrite every persisted path spelling that the pre-fix `canonicalize` wrote in
+/// the Windows `\\?\` VERBATIM form into the plain spelling this binary now produces.
+///
+/// The upgrade hazard this closes is silent on Windows. These stored strings are compared
+/// TEXTUALLY against a freshly-canonicalized path:
+///  * `worktree_id` — a canonicalized checkout path, carried by every linked worktree's overlay
+///    rows and every dirty row (committed base rows are shared across checkouts under `worktree_id
+///    = ''` and are not implicated). Once production answers `C:\…` and the rows still say
+///    `\\?\C:\…`, those rows fall out of the active scope AND out of the GC live set, which is
+///    built from the same fresh canonicalization: `garbage_collect` reads every stored id as a
+///    checkout that no longer exists and DELETES its rows. Registered, live worktrees, pruned as
+///    dead on the first maintenance pass after the upgrade.
+///  * `repo_roots.root` / `repo_meta[source_root]` — `repo_indexed_at_this_root` is the "this
+///    checkout was indexed here" signal behind the empty-index guard. A stale spelling makes an
+///    established checkout look first-time, so an index run whose files have just been deleted is
+///    refused as an accidental empty repo instead of pruning, and the deleted files' rows stay live
+///    until the user finds `--allow-empty`.
+///  * `repo_meta[git_history_indexed_root]` — the git-history reload gate's root cursor. A stale
+///    spelling fails the `is_history_current` / `prepare_plan` comparison, so the first pass after
+///    the upgrade takes the FULL path: the whole commit + file-change set is deleted and re-read
+///    off a fresh revwalk, and the repo's blame cache is wiped with it. Self-healing after one
+///    pass, but a minutes-long stall and a cold blame cache on a large repo.
+///
+/// One derived value is knowingly left to re-derive: `repo_meta[git_coupling_stamp]` folds the
+/// history cursor snapshot (root spelling included) into its own freshness key, so rekeying the
+/// cursor makes it stale. That is the change-coupling table's ordinary invalidation path — a
+/// bounded window recompute, with an in-memory fallback that keeps reads correct meanwhile — and
+/// the same recompute happens anyway on the next history apply. Rewriting a composite freshness
+/// stamp from a migration would buy nothing and couple the ladder to that stamp's format.
+///
+/// Rewriting goes through `paths::rekeyed_from_verbatim`, the SAME rule production canonicalizes
+/// with, not a blind prefix strip: verbatim form is still produced (and still correct) for UNC
+/// shares, paths past `MAX_PATH`, and reserved DOS names, and rewriting those would BREAK the match
+/// this exists to preserve. On Unix that rule is the identity for every input, so this migration is
+/// a strict no-op there.
+pub fn apply_windows_verbatim_path_rekey(conn: &Connection) -> rusqlite::Result<()> {
+    rekey_persisted_path_spellings(conn, rag_rat_base::paths::rekeyed_from_verbatim)
+}
+
+/// [`apply_windows_verbatim_path_rekey`] with the spelling rule injected.
+///
+/// The rule is a parameter so the ROW-WALKING half — which columns and which meta keys the pass
+/// covers — is testable on every platform. The real rule is inert off Windows, so a Unix-only test
+/// of the production entry point can only ever observe "nothing happened" and would pass just as
+/// well against a pass that covers no tables at all. `pub` for that reason alone: the engine's
+/// upgrade regression test drives a real multi-worktree index through this with a rule that is
+/// active everywhere, so the Linux gate sees the scope-restore and the GC-survival that the
+/// Windows leg then confirms under the production rule.
+pub fn rekey_persisted_path_spellings(
+    conn: &Connection,
+    rekey: fn(&str) -> Option<String>,
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for table in V097_WORKTREE_ID_SCOPED_TABLES {
+        if column_exists(&tx, table, "worktree_id")? {
+            rekey_column(&tx, table, "worktree_id", rekey)?;
+        }
+    }
+    if column_exists(&tx, "repo_roots", "root")? {
+        rekey_column(&tx, "repo_roots", "root", rekey)?;
+    }
+    // These keys land in `repo_meta` at V039; a pre-V039 store still carries them in the global
+    // `index_meta`, and the ladder replays in order, so by here they have moved. Both are swept
+    // anyway — the pass is idempotent and a stale copy either table kept is equally stale. The
+    // sweep is KEY-SCOPED: most meta values are not paths, and rewriting one that merely starts
+    // with those bytes would corrupt it.
+    for (table, column) in [("repo_meta", "value"), ("index_meta", "value")] {
+        if column_exists(&tx, table, column)? {
+            for key in V097_PATH_VALUED_META_KEYS {
+                rekey_meta_value_at_key(&tx, table, key, rekey)?;
+            }
+        }
+    }
+    if column_exists(&tx, "repo_meta", "key")? {
+        rekey_worktree_overlay_basis_keys(&tx, rekey)?;
+    }
+    tx.commit()
+}
+
+/// Rewrite the stale spellings in `table.column` in place.
+///
+/// Reads the DISTINCT values first: a `worktree_id` column has one value per checkout however many
+/// million rows carry it, so the rule runs a handful of times and each rewrite is one indexed
+/// UPDATE.
+///
+/// `UPDATE OR IGNORE` because the target spelling can already be present. On the real upgrade it
+/// cannot be — the old binary only ever wrote the verbatim form — but a store written by a MIX of
+/// binaries can hold both, and there the plain-spelled row is the one production just wrote and
+/// must win. Skipping leaves the verbatim row for GC, which is the correct disposition for a
+/// superseded duplicate; the alternatives are worse in both directions (`OR REPLACE` would cascade
+/// the live row's children away, a bare UPDATE would abort the upgrade on a constraint failure).
+fn rekey_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    rekey: fn(&str) -> Option<String>,
+) -> rusqlite::Result<()> {
+    let stored: Vec<String> = {
+        let mut stmt = conn
+            .prepare(&format!("SELECT DISTINCT {column} FROM main.{table} WHERE {column} != ''"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for old in stored {
+        let Some(new) = rekey(&old) else { continue };
+        conn.execute(
+            &format!("UPDATE OR IGNORE main.{table} SET {column} = ?1 WHERE {column} = ?2"),
+            params![new, old],
+        )?;
+    }
+    Ok(())
+}
+
+/// Rewrite the VALUE of a single meta row whose key is `key` — the `source_root` case, where the
+/// path is the value rather than part of the key.
+fn rekey_meta_value_at_key(
+    conn: &Connection,
+    table: &str,
+    key: &str,
+    rekey: fn(&str) -> Option<String>,
+) -> rusqlite::Result<()> {
+    let stored: Vec<String> = {
+        let mut stmt =
+            conn.prepare(&format!("SELECT DISTINCT value FROM main.{table} WHERE key = ?1"))?;
+        let rows = stmt.query_map([key], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for old in stored {
+        let Some(new) = rekey(&old) else { continue };
+        conn.execute(
+            &format!("UPDATE OR IGNORE main.{table} SET value = ?1 WHERE key = ?2 AND value = ?3"),
+            params![new, key, old],
+        )?;
+    }
+    Ok(())
+}
+
+/// Rewrite the overlay-basis rows whose KEY embeds a stale `worktree_id`
+/// (`worktree_overlay_basis:<worktree_id>`).
+///
+/// Left behind, the basis record is unreachable under the rekeyed scope, and the overlay refresh
+/// reads a missing basis as "never refreshed" — correct but wasteful (a full re-derive per linked
+/// checkout). The GC that prunes basis rows outside the live worktree set would then delete it,
+/// which is harmless once the row is orphaned but leaves the quiet-window anchor gone. Moving the
+/// key keeps the basis attached to the checkout it describes.
+fn rekey_worktree_overlay_basis_keys(
+    conn: &Connection,
+    rekey: fn(&str) -> Option<String>,
+) -> rusqlite::Result<()> {
+    let stored: Vec<String> = {
+        // `\` is not a LIKE metacharacter in SQLite, but `_` in the prefix is — match on the
+        // literal prefix with `substr` instead of relying on an ESCAPE clause.
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT key FROM main.repo_meta WHERE substr(key, 1, ?1) = ?2")?;
+        let prefix_len = V097_WORKTREE_OVERLAY_BASIS_PREFIX.len() as i64;
+        let rows = stmt
+            .query_map(params![prefix_len, V097_WORKTREE_OVERLAY_BASIS_PREFIX], |row| {
+                row.get::<_, String>(0)
+            })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for old_key in stored {
+        let Some(worktree_id) = old_key.strip_prefix(V097_WORKTREE_OVERLAY_BASIS_PREFIX) else {
+            continue;
+        };
+        let Some(rekeyed) = rekey(worktree_id) else { continue };
+        conn.execute("UPDATE OR IGNORE main.repo_meta SET key = ?1 WHERE key = ?2", params![
+            format!("{V097_WORKTREE_OVERLAY_BASIS_PREFIX}{rekeyed}"),
+            old_key
+        ])?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod windows_verbatim_rekey_tests {
+    use super::*;
+
+    /// The stand-in spelling rule. The production rule (`paths::rekeyed_from_verbatim`) is the
+    /// identity on Unix by design, so driving this pass with it here would assert nothing: this
+    /// one is active on every platform, which is what lets the Linux gate observe that each
+    /// covered column and meta key is actually rewritten.
+    fn strip_verbatim(stored: &str) -> Option<String> {
+        stored.strip_prefix(r"\\?\").map(str::to_string)
+    }
+
+    /// A store shaped like a pre-V097 Windows index: every scope key and recorded root spelled the
+    /// way `std::fs::canonicalize` used to answer.
+    fn poisoned_store() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r"
+            CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT NOT NULL, commit_sha TEXT NOT NULL
+                DEFAULT '', worktree_id TEXT NOT NULL DEFAULT '',
+                UNIQUE(path, commit_sha, worktree_id));
+            CREATE TABLE packages(manifest_dir TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+                worktree_id TEXT NOT NULL DEFAULT '');
+            CREATE TABLE oracle_runs(id INTEGER PRIMARY KEY, worktree_id TEXT NOT NULL DEFAULT '');
+            CREATE TABLE external_symbols(name TEXT NOT NULL, worktree_id TEXT NOT NULL);
+            CREATE TABLE repo_roots(repo_id TEXT NOT NULL, root TEXT NOT NULL,
+                PRIMARY KEY(repo_id, root));
+            CREATE TABLE repo_meta(repo_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+                PRIMARY KEY(repo_id, key));
+            CREATE TABLE index_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+            INSERT INTO files(path, commit_sha, worktree_id)
+                VALUES ('src/a.rs', 'headsha', '\\?\C:\repo'),
+                       ('src/b.rs', '', '\\?\C:\linked');
+            INSERT INTO packages VALUES ('crate', 'headsha', '\\?\C:\repo');
+            INSERT INTO oracle_runs(worktree_id) VALUES ('\\?\C:\repo');
+            INSERT INTO external_symbols VALUES ('Ext', '\\?\C:\repo');
+            INSERT INTO repo_roots VALUES ('repo-1', '\\?\C:\repo');
+            INSERT INTO repo_meta VALUES ('repo-1', 'source_root', '\\?\C:\repo');
+            INSERT INTO repo_meta VALUES ('repo-1', 'git_history_indexed_root', '\\?\C:\repo');
+            -- The reload cursor's SIBLING key, given a value the rule would happily rewrite so a
+            -- blanket value-sweep would visibly corrupt it. In a real store this holds a commit
+            -- hash; the sweep must be scoped to the keys that carry a path.
+            INSERT INTO repo_meta VALUES ('repo-1', 'git_history_indexed_head', '\\?\C:\repo');
+            INSERT INTO repo_meta VALUES
+                ('repo-1', 'worktree_overlay_basis:\\?\C:\linked',
+                 'base' || char(10) || 'linked' || char(10) || '42');
+            INSERT INTO index_meta VALUES ('source_root', '\\?\C:\repo');
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn scalar(conn: &Connection, sql: &str) -> String {
+        conn.query_row(sql, [], |row| row.get::<_, String>(0)).unwrap()
+    }
+
+    /// The whole class in one pass: every table whose `worktree_id` names a checkout, the recorded
+    /// root behind the empty-index guard, the `source_root` fallback beside it, the git-history
+    /// reload cursor's root, and the overlay basis whose worktree identity lives in the KEY — plus
+    /// the negative half, a meta key that is NOT a path staying put.
+    ///
+    /// Against the unfixed state (no migration at all) every one of these still reads the verbatim
+    /// spelling, which is precisely the state where the active scope selects nothing and GC prunes
+    /// the rows as dead.
+    #[test]
+    fn the_rekey_covers_every_persisted_path_spelling() {
+        let conn = poisoned_store();
+        rekey_persisted_path_spellings(&conn, strip_verbatim).unwrap();
+
+        for (table, column) in [
+            ("files", "worktree_id"),
+            ("packages", "worktree_id"),
+            ("oracle_runs", "worktree_id"),
+            ("external_symbols", "worktree_id"),
+        ] {
+            let remaining: i64 = conn
+                .query_row(
+                    &format!(r"SELECT COUNT(*) FROM {table} WHERE substr({column}, 1, 4) = '\\?\'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0, "{table}.{column} still holds a verbatim spelling");
+        }
+        assert_eq!(
+            scalar(&conn, "SELECT worktree_id FROM files WHERE path = 'src/a.rs'"),
+            r"C:\repo",
+            "the base index's scope key is rekeyed, not just the overlay's",
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT worktree_id FROM files WHERE path = 'src/b.rs'"),
+            r"C:\linked",
+        );
+        assert_eq!(scalar(&conn, "SELECT root FROM repo_roots"), r"C:\repo");
+        assert_eq!(
+            scalar(&conn, "SELECT value FROM repo_meta WHERE key = 'source_root'"),
+            r"C:\repo",
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT value FROM index_meta WHERE key = 'source_root'"),
+            r"C:\repo",
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT value FROM repo_meta WHERE key = 'git_history_indexed_root'"),
+            r"C:\repo",
+            "the git-history reload cursor is a ROOT PATH, not a commit hash — left stale it \
+             fails the freshness comparison and forces a full revwalk plus a blame-cache wipe",
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT value FROM repo_meta WHERE key = 'git_history_indexed_head'"),
+            r"\\?\C:\repo",
+            "a meta key that does not carry a path is left alone — the sweep is key-scoped, not a \
+             blanket rewrite of every value that happens to start with those bytes",
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT key FROM repo_meta WHERE key LIKE 'worktree_overlay_basis:%'",),
+            r"worktree_overlay_basis:C:\linked",
+            "the basis key carries the worktree identity, so the KEY must move with it",
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT value FROM repo_meta WHERE key LIKE 'worktree_overlay_basis:%'",),
+            "base\nlinked\n42",
+            "the basis payload rides the key move intact",
+        );
+    }
+
+    /// Re-running the pass changes nothing — the ladder can replay it, and a store already written
+    /// by a fixed binary must come through untouched.
+    #[test]
+    fn the_rekey_is_idempotent() {
+        let conn = poisoned_store();
+        rekey_persisted_path_spellings(&conn, strip_verbatim).unwrap();
+        let snapshot =
+            scalar(&conn, "SELECT group_concat(worktree_id, '|') FROM files ORDER BY id");
+        rekey_persisted_path_spellings(&conn, strip_verbatim).unwrap();
+        assert_eq!(
+            scalar(&conn, "SELECT group_concat(worktree_id, '|') FROM files ORDER BY id"),
+            snapshot,
+        );
+    }
+
+    /// A spelling the rule declines to rewrite is LEFT ALONE. This is the half a blind `\\?\`
+    /// strip would get wrong: verbatim form is still produced for UNC shares and reserved names,
+    /// and rewriting one would break the very match the migration exists to preserve.
+    #[test]
+    fn a_spelling_the_rule_declines_is_untouched() {
+        let conn = poisoned_store();
+        rekey_persisted_path_spellings(&conn, |_| None).unwrap();
+        assert_eq!(
+            scalar(&conn, "SELECT worktree_id FROM files WHERE path = 'src/a.rs'"),
+            r"\\?\C:\repo",
+            "a declined rewrite must not be applied anyway",
+        );
+        assert_eq!(scalar(&conn, "SELECT root FROM repo_roots"), r"\\?\C:\repo");
+    }
+
+    /// A mixed-binary store already holds the plain spelling for one of the rows being rekeyed.
+    /// The pass must not abort the upgrade on the unique constraint, and must not cascade the live
+    /// plain-spelled row away: it keeps that row and leaves the superseded verbatim duplicate for
+    /// GC.
+    #[test]
+    fn a_colliding_plain_row_survives_the_rekey() {
+        let conn = poisoned_store();
+        conn.execute(
+            r"INSERT INTO files(path, commit_sha, worktree_id) VALUES ('src/a.rs', 'headsha', 'C:\repo')",
+            [],
+        )
+        .unwrap();
+        rekey_persisted_path_spellings(&conn, strip_verbatim).unwrap();
+        let live: i64 = conn
+            .query_row(
+                r"SELECT COUNT(*) FROM files WHERE path = 'src/a.rs' AND worktree_id = 'C:\repo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 1, "the row production just wrote is intact, not replaced or cascaded");
+    }
+
+    /// The real entry point is a no-op on Unix: nothing in a Unix store was ever spelled verbatim,
+    /// and a pass that rewrote a path merely because it starts with those bytes would corrupt it.
+    #[cfg(unix)]
+    #[test]
+    fn the_production_pass_is_inert_on_unix() {
+        let conn = poisoned_store();
+        apply_windows_verbatim_path_rekey(&conn).unwrap();
+        assert_eq!(
+            scalar(&conn, "SELECT worktree_id FROM files WHERE path = 'src/a.rs'"),
+            r"\\?\C:\repo",
+        );
+    }
+
+    /// The real entry point end-to-end on the platform that has the hazard.
+    #[cfg(windows)]
+    #[test]
+    fn the_production_pass_rekeys_on_windows() {
+        let conn = poisoned_store();
+        apply_windows_verbatim_path_rekey(&conn).unwrap();
+        assert_eq!(
+            scalar(&conn, "SELECT worktree_id FROM files WHERE path = 'src/a.rs'"),
+            r"C:\repo",
+        );
+        assert_eq!(scalar(&conn, "SELECT root FROM repo_roots"), r"C:\repo");
+        assert_eq!(
+            scalar(&conn, "SELECT key FROM repo_meta WHERE key LIKE 'worktree_overlay_basis:%'"),
+            r"worktree_overlay_basis:C:\linked",
+        );
+    }
+
+    /// A store that predates a covered table (a partial-schema bootstrap fixture) must not abort
+    /// the ladder — every sweep is guarded on the column actually being there.
+    #[test]
+    fn a_missing_table_is_skipped_rather_than_failing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r"CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT NOT NULL,
+                  worktree_id TEXT NOT NULL DEFAULT '');
+              INSERT INTO files(path, worktree_id) VALUES ('a.rs', '\\?\C:\repo');",
+        )
+        .unwrap();
+        rekey_persisted_path_spellings(&conn, strip_verbatim).unwrap();
+        assert_eq!(scalar(&conn, "SELECT worktree_id FROM files"), r"C:\repo");
+    }
 }
 
 #[cfg(test)]

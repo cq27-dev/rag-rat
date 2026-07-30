@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 96;
+pub const LATEST_SCHEMA_VERSION: u32 = 97;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -717,6 +717,19 @@ const MIGRATION_096_DESCRIPTION: &str =
      authoring Lamport clock, the lamport-advance bound, the chain tail, entry existence, the LWW \
      winner lookup, and the refold's pending set — and every one of them must keep excluding an \
      entry that is not on a chain";
+
+const MIGRATION_097_ID: &str = "097_windows_verbatim_path_rekey";
+const MIGRATION_097_CHECKSUM: &str = "sha256:rag-rat-windows-verbatim-path-rekey-v97";
+const MIGRATION_097_DESCRIPTION: &str =
+    "Rekey the persisted Windows path spellings an older binary wrote in the \\\\?\\ verbatim \
+     form (#1048): every worktree_id scope key, repo_roots.root, the path-valued meta keys \
+     (source_root and the git_history_indexed_root reload cursor), and the worktree_overlay_basis \
+     keys whose suffix is a worktree_id. Production now canonicalizes to the plain spelling, and \
+     these values are compared textually against it — left stale, the overlay and dirty rows fall \
+     out of the active scope and GC prunes them as a dead checkout, and the git-history gate \
+     forces a full revwalk plus a blame-cache wipe. Rewriting uses the same rule canonicalization \
+     does, so a verbatim path that is still load-bearing (UNC, >MAX_PATH, reserved DOS names) is \
+     kept. A no-op on Unix";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1489,6 +1502,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_096_CHECKSUM,
         description: MIGRATION_096_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_table_sync_gapped_entries),
+    },
+    Migration {
+        id: MIGRATION_097_ID,
+        checksum: MIGRATION_097_CHECKSUM,
+        description: MIGRATION_097_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_windows_verbatim_path_rekey),
     },
 ];
 

@@ -43,7 +43,13 @@ pub(crate) use discovery::{
 /// (never the safe-direction refresh). Kept per worktree in the per-repo kv rather than a
 /// dedicated table: it is a marker, not queried relationally, and the
 /// `watch_shutdown_reconcile_pending` marker set the pattern.
-const WORKTREE_OVERLAY_BASIS_META_PREFIX: &str = "worktree_overlay_basis:";
+///
+/// The literal itself is owned by `rag-rat-db`: the V096 rekey (#1048) has to find these keys to
+/// rewrite a stale Windows path spelling in their `worktree_id` suffix, and migrations sit below
+/// this crate. Aliasing it here rather than repeating it is what keeps the rekey and these reads
+/// from drifting into a silent miss.
+const WORKTREE_OVERLAY_BASIS_META_PREFIX: &str =
+    rag_rat_db::meta::WORKTREE_OVERLAY_BASIS_META_PREFIX;
 
 /// A parsed refresh-basis value: the #577 skip-proof pair plus, when recorded by a #822-aware
 /// build, the recording refresh's timestamp. Internal to the two projection readers so the meta

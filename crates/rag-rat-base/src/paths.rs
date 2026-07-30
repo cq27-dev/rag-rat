@@ -43,6 +43,24 @@ pub fn canonicalize_or_simplified(path: &Path) -> PathBuf {
     canonicalize(path).unwrap_or_else(|_| simplified(path).to_path_buf())
 }
 
+/// The [`simplified`] rule applied to a path that was PERSISTED as a string — `None` when the
+/// stored spelling is already the one this binary produces, `Some(plain)` when it is a verbatim
+/// path that must be rekeyed to keep matching.
+///
+/// The rekey seam for stored identity. Values like a `worktree_id` scope key or a recorded
+/// `repo_roots.root` are compared TEXTUALLY against a freshly-canonicalized path, so an index
+/// written when [`canonicalize`] still answered `\\?\C:\…` stops matching the moment this binary
+/// answers `C:\…` — the rows go out of scope and GC prunes them as a dead checkout. Rewriting the
+/// stored string through the SAME rule production uses is what keeps the two comparable; a blind
+/// `\\?\` strip would not, because [`simplified`] deliberately KEEPS the prefix where it is
+/// load-bearing (UNC, >`MAX_PATH`, reserved DOS names) and this binary still produces it there.
+///
+/// `None` on Unix for every input, so a rekey pass over a Unix index is a strict no-op.
+pub fn rekeyed_from_verbatim(stored: &str) -> Option<String> {
+    let plain = simplified(Path::new(stored)).to_string_lossy();
+    (plain != stored).then(|| plain.into_owned())
+}
+
 /// The canonical `/`-separated rendering used everywhere a path is persisted or compared against
 /// the `files` table — Windows separators normalize so the same file hashes/joins identically on
 /// every platform.
@@ -116,6 +134,42 @@ mod tests {
         let canonical = canonicalize(dir.path()).unwrap();
         assert_eq!(simplified(&canonical), canonical.as_path());
         assert!(!is_verbatim(simplified(&canonical)));
+    }
+
+    /// A spelling this binary already produces is left ALONE — the rekey must be a no-op for every
+    /// value that is not stale, or a migration would rewrite rows it has no business touching.
+    /// Holds on both platforms: `C:\plain` is what Windows produces, and on Unix `simplified` is
+    /// the identity for everything.
+    #[test]
+    fn rekeyed_from_verbatim_leaves_a_current_spelling_alone() {
+        assert_eq!(rekeyed_from_verbatim(r"C:\plain\root"), None);
+        assert_eq!(rekeyed_from_verbatim("/home/user/repo"), None);
+        assert_eq!(rekeyed_from_verbatim(""), None);
+    }
+
+    /// On Unix NOTHING is rekeyed, including a string that merely LOOKS verbatim: a Unix index
+    /// never held one, and rewriting a path that happens to start with those bytes would corrupt
+    /// it. This is what makes the migration a strict no-op off Windows.
+    #[cfg(unix)]
+    #[test]
+    fn rekeyed_from_verbatim_is_inert_on_unix() {
+        assert_eq!(rekeyed_from_verbatim(r"\\?\C:\Users\dev\repo"), None);
+    }
+
+    /// The rekey itself: a stored verbatim path maps to the plain spelling `canonicalize` now
+    /// answers, and the prefix is KEPT where it is load-bearing (a UNC share), because this binary
+    /// still produces it there and rewriting would break the match it exists to preserve.
+    #[cfg(windows)]
+    #[test]
+    fn rekeyed_from_verbatim_rewrites_only_the_droppable_prefix() {
+        assert_eq!(
+            rekeyed_from_verbatim(r"\\?\C:\Users\dev\repo").as_deref(),
+            Some(r"C:\Users\dev\repo"),
+        );
+        // Load-bearing verbatim: `simplified` keeps it, so the stored value is already current.
+        assert_eq!(rekeyed_from_verbatim(r"\\?\UNC\server\share\repo"), None);
+        // Idempotent — re-running a rekey pass changes nothing the first one produced.
+        assert_eq!(rekeyed_from_verbatim(r"C:\Users\dev\repo"), None);
     }
 
     /// The fallback arm must hold the invariant too: a path that cannot be resolved comes back
