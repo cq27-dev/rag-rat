@@ -497,9 +497,9 @@ mod tests {
 
     fn conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        rag_rat_db::schema::apply_distill_record_store(&conn).unwrap();
+        rag_rat_db::schema::migrations::apply_distill_record_store(&conn).unwrap();
         // V078 adds the anchor `selected` flag that `records_for_symbol` gates on.
-        rag_rat_db::schema::apply_distill_anchor_selection(&conn).unwrap();
+        rag_rat_db::schema::migrations::apply_distill_anchor_selection(&conn).unwrap();
         conn
     }
 

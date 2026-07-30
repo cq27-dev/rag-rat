@@ -1,4 +1,6 @@
-use super::*;
+use rusqlite::Connection;
+
+use super::migrations;
 
 pub fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     drop_legacy_ai_prototype_tables(conn)?;
@@ -467,41 +469,41 @@ pub fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         ",
     )?;
     // The view + its INSTEAD OF triggers exist only when no legacy `edges` TABLE is present
-    // (fresh DB, or post-V020): `migrate_edges` below touches `edges`, which on a fresh DB must
-    // already resolve to the view. On a pre-V020 DB the legacy table is still in place here and
-    // `apply_edge_string_interning` converts it later in the ladder.
-    ensure_edges_data_indexes(conn)?;
-    ensure_edges_view(conn)?;
-    migrate_files(conn)?;
-    migrate_chunks(conn)?;
-    migrate_edges(conn)?;
-    apply_embedding_vector_metadata(conn)?;
-    apply_derived_artifact_reconcile_metadata(conn)?;
-    apply_edge_source_target_spans(conn)?;
-    apply_embedding_policy_and_input_hash(conn)?;
-    apply_logical_symbol_groups(conn)?;
+    // (fresh DB, or post-V020): `migrations::migrate_edges` below touches `edges`, which on a fresh
+    // DB must already resolve to the view. On a pre-V020 DB the legacy table is still in place
+    // here and `migrations::apply_edge_string_interning` converts it later in the ladder.
+    migrations::ensure_edges_data_indexes(conn)?;
+    migrations::ensure_edges_view(conn)?;
+    migrations::migrate_files(conn)?;
+    migrations::migrate_chunks(conn)?;
+    migrations::migrate_edges(conn)?;
+    migrations::apply_embedding_vector_metadata(conn)?;
+    migrations::apply_derived_artifact_reconcile_metadata(conn)?;
+    migrations::apply_edge_source_target_spans(conn)?;
+    migrations::apply_embedding_policy_and_input_hash(conn)?;
+    migrations::apply_logical_symbol_groups(conn)?;
     // The provider-neutral papertrail tables (V060). The baseline produces the CURRENT schema
     // directly — no legacy github_* tables are created — so a routine `migrate_forward` (which
     // re-runs the baseline) can never resurrect the dropped legacy cache. The V009/V041/V044/V045
     // github migrations in the ladder each no-op when the legacy tables are absent.
-    create_papertrail_tables(conn)?;
+    migrations::create_papertrail_tables(conn)?;
     // V073 (#702): the distillation substrate — closing edges + item/comment outcome columns.
     // Additive over the V060 shape; the baseline converges to the current schema directly.
     migrations::apply_papertrail_distill_substrate(conn)?;
-    apply_symbol_facts(conn)?;
-    apply_repo_memories(conn)?;
-    apply_repo_memory_call_paths(conn)?;
-    apply_repo_memory_call_path_edges(conn)?;
-    apply_graph_file_lookup_indexes(conn)?;
+    migrations::apply_symbol_facts(conn)?;
+    migrations::apply_repo_memories(conn)?;
+    migrations::apply_repo_memory_call_paths(conn)?;
+    migrations::apply_repo_memory_call_path_edges(conn)?;
+    migrations::apply_graph_file_lookup_indexes(conn)?;
     interned_qualified_name_indexes(conn)?;
-    apply_clone_fingerprint_tables(conn)?;
+    migrations::apply_clone_fingerprint_tables(conn)?;
     // V032 (#231): converge the clone substrate to its BLOB-packed shape. The line above
     // (re)creates `symbol_token_postings` from V029's DDL; this transform adds the
     // `symbol_fingerprints.token_bag` column and DROPs the postings table — so the baseline
     // produces the CURRENT schema directly, and a routine `migrate_forward` (which re-runs the
     // baseline) cannot leave the postings table behind it. R5: V029's DDL is not edited; the
     // convergence lives here, not in the checksummed migration body.
-    apply_token_bag_blob(conn)?;
+    migrations::apply_token_bag_blob(conn)?;
     Ok(())
 }
 
@@ -515,7 +517,7 @@ pub fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
 /// data-preserving — destructive conversions fire only when the legacy shape is actually present.
 fn drop_legacy_ai_prototype_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS embeddings;")?;
-    if !column_exists(conn, "chunk_summaries", "prompt_version")? {
+    if !migrations::column_exists(conn, "chunk_summaries", "prompt_version")? {
         conn.execute_batch("DROP TABLE IF EXISTS chunk_summaries;")?;
     }
     Ok(())
@@ -528,13 +530,13 @@ fn drop_legacy_ai_prototype_tables(conn: &Connection) -> rusqlite::Result<()> {
 /// absent until V028 adds + backfills it, which is where V028 creates these same indexes. Guarding
 /// here keeps `apply_baseline` from referencing a not-yet-added column on an older DB.
 fn interned_qualified_name_indexes(conn: &Connection) -> rusqlite::Result<()> {
-    if column_exists(conn, "symbols", "qualified_name_id")? {
+    if migrations::column_exists(conn, "symbols", "qualified_name_id")? {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name_id
                 ON symbols(qualified_name_id);",
         )?;
     }
-    if column_exists(conn, "logical_symbols", "qualified_name_id")? {
+    if migrations::column_exists(conn, "logical_symbols", "qualified_name_id")? {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name_id
                 ON logical_symbols(qualified_name_id);",

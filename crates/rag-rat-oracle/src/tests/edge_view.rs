@@ -153,7 +153,7 @@ fn v020_converts_a_legacy_edges_table() {
     )
     .unwrap();
 
-    schema::apply_edge_string_interning(&conn).unwrap();
+    schema::migrations::apply_edge_string_interning(&conn).unwrap();
 
     let (to_name, evidence, resolution): (String, String, String) = conn
         .query_row("SELECT to_name, evidence, resolution FROM edges WHERE id = 7", [], |row| {

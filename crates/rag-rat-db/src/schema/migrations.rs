@@ -907,7 +907,7 @@ pub(crate) fn apply_contentless_chunk_fts(conn: &Connection) -> rusqlite::Result
 /// probe (the query_warm regression). A DB already at the schema tip opens as `Compatible` and
 /// never re-runs the view bootstrap, so without this ladder step only freshly migrated indexes
 /// would pick up the cheap form.
-pub fn apply_edges_view_scalar_suppression(conn: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn apply_edges_view_scalar_suppression(conn: &Connection) -> rusqlite::Result<()> {
     ensure_edges_view(conn)
 }
 
@@ -920,7 +920,7 @@ pub fn apply_edges_view_scalar_suppression(conn: &Connection) -> rusqlite::Resul
 /// kinds (#200) and suppressed unresolved candidates (V068). Idempotent — the ADD is guarded, the
 /// UPDATE only ever promotes `hidden = 0` rows the predicate says are invisible, and the view
 /// refresh is DROP + CREATE.
-pub fn apply_edges_hidden_flag(conn: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn apply_edges_hidden_flag(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "edges_data", "hidden", "INTEGER NOT NULL DEFAULT 0")?;
     conn.execute_batch(
         "UPDATE edges_data SET hidden = 1
@@ -4916,7 +4916,7 @@ fn backfill_chunk_symbol_ids(conn: &Connection) -> rusqlite::Result<()> {
 /// (not INT) so a `u64` epoch round-trips without the `i64` narrowing hazard. `UNIQUE(kind,
 /// entry_hash)` + `INSERT OR IGNORE` (the write path) keep a hot seal-path retry from re-appending
 /// the same evidence for one op. Purely additive; CREATE ... IF NOT EXISTS, nothing to backfill.
-pub fn apply_sync_security_events(conn: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn apply_sync_security_events(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sync_security_events(
              id              INTEGER PRIMARY KEY,

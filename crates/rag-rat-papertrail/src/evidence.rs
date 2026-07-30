@@ -464,7 +464,7 @@ mod payload_tests {
     #[test]
     fn attach_records_populates_hits_from_the_store_and_leaves_bare_hits_bare() {
         let conn = Connection::open_in_memory().unwrap();
-        rag_rat_db::schema::apply_distill_record_store(&conn).unwrap();
+        rag_rat_db::schema::migrations::apply_distill_record_store(&conn).unwrap();
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
         )

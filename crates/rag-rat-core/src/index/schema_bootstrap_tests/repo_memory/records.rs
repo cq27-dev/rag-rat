@@ -780,7 +780,7 @@ fn drive_by_records_survive_a_v083_upgrade_via_the_backfill() {
     assert!(read().is_empty(), "a pre-V083 chunk (NULL symbol_id) resolves to no record");
 
     // The V083 backfill re-links the pre-migration chunk by line-range containment.
-    rag_rat_db::schema::apply_chunk_symbol_id(conn).unwrap();
+    rag_rat_db::schema::migrations::apply_chunk_symbol_id(conn).unwrap();
     assert_eq!(read(), vec!["5".to_string()], "the backfill restores the record on the old chunk");
 
     let _ = fs::remove_dir_all(&root);

@@ -32,8 +32,8 @@ fn migration_052_adds_oplog_storage_tables() {
     )
     .unwrap();
     assert!(!conn_table_exists(&conn, "oplog_entries"), "dropped before the isolated apply");
-    schema::apply_oplog_storage(&conn).unwrap();
-    schema::apply_oplog_storage(&conn).expect("replay is a no-op");
+    schema::migrations::apply_oplog_storage(&conn).unwrap();
+    schema::migrations::apply_oplog_storage(&conn).expect("replay is a no-op");
     for table in OPLOG_TABLES {
         assert!(conn_table_exists(&conn, table), "the isolated applier recreates {table}");
     }
@@ -92,8 +92,8 @@ fn migration_053_scopes_the_oplog_by_stream_and_adds_fork_evidence() {
          CREATE TABLE oplog_entries(entry_hash BLOB PRIMARY KEY) STRICT;",
     )
     .unwrap();
-    schema::apply_oplog_stream_scoping(&conn).unwrap();
-    schema::apply_oplog_stream_scoping(&conn).expect("replay reconverges");
+    schema::migrations::apply_oplog_stream_scoping(&conn).unwrap();
+    schema::migrations::apply_oplog_stream_scoping(&conn).expect("replay reconverges");
     for table in
         ["oplog_entries", "oplog_projected_nodes", "oplog_projected_edges", "oplog_fork_evidence"]
     {
@@ -162,8 +162,8 @@ fn migration_054_adds_the_single_row_device_identity_table() {
         !conn_table_exists(&conn, "oplog_device_identity"),
         "dropped before the isolated apply"
     );
-    schema::apply_oplog_device_identity(&conn).unwrap();
-    schema::apply_oplog_device_identity(&conn).expect("replay is a no-op");
+    schema::migrations::apply_oplog_device_identity(&conn).unwrap();
+    schema::migrations::apply_oplog_device_identity(&conn).expect("replay is a no-op");
     assert!(
         conn_table_columns(&conn, "oplog_device_identity").contains(&"seed".to_string()),
         "the isolated applier recreates the table"
@@ -243,8 +243,8 @@ fn migration_056_adds_the_git_change_couplings_table() {
     // no-op.
     conn.execute_batch("DROP TABLE git_change_couplings;").unwrap();
     assert!(!conn_table_exists(&conn, "git_change_couplings"), "dropped before the isolated apply");
-    schema::apply_git_change_couplings(&conn).unwrap();
-    schema::apply_git_change_couplings(&conn).expect("replay is a no-op");
+    schema::migrations::apply_git_change_couplings(&conn).unwrap();
+    schema::migrations::apply_git_change_couplings(&conn).expect("replay is a no-op");
     assert!(
         conn_table_exists(&conn, "git_change_couplings"),
         "the isolated applier recreates the table"
@@ -374,8 +374,8 @@ fn migration_057_adds_the_external_symbols_table() {
     // EXISTS).
     conn.execute_batch("DROP TABLE external_symbols;").unwrap();
     assert!(!conn_table_exists(&conn, "external_symbols"), "dropped before the isolated apply");
-    schema::apply_external_symbols(&conn).unwrap();
-    schema::apply_external_symbols(&conn).expect("replay is a no-op");
+    schema::migrations::apply_external_symbols(&conn).unwrap();
+    schema::migrations::apply_external_symbols(&conn).expect("replay is a no-op");
     assert!(
         conn_table_columns(&conn, "external_symbols").contains(&"moniker".to_string()),
         "the isolated applier recreates the table"
@@ -419,15 +419,15 @@ fn migration_058_adds_the_oplog_device_x25519_columns() {
     // ladder's end state) — the x25519 columns are absent — then the V058 applier adds them, and a
     // replay is an idempotent no-op (add_column_if_missing).
     let isolated = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_oplog_device_identity(&isolated).unwrap();
+    schema::migrations::apply_oplog_device_identity(&isolated).unwrap();
     for column in ["x25519_secret", "x25519_public"] {
         assert!(
             !conn_table_columns(&isolated, "oplog_device_identity").contains(&column.to_string()),
             "the V054 table alone lacks the {column} column"
         );
     }
-    schema::apply_oplog_device_x25519(&isolated).unwrap();
-    schema::apply_oplog_device_x25519(&isolated).expect("replay is a no-op");
+    schema::migrations::apply_oplog_device_x25519(&isolated).unwrap();
+    schema::migrations::apply_oplog_device_x25519(&isolated).expect("replay is a no-op");
     for column in ["x25519_secret", "x25519_public"] {
         assert!(
             conn_table_columns(&isolated, "oplog_device_identity").contains(&column.to_string()),
@@ -483,8 +483,8 @@ fn migration_059_creates_the_account_candidate_dag() {
     // replay is an idempotent no-op (every statement is CREATE ... IF NOT EXISTS).
     let isolated = rusqlite::Connection::open_in_memory().unwrap();
     assert!(!conn_table_exists(&isolated, "account_entries"), "bare DB lacks account_entries");
-    schema::apply_account_candidate_dag(&isolated).unwrap();
-    schema::apply_account_candidate_dag(&isolated).expect("replay is a no-op");
+    schema::migrations::apply_account_candidate_dag(&isolated).unwrap();
+    schema::migrations::apply_account_candidate_dag(&isolated).expect("replay is a no-op");
     for table in ["account_entries", "account_entry_status", "account_pre_verify"] {
         assert!(conn_table_exists(&isolated, table), "the isolated V059 applier creates {table}");
     }
@@ -519,8 +519,9 @@ fn migration_064_creates_account_authority_shadow_tables() {
         assert!(conn_table_exists(&conn, table), "V064 creates {table}");
     }
     let isolated = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_account_authority_projection(&isolated).unwrap();
-    schema::apply_account_authority_projection(&isolated).expect("V064 replay is idempotent");
+    schema::migrations::apply_account_authority_projection(&isolated).unwrap();
+    schema::migrations::apply_account_authority_projection(&isolated)
+        .expect("V064 replay is idempotent");
     assert!(conn_table_exists(&isolated, "account_auth_state"));
     let seq_type: String = isolated
         .query_row(
@@ -577,7 +578,8 @@ fn migration_065_adds_historical_authority_boundaries() {
             );
         }
     }
-    schema::apply_account_authority_boundaries(&conn).expect("V065 replay is idempotent");
+    schema::migrations::apply_account_authority_boundaries(&conn)
+        .expect("V065 replay is idempotent");
 }
 
 #[test]
@@ -603,7 +605,7 @@ fn migration_066_adds_the_content_candidate_dag() {
     ] {
         assert!(columns.contains(&column.to_string()), "V066 adds content_entries.{column}");
     }
-    schema::apply_content_candidate_dag(&conn).expect("V066 replay is idempotent");
+    schema::migrations::apply_content_candidate_dag(&conn).expect("V066 replay is idempotent");
     let insert = |hash: u8, seq_width: usize| {
         conn.execute(
             "INSERT INTO content_entries(
@@ -784,8 +786,8 @@ fn migration_069_adds_the_local_account_pointer() {
         !conn_table_exists(&isolated, "oplog_local_account"),
         "bare DB lacks oplog_local_account before the isolated apply",
     );
-    schema::apply_oplog_local_account(&isolated).unwrap();
-    schema::apply_oplog_local_account(&isolated).expect("replay is a no-op");
+    schema::migrations::apply_oplog_local_account(&isolated).unwrap();
+    schema::migrations::apply_oplog_local_account(&isolated).expect("replay is a no-op");
     assert!(
         conn_table_columns(&isolated, "oplog_local_account")
             .contains(&"genesis_entry_hash".to_string()),
@@ -869,8 +871,8 @@ fn migration_070_adds_the_content_projected_tables() {
         !conn_table_exists(&isolated, "content_projected_nodes"),
         "bare DB lacks content_projected_nodes before the isolated apply",
     );
-    schema::apply_content_projected_tables(&isolated).unwrap();
-    schema::apply_content_projected_tables(&isolated).expect("replay is a no-op");
+    schema::migrations::apply_content_projected_tables(&isolated).unwrap();
+    schema::migrations::apply_content_projected_tables(&isolated).expect("replay is a no-op");
     assert!(
         conn_table_columns(&isolated, "content_projected_edges").contains(&"spec_json".to_string()),
         "the isolated applier recreates the tables",
@@ -920,8 +922,8 @@ fn migration_071_indexes_edge_target_qname() {
     // Idempotent applier: drop it, re-run twice — CREATE INDEX IF NOT EXISTS reconverges.
     conn.execute("DROP INDEX idx_edges_target_qname", []).unwrap();
     assert_eq!(index_on(&conn), 0, "index dropped");
-    schema::apply_edge_target_qname_index(&conn).unwrap();
-    schema::apply_edge_target_qname_index(&conn).expect("replay is a no-op");
+    schema::migrations::apply_edge_target_qname_index(&conn).unwrap();
+    schema::migrations::apply_edge_target_qname_index(&conn).expect("replay is a no-op");
     assert_eq!(index_on(&conn), 1, "the isolated applier recreates the index");
 
     // A forward migrate over a ledger truncated below V071 replays the step and records V071.
@@ -991,8 +993,8 @@ fn migration_072_queues_pending_refold() {
         !conn_table_exists(&isolated, "content_streams_pending_refold"),
         "bare DB lacks content_streams_pending_refold before the isolated apply",
     );
-    schema::apply_content_streams_pending_refold(&isolated).unwrap();
-    schema::apply_content_streams_pending_refold(&isolated).expect("replay is a no-op");
+    schema::migrations::apply_content_streams_pending_refold(&isolated).unwrap();
+    schema::migrations::apply_content_streams_pending_refold(&isolated).expect("replay is a no-op");
     assert!(
         conn_table_columns(&isolated, "content_streams_pending_refold")
             .contains(&"stream_id".to_string()),
@@ -1026,13 +1028,13 @@ fn migration_047_deferred_absence_and_reconverges_from_torn_state() {
         "torn table lacks the sentinel column"
     );
 
-    schema::apply_memory_model_failures_table(&conn).unwrap();
+    schema::migrations::apply_memory_model_failures_table(&conn).unwrap();
 
     assert!(
         conn_table_columns(&conn, "memory_model_failures").contains(&"reason".to_string()),
         "V047 drops the torn scratch table and creates the real shape"
     );
-    schema::apply_memory_model_failures_table(&conn).expect("replay is a no-op");
+    schema::migrations::apply_memory_model_failures_table(&conn).expect("replay is a no-op");
     conn.execute(
         "INSERT INTO memory_model_failures(memory_id, repo_id, pass, content_hash, model_id, \
          prompt_version, reason, failed_at_ms) VALUES \
@@ -1074,7 +1076,7 @@ fn migration_046_deferred_absence_and_reconverges_from_torn_state() {
     // whose end state always has the table): the sentinel table is absent before V046 runs.
     assert!(!conn_table_exists(&conn, "memory_reality"), "memory_reality absent before V046 runs");
 
-    schema::apply_memory_verification_tables(&conn).unwrap();
+    schema::migrations::apply_memory_verification_tables(&conn).unwrap();
 
     assert!(conn_table_exists(&conn, "memory_reality"), "V046 creates memory_reality");
     assert!(conn_table_exists(&conn, "memory_summaries"), "V046 creates memory_summaries");
@@ -1083,7 +1085,7 @@ fn migration_046_deferred_absence_and_reconverges_from_torn_state() {
         "the torn scratch table was dropped and recreated with the real shape"
     );
     // Replay short-circuits on the sentinel.
-    schema::apply_memory_verification_tables(&conn).expect("replay is a no-op");
+    schema::migrations::apply_memory_verification_tables(&conn).expect("replay is a no-op");
 
     // memory_reality PK (repo_id, memory_id): one row per memory; a duplicate is rejected.
     conn.execute(
@@ -1222,14 +1224,14 @@ fn migration_087_adds_table_sync_tables() {
         assert!(!schema::table_exists(&bare, t).unwrap(), "pre-V087 has no {t}");
     }
 
-    schema::apply_table_sync_tables(&bare).unwrap();
+    schema::migrations::apply_table_sync_tables(&bare).unwrap();
 
     for t in added {
         assert!(schema::table_exists(&bare, t).unwrap(), "V087 adds {t}");
     }
     // The applier is idempotent (CREATE TABLE IF NOT EXISTS) — a second run is a no-op, not an
     // error.
-    schema::apply_table_sync_tables(&bare).unwrap();
+    schema::migrations::apply_table_sync_tables(&bare).unwrap();
     // The whole-row LWW clock is keyed per row; a duplicate row key collides on the composite PK.
     bare.execute(
         "INSERT INTO sync_row_clocks(repo_id, table_name, row_pk, lamport, device_fingerprint) \
@@ -1304,7 +1306,7 @@ fn migration_088_caches_the_generation_posting_row_count() {
     }
     conn.execute_batch("ALTER TABLE clone_graph_generations DROP COLUMN postings_row_count;")
         .unwrap();
-    schema::apply_clone_postings_row_count(&conn).unwrap();
+    schema::migrations::apply_clone_postings_row_count(&conn).unwrap();
     let backfilled: i64 = conn
         .query_row(
             "SELECT postings_row_count FROM clone_graph_generations WHERE generation = 7",
@@ -1315,7 +1317,7 @@ fn migration_088_caches_the_generation_posting_row_count() {
     assert_eq!(backfilled, 3, "the backfill counts the generation's actual postings");
 
     // Additive + idempotent: a re-apply keeps the column and its value.
-    schema::apply_clone_postings_row_count(&conn).unwrap();
+    schema::migrations::apply_clone_postings_row_count(&conn).unwrap();
     let after_reapply: i64 = conn
         .query_row(
             "SELECT postings_row_count FROM clone_graph_generations WHERE generation = 7",
@@ -1330,8 +1332,8 @@ fn migration_088_caches_the_generation_posting_row_count() {
 #[test]
 fn migration_089_adds_sync_invites() {
     let bare = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_sync_invites(&bare).unwrap();
-    schema::apply_sync_invites(&bare).expect("replay is a no-op");
+    schema::migrations::apply_sync_invites(&bare).unwrap();
+    schema::migrations::apply_sync_invites(&bare).expect("replay is a no-op");
     assert!(conn_table_exists(&bare, "sync_invites"));
     assert!(
         !conn_table_exists(&bare, "account_candidate_reservations"),
@@ -1373,8 +1375,8 @@ fn migration_089_adds_sync_invites() {
 #[test]
 fn migration_090_adds_account_candidate_reservations() {
     let bare = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_account_candidate_reservations(&bare).unwrap();
-    schema::apply_account_candidate_reservations(&bare).expect("replay is a no-op");
+    schema::migrations::apply_account_candidate_reservations(&bare).unwrap();
+    schema::migrations::apply_account_candidate_reservations(&bare).expect("replay is a no-op");
     assert!(conn_table_exists(&bare, "account_candidate_reservations"));
     assert!(
         bare.execute(
@@ -1405,7 +1407,7 @@ fn migration_090_adds_account_candidate_reservations() {
 #[test]
 fn migration_092_normalizes_invite_receipts() {
     let bare = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_sync_invites(&bare).unwrap();
+    schema::migrations::apply_sync_invites(&bare).unwrap();
     bare.execute(
         "INSERT INTO sync_invites(
              nonce, account_id, role, label, expires_at_ms, created_at_ms, used_at_ms,
@@ -1417,8 +1419,8 @@ fn migration_092_normalizes_invite_receipts() {
         [],
     )
     .unwrap();
-    schema::apply_sync_invites_normalized_receipts(&bare).unwrap();
-    schema::apply_sync_invites_normalized_receipts(&bare).expect("replay is a no-op");
+    schema::migrations::apply_sync_invites_normalized_receipts(&bare).unwrap();
+    schema::migrations::apply_sync_invites_normalized_receipts(&bare).expect("replay is a no-op");
     let (role, receipt, legacy): (String, Vec<u8>, Vec<u8>) = bare
         .query_row(
             "SELECT role, receipt_signed, receipt_bytes FROM sync_invites
@@ -1446,7 +1448,7 @@ fn migration_092_normalizes_invite_receipts() {
         [],
     )
     .unwrap();
-    schema::apply_sync_invites_normalized_receipts(&bare).unwrap();
+    schema::migrations::apply_sync_invites_normalized_receipts(&bare).unwrap();
     let manifest: Vec<u8> = bare
         .query_row(
             "SELECT receipt_entries FROM sync_invites
@@ -1478,8 +1480,8 @@ fn migration_095_records_the_table_spec_version() {
     assert_eq!(schema::LATEST_SCHEMA_VERSION, 95, "move this pin with the next schema migration");
 
     let bare = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_table_sync_tables(&bare).unwrap();
-    schema::apply_table_sync_projection_state(&bare).unwrap();
+    schema::migrations::apply_table_sync_tables(&bare).unwrap();
+    schema::migrations::apply_table_sync_projection_state(&bare).unwrap();
     assert!(
         schema::column_exists(&bare, "sync_published_rows", "projector_version").unwrap(),
         "V093 records the store-global projector version"
@@ -1495,8 +1497,8 @@ fn migration_095_records_the_table_spec_version() {
     )
     .unwrap();
 
-    schema::apply_table_sync_spec_version(&bare).unwrap();
-    schema::apply_table_sync_spec_version(&bare).expect("replay is a no-op");
+    schema::migrations::apply_table_sync_spec_version(&bare).unwrap();
+    schema::migrations::apply_table_sync_spec_version(&bare).expect("replay is a no-op");
     let carried: Option<i64> = bare
         .query_row(
             "SELECT spec_version FROM sync_published_rows WHERE row_pk = 'carried'",
@@ -1594,7 +1596,7 @@ fn migration_093_adds_table_sync_projection_state() {
     // Absence is asserted against the PRE-V093 DDL in isolation, never against the full ladder
     // (which now ends at V093 and would make the check vacuous).
     let bare = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_table_sync_tables(&bare).unwrap();
+    schema::migrations::apply_table_sync_tables(&bare).unwrap();
     assert!(
         !schema::column_exists(&bare, "table_sync_entries", "pending_reason").unwrap(),
         "the pending mark arrives with V093, not before"
@@ -1605,8 +1607,8 @@ fn migration_093_adds_table_sync_projection_state() {
     );
     assert!(!schema::table_exists(&bare, "table_sync_streams").unwrap());
 
-    schema::apply_table_sync_projection_state(&bare).unwrap();
-    schema::apply_table_sync_projection_state(&bare).expect("replay is a no-op");
+    schema::migrations::apply_table_sync_projection_state(&bare).unwrap();
+    schema::migrations::apply_table_sync_projection_state(&bare).expect("replay is a no-op");
 
     assert!(schema::column_exists(&bare, "table_sync_entries", "pending_reason").unwrap());
     assert!(
@@ -1620,9 +1622,9 @@ fn migration_093_adds_table_sync_projection_state() {
     // still gains the rest: the ladder records V093 as applied and never re-runs it, so a
     // group-guarded add would leave a column missing on a store that reports itself current.
     let partial = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_table_sync_tables(&partial).unwrap();
+    schema::migrations::apply_table_sync_tables(&partial).unwrap();
     partial.execute("ALTER TABLE table_sync_entries ADD COLUMN pending_reason TEXT", []).unwrap();
-    schema::apply_table_sync_projection_state(&partial).unwrap();
+    schema::migrations::apply_table_sync_projection_state(&partial).unwrap();
     assert!(
         schema::column_exists(&partial, "table_sync_entries", "quarantine_reason").unwrap(),
         "a partially-migrated store still gains the columns it is missing"
@@ -1662,7 +1664,7 @@ fn migration_093_adds_table_sync_projection_state() {
 #[test]
 fn migration_091_adds_account_candidate_reservation_targets() {
     let bare = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_account_candidate_reservations(&bare).unwrap();
+    schema::migrations::apply_account_candidate_reservations(&bare).unwrap();
     bare.execute(
         "INSERT INTO account_candidate_reservations(
              reservation_id, account_id, reserved_entries, reserved_bytes, expires_at_ms
@@ -1670,8 +1672,9 @@ fn migration_091_adds_account_candidate_reservation_targets() {
         [],
     )
     .unwrap();
-    schema::apply_account_candidate_reservation_targets(&bare).unwrap();
-    schema::apply_account_candidate_reservation_targets(&bare).expect("replay is a no-op");
+    schema::migrations::apply_account_candidate_reservation_targets(&bare).unwrap();
+    schema::migrations::apply_account_candidate_reservation_targets(&bare)
+        .expect("replay is a no-op");
     let targets: i64 = bare
         .query_row(
             "SELECT reserved_targets FROM account_candidate_reservations
@@ -1806,7 +1809,7 @@ fn migration_094_tracks_lens_enrichment_changes_in_constant_time() {
     assert_eq!(sibling_revision, 21, "the run clocks its owning repo");
     assert_eq!(revision(), 6, "a sibling repo's linked-worktree run stays isolated");
 
-    schema::apply_lens_enrichment_revision(&conn).unwrap();
+    schema::migrations::apply_lens_enrichment_revision(&conn).unwrap();
     assert_eq!(trigger_count("oracle_runs_lens_revision_"), 3);
     assert_eq!(trigger_count("git_file_changes_lens_revision_"), 0);
     conn.execute(

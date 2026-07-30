@@ -155,7 +155,7 @@ fn migration_043_adds_generation_and_reconverges_from_torn_state() {
         "generation is absent before V043 runs"
     );
 
-    schema::apply_files_generation(&conn).unwrap();
+    schema::migrations::apply_files_generation(&conn).unwrap();
 
     assert!(
         conn_table_columns(&conn, "files").contains(&"generation".to_string()),
@@ -173,7 +173,7 @@ fn migration_043_adds_generation_and_reconverges_from_torn_state() {
     );
     assert_eq!(generation, 0, "existing rows carry generation 0");
     // Torn scratch re-converged (dropped + rebuilt), and a replay short-circuits on the sentinel.
-    schema::apply_files_generation(&conn).expect("replay is a no-op");
+    schema::migrations::apply_files_generation(&conn).expect("replay is a no-op");
     // The widened UNIQUE now admits a second generation of the same scope.
     conn.execute(
         "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, repo_id, \

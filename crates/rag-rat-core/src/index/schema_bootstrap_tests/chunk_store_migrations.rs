@@ -856,7 +856,7 @@ fn has_test_code_backfill_is_case_sensitive() {
     )
     .unwrap();
     conn.execute("UPDATE files SET has_test_code = 0", []).unwrap();
-    schema::apply_files_has_test_code(&conn).unwrap();
+    schema::migrations::apply_files_has_test_code(&conn).unwrap();
     let flag = |id: i64| -> i64 {
         conn.query_row("SELECT has_test_code FROM files WHERE id = ?1", [id], |r| r.get(0)).unwrap()
     };

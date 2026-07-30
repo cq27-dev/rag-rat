@@ -246,7 +246,7 @@ fn migration_050_adds_the_postings_path_index_and_delta_counter() {
     // treated as delta-ready.
     conn.execute_batch("ALTER TABLE clone_graph_generations DROP COLUMN delta_files_applied;")
         .unwrap();
-    schema::apply_clone_delta_maintenance(&conn).unwrap();
+    schema::migrations::apply_clone_delta_maintenance(&conn).unwrap();
     let postings_written: i64 = conn
         .query_row(
             "SELECT postings_written FROM clone_graph_generations WHERE generation = 1",
@@ -295,7 +295,7 @@ fn migration_051_adds_clone_df_epoch_and_backfills_existing_generations() {
     )
     .unwrap();
     conn.execute_batch("DROP TABLE clone_df_epoch;").unwrap();
-    schema::apply_clone_df_epoch(&conn).unwrap();
+    schema::migrations::apply_clone_df_epoch(&conn).unwrap();
     let epoch_rows = |conn: &rusqlite::Connection| -> Vec<(i64, i64, i64)> {
         conn.prepare(
             "SELECT build_generation, token_hash, df FROM clone_df_epoch
@@ -322,7 +322,7 @@ fn migration_051_adds_clone_df_epoch_and_backfills_existing_generations() {
         [],
     )
     .unwrap();
-    schema::apply_clone_df_epoch(&conn).unwrap();
+    schema::migrations::apply_clone_df_epoch(&conn).unwrap();
     assert_eq!(
         epoch_rows(&conn),
         vec![(7, 101, 3), (7, 102, 9)],

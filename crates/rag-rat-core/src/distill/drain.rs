@@ -981,11 +981,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use rag_rat_db::schema::{
-        apply_distill_anchor_selection, apply_distill_enriched_context,
-        apply_distill_evidence_source_part, apply_distill_record_store,
-        apply_distill_safe_input_snapshot,
-    };
+    use rag_rat_db::schema::migrations;
     use rag_rat_llm::chat::{ChatModel, GuidedJson};
     use rusqlite::Connection;
 
@@ -1032,11 +1028,11 @@ mod tests {
 
     fn fixture() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        apply_distill_record_store(&conn).unwrap();
-        apply_distill_anchor_selection(&conn).unwrap();
-        apply_distill_safe_input_snapshot(&conn).unwrap();
-        apply_distill_enriched_context(&conn).unwrap();
-        apply_distill_evidence_source_part(&conn).unwrap();
+        migrations::apply_distill_record_store(&conn).unwrap();
+        migrations::apply_distill_anchor_selection(&conn).unwrap();
+        migrations::apply_distill_safe_input_snapshot(&conn).unwrap();
+        migrations::apply_distill_enriched_context(&conn).unwrap();
+        migrations::apply_distill_evidence_source_part(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
@@ -1322,11 +1318,11 @@ mod tests {
     fn stale_success_does_not_delete_or_poison_new_work() {
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let conn = Connection::open(&path).unwrap();
-        apply_distill_record_store(&conn).unwrap();
-        apply_distill_anchor_selection(&conn).unwrap();
-        apply_distill_safe_input_snapshot(&conn).unwrap();
-        apply_distill_enriched_context(&conn).unwrap();
-        apply_distill_evidence_source_part(&conn).unwrap();
+        migrations::apply_distill_record_store(&conn).unwrap();
+        migrations::apply_distill_anchor_selection(&conn).unwrap();
+        migrations::apply_distill_safe_input_snapshot(&conn).unwrap();
+        migrations::apply_distill_enriched_context(&conn).unwrap();
+        migrations::apply_distill_evidence_source_part(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
@@ -1511,11 +1507,11 @@ mod tests {
     fn model_executes_after_the_read_transaction_is_released() {
         let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let conn = Connection::open(&path).unwrap();
-        apply_distill_record_store(&conn).unwrap();
-        apply_distill_anchor_selection(&conn).unwrap();
-        apply_distill_safe_input_snapshot(&conn).unwrap();
-        apply_distill_enriched_context(&conn).unwrap();
-        apply_distill_evidence_source_part(&conn).unwrap();
+        migrations::apply_distill_record_store(&conn).unwrap();
+        migrations::apply_distill_anchor_selection(&conn).unwrap();
+        migrations::apply_distill_safe_input_snapshot(&conn).unwrap();
+        migrations::apply_distill_enriched_context(&conn).unwrap();
+        migrations::apply_distill_evidence_source_part(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,

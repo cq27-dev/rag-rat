@@ -96,7 +96,8 @@ fn migration_034_adds_content_anchored_clone_graph_tables() {
     // now HAS the table — that is V037's job, verified by
     // `migration_037_adds_content_anchored_clone_subblock_postings`.)
     let v034_only = rusqlite::Connection::open_in_memory().expect("open v034-only conn");
-    rag_rat_db::schema::apply_clone_graph_tables(&v034_only).expect("apply V034 clone-graph DDL");
+    rag_rat_db::schema::migrations::apply_clone_graph_tables(&v034_only)
+        .expect("apply V034 clone-graph DDL");
     assert!(
         !conn_table_exists(&v034_only, "clone_subblock_postings"),
         "the persisted postings table is deferred to V037 — the V034 DDL must NOT create it"

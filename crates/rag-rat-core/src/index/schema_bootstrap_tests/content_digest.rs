@@ -387,7 +387,7 @@ fn migration_restamps_fresh_legacy_stamps_but_leaves_stale_ones() {
     .unwrap();
 
     // Re-run the applier (idempotent): re-seeds (files unchanged) and re-stamps legacy -> new.
-    rag_rat_db::schema::apply_content_digest_state(&conn).unwrap();
+    rag_rat_db::schema::migrations::apply_content_digest_state(&conn).unwrap();
 
     let meta = |key: &str| -> String {
         conn.query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |r| r.get(0)).unwrap()

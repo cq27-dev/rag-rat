@@ -129,7 +129,8 @@ fn v038_registry_ddl_is_self_contained_and_introduces_the_registry() {
     let bare = rusqlite::Connection::open_in_memory().expect("open");
     assert!(!conn_table_exists(&bare, "repos"), "no registry before the migration runs");
 
-    schema::apply_repos_registry(&bare).expect("V038 DDL applies standalone on a bare conn");
+    schema::migrations::apply_repos_registry(&bare)
+        .expect("V038 DDL applies standalone on a bare conn");
 
     for table in ["repos", "repo_roots", "repo_meta"] {
         assert!(conn_table_exists(&bare, table), "V038 creates {table}");
@@ -553,7 +554,7 @@ fn migration_039_relocates_per_repo_meta_and_leaves_global_keys() {
     upsert_meta(&conn, "reconcile_meta", "last_embedding_reconcile_started_at_ms", "1000"); // stays
 
     // Re-run the relocation (the tables were empty when apply() first ran it).
-    schema::apply_move_per_repo_meta(&conn).expect("relocate");
+    schema::migrations::apply_move_per_repo_meta(&conn).expect("relocate");
 
     for (key, value) in [
         ("source_root", "/src/repo"),
@@ -636,15 +637,15 @@ fn v039_relocation_runs_standalone_and_is_idempotent() {
          CREATE TABLE reconcile_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )
     .unwrap();
-    schema::apply_repos_registry(&bare).expect("V038 registry");
+    schema::migrations::apply_repos_registry(&bare).expect("V038 registry");
     // `git_commit` is a genuinely per-repo key V039 relocates; the reencode cursor moves too. (The
     // `fts_*` trio + `content_revision` are RECLASSIFIED GLOBAL by V040, so V039 no longer
     // relocates them — covered by `v039_leaves_reclassified_global_keys_in_index_meta`.)
     upsert_meta(&bare, "index_meta", "git_commit", "abc123");
     upsert_meta(&bare, "reconcile_meta", "vector_int8_reencode_cursor", "7\nm");
 
-    schema::apply_move_per_repo_meta(&bare).expect("V039 relocation standalone");
-    schema::apply_move_per_repo_meta(&bare).expect("V039 relocation is idempotent");
+    schema::migrations::apply_move_per_repo_meta(&bare).expect("V039 relocation standalone");
+    schema::migrations::apply_move_per_repo_meta(&bare).expect("V039 relocation is idempotent");
 
     assert_eq!(
         rag_rat_db::meta::repo_meta(&bare, LEGACY_REPO_ID, "git_commit").unwrap().as_deref(),
@@ -683,7 +684,7 @@ fn v039_leaves_reclassified_global_keys_in_index_meta() {
          CREATE TABLE reconcile_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )
     .unwrap();
-    schema::apply_repos_registry(&bare).expect("V038 registry");
+    schema::migrations::apply_repos_registry(&bare).expect("V038 registry");
     // The 4 reclassified-global index_meta keys, plus one genuinely-per-repo key as a positive
     // control that DOES relocate.
     for key in ["content_revision", "fts_dirty", "fts_source_revision", "fts_synced_at_ms"] {
@@ -691,7 +692,7 @@ fn v039_leaves_reclassified_global_keys_in_index_meta() {
     }
     upsert_meta(&bare, "index_meta", "source_root", "/src/repo");
 
-    schema::apply_move_per_repo_meta(&bare).expect("V039 relocation standalone");
+    schema::migrations::apply_move_per_repo_meta(&bare).expect("V039 relocation standalone");
 
     // The 4 global keys STAY in index_meta and never enter repo_meta.
     for key in ["content_revision", "fts_dirty", "fts_source_revision", "fts_synced_at_ms"] {
@@ -1004,12 +1005,13 @@ fn register_repo_adoption_is_atomic_on_a_mid_sequence_failure() {
 
 // --- V040: repo_id scoping on the core tables (memory-sync phase A3) ---
 
-/// The pre-V040 (post-V039) shape of every core table [`schema::apply_repo_id_core_scoping`]
-/// transforms, plus the V038 registry it relocates meta under — built in ISOLATION so the migration
-/// is exercised against its own inputs, not the full ladder (the directory's "assert deferred
-/// absence / rebuild behavior in isolation" rule). `files`/`packages`/… carry NO `repo_id`;
-/// `parser_failures` is id-keyed; `git_commits` is `hash`-PK with `commit_fts` external content and
-/// a `git_file_changes(commit_hash)` FK — exactly what V040 rebuilds.
+/// The pre-V040 (post-V039) shape of every core table
+/// [`schema::migrations::apply_repo_id_core_scoping`] transforms, plus the V038 registry it
+/// relocates meta under — built in ISOLATION so the migration is exercised against its own inputs,
+/// not the full ladder (the directory's "assert deferred absence / rebuild behavior in isolation"
+/// rule). `files`/`packages`/… carry NO `repo_id`; `parser_failures` is id-keyed; `git_commits` is
+/// `hash`-PK with `commit_fts` external content and a `git_file_changes(commit_hash)` FK — exactly
+/// what V040 rebuilds.
 fn seed_pre_v040_core_schema(conn: &rusqlite::Connection) {
     conn.execute_batch(
         "
@@ -1076,7 +1078,7 @@ fn seed_pre_v040_core_schema(conn: &rusqlite::Connection) {
         ",
     )
     .unwrap();
-    schema::apply_repos_registry(conn).expect("V038 registry seeds the placeholder");
+    schema::migrations::apply_repos_registry(conn).expect("V038 registry seeds the placeholder");
 }
 
 /// Seed one git commit + its file change + its FTS entry into a pre-V040 fixture, returning the
@@ -1180,7 +1182,7 @@ fn migration_040_git_rebuild_preserves_rows_commit_fts_and_reconverges_from_torn
     )
     .unwrap();
 
-    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+    schema::migrations::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
         .expect("V040 converges from the torn state");
 
     // The scratch tables are gone; the transform completed.
@@ -1209,7 +1211,7 @@ fn migration_040_git_rebuild_preserves_rows_commit_fts_and_reconverges_from_torn
     assert_eq!(fc_repo, LEGACY_REPO_ID);
 
     // Idempotent re-run (the all-or-nothing sentinel short-circuits once files carries repo_id).
-    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+    schema::migrations::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
         .expect("re-apply is a clean no-op");
 
     // Adoption re-points git_commits.repo_id → real, and the ON UPDATE CASCADE carries the change
@@ -1248,7 +1250,8 @@ fn migration_040_reunites_active_model_provenance_meta_into_repo_meta() {
     upsert_meta(&conn, "index_meta", "active_embedding_remote_config", "{\"endpoint\":\"x\"}");
     upsert_meta(&conn, "index_meta", "generated_flags_version", "1"); // machine-level, stays
 
-    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks()).unwrap();
+    schema::migrations::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+        .unwrap();
 
     for key in ["active_embedding_model_provisional", "active_embedding_remote_config"] {
         assert!(
@@ -1326,7 +1329,7 @@ fn migration_040_backfills_an_adopted_pre_v040_db_under_the_real_repo_id() {
     .unwrap();
     conn.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID]).unwrap();
 
-    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+    schema::migrations::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
         .expect("V040 applies on an adopted DB");
 
     for table in [
@@ -1462,7 +1465,7 @@ fn migration_040_realigns_logical_symbol_ids_and_carries_bound_memories() {
     let old_id = 424_242_i64; // an arbitrary pre-fold id
     seed_pre_v040_logical_symbol_with_a_bound_memory(&conn, old_id);
 
-    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+    schema::migrations::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
         .expect("V040 applies");
 
     // The symbol's id was re-derived (repo_id folded in), so it CHANGED from the pre-fold value.
@@ -1493,7 +1496,7 @@ fn adoption_realigns_logical_symbol_ids_so_pre_v040_memories_survive() {
     let old_id = 999_001_i64;
     seed_pre_v040_logical_symbol_with_a_bound_memory(&conn, old_id);
 
-    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+    schema::migrations::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
         .expect("V040 applies (unadopted → placeholder id)");
     let placeholder_id = bound_logical_symbol_id(&conn);
     assert_ne!(placeholder_id, old_id, "V040 already realigned under the placeholder repo_id");
@@ -1548,7 +1551,7 @@ fn register_repo_upgrades_a_local_only_id_to_a_portable_id_in_place() {
     .unwrap();
     seed_pre_v040_logical_symbol_with_a_bound_memory(&conn, 777_001);
 
-    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+    schema::migrations::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
         .expect("V040 applies (unadopted → placeholder id)");
 
     // First registration: a cut shallow clone adopts under a machine-local id AND records its
@@ -1626,7 +1629,7 @@ fn upgrade_blocks_until_the_outgoing_local_lock_holder_finishes() {
         [],
     )
     .unwrap();
-    schema::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
+    schema::migrations::apply_repo_id_core_scoping(&conn, &crate::index::migration_hooks())
         .expect("V040 applies");
     let local_id = "local:aaaa1111bbbb";
     register_repo(
@@ -2763,8 +2766,9 @@ fn an_identity_less_open_refuses_to_sole_pick_on_a_multi_repo_db() {
 // --- V041: repo_id scoping on the GitHub papertrail tables (memory-sync phase A4) ---
 
 /// The pre-V041 shape of the seven GitHub tables + `github_fts` (no `repo_id`) plus the V038
-/// registry, built in ISOLATION so [`schema::apply_github_repo_id_scoping`] is exercised against
-/// its own inputs (the directory's "assert deferred absence / rebuild behavior in isolation" rule).
+/// registry, built in ISOLATION so [`schema::migrations::apply_github_repo_id_scoping`] is
+/// exercised against its own inputs (the directory's "assert deferred absence / rebuild behavior in
+/// isolation" rule).
 fn seed_pre_v041_github_schema(conn: &rusqlite::Connection) {
     conn.execute_batch(
         "
@@ -2811,7 +2815,7 @@ fn seed_pre_v041_github_schema(conn: &rusqlite::Connection) {
         ",
     )
     .unwrap();
-    schema::apply_repos_registry(conn).expect("V038 registry seeds the placeholder");
+    schema::migrations::apply_repos_registry(conn).expect("V038 registry seeds the placeholder");
 }
 
 /// Fresh `apply` produces the repo-scoped papertrail tables directly (the V060 baseline shape —
@@ -2871,7 +2875,8 @@ fn migration_041_github_rebuild_preserves_rows_and_reconverges_from_torn_state()
     // drop it and re-converge rather than fail on CREATE.
     conn.execute_batch("CREATE TABLE github_fts_new(bogus INTEGER);").unwrap();
 
-    schema::apply_github_repo_id_scoping(&conn).expect("V041 converges from the torn state");
+    schema::migrations::apply_github_repo_id_scoping(&conn)
+        .expect("V041 converges from the torn state");
 
     assert!(!conn_table_exists(&conn, "github_fts_new"), "scratch table gone");
     assert!(
@@ -2896,7 +2901,7 @@ fn migration_041_github_rebuild_preserves_rows_and_reconverges_from_torn_state()
     assert_eq!(matched, 1, "github_fts still MATCHes after the rebuild");
 
     // Idempotent re-run (the sentinel short-circuits once github_fts carries repo_id).
-    schema::apply_github_repo_id_scoping(&conn).expect("re-apply is a clean no-op");
+    schema::migrations::apply_github_repo_id_scoping(&conn).expect("re-apply is a clean no-op");
 }
 
 /// Full-schema adoption of the papertrail: `register_repo` re-points the placeholder papertrail
@@ -2989,7 +2994,7 @@ fn migration_041_backfills_an_adopted_pre_v041_db_under_the_real_repo_id() {
     .unwrap();
     conn.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID]).unwrap();
 
-    schema::apply_github_repo_id_scoping(&conn).expect("V041 applies on an adopted DB");
+    schema::migrations::apply_github_repo_id_scoping(&conn).expect("V041 applies on an adopted DB");
 
     for table in ["github_refs", "github_issues", "github_fts"] {
         let (total, under_real): (i64, i64) = conn
@@ -3051,7 +3056,7 @@ fn migration_041_leaves_github_rows_at_the_placeholder_on_a_consolidated_db() {
     .unwrap();
     conn.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID]).unwrap();
 
-    schema::apply_github_repo_id_scoping(&conn)
+    schema::migrations::apply_github_repo_id_scoping(&conn)
         .expect("V041 must not abort the upgrade on a consolidated DB");
 
     for table in ["github_refs", "github_issues", "github_fts"] {
@@ -3252,21 +3257,22 @@ fn pk_includes_repo_id(conn: &rusqlite::Connection, table: &str) -> bool {
 
 /// The pre-V042 shape of the clone / oracle / reconcile / memory periphery tables (NO `repo_id`),
 /// built by calling the real table-creating DDL fns in ISOLATION — so
-/// [`schema::apply_repo_id_periphery_scoping`] runs against its own genuine inputs (the directory's
-/// "assert deferred absence / rebuild behavior in isolation, not the full ladder" rule). Calling
-/// the real DDL fns (not hand-copied `CREATE TABLE`s) keeps the fixture drift-free as those tables
-/// evolve. The core / GitHub tables are deliberately NOT scoped here (V040 / V041 are not run):
-/// this fixture drives only V042, so [`register_repo`] adoption is exercised in the full-ladder
-/// test below, where every direct-scoped column exists.
+/// [`schema::migrations::apply_repo_id_periphery_scoping`] runs against its own genuine inputs (the
+/// directory's "assert deferred absence / rebuild behavior in isolation, not the full ladder"
+/// rule). Calling the real DDL fns (not hand-copied `CREATE TABLE`s) keeps the fixture drift-free
+/// as those tables evolve. The core / GitHub tables are deliberately NOT scoped here (V040 / V041
+/// are not run): this fixture drives only V042, so [`register_repo`] adoption is exercised in the
+/// full-ladder test below, where every direct-scoped column exists.
 fn seed_pre_v042_periphery_schema(conn: &rusqlite::Connection) {
     schema::apply_baseline(conn)
         .expect("baseline: repo_memories/bindings/tags/fts + reconcile_attempts + core tables");
-    schema::apply_oracle_tables(conn).expect("oracle_runs + edge_oracle");
-    schema::apply_scip_moniker_anchors(conn).expect("logical_symbol_monikers");
-    schema::apply_clone_fingerprint_tables(conn).expect("clone_token_df + clone_refinements");
-    schema::apply_clone_graph_tables(conn).expect("clone_graph_generations");
-    schema::apply_dream_findings(conn).expect("dream_findings");
-    schema::apply_repos_registry(conn).expect("V038 registry seeds the placeholder");
+    schema::migrations::apply_oracle_tables(conn).expect("oracle_runs + edge_oracle");
+    schema::migrations::apply_scip_moniker_anchors(conn).expect("logical_symbol_monikers");
+    schema::migrations::apply_clone_fingerprint_tables(conn)
+        .expect("clone_token_df + clone_refinements");
+    schema::migrations::apply_clone_graph_tables(conn).expect("clone_graph_generations");
+    schema::migrations::apply_dream_findings(conn).expect("dream_findings");
+    schema::migrations::apply_repos_registry(conn).expect("V038 registry seeds the placeholder");
 }
 
 /// Fresh `apply` runs V042 (the schema tip): every periphery table gains a direct `repo_id` and the
@@ -3339,7 +3345,7 @@ fn migration_042_periphery_rebuild_preserves_rows_and_reconverges_from_torn_stat
     // TORN STATE: a prior V042 pass crashed after creating a rebuild scratch table.
     conn.execute_batch("CREATE TABLE clone_token_df_new(bogus INTEGER);").unwrap();
 
-    schema::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
+    schema::migrations::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
         .expect("V042 converges from the torn state");
 
     assert!(!conn_table_exists(&conn, "clone_token_df_new"), "scratch table swept");
@@ -3374,7 +3380,7 @@ fn migration_042_periphery_rebuild_preserves_rows_and_reconverges_from_torn_stat
     assert_eq!(matched, 1, "repo_memory_fts still MATCHes the seeded memory after the rebuild");
 
     // Idempotent re-run (the repo_memories.repo_id sentinel short-circuits).
-    schema::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
+    schema::migrations::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
         .expect("re-apply is a clean no-op");
 }
 
@@ -3411,7 +3417,7 @@ fn migration_042_backfills_an_adopted_pre_v042_db_under_the_real_repo_id() {
     .unwrap();
     conn.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID]).unwrap();
 
-    schema::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
+    schema::migrations::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
         .expect("V042 applies on an adopted DB");
 
     let df_repo: String = conn
@@ -3476,7 +3482,7 @@ fn migration_042_leaves_periphery_rows_at_the_placeholder_on_a_consolidated_db()
     .unwrap();
     conn.execute("DELETE FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID]).unwrap();
 
-    schema::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
+    schema::migrations::apply_repo_id_periphery_scoping(&conn, &crate::index::migration_hooks())
         .expect("V042 must not abort the upgrade on a consolidated DB");
 
     for table in ["repo_memories", "clone_token_df", "repo_memory_fts"] {

@@ -657,7 +657,7 @@ fn migration_063_persists_mirror_resume_state() {
     assert!(
         conn_table_columns(&conn, "papertrail_items").contains(&"full_rewalk_seen".to_string())
     );
-    schema::apply_papertrail_mirror_resume_state(&conn).unwrap();
+    schema::migrations::apply_papertrail_mirror_resume_state(&conn).unwrap();
     assert_eq!(conn_table_columns(&conn, "papertrail_sync_cursor"), columns, "V063 is idempotent");
 }
 
@@ -684,7 +684,7 @@ fn migration_067_persists_binding_health() {
         [],
     )
     .unwrap();
-    schema::apply_papertrail_binding_health(&conn).unwrap();
+    schema::migrations::apply_papertrail_binding_health(&conn).unwrap();
     let (probe, mirror, full): (Option<i64>, Option<i64>, Option<i64>) = conn
         .query_row(
             "SELECT last_successful_probe_ms, last_successful_mirror_ms, last_full_sync_ms
@@ -847,7 +847,7 @@ fn migration_045_duplicates_children_per_owning_repo_and_keeps_orphans() {
     )
     .unwrap();
 
-    schema::apply_github_child_key_widening(&conn).unwrap();
+    schema::migrations::apply_github_child_key_widening(&conn).unwrap();
 
     // The shared children now exist once per OWNING repo.
     for (table, id) in
@@ -1276,8 +1276,11 @@ fn seeded_pre_v060_legacy_db() -> rusqlite::Connection {
 fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
     let conn = seeded_pre_v060_legacy_db();
 
-    schema::apply_papertrail_provider_neutral_schema(&conn, &crate::index::migration_hooks())
-        .unwrap();
+    schema::migrations::apply_papertrail_provider_neutral_schema(
+        &conn,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
 
     // Items: issue #1 (both repos, verbatim repo_id) + ONE change_request #2 (shadow deduped,
     // pulls copy wins so merged_at survives).
@@ -1514,8 +1517,11 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
     assert_eq!(refs[0].item_key, "1");
 
     // Replay converges: a second apply is a clean no-op (nothing legacy left to backfill).
-    schema::apply_papertrail_provider_neutral_schema(&conn, &crate::index::migration_hooks())
-        .unwrap();
+    schema::migrations::apply_papertrail_provider_neutral_schema(
+        &conn,
+        &crate::index::migration_hooks(),
+    )
+    .unwrap();
     let items_after: i64 =
         conn.query_row("SELECT COUNT(*) FROM papertrail_items", [], |r| r.get(0)).unwrap();
     assert_eq!(items_after, 3, "re-apply neither duplicates nor drops migrated rows");

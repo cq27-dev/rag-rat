@@ -1,34 +1,13 @@
 mod baseline;
-mod migrations;
+// The individual migration STEPS (`apply_*`) are reached through this module rather than
+// re-exported: `migrations::apply_oplog_storage(conn)` says where the step comes from, whereas a
+// bare `apply_oplog_storage(conn)` at a call site in another crate reads like a local function.
+// The general-purpose schema predicates below are re-exported, since they are not ladder steps.
+pub mod migrations;
 mod purge;
 mod registry;
 // The schema surface the engine crates consume (everything else stays crate-internal):
 pub use baseline::{apply_baseline, rebuild_commit_fts};
-pub(crate) use migrations::*;
-// Migration steps and table lists the engine's schema tests exercise directly:
-pub use migrations::{
-    apply_account_authority_boundaries, apply_account_authority_projection,
-    apply_account_candidate_dag, apply_account_candidate_reservation_targets,
-    apply_account_candidate_reservations, apply_chunk_symbol_id, apply_clone_delta_maintenance,
-    apply_clone_df_epoch, apply_clone_fingerprint_tables, apply_clone_graph_tables,
-    apply_clone_postings_row_count, apply_content_candidate_dag, apply_content_digest_state,
-    apply_content_projected_tables, apply_content_refold_queue_and_stats,
-    apply_content_streams_pending_refold, apply_distill_anchor_selection,
-    apply_distill_enriched_context, apply_distill_evidence_source_part, apply_distill_record_store,
-    apply_distill_safe_input_snapshot, apply_dream_findings, apply_edge_string_interning,
-    apply_edge_target_qname_index, apply_external_symbols, apply_files_generation,
-    apply_files_has_test_code, apply_git_change_couplings, apply_github_child_key_widening,
-    apply_github_repo_id_scoping, apply_lens_enrichment_revision,
-    apply_memory_model_failures_table, apply_memory_verification_tables, apply_move_per_repo_meta,
-    apply_oplog_device_identity, apply_oplog_device_x25519, apply_oplog_local_account,
-    apply_oplog_storage, apply_oplog_stream_scoping, apply_oracle_tables,
-    apply_papertrail_binding_health, apply_papertrail_distill_substrate,
-    apply_papertrail_mirror_resume_state, apply_papertrail_provider_neutral_schema,
-    apply_repo_id_core_scoping, apply_repo_id_periphery_scoping, apply_repos_registry,
-    apply_scip_moniker_anchors, apply_sync_invites, apply_sync_invites_normalized_receipts,
-    apply_sync_origin_and_edge_tombstone, apply_table_sync_projection_state,
-    apply_table_sync_spec_version, apply_table_sync_tables,
-};
 pub use migrations::{column_exists, rebuild_repo_memory_fts_with_repo_id, table_exists};
 pub use purge::{RepoRowCounts, count_repo_rows, purge_repo_rows, repo_scoped_table_names};
 // `multiple_real_repos` lost its V042-era seam-guard callers (real `repo_id` predicates
@@ -840,7 +819,7 @@ fn provision_baseline(conn: &Connection) -> rusqlite::Result<()> {
     }
     if baseline_owed {
         conn.execute("DELETE FROM schema_version WHERE id = ?1", [DIRTY_MIGRATION_ID])?;
-        record_migration(
+        migrations::record_migration(
             conn,
             MIGRATION_001_ID,
             MIGRATION_001_CHECKSUM,
@@ -871,7 +850,7 @@ pub fn apply(conn: &Connection, hooks: &MigrationHooks) -> rusqlite::Result<()> 
     // #585: record which binary brought the schema current, so a stranded fleet is diagnosable.
     // Best-effort: the schema is already applied, and provenance is diagnostic — a stamp failure
     // must not fail the migration (the reader tolerates an absent record).
-    let _ = record_migration_provenance(conn);
+    let _ = migrations::record_migration_provenance(conn);
     Ok(())
 }
 
@@ -917,13 +896,13 @@ fn apply_and_record_migration(
 ) -> rusqlite::Result<()> {
     if !matches!(step.id, MIGRATION_064_ID | MIGRATION_065_ID) {
         step.apply.run(conn, hooks)?;
-        return record_migration(conn, step.id, step.checksum, step.description);
+        return migrations::record_migration(conn, step.id, step.checksum, step.description);
     }
 
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     step.apply.run(&tx, hooks)?;
     (hooks.backfill_authority_projection)(&tx)?;
-    record_migration(&tx, step.id, step.checksum, step.description)?;
+    migrations::record_migration(&tx, step.id, step.checksum, step.description)?;
     tx.commit()
 }
 
@@ -932,565 +911,565 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         id: MIGRATION_002_ID,
         checksum: MIGRATION_002_CHECKSUM,
         description: MIGRATION_002_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_embedding_vector_metadata),
+        apply: MigrationFn::Plain(migrations::apply_embedding_vector_metadata),
     },
     Migration {
         id: MIGRATION_003_ID,
         checksum: MIGRATION_003_CHECKSUM,
         description: MIGRATION_003_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_derived_artifact_reconcile_metadata),
+        apply: MigrationFn::Plain(migrations::apply_derived_artifact_reconcile_metadata),
     },
     Migration {
         id: MIGRATION_004_ID,
         checksum: MIGRATION_004_CHECKSUM,
         description: MIGRATION_004_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_edge_source_target_spans),
+        apply: MigrationFn::Plain(migrations::apply_edge_source_target_spans),
     },
     Migration {
         id: MIGRATION_005_ID,
         checksum: MIGRATION_005_CHECKSUM,
         description: MIGRATION_005_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_edge_evidence_and_resolution),
+        apply: MigrationFn::Plain(migrations::apply_edge_evidence_and_resolution),
     },
     Migration {
         id: MIGRATION_006_ID,
         checksum: MIGRATION_006_CHECKSUM,
         description: MIGRATION_006_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_embedding_policy_and_input_hash),
+        apply: MigrationFn::Plain(migrations::apply_embedding_policy_and_input_hash),
     },
     Migration {
         id: MIGRATION_007_ID,
         checksum: MIGRATION_007_CHECKSUM,
         description: MIGRATION_007_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_logical_symbol_groups),
+        apply: MigrationFn::Plain(migrations::apply_logical_symbol_groups),
     },
     Migration {
         id: MIGRATION_008_ID,
         checksum: MIGRATION_008_CHECKSUM,
         description: MIGRATION_008_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_commit_addressable_worktrees),
+        apply: MigrationFn::Plain(migrations::apply_commit_addressable_worktrees),
     },
     Migration {
         id: MIGRATION_009_ID,
         checksum: MIGRATION_009_CHECKSUM,
         description: MIGRATION_009_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_github_ref_sync),
+        apply: MigrationFn::Plain(migrations::apply_github_ref_sync),
     },
     Migration {
         id: MIGRATION_010_ID,
         checksum: MIGRATION_010_CHECKSUM,
         description: MIGRATION_010_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_symbol_facts),
+        apply: MigrationFn::Plain(migrations::apply_symbol_facts),
     },
     Migration {
         id: MIGRATION_011_ID,
         checksum: MIGRATION_011_CHECKSUM,
         description: MIGRATION_011_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_repo_memories),
+        apply: MigrationFn::Plain(migrations::apply_repo_memories),
     },
     Migration {
         id: MIGRATION_012_ID,
         checksum: MIGRATION_012_CHECKSUM,
         description: MIGRATION_012_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_repo_memory_call_paths),
+        apply: MigrationFn::Plain(migrations::apply_repo_memory_call_paths),
     },
     Migration {
         id: MIGRATION_013_ID,
         checksum: MIGRATION_013_CHECKSUM,
         description: MIGRATION_013_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_graph_file_lookup_indexes),
+        apply: MigrationFn::Plain(migrations::apply_graph_file_lookup_indexes),
     },
     Migration {
         id: MIGRATION_014_ID,
         checksum: MIGRATION_014_CHECKSUM,
         description: MIGRATION_014_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_memory_binding_signals),
+        apply: MigrationFn::Plain(migrations::apply_memory_binding_signals),
     },
     Migration {
         id: MIGRATION_015_ID,
         checksum: MIGRATION_015_CHECKSUM,
         description: MIGRATION_015_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_repo_memory_call_path_edges),
+        apply: MigrationFn::Plain(migrations::apply_repo_memory_call_path_edges),
     },
     Migration {
         id: MIGRATION_016_ID,
         checksum: MIGRATION_016_CHECKSUM,
         description: MIGRATION_016_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_symbol_line_spans),
+        apply: MigrationFn::Plain(migrations::apply_symbol_line_spans),
     },
     Migration {
         id: MIGRATION_017_ID,
         checksum: MIGRATION_017_CHECKSUM,
         description: MIGRATION_017_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_edge_callee_byte_range),
+        apply: MigrationFn::Plain(migrations::apply_edge_callee_byte_range),
     },
     Migration {
         id: MIGRATION_018_ID,
         checksum: MIGRATION_018_CHECKSUM,
         description: MIGRATION_018_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_oracle_tables),
+        apply: MigrationFn::Plain(migrations::apply_oracle_tables),
     },
     Migration {
         id: MIGRATION_019_ID,
         checksum: MIGRATION_019_CHECKSUM,
         description: MIGRATION_019_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_scip_moniker_anchors),
+        apply: MigrationFn::Plain(migrations::apply_scip_moniker_anchors),
     },
     Migration {
         id: MIGRATION_020_ID,
         checksum: MIGRATION_020_CHECKSUM,
         description: MIGRATION_020_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_edge_string_interning),
+        apply: MigrationFn::Plain(migrations::apply_edge_string_interning),
     },
     Migration {
         id: MIGRATION_021_ID,
         checksum: MIGRATION_021_CHECKSUM,
         description: MIGRATION_021_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_symbol_scope_path),
+        apply: MigrationFn::Plain(migrations::apply_symbol_scope_path),
     },
     Migration {
         id: MIGRATION_022_ID,
         checksum: MIGRATION_022_CHECKSUM,
         description: MIGRATION_022_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_per_package_import_scope),
+        apply: MigrationFn::Plain(migrations::apply_per_package_import_scope),
     },
     Migration {
         id: MIGRATION_023_ID,
         checksum: MIGRATION_023_CHECKSUM,
         description: MIGRATION_023_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_edges_view_refresh),
+        apply: MigrationFn::Plain(migrations::apply_edges_view_refresh),
     },
     Migration {
         id: MIGRATION_024_ID,
         checksum: MIGRATION_024_CHECKSUM,
         description: MIGRATION_024_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_files_has_test_code),
+        apply: MigrationFn::Plain(migrations::apply_files_has_test_code),
     },
     Migration {
         id: MIGRATION_025_ID,
         checksum: MIGRATION_025_CHECKSUM,
         description: MIGRATION_025_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_chunk_text_compression_tables),
+        apply: MigrationFn::Plain(migrations::apply_chunk_text_compression_tables),
     },
     Migration {
         id: MIGRATION_026_ID,
         checksum: MIGRATION_026_CHECKSUM,
         description: MIGRATION_026_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_contentless_chunk_fts),
+        apply: MigrationFn::Plain(migrations::apply_contentless_chunk_fts),
     },
     Migration {
         id: MIGRATION_027_ID,
         checksum: MIGRATION_027_CHECKSUM,
         description: MIGRATION_027_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_drop_chunks_text),
+        apply: MigrationFn::Plain(migrations::apply_drop_chunks_text),
     },
     Migration {
         id: MIGRATION_028_ID,
         checksum: MIGRATION_028_CHECKSUM,
         description: MIGRATION_028_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_intern_symbol_qualified_names),
+        apply: MigrationFn::Plain(migrations::apply_intern_symbol_qualified_names),
     },
     Migration {
         id: MIGRATION_029_ID,
         checksum: MIGRATION_029_CHECKSUM,
         description: MIGRATION_029_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_clone_fingerprint_tables),
+        apply: MigrationFn::Plain(migrations::apply_clone_fingerprint_tables),
     },
     Migration {
         id: MIGRATION_030_ID,
         checksum: MIGRATION_030_CHECKSUM,
         description: MIGRATION_030_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_clone_refinements_lcs_sampled),
+        apply: MigrationFn::Plain(migrations::apply_clone_refinements_lcs_sampled),
     },
     Migration {
         id: MIGRATION_031_ID,
         checksum: MIGRATION_031_CHECKSUM,
         description: MIGRATION_031_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_edge_oracle_content_anchor),
+        apply: MigrationFn::Plain(migrations::apply_edge_oracle_content_anchor),
     },
     Migration {
         id: MIGRATION_032_ID,
         checksum: MIGRATION_032_CHECKSUM,
         description: MIGRATION_032_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_token_bag_blob),
+        apply: MigrationFn::Plain(migrations::apply_token_bag_blob),
     },
     Migration {
         id: MIGRATION_033_ID,
         checksum: MIGRATION_033_CHECKSUM,
         description: MIGRATION_033_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_dream_findings),
+        apply: MigrationFn::Plain(migrations::apply_dream_findings),
     },
     Migration {
         id: MIGRATION_034_ID,
         checksum: MIGRATION_034_CHECKSUM,
         description: MIGRATION_034_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_clone_graph_tables),
+        apply: MigrationFn::Plain(migrations::apply_clone_graph_tables),
     },
     Migration {
         id: MIGRATION_035_ID,
         checksum: MIGRATION_035_CHECKSUM,
         description: MIGRATION_035_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_symbols_is_test),
+        apply: MigrationFn::Plain(migrations::apply_symbols_is_test),
     },
     Migration {
         id: MIGRATION_036_ID,
         checksum: MIGRATION_036_CHECKSUM,
         description: MIGRATION_036_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_embedding_content_cache),
+        apply: MigrationFn::Plain(migrations::apply_embedding_content_cache),
     },
     Migration {
         id: MIGRATION_037_ID,
         checksum: MIGRATION_037_CHECKSUM,
         description: MIGRATION_037_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_clone_subblock_postings_tables),
+        apply: MigrationFn::Plain(migrations::apply_clone_subblock_postings_tables),
     },
     Migration {
         id: MIGRATION_038_ID,
         checksum: MIGRATION_038_CHECKSUM,
         description: MIGRATION_038_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_repos_registry),
+        apply: MigrationFn::Plain(migrations::apply_repos_registry),
     },
     Migration {
         id: MIGRATION_039_ID,
         checksum: MIGRATION_039_CHECKSUM,
         description: MIGRATION_039_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_move_per_repo_meta),
+        apply: MigrationFn::Plain(migrations::apply_move_per_repo_meta),
     },
     Migration {
         id: MIGRATION_040_ID,
         checksum: MIGRATION_040_CHECKSUM,
         description: MIGRATION_040_DESCRIPTION,
-        apply: MigrationFn::WithHooks(apply_repo_id_core_scoping),
+        apply: MigrationFn::WithHooks(migrations::apply_repo_id_core_scoping),
     },
     Migration {
         id: MIGRATION_041_ID,
         checksum: MIGRATION_041_CHECKSUM,
         description: MIGRATION_041_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_github_repo_id_scoping),
+        apply: MigrationFn::Plain(migrations::apply_github_repo_id_scoping),
     },
     Migration {
         id: MIGRATION_042_ID,
         checksum: MIGRATION_042_CHECKSUM,
         description: MIGRATION_042_DESCRIPTION,
-        apply: MigrationFn::WithHooks(apply_repo_id_periphery_scoping),
+        apply: MigrationFn::WithHooks(migrations::apply_repo_id_periphery_scoping),
     },
     Migration {
         id: MIGRATION_043_ID,
         checksum: MIGRATION_043_CHECKSUM,
         description: MIGRATION_043_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_files_generation),
+        apply: MigrationFn::Plain(migrations::apply_files_generation),
     },
     Migration {
         id: MIGRATION_044_ID,
         checksum: MIGRATION_044_CHECKSUM,
         description: MIGRATION_044_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_github_natural_key_widening),
+        apply: MigrationFn::Plain(migrations::apply_github_natural_key_widening),
     },
     Migration {
         id: MIGRATION_045_ID,
         checksum: MIGRATION_045_CHECKSUM,
         description: MIGRATION_045_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_github_child_key_widening),
+        apply: MigrationFn::Plain(migrations::apply_github_child_key_widening),
     },
     Migration {
         id: MIGRATION_046_ID,
         checksum: MIGRATION_046_CHECKSUM,
         description: MIGRATION_046_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_memory_verification_tables),
+        apply: MigrationFn::Plain(migrations::apply_memory_verification_tables),
     },
     Migration {
         id: MIGRATION_047_ID,
         checksum: MIGRATION_047_CHECKSUM,
         description: MIGRATION_047_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_memory_model_failures_table),
+        apply: MigrationFn::Plain(migrations::apply_memory_model_failures_table),
     },
     Migration {
         id: MIGRATION_048_ID,
         checksum: MIGRATION_048_CHECKSUM,
         description: MIGRATION_048_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_memory_payload_json),
+        apply: MigrationFn::Plain(migrations::apply_memory_payload_json),
     },
     Migration {
         id: MIGRATION_049_ID,
         checksum: MIGRATION_049_CHECKSUM,
         description: MIGRATION_049_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_repo_node_edges),
+        apply: MigrationFn::Plain(migrations::apply_repo_node_edges),
     },
     Migration {
         id: MIGRATION_050_ID,
         checksum: MIGRATION_050_CHECKSUM,
         description: MIGRATION_050_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_clone_delta_maintenance),
+        apply: MigrationFn::Plain(migrations::apply_clone_delta_maintenance),
     },
     Migration {
         id: MIGRATION_051_ID,
         checksum: MIGRATION_051_CHECKSUM,
         description: MIGRATION_051_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_clone_df_epoch),
+        apply: MigrationFn::Plain(migrations::apply_clone_df_epoch),
     },
     Migration {
         id: MIGRATION_052_ID,
         checksum: MIGRATION_052_CHECKSUM,
         description: MIGRATION_052_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_oplog_storage),
+        apply: MigrationFn::Plain(migrations::apply_oplog_storage),
     },
     Migration {
         id: MIGRATION_053_ID,
         checksum: MIGRATION_053_CHECKSUM,
         description: MIGRATION_053_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_oplog_stream_scoping),
+        apply: MigrationFn::Plain(migrations::apply_oplog_stream_scoping),
     },
     Migration {
         id: MIGRATION_054_ID,
         checksum: MIGRATION_054_CHECKSUM,
         description: MIGRATION_054_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_oplog_device_identity),
+        apply: MigrationFn::Plain(migrations::apply_oplog_device_identity),
     },
     Migration {
         id: MIGRATION_055_ID,
         checksum: MIGRATION_055_CHECKSUM,
         description: MIGRATION_055_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_binding_downgrade_marker),
+        apply: MigrationFn::Plain(migrations::apply_binding_downgrade_marker),
     },
     Migration {
         id: MIGRATION_056_ID,
         checksum: MIGRATION_056_CHECKSUM,
         description: MIGRATION_056_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_git_change_couplings),
+        apply: MigrationFn::Plain(migrations::apply_git_change_couplings),
     },
     Migration {
         id: MIGRATION_057_ID,
         checksum: MIGRATION_057_CHECKSUM,
         description: MIGRATION_057_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_external_symbols),
+        apply: MigrationFn::Plain(migrations::apply_external_symbols),
     },
     Migration {
         id: MIGRATION_058_ID,
         checksum: MIGRATION_058_CHECKSUM,
         description: MIGRATION_058_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_oplog_device_x25519),
+        apply: MigrationFn::Plain(migrations::apply_oplog_device_x25519),
     },
     Migration {
         id: MIGRATION_059_ID,
         checksum: MIGRATION_059_CHECKSUM,
         description: MIGRATION_059_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_account_candidate_dag),
+        apply: MigrationFn::Plain(migrations::apply_account_candidate_dag),
     },
     Migration {
         id: MIGRATION_060_ID,
         checksum: MIGRATION_060_CHECKSUM,
         description: MIGRATION_060_DESCRIPTION,
-        apply: MigrationFn::WithHooks(apply_papertrail_provider_neutral_schema),
+        apply: MigrationFn::WithHooks(migrations::apply_papertrail_provider_neutral_schema),
     },
     Migration {
         id: MIGRATION_061_ID,
         checksum: MIGRATION_061_CHECKSUM,
         description: MIGRATION_061_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_papertrail_ref_item_kind),
+        apply: MigrationFn::Plain(migrations::apply_papertrail_ref_item_kind),
     },
     Migration {
         id: MIGRATION_062_ID,
         checksum: MIGRATION_062_CHECKSUM,
         description: MIGRATION_062_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_papertrail_comment_cursor),
+        apply: MigrationFn::Plain(migrations::apply_papertrail_comment_cursor),
     },
     Migration {
         id: MIGRATION_063_ID,
         checksum: MIGRATION_063_CHECKSUM,
         description: MIGRATION_063_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_papertrail_mirror_resume_state),
+        apply: MigrationFn::Plain(migrations::apply_papertrail_mirror_resume_state),
     },
     Migration {
         id: MIGRATION_064_ID,
         checksum: MIGRATION_064_CHECKSUM,
         description: MIGRATION_064_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_account_authority_projection),
+        apply: MigrationFn::Plain(migrations::apply_account_authority_projection),
     },
     Migration {
         id: MIGRATION_065_ID,
         checksum: MIGRATION_065_CHECKSUM,
         description: MIGRATION_065_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_account_authority_boundaries),
+        apply: MigrationFn::Plain(migrations::apply_account_authority_boundaries),
     },
     Migration {
         id: MIGRATION_066_ID,
         checksum: MIGRATION_066_CHECKSUM,
         description: MIGRATION_066_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_content_candidate_dag),
+        apply: MigrationFn::Plain(migrations::apply_content_candidate_dag),
     },
     Migration {
         id: MIGRATION_067_ID,
         checksum: MIGRATION_067_CHECKSUM,
         description: MIGRATION_067_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_papertrail_binding_health),
+        apply: MigrationFn::Plain(migrations::apply_papertrail_binding_health),
     },
     Migration {
         id: MIGRATION_068_ID,
         checksum: MIGRATION_068_CHECKSUM,
         description: MIGRATION_068_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_edges_view_refresh),
+        apply: MigrationFn::Plain(migrations::apply_edges_view_refresh),
     },
     Migration {
         id: MIGRATION_069_ID,
         checksum: MIGRATION_069_CHECKSUM,
         description: MIGRATION_069_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_oplog_local_account),
+        apply: MigrationFn::Plain(migrations::apply_oplog_local_account),
     },
     Migration {
         id: MIGRATION_070_ID,
         checksum: MIGRATION_070_CHECKSUM,
         description: MIGRATION_070_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_content_projected_tables),
+        apply: MigrationFn::Plain(migrations::apply_content_projected_tables),
     },
     Migration {
         id: MIGRATION_071_ID,
         checksum: MIGRATION_071_CHECKSUM,
         description: MIGRATION_071_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_edge_target_qname_index),
+        apply: MigrationFn::Plain(migrations::apply_edge_target_qname_index),
     },
     Migration {
         id: MIGRATION_072_ID,
         checksum: MIGRATION_072_CHECKSUM,
         description: MIGRATION_072_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_content_streams_pending_refold),
+        apply: MigrationFn::Plain(migrations::apply_content_streams_pending_refold),
     },
     Migration {
         id: MIGRATION_073_ID,
         checksum: MIGRATION_073_CHECKSUM,
         description: MIGRATION_073_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_papertrail_distill_substrate),
+        apply: MigrationFn::Plain(migrations::apply_papertrail_distill_substrate),
     },
     Migration {
         id: MIGRATION_074_ID,
         checksum: MIGRATION_074_CHECKSUM,
         description: MIGRATION_074_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_edges_view_scalar_suppression),
+        apply: MigrationFn::Plain(migrations::apply_edges_view_scalar_suppression),
     },
     Migration {
         id: MIGRATION_075_ID,
         checksum: MIGRATION_075_CHECKSUM,
         description: MIGRATION_075_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_edges_hidden_flag),
+        apply: MigrationFn::Plain(migrations::apply_edges_hidden_flag),
     },
     Migration {
         id: MIGRATION_076_ID,
         checksum: MIGRATION_076_CHECKSUM,
         description: MIGRATION_076_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_sync_security_events),
+        apply: MigrationFn::Plain(migrations::apply_sync_security_events),
     },
     Migration {
         id: MIGRATION_077_ID,
         checksum: MIGRATION_077_CHECKSUM,
         description: MIGRATION_077_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_distill_record_store),
+        apply: MigrationFn::Plain(migrations::apply_distill_record_store),
     },
     Migration {
         id: MIGRATION_078_ID,
         checksum: MIGRATION_078_CHECKSUM,
         description: MIGRATION_078_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_distill_anchor_selection),
+        apply: MigrationFn::Plain(migrations::apply_distill_anchor_selection),
     },
     Migration {
         id: MIGRATION_079_ID,
         checksum: MIGRATION_079_CHECKSUM,
         description: MIGRATION_079_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_distill_safe_input_snapshot),
+        apply: MigrationFn::Plain(migrations::apply_distill_safe_input_snapshot),
     },
     Migration {
         id: MIGRATION_080_ID,
         checksum: MIGRATION_080_CHECKSUM,
         description: MIGRATION_080_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_distill_enriched_context),
+        apply: MigrationFn::Plain(migrations::apply_distill_enriched_context),
     },
     Migration {
         id: MIGRATION_081_ID,
         checksum: MIGRATION_081_CHECKSUM,
         description: MIGRATION_081_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_distill_evidence_source_part),
+        apply: MigrationFn::Plain(migrations::apply_distill_evidence_source_part),
     },
     Migration {
         id: MIGRATION_082_ID,
         checksum: MIGRATION_082_CHECKSUM,
         description: MIGRATION_082_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_content_refold_queue_and_stats),
+        apply: MigrationFn::Plain(migrations::apply_content_refold_queue_and_stats),
     },
     Migration {
         id: MIGRATION_083_ID,
         checksum: MIGRATION_083_CHECKSUM,
         description: MIGRATION_083_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_logical_group_reason_by_evidence),
+        apply: MigrationFn::Plain(migrations::apply_logical_group_reason_by_evidence),
     },
     Migration {
         id: MIGRATION_084_ID,
         checksum: MIGRATION_084_CHECKSUM,
         description: MIGRATION_084_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_chunk_symbol_id),
+        apply: MigrationFn::Plain(migrations::apply_chunk_symbol_id),
     },
     Migration {
         id: MIGRATION_085_ID,
         checksum: MIGRATION_085_CHECKSUM,
         description: MIGRATION_085_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_sync_origin_and_edge_tombstone),
+        apply: MigrationFn::Plain(migrations::apply_sync_origin_and_edge_tombstone),
     },
     Migration {
         id: MIGRATION_086_ID,
         checksum: MIGRATION_086_CHECKSUM,
         description: MIGRATION_086_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_content_digest_state),
+        apply: MigrationFn::Plain(migrations::apply_content_digest_state),
     },
     Migration {
         id: MIGRATION_087_ID,
         checksum: MIGRATION_087_CHECKSUM,
         description: MIGRATION_087_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_table_sync_tables),
+        apply: MigrationFn::Plain(migrations::apply_table_sync_tables),
     },
     Migration {
         id: MIGRATION_088_ID,
         checksum: MIGRATION_088_CHECKSUM,
         description: MIGRATION_088_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_clone_postings_row_count),
+        apply: MigrationFn::Plain(migrations::apply_clone_postings_row_count),
     },
     Migration {
         id: MIGRATION_089_ID,
         checksum: MIGRATION_089_CHECKSUM,
         description: MIGRATION_089_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_sync_invites),
+        apply: MigrationFn::Plain(migrations::apply_sync_invites),
     },
     Migration {
         id: MIGRATION_090_ID,
         checksum: MIGRATION_090_CHECKSUM,
         description: MIGRATION_090_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_account_candidate_reservations),
+        apply: MigrationFn::Plain(migrations::apply_account_candidate_reservations),
     },
     Migration {
         id: MIGRATION_091_ID,
         checksum: MIGRATION_091_CHECKSUM,
         description: MIGRATION_091_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_account_candidate_reservation_targets),
+        apply: MigrationFn::Plain(migrations::apply_account_candidate_reservation_targets),
     },
     Migration {
         id: MIGRATION_092_ID,
         checksum: MIGRATION_092_CHECKSUM,
         description: MIGRATION_092_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_sync_invites_normalized_receipts),
+        apply: MigrationFn::Plain(migrations::apply_sync_invites_normalized_receipts),
     },
     Migration {
         id: MIGRATION_093_ID,
         checksum: MIGRATION_093_CHECKSUM,
         description: MIGRATION_093_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_table_sync_projection_state),
+        apply: MigrationFn::Plain(migrations::apply_table_sync_projection_state),
     },
     Migration {
         id: MIGRATION_094_ID,
         checksum: MIGRATION_094_CHECKSUM,
         description: MIGRATION_094_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_lens_enrichment_revision),
+        apply: MigrationFn::Plain(migrations::apply_lens_enrichment_revision),
     },
     Migration {
         id: MIGRATION_095_ID,
         checksum: MIGRATION_095_CHECKSUM,
         description: MIGRATION_095_DESCRIPTION,
-        apply: MigrationFn::Plain(apply_table_sync_spec_version),
+        apply: MigrationFn::Plain(migrations::apply_table_sync_spec_version),
     },
 ];
 
@@ -1514,7 +1493,7 @@ pub fn migrate_forward(conn: &Connection, hooks: &MigrationHooks) -> anyhow::Res
     // and never breaks the loser-discipline "nothing owed ⇒ write nothing" guarantee below.
     crate::content_digest::register_content_digest_fold(conn)?;
     let applied: std::collections::HashSet<String> =
-        applied_migrations(conn)?.into_iter().map(|migration| migration.id).collect();
+        migrations::applied_migrations(conn)?.into_iter().map(|migration| migration.id).collect();
     if applied.contains(MIGRATION_001_ID)
         && ADDITIVE_MIGRATIONS.iter().all(|step| applied.contains(step.id))
     {
@@ -1529,7 +1508,7 @@ pub fn migrate_forward(conn: &Connection, hooks: &MigrationHooks) -> anyhow::Res
     // #585: this path only runs when a forward migration actually happened (early-returned above
     // otherwise) — stamp who did it (the shared-store stranding path). Best-effort: the migration
     // has committed; a diagnostic stamp failure must not fail it (the reader tolerates absence).
-    let _ = record_migration_provenance(conn);
+    let _ = migrations::record_migration_provenance(conn);
     Ok(())
 }
 
@@ -1572,35 +1551,35 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
         });
     }
 
-    let migrations = applied_migrations(conn)?;
-    if migrations.iter().any(|migration| migration.id == DIRTY_MIGRATION_ID) {
+    let applied = migrations::applied_migrations(conn)?;
+    if applied.iter().any(|migration| migration.id == DIRTY_MIGRATION_ID) {
         return Ok(SchemaStatus {
             state: SchemaState::Dirty,
-            current_version: known_version(&migrations),
+            current_version: migrations::known_version(&applied),
             latest_version: LATEST_SCHEMA_VERSION,
-            migrations,
+            migrations: applied,
             message: "dirty or partial schema migration detected; rebuild the derived index with \
                       `rag-rat index --full`"
                 .to_string(),
         });
     }
-    if migrations.iter().any(migration_checksum_mismatch) {
+    if applied.iter().any(migrations::migration_checksum_mismatch) {
         return Ok(SchemaStatus {
             state: SchemaState::Dirty,
-            current_version: known_version(&migrations),
+            current_version: migrations::known_version(&applied),
             latest_version: LATEST_SCHEMA_VERSION,
-            migrations,
+            migrations: applied,
             message: "schema migration checksum mismatch; refusing to open, rebuild the derived \
                       index with `rag-rat index --full`"
                 .to_string(),
         });
     }
-    if migrations.iter().any(|migration| !known_migration(&migration.id)) {
+    if applied.iter().any(|migration| !migrations::known_migration(&migration.id)) {
         return Ok(SchemaStatus {
             state: SchemaState::Newer,
-            current_version: known_version(&migrations),
+            current_version: migrations::known_version(&applied),
             latest_version: LATEST_SCHEMA_VERSION,
-            migrations,
+            migrations: applied,
             // #484/#585: on a shared global DB one upgraded agent migrates the schema and every
             // process still on an older binary lands here — the refusal must carry the remedy AND
             // name this binary's schema ceiling + WHO migrated the store (from provenance), because
@@ -1611,17 +1590,17 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
                  supports up to schema v{LATEST_SCHEMA_VERSION}, so upgrade rag-rat or restart \
                  sessions/servers still running an older binary{}{}",
                 hot_upgrade_caveat(),
-                migration_provenance_note(conn),
+                migrations::migration_provenance_note(conn),
             ),
         });
     }
-    let current_version = known_version(&migrations);
+    let current_version = migrations::known_version(&applied);
     if current_version < LATEST_SCHEMA_VERSION {
         return Ok(SchemaStatus {
             state: SchemaState::Older,
             current_version,
             latest_version: LATEST_SCHEMA_VERSION,
-            migrations,
+            migrations: applied,
             message: "index schema is older than this rag-rat; it migrates forward automatically \
                       on open (or rebuild with `rag-rat index --full`)"
                 .to_string(),
@@ -1631,7 +1610,7 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
         state: SchemaState::Compatible,
         current_version,
         latest_version: LATEST_SCHEMA_VERSION,
-        migrations,
+        migrations: applied,
         message: "schema is compatible".to_string(),
     })
 }
@@ -1690,8 +1669,9 @@ pub fn ensure_compatible_or_migrate(
 
 /// Registering a migration takes six coordinated edits — the `MIGRATION_0NN_{ID,CHECKSUM,
 /// DESCRIPTION}` consts, the [`ADDITIVE_MIGRATIONS`] entry, [`LATEST_SCHEMA_VERSION`], and three
-/// separate recognizers in `migrations.rs` ([`known_version`], [`known_migration`],
-/// [`migration_checksum_mismatch`]) — and only the first two fail to compile when forgotten.
+/// separate recognizers in `migrations.rs` ([`migrations::known_version`],
+/// [`migrations::known_migration`], [`migrations::migration_checksum_mismatch`]) — and only the
+/// first two fail to compile when forgotten.
 ///
 /// These tests make the remaining four mechanical by ranging over the shipped ladder itself, so a
 /// new migration is checked automatically. The `known_migration` arm is the one that is otherwise
@@ -1721,10 +1701,11 @@ mod migration_arming {
         }
     }
 
-    /// The version [`known_version`] assigns to `id` on its own, or `None` when no arm claims it.
+    /// The version [`migrations::known_version`] assigns to `id` on its own, or `None` when no arm
+    /// claims it.
     /// No migration maps to 0, so the `unwrap_or(0)` floor is an unambiguous "unarmed".
     fn armed_version(id: &str) -> Option<u32> {
-        match known_version(&[ledger_row(id, "")]) {
+        match migrations::known_version(&[ledger_row(id, "")]) {
             0 => None,
             version => Some(version),
         }
@@ -1745,7 +1726,7 @@ mod migration_arming {
     fn every_shipped_migration_is_a_known_migration() {
         for (id, _) in shipped_ladder() {
             assert!(
-                known_migration(id),
+                migrations::known_migration(id),
                 "{id} is missing from `known_migration`, so its own ledger row reads as written \
                  by a future binary and `status` refuses the store as `Newer`",
             );
@@ -1753,20 +1734,26 @@ mod migration_arming {
         // The dirty marker is not a migration and has no version or checksum arm, but it rides the
         // same roster: drop it and a crashed migration's marker reads as `Newer` instead of
         // `Dirty`, which names the wrong remedy.
-        assert!(known_migration(DIRTY_MIGRATION_ID), "the dirty marker stays a recognized id");
+        assert!(
+            migrations::known_migration(DIRTY_MIGRATION_ID),
+            "the dirty marker stays a recognized id"
+        );
     }
 
     #[test]
     fn every_shipped_migration_has_a_checksum_arm() {
         for (id, checksum) in shipped_ladder() {
             assert!(
-                !migration_checksum_mismatch(&ledger_row(id, checksum)),
+                !migrations::migration_checksum_mismatch(&ledger_row(id, checksum)),
                 "{id} at its shipped checksum must not read as tampered",
             );
             // The load-bearing direction: the `_ => false` catch-all silently accepts ANY checksum
             // for an unarmed id, so a store whose migration body changed under it opens clean.
             assert!(
-                migration_checksum_mismatch(&ledger_row(id, &format!("{checksum}-tampered"))),
+                migrations::migration_checksum_mismatch(&ledger_row(
+                    id,
+                    &format!("{checksum}-tampered")
+                )),
                 "{id} has no `migration_checksum_mismatch` arm, so a changed migration body is \
                  never detected",
             );

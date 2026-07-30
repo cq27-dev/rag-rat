@@ -8,7 +8,8 @@
 //! Phase 1 is **eval-only**: no CLI command, no MCP tool (those are #69). It reads a `.scip`,
 //! joins occurrences against edge candidates, writes `edge_oracle` side rows, and emits
 //! precision/recall metrics. The heuristic resolution on the `edges` row is **never** overwritten —
-//! both coexist so eval can diff them (see [`rag_rat_db::schema::apply_oracle_tables`]).
+//! both coexist so eval can diff them (see
+//! [`rag_rat_db::schema::migrations::apply_oracle_tables`]).
 //!
 //! Layout mirrors `index/ai/`:
 //! - `scip.rs`  — `.scip` reader: per-document `position_encoding`-aware occurrence + definition

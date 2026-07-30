@@ -96,7 +96,7 @@ fn migration_073_backfills_state_normalized_from_the_provider_truthful_pair() {
     insert("2", "merged", None); // GitLab merged MR
     insert("3", "closed", None); // closed unmerged
     insert("4", "open", None);
-    rag_rat_db::schema::apply_papertrail_distill_substrate(&conn).unwrap();
+    rag_rat_db::schema::migrations::apply_papertrail_distill_substrate(&conn).unwrap();
     let normalized = |key: &str| -> String {
         conn.query_row(
             "SELECT state_normalized FROM papertrail_items WHERE item_key = ?1",
@@ -113,7 +113,7 @@ fn migration_073_backfills_state_normalized_from_the_provider_truthful_pair() {
     conn.execute("UPDATE papertrail_items SET state_normalized = 'closed' WHERE item_key = '4'", [
     ])
     .unwrap();
-    rag_rat_db::schema::apply_papertrail_distill_substrate(&conn).unwrap();
+    rag_rat_db::schema::migrations::apply_papertrail_distill_substrate(&conn).unwrap();
     assert_eq!(normalized("4"), "closed", "replay does not re-derive a stamped row");
 }
 
@@ -446,7 +446,7 @@ fn migration_078_distinguishes_candidates_from_selections() {
     // Exercise the real V077 -> V078 upgrade with existing rows. Row-id order is the deterministic
     // tie-break within each thread; a second thread starts its own zero-based ordinal sequence.
     let legacy = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_distill_record_store(&legacy).unwrap();
+    schema::migrations::apply_distill_record_store(&legacy).unwrap();
     legacy
         .execute_batch(
             "
@@ -472,7 +472,7 @@ fn migration_078_distinguishes_candidates_from_selections() {
                  INTEGER NOT NULL DEFAULT 0 CHECK(candidate_ordinal >= 0);",
         )
         .unwrap();
-    schema::apply_distill_anchor_selection(&legacy).unwrap();
+    schema::migrations::apply_distill_anchor_selection(&legacy).unwrap();
 
     let upgraded: Vec<UpgradedAnchor> = legacy
         .prepare(
@@ -544,7 +544,7 @@ fn migration_078_distinguishes_candidates_from_selections() {
         "candidate ordinals are unique within a thread",
     );
     legacy.execute("UPDATE papertrail_distill_anchors SET selected = 1 WHERE id = 2", []).unwrap();
-    schema::apply_distill_anchor_selection(&legacy).unwrap();
+    schema::migrations::apply_distill_anchor_selection(&legacy).unwrap();
     let selected: i64 = legacy
         .query_row("SELECT selected FROM papertrail_distill_anchors WHERE id = 2", [], |row| {
             row.get(0)
@@ -582,12 +582,12 @@ fn migration_079_builds_safe_input_snapshots() {
     // `LATEST_SCHEMA_VERSION` pin moved to `migration_083_*`, the new tip; this uses only the
     // symbolic checks (the hardcoded-LATEST footgun).
     let legacy = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_distill_record_store(&legacy).unwrap();
-    schema::apply_distill_anchor_selection(&legacy).unwrap();
+    schema::migrations::apply_distill_record_store(&legacy).unwrap();
+    schema::migrations::apply_distill_anchor_selection(&legacy).unwrap();
     assert!(!conn_table_columns(&legacy, "papertrail_distill").contains(&"prompt_version".into()));
     assert!(!schema::table_exists(&legacy, "papertrail_distill_sources").unwrap());
 
-    schema::apply_distill_safe_input_snapshot(&legacy).unwrap();
+    schema::migrations::apply_distill_safe_input_snapshot(&legacy).unwrap();
     let distill_columns = conn_table_columns(&legacy, "papertrail_distill");
     assert!(distill_columns.contains(&"prompt_version".into()));
     assert!(distill_columns.contains(&"model_input_hash".into()));
@@ -661,7 +661,7 @@ fn migration_079_builds_safe_input_snapshots() {
     // Torn replay: both columns and the source table survived, while the unit table/index did not.
     // The additive applier must converge without touching existing source rows.
     legacy.execute_batch("DROP TABLE papertrail_distill_units;").unwrap();
-    schema::apply_distill_safe_input_snapshot(&legacy).unwrap();
+    schema::migrations::apply_distill_safe_input_snapshot(&legacy).unwrap();
     assert!(schema::table_exists(&legacy, "papertrail_distill_units").unwrap());
     let sources: i64 = legacy
         .query_row("SELECT COUNT(*) FROM papertrail_distill_sources", [], |row| row.get(0))
@@ -686,13 +686,13 @@ fn migration_080_builds_enriched_context_snapshots() {
     // The `LATEST_SCHEMA_VERSION` pin lives on `migration_083_*`, the current tip; this uses
     // only the symbolic checks (the hardcoded-LATEST footgun).
     let legacy = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_distill_record_store(&legacy).unwrap();
-    schema::apply_distill_anchor_selection(&legacy).unwrap();
-    schema::apply_distill_safe_input_snapshot(&legacy).unwrap();
+    schema::migrations::apply_distill_record_store(&legacy).unwrap();
+    schema::migrations::apply_distill_anchor_selection(&legacy).unwrap();
+    schema::migrations::apply_distill_safe_input_snapshot(&legacy).unwrap();
     assert!(!schema::table_exists(&legacy, "papertrail_distill_fix_diffs").unwrap());
     assert!(!schema::table_exists(&legacy, "papertrail_distill_xrefs").unwrap());
 
-    schema::apply_distill_enriched_context(&legacy).unwrap();
+    schema::migrations::apply_distill_enriched_context(&legacy).unwrap();
     for table in ["papertrail_distill_fix_diffs", "papertrail_distill_xrefs"] {
         assert!(schema::table_exists(&legacy, table).unwrap(), "V080 table `{table}` exists");
     }
@@ -767,7 +767,7 @@ fn migration_080_builds_enriched_context_snapshots() {
     // Torn replay: the diff table survived, the xref table did not. The additive applier must
     // converge without touching existing rows.
     legacy.execute_batch("DROP TABLE papertrail_distill_xrefs;").unwrap();
-    schema::apply_distill_enriched_context(&legacy).unwrap();
+    schema::migrations::apply_distill_enriched_context(&legacy).unwrap();
     assert!(schema::table_exists(&legacy, "papertrail_distill_xrefs").unwrap());
     let diffs: i64 = legacy
         .query_row("SELECT COUNT(*) FROM papertrail_distill_fix_diffs", [], |row| row.get(0))
@@ -794,13 +794,13 @@ fn migration_081_adds_evidence_source_part() {
     // The evidence table predates the column: build the record store (V077) without V081, then
     // apply V081 and confirm the column appears.
     let legacy = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply_distill_record_store(&legacy).unwrap();
+    schema::migrations::apply_distill_record_store(&legacy).unwrap();
     assert!(
         !schema::column_exists(&legacy, "papertrail_distill_evidence", "source_part").unwrap(),
         "V077 evidence has no source_part",
     );
 
-    schema::apply_distill_evidence_source_part(&legacy).unwrap();
+    schema::migrations::apply_distill_evidence_source_part(&legacy).unwrap();
     assert!(
         schema::column_exists(&legacy, "papertrail_distill_evidence", "source_part").unwrap(),
         "V081 adds the source_part column",
@@ -842,7 +842,7 @@ fn migration_081_adds_evidence_source_part() {
 
     // Torn replay: the column already exists, so re-applying is a no-op, not a duplicate-column
     // error, and existing rows survive.
-    schema::apply_distill_evidence_source_part(&legacy).unwrap();
+    schema::migrations::apply_distill_evidence_source_part(&legacy).unwrap();
     let rows: i64 = legacy
         .query_row("SELECT COUNT(*) FROM papertrail_distill_evidence", [], |row| row.get(0))
         .unwrap();
@@ -1006,8 +1006,8 @@ fn migration_082_accounts_for_content_refold_work() {
 
     // A full-ladder replay recomputes the same source-derived stats and leaves queue metadata
     // intact.
-    schema::apply_content_refold_queue_and_stats(&conn).unwrap();
-    schema::apply_content_refold_queue_and_stats(&conn).unwrap();
+    schema::migrations::apply_content_refold_queue_and_stats(&conn).unwrap();
+    schema::migrations::apply_content_refold_queue_and_stats(&conn).unwrap();
     let replay_stats: Vec<(Vec<u8>, i64, i64)> = conn
         .prepare(
             "SELECT stream_id, candidate_count, candidate_bytes
@@ -1197,7 +1197,7 @@ fn migration_084_links_chunks_to_symbols() {
         )
         .unwrap();
 
-    schema::apply_chunk_symbol_id(&legacy).unwrap();
+    schema::migrations::apply_chunk_symbol_id(&legacy).unwrap();
     assert!(
         schema::column_exists(&legacy, "chunks", "symbol_id").unwrap(),
         "V084 adds the symbol_id column",
@@ -1246,7 +1246,7 @@ fn migration_084_links_chunks_to_symbols() {
 
     // Torn replay: the column already exists and every chunk is already linked, so re-applying is a
     // no-op — it neither errors nor overwrites a resolved symbol_id.
-    schema::apply_chunk_symbol_id(&legacy).unwrap();
+    schema::migrations::apply_chunk_symbol_id(&legacy).unwrap();
     let relinked: Vec<(Option<String>, Option<i64>)> = legacy
         .prepare("SELECT symbol_path, symbol_id FROM chunks ORDER BY id")
         .unwrap()
@@ -1305,7 +1305,7 @@ fn migration_085_adds_origin_and_edge_present() {
         assert!(!schema::column_exists(&legacy, t, c).unwrap(), "pre-V085 {t} has no {c}");
     }
 
-    schema::apply_sync_origin_and_edge_tombstone(&legacy).unwrap();
+    schema::migrations::apply_sync_origin_and_edge_tombstone(&legacy).unwrap();
 
     for (t, c) in added {
         assert!(schema::column_exists(&legacy, t, c).unwrap(), "V085 adds {t}.{c}");
