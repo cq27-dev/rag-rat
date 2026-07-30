@@ -3090,6 +3090,89 @@ test('a digest taken for another version of the buffer certifies nothing', async
   assert.equal((await store.dataFor(doc)).kind, 'other-content');
 });
 
+/**
+ * A digest that is held open until the test releases it, so the window the content gate spends
+ * reading and hashing the file is under the test's control. On a remote or virtual workspace that
+ * window is a network round trip, which is long enough for a server to die inside it.
+ */
+function gatedDigest(sha256) {
+  const gate = deferred();
+  const reached = deferred();
+  return {
+    gate,
+    reached,
+    of: async (doc) => {
+      reached.resolve();
+      await gate.promise;
+      return { version: doc.version, sha256 };
+    },
+  };
+}
+
+test('an answer released after the store went offline is withheld, not drawn', async () => {
+  const FileStore = await loadStore();
+  const digest = gatedDigest(INDEXED_SHA);
+  const store = new FileStore(
+    clientNaming(from(INDEXED_SHA)),
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    endpoint,
+    digest.of,
+  );
+  store.setOnline(true);
+  const doc = document();
+
+  const inFlight = store.dataFor(doc);
+  await digest.reached.promise;
+  // The server dies while the file read is outstanding: the stream errors, the status probe fails,
+  // and the reload takes the store offline and clears every overlay and diagnostic on screen.
+  store.setOnline(false);
+  digest.gate.resolve();
+
+  assert.equal(
+    (await inFlight).kind,
+    'none',
+    'a payload whose store went offline mid-hash must not be drawn back over cleared surfaces',
+  );
+  assert.equal(
+    store.shouldClearSignals('src/lib.rs'),
+    true,
+    'and the surfaces stay down, because nothing will re-ask until the next reconnect',
+  );
+});
+
+test('an answer released after the store re-pointed to another server is withheld', async () => {
+  const FileStore = await loadStore();
+  const digest = gatedDigest(INDEXED_SHA);
+  const served = { identity: 'http://127.0.0.1:18120 owner-token' };
+  const store = new FileStore(
+    clientNaming(from(INDEXED_SHA)),
+    () => 0.9,
+    () => 100,
+    (doc) => (doc.uri.toString().endsWith('lib.rs') ? 'src/lib.rs' : 'src/other.rs'),
+    async () => served.identity,
+    digest.of,
+  );
+  store.setOnline(true);
+  const doc = document();
+
+  const inFlight = store.dataFor(doc);
+  await digest.reached.promise;
+  // Discovery re-points — a restarted server on another port — and another file's load observes it
+  // first. That moves the SOURCE without moving the epoch, so an epoch check alone would let the
+  // previous server's answer through: not merely out of date, but about a different repository.
+  served.identity = 'http://127.0.0.1:18121 other-token';
+  await store.data('src/other.rs');
+  digest.gate.resolve();
+
+  assert.equal(
+    (await inFlight).kind,
+    'none',
+    'a payload the store no longer attributes to the server it is serving from must not be drawn',
+  );
+});
+
 test('the store reports where each lane value came from', async (t) => {
   const FileStore = await loadStore();
   const realNow = Date.now;

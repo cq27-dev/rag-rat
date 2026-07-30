@@ -286,13 +286,14 @@ export class FileStore {
    *
    * The premise-expiry case is why this exists. Every consumer runs the same three steps: resolve a
    * path, await the data, draw. Between step two and step three the premise can expire — the user
-   * types and the buffer goes dirty, or the workspace folder is replaced — and the answer that
-   * arrives describes a file that is no longer what the editor is showing. Drawing it puts
-   * line-anchored claims back on a buffer that was deliberately cleared moments earlier.
+   * types and the buffer goes dirty, the workspace folder is replaced, the server stops answering —
+   * and what arrives describes a file, or an index, that is no longer the one the editor is looking
+   * at. Drawing it puts line-anchored claims back on a buffer that was deliberately cleared moments
+   * earlier.
    *
-   * Re-asking `pathOf` after the await is the whole check, but it has to happen in EVERY
-   * consumer: overlays, diagnostics, both CodeLens providers, hovers, and the sidebar. Doing it
-   * here is what stops that from being five independent chances to forget.
+   * Re-checking the premises after each await is the whole check, but it would otherwise have to
+   * happen in EVERY consumer: overlays, diagnostics, both CodeLens providers, hovers, and the
+   * sidebar. Doing it here is what stops that from being five independent chances to forget.
    */
   async dataFor(document: vscode.TextDocument): Promise<FileLoad> {
     const path = this.pathOf(document);
@@ -303,11 +304,34 @@ export class FileStore {
     if (!data || this.pathOf(document) !== path) {
       return { kind: 'none' };
     }
+    // The store state this payload is entitled to be released under, read AFTER it arrived: a load
+    // that re-points mid-flight answers from the server serving NOW, so sampling before the load
+    // would refuse the first payload of every new endpoint.
+    const epoch = this.epoch;
+    const source = this.source;
     const agreed = await this.agreeingWithContent(document, data);
-    // Hashing is another await, and the same premise can expire across it. A document that stopped
-    // describing this path says nothing about content agreement, so it is `none` rather than a
-    // disagreement — the two are reported separately precisely so neither stands in for the other.
-    if (this.pathOf(document) !== path) {
+    // Hashing is another await — a whole-file read, and a network round trip on a remote or
+    // virtual workspace — and every premise the payload rests on can expire across it.
+    //
+    // A document that stopped describing this path says nothing about content agreement, so it is
+    // `none` rather than a disagreement: the two are reported separately precisely so neither
+    // stands in for the other.
+    //
+    // The store's OWN state is re-read for the same reason, and it is the one that bites hardest.
+    // The push surfaces — overlays and diagnostics — have no second chance to notice: when the
+    // server dies mid-hash the reload takes the store offline and `clearSignals()` clears them, so
+    // releasing this payload afterwards paints the dead server's clone regions and memory warnings
+    // straight back on, with nothing to correct them until a reconnect. Epoch and source are read
+    // together because they answer different questions and neither implies the other: the index
+    // moving (or reachability changing) versus a re-point to a server whose answers describe a
+    // different repository. A dropped payload publishes nothing, which is sound because every
+    // invalidation and re-point is paired with a refresh that asks again.
+    if (
+      this.pathOf(document) !== path
+      || !this.online
+      || this.epoch !== epoch
+      || this.source !== source
+    ) {
       return { kind: 'none' };
     }
     return agreed ? { kind: 'answer', path, data: agreed } : { kind: 'other-content' };
