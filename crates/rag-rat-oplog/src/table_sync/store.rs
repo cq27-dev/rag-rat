@@ -121,6 +121,28 @@ impl PendingReason {
     /// Every non-deferral variant is a version gap, INCLUDING `PartialAfterImage` (a broken
     /// producer its own doc says will not clear here) and `NoStreamContext`: as deferrals those
     /// would retry forever with nothing able to redeem them.
+    /// Whether this deferral rests on PROOF that local work would be destroyed, as opposed to an
+    /// inability to establish the row's state either way.
+    ///
+    /// The difference decides what the LIVE ingest path does. `DeferredUnresolvedWinner` is the one
+    /// reason that is merely unprovable — the row was published under a different column set and
+    /// its winning op cannot be projected — and acting on it at ingest would delay a deletion
+    /// across a version skew, which is the convergence wedge [`super::apply::apply_row_op`]
+    /// deliberately keeps `Remove` out of. The refold pays that cost because it runs at store
+    /// open with no driver to have ordered it; ingest does not, because it is the path a driver
+    /// orders.
+    pub(crate) fn is_proven_unsent_work(self) -> bool {
+        match self {
+            Self::DeferredUnsentEdit | Self::DeferredUnsentDelete | Self::DeferredUnreadableRow =>
+                true,
+            Self::DeferredUnresolvedWinner => false,
+            other => {
+                debug_assert!(!other.is_deferral(), "every deferral must state its confidence");
+                false
+            },
+        }
+    }
+
     pub(crate) fn is_deferral(self) -> bool {
         match self {
             Self::DeferredUnsentEdit

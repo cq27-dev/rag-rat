@@ -861,6 +861,76 @@ pub(crate) fn unsent_work_blocking_replay(
     })
 }
 
+/// How much doubt a caller acts on when the row's state cannot be established either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowDoubt {
+    /// Defer on ANY doubt. The refold runs at store open, with no driver to have authored local
+    /// work first, so an unprovable row is treated as unsafe to write over.
+    DeferOnAnyDoubt,
+    /// Defer on any doubt EXCEPT an unprovable verdict against a `Remove`, which is applied.
+    ///
+    /// The live ingest path takes this, and the exemption is deliberately that narrow. Holding a
+    /// deletion back on a verdict that may never resolve is the convergence wedge
+    /// [`apply_row_op`] keeps `Remove` clear of — a row deleted after a column change would become
+    /// undeletable across the skew.
+    ///
+    /// An `Upsert` gets NO exemption. It is already version-gated, so deferring one costs nothing a
+    /// skew was not costing anyway, and applying it on an unprovable verdict destroys exactly the
+    /// unsent edit this guard exists to protect. The confidence split alone is the wrong axis: it
+    /// is the OP KIND that decides whether the convergence argument applies at all.
+    DeferExceptUnprovableRemoval,
+}
+
+/// Everything that must be settled BEFORE `op` is handed to [`apply_row_op`], in the order it has
+/// to be settled in.
+///
+/// Both the live ingest path and the refold need this exact sequence, and the ordering is easy to
+/// get right in one and wrong in the other — so it lives here once. The payload goes first:
+/// whatever [`payload_verdict`] decides, no row read can change, and filing a version gap or a
+/// terminal payload under a row-state reason would move it into the retry family replayed at every
+/// store open, where nothing could redeem it. Only when the payload leaves the question open does
+/// the ROW get a say.
+pub(crate) fn pre_apply(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    stream: StreamId,
+    op: &RowOp,
+    doubt: RowDoubt,
+) -> anyhow::Result<PreApply> {
+    match payload_verdict(spec, repo_id, op) {
+        PayloadVerdict::Gap(reason) => return Ok(PreApply::Park(reason)),
+        // Terminal on its own merits. Hand it to `apply_row_op`, which quarantines it without
+        // writing — one writer of that verdict rather than two, and a terminal payload must not
+        // enter a retry family it can never leave.
+        PayloadVerdict::Rejected(_) => return Ok(PreApply::Apply),
+        PayloadVerdict::RowDecides(_) => {},
+    }
+    let Some(deferral) = unsent_work_blocking_replay(tx, spec, repo_id, stream, op)? else {
+        return Ok(PreApply::Apply);
+    };
+    // The one case a caller may act through: a deletion held back on a verdict that may never
+    // resolve. Everything else defers, including an unprovable verdict against an `Upsert` — see
+    // [`RowDoubt::DeferExceptUnprovableRemoval`] for why the op kind, not the confidence, is what
+    // makes the difference.
+    let unprovable_removal =
+        !deferral.is_proven_unsent_work() && matches!(op, RowOp::Remove { .. });
+    Ok(match doubt {
+        RowDoubt::DeferExceptUnprovableRemoval if unprovable_removal => PreApply::Apply,
+        RowDoubt::DeferOnAnyDoubt | RowDoubt::DeferExceptUnprovableRemoval =>
+            PreApply::Park(deferral),
+    })
+}
+
+/// The outcome of [`pre_apply`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreApply {
+    /// Do not apply: record this reason and leave the entry outstanding.
+    Park(PendingReason),
+    /// Nothing stands in the way — hand it to [`apply_row_op`].
+    Apply,
+}
+
 /// Claim `row_pk` as a COMPLETE projection: `hash` covers every synced column this binary knows,
 /// stamped with the TABLE's spec version, which is what defines that column set. Deliberately not
 /// the store-global projector version — that would make an unrelated table's registration mark this

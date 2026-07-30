@@ -131,6 +131,11 @@ pub(crate) fn produce_and_author(
             }
         }
     }
+    // Local work is now published, so anything ingest deferred behind it is unblocked — replay it
+    // here rather than leaving it for the next store open. This is where author-before-apply
+    // actually holds: a remote op deferred to protect a local edit gets its rematch immediately
+    // after that edit is authored, and loses on the merits instead of by default.
+    refold::replay_deferred_entries(tx, ctx.registry)?;
     Ok(authored)
 }
 
@@ -174,6 +179,39 @@ pub(crate) fn ingest(
                 else {
                     return Ok(IngestOutcome::Parked("table not in scope"));
                 };
+                // NEVER apply over unsent local work. A raw local write does not advance the row
+                // clock, so the LWW comparison below cannot see it: this op would simply win and
+                // record its OWN hash as published, after which the producer sees no delta and the
+                // local change is gone with nothing left to author it from.
+                //
+                // Deferring is safe to do HERE, which it was not before #1005: a deferral now
+                // carries its own refold trigger, so the entry is retried once the local work is
+                // authored rather than being parked and forgotten. The chain still advances — the
+                // entry is stored either way — and convergence stays on the merits, because the
+                // local edit is authored at `MAX(lamport) + 1` counting this parked entry and so
+                // wins the comparison this op would otherwise have won by default.
+                //
+                // `DeferExceptUnprovableRemoval`, unlike the refold's blanket caution: a deletion
+                // must not be held back on a verdict that may never resolve, or a row deleted after
+                // a column change becomes undeletable across the skew. That exemption is for
+                // `Remove` only — an unprovable verdict against an `Upsert` still defers, because
+                // applying it would destroy the very edit this guard exists to protect.
+                if let apply::PreApply::Park(deferral) = apply::pre_apply(
+                    tx,
+                    spec,
+                    ctx.repo_id,
+                    stream,
+                    &op,
+                    apply::RowDoubt::DeferExceptUnprovableRemoval,
+                )? {
+                    store::mark_entry_pending(
+                        tx,
+                        &entry_hash,
+                        deferral,
+                        refold::TABLE_SYNC_PROJECTOR_VERSION,
+                    )?;
+                    return Ok(IngestOutcome::Retained(deferral.as_db_str()));
+                }
                 match apply::apply_row_op(tx, spec, ctx.repo_id, &op, meta)? {
                     // A received op that lost on the merits still landed: the entry is
                     // stored, nothing is outstanding, and redelivery stays idempotent.
@@ -269,7 +307,11 @@ mod tests {
             out
         }
 
-        fn ingest_all(&mut self, entries: &[Vec<u8>], from: &DevicePublic) {
+        fn delete_row(&self) {
+            self.conn.execute("DELETE FROM t_demo WHERE id = 'r1'", []).unwrap();
+        }
+
+        fn ingest_all(&mut self, entries: &[Vec<u8>], from: &DevicePublic) -> Vec<IngestOutcome> {
             // The receiver has folded the author's DeviceAdd, so it is an effective writer here —
             // otherwise the #935 authority gate would drop every entry as Unauthorized.
             enroll_writer(&self.conn, AccountId::from_bytes([42; 32]), from.fingerprint());
@@ -281,10 +323,10 @@ mod tests {
                 registry: REGISTRY,
                 now_ms: 0,
             };
-            for bytes in entries {
-                ingest(&tx, &ctx, "demo/1", bytes, from).unwrap();
-            }
+            let out = entries.iter().map(|bytes| ingest(&tx, &ctx, "demo/1", bytes, from).unwrap());
+            let out = out.collect();
             tx.commit().unwrap();
+            out
         }
     }
 
@@ -324,6 +366,105 @@ mod tests {
         assert!(b.produce().is_empty(), "a received row never echoes back");
         // And the author does not re-emit its own already-published row.
         assert!(a.produce().is_empty(), "a published row is not re-authored");
+    }
+
+    #[test]
+    fn a_remote_upsert_does_not_clobber_an_unpublished_local_edit() {
+        // The ingest path's half of the unsent-local-work problem. A raw local write does not
+        // advance the row clock, so the LWW comparison cannot see it: a remote op simply wins and
+        // records its OWN hash as published, after which the producer sees no delta and the local
+        // edit is gone with nothing left to author it from.
+        //
+        // The refold has guarded this since #1002 because it runs at store open with no driver to
+        // order it. Ingest has the identical exposure and no guard.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'base')", []).unwrap();
+        b.ingest_all(&a.produce(), &a.pubkey());
+        assert_eq!(b.title().as_deref(), Some("base"), "both devices start converged");
+
+        // B writes locally and does not get to author before A's next entry arrives.
+        b.set_title("unsent-B");
+        a.set_title("from-A");
+        let from_a = a.produce();
+        assert_eq!(from_a.len(), 1);
+        b.ingest_all(&from_a, &a.pubkey());
+
+        assert_eq!(b.title().as_deref(), Some("unsent-B"), "the unsent local edit survives");
+        assert_eq!(
+            b.produce().len(),
+            1,
+            "and is still authorable, so it competes on the merits instead of vanishing",
+        );
+    }
+
+    #[test]
+    fn a_remote_upsert_does_not_resurrect_a_row_deleted_locally_but_not_yet_authored() {
+        // The delete half, and the subtler one: the row is GONE, so there is no current state for a
+        // comparison to catch — but the surviving published identity is exactly what the producer's
+        // `Remove` branch keys on. A remote upsert recreates the row AND re-records its published
+        // hash, after which the producer sees no delta and the deletion is undone for good.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'base')", []).unwrap();
+        b.ingest_all(&a.produce(), &a.pubkey());
+
+        // B deletes locally and does not get to author the removal.
+        b.delete_row();
+        a.set_title("from-A");
+        b.ingest_all(&a.produce(), &a.pubkey());
+
+        assert_eq!(b.title(), None, "the unauthored local deletion survives");
+        assert_eq!(b.produce().len(), 1, "and is still authorable, so it reaches peers");
+    }
+
+    #[test]
+    fn two_devices_with_unsent_edits_converge_through_the_deferral() {
+        // Deferring at ingest must not cost convergence — it has to change WHEN an op is applied,
+        // never whether the devices agree. Both devices hold an unsent edit, and B receives A's
+        // entry before it has authored its own, so B defers.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'base')", []).unwrap();
+        b.ingest_all(&a.produce(), &a.pubkey());
+
+        a.set_title("from-A");
+        b.set_title("from-B");
+
+        // A authors first. B, still holding its own unsent edit, defers rather than clobbering it.
+        let from_a = a.produce();
+        assert_eq!(b.ingest_all(&from_a, &a.pubkey()), vec![IngestOutcome::Retained(
+            crate::table_sync::store::PendingReason::DeferredUnsentEdit.as_db_str()
+        )],);
+        assert_eq!(b.title().as_deref(), Some("from-B"), "B's edit is intact");
+
+        // B authors, which takes `MAX(lamport) + 1` counting the entry it parked — so B's edit is
+        // causally later — and settles that entry in the same pass.
+        let from_b = b.produce();
+        assert_eq!(from_b.len(), 1);
+        a.ingest_all(&from_b, &b.pubkey());
+
+        assert_eq!(
+            (a.title().as_deref(), b.title().as_deref()),
+            (Some("from-B"), Some("from-B")),
+            "both devices converge on the causally-later edit, not on a coin flip",
+        );
+        for device in [&a, &b] {
+            assert_eq!(
+                device
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM table_sync_entries WHERE pending_reason IS NOT NULL",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0,
+                "and nothing is left outstanding on either side",
+            );
+        }
+        // Steady state: neither device has anything more to say.
+        assert!(a.produce().is_empty() && b.produce().is_empty());
     }
 
     #[test]

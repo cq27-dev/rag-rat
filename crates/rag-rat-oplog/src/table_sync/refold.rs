@@ -81,10 +81,11 @@ const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
 /// this store and could re-create the legacy state after we stamped" is the obvious objection.
 /// There are exactly TWO writers of a pending mark, and neither can:
 ///
-/// - **Ingest** ([`super::engine`]) marks from `ApplyOutcome::Unprojectable`, which is
-///   [`super::apply::PayloadVerdict::Gap`] — decided on the payload alone, so it is a version gap
-///   by construction and never a deferral, whatever the row holds. It cannot write a misclassified
-///   mark, in any binary.
+/// - **Ingest** ([`super::engine`]) reaches a version gap only through
+///   [`super::apply::PayloadVerdict::Gap`], decided on the payload alone — so the reason it records
+///   there means the same thing under every vocabulary, whatever the row holds. (Since #1056 it
+///   records deferrals too, but only reasons from THIS vocabulary: a binary predating a vocabulary
+///   has no way to name its states, so it cannot write them.)
 /// - **[`repark`]** only runs inside a pass, and a pass is gated on [`refold_owed`]. An older
 ///   binary's triggers are all version-based, so once the projector stamp is current and every
 ///   pending entry sits at that version, its refold does not run at all — which is precisely the
@@ -126,12 +127,38 @@ pub(crate) fn refold_stale_projections_against(
     // `refold_owed` already excludes a newer stamp; re-assert inside the write txn so this stays
     // honest if that predicate ever changes.
     assert_projector_not_newer(&tx)?;
-    for pending in store::pending_entries(&tx, owed.worklist())? {
-        replay_pending_entry(&tx, registry, &pending)?;
-    }
+    replay_worklist(&tx, registry, owed.worklist())?;
     stamp_fold_versions(&tx)?;
     tx.commit()?;
     Ok(true)
+}
+
+/// Replay entries deferred behind LOCAL ROW STATE, inside the CALLER's transaction.
+///
+/// The producer's counterpart to the store-open pass, and the reason a deferral is a usable state
+/// rather than one that only clears on restart: the moment local work is authored, the thing those
+/// entries were blocked behind is gone, so this is exactly when they are worth another look.
+///
+/// Running it here is also what makes "author local before applying remote" hold BY CONSTRUCTION at
+/// this seam, instead of being a convention every future driver has to remember. It is deliberately
+/// narrowed to the deferral family — authoring says nothing about a version gap — and deliberately
+/// does not stamp: it is not a full fold, and claiming one would let a genuine gap go unreplayed.
+pub(crate) fn replay_deferred_entries(
+    tx: &Transaction<'_>,
+    registry: &[TableSpec],
+) -> anyhow::Result<()> {
+    replay_worklist(tx, registry, Worklist::Deferrals)
+}
+
+fn replay_worklist(
+    tx: &Transaction<'_>,
+    registry: &[TableSpec],
+    worklist: Worklist,
+) -> anyhow::Result<()> {
+    for pending in store::pending_entries(tx, worklist)? {
+        replay_pending_entry(tx, registry, &pending)?;
+    }
+    Ok(())
 }
 
 /// What a refold pass is owed, and therefore how much of the pending set it has to replay.
@@ -259,34 +286,25 @@ fn replay_pending_entry(
     else {
         return repark(tx, pending, PendingReason::TableNotInScope);
     };
-    // Settle the PAYLOAD question before the ROW question. Whatever the payload alone decides, the
-    // row cannot change — so consulting the guard first would file a version gap, or a payload
-    // terminal on its own merits, under the deferral family instead: replayed at every open until
-    // some unrelated local edit happened to be authored, with the real reason no longer recorded
-    // anywhere. The verdict is pure, so asking it first is free.
-    match apply::payload_verdict(spec, &context.repo_id, &op) {
-        apply::PayloadVerdict::Gap(reason) => return repark(tx, pending, reason),
-        // Terminal. Falls through to the apply path below, which records the quarantine — one
-        // writer of that verdict rather than two.
-        apply::PayloadVerdict::Rejected(_) => {},
-        // Only here does the row have a say. NEVER replay over an unsent local edit: a raw local
-        // write does not advance the row clock, so the LWW comparison cannot see it and this older
-        // entry would simply win — silently destroying a change no peer has ever seen, at store
-        // open, before anything has had a chance to author it. Park it on WHICH local state is in
-        // the way: once the producer authors that edit (at a lamport above this entry's, since
-        // authoring counts parked entries), a later replay lands and loses on the merits — and
-        // until then the deferral reason is what brings the entry back for another look at every
-        // open, since no version bump can signal that the row moved.
-        apply::PayloadVerdict::RowDecides(_) =>
-            if let Some(deferral) = apply::unsent_work_blocking_replay(
-                tx,
-                spec,
-                &context.repo_id,
-                pending.stream_id,
-                &op,
-            )? {
-                return repark(tx, pending, deferral);
-            },
+    // NEVER replay over unsent local work. A raw local write does not advance the row clock, so the
+    // LWW comparison cannot see it and this older entry would simply win — silently destroying a
+    // change no peer has ever seen, at store open, before anything has had a chance to author it.
+    // Park it on WHICH state is in the way: once the producer authors that edit (at a lamport above
+    // this entry's, since authoring counts parked entries), a later replay lands and loses on the
+    // merits — and until then the deferral reason is what brings the entry back for another look,
+    // since no version bump can signal that the row moved.
+    //
+    // `DeferOnAnyDoubt`: nothing ordered a producer before this pass, so a row whose state cannot
+    // be established either way is treated as unsafe to write over.
+    if let apply::PreApply::Park(reason) = apply::pre_apply(
+        tx,
+        spec,
+        &context.repo_id,
+        pending.stream_id,
+        &op,
+        apply::RowDoubt::DeferOnAnyDoubt,
+    )? {
+        return repark(tx, pending, reason);
     }
     let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
     match apply::apply_row_op(tx, spec, &context.repo_id, &op, meta)? {
@@ -840,6 +858,52 @@ mod tests {
     }
 
     #[test]
+    fn ingest_defers_an_upsert_whose_row_state_cannot_be_established() {
+        // The live path's exemption is for `Remove` ONLY. An unprovable verdict against an UPSERT
+        // still defers: the row may hold an unsent raw edit, and a winning upsert rewrites every
+        // synced column and records its own hash as published — destroying the edit with nothing
+        // left to author it from, which is exactly #1056. The convergence argument that lets a
+        // deletion through does not reach an upsert, because an upsert is version-gated anyway, so
+        // deferring one costs nothing the skew was not costing already.
+        let mut a = Device::new();
+        let mut b = Device::new();
+
+        // B publishes r1 under the OLD column set, edits it raw, then loses its own winning entry —
+        // the shape retention/GC leaves behind if it drops a winner without first refreshing the
+        // row's publication record.
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'mine', NULL)", [])
+            .unwrap();
+        assert_eq!(b.produce(OLD_REGISTRY, "repo").len(), 1, "r1 is published under the old spec");
+        b.conn.execute("UPDATE t_demo SET title = 'edited' WHERE id = 'r1'", []).unwrap();
+        b.conn.execute("DELETE FROM table_sync_entries", []).unwrap();
+
+        // A authors twice, so the entry that matters outranks B's row clock and would win.
+        a.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'a1', 'wide')", [])
+            .unwrap();
+        let mut entries = a.produce(NEW_REGISTRY, "repo");
+        a.conn.execute("UPDATE t_demo SET title = 'a2' WHERE id = 'r1'", []).unwrap();
+        entries.extend(a.produce(NEW_REGISTRY, "repo"));
+
+        // Ingested under the WIDER registry, so the payload projects cleanly and the only thing in
+        // question is the row.
+        b.enroll(a.pubkey().fingerprint());
+        let outcomes = b.ingest(NEW_REGISTRY, "repo", &entries, &a.pubkey());
+        assert!(
+            outcomes.iter().all(|outcome| *outcome
+                == IngestOutcome::Retained(PendingReason::DeferredUnresolvedWinner.as_db_str())),
+            "each upsert is deferred rather than applied: {outcomes:?}",
+        );
+        assert_eq!(b.row().unwrap().0, "edited", "the possibly-unsent local edit survives");
+        assert_eq!(
+            b.produce(NEW_REGISTRY, "repo").len(),
+            1,
+            "and is still authorable, so it competes on the merits",
+        );
+    }
+
+    #[test]
     fn the_refold_defers_when_the_rows_winner_cannot_be_resolved_at_all() {
         // The UNPROVABLE arm of the same guard. When a row's winning entry cannot be resolved, the
         // projection comparison is unavailable and there is no way to tell an untouched row from an
@@ -1228,6 +1292,12 @@ mod tests {
     fn a_remove_crosses_a_spec_version_skew_unimpeded() {
         // A remove names only the row identity, so no column set is involved and its version is
         // never acted on. Gating it would delay deletions across a skew for no benefit.
+        //
+        // This is also the case that pins ingest's one guard exemption
+        // (`RowDoubt::DeferExceptUnprovableRemoval`): B's row was published under the wider column
+        // set, so the unsent-work guard cannot resolve its winner under the narrower spec and
+        // returns `DeferredUnresolvedWinner`. Deferring on that would make a row deleted after a
+        // column change undeletable until B upgrades.
         let mut a = Device::new();
         let mut b = Device::new();
         a.conn
@@ -1756,18 +1826,44 @@ mod tests {
     }
 
     #[test]
-    fn a_deferral_marked_at_the_current_version_is_retried_on_the_next_open() {
-        // The #1005 bug. An entry deferred behind local row state is redeemed by the ROW changing —
-        // the edit gets authored, the unreadable cell repaired — which no projector version can
-        // express and no upgrade implies. Without a trigger keyed on the deferral itself, an entry
-        // parked by THIS binary is never looked at again, and redelivery cannot rescue it (it
-        // short-circuits on `entry_exists`).
+    fn authoring_the_local_edit_settles_the_deferral_in_the_same_pass() {
+        // The producer is the deferral's natural redeemer: the moment the local work is published,
+        // the thing the entry was blocked behind is gone. Doing it inside that pass is what makes
+        // author-before-apply hold by construction, and it means a deferral does not have to wait
+        // for a restart to clear (#1056).
         let mut a = Device::new();
         let mut b = Device::new();
         defer_over_an_unsent_edit(&mut a, &mut b);
 
-        // Authoring the edit publishes the row, so nothing stands in the replay's way any more.
         assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1, "the local edit is authored");
+        assert_eq!(b.pending_count(), 0, "and the deferred entry settles in that same pass");
+        assert_eq!(
+            b.row().unwrap().0,
+            "unsent",
+            "losing the LWW comparison to the edit it was protecting, rather than by default",
+        );
+        assert!(
+            !refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap(),
+            "leaving nothing for the next store open to do"
+        );
+    }
+
+    #[test]
+    fn a_deferral_marked_at_the_current_version_is_retried_on_the_next_open() {
+        // The #1005 bug, on the path the producer does NOT redeem. An entry deferred behind local
+        // row state is redeemed by the ROW changing, which no projector version can express and no
+        // upgrade implies — so without a trigger keyed on the deferral itself, an entry parked by
+        // THIS binary is never looked at again, and redelivery cannot rescue it (it short-circuits
+        // on `entry_exists`).
+        //
+        // Redemption here is the local row being DISCARDED, not authored — the row was purely local
+        // (no apply ever published it), so once it is gone there is nothing left to protect.
+        // Nothing produces, so the store-open trigger is the only thing that can settle it.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        defer_over_an_unsent_edit(&mut a, &mut b);
+
+        b.conn.execute("DELETE FROM t_demo WHERE id = 'r1'", []).unwrap();
 
         assert!(
             refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap(),
@@ -1775,9 +1871,9 @@ mod tests {
         );
         assert_eq!(b.pending_count(), 0, "and the entry finally settles, on the merits");
         assert_eq!(
-            b.row().unwrap().0,
-            "unsent",
-            "losing the LWW comparison to the edit it was protecting"
+            b.row(),
+            Some(("v1".to_string(), Some("wide".to_string()))),
+            "the replayed entry lands in full once nothing is in its way",
         );
     }
 
@@ -1827,23 +1923,25 @@ mod tests {
         );
 
         // From here the ordinary deferral machinery takes over, and the entry is no longer
-        // stranded.
+        // stranded: authoring the edit settles it.
         assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1);
-        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
         assert_eq!(b.pending_count(), 0);
     }
 
     #[test]
-    fn ingest_classifies_on_the_payload_alone_and_never_writes_a_deferral() {
-        // What makes ONE store-global vocabulary stamp sufficient. The worry it has to answer is an
-        // older binary sharing the store and re-creating the legacy state after we stamped; the
-        // answer is that only a refold pass can write a stale classification, and an older binary's
-        // pass cannot run once the projector stamp and every pending mark are current.
+    fn ingest_marks_an_unprojectable_payload_as_a_version_gap_even_over_unsent_work() {
+        // Two properties at once, and they are the same property.
         //
-        // That argument rests on the OTHER writer — ingest — never producing a deferral, which it
-        // cannot, because it classifies from the payload alone and never looks at the row. This
-        // pins that: the row here holds an unsent local edit, so a row-aware ingest would have
-        // something to find, and finding it would silently break the reachability argument above.
+        // The ORDERING: an entry this binary cannot project is a version gap whatever the row
+        // holds, so the payload has to be settled before the row is consulted. The row here
+        // holds an unsent local edit, so the guard would fire — and filing that as a
+        // deferral would erase the version gap and move the entry into the family replayed
+        // at every store open, where nothing could redeem it.
+        //
+        // The VOCABULARY argument that lets one store-global stamp cover a shared store also rests
+        // on this: a version-gap reason means the same thing under every vocabulary, so ingest
+        // recording one is safe in any binary. Ingest also records deferrals now, but only ones
+        // this vocabulary can name.
         let mut a = Device::new();
         let mut b = Device::new();
         let entries = author_wide_row(&mut a);
@@ -1919,12 +2017,10 @@ mod tests {
                 TABLE_SYNC_PROJECTOR_VERSION
             )),
         );
-        assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1, "the removal is authored");
-
         // SETTLEMENT is the observable here, not the row. The authored `Remove` takes
         // `MAX(lamport) + 1` counting the parked entries, so the row stays deleted whether or not
         // they are ever replayed — a content assertion would pass with the retry deleted.
-        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1, "the removal is authored");
         assert_eq!(b.pending_count(), 0, "both deferred upserts lose to the tombstone and clear");
         assert_eq!(b.row(), None);
     }
@@ -2360,11 +2456,12 @@ mod tests {
             1,
             "this opener authors the edit"
         );
-        assert!(
-            second.refold(NEW_REGISTRY).unwrap(),
-            "and is the one owed the deferred entry's replay"
+        assert_eq!(
+            second.pending_count(),
+            0,
+            "and settles the deferral the OTHER opener recorded — the mark and its trigger are \
+             file state, not connection state",
         );
-        assert_eq!(second.pending_count(), 0);
         assert_eq!(second.row().unwrap().0, "unsent");
     }
 
