@@ -732,29 +732,10 @@ mod tests {
         let b_stream = seed_table_sync_stream(conn, POISON_REPO_ID, 0xbb);
         let a_stream = seed_table_sync_stream(conn, &repo_a, 0xaa);
 
-        // The multi-checkout shape: a linked worktree registers a SECOND root under the SAME
-        // `repo_id`, which is the only thing about it the store records — the stream directory is
-        // keyed by `(repo_id, account_id, scope_id)` with no checkout dimension, so both checkouts
-        // share one stream row set and a purge from either must take it exactly once. Seeding the
-        // second root pins that: if the purge ever grew a per-checkout predicate, a repo reachable
-        // from two roots would leave half its rows behind.
-        // Plain INSERT, not `INSERT OR IGNORE`: OR IGNORE would swallow a missing NOT NULL column
-        // and leave the scenario un-seeded while the test still read as passing.
-        for root in ["/tmp/zz_poison_main_checkout", "/tmp/zz_poison_linked_worktree"] {
-            conn.execute(
-                "INSERT INTO repo_roots(repo_id, root, registered_at_ms) VALUES (?1, ?2, 0)",
-                params![POISON_REPO_ID, root],
-            )
-            .unwrap();
-        }
-        let b_roots: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM repo_roots WHERE repo_id = ?1",
-                params![POISON_REPO_ID],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(b_roots >= 2, "the victim must be reachable from more than one checkout");
+        // The multi-checkout dimension of this purge is covered where it can be exercised for real:
+        // `schema_bootstrap_tests::worktree_purge` builds a main checkout and a linked worktree
+        // sharing one database, resolves the removal through the linked one, and asserts a sibling
+        // repo's stream-keyed log survives. This tripwire stays about class-level completeness.
 
         // The full class-level table set, captured from the LIVE schema. A subset here would
         // silently narrow the guarantee, so pin a floor on its breadth.

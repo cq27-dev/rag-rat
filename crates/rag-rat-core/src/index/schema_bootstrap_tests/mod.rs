@@ -989,3 +989,4 @@ mod swift_corpus;
 mod symbol_search_lookup;
 mod watch_placement;
 mod worktree_overlay;
+mod worktree_purge;
