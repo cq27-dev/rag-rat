@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use path_slash::PathExt;
 
 use super::{
-    self as config, Config, ConfigError, DEFAULT_SYNC_RELAY, DistillLlmConfig,
-    EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel, MemoryConfig, MemorySurface,
-    OracleConfig, OracleLiveConfig, RawConfig, RawMemory, RawOracle, RawSearch, RawSync, RawTarget,
-    RawVersionCheck, RawWatch, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig,
-    ResolvedTarget, SearchConfig, SyncConfig, TargetKind, TrackerAuth, VersionCheckConfig,
-    WatchConfig,
+    self as config, Config, ConfigError, DEFAULT_DISCOVERY_NODE, DEFAULT_SYNC_RELAY,
+    DistillLlmConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel,
+    MemoryConfig, MemorySurface, OracleConfig, OracleLiveConfig, RawConfig, RawMemory, RawOracle,
+    RawSearch, RawSync, RawTarget, RawVersionCheck, RawWatch, RemoteBackend, RemoteDreamConfig,
+    RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, SyncConfig, TargetKind, TrackerAuth,
+    VersionCheckConfig, WatchConfig,
 };
 use crate::language::Language;
 
@@ -2212,6 +2212,37 @@ fn sync_server_peers_default_empty_and_dedupe_while_push_interval_defaults() {
         "server_peers are trimmed, de-duplicated, and blanks dropped, order preserved"
     );
     assert_eq!(sync.push_interval_secs, 60, "[sync] push_interval_secs overrides the default");
+}
+
+#[test]
+fn sync_discovery_defaults_to_off_for_publishing_and_to_the_shipped_service_node() {
+    let default: SyncConfig = RawSync::default().into();
+    assert!(
+        !default.discoverable,
+        "publishing this device to the discovery service is opt-in; fetching is not gated on it"
+    );
+    assert_eq!(
+        default.discovery_node_id, DEFAULT_DISCOVERY_NODE,
+        "an absent [sync] block uses the shipped discovery service node id"
+    );
+
+    let raw: RawConfig = toml::from_str(
+        "[index]\nroot = \".\"\n\n[sync]\ndiscoverable = true\ndiscovery_node_id = \" abc123 \"\n",
+    )
+    .unwrap();
+    let sync: SyncConfig = raw.sync.into();
+    assert!(sync.discoverable, "[sync] discoverable = true opts this device into publishing");
+    assert_eq!(sync.discovery_node_id, "abc123", "discovery_node_id is trimmed");
+
+    // A blank node id falls back to the shipped default: an empty one would disable discovery in a
+    // way indistinguishable from discovery simply not working.
+    let raw: RawConfig =
+        toml::from_str("[index]\nroot = \".\"\n\n[sync]\ndiscovery_node_id = \"   \"\n").unwrap();
+    let sync: SyncConfig = raw.sync.into();
+    assert_eq!(
+        sync.discovery_node_id, DEFAULT_DISCOVERY_NODE,
+        "a blank discovery_node_id falls back to the default"
+    );
 }
 
 #[test]

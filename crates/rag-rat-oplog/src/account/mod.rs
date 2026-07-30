@@ -52,7 +52,8 @@ pub use bootstrap::{
     AuthoredDurability, ENROLLMENT_HELD_ENTRY_HASHES_MAX, EnrollmentBootstrap, EnrollmentBudget,
     adopt_enrollment_bootstrap, adopt_local_account, enrollment_budget, held_account_entry_hashes,
     local_account, prune_account_candidate_reservations_in_tx, read_local_account,
-    release_account_candidate_reservation_in_tx, upsert_account_candidate_reservation_in_tx,
+    read_local_account_genesis, release_account_candidate_reservation_in_tx,
+    upsert_account_candidate_reservation_in_tx,
 };
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub use content::{

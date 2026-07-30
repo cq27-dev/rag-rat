@@ -260,6 +260,97 @@ impl DiscoveryResponse {
     }
 }
 
+/// The SERVICE's half of the contract, for the in-process stub the tests run against.
+///
+/// Test-only on purpose: rag-rat is a client and never serves discovery, so shipping these would be
+/// dead production surface. They exist because a stub that spoke a convenient encoding instead of
+/// the real one would let the client's own bugs pass — the stub has to be as literal as the
+/// service. `the_service_side_encoder_reproduces_the_measured_response_bytes` pins that by
+/// re-deriving the measured golden vectors through this encoder.
+#[cfg(test)]
+impl DiscoveryResponse {
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(2).expect(INFALLIBLE);
+        match self {
+            Self::Published { withdraw_token } => {
+                enc.u32(0).expect(INFALLIBLE);
+                enc.array(1).expect(INFALLIBLE);
+                encode_byte_array(&mut enc, withdraw_token);
+            },
+            Self::Fetched { announcements } => {
+                enc.u32(1).expect(INFALLIBLE);
+                enc.array(1).expect(INFALLIBLE);
+                enc.array(announcements.len() as u64).expect(INFALLIBLE);
+                for announcement in announcements {
+                    enc.array(2).expect(INFALLIBLE);
+                    encode_byte_array(&mut enc, &announcement.payload);
+                    enc.i64(announcement.expires_at_ms).expect(INFALLIBLE);
+                }
+            },
+            Self::Withdrawn => {
+                enc.u32(2).expect(INFALLIBLE);
+                enc.array(0).expect(INFALLIBLE);
+            },
+            Self::Error { code, message } => {
+                enc.u32(3).expect(INFALLIBLE);
+                enc.array(2).expect(INFALLIBLE);
+                // The code is itself an enum on the wire: `[index, []]`.
+                enc.array(2).expect(INFALLIBLE);
+                enc.u32(match code {
+                    DecodedErrorCode::Known(known) => known.index(),
+                    DecodedErrorCode::Unknown(index) => *index,
+                })
+                .expect(INFALLIBLE);
+                enc.array(0).expect(INFALLIBLE);
+                enc.str(message).expect(INFALLIBLE);
+            },
+        }
+        buf
+    }
+}
+
+#[cfg(test)]
+impl DiscoveryRequest {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, WireError> {
+        let mut dec = Decoder::new(bytes);
+        let outer = dec.array()?.ok_or_else(|| WireError("indefinite-length request".into()))?;
+        if outer != 2 {
+            return Err(WireError(format!("request envelope has {outer} items, expected 2")));
+        }
+        let variant = dec.u32()?;
+        let fields = dec.array()?.ok_or_else(|| WireError("indefinite-length fields".into()))?;
+        let tag = |dec: &mut Decoder<'_>| -> Result<[u8; TAG_LEN], WireError> {
+            let bytes = decode_byte_vec(dec, TAG_LEN as u64)?;
+            <[u8; TAG_LEN]>::try_from(bytes.as_slice())
+                .map_err(|_| WireError("tag is not 32 bytes".into()))
+        };
+        Ok(match variant {
+            0 => {
+                expect_fields(fields, 3, "Publish")?;
+                Self::Publish {
+                    tag: tag(&mut dec)?,
+                    payload: decode_byte_vec(&mut dec, MAX_FRAME_LEN as u64)?,
+                    ttl_seconds: dec.u32()?,
+                }
+            },
+            1 => {
+                expect_fields(fields, 1, "Fetch")?;
+                Self::Fetch { tag: tag(&mut dec)? }
+            },
+            2 => {
+                expect_fields(fields, 2, "Withdraw")?;
+                Self::Withdraw {
+                    tag: tag(&mut dec)?,
+                    withdraw_token: decode_byte_vec(&mut dec, MAX_FRAME_LEN as u64)?,
+                }
+            },
+            other => return Err(WireError(format!("unknown request variant {other}"))),
+        })
+    }
+}
+
 fn expect_fields(actual: u64, expected: u64, what: &str) -> Result<(), WireError> {
     if actual == expected {
         Ok(())
@@ -388,6 +479,48 @@ mod tests {
                 message: "slow down".into(),
             },
         );
+    }
+
+    /// The stub the transport tests run against answers with the test-only service-side encoder, so
+    /// that encoder has to produce the SAME bytes the real service does — otherwise those tests
+    /// validate the client against a fiction. Re-deriving the measured vectors through it is the
+    /// pin. Mutate any arm of `DiscoveryResponse::encode` and this fails.
+    #[test]
+    fn the_service_side_encoder_reproduces_the_measured_response_bytes() {
+        for (measured, response) in [
+            ("820081820102", DiscoveryResponse::Published { withdraw_token: vec![1, 2] }),
+            ("82018180", DiscoveryResponse::Fetched { announcements: Vec::new() }),
+            ("820181818281091b0000018bcfe56800", DiscoveryResponse::Fetched {
+                announcements: vec![WireAnnouncement {
+                    payload: vec![0x09],
+                    expires_at_ms: 1_700_000_000_000,
+                }],
+            }),
+            ("820280", DiscoveryResponse::Withdrawn),
+            ("82038282008069736c6f7720646f776e", DiscoveryResponse::Error {
+                code: DecodedErrorCode::Known(DiscoveryErrorCode::RateLimited),
+                message: "slow down".into(),
+            }),
+        ] {
+            assert_eq!(hex(&response.encode()), measured, "re-encoding {response:?}");
+        }
+    }
+
+    /// The stub's request decoder is the other half of that mirror: it must read exactly what this
+    /// client writes, including the integer-array encoding of a tag.
+    #[test]
+    fn the_service_side_decoder_reads_every_request_this_client_writes() {
+        for request in [
+            DiscoveryRequest::Publish {
+                tag: [0x01; TAG_LEN],
+                payload: vec![0xde, 0xad],
+                ttl_seconds: 900,
+            },
+            DiscoveryRequest::Fetch { tag: [0xab; TAG_LEN] },
+            DiscoveryRequest::Withdraw { tag: [0x01; TAG_LEN], withdraw_token: vec![0x07] },
+        ] {
+            assert_eq!(DiscoveryRequest::decode(&request.encode()).unwrap(), request);
+        }
     }
 
     /// A code a NEWER service adds must decode, not fail. Otherwise "the service told me why it

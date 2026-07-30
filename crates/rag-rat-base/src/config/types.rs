@@ -301,6 +301,15 @@ impl Default for VersionCheckConfig {
 /// `[sync] relay_url`, and per-invocation via the `RAG_RAT_SYNC_RELAY` env var at the call site.
 pub const DEFAULT_SYNC_RELAY: &str = "https://relay.cq27.dev";
 
+/// The project's shipped default peer-discovery service.
+///
+/// This is a node id, NOT a URL: the discovery service is a separate iroh peer reached BY NODE ID
+/// through [`DEFAULT_SYNC_RELAY`], not the relay itself. Overridable via `[sync]
+/// discovery_node_id`, and per-invocation via the `RAG_RAT_SYNC_DISCOVERY_NODE` env var at the call
+/// site.
+pub const DEFAULT_DISCOVERY_NODE: &str =
+    "c2c133affcb63f044efb808e8d1746ebe4f0425576cbc45878d4531446106583";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncConfig {
     /// The iroh relay URL peers pin for discovery and relay fallback. Defaults to
@@ -316,6 +325,21 @@ pub struct SyncConfig {
     /// Minimum seconds between device-side sync attempts on the maintenance path (default 300).
     /// `0` attempts on every trigger. Only consulted when `server_peers` is non-empty.
     pub push_interval_secs: u64,
+    /// Advertise this device's node id to the peer-discovery service so the account's other
+    /// devices can dial it without a static `server_peers` entry (default false).
+    ///
+    /// Publishing is opt-in but FETCHING is not: a device that does not advertise itself still
+    /// learns where its peers are, which is what lets a machine behind NAT reach a server without
+    /// becoming discoverable itself. Turning this on is what makes an always-on host findable.
+    pub discoverable: bool,
+    /// The peer-discovery service's node id — a NODE ID, not a URL, dialed through
+    /// [`relay_url`](Self::relay_url). Defaults to [`DEFAULT_DISCOVERY_NODE`]. The
+    /// `RAG_RAT_SYNC_DISCOVERY_NODE` env var overrides this at the call site (ops/tests).
+    ///
+    /// The FORMAT is validated at dial time, like [`server_peers`](Self::server_peers) — the
+    /// config layer has no iroh dependency. An unparseable value disables discovery for the
+    /// pass and is logged; it never fails a sync.
+    pub discovery_node_id: String,
 }
 
 impl Default for SyncConfig {
@@ -324,6 +348,8 @@ impl Default for SyncConfig {
             relay_url: DEFAULT_SYNC_RELAY.to_string(),
             server_peers: Vec::new(),
             push_interval_secs: 300,
+            discoverable: false,
+            discovery_node_id: DEFAULT_DISCOVERY_NODE.to_string(),
         }
     }
 }

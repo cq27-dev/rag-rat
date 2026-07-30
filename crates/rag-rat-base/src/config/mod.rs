@@ -204,12 +204,12 @@ pub(crate) use raw::{RawConfig, RawTarget, resolve_relative_cookbook_path};
 pub(crate) use raw::{RawMemory, RawOracle, RawSearch, RawSync, RawVersionCheck, RawWatch};
 pub use raw::{endpoint_authority_has_userinfo, valid_tracker_base_url, valid_tracker_project};
 pub use types::{
-    Config, DEFAULT_QUERY_ENDPOINT, DEFAULT_SYNC_RELAY, DistillLlmConfig, DreamLlmConfig,
-    EmbeddingBackend, EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat,
-    LogLevel, MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig,
-    OracleLiveConfig, PapertrailConfig, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig,
-    ResolvedTarget, SearchConfig, SyncConfig, TargetKind, Tracker, TrackerAuth, TrackerConfig,
-    VersionCheckConfig, WatchConfig,
+    Config, DEFAULT_DISCOVERY_NODE, DEFAULT_QUERY_ENDPOINT, DEFAULT_SYNC_RELAY, DistillLlmConfig,
+    DreamLlmConfig, EmbeddingBackend, EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig,
+    LogConfig, LogFormat, LogLevel, MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface,
+    OracleConfig, OracleLiveConfig, PapertrailConfig, RemoteBackend, RemoteDreamConfig,
+    RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, SyncConfig, TargetKind, Tracker,
+    TrackerAuth, TrackerConfig, VersionCheckConfig, WatchConfig,
 };
 
 #[cfg(test)]

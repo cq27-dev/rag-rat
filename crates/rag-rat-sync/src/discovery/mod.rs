@@ -18,6 +18,11 @@
 
 pub mod wire;
 
+#[cfg(test)]
+mod stub;
+#[cfg(test)]
+mod tests;
+
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr};
@@ -74,39 +79,112 @@ pub fn account_tag(secret: &[u8; 32]) -> [u8; TAG_LEN] {
     hasher.finalize().into()
 }
 
+/// The key material [`account_tag`] is computed under, or `None` when this store has no account
+/// (nothing to discover: a restoring-from-zero device holds a ticket with an explicit address).
+///
+/// A SINGLE SEAM ON PURPOSE. The account's genesis entry hash is used because it is stable forever
+/// and present on every enrolled device — unlike the stream key, which rotates and whose sealing
+/// selection may fall back to a lower epoch, so two devices could compute different tags at the
+/// same moment.
+///
+/// The honest limitation: the genesis hash is an IDENTIFIER, not a rotatable secret. If it leaks —
+/// a log, a debug dump, a pasted diagnostic — the tag becomes computable by whoever saw it and
+/// CANNOT be rotated. It is still strictly better than the account id, which is broadcast to every
+/// dialed host by design (it is the dialer's first frame, sent before the peer proves anything).
+/// The upgrade is a purpose-built discovery secret sealed to roster-effective devices; routing all
+/// key material through this one function is what keeps that change from touching the wire, the tag
+/// domain, the client, or the driver.
+pub fn discovery_secret(conn: &rusqlite::Connection) -> anyhow::Result<Option<[u8; 32]>> {
+    rag_rat_oplog::read_local_account_genesis(conn)
+}
+
+/// The TTL to publish under, given the device-sync cadence.
+///
+/// The service APPENDS and never replaces, reaping only on expiry, and caps a tag at 8 live
+/// announcements — so a device holds `ceil(ttl / cadence)` simultaneous copies of ITSELF.
+/// Publishing at the service maximum (900s) on the default 300s cadence would be 3 copies per
+/// device, and a perfectly ordinary 3-device account would exhaust the cap and start having its
+/// publishes REJECTED — leaving the tag holding zero real peers rather than a stale few.
+///
+/// Two cadences' worth bounds that at 2 copies per device, which is the steady state at the default
+/// cadence — the skip in [`exchange`] does NOT reduce it further there, because an entry published
+/// one cadence ago has exactly half its life left and republishing is the safe call at that
+/// boundary. The skip earns its place in the opposite regime: `push_interval_secs = 0` runs a pass
+/// per trigger and several git hooks fire per action, so without it a device stacks copies of
+/// itself seconds apart until the tag is full.
+///
+/// Two known residuals, neither papered over:
+/// - `push_interval_secs > 450` clamps to the service maximum and the announcement then expires
+///   between passes, so such a device is intermittently discoverable. The alternative is publishing
+///   under a TTL the service would reject outright.
+/// - At ~2 slots per device the cap allows roughly four devices before publishes start being
+///   REFUSED (the service rejects rather than evicting). A refused device still fetches, and
+///   explicit `server_peers` are unaffected, so it degrades rather than breaking — but lifting the
+///   ceiling needs an evict-oldest policy on the SERVICE, not a change here.
+pub fn publish_ttl_seconds(push_interval_secs: u64) -> u32 {
+    const MIN_TTL: u64 = 60;
+    const MAX_TTL: u64 = 900;
+    push_interval_secs.saturating_mul(2).clamp(MIN_TTL, MAX_TTL) as u32
+}
+
+/// What became of this node's own announcement during a pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PublishState {
+    /// This device does not advertise itself (`[sync] discoverable` is off), or the pass never got
+    /// far enough to try.
+    #[default]
+    NotAttempted,
+    /// A live announcement for this node was already present with comfortable time left, so the
+    /// pass did not spend a slot on another copy.
+    AlreadyLive,
+    /// This pass wrote a fresh announcement.
+    Published,
+    /// The service refused or the write failed. Non-fatal: the fetch half still ran.
+    Failed,
+}
+
 /// What one discovery pass produced. Never an `Err`: see the module docs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DiscoveryOutcome {
-    /// Node ids advertised for this account, already filtered to well-formed ones.
+    /// Node ids advertised for this account, already filtered to well-formed ones. Includes this
+    /// node when it advertises itself — self-exclusion belongs to the composing caller, which
+    /// needs the raw set to decide whether its own announcement is still live.
     pub peers: Vec<[u8; 32]>,
-    /// Whether the publish half succeeded, when one was attempted.
-    pub published: bool,
+    /// What happened to this node's own announcement.
+    pub publish: PublishState,
     /// Why the pass produced less than it might have — for logging only. A caller that branches on
     /// this is treating routing advice as authority.
     pub degraded: Option<String>,
 }
 
-/// Publish `local_node` under this account's tag and fetch the account's current advertisers.
+/// One discovery pass: what to ask, and who is asking.
+pub struct DiscoveryExchange<'a> {
+    pub endpoint: &'a Endpoint,
+    /// The service's dialable address. A PARAMETER, not a constant, so an in-process stub is
+    /// testable against the real code path.
+    pub service: EndpointAddr,
+    pub tag: [u8; TAG_LEN],
+    /// `Some(node)` advertises `node`; `None` fetches only — which is what lets a machine behind
+    /// NAT find a server without becoming discoverable itself.
+    pub publish: Option<[u8; 32]>,
+    pub ttl_seconds: u32,
+    /// "Now" as a VALUE, not a clock: the exchange reads it exactly once, to judge whether this
+    /// node's existing announcement has enough life left to skip republishing.
+    pub now_ms: i64,
+}
+
+/// Fetch the account's current advertisers and, when asked, make sure this node is among them.
 ///
-/// Publish and fetch are INDEPENDENT: a publish failure must not suppress the fetch, or one
-/// device's rate-limiting would blind it to peers it could otherwise reach. They travel on separate
-/// bi-streams because the service answers exactly one request per stream.
+/// **Fetch first, then publish.** The service APPENDS and never replaces, so publishing blind every
+/// pass accumulates copies of this node until the per-tag cap rejects everyone — see
+/// [`publish_ttl_seconds`]. Fetching first lets the pass skip a publish it does not need, and the
+/// fetch was going to happen anyway.
 ///
-/// `publish` is opt-in; a device that does not advertise itself still learns about others, which is
-/// what lets a machine behind NAT reach a server without becoming discoverable itself.
-pub async fn exchange(
-    endpoint: &Endpoint,
-    service: EndpointAddr,
-    tag: [u8; TAG_LEN],
-    local_node: Option<[u8; 32]>,
-    ttl_seconds: u32,
-) -> DiscoveryOutcome {
-    match tokio::time::timeout(
-        DISCOVERY_TIMEOUT,
-        exchange_inner(endpoint, service, tag, local_node, ttl_seconds),
-    )
-    .await
-    {
+/// The two halves stay INDEPENDENT in the failure direction: a publish that fails does not discard
+/// the peers already fetched, or one device's rate-limiting would blind it to peers it can reach.
+/// They travel on separate bi-streams because the service answers exactly one request per stream.
+pub async fn exchange(params: DiscoveryExchange<'_>) -> DiscoveryOutcome {
+    match tokio::time::timeout(DISCOVERY_TIMEOUT, exchange_inner(&params)).await {
         Ok(outcome) => outcome,
         // The bound exists precisely for a service that accepts and then stalls, which no transport
         // error would ever surface.
@@ -117,14 +195,9 @@ pub async fn exchange(
     }
 }
 
-async fn exchange_inner(
-    endpoint: &Endpoint,
-    service: EndpointAddr,
-    tag: [u8; TAG_LEN],
-    local_node: Option<[u8; 32]>,
-    ttl_seconds: u32,
-) -> DiscoveryOutcome {
-    let conn = match endpoint.connect(service, PEER_DISCOVERY_ALPN).await {
+async fn exchange_inner(params: &DiscoveryExchange<'_>) -> DiscoveryOutcome {
+    let DiscoveryExchange { endpoint, service, tag, publish, ttl_seconds, now_ms } = params;
+    let conn = match endpoint.connect(service.clone(), PEER_DISCOVERY_ALPN).await {
         Ok(conn) => conn,
         // Includes an ALPN the service does not know — the shape a client deployed ahead of the
         // service sees. Fail open: the configured peers are unaffected.
@@ -137,30 +210,8 @@ async fn exchange_inner(
     };
 
     let mut degraded = Vec::new();
-    let mut published = false;
-    if let Some(node) = local_node {
-        match request(&conn, &DiscoveryRequest::Publish {
-            tag,
-            payload: node.to_vec(),
-            ttl_seconds,
-        })
-        .await
-        {
-            Ok(DiscoveryResponse::Published { .. }) => published = true,
-            Ok(other) => degraded.push(format!("publish refused: {other:?}")),
-            Err(error) => degraded.push(format!("publish failed: {error}")),
-        }
-    }
-
-    // Reached even when the publish failed above — the two halves are independent.
-    let peers = match request(&conn, &DiscoveryRequest::Fetch { tag }).await {
-        Ok(DiscoveryResponse::Fetched { announcements }) => announcements
-            .into_iter()
-            .take(MAX_ANNOUNCEMENTS)
-            // A malformed payload is dropped INDIVIDUALLY. Failing the batch would let one bad
-            // entry — which any party that can compute the tag may publish — hide every good one.
-            .filter_map(|announcement| <[u8; 32]>::try_from(announcement.payload.as_slice()).ok())
-            .collect(),
+    let announcements = match request(&conn, &DiscoveryRequest::Fetch { tag: *tag }).await {
+        Ok(DiscoveryResponse::Fetched { announcements }) => announcements,
         Ok(other) => {
             degraded.push(format!("fetch refused: {other:?}"));
             Vec::new()
@@ -171,11 +222,65 @@ async fn exchange_inner(
         },
     };
 
+    // Reached even when the fetch failed above — an empty announcement list then reads as "this
+    // node is not live", which republishes. Publishing a copy we did not need is far cheaper than
+    // silently ceasing to advertise.
+    let publish_state = match publish {
+        None => PublishState::NotAttempted,
+        Some(node) if is_live(&announcements, node, *ttl_seconds, *now_ms) =>
+            PublishState::AlreadyLive,
+        Some(node) => {
+            match request(&conn, &DiscoveryRequest::Publish {
+                tag: *tag,
+                payload: node.to_vec(),
+                ttl_seconds: *ttl_seconds,
+            })
+            .await
+            {
+                Ok(DiscoveryResponse::Published { .. }) => PublishState::Published,
+                Ok(other) => {
+                    degraded.push(format!("publish refused: {other:?}"));
+                    PublishState::Failed
+                },
+                Err(error) => {
+                    degraded.push(format!("publish failed: {error}"));
+                    PublishState::Failed
+                },
+            }
+        },
+    };
+
+    let peers = announcements
+        .into_iter()
+        // A malformed payload is dropped INDIVIDUALLY. Failing the batch would let one bad entry —
+        // which any party that can compute the tag may publish — hide every good one.
+        .filter_map(|announcement| <[u8; 32]>::try_from(announcement.payload.as_slice()).ok())
+        .take(MAX_ANNOUNCEMENTS)
+        .collect();
+
     DiscoveryOutcome {
         peers,
-        published,
+        publish: publish_state,
         degraded: (!degraded.is_empty()).then(|| degraded.join("; ")),
     }
+}
+
+/// Whether `node` already has an announcement with more than half its TTL left.
+///
+/// Half a TTL is one full cadence of headroom (the TTL is two cadences), so a node that skips here
+/// is guaranteed another pass before the entry expires. Requiring merely "present" would let an
+/// announcement lapse in the gap between passes; requiring "freshly written" would defeat the skip.
+fn is_live(
+    announcements: &[wire::WireAnnouncement],
+    node: &[u8; 32],
+    ttl_seconds: u32,
+    now_ms: i64,
+) -> bool {
+    let headroom_ms = i64::from(ttl_seconds) * 1000 / 2;
+    announcements.iter().any(|announcement| {
+        announcement.payload.as_slice() == node.as_slice()
+            && announcement.expires_at_ms.saturating_sub(now_ms) > headroom_ms
+    })
 }
 
 /// One request on its own bi-stream. The service reads a single frame, answers, and closes, so a
@@ -189,36 +294,4 @@ async fn request(
     send.finish()?;
     let body = wire::read_frame(&mut recv).await?;
     Ok(DiscoveryResponse::decode(&body)?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The tag must depend on the secret, or every account shares one tag and discovery becomes a
-    /// global address book.
-    #[test]
-    fn the_tag_is_keyed_by_the_secret() {
-        assert_ne!(account_tag(&[1; 32]), account_tag(&[2; 32]));
-    }
-
-    /// Pinned: the derivation IS the contract between two devices of one account. If it moves,
-    /// peers stop finding each other and nothing reports an error — they simply see an empty
-    /// account.
-    #[test]
-    fn the_tag_derivation_is_pinned() {
-        let tag = account_tag(&[0xab; 32]);
-        let hex: String = tag.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "27da05bee4ecf160b800de8f223835cda93e73d3d883b578966a5f82229fcaaf");
-    }
-
-    /// The domain must be textually independent of the ALPN, so renaming the ALPN cannot silently
-    /// re-partition the tag space. This is a source-level guard because the failure it prevents is
-    /// invisible at runtime.
-    #[test]
-    fn the_tag_domain_is_not_the_alpn() {
-        assert_ne!(DISCOVERY_TAG_DOMAIN, PEER_DISCOVERY_ALPN);
-        assert_eq!(DISCOVERY_TAG_DOMAIN, b"rag-rat/discovery-tag/1");
-        assert_eq!(PEER_DISCOVERY_ALPN, b"dev.cq27.peer-discovery/1");
-    }
 }

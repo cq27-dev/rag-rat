@@ -520,6 +520,17 @@ fn resolve_account_for_genesis(
     Ok(AccountId::from_bytes(account_id))
 }
 
+/// This store's genesis entry hash, or `None` when no account has been minted — the account's one
+/// permanently stable secret-ish identifier.
+///
+/// Distinct from [`read_local_account`], which returns the account_id: the two are DIFFERENT
+/// digests of the same genesis payload, so holding one does not yield the other. That asymmetry is
+/// load-bearing for callers that need a value every enrolled device shares but a peer who has only
+/// seen the account_id cannot compute. Non-minting, like [`read_local_account`].
+pub fn read_local_account_genesis(conn: &Connection) -> anyhow::Result<Option<[u8; 32]>> {
+    read_pointer_hash(conn)
+}
+
 /// Read the single-row pointer's genesis hash, or `None` when no account has been minted.
 fn read_pointer_hash(conn: &Connection) -> anyhow::Result<Option<[u8; 32]>> {
     let hash: Option<Vec<u8>> = conn

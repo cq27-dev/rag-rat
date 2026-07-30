@@ -80,6 +80,28 @@ fn effective_relay_url(config: &Config) -> String {
     }
 }
 
+/// The peer-discovery service this invocation queries: `RAG_RAT_SYNC_DISCOVERY_NODE` (ops/tests)
+/// overrides the configured `[sync] discovery_node_id`, which itself defaults to the shipped
+/// service. A NODE ID, not a URL — the service is a separate iroh peer reached through the relay.
+fn effective_discovery_node(config: &Config) -> String {
+    discovery_node_or_configured(
+        std::env::var("RAG_RAT_SYNC_DISCOVERY_NODE").ok().as_deref(),
+        config,
+    )
+}
+
+/// The precedence rule behind [`effective_discovery_node`], with the environment read lifted out.
+///
+/// Split so the rule is testable without mutating process-global state: env-var tests are
+/// invisible under a per-process test runner and race under an in-process one, and this repository
+/// is verified under both.
+fn discovery_node_or_configured(from_env: Option<&str>, config: &Config) -> String {
+    match from_env {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => config.sync.discovery_node_id.clone(),
+    }
+}
+
 /// A one-time enrollment invite `sync init` mints as it starts hosting the pairing exchange.
 struct InviteMint {
     role: rag_rat_oplog::DeviceRole,
@@ -470,10 +492,13 @@ pub(crate) enum DeviceSyncOutcome {
     Skipped,
     /// The per-database session lock is held (a serve peer or another sync); retry next pass.
     Deferred,
-    /// Ran against the configured peers (resolved through the discovery seam): `ok` sessions
-    /// succeeded, `errors` failed. `peers` is the configured count and `ok + errors == peers` — a
-    /// configured id that failed to resolve is logged and counted as an error, so a typo stays
-    /// visible rather than shrinking the peer set to a healthy-looking zero.
+    /// Ran against the peers this pass resolved — configured plus discovered: `ok` sessions
+    /// succeeded, `errors` failed, and `ok + errors == peers`.
+    ///
+    /// `peers` is what was ATTEMPTED, not what was configured. The two diverge in both directions:
+    /// discovery adds peers no config named, and several configured spellings of one node collapse
+    /// into a single dial. A configured id that failed to resolve is logged and counted as an
+    /// error, so a typo stays visible rather than shrinking the peer set to a healthy-looking zero.
     Ran { peers: usize, ok: usize, errors: usize },
 }
 
@@ -523,34 +548,65 @@ pub(crate) fn device_sync_run(
         return Ok(DeviceSyncOutcome::Disabled);
     }
     let relay = effective_relay_url(config);
-    // Resolve which peers to dial through the discovery seam — explicit config today, with
-    // relay-side account-keyed discovery landing behind it (`rag_rat_sync::discover_peers`, #988).
-    // Each entry pairs the peer's node-id string (for logs) with its dialable address; a configured
-    // id that does not parse is logged and dropped there, so it never becomes a dial attempt.
-    let configured = config.sync.server_peers.len();
-    let peers = rag_rat_sync::discover_peers(account_id, &config.sync.server_peers, &relay);
-    // Count the dropped (unresolvable) configured ids as errors: otherwise an all-typo
-    // `server_peers` reports a healthy-looking `ran` with zero peers and stamps the cadence
-    // watermark, silently suppressing sync until the next interval (repository logging is off
-    // by default).
-    let unresolved = configured.saturating_sub(peers.len());
+    // Key material for the account's discovery tag. Absent only when no account is minted, which
+    // the read above already ruled out; treat it as "no discovery" rather than an error either way.
+    let discovery_tag = rag_rat_sync::discovery::discovery_secret(conn)?
+        .map(|secret| rag_rat_sync::discovery::account_tag(&secret));
+    // The discovery service is a separate iroh peer reached BY NODE ID through the same relay — not
+    // the relay itself. An unusable id disables discovery for this pass rather than failing the
+    // sync: it is ordinary misconfiguration, and the configured peers stay perfectly dialable.
+    let discovery_node = effective_discovery_node(config);
+    let discovery_service = match rag_rat_sync::peer_addr(&discovery_node, &relay) {
+        Ok(addr) => Some(addr),
+        Err(error) => {
+            tracing::warn!(
+                service = discovery_node,
+                %error,
+                "skipping peer discovery: [sync] discovery_node_id is not a usable node id"
+            );
+            None
+        },
+    };
 
     let runtime =
         tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
-    let result: anyhow::Result<(usize, usize)> = runtime.block_on(async {
+    let result: anyhow::Result<(usize, usize, usize)> = runtime.block_on(async {
         let endpoint = rag_rat_sync::build_endpoint(*node_key, &relay)
             .await
             .with_context(|| format!("binding the sync endpoint over relay {relay}"))?;
-        let mut ok = 0usize;
-        let mut errors = unresolved;
+        // Resolve which peers to dial: the configured ids plus whatever the account advertises.
+        // INSIDE the runtime and AFTER the bind on purpose — publishing advertises this endpoint's
+        // identity, so there is nothing to announce until it exists. Each entry pairs the peer's
+        // node-id string (for logs) with its dialable address; a configured id that does not parse
+        // is logged and counted there, so it never becomes a dial attempt.
+        let resolved = rag_rat_sync::discover_peers(
+            &config.sync.server_peers,
+            &relay,
+            discovery_tag.zip(discovery_service).map(|(tag, service)| {
+                rag_rat_sync::discovery::DiscoveryExchange {
+                    endpoint: &endpoint,
+                    service,
+                    tag,
+                    // Publishing is opt-in; fetching is not. A device that does not advertise
+                    // itself still finds its peers.
+                    publish: config.sync.discoverable.then_some(local_node),
+                    ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
+                        config.sync.push_interval_secs,
+                    ),
+                    now_ms: time::now_ms(),
+                }
+            }),
+        )
+        .await;
+        let peers = resolved.peers;
+        let mut reached = Vec::with_capacity(peers.len());
         for (peer, addr) in &peers {
             // Own a copy of the resolved address: it is dialed twice (account log, then content),
             // and `addr` is a borrow into `peers`.
             let addr = (*addr).clone();
             // Account log FIRST — it carries the roster + stream ownership that AUTHORIZE content,
-            // so leading with it minimizes parking on the peer. The account-log result
-            // IS the peer's outcome, so `ok + errors` (seeded with the unresolvable count)
-            // stays equal to the number of configured peers. `/3` content rides on top:
+            // so leading with it minimizes parking on the peer. The account-log result IS the
+            // peer's outcome — exactly one entry in `reached` per peer. `/3` content rides on top:
             // best-effort, attempted only once the account log reached the peer, and a
             // content hiccup is logged — never a peer failure.
             // Reconcile each stream to a fixpoint (#878): a single session can report `Done` while
@@ -612,13 +668,9 @@ pub(crate) fn device_sync_run(
                     Err(e) => tracing::warn!(peer, error = %e, "device sync (content) failed"),
                 }
             }
-            if account_ok {
-                ok += 1;
-            } else {
-                errors += 1;
-            }
+            reached.push(account_ok);
         }
-        anyhow::Ok((ok, errors))
+        anyhow::Ok(fold_peer_outcomes(resolved.unresolved_configured, &reached))
     });
 
     // Stamp the cadence watermark on ANY completed attempt — a per-peer failure OR an endpoint-bind
@@ -627,8 +679,22 @@ pub(crate) fn device_sync_run(
     // ignoring `push_interval_secs`. A bind failure still surfaces (the caller reports it and never
     // fails the hook), but it is now cadence-limited exactly like an unreachable peer.
     record_device_sync(conn)?;
-    let (ok, errors) = result?;
-    Ok(DeviceSyncOutcome::Ran { peers: configured, ok, errors })
+    let (peers, ok, errors) = result?;
+    Ok(DeviceSyncOutcome::Ran { peers, ok, errors })
+}
+
+/// Fold the per-peer session results into the `(peers, ok, errors)` a [`DeviceSyncOutcome::Ran`]
+/// reports. `reached[i]` is whether peer `i`'s account-log session succeeded.
+///
+/// Pure, and separately tested, because this accounting is where the mistake lives when it is made.
+/// The obvious spelling — deriving the unresolvable count as `configured - peers.len()` — is wrong
+/// the moment discovery can add peers or duplicate spellings can collapse, and it under-counts
+/// errors all the way to a healthy-looking zero over an all-typo `server_peers`. A unit test on the
+/// resolver's return value cannot see that, because the subtraction lives HERE, at the caller.
+fn fold_peer_outcomes(unresolved_configured: usize, reached: &[bool]) -> (usize, usize, usize) {
+    let ok = reached.iter().filter(|reached| **reached).count();
+    let errors = reached.len() - ok + unresolved_configured;
+    (reached.len() + unresolved_configured, ok, errors)
 }
 
 /// The cadence gate: whether enough time has passed since the last device-side sync attempt.
@@ -757,7 +823,8 @@ mod tests {
 
     use super::{
         DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, decode_node_secret, device_can_serve,
-        device_can_sync, device_sync_due, device_sync_run, join, node_secret, record_device_sync,
+        device_can_sync, device_sync_due, device_sync_run, discovery_node_or_configured,
+        fold_peer_outcomes, join, node_secret, record_device_sync,
     };
 
     fn schema_conn() -> Connection {
@@ -791,6 +858,57 @@ mod tests {
         let future = (rag_rat_base::time::now_ms() + 10_000_000).to_string();
         rag_rat_db::meta::set_meta(&conn, DEVICE_SYNC_LAST_META_KEY, &future).unwrap();
         assert!(device_sync_due(&conn, 300).unwrap(), "a future watermark is treated as due");
+    }
+
+    /// The accounting the old `configured.saturating_sub(peers.len())` got wrong. Restoring that
+    /// subtraction makes the discovery row report 1 error instead of 3, and the all-typo row report
+    /// 0 instead of 2 — a pass that looks healthy while syncing with nobody.
+    #[test]
+    fn peer_outcomes_count_every_attempt_including_the_ids_that_never_resolved() {
+        assert_eq!(
+            fold_peer_outcomes(0, &[true, true]),
+            (2, 2, 0),
+            "two configured peers, both reached"
+        );
+        assert_eq!(
+            fold_peer_outcomes(2, &[]),
+            (2, 0, 2),
+            "an all-typo server_peers reports errors, never a healthy-looking empty run"
+        );
+        assert_eq!(
+            fold_peer_outcomes(3, &[true, false]),
+            (5, 1, 4),
+            "unresolvable ids are attempts too: they seed errors and count toward peers"
+        );
+        // Discovery adds peers no config named, so `peers` exceeds the configured count. The old
+        // subtraction could not represent this at all.
+        let (peers, ok, errors) = fold_peer_outcomes(1, &[true, true, false, true]);
+        assert_eq!((peers, ok, errors), (5, 3, 2));
+        assert_eq!(
+            ok + errors,
+            peers,
+            "ok + errors == peers is the invariant the hook report reads"
+        );
+    }
+
+    /// The env override exists for ops and tests; without it, pointing a checkout at a throwaway
+    /// discovery service would mean editing committed config.
+    #[test]
+    fn the_discovery_node_env_override_wins_over_the_configured_service() {
+        let mut config = min_config();
+        config.sync.discovery_node_id = "configured-node".to_string();
+        assert_eq!(
+            discovery_node_or_configured(Some("  env-node  "), &config),
+            "env-node",
+            "the override wins and is trimmed"
+        );
+        for absent in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                discovery_node_or_configured(absent, &config),
+                "configured-node",
+                "an unset or blank override falls through to the configured service ({absent:?})"
+            );
+        }
     }
 
     #[test]

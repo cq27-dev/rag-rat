@@ -22,6 +22,7 @@
 //! one-time invite into a roster `DeviceAdd` before normal sync authentication can admit the new
 //! device.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use iroh::endpoint::presets;
@@ -99,9 +100,10 @@ pub fn node_id_from_secret(secret_key: [u8; 32]) -> [u8; 32] {
     *SecretKey::from_bytes(&secret_key).public().as_bytes()
 }
 
-/// Build a dialable [`EndpointAddr`] from a peer's node id (the z-base-32 form `endpoint.id()`
-/// prints) and the shared relay URL. The device-side sync driver configures server peers by node id
-/// and reaches each through the pinned relay — the CLI stays iroh-free by going through here.
+/// Build a dialable [`EndpointAddr`] from a peer's node id (the 64-char lowercase hex form
+/// `endpoint.id()` prints; standard base32 is also accepted) and the shared relay URL. The
+/// device-side sync driver configures server peers by node id and reaches each through the pinned
+/// relay — the CLI stays iroh-free by going through here.
 pub fn peer_addr(node_id: &str, relay_url: &str) -> Result<EndpointAddr, EndpointError> {
     let id =
         EndpointId::from_str(node_id.trim()).map_err(|e| EndpointError::PeerId(e.to_string()))?;
@@ -123,39 +125,93 @@ pub fn peer_addr_from_bytes(
     Ok(EndpointAddr::new(id).with_relay_url(relay))
 }
 
-/// Resolve the peers a device-side sync should dial for `account_id` into dialable addresses, each
-/// paired with the node-id string that names it (for logging). This is the single seam the sync
-/// driver iterates: today it maps each explicitly configured node id through the pinned relay,
-/// logging and skipping any that do not parse, so a misconfigured entry surfaces in the logs rather
-/// than aborting the whole pass.
+/// The peers one device-side sync pass should dial, plus the configured ids it could not use.
+#[derive(Debug, Default, Clone)]
+pub struct DiscoveredPeers {
+    /// Each dialable address paired with the node-id string naming it, for logging. Configured
+    /// peers come first and win on collision, so a pass that discovers nothing behaves exactly as
+    /// it did before discovery existed.
+    pub peers: Vec<(String, EndpointAddr)>,
+    /// Configured ids that did not parse, each already logged.
+    ///
+    /// Deliberately NOT recoverable as `configured.len() - peers.len()`: discovery can add peers,
+    /// and two configured spellings of one node collapse into a single entry without either being
+    /// unresolved. A caller that subtracts under-counts its errors and reports a healthy-looking
+    /// pass over an all-typo peer list.
+    pub unresolved_configured: usize,
+}
+
+/// Resolve the peers a device-side sync should dial: the explicitly configured ones, plus whatever
+/// the account advertises to the peer-discovery service.
 ///
-/// `account_id` is unused by the explicit-config resolver — it is the parameter a relay-backed
-/// resolver keys on. When peers of an account are online together they should auto-discover and
-/// sync directly instead of every device carrying a static peer list; because the driver only ever
-/// iterates this function, that lands as an implementation swap here, not a driver rewrite. A
-/// discovered peer fills the same `(node_id, addr)` shape a configured one does.
-// TODO(discovery, #988): a relay-side account-keyed resolver plugs in here — query the pinned
-// relay for the endpoints advertising `account_id` and compose them with the configured peers.
-pub fn discover_peers(
-    account_id: AccountId,
+/// Configured peers are first-class and unchanged — discovery is purely additive, and `discovery:
+/// None` reduces this to the configured resolver. A configured id that does not parse is logged
+/// and counted rather than aborting the pass, so one typo cannot suppress every other peer.
+///
+/// **Everything is compared on the raw 32 bytes, never the display string.**
+/// [`iroh::EndpointId::from_str`] accepts 64-char lowercase hex (the `Display` form) OR standard
+/// base32, and uppercases before base32-decoding, so three distinct strings can name one peer —
+/// while the config layer only trims and de-duplicates literally. Comparing strings would dial such
+/// a peer twice per pass (two full two-ALPN reconciles) and double-count it in `ok`/`errors`.
+pub async fn discover_peers(
     configured_peers: &[String],
     relay_url: &str,
-) -> Vec<(String, EndpointAddr)> {
-    let _ = account_id; // reserved for the relay-backed resolver (see the TODO above)
-    configured_peers
-        .iter()
-        .filter_map(|peer| match peer_addr(peer, relay_url) {
-            Ok(addr) => Some((peer.clone(), addr)),
+    discovery: Option<crate::discovery::DiscoveryExchange<'_>>,
+) -> DiscoveredPeers {
+    let mut peers: Vec<(String, EndpointAddr)> = Vec::new();
+    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut unresolved_configured = 0usize;
+
+    for peer in configured_peers {
+        match peer_addr(peer, relay_url) {
+            Ok(addr) =>
+                if seen.insert(*addr.id.as_bytes()) {
+                    peers.push((peer.clone(), addr));
+                } else {
+                    tracing::debug!(
+                        peer,
+                        "skipping a configured sync peer another entry already names"
+                    );
+                },
             Err(error) => {
                 tracing::warn!(peer, %error, "skipping a configured sync peer with an invalid node id");
-                None
+                unresolved_configured += 1;
             },
-        })
-        .collect()
+        }
+    }
+
+    let Some(discovery) = discovery else {
+        return DiscoveredPeers { peers, unresolved_configured };
+    };
+    // Read the local id BEFORE the exchange consumes the params. Self-exclusion is not optional:
+    // advertising this node is precisely what puts it in the set it then fetches back.
+    let local_node = *discovery.endpoint.id().as_bytes();
+    let outcome = crate::discovery::exchange(discovery).await;
+    if let Some(degraded) = &outcome.degraded {
+        // Never fatal — the configured peers are dialed regardless. See the discovery module docs.
+        tracing::warn!(
+            degraded,
+            "peer discovery degraded; continuing with the peers already resolved"
+        );
+    }
+    for node in outcome.peers {
+        if node == local_node || !seen.insert(node) {
+            continue;
+        }
+        match peer_addr_from_bytes(&node, relay_url) {
+            // The label comes off the parsed id rather than a second fallible conversion.
+            Ok(addr) => peers.push((addr.id.to_string(), addr)),
+            // `from_bytes` rejects a non-canonical point. Dropped individually: anyone who can
+            // compute the tag can publish garbage, and one bad entry must not hide the good ones.
+            Err(error) =>
+                tracing::warn!(%error, "dropping a discovered peer with an unusable node id"),
+        }
+    }
+    DiscoveredPeers { peers, unresolved_configured }
 }
 
 /// The dialable node-id string for a peer's node id BYTES — the inverse of the byte form a ticket
-/// or discovery record carries, in the z-base-32 shape `[sync] server_peers` accepts. Lets the
+/// or discovery record carries, in the lowercase-hex shape `[sync] server_peers` accepts. Lets the
 /// enrollment CLI print a joinable peer id without naming an iroh type.
 pub fn node_id_to_string(node_id: &[u8; 32]) -> Result<String, EndpointError> {
     EndpointId::from_bytes(node_id)
@@ -713,23 +769,89 @@ mod tests {
         assert_eq!(reconcile_step(&quiet, 8, 8), ReconcileStep::Stop { converged: true });
     }
 
-    #[test]
-    fn discover_peers_resolves_valid_ids_and_drops_invalid_ones() {
+    #[tokio::test]
+    async fn discover_peers_resolves_valid_ids_and_counts_invalid_ones() {
         let valid = node_id_to_string(&node_id_from_secret([7u8; 32])).unwrap();
-        let peers = discover_peers(
-            AccountId::from_bytes([1u8; 32]),
+        let resolved = discover_peers(
             &[valid.clone(), "not-a-node-id".to_string()],
             "https://relay.example",
+            None,
+        )
+        .await;
+        assert_eq!(
+            resolved.peers.len(),
+            1,
+            "the unparseable id is dropped, the valid one resolves"
         );
-        assert_eq!(peers.len(), 1, "the unparseable id is dropped, the valid one resolves");
-        assert_eq!(peers[0].0, valid, "the resolved entry keeps its node-id label");
+        assert_eq!(resolved.peers[0].0, valid, "the resolved entry keeps its node-id label");
+        assert_eq!(
+            resolved.unresolved_configured, 1,
+            "the unparseable id is COUNTED, not silently forgotten — the driver seeds its error \
+             tally from this and cannot recover it by subtraction once discovery adds peers"
+        );
+    }
+
+    /// Standard base32, no padding — one of the spellings `EndpointId::from_str` accepts for a
+    /// node id, alongside the 64-char lowercase hex that `Display` produces.
+    fn base32_nopad(bytes: &[u8; 32]) -> String {
+        const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let mut out = String::with_capacity(52);
+        let (mut acc, mut bits) = (0u32, 0u32);
+        for &byte in bytes {
+            acc = (acc << 8) | u32::from(byte);
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out.push(ALPHABET[((acc >> bits) & 0x1f) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(ALPHABET[((acc << (5 - bits)) & 0x1f) as usize] as char);
+        }
+        out
+    }
+
+    /// One node written several ways must be dialed once.
+    ///
+    /// `EndpointId::from_str` takes 64-char lowercase hex OR standard base32, and uppercases before
+    /// base32-decoding — so three strings name one node, while `[sync] server_peers` only
+    /// de-duplicates literally. Comparing display strings would dial this peer three times per pass
+    /// (each a full two-ALPN reconcile) and triple-count it in `ok`/`errors`.
+    #[tokio::test]
+    async fn discover_peers_dedupes_configured_spellings_of_one_node() {
+        let bytes = node_id_from_secret([11u8; 32]);
+        let hex = node_id_to_string(&bytes).unwrap();
+        let base32_upper = base32_nopad(&bytes);
+        let base32_lower = base32_upper.to_ascii_lowercase();
+        for spelling in [&hex, &base32_upper, &base32_lower] {
+            assert_eq!(
+                EndpointId::from_str(spelling).unwrap().as_bytes(),
+                &bytes,
+                "every spelling under test must really name this node"
+            );
+        }
+        assert_eq!(
+            [&hex, &base32_upper, &base32_lower].iter().collect::<HashSet<_>>().len(),
+            3,
+            "the spellings must be textually distinct or the test proves nothing"
+        );
+
+        let configured =
+            [hex.clone(), base32_upper.clone(), base32_lower.clone(), base32_upper.clone()];
+        let resolved = discover_peers(&configured, "https://relay.example", None).await;
+        assert_eq!(resolved.peers.len(), 1, "every spelling names one peer, dialed once");
+        assert_eq!(resolved.peers[0].0, hex, "the first spelling configured wins");
+        assert_eq!(
+            resolved.unresolved_configured, 0,
+            "a de-duplicated spelling resolved fine; it is not an error"
+        );
     }
 
     #[test]
     fn node_id_string_round_trips_through_bytes() {
         let bytes = node_id_from_secret([9u8; 32]);
         let text = node_id_to_string(&bytes).unwrap();
-        // `peer_addr` parses the same z-base-32 form, so the string is a valid dial id, and
+        // `peer_addr` parses the same hex form, so the string is a valid dial id, and
         // `peer_addr_from_bytes` reaches the same address from the raw bytes a ticket carries.
         assert!(peer_addr(&text, "https://relay.example").is_ok());
         assert!(peer_addr_from_bytes(&bytes, "https://relay.example").is_ok());
