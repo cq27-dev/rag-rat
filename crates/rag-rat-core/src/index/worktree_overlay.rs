@@ -25,10 +25,10 @@ mod lifecycle;
 mod materialize;
 mod query_adaptation;
 
-pub use discovery::WorktreeOverlayReport;
 #[cfg(test)]
 use discovery::fold_status_candidates;
 use discovery::resolve_overlay_scope;
+pub use discovery::{ChangedPathsCoverage, WorktreeOverlayReport};
 pub(crate) use discovery::{
     CommittedDeltaSource, ResolvedOverlayScope, compute_linked_worktree_delta, linked_source_root,
 };

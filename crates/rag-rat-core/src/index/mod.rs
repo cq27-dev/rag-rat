@@ -93,7 +93,8 @@ pub use schema::RegisteredRepo;
 pub(crate) use util::*;
 pub(crate) use worktree_overlay::linked_source_root;
 pub use worktree_overlay::{
-    OverlayBasisUpdate, OverlayLogicalRebuild, OverlayRefreshTail, WorktreeOverlayReport,
+    ChangedPathsCoverage, OverlayBasisUpdate, OverlayLogicalRebuild, OverlayRefreshTail,
+    WorktreeOverlayReport,
 };
 
 #[cfg(test)]

@@ -364,7 +364,7 @@ impl IndexDatabase {
         &self,
         worktree_id: &str,
         shadowing: &BTreeSet<PathBuf>,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<Vec<PathBuf>> {
         let existing: Vec<String> = {
             let conn = self.storage.connection();
             // Direct `main.files` probe → explicit `repo_id` predicate (A3), same class as the
@@ -378,11 +378,14 @@ impl IndexDatabase {
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        let mut pruned = 0usize;
+        // The pruned PATHS, not just a count: dropping an overlay row un-shadows the base version
+        // for this checkout, so the path's effective content changed and a per-checkout consumer
+        // must be told about it (#1010).
+        let mut pruned = Vec::new();
         for path in existing {
             if !shadowing.contains(Path::new(&path)) {
                 self.remove_file_in_scope(Path::new(&path), "", worktree_id)?;
-                pruned += 1;
+                pruned.push(PathBuf::from(path));
             }
         }
         Ok(pruned)

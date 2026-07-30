@@ -7,7 +7,8 @@ use rag_rat_base::config::Config;
 
 use crate::index::ai::ReconcileOptions;
 use crate::index::{
-    IndexDatabase, IndexProgress, OverlayBasisUpdate, OverlayLogicalRebuild, OverlayRefreshTail,
+    ChangedPathsCoverage, IndexDatabase, IndexProgress, OverlayBasisUpdate, OverlayLogicalRebuild,
+    OverlayRefreshTail,
 };
 
 /// The canonical worktree id string [`crate::index::live_worktree_contexts`] reports. When `root`
@@ -151,11 +152,32 @@ impl OverlayScope {
 pub struct OverlayRefresh {
     /// Whether any overlay changed. The answer this function used to return alone.
     pub changed: bool,
-    /// Repo-relative paths each visited linked checkout reindexed, keyed by its worktree id —
-    /// which is that checkout's root. A checkout the pass skipped (unchanged basis, quiet
-    /// window, not implicated by events) has NO entry; one it visited with nothing to do has
-    /// an empty one.
-    pub reindexed: BTreeMap<String, Vec<PathBuf>>,
+    /// What each VISITED linked checkout's refresh changed, keyed by its worktree id. A checkout
+    /// the pass skipped (unchanged basis, quiet window, not implicated by events, or a refresh
+    /// that errored) has NO entry; one it visited with nothing to do has an entry with no paths.
+    pub reindexed: BTreeMap<String, CheckoutReindex>,
+}
+
+/// What one linked checkout's overlay refresh changed, for a consumer that must act on that
+/// checkout specifically (#1010).
+///
+/// The three fields travel together on purpose: paths alone are unusable. Without `source_root`
+/// they cannot be resolved to files (a subdir-rooted config makes the checkout root the wrong
+/// base), and without `coverage` an empty list is ambiguous between "nothing changed" and "the
+/// status read failed and the list is missing entries".
+#[derive(Debug, Clone)]
+pub struct CheckoutReindex {
+    /// The directory [`Self::paths`] are relative to — this checkout's equivalent of
+    /// `config.root`, which is NOT the checkout root when `config.root` is a repo subdir. See
+    /// [`crate::index::WorktreeOverlayReport::source_root`].
+    pub source_root: PathBuf,
+    /// Paths whose effective indexed content this refresh may have changed, relative to
+    /// [`Self::source_root`]. A superset when `coverage` is
+    /// [`ChangedPathsCoverage::Complete`]; otherwise not even that.
+    pub paths: Vec<PathBuf>,
+    /// Whether `paths` is the complete set. `Partial` means the consumer must treat the whole
+    /// checkout as suspect rather than trusting the list.
+    pub coverage: ChangedPathsCoverage,
 }
 
 /// `pub` so the hook-driven CLI `maintenance` command shares this exact path: the git hooks invoke
@@ -189,7 +211,7 @@ pub fn refresh_worktree_overlays(
     let overlay_quiet_secs =
         if config.watch.periodic_sweep_secs == 0 { 0 } else { config.watch.overlay_quiet_secs };
     let mut changed = false;
-    let mut reindexed: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut reindexed: BTreeMap<String, CheckoutReindex> = BTreeMap::new();
     for worktree in worktrees {
         if worktree == base_id {
             continue; // the rooted checkout is the base scope, not an overlay
@@ -264,12 +286,20 @@ pub fn refresh_worktree_overlays(
                 }
                 let this_changed = report.indexed > 0 || report.tombstoned > 0 || report.pruned > 0;
                 changed |= this_changed;
-                // Keyed by the WORKTREE ID, which is this checkout's root — the two things a
-                // consumer needs to act on the paths: a scope to write rows under, and a directory
-                // to root a tool at. Recorded even when the refresh reindexed nothing, so an empty
-                // entry reads as "this checkout was visited and had no work" rather than as
-                // "this checkout was never looked at".
-                reindexed.insert(worktree.clone(), report.reindexed_paths.clone());
+                // Keyed by the report's RESOLVED worktree id, not the registered path this loop
+                // iterates: the id is what the overlay's rows are keyed by, so a consumer can use
+                // it directly as a DB scope. An empty id means the refresh never resolved a linked
+                // scope and returned the default report — record nothing rather than claim a visit
+                // to a checkout that was never read. Recorded even when the refresh changed
+                // nothing, so an entry with no paths reads as "visited, no work" rather than as
+                // "never looked at".
+                if !report.worktree_id.is_empty() {
+                    reindexed.insert(report.worktree_id.clone(), CheckoutReindex {
+                        source_root: report.source_root.clone(),
+                        paths: report.changed_paths.clone(),
+                        coverage: report.coverage,
+                    });
+                }
                 // Embed the overlay's chunks NOW, while the connection is still scoped to this
                 // overlay (index_worktree_overlay left it there) — the trailing base reconcile
                 // won't see them (#219 review). Run when the overlay CHANGED, OR — on an `All`

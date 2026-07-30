@@ -86,7 +86,7 @@ impl IndexDatabase {
         // instead of failing the deferred read→write upgrade with SQLITE_BUSY; ROLLBACK on
         // any error (#219 review).
         self.storage.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> anyhow::Result<(usize, usize, usize)> {
+        let result = (|| -> anyhow::Result<(usize, usize, Vec<PathBuf>)> {
             // #826: arm scoped logical re-derive capture — the overlay's file removals / inserts
             // below stage the worktree's changed PATHS so `finalize_overlay_refresh`'s Inline case
             // can re-derive only those paths' logical groups instead of the whole repo. Armed (and
@@ -118,11 +118,12 @@ impl IndexDatabase {
             // false) is missing untracked / working-tree-deleted paths, so pruning against its
             // `shadowing_paths` would delete valid overlay rows; skip the prune and let the
             // next complete pass reconcile (mirrors gc's empty-live-set guard) (#219 review).
-            let pruned = if delta.status_complete {
+            let pruned_paths = if delta.status_complete {
                 self.prune_overlay_rows_not_in_delta(&worktree_id, &delta.shadowing_paths())?
             } else {
-                0
+                Vec::new()
             };
+            let pruned = pruned_paths.len();
             self.finalize_overlay_refresh(
                 &source_root,
                 &worktree_id,
@@ -136,13 +137,13 @@ impl IndexDatabase {
             // commit each). Un-gated on the counts: a COMPLETE no-change refresh must still
             // record its basis (that skip proof is the whole point of #577).
             self.apply_overlay_basis_tail(&worktree_id, delta.status_complete, tail.basis)?;
-            Ok((indexed, tombstoned, pruned))
+            Ok((indexed, tombstoned, pruned_paths))
         })();
         // #826: disarm scoped logical re-derive capture on BOTH Ok and Err paths — this pass's
         // `&mut self` outlives an error return, so the flag must not leak into the caller's next
         // use.
         self.finish_scoped_logical_rederive();
-        let (indexed, tombstoned, pruned) = match result {
+        let (indexed, tombstoned, pruned_paths) = match result {
             Ok(counts) => {
                 self.storage.execute_batch("COMMIT")?;
                 counts
@@ -158,10 +159,29 @@ impl IndexDatabase {
         // the obligation survives for the next pass, like the batch callers' error arms.
         self.settle_pending_logical_rebuild_inline(tail.logical_rebuild)?;
 
+        // Every path whose effective content moved: written, shadowed, and un-shadowed (see
+        // `changed_paths`). A partial delta already reports `Partial` coverage, so a consumer
+        // never mistakes this list for the whole story.
+        let pruned = pruned_paths.len();
+        let changed_paths = delta
+            .readable
+            .iter()
+            .chain(&delta.tombstones)
+            .cloned()
+            .chain(pruned_paths)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         Ok(WorktreeOverlayReport {
             worktree_id,
+            source_root,
             indexed,
-            reindexed_paths: delta.readable.clone(),
+            changed_paths,
+            coverage: if delta.status_complete {
+                ChangedPathsCoverage::Complete
+            } else {
+                ChangedPathsCoverage::Partial
+            },
             tombstoned,
             pruned,
             status_complete: delta.status_complete,
@@ -349,10 +369,30 @@ impl IndexDatabase {
         // supplied path identity-skips (the finalize above never ran), and a stale pending
         // obligation must not survive this exit.
         self.settle_pending_logical_rebuild_inline(logical_rebuild)?;
+        // Every supplied path landed in exactly one of the three buckets (or was dropped by the
+        // guards as un-indexable), so their union is this pass's changed set — written, shadowed,
+        // or un-shadowed. A superset: the in-transaction re-validation may have declined some
+        // tombstones and removals.
+        let changed_paths = readable
+            .iter()
+            .cloned()
+            .chain(tombstones.into_iter().map(|(rel, _)| rel))
+            .chain(removal_candidates.into_iter().map(|(rel, _)| rel))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         Ok(WorktreeOverlayReport {
             worktree_id,
+            source_root,
             indexed,
-            reindexed_paths: readable.clone(),
+            changed_paths,
+            // COMPLETE despite `status_complete: false` below — the two answer different
+            // questions. The caller named the exact paths it wanted refreshed, so nothing is
+            // missing from the list; what is incomplete is the overlay's reconciliation against
+            // the whole checkout. Deriving this from `status_complete` would mark every
+            // event-driven pass lossy and force consumers into a whole-checkout fallback on the
+            // hot path.
+            coverage: ChangedPathsCoverage::Complete,
             tombstoned,
             pruned,
             // A path-scoped pass never fully reconciles the overlay — signal incomplete so the
