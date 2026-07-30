@@ -573,6 +573,17 @@ mod tests {
             params![vec![seed; 32], stream_id, vec![seed; 32], vec![seed; 8]],
         )
         .unwrap();
+        // The gapped half of the log is swept through the same directory, so it needs its own seed
+        // row or the assertion below passes on an empty table.
+        conn.execute(
+            "INSERT INTO table_sync_gapped_entries(entry_hash, stream_id, device_fingerprint, \
+             lamport, prev_hash, signed_bytes, gapped_at_ms) VALUES (?1, ?2, ?3, 2, ?4, ?5, 0)",
+            params![vec![seed ^ 0xff; 32], stream_id, vec![seed; 32], vec![seed; 32], vec![
+                seed;
+                8
+            ]],
+        )
+        .unwrap();
         stream_id
     }
 
@@ -622,6 +633,7 @@ mod tests {
             ("clone_subblock_postings", "build_generation", generation_in.clone()),
             ("clone_df_epoch", "build_generation", generation_in),
             ("table_sync_entries", "stream_id", blob_literal(stream_id)),
+            ("table_sync_gapped_entries", "stream_id", blob_literal(stream_id)),
         ];
         for (table, column, in_body) in checks {
             let count: i64 = conn
@@ -811,6 +823,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(a_entries, 1, "the sibling's stream-keyed entries survive the scoped purge");
+        let a_gapped: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM table_sync_gapped_entries WHERE stream_id = {}",
+                    blob_literal(&a_stream)
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_gapped, 1, "the sibling's entries awaiting a predecessor survive it too");
         let edge_exists = |id: i64| -> bool {
             conn.query_row("SELECT EXISTS(SELECT 1 FROM edges_data WHERE id = ?1)", [id], |row| {
                 row.get(0)

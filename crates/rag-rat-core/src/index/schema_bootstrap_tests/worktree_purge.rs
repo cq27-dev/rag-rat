@@ -46,12 +46,33 @@ fn seed_stream(conn: &rusqlite::Connection, repo_id: &str, seed: u8) -> Vec<u8> 
         rusqlite::params![vec![seed; 32], stream_id, vec![seed; 32], vec![seed; 8]],
     )
     .unwrap();
+    conn.execute(
+        "INSERT INTO table_sync_gapped_entries(entry_hash, stream_id, device_fingerprint, \
+         lamport, prev_hash, signed_bytes, gapped_at_ms) VALUES (?1, ?2, ?3, 2, ?4, ?5, 0)",
+        rusqlite::params![vec![seed ^ 0xff; 32], stream_id, vec![seed; 32], vec![seed; 32], vec![
+            seed;
+            8
+        ]],
+    )
+    .unwrap();
     stream_id
 }
 
 fn entries_on(conn: &rusqlite::Connection, stream_id: &[u8]) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM table_sync_entries WHERE stream_id = ?1",
+        rusqlite::params![stream_id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+/// Entries held awaiting a predecessor on `stream_id`. Counted separately from [`entries_on`]: they
+/// live in their own table precisely because they are NOT on the accepted chain, so a purge that
+/// swept one and not the other would be invisible to that count.
+fn gapped_on(conn: &rusqlite::Connection, stream_id: &[u8]) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM table_sync_gapped_entries WHERE stream_id = ?1",
         rusqlite::params![stream_id],
         |row| row.get(0),
     )
@@ -124,11 +145,18 @@ fn rm_from_a_linked_worktree_purges_the_shared_stream_log_and_spares_the_sibling
         "and the stream-keyed entry log goes with the directory that placed it, whichever \
          checkout drove the removal",
     );
+    assert_eq!(
+        gapped_on(conn, &shared_stream),
+        0,
+        "including the entries still awaiting a predecessor — they are signed operations on the \
+         same derived stream id, so retaining them would let a re-registration replay them back",
+    );
 
     // SIBLING PRESERVATION: the other repo in the shared store keeps both halves. Its entries carry
     // no `repo_id`, so only the captured stream ids could have spared them.
     assert_eq!(directory_rows(conn, &sibling_repo_id), 1, "the sibling's directory row survives");
     assert_eq!(entries_on(conn, &sibling_stream), 1, "and so does its entry log");
+    assert_eq!(gapped_on(conn, &sibling_stream), 1, "and its entries awaiting a predecessor");
 
     let _ = fs::remove_dir_all(&linked);
 }

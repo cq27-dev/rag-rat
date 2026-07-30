@@ -555,7 +555,7 @@ mod tests {
             };
             let out = entries
                 .iter()
-                .map(|bytes| engine::ingest(&tx, &ctx, "demo/1", bytes, from).unwrap())
+                .map(|bytes| engine::ingest(&tx, &ctx, "demo/1", bytes, from).unwrap().outcome)
                 .collect();
             tx.commit().unwrap();
             out
@@ -2384,7 +2384,7 @@ mod tests {
             };
             let out = entries
                 .iter()
-                .map(|bytes| engine::ingest(&tx, &ctx, "demo/1", bytes, from).unwrap())
+                .map(|bytes| engine::ingest(&tx, &ctx, "demo/1", bytes, from).unwrap().outcome)
                 .collect();
             tx.commit().unwrap();
             out

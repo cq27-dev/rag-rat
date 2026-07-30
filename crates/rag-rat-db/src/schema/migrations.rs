@@ -1381,6 +1381,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_093_ID => Some(93),
             MIGRATION_094_ID => Some(94),
             MIGRATION_095_ID => Some(95),
+            MIGRATION_096_ID => Some(96),
             _ => None,
         })
         .max()
@@ -1485,6 +1486,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_093_ID
             | MIGRATION_094_ID
             | MIGRATION_095_ID
+            | MIGRATION_096_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1586,6 +1588,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_093_ID => migration.checksum != MIGRATION_093_CHECKSUM,
         MIGRATION_094_ID => migration.checksum != MIGRATION_094_CHECKSUM,
         MIGRATION_095_ID => migration.checksum != MIGRATION_095_CHECKSUM,
+        MIGRATION_096_ID => migration.checksum != MIGRATION_096_CHECKSUM,
         _ => false,
     }
 }
@@ -6559,6 +6562,68 @@ pub fn apply_table_sync_spec_version(conn: &Connection) -> rusqlite::Result<()> 
              DROP TABLE sync_published_rows_pre_v095;",
         )?;
     }
+    tx.commit()
+}
+
+/// V096 (#1058): retention for a table-sync entry whose chain predecessor has not arrived.
+///
+/// A verified entry that links to a predecessor this device does not hold used to be DROPPED, so a
+/// chain delivered out of causal order — the normal condition on a transport — could only converge
+/// through redelivery in exact order. It is now retained here until the predecessor is accepted,
+/// then promoted through the ordinary accept-and-apply path.
+///
+/// This is deliberately its OWN table rather than a status column on `table_sync_entries`, because
+/// six queries read that table as "the accepted chain" and every one of them must keep excluding an
+/// entry that is not on a chain: the authoring Lamport clock and the lamport-advance bound (a
+/// retained entry must not drag either), the chain tail (the promote target), entry existence (how
+/// fork is told from gap), the LWW winner lookup, and the refold's pending set. A status column
+/// would put a filter on each, and the one that got missed would fail silently.
+///
+/// `prev_hash` is NOT NULL: a genesis has no predecessor and so can never gap.
+///
+/// There is deliberately no `UNIQUE(stream_id, device_fingerprint, lamport)`. Two equivocating
+/// entries at one lamport must both be storable, or the first one retained blocks the legitimate
+/// one; identity here is the entry hash, and the conflict is resolved when the predecessor arrives
+/// and one of them takes the successor slot. Accepted entries keep their own uniqueness — a losing
+/// sibling never reaches `table_sync_entries`.
+pub fn apply_table_sync_gapped_entries(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS table_sync_gapped_entries(
+             entry_hash         BLOB    NOT NULL PRIMARY KEY,
+             stream_id          BLOB    NOT NULL,
+             device_fingerprint BLOB    NOT NULL,
+             lamport            INTEGER NOT NULL,
+             prev_hash          BLOB    NOT NULL,
+             signed_bytes       BLOB    NOT NULL,
+             gapped_at_ms       INTEGER NOT NULL
+         ) STRICT;
+         -- Both walks of the promote loop: the child of the entry just accepted, and the siblings
+         -- of its predecessor (which the acceptance just proved to be forks). The trailing
+         -- (lamport, entry_hash) is the total order those walks take siblings in, so the index
+         -- answers the ordering too instead of the query sorting a temp b-tree per probe.
+         CREATE INDEX IF NOT EXISTS table_sync_gapped_entries_child
+             ON table_sync_gapped_entries(
+                 stream_id, device_fingerprint, prev_hash, lamport, entry_hash);
+         -- The per-chain cap's count and its eviction victim, from an index tail instead of a \
+         scan.
+         CREATE INDEX IF NOT EXISTS table_sync_gapped_entries_chain_lamport
+             ON table_sync_gapped_entries(stream_id, device_fingerprint, lamport);
+         -- Children of a hash ACROSS devices: the abandoned-subtree walk and the cross-chain
+         -- citation sweep, both of which run per accepted entry. The two indexes above lead with
+         -- device_fingerprint and so answer neither — SQLite would fall back to the stream_id
+         -- prefix and scan every held row on the stream, once per acceptance, which is quadratic
+         -- over a reverse-delivered chain and is NOT bounded by the per-chain cap when several
+         -- devices share the stream.
+         --
+         -- It carries device_fingerprint and entry_hash so it COVERS both probes. Without them the
+         -- planner prefers the wider child index — which it can only use for its stream_id prefix,
+         -- i.e. the scan this index exists to avoid — because that one is covering and this one
+         -- would not be. Verified with EXPLAIN QUERY PLAN, not assumed.
+         CREATE INDEX IF NOT EXISTS table_sync_gapped_entries_predecessor
+             ON table_sync_gapped_entries(
+                 stream_id, prev_hash, device_fingerprint, entry_hash);",
+    )?;
     tx.commit()
 }
 

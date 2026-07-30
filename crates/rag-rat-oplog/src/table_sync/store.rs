@@ -9,8 +9,19 @@
 //! [`author_row_entry`] mints a local entry (lamport = one past the highest on the stream);
 //! [`accept_row_entry`] verifies and chain-classifies a foreign entry, stores it if the chain is
 //! continuous, then decides whether its payload applies — so one bad payload never wedges the
-//! chain. Full fork evidence and out-of-order backfill are the transport milestone's job — here a
-//! gap or conflict is simply reported, not durably quarantined.
+//! chain.
+//!
+//! An entry whose predecessor has NOT arrived is held in `table_sync_gapped_entries` and promoted
+//! once the predecessor is accepted, because out-of-order delivery is the normal condition on a
+//! transport rather than an error. That table is deliberately separate: six queries here read
+//! `table_sync_entries` as "the accepted chain" — the authoring Lamport clock, the lamport-advance
+//! bound, [`chain_tail`], [`entry_exists`], the winning-entry lookup, and the refold's pending set
+//! — and every one of them must keep excluding an entry that is not on a chain. A held entry is a
+//! CHAIN state and carries no `pending_reason`; do not conflate it with the PROJECTION state that
+//! column tracks.
+//!
+//! Fork EVIDENCE (proving an equivocation to a peer) remains the transport milestone's job — a
+//! conflict is reported here, not durably quarantined.
 
 use anyhow::Context;
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -179,16 +190,35 @@ pub(crate) enum AcceptOutcome {
         op: RowOp,
         meta: OpMeta,
         entry_hash: [u8; 32],
+        /// Where this entry sits on its chain — what a gapped successor cites. `None` for a
+        /// genesis.
+        prev_hash: Option<[u8; 32]>,
     },
     /// Stored and retained, but NOT applied — an undecodable payload, a future op-kind, or a table
     /// not in this scope. The chain still advanced, and the entry is marked pending so a later
     /// binary replays it.
-    StoredInert(PendingReason),
+    StoredInert {
+        reason: PendingReason,
+        entry_hash: [u8; 32],
+        prev_hash: Option<[u8; 32]>,
+    },
     AlreadyPresent,
     /// The lamport advances past the tail but the entry does not link to it (a gap): the
-    /// predecessor has not arrived. Routine under out-of-order delivery; the transport retries
-    /// after backfill.
-    MissingPredecessor,
+    /// predecessor has not arrived. Routine under out-of-order delivery, which is the NORMAL
+    /// condition on a transport — so the entry is RETAINED in `table_sync_gapped_entries` and
+    /// promoted once its predecessor is accepted, rather than dropped and left to redelivery in
+    /// exact causal order.
+    GapRetained,
+    /// A gapped entry already held. Deliberately distinct from [`Self::AlreadyPresent`]: that one
+    /// is a durable promise, whereas a gapped entry can still be evicted by the per-chain cap, so
+    /// a caller must not build a sync frontier on this as if the entry were settled.
+    AlreadyGapped,
+    /// The entry gapped AND is further ahead than every entry the chain is already holding, so the
+    /// per-chain cap dropped it rather than a nearer one. Reported rather than folded into
+    /// [`Self::GapRetained`]: the entry is NOT held, and a caller that treats it as held would wait
+    /// forever for a promotion that cannot come. RETRYABLE — once the entries between it and the
+    /// tail arrive and promote, there is room and it is no longer the furthest ahead.
+    GapChainFull,
     /// The entry conflicts with the stored chain (a second genesis, or a lamport at/behind the
     /// tail) — an equivocation the transport milestone will quarantine with evidence.
     Fork,
@@ -296,6 +326,14 @@ pub(crate) fn accept_row_entry(
     if entry_exists(tx, &verified.entry_hash)? {
         return Ok(AcceptOutcome::AlreadyPresent);
     }
+    // Dedupe against the gapped table HERE, beside the accepted-entry check and BEFORE the
+    // authority gate, so a redelivered gapped entry reports the same way whether or not its
+    // device is still roster-effective — the dedup-precedence-over-authority ordering the
+    // accepted path already has. In the `Gap` arm below instead, a removed device's redelivery
+    // would report `Unauthorized`.
+    if gapped_entry_exists(tx, &verified.entry_hash)? {
+        return Ok(AcceptOutcome::AlreadyGapped);
+    }
     // Authority gate (#935): the signing device must be a roster-effective WRITER of the account.
     // Placed AFTER `entry_exists` so an entry stored while the device WAS a writer still reports
     // `AlreadyPresent` after its removal (dedup precedence over authority), and BEFORE
@@ -315,29 +353,39 @@ pub(crate) fn accept_row_entry(
     }
     match classify(tx, expected_stream, &verified)? {
         ChainFit::Ok => {},
-        ChainFit::Gap => return Ok(AcceptOutcome::MissingPredecessor),
+        ChainFit::Gap =>
+            return Ok(if retain_gapped_entry(tx, &verified, signed_bytes, now_ms)? {
+                AcceptOutcome::GapRetained
+            } else {
+                AcceptOutcome::GapChainFull
+            }),
         ChainFit::Conflict => return Ok(AcceptOutcome::Fork),
     }
     // Classify the payload BEFORE storing, so the entry lands with its projection state recorded in
     // the same INSERT — no store-then-mark window, and no second write.
+    let inert = |reason| AcceptOutcome::StoredInert {
+        reason,
+        entry_hash: verified.entry_hash,
+        prev_hash: verified.prev_hash,
+    };
     let outcome = match row_op::decode(&verified.op_bytes) {
-        Err(_) => AcceptOutcome::StoredInert(PendingReason::UndecodablePayload),
-        Ok(DecodedRowOp::Unknown { .. }) =>
-            AcceptOutcome::StoredInert(PendingReason::UnknownOpKind),
+        Err(_) => inert(PendingReason::UndecodablePayload),
+        Ok(DecodedRowOp::Unknown { .. }) => inert(PendingReason::UnknownOpKind),
         Ok(DecodedRowOp::Known(op)) =>
             if expected_tables.contains(&op.table()) {
                 AcceptOutcome::Stored {
                     op,
                     meta: OpMeta { lamport: verified.lamport, device: verified.device_fingerprint },
                     entry_hash: verified.entry_hash,
+                    prev_hash: verified.prev_hash,
                 }
             } else {
-                AcceptOutcome::StoredInert(PendingReason::TableNotInScope)
+                inert(PendingReason::TableNotInScope)
             },
     };
     // Chain-continuous: store now so a bad payload can never wedge the device's chain.
     let pending = match &outcome {
-        AcceptOutcome::StoredInert(reason) => Some(*reason),
+        AcceptOutcome::StoredInert { reason, .. } => Some(*reason),
         // A `Stored` op may still fail to project on an unknown COLUMN, which only the
         // registry-aware applier sees; the caller marks it pending via `entry_hash` in that case.
         _ => None,
@@ -363,8 +411,18 @@ fn classify(
         // when a chain already exists is a second head — an equivocation.
         (None, None) => ChainFit::Ok,
         (None, Some(_)) => ChainFit::Conflict,
-        // A non-genesis whose device has no chain yet: its predecessor has not been delivered.
-        (Some(_), None) => ChainFit::Gap,
+        // A non-genesis whose device has no chain yet. Its predecessor has not been delivered —
+        // UNLESS we already hold it, in which case it belongs to a DIFFERENT device's chain and
+        // this link is structurally impossible: `author_row_entry` always sets `prev_hash` from the
+        // signer's OWN chain tail, so a cross-chain citation can never be honest. Reporting `Gap`
+        // there would retain an entry that no arrival can ever redeem, because this arm keys the
+        // tail on the signer's chain and would keep returning `Gap` forever.
+        (Some(prev), None) =>
+            if entry_exists(tx, &prev)? {
+                ChainFit::Conflict
+            } else {
+                ChainFit::Gap
+            },
         (Some(prev), Some((tail_lamport, tail_hash))) =>
             if prev == tail_hash && verified.lamport > tail_lamport {
                 ChainFit::Ok
@@ -411,6 +469,254 @@ fn entry_exists(tx: &Transaction<'_>, entry_hash: &[u8; 32]) -> anyhow::Result<b
         )
         .optional()?
         .is_some())
+}
+
+/// A verified entry held in `table_sync_gapped_entries`, awaiting its chain predecessor.
+pub(crate) struct GappedEntry {
+    pub entry_hash: [u8; 32],
+    pub prev_hash: [u8; 32],
+    pub signed_bytes: Vec<u8>,
+}
+
+/// The most gapped entries held for one `(stream, device)` chain.
+///
+/// Only a roster-effective WRITER reaches the retention below — the authority gate in
+/// [`accept_row_entry`] runs first — so this bounds a misbehaving ROSTER MEMBER, whose remedy is
+/// device removal. That is the same posture [`MAX_LAMPORT_ADVANCE`] documents for in-window lamport
+/// griefing, not a defense against arbitrary peers.
+const MAX_GAPPED_PER_CHAIN: usize = 4096;
+
+fn gapped_entry_exists(tx: &Transaction<'_>, entry_hash: &[u8; 32]) -> anyhow::Result<bool> {
+    Ok(tx
+        .query_row(
+            "SELECT 1 FROM table_sync_gapped_entries WHERE entry_hash = ?1",
+            params![entry_hash.as_slice()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Hold a verified entry whose predecessor has not arrived, keeping the chain's NEAREST-TAIL
+/// `MAX_GAPPED_PER_CHAIN` entries when the cap is reached.
+///
+/// The policy is "retain the entries closest to the tail", because those promote soonest — an entry
+/// far ahead of the clock needs everything between it and the tail to arrive first. That is why the
+/// cap evicts rather than simply refusing: a peer that filled the table early must not be able to
+/// block the near-tail entry the chain is actually waiting on.
+///
+/// The newcomer competes on the same footing as the rows already held, so an arrival that is ITSELF
+/// the furthest-ahead is the one refused. Evicting the stored maximum unconditionally would invert
+/// the policy exactly when it matters — a table full of near-tail entries would be hollowed out one
+/// row at a time by a stream of ever-higher-lamport arrivals.
+///
+/// Returns whether the entry is now held.
+fn retain_gapped_entry(
+    tx: &Transaction<'_>,
+    verified: &VerifiedEntry,
+    signed_bytes: &[u8],
+    now_ms: i64,
+) -> anyhow::Result<bool> {
+    let stream_bytes = verified.stream_id.to_bytes();
+    let device_bytes = verified.device_fingerprint.to_bytes();
+    // `classify` returns `Gap` only for an entry that HAS a predecessor — a genesis never gaps — so
+    // the NOT NULL column always has a value here.
+    let prev_hash = verified.prev_hash.context("a gapped entry always has a predecessor")?;
+    let held: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM table_sync_gapped_entries
+          WHERE stream_id = ?1 AND device_fingerprint = ?2",
+        params![stream_bytes.as_slice(), device_bytes.as_slice()],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(held)? >= MAX_GAPPED_PER_CHAIN {
+        let (furthest_hash, furthest_lamport) = tx.query_row(
+            "SELECT entry_hash, lamport FROM table_sync_gapped_entries
+              WHERE stream_id = ?1 AND device_fingerprint = ?2
+              ORDER BY lamport DESC, entry_hash DESC LIMIT 1",
+            params![stream_bytes.as_slice(), device_bytes.as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        // Rank on `(lamport, entry_hash)`, the SAME total order the victim was chosen by. On
+        // lamport alone a tie at the cap boundary would resolve as "whoever is already held wins",
+        // which is insertion order again — the property the hash tie-break exists to remove.
+        if (i64::try_from(verified.lamport)?, verified.entry_hash.as_slice())
+            >= (furthest_lamport, furthest_hash.as_slice())
+        {
+            // The arrival is the furthest-ahead of the whole set: it is the one the policy drops.
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
+            furthest_hash
+        ])?;
+    }
+    tx.execute(
+        "INSERT INTO table_sync_gapped_entries(
+             entry_hash, stream_id, device_fingerprint, lamport, prev_hash, signed_bytes,
+             gapped_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            verified.entry_hash.as_slice(),
+            stream_bytes.as_slice(),
+            device_bytes.as_slice(),
+            i64::try_from(verified.lamport)?,
+            prev_hash.as_slice(),
+            signed_bytes,
+            now_ms,
+        ],
+    )?;
+    Ok(true)
+}
+
+/// Discard every held entry on `stream` that descends from `root` — the subtree behind an entry
+/// that has just been judged a fork, or abandoned behind one.
+///
+/// A fork is never stored, so nothing will ever put `root`'s hash on the chain, so an entry citing
+/// it can never be promoted; and because it is keyed to a hash no future acceptance will produce,
+/// no later probe would look at it again either. Without this sweep such an entry sits in the table
+/// until the per-chain cap or a repo purge removes it, occupying a slot a promotable entry could
+/// have used.
+///
+/// The walk is scoped to the STREAM, not to the rejected entry's device. A citation from another
+/// device's chain is structurally impossible, but it is retained anyway (until the cited hash is
+/// held, nothing distinguishes it from an ordinary missing predecessor) — and for a REJECTED hash
+/// there is no later event that could retire it, because [`discard_foreign_chain_citations`] fires
+/// only on an ACCEPTED one. A device-filtered walk here would leave exactly those rows stranded.
+///
+/// Stream scope is also the safety boundary: a stream id is derived from `(repo_id, account_id,
+/// scope_id)`, so staying within one stream stays within the repo whose write lock the caller
+/// holds. Sweeping by `prev_hash` alone would reach other repos' rows in a shared database.
+///
+/// Iterative over a worklist, for the same reason promotion is: the abandoned subtree can be as
+/// deep as the chain is long.
+///
+/// Returns how many entries were discarded.
+pub(crate) fn discard_gapped_descendants(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    root: &[u8; 32],
+) -> anyhow::Result<usize> {
+    let stream_bytes = stream.to_bytes();
+    let mut discarded = 0;
+    let mut worklist = vec![*root];
+    while let Some(parent) = worklist.pop() {
+        let children: Vec<Vec<u8>> = tx
+            .prepare(
+                "SELECT entry_hash FROM table_sync_gapped_entries
+                  WHERE stream_id = ?1 AND prev_hash = ?2",
+            )?
+            .query_map(params![stream_bytes.as_slice(), parent.as_slice()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for child in children {
+            tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
+                child
+            ])?;
+            worklist.push(fixed32(child)?);
+            discarded += 1;
+        }
+    }
+    Ok(discarded)
+}
+
+/// Discard held entries on OTHER devices' chains that cite `hash` as their predecessor, together
+/// with everything behind them.
+///
+/// A chain is per `(stream, device)` and [`author_row_entry`] always links to the signer's OWN
+/// tail, so an entry citing a predecessor from a different device's chain can never be honest. Such
+/// an entry is nonetheless retained on arrival, because until the cited hash is held there is no
+/// way to tell it from an ordinary missing predecessor.
+///
+/// Accepting the cited entry is the moment that becomes decidable, and it is also the ONLY moment:
+/// [`classify`] keys the tail on the citing device's own chain, so re-examining the entry later
+/// would just report `Gap` again forever. Without this sweep it occupies that chain's hold capacity
+/// until eviction or a repo purge.
+///
+/// A citation from a different STREAM is deliberately NOT swept, and this is the one residual the
+/// sweep leaves. Reaching it would mean matching on `prev_hash` without the `stream_id` equality,
+/// and a stream id is derived from `(repo_id, account_id, scope_id)` — so that query would delete
+/// rows belonging to OTHER REPOS in a shared database, under a write lock scoped to this one.
+/// Trading a bounded capacity leak for a cross-repo write outside its lock is the wrong direction.
+/// The leak is charged to the malformed signer's own chain, is capped by `MAX_GAPPED_PER_CHAIN`,
+/// and is reclaimed by the deferred retention/GC horizon over this table. (The reverse arrival
+/// order is already handled: [`classify`] consults `entry_exists`, which is not stream-scoped, so a
+/// citation of an already-held entry is judged on arrival rather than retained.)
+///
+/// Returns how many entries were discarded.
+pub(crate) fn discard_foreign_chain_citations(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    own_device: DeviceFingerprint,
+    hash: &[u8; 32],
+) -> anyhow::Result<usize> {
+    let stream_bytes = stream.to_bytes();
+    let own_bytes = own_device.to_bytes();
+    let citations: Vec<Vec<u8>> = tx
+        .prepare(
+            "SELECT entry_hash FROM table_sync_gapped_entries
+              WHERE stream_id = ?1 AND prev_hash = ?2 AND device_fingerprint != ?3",
+        )?
+        .query_map(
+            params![stream_bytes.as_slice(), hash.as_slice(), own_bytes.as_slice()],
+            |row| row.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut discarded = 0;
+    for entry_hash in citations {
+        tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
+            entry_hash
+        ])?;
+        discarded += 1;
+        // Everything queued behind it is orphaned by the same argument.
+        discarded += discard_gapped_descendants(tx, stream, &fixed32(entry_hash)?)?;
+    }
+    Ok(discarded)
+}
+
+/// Remove and return one gapped entry of `(stream, device)` whose predecessor is `prev_hash`.
+///
+/// TAKE, not read: the caller feeds the entry straight back through [`accept_row_entry`], which
+/// re-verifies it and re-classifies it against the now-advanced chain. Leaving it here would either
+/// duplicate it on acceptance or strand it when it turns out to be a fork.
+///
+/// Ordered by `(lamport, entry_hash)`, so which of two equivocating siblings takes the successor
+/// slot is a property of the ENTRIES rather than of insertion order. The hash tie-break is
+/// load-bearing, not decoration: the schema deliberately admits two siblings at one lamport
+/// (§`table_sync_gapped_entries`), and on lamport alone SQLite's choice between them falls back to
+/// physical row order — so two replicas holding the same pair could accept different successors and
+/// project different rows, with each then classifying the other's winner as a fork.
+pub(crate) fn take_gapped_child(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    device: DeviceFingerprint,
+    prev_hash: &[u8; 32],
+) -> anyhow::Result<Option<GappedEntry>> {
+    let stream_bytes = stream.to_bytes();
+    let device_bytes = device.to_bytes();
+    let row = tx
+        .query_row(
+            "SELECT entry_hash, prev_hash, signed_bytes FROM table_sync_gapped_entries
+              WHERE stream_id = ?1 AND device_fingerprint = ?2 AND prev_hash = ?3
+              ORDER BY lamport, entry_hash LIMIT 1",
+            params![stream_bytes.as_slice(), device_bytes.as_slice(), prev_hash.as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((entry_hash, prev, signed_bytes)) = row else {
+        return Ok(None);
+    };
+    tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
+        entry_hash.as_slice()
+    ])?;
+    Ok(Some(GappedEntry {
+        entry_hash: fixed32(entry_hash)?,
+        prev_hash: fixed32(prev)?,
+        signed_bytes,
+    }))
 }
 
 /// Store a chain-continuous entry, carrying its projection state (`pending`: `None` = fully
@@ -746,6 +1052,7 @@ mod tests {
             op: op("r1"),
             meta: OpMeta { lamport: 0, device: secret.public().fingerprint() },
             entry_hash: signed.entry.entry_hash,
+            prev_hash: None,
         });
     }
 
@@ -868,7 +1175,11 @@ mod tests {
                 0
             )
             .unwrap(),
-            AcceptOutcome::StoredInert(PendingReason::TableNotInScope),
+            AcceptOutcome::StoredInert {
+                reason: PendingReason::TableNotInScope,
+                entry_hash: first.entry.entry_hash,
+                prev_hash: None,
+            },
         );
         // The chain is not wedged: the next entry (which links to the first) still stores +
         // applies.
@@ -914,7 +1225,11 @@ mod tests {
                 0
             )
             .unwrap(),
-            AcceptOutcome::StoredInert(PendingReason::UndecodablePayload),
+            AcceptOutcome::StoredInert {
+                reason: PendingReason::UndecodablePayload,
+                entry_hash: garbage.entry.entry_hash,
+                prev_hash: None,
+            },
         );
         // One bad payload does not wedge the chain: the next valid entry still applies.
         assert!(matches!(
@@ -1020,8 +1335,9 @@ mod tests {
     }
 
     #[test]
-    fn a_gap_is_reported_not_stored() {
-        // A second-position entry (lamport 1) arriving before the genesis is a missing predecessor.
+    fn a_gap_is_retained_awaiting_its_predecessor() {
+        // A second-position entry (lamport 1) arriving before the genesis has a missing
+        // predecessor: it is held rather than dropped, so reverse delivery can still converge.
         let mut b = conn();
         let secret = DeviceSecret::from_seed(&[1; 32]);
         let second = {
@@ -1044,7 +1360,321 @@ mod tests {
                 0
             )
             .unwrap(),
-            AcceptOutcome::MissingPredecessor,
+            AcceptOutcome::GapRetained,
+        );
+        let held: i64 = tx
+            .query_row("SELECT COUNT(*) FROM table_sync_gapped_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            held, 1,
+            "and it is HELD, not merely reported — the verdict alone is not the fix"
+        );
+        let accepted: i64 =
+            tx.query_row("SELECT COUNT(*) FROM table_sync_entries", [], |r| r.get(0)).unwrap();
+        assert_eq!(accepted, 0, "but it is not on the accepted chain");
+    }
+
+    /// Two entries citing the SAME predecessor, both arriving before it. Both are held — neither
+    /// can be classified yet, because the predecessor that would make one of them a second
+    /// successor is not here. The equivocation only becomes visible on promotion.
+    #[test]
+    fn two_siblings_awaiting_one_predecessor_are_both_held() {
+        let secret = DeviceSecret::from_seed(&[1; 32]);
+        let (genesis, first) = {
+            let mut a = conn();
+            let tx = a.transaction().unwrap();
+            let genesis = author_row_entry(&tx, stream(), &secret, &op("r1"), 0).unwrap();
+            let first = author_row_entry(&tx, stream(), &secret, &op("r2"), 0).unwrap();
+            tx.commit().unwrap();
+            (genesis, first)
+        };
+        let sibling = entry::sign_entry_from_op_bytes(
+            &secret,
+            stream(),
+            Some(genesis.entry.entry_hash),
+            first.entry.lamport + 1,
+            row_op::encode(&op("r_sibling")),
+        );
+
+        let mut b = conn();
+        let tx = b.transaction().unwrap();
+        for bytes in [&first.signed_bytes, &sibling.signed_bytes] {
+            assert_eq!(
+                accept_row_entry(&tx, account(), stream(), &["t"], bytes, &secret.public(), 0)
+                    .unwrap(),
+                AcceptOutcome::GapRetained,
+            );
+        }
+        let held: i64 = tx
+            .query_row("SELECT COUNT(*) FROM table_sync_gapped_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(held, 2, "both siblings are held; neither can be judged without the parent");
+    }
+
+    /// The cap evicts the FURTHEST-AHEAD held entry, not the newcomer. Refusing the newcomer would
+    /// let whoever filled the table first block the near-tail entry the chain actually needs.
+    #[test]
+    fn the_cap_evicts_the_furthest_ahead_held_entry() {
+        let secret = DeviceSecret::from_seed(&[1; 32]);
+        let mut b = conn();
+        let tx = b.transaction().unwrap();
+        let stream_bytes = stream().to_bytes();
+        let device_bytes = secret.public().fingerprint().to_bytes();
+        // Fill the chain to the cap with synthetic held rows at high lamports.
+        for i in 0..MAX_GAPPED_PER_CHAIN {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            tx.execute(
+                "INSERT INTO table_sync_gapped_entries(entry_hash, stream_id, device_fingerprint, \
+                 lamport, prev_hash, signed_bytes, gapped_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                params![
+                    hash.as_slice(),
+                    stream_bytes.as_slice(),
+                    device_bytes.as_slice(),
+                    i64::try_from(1_000_000 + i).unwrap(),
+                    [9u8; 32].as_slice(),
+                    [0u8; 4].as_slice(),
+                ],
+            )
+            .unwrap();
+        }
+        let highest = i64::try_from(1_000_000 + MAX_GAPPED_PER_CHAIN - 1).unwrap();
+
+        // A near-tail entry arrives with the table full.
+        let newcomer = entry::sign_entry_from_op_bytes(
+            &secret,
+            stream(),
+            Some([7u8; 32]),
+            5,
+            row_op::encode(&op("r_new")),
+        );
+        assert_eq!(
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &newcomer.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
+            AcceptOutcome::GapRetained,
+            "the newcomer is held, not refused",
+        );
+        let still_capped: i64 = tx
+            .query_row("SELECT COUNT(*) FROM table_sync_gapped_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(usize::try_from(still_capped).unwrap(), MAX_GAPPED_PER_CHAIN, "the cap holds");
+        let evicted: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM table_sync_gapped_entries WHERE lamport = ?1",
+                params![highest],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(evicted, 0, "the furthest-ahead entry made room, not the arriving one");
+        let kept: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM table_sync_gapped_entries WHERE entry_hash = ?1",
+                params![newcomer.entry.entry_hash.as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "and the near-tail newcomer is the one held");
+
+        // The OTHER direction: an arrival further ahead than everything held is itself the entry
+        // the policy drops. Evicting the stored maximum for it would invert the policy — a table of
+        // near-tail entries would be hollowed out by a stream of ever-higher-lamport arrivals.
+        let far = entry::sign_entry_from_op_bytes(
+            &secret,
+            stream(),
+            Some([7u8; 32]),
+            9_000_000,
+            row_op::encode(&op("r_far")),
+        );
+        assert_eq!(
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &far.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
+            AcceptOutcome::GapChainFull,
+            "the furthest-ahead arrival is refused, and says so rather than reporting itself held",
+        );
+        let far_held: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM table_sync_gapped_entries WHERE entry_hash = ?1",
+                params![far.entry.entry_hash.as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(far_held, 0, "it is not held");
+        let survivors: i64 = tx
+            .query_row("SELECT COUNT(*) FROM table_sync_gapped_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            usize::try_from(survivors).unwrap(),
+            MAX_GAPPED_PER_CHAIN,
+            "and it displaced nothing",
+        );
+    }
+
+    /// At the cap boundary the arrival's lamport can TIE the furthest-ahead held entry. Ranking on
+    /// lamport alone resolves that as "whoever is already held wins" — insertion order again, the
+    /// property the hash tie-break exists to remove. The comparison therefore uses the same
+    /// `(lamport, entry_hash)` order the eviction victim is chosen by, so two ties on opposite
+    /// sides of the held entry get opposite answers.
+    #[test]
+    fn a_lamport_tie_at_the_cap_boundary_is_broken_by_hash() {
+        let secret = DeviceSecret::from_seed(&[1; 32]);
+        let mut b = conn();
+        let tx = b.transaction().unwrap();
+        let stream_bytes = stream().to_bytes();
+        let device_bytes = secret.public().fingerprint().to_bytes();
+        // Fill to the cap. Every row sits at the SAME lamport with a mid-range hash, so a real
+        // signed entry at that lamport can sort on either side of the furthest-ahead one.
+        const BOUNDARY: i64 = 500;
+        for i in 0..MAX_GAPPED_PER_CHAIN {
+            let mut hash = [0x80u8; 32];
+            hash[8..16].copy_from_slice(&(i as u64).to_be_bytes());
+            tx.execute(
+                "INSERT INTO table_sync_gapped_entries(entry_hash, stream_id, device_fingerprint, \
+                 lamport, prev_hash, signed_bytes, gapped_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                params![
+                    hash.as_slice(),
+                    stream_bytes.as_slice(),
+                    device_bytes.as_slice(),
+                    BOUNDARY,
+                    [9u8; 32].as_slice(),
+                    [0u8; 4].as_slice(),
+                ],
+            )
+            .unwrap();
+        }
+        let furthest: Vec<u8> = tx
+            .query_row(
+                "SELECT entry_hash FROM table_sync_gapped_entries
+                  WHERE stream_id = ?1 AND lamport = ?2 ORDER BY entry_hash DESC LIMIT 1",
+                params![stream_bytes.as_slice(), BOUNDARY],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let (mut lower, mut higher) = (None, None);
+        for nonce in 0u32..256 {
+            let tie = entry::sign_entry_from_op_bytes(
+                &secret,
+                stream(),
+                Some([7u8; 32]),
+                u64::try_from(BOUNDARY).unwrap(),
+                row_op::encode(&op(&format!("tie{nonce}"))),
+            );
+            if tie.entry.entry_hash.as_slice() < furthest.as_slice() {
+                lower.get_or_insert(tie);
+            } else {
+                higher.get_or_insert(tie);
+            }
+            if lower.is_some() && higher.is_some() {
+                break;
+            }
+        }
+        let (lower, higher) =
+            (lower.expect("a lower-hash tie"), higher.expect("a higher-hash tie"));
+
+        assert_eq!(
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &higher.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
+            AcceptOutcome::GapChainFull,
+            "a tie sorting ABOVE the furthest held entry is the one dropped",
+        );
+        assert_eq!(
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &lower.signed_bytes,
+                &secret.public(),
+                0
+            )
+            .unwrap(),
+            AcceptOutcome::GapRetained,
+            "a tie sorting BELOW it displaces it instead",
+        );
+    }
+
+    /// Which of two same-lamport siblings takes the successor slot must be a property of the
+    /// ENTRIES, not of the order they happened to be inserted in. On lamport alone, SQLite falls
+    /// back to physical row order, so two replicas holding the same pair could accept different
+    /// successors and project different rows.
+    #[test]
+    fn the_sibling_taken_first_does_not_depend_on_insertion_order() {
+        let secret = DeviceSecret::from_seed(&[1; 32]);
+        let genesis = {
+            let mut a = conn();
+            let tx = a.transaction().unwrap();
+            let g = author_row_entry(&tx, stream(), &secret, &op("r1"), 0).unwrap();
+            tx.commit().unwrap();
+            g
+        };
+        let sib = |id: &str| {
+            entry::sign_entry_from_op_bytes(
+                &secret,
+                stream(),
+                Some(genesis.entry.entry_hash),
+                7,
+                row_op::encode(&op(id)),
+            )
+        };
+        let (one, two) = (sib("r_one"), sib("r_two"));
+
+        // Two stores, same pair of siblings, opposite insertion orders.
+        let taken_by = |order: [&crate::entry::SignedEntry; 2]| {
+            let mut b = conn();
+            let tx = b.transaction().unwrap();
+            for e in order {
+                accept_row_entry(
+                    &tx,
+                    account(),
+                    stream(),
+                    &["t"],
+                    &e.signed_bytes,
+                    &secret.public(),
+                    0,
+                )
+                .unwrap();
+            }
+            take_gapped_child(
+                &tx,
+                stream(),
+                secret.public().fingerprint(),
+                &genesis.entry.entry_hash,
+            )
+            .unwrap()
+            .expect("a sibling is available")
+            .entry_hash
+        };
+
+        assert_eq!(
+            taken_by([&one, &two]),
+            taken_by([&two, &one]),
+            "the same pair yields the same winner whichever arrived first",
         );
     }
 

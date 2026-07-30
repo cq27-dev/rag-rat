@@ -39,8 +39,25 @@ pub(crate) enum IngestOutcome {
     /// `&str` is the reason. Forward-compatible: the chain advanced, the payload is retained.
     Retained(&'static str),
     AlreadyPresent,
-    /// A chain gap or fork — the transport milestone resolves it (backfill / fork evidence).
-    Parked(&'static str),
+    /// The entry's chain predecessor has not arrived, so it is RETAINED and will be promoted when
+    /// the predecessor is accepted. Not an error: out-of-order delivery is the normal condition on
+    /// a transport.
+    AwaitingPredecessor,
+    /// Already retained awaiting its predecessor. Weaker than [`Self::AlreadyPresent`] — a retained
+    /// entry can still be evicted by the per-chain cap, so a frontier must not treat it as settled.
+    AlreadyAwaiting,
+    /// The entry's predecessor is missing AND it is further ahead than everything the chain already
+    /// holds, so the per-chain cap dropped it. NOT held — nothing will promote it. RETRYABLE once
+    /// the entries between it and the tail have arrived.
+    HeldChainFull,
+    /// The entry conflicts with the stored chain — an equivocation. Fork EVIDENCE (proving it to a
+    /// peer) is the transport milestone's.
+    Forked,
+    /// A held entry discarded because the entry it cites was judged a fork. It was never itself
+    /// classified: nothing will ever place its predecessor on the chain, so it could not have been
+    /// promoted, and it cites a hash no future acceptance produces, so nothing would look at it
+    /// again.
+    AbandonedBehindFork,
     /// A type mismatch — stored, unprojectable, surfaced.
     Quarantined(String),
     /// The signing device is not a roster-effective writer (off-roster, removed, or read-only), so
@@ -139,6 +156,15 @@ pub(crate) fn produce_and_author(
     Ok(authored)
 }
 
+/// **The caller MUST roll back on `Err`.** Everything here runs in the caller's transaction and
+/// nothing is safe to commit after a failure: the entry may be stored with its payload neither
+/// applied nor marked, and a promotion in flight takes an entry out of the held table before
+/// re-ingesting it, so committing past an error can lose it. That contract predates promotion — an
+/// `accept` followed by a failing apply had it already — and promotion widens what is lost rather
+/// than changing the rule. No `SAVEPOINT` is taken: it would make this one function's atomicity
+/// self-contained while every sibling in the module still depends on caller rollback, which is a
+/// worse thing to reason about than one uniform rule.
+///
 /// Verify, store, and apply one received entry for `scope_id`'s stream, signed by `pubkey`. A scope
 /// may carry several tables (overlay, distill), so the target spec is resolved from the decoded
 /// op's table against every registry entry in the scope — not fixed by the caller. The op's table
@@ -150,7 +176,118 @@ pub(crate) fn ingest(
     scope_id: &str,
     signed_bytes: &[u8],
     pubkey: &DevicePublic,
-) -> anyhow::Result<IngestOutcome> {
+) -> anyhow::Result<IngestReport> {
+    let device = pubkey.fingerprint();
+    let stream = scope_stream_id(ctx.repo_id, ctx.account_id, scope_id);
+    let (outcome, mut tail) = ingest_one(tx, ctx, scope_id, signed_bytes, pubkey)?;
+    let mut promoted = Vec::new();
+    // Each accepted entry settles the held CHILDREN of two hashes, and both sets must be drained
+    // or rows sit in the table forever, keyed to a hash no probe will ever revisit:
+    //
+    //  1. the children of its PREDECESSOR — its own siblings. The acceptance just filled that
+    //     successor slot, so each is now provably an equivocation.
+    //  2. the children of the accepted entry ITSELF — the chain advance.
+    //
+    // Both are the same operation, so both go through `drain_children`: take every held child of a
+    // hash, re-ingest each, and report which one (if any) took the slot. Draining must CONTINUE
+    // past a child that fails to store — a rejected child leaves the slot open, and stopping there
+    // would strand a valid successor queued behind it and halt the chain.
+    //
+    // Iterative, not recursive: a long chain delivered in reverse must heal without growing the
+    // stack in proportion to its length.
+    while let Some(accepted) = tail {
+        if let Some(prev) = accepted.prev_hash {
+            // Cannot advance the chain: the slot is already held by `accepted`.
+            drain_children(tx, ctx, scope_id, pubkey, stream, device, &prev, &mut promoted)?;
+        }
+        // A held entry on ANOTHER device's chain citing this hash is structurally impossible (a
+        // chain links only within its own device), and accepting this entry is the only moment that
+        // is decidable — `classify` keys the tail on the citing device's chain, so it would report
+        // `Gap` forever. Sweep those now or they hold that chain's capacity until eviction.
+        let foreign =
+            store::discard_foreign_chain_citations(tx, stream, device, &accepted.entry_hash)?;
+        promoted.extend(std::iter::repeat_n(IngestOutcome::AbandonedBehindFork, foreign));
+        tail = drain_children(
+            tx,
+            ctx,
+            scope_id,
+            pubkey,
+            stream,
+            device,
+            &accepted.entry_hash,
+            &mut promoted,
+        )?;
+    }
+    Ok(IngestReport { outcome, promoted })
+}
+
+/// What one entry's arrival did, plus everything its acceptance unblocked.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct IngestReport {
+    pub outcome: IngestOutcome,
+    /// Outcomes of the entries promoted out of the gapped table by this arrival, in promotion
+    /// order. Reported individually rather than counted: promotion settles the CHAIN question, so
+    /// a promoted entry can still be retained, quarantined, or deferred on its PAYLOAD.
+    pub promoted: Vec<IngestOutcome>,
+}
+
+/// The entry an acceptance put at the chain tail — what a promotion probe keys on.
+#[derive(Debug, Clone, Copy)]
+struct AcceptedEntry {
+    entry_hash: [u8; 32],
+    prev_hash: Option<[u8; 32]>,
+}
+
+/// Re-ingest every held child of `parent_hash`, returning the one that took the successor slot.
+///
+/// At most one can: once a child is stored, the rest classify as equivocations. But the loop must
+/// run to exhaustion either way. Stopping at the first child that fails to store would leave a
+/// VALID successor queued behind an invalid one — the invalid child sorts first (a lamport at or
+/// below the tail is a `Conflict`, and it is a lower lamport), takes the slot's only probe, and the
+/// legitimate entry behind it is never examined again. The chain would stop advancing there.
+///
+/// A child that does not store is a fork, and its own held descendants are abandoned with it:
+/// nothing will ever put its hash on the chain, so they can never promote, and they cite a hash no
+/// future acceptance produces, so no probe would reach them either.
+#[allow(clippy::too_many_arguments)]
+fn drain_children(
+    tx: &Transaction<'_>,
+    ctx: &SyncCtx<'_>,
+    scope_id: &str,
+    pubkey: &DevicePublic,
+    stream: crate::stream::StreamId,
+    device: crate::op::DeviceFingerprint,
+    parent_hash: &[u8; 32],
+    promoted: &mut Vec<IngestOutcome>,
+) -> anyhow::Result<Option<AcceptedEntry>> {
+    let mut took_the_slot = None;
+    while let Some(child) = store::take_gapped_child(tx, stream, device, parent_hash)? {
+        let (outcome, stored) = ingest_one(tx, ctx, scope_id, &child.signed_bytes, pubkey)?;
+        promoted.push(outcome);
+        match stored {
+            Some(entry) => took_the_slot = Some(entry),
+            None => {
+                let abandoned = store::discard_gapped_descendants(tx, stream, &child.entry_hash)?;
+                promoted.extend(std::iter::repeat_n(IngestOutcome::AbandonedBehindFork, abandoned));
+            },
+        }
+    }
+    Ok(took_the_slot)
+}
+
+/// Ingest exactly one entry, with no promotion. Returns the accepted entry when this call STORED
+/// one, which is what drives [`ingest`]'s loop.
+///
+/// The tail is returned explicitly rather than inferred from the outcome variant. Several outcomes
+/// imply storage (`Applied`, `Retained`, `Quarantined`), and a future one that also stores must not
+/// silently fail to drive promotion.
+fn ingest_one(
+    tx: &Transaction<'_>,
+    ctx: &SyncCtx<'_>,
+    scope_id: &str,
+    signed_bytes: &[u8],
+    pubkey: &DevicePublic,
+) -> anyhow::Result<(IngestOutcome, Option<AcceptedEntry>)> {
     // Same refusal as the producer: an older binary must not re-park, under its own version, an
     // entry a newer projector already understood and folded.
     refold::assert_projector_not_newer(tx)?;
@@ -170,14 +307,15 @@ pub(crate) fn ingest(
             pubkey,
             ctx.now_ms,
         )? {
-            AcceptOutcome::Stored { op, meta, entry_hash } => {
+            AcceptOutcome::Stored { op, meta, entry_hash, prev_hash } => {
+                let accepted = Some(AcceptedEntry { entry_hash, prev_hash });
                 // `accept_row_entry` already validated the op's table is in `scope_tables`, so
                 // exactly one spec matches; the fallback is defensive, never
                 // reached.
                 let Some(spec) =
                     ctx.registry.iter().find(|s| s.scope_id == scope_id && s.name == op.table())
                 else {
-                    return Ok(IngestOutcome::Parked("table not in scope"));
+                    return Ok((IngestOutcome::Retained("table not in scope"), accepted));
                 };
                 // NEVER apply over unsent local work. A raw local write does not advance the row
                 // clock, so the LWW comparison below cannot see it: this op would simply win and
@@ -210,9 +348,9 @@ pub(crate) fn ingest(
                         deferral,
                         refold::TABLE_SYNC_PROJECTOR_VERSION,
                     )?;
-                    return Ok(IngestOutcome::Retained(deferral.as_db_str()));
+                    return Ok((IngestOutcome::Retained(deferral.as_db_str()), accepted));
                 }
-                match apply::apply_row_op(tx, spec, ctx.repo_id, &op, meta)? {
+                let outcome = match apply::apply_row_op(tx, spec, ctx.repo_id, &op, meta)? {
                     // A received op that lost on the merits still landed: the entry is
                     // stored, nothing is outstanding, and redelivery stays idempotent.
                     ApplyOutcome::Applied | ApplyOutcome::Superseded => IngestOutcome::Applied,
@@ -234,13 +372,21 @@ pub(crate) fn ingest(
                         )?;
                         IngestOutcome::Retained(reason.as_db_str())
                     },
-                }
+                };
+                (outcome, accepted)
             },
-            AcceptOutcome::StoredInert(reason) => IngestOutcome::Retained(reason.as_db_str()),
-            AcceptOutcome::AlreadyPresent => IngestOutcome::AlreadyPresent,
-            AcceptOutcome::MissingPredecessor => IngestOutcome::Parked("missing predecessor"),
-            AcceptOutcome::Fork => IngestOutcome::Parked("fork"),
-            AcceptOutcome::Unauthorized => IngestOutcome::Unauthorized,
+            AcceptOutcome::StoredInert { reason, entry_hash, prev_hash } => (
+                IngestOutcome::Retained(reason.as_db_str()),
+                Some(AcceptedEntry { entry_hash, prev_hash }),
+            ),
+            // Nothing was stored by these, so none of them advances a chain and none can unblock a
+            // retained successor.
+            AcceptOutcome::AlreadyPresent => (IngestOutcome::AlreadyPresent, None),
+            AcceptOutcome::GapRetained => (IngestOutcome::AwaitingPredecessor, None),
+            AcceptOutcome::GapChainFull => (IngestOutcome::HeldChainFull, None),
+            AcceptOutcome::AlreadyGapped => (IngestOutcome::AlreadyAwaiting, None),
+            AcceptOutcome::Fork => (IngestOutcome::Forked, None),
+            AcceptOutcome::Unauthorized => (IngestOutcome::Unauthorized, None),
         },
     )
 }
@@ -311,6 +457,35 @@ mod tests {
             self.conn.execute("DELETE FROM t_demo WHERE id = 'r1'", []).unwrap();
         }
 
+        /// Deliver `entries` in the given order, returning the FULL report per entry — including
+        /// what each arrival promoted out of the gapped table.
+        fn ingest_reports(
+            &mut self,
+            entries: &[Vec<u8>],
+            from: &DevicePublic,
+        ) -> Vec<IngestReport> {
+            enroll_writer(&self.conn, AccountId::from_bytes([42; 32]), from.fingerprint());
+            let tx = self.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: AccountId::from_bytes([42; 32]),
+                device: &self.local,
+                registry: REGISTRY,
+                now_ms: 0,
+            };
+            let out = entries.iter().map(|bytes| ingest(&tx, &ctx, "demo/1", bytes, from).unwrap());
+            let out = out.collect();
+            tx.commit().unwrap();
+            out
+        }
+
+        /// Entries held awaiting a predecessor, across every stream.
+        fn gapped_count(&self) -> i64 {
+            self.conn
+                .query_row("SELECT COUNT(*) FROM table_sync_gapped_entries", [], |r| r.get(0))
+                .unwrap()
+        }
+
         fn ingest_all(&mut self, entries: &[Vec<u8>], from: &DevicePublic) -> Vec<IngestOutcome> {
             // The receiver has folded the author's DeviceAdd, so it is an effective writer here —
             // otherwise the #935 authority gate would drop every entry as Unauthorized.
@@ -323,7 +498,9 @@ mod tests {
                 registry: REGISTRY,
                 now_ms: 0,
             };
-            let out = entries.iter().map(|bytes| ingest(&tx, &ctx, "demo/1", bytes, from).unwrap());
+            let out = entries
+                .iter()
+                .map(|bytes| ingest(&tx, &ctx, "demo/1", bytes, from).unwrap().outcome);
             let out = out.collect();
             tx.commit().unwrap();
             out
@@ -349,6 +526,567 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    /// Three rows authored in order on A, then delivered to B in REVERSE. Before entries awaiting
+    /// a predecessor were retained, everything after the gap was dropped and only redelivery in
+    /// exact causal order could recover it.
+    #[test]
+    fn a_chain_delivered_in_reverse_converges() {
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let mut entries = Vec::new();
+        for (id, title) in [("r1", "one"), ("r2", "two"), ("r3", "three")] {
+            a.conn.execute("INSERT INTO t_demo(id, title) VALUES (?1, ?2)", [id, title]).unwrap();
+            entries.extend(a.produce());
+        }
+        assert_eq!(entries.len(), 3, "one entry per authored row");
+
+        entries.reverse();
+        let reports = b.ingest_reports(&entries, &a.pubkey());
+
+        // The first two arrive with no predecessor and are held; the third completes the chain and
+        // drags both forward behind it.
+        assert_eq!(reports[0].outcome, IngestOutcome::AwaitingPredecessor);
+        assert_eq!(reports[1].outcome, IngestOutcome::AwaitingPredecessor);
+        assert_eq!(reports[2].outcome, IngestOutcome::Applied);
+        assert_eq!(
+            reports[2].promoted,
+            vec![IngestOutcome::Applied, IngestOutcome::Applied],
+            "the genesis promotes both retained successors, in chain order",
+        );
+        let titles: Vec<String> = b
+            .conn
+            .prepare("SELECT title FROM t_demo ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(titles, ["one", "two", "three"], "every row lands");
+        assert_eq!(b.gapped_count(), 0, "and nothing is left held");
+    }
+
+    /// A long chain delivered in reverse converges in ONE delivery pass, at a write cost linear in
+    /// its length.
+    ///
+    /// Scoped to what the instrument can actually see. `total_changes` counts rows written, so it
+    /// catches a promote path that writes per-promotion work proportional to the chain (the
+    /// quadratic shape), but it cannot see read cost — a purely-reading rescan would be invisible
+    /// here, and nothing in this test would catch it. The depth is likewise chosen to exercise the
+    /// iterative walk, not to prove recursion would overflow: a few hundred frames would not.
+    #[test]
+    fn a_long_chain_delivered_in_reverse_converges_at_linear_write_cost() {
+        const ROWS: usize = 200;
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let mut entries = Vec::new();
+        for i in 0..ROWS {
+            a.conn
+                .execute("INSERT INTO t_demo(id, title) VALUES (?1, 't')", [format!("r{i:04}")])
+                .unwrap();
+            entries.extend(a.produce());
+        }
+        assert_eq!(entries.len(), ROWS);
+        entries.reverse();
+
+        let before = b.conn.total_changes();
+        let reports = b.ingest_reports(&entries, &a.pubkey());
+        let writes = b.conn.total_changes() - before;
+
+        assert_eq!(reports[ROWS - 1].promoted.len(), ROWS - 1, "one promotion per held entry");
+        let rows: i64 = b.conn.query_row("SELECT COUNT(*) FROM t_demo", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows as usize, ROWS, "every row lands");
+        assert_eq!(b.gapped_count(), 0, "and nothing is left held");
+        // Each entry costs a bounded number of writes: retain, take (delete), insert, apply, plus
+        // the row-clock and published-row bookkeeping. A per-promotion write-amplifying rescan
+        // blows past this by orders of magnitude; the bound is loose enough not to be a churn
+        // magnet.
+        assert!(
+            writes < (ROWS as u64) * 40,
+            "delivery cost {writes} writes for {ROWS} entries — superlinear in the chain length",
+        );
+    }
+
+    /// Redelivery of a held entry must not duplicate it, and must not be reported as settled: the
+    /// per-chain cap can still evict it, unlike an accepted entry.
+    #[test]
+    fn a_redelivered_held_entry_is_recognized_and_not_duplicated() {
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'one')", []).unwrap();
+        let genesis = a.produce();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
+        let second = a.produce();
+
+        let first = b.ingest_reports(&second, &a.pubkey());
+        assert_eq!(first[0].outcome, IngestOutcome::AwaitingPredecessor);
+        assert_eq!(b.gapped_count(), 1);
+
+        let again = b.ingest_reports(&second, &a.pubkey());
+        assert_eq!(
+            again[0].outcome,
+            IngestOutcome::AlreadyAwaiting,
+            "a redelivered held entry is recognized, and reported distinctly from AlreadyPresent",
+        );
+        assert_eq!(b.gapped_count(), 1, "and is not held twice");
+
+        // It still promotes once the predecessor lands.
+        let done = b.ingest_reports(&genesis, &a.pubkey());
+        assert_eq!(done[0].promoted, vec![IngestOutcome::Applied]);
+        assert_eq!(b.gapped_count(), 0);
+    }
+
+    /// Entries awaiting a predecessor are NOT on the accepted chain, so they must not move the
+    /// stream's Lamport clock. If they did, one far-ahead held entry would drag local authoring
+    /// with it — exactly what the lamport-advance bound exists to stop a single entry doing.
+    #[test]
+    fn a_held_entry_does_not_advance_the_stream_lamport_clock() {
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'one')", []).unwrap();
+        let _genesis = a.produce();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
+        let second = a.produce();
+
+        // B holds A's second entry (lamport 1) without its predecessor, then authors its own row.
+        b.ingest_reports(&second, &a.pubkey());
+        assert_eq!(b.gapped_count(), 1, "the entry is held, not accepted");
+        b.conn.execute("INSERT INTO t_demo(id, title) VALUES ('own', 'mine')", []).unwrap();
+        let mine = b.produce();
+        assert_eq!(mine.len(), 1);
+
+        let lamport: i64 = b
+            .conn
+            .query_row(
+                "SELECT lamport FROM table_sync_entries WHERE device_fingerprint = ?1",
+                rusqlite::params![b.pubkey().fingerprint().to_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            lamport, 0,
+            "B's own genesis takes lamport 0 — the held entry's lamport 1 is invisible to the \
+             clock",
+        );
+    }
+
+    /// The promote loop must drain the SIBLINGS of the entry it just accepted, not only that
+    /// entry's child.
+    ///
+    /// Two held entries cite the same predecessor. When it arrives, one takes the successor slot;
+    /// the other is now provably an equivocation — but it is still keyed to a predecessor whose
+    /// slot is filled, so a loop that probes only the ADVANCING tail would never look at it again
+    /// and it would sit in the table forever, re-examined on every future promotion.
+    #[test]
+    fn a_promotion_drains_the_sibling_it_just_proved_to_be_a_fork() {
+        use crate::entry;
+        use crate::table_sync::row_op;
+
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'one')", []).unwrap();
+        let genesis = a.produce();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
+        let second = a.produce();
+
+        // A second successor of the genesis, signed by the same device — an equivocation.
+        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), "demo/1");
+        let genesis_hash: [u8; 32] = a
+            .conn
+            .query_row(
+                "SELECT entry_hash FROM table_sync_entries ORDER BY lamport LIMIT 1",
+                [],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let sibling = entry::sign_entry_from_op_bytes(
+            a.local.secret(),
+            stream,
+            Some(genesis_hash),
+            9,
+            row_op::encode(&row_op::RowOp::Remove {
+                table: "t_demo".into(),
+                pk: vec![row_op::TypedValue::Text("r9".into())],
+                spec_version: 1,
+            }),
+        );
+
+        // Both successors arrive before the genesis and are held.
+        let held =
+            b.ingest_reports(&[second[0].clone(), sibling.signed_bytes.clone()], &a.pubkey());
+        assert_eq!(held[0].outcome, IngestOutcome::AwaitingPredecessor);
+        assert_eq!(held[1].outcome, IngestOutcome::AwaitingPredecessor);
+        assert_eq!(b.gapped_count(), 2);
+
+        let report = b.ingest_reports(&genesis, &a.pubkey());
+        assert_eq!(report[0].outcome, IngestOutcome::Applied);
+        assert!(
+            report[0].promoted.contains(&IngestOutcome::Forked),
+            "the losing sibling is judged, not left held: {:?}",
+            report[0].promoted,
+        );
+        assert_eq!(
+            b.gapped_count(),
+            0,
+            "and the table is empty — nothing is stranded behind a filled successor slot",
+        );
+    }
+
+    /// A promoted entry goes through the SAME gates as a freshly delivered one — it is fed back
+    /// through the whole accept-and-apply path, not written straight into its table.
+    ///
+    /// The observable is the unsent-work guard: B holds an entry that would overwrite a local edit
+    /// no peer has seen. When the predecessor arrives and promotes it, it must DEFER, exactly as it
+    /// would have on direct delivery. A promote path that wrote the row directly would clobber the
+    /// edit and this would read "from-A".
+    #[test]
+    fn a_promoted_entry_still_defers_to_unsent_local_work() {
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'base')", []).unwrap();
+        b.ingest_all(&a.produce(), &a.pubkey());
+
+        // A's next two entries: an unrelated row, then the edit to r1 that would overwrite B.
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
+        let filler = a.produce();
+        a.set_title("from-A");
+        let edit = a.produce();
+
+        // B makes its own unsent edit, then receives A's LAST entry first — so it is held.
+        b.set_title("from-B");
+        let held = b.ingest_reports(&edit, &a.pubkey());
+        assert_eq!(held[0].outcome, IngestOutcome::AwaitingPredecessor);
+        assert_eq!(b.gapped_count(), 1);
+
+        // The predecessor arrives and promotes it. The guard must still fire.
+        let report = b.ingest_reports(&filler, &a.pubkey());
+        assert_eq!(
+            report[0].promoted,
+            vec![IngestOutcome::Retained(
+                crate::table_sync::store::PendingReason::DeferredUnsentEdit.as_db_str()
+            )],
+            "the promoted entry defers rather than applying",
+        );
+        assert_eq!(b.title().as_deref(), Some("from-B"), "B's unsent edit survives promotion");
+        assert_eq!(b.gapped_count(), 0, "and the entry left the held table — it is stored now");
+    }
+
+    /// Held entries are a CHAIN state, not a projection state: they carry no pending reason and
+    /// must not make a refold owed. Their redemption trigger is a predecessor's arrival, not a
+    /// projector-version bump — and a refold owed on every open is the per-open cost #1005's
+    /// narrowing exists to avoid.
+    #[test]
+    fn held_entries_do_not_make_a_refold_owed() {
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'one')", []).unwrap();
+        let _genesis = a.produce();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
+        let second = a.produce();
+
+        // Settle any refold the fresh store owes for unrelated reasons (a first-open version
+        // stamp), so what this test observes afterwards is attributable to the held entry alone.
+        refold::refold_stale_projections_against(&b.conn, REGISTRY).unwrap();
+
+        b.ingest_reports(&second, &a.pubkey());
+        assert_eq!(b.gapped_count(), 1, "an entry is held");
+
+        let pending: i64 = b
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM table_sync_entries WHERE pending_reason IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0, "it is not recorded as a projection gap");
+        assert!(
+            !refold::refold_stale_projections_against(&b.conn, REGISTRY).unwrap(),
+            "and no refold is owed while it waits",
+        );
+    }
+
+    /// A held entry whose predecessor turns out to be a FORK is abandoned with it.
+    ///
+    /// Two successors of the genesis, X and Y, plus a held entry W citing X. When the genesis
+    /// arrives, one of X/Y takes the successor slot and the other is judged a fork — and a fork is
+    /// never stored, so nothing will ever put its hash on the chain. W therefore can never be
+    /// promoted, and it is keyed to a hash no future acceptance produces, so no later probe would
+    /// examine it either. Draining only the siblings themselves would leave it in the table
+    /// permanently.
+    #[test]
+    fn a_held_entry_behind_a_fork_is_abandoned_with_it() {
+        use crate::entry;
+        use crate::table_sync::row_op;
+
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'one')", []).unwrap();
+        let genesis = a.produce();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
+        let winner = a.produce();
+
+        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), "demo/1");
+        let genesis_hash: [u8; 32] = a
+            .conn
+            .query_row(
+                "SELECT entry_hash FROM table_sync_entries ORDER BY lamport LIMIT 1",
+                [],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let remove = |id: &str| {
+            row_op::encode(&row_op::RowOp::Remove {
+                table: "t_demo".into(),
+                pk: vec![row_op::TypedValue::Text(id.into())],
+                spec_version: 1,
+            })
+        };
+        // The losing sibling, at a HIGHER lamport than the winner so the drain order is fixed.
+        let loser = entry::sign_entry_from_op_bytes(
+            a.local.secret(),
+            stream,
+            Some(genesis_hash),
+            50,
+            remove("r_loser"),
+        );
+        // And a child of the loser — held behind an entry that will never be stored.
+        let orphan = entry::sign_entry_from_op_bytes(
+            a.local.secret(),
+            stream,
+            Some(loser.entry.entry_hash),
+            60,
+            remove("r_orphan"),
+        );
+
+        let held = b.ingest_reports(
+            &[winner[0].clone(), loser.signed_bytes.clone(), orphan.signed_bytes.clone()],
+            &a.pubkey(),
+        );
+        assert!(held.iter().all(|r| r.outcome == IngestOutcome::AwaitingPredecessor));
+        assert_eq!(b.gapped_count(), 3, "all three wait on predecessors");
+
+        let report = b.ingest_reports(&genesis, &a.pubkey());
+        assert!(
+            report[0].promoted.contains(&IngestOutcome::Forked),
+            "the losing sibling is judged: {:?}",
+            report[0].promoted,
+        );
+        assert!(
+            report[0].promoted.contains(&IngestOutcome::AbandonedBehindFork),
+            "and its held child is abandoned with it, not left keyed to a hash that never lands: \
+             {:?}",
+            report[0].promoted,
+        );
+        assert_eq!(b.gapped_count(), 0, "nothing is stranded");
+    }
+
+    /// Draining must continue PAST a child that fails to store, or a valid successor queued behind
+    /// an invalid one is stranded and the chain stops advancing.
+    ///
+    /// Two children cite the genesis: one at a lamport at/below the tail (an equivocation) and the
+    /// real successor above it. The invalid one sorts first, so a drain that stopped at the first
+    /// non-storing child would take the genesis's only probe, leave the successor slot open with
+    /// nothing left to fill it, and halt there — the successor is keyed to a hash no later
+    /// acceptance revisits.
+    #[test]
+    fn a_rejected_child_does_not_strand_the_valid_successor_behind_it() {
+        use crate::entry;
+        use crate::table_sync::row_op;
+
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'one')", []).unwrap();
+        let genesis = a.produce();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
+        let successor = a.produce();
+
+        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), "demo/1");
+        let genesis_hash: [u8; 32] = a
+            .conn
+            .query_row(
+                "SELECT entry_hash FROM table_sync_entries ORDER BY lamport LIMIT 1",
+                [],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .unwrap()
+            .try_into()
+            .unwrap();
+        // Lamport 0 ties the genesis's own lamport, so this classifies at/below the tail — a
+        // conflict — and sorts BEFORE the real successor at lamport 1.
+        let invalid = entry::sign_entry_from_op_bytes(
+            a.local.secret(),
+            stream,
+            Some(genesis_hash),
+            0,
+            row_op::encode(&row_op::RowOp::Remove {
+                table: "t_demo".into(),
+                pk: vec![row_op::TypedValue::Text("r_bogus".into())],
+                spec_version: 1,
+            }),
+        );
+
+        let held =
+            b.ingest_reports(&[invalid.signed_bytes.clone(), successor[0].clone()], &a.pubkey());
+        assert!(held.iter().all(|r| r.outcome == IngestOutcome::AwaitingPredecessor));
+        assert_eq!(b.gapped_count(), 2);
+
+        let report = b.ingest_reports(&genesis, &a.pubkey());
+        assert!(
+            report[0].promoted.contains(&IngestOutcome::Forked),
+            "the invalid child is judged: {:?}",
+            report[0].promoted,
+        );
+        assert!(
+            report[0].promoted.contains(&IngestOutcome::Applied),
+            "and the drain continues past it to the real successor: {:?}",
+            report[0].promoted,
+        );
+        assert_eq!(
+            b.conn
+                .query_row("SELECT title FROM t_demo WHERE id = 'r2'", [], |r| r
+                    .get::<_, String>(0))
+                .ok()
+                .as_deref(),
+            Some("two"),
+            "the successor's row lands — the chain did not halt on the rejected child",
+        );
+        assert_eq!(b.gapped_count(), 0, "nothing is stranded");
+    }
+
+    /// An entry citing a predecessor from ANOTHER device's chain can never be honest — a chain
+    /// links only within its own device. It is retained on arrival (until the cited hash is held,
+    /// it is indistinguishable from an ordinary missing predecessor), and accepting that hash is
+    /// the only moment the impossibility becomes decidable: `classify` keys the tail on the citing
+    /// device's own chain, so re-examining it later reports `Gap` forever.
+    #[test]
+    fn a_held_entry_citing_another_devices_chain_is_discarded_when_that_entry_lands() {
+        use crate::entry;
+        use crate::table_sync::row_op;
+
+        let mut a = Device::new();
+        let c = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'one')", []).unwrap();
+        let genesis = a.produce();
+        let a_genesis_hash: [u8; 32] = a
+            .conn
+            .query_row("SELECT entry_hash FROM table_sync_entries LIMIT 1", [], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        // Device C signs an entry citing A's hash — a cross-chain link.
+        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), "demo/1");
+        let cross = entry::sign_entry_from_op_bytes(
+            c.local.secret(),
+            stream,
+            Some(a_genesis_hash),
+            5,
+            row_op::encode(&row_op::RowOp::Remove {
+                table: "t_demo".into(),
+                pk: vec![row_op::TypedValue::Text("r_cross".into())],
+                spec_version: 1,
+            }),
+        );
+
+        // It arrives BEFORE A's entry, so nothing yet distinguishes it from a real gap.
+        let held = b.ingest_reports(std::slice::from_ref(&cross.signed_bytes), &c.pubkey());
+        assert_eq!(held[0].outcome, IngestOutcome::AwaitingPredecessor);
+        assert_eq!(b.gapped_count(), 1);
+
+        b.ingest_reports(&genesis, &a.pubkey());
+        assert_eq!(
+            b.gapped_count(),
+            0,
+            "accepting the cited entry retires the cross-chain citation, which nothing else would",
+        );
+
+        // The OTHER delivery order is decidable on arrival, and must not be retained at all: the
+        // cited hash is already held, so the link is provably cross-chain right then. Retaining it
+        // would create exactly the row the sweep above exists to clean up.
+        let mut fresh = Device::new();
+        fresh.ingest_reports(&genesis, &a.pubkey());
+        let late = fresh.ingest_reports(std::slice::from_ref(&cross.signed_bytes), &c.pubkey());
+        assert_eq!(
+            late[0].outcome,
+            IngestOutcome::Forked,
+            "a citation of an already-held foreign entry is judged on arrival, not held",
+        );
+        assert_eq!(fresh.gapped_count(), 0);
+    }
+
+    /// A held entry citing a REJECTED entry is abandoned even when it is on a different device's
+    /// chain.
+    ///
+    /// This is the case no later event could clean up: the cross-chain sweep fires only on an
+    /// ACCEPTED hash, and a rejected sibling's hash is never accepted — so a device-filtered
+    /// descendant walk would leave the row held until eviction or a repo purge.
+    #[test]
+    fn a_foreign_citation_of_a_rejected_entry_is_abandoned_with_it() {
+        use crate::entry;
+        use crate::table_sync::row_op;
+
+        let mut a = Device::new();
+        let c = Device::new();
+        let mut b = Device::new();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'one')", []).unwrap();
+        let genesis = a.produce();
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
+        let winner = a.produce();
+
+        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), "demo/1");
+        let genesis_hash: [u8; 32] = a
+            .conn
+            .query_row(
+                "SELECT entry_hash FROM table_sync_entries ORDER BY lamport LIMIT 1",
+                [],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let remove = |id: &str| {
+            row_op::encode(&row_op::RowOp::Remove {
+                table: "t_demo".into(),
+                pk: vec![row_op::TypedValue::Text(id.into())],
+                spec_version: 1,
+            })
+        };
+        // A's losing sibling, and a citation of it signed by a DIFFERENT device.
+        let loser = entry::sign_entry_from_op_bytes(
+            a.local.secret(),
+            stream,
+            Some(genesis_hash),
+            50,
+            remove("r_loser"),
+        );
+        let foreign = entry::sign_entry_from_op_bytes(
+            c.local.secret(),
+            stream,
+            Some(loser.entry.entry_hash),
+            60,
+            remove("r_foreign"),
+        );
+
+        b.ingest_reports(&[winner[0].clone(), loser.signed_bytes.clone()], &a.pubkey());
+        b.ingest_reports(std::slice::from_ref(&foreign.signed_bytes), &c.pubkey());
+        assert_eq!(b.gapped_count(), 3, "all three wait on predecessors");
+
+        b.ingest_reports(&genesis, &a.pubkey());
+        assert_eq!(
+            b.gapped_count(),
+            0,
+            "the loser is judged and the OTHER device's citation of it goes too — nothing else \
+             could retire that row, since its predecessor is never accepted",
+        );
     }
 
     #[test]
@@ -562,7 +1300,7 @@ mod tests {
             };
             for bytes in &entries {
                 assert_eq!(
-                    ingest(&tx, &ctx, "multi/1", bytes, &a_dev.secret().public()).unwrap(),
+                    ingest(&tx, &ctx, "multi/1", bytes, &a_dev.secret().public()).unwrap().outcome,
                     IngestOutcome::Applied,
                 );
             }

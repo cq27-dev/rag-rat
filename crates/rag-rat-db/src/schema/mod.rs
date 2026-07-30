@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 95;
+pub const LATEST_SCHEMA_VERSION: u32 = 96;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -704,6 +704,19 @@ const MIGRATION_095_DESCRIPTION: &str =
      spec_version rather than the store-global projector version, so an unrelated projector bump \
      no longer marks every table's rows incomparable. The table is necessarily empty (no table is \
      registered), so it is rebuilt into its final shape rather than carrying a dead column";
+
+const MIGRATION_096_ID: &str = "096_table_sync_gapped_entries";
+const MIGRATION_096_CHECKSUM: &str = "sha256:rag-rat-table-sync-gapped-entries-v96";
+const MIGRATION_096_DESCRIPTION: &str =
+    "Retention for table-sync entries whose chain predecessor has not arrived (#1058): \
+     table_sync_gapped_entries holds a verified entry that links to an unheld predecessor until \
+     that predecessor is accepted, at which point it is promoted through the ordinary accept and \
+     apply path. Previously such an entry was dropped, so a chain delivered out of causal order \
+     could only converge through redelivery in exact order. Deliberately its own table rather \
+     than a status column: six queries read table_sync_entries as the accepted chain — the \
+     authoring Lamport clock, the lamport-advance bound, the chain tail, entry existence, the LWW \
+     winner lookup, and the refold's pending set — and every one of them must keep excluding an \
+     entry that is not on a chain";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1470,6 +1483,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_095_CHECKSUM,
         description: MIGRATION_095_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_table_sync_spec_version),
+    },
+    Migration {
+        id: MIGRATION_096_ID,
+        checksum: MIGRATION_096_CHECKSUM,
+        description: MIGRATION_096_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_table_sync_gapped_entries),
     },
 ];
 

@@ -1473,12 +1473,116 @@ fn migration_092_normalizes_invite_receipts() {
     assert_eq!(recorded, 1, "the forward migration records V092");
 }
 
+/// V096 (#1058) adds the table holding entries whose chain predecessor has not arrived.
+///
+/// Asserted against the migration's own DDL on a bare connection, not the full ladder's end state:
+/// the directory rule for this suite is that a table's arrival is proved by the step that creates
+/// it, so the assertion keeps meaning something when a later migration also touches it.
+#[test]
+fn migration_096_holds_entries_awaiting_a_chain_predecessor() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 96, "move this pin with the next schema migration");
+
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    assert!(
+        !schema::table_exists(&bare, "table_sync_gapped_entries").unwrap(),
+        "the table arrives with V096, not before"
+    );
+    schema::migrations::apply_table_sync_gapped_entries(&bare).unwrap();
+    schema::migrations::apply_table_sync_gapped_entries(&bare).expect("replay is a no-op");
+    assert!(schema::table_exists(&bare, "table_sync_gapped_entries").unwrap());
+
+    // A held entry always cites a predecessor — a genesis can never gap — so the column is NOT
+    // NULL.
+    let without_predecessor = bare.execute(
+        "INSERT INTO table_sync_gapped_entries(entry_hash, stream_id, device_fingerprint, \
+         lamport, prev_hash, signed_bytes, gapped_at_ms)
+         VALUES (X'01', X'02', X'03', 1, NULL, X'04', 0)",
+        [],
+    );
+    assert!(without_predecessor.is_err(), "a held entry always names the predecessor it waits on");
+
+    // Two equivocating siblings at ONE lamport must both be storable, or whichever arrived first
+    // would block the legitimate one. Identity is the entry hash alone.
+    bare.execute(
+        "INSERT INTO table_sync_gapped_entries(entry_hash, stream_id, device_fingerprint, \
+         lamport, prev_hash, signed_bytes, gapped_at_ms)
+         VALUES (X'01', X'02', X'03', 1, X'09', X'04', 0)",
+        [],
+    )
+    .unwrap();
+    bare.execute(
+        "INSERT INTO table_sync_gapped_entries(entry_hash, stream_id, device_fingerprint, \
+         lamport, prev_hash, signed_bytes, gapped_at_ms)
+         VALUES (X'99', X'02', X'03', 1, X'09', X'04', 0)",
+        [],
+    )
+    .expect("a second entry at the same lamport is a fork to resolve later, not a refusal now");
+
+    // Both indexes carry explicit rationale in the DDL — one serves the promote walks, the other
+    // the cap's count and eviction — and no behavioral test can observe a missing index, only a
+    // slower one. Pin them.
+    for index in [
+        "table_sync_gapped_entries_child",
+        "table_sync_gapped_entries_chain_lamport",
+        "table_sync_gapped_entries_predecessor",
+    ] {
+        let present: i64 = bare
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1 AND \
+                 tbl_name = 'table_sync_gapped_entries'",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "{index} is created with the table");
+    }
+    // The predecessor index must actually be CHOSEN, not merely present: the two chain indexes both
+    // lead with device_fingerprint, so without it these two per-acceptance probes fall back to the
+    // stream_id prefix and scan every held row on the stream. A plan assertion is the only way to
+    // see that — a behavioral test observes the same answer either way, just slower.
+    for probe in [
+        "SELECT entry_hash FROM table_sync_gapped_entries WHERE stream_id = X'01' AND prev_hash = \
+         X'02'",
+        "SELECT entry_hash FROM table_sync_gapped_entries WHERE stream_id = X'01' AND prev_hash = \
+         X'02' AND device_fingerprint != X'03'",
+    ] {
+        let plan: String =
+            bare.query_row(&format!("EXPLAIN QUERY PLAN {probe}"), [], |row| row.get(3)).unwrap();
+        assert!(
+            plan.contains("table_sync_gapped_entries_predecessor"),
+            "the predecessor probe must seek the predecessor index, not scan the stream: {plan}"
+        );
+    }
+
+    // STRICT, per the schema convention for every new table: a held entry's lamport and hashes are
+    // compared as stored, so a silently-coerced value would misorder or mis-key a promotion.
+    let ddl: String = bare
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = \
+             'table_sync_gapped_entries'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(ddl.to_ascii_uppercase().contains("STRICT"), "the table is STRICT: {ddl}");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '096_table_sync_gapped_entries'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V096");
+}
+
 /// V095 (#1002) records the TABLE's spec version on each published row, so an unrelated projector
 /// bump no longer marks every table's rows incomparable.
 #[test]
 fn migration_095_records_the_table_spec_version() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 95, "move this pin with the next schema migration");
-
     let bare = rusqlite::Connection::open_in_memory().unwrap();
     schema::migrations::apply_table_sync_tables(&bare).unwrap();
     schema::migrations::apply_table_sync_projection_state(&bare).unwrap();
