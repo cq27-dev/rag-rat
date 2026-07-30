@@ -167,8 +167,8 @@ pub(crate) fn absolute_config_root_value(root: &Path, parent: &Path) -> String {
     // stripping so they share one form (no-op when there's no symlink, i.e. everywhere on Linux
     // CI). Fall back to the raw path if canonicalize fails (e.g. the dir doesn't exist yet) —
     // same behavior as before for that edge. (#446)
-    let root_canon = root.canonicalize();
-    let parent_canon = parent.canonicalize();
+    let root_canon = rag_rat_base::paths::canonicalize(root);
+    let parent_canon = rag_rat_base::paths::canonicalize(parent);
     let root_ref = root_canon.as_deref().unwrap_or(root);
     let parent_ref = parent_canon.as_deref().unwrap_or(parent);
     if let Ok(relative_parent) = parent_ref.strip_prefix(root_ref) {
@@ -219,7 +219,7 @@ mod tests {
 
         // `root` = canonicalized real dir (what Config::load stores); `parent` reaches the same dir
         // through the symlink (what a config path under `link/` yields).
-        let root = real.canonicalize().unwrap();
+        let root = rag_rat_base::paths::canonicalize(real).unwrap();
         assert_ne!(link, root, "the symlinked path must differ from the canonical one");
         assert_eq!(config_root_value(&root, &link.join("rag-rat.toml")), ".");
 

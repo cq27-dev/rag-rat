@@ -167,7 +167,7 @@ mod tests {
         );
         assert_eq!(
             config.root,
-            scratch.path().canonicalize().unwrap(),
+            rag_rat_base::paths::canonicalize(scratch.path()).unwrap(),
             "both spellings name the same directory",
         );
     }

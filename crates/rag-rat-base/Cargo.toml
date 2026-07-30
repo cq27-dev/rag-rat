@@ -15,6 +15,7 @@ categories.workspace = true
 minicbor.workspace = true
 unicode-normalization.workspace = true
 anyhow.workspace = true
+dunce.workspace = true
 gix.workspace = true
 libc.workspace = true
 path-slash.workspace = true

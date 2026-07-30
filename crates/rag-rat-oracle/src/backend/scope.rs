@@ -47,7 +47,7 @@ impl<'a> CheckoutScope<'a> {
     /// config loads — so it costs nothing and removes a class of mismatch from every test fixture
     /// and every checkout reached through a symlink.
     pub fn resolve(root: &Path, corpus: &'a dyn IndexedCorpus) -> Self {
-        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let root = rag_rat_base::paths::canonicalize_or_simplified(root);
         // The CONTAINING checkout, never the main one: each linked worktree is a different source
         // tree, so a ceiling pointing at main would admit another checkout's databases and
         // ancestors. `config::main_worktree_root` is the adjacent function that must NOT be used

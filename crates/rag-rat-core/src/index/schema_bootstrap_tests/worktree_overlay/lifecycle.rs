@@ -737,7 +737,7 @@ fn worktree_overlay_serves_a_subdir_rooted_config() {
     // canonicalized base workdir. On macOS `std::env::temp_dir()` is `/var/folders/...` (a symlink
     // to `/private/var/folders/...`), so an un-canonicalized root fails the `strip_prefix` and the
     // subdir derivation collapses → zero overlay rows.
-    let main = main.canonicalize().unwrap();
+    let main = rag_rat_base::paths::canonicalize(&main).unwrap();
     fs::write(main.join("crate/src/lib.rs"), "pub fn base_fn() {}\n").unwrap();
     init_git_repo(&main);
     run_git(&main, &["add", "."]);

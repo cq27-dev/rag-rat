@@ -282,7 +282,7 @@ fn init_refuses_to_run_in_a_linked_worktree() {
     assert!(!output.status.success(), "init in a linked worktree is refused");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("main worktree"), "the refusal points at the main worktree: {stderr}");
-    let root_canonical = root.canonicalize().unwrap();
+    let root_canonical = rag_rat_base::paths::canonicalize(&root).unwrap();
     assert!(
         stderr.contains(&root_canonical.display().to_string()),
         "the refusal names the main worktree path: {stderr}"

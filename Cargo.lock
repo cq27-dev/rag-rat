@@ -4970,6 +4970,7 @@ name = "rag-rat-base"
 version = "0.21.1"
 dependencies = [
  "anyhow",
+ "dunce",
  "filetime",
  "gix",
  "libc",

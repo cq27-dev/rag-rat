@@ -465,7 +465,7 @@ fn rel_contains_floor_dir(rel: &Path) -> bool {
 ///
 /// Shared with `watch.rs` (gitignore watch-dir + subdir-prefix derivation hit the same mismatch).
 pub(crate) fn base_under_worktree(root: &Path, wt: &Path) -> Option<PathBuf> {
-    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let canon = |p: &Path| rag_rat_base::paths::canonicalize_or_simplified(p);
     let canon_wt = canon(wt);
     root.ancestors().find(|ancestor| canon(ancestor) == canon_wt).map(Path::to_path_buf)
 }
@@ -844,7 +844,7 @@ mod tests {
         // Canonicalize so the absolute paths we build match what worktree-root resolution returns
         // (macOS /tmp is a symlink to /private/tmp; git reports the canonical form). The guard
         // still removes the directory: the canonical form is the same inode.
-        let root = guard.path().canonicalize().unwrap_or_else(|_| guard.path().to_path_buf());
+        let root = rag_rat_base::paths::canonicalize_or_simplified(guard.path());
         (guard, root)
     }
 

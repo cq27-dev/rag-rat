@@ -115,7 +115,7 @@ fn env_flag(key: &str) -> bool {
 /// equality. Both sides are canonicalized (per the `strip_prefix` two-sided-canonicalize rule);
 /// falls back to literal comparison when either path can't be canonicalized.
 fn same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
+    match (rag_rat_base::paths::canonicalize(a), rag_rat_base::paths::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }

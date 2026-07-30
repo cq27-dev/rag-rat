@@ -57,7 +57,7 @@ pub fn nearest_config_at_or_above(dir: &Path) -> Option<PathBuf> {
     // filesystem tree (the callers pass `Path::new(".")` for cwd). `canonicalize` also collapses
     // `..`/symlinks so the climb follows the true directory chain. If it fails (a non-existent
     // `dir`), fall back to walking `dir` as given rather than aborting discovery.
-    let absolute = dir.canonicalize().ok();
+    let absolute = crate::paths::canonicalize(dir).ok();
     let start = absolute.as_deref().unwrap_or(dir);
     // The enclosing git repo's workdir root — the ceiling the climb must not cross (canonicalized
     // so it compares equal to the canonicalized `cur`). `None` for a non-git `dir` ⇒ no
@@ -65,7 +65,7 @@ pub fn nearest_config_at_or_above(dir: &Path) -> Option<PathBuf> {
     let boundary = crate::repo_discover::discover_repo(start)
         .ok()
         .and_then(|repo| repo.workdir().map(Path::to_path_buf))
-        .and_then(|workdir| workdir.canonicalize().ok());
+        .and_then(|workdir| crate::paths::canonicalize(workdir).ok());
     let mut current = Some(start);
     while let Some(cur) = current {
         let candidate = cur.join("rag-rat.toml");
@@ -94,7 +94,7 @@ pub fn linked_worktree_main_root(root: &Path) -> Option<PathBuf> {
     let repo = crate::repo_discover::discover_repo(root).ok()?;
     let main = main_worktree_root(root)?;
     let workdir = repo.workdir()?;
-    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    let workdir = crate::paths::canonicalize_or_simplified(workdir);
     (main != workdir).then_some(main)
 }
 
@@ -105,12 +105,12 @@ pub fn linked_worktree_main_root(root: &Path) -> Option<PathBuf> {
 pub fn worktree_root(path: &Path) -> Option<PathBuf> {
     let repo = crate::repo_discover::discover_repo(path).ok()?;
     let workdir = repo.workdir()?;
-    Some(workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf()))
+    Some(crate::paths::canonicalize_or_simplified(workdir))
 }
 
 pub(crate) fn main_worktree_root(root: &Path) -> Option<PathBuf> {
     let repo = crate::repo_discover::discover_repo(root).ok()?;
-    let common_dir = repo.common_dir().canonicalize().ok()?;
+    let common_dir = crate::paths::canonicalize(repo.common_dir()).ok()?;
     // Only the standard `<main>/.git` layout maps cleanly to a main worktree root.
     if common_dir.file_name()?.to_str()? != ".git" {
         return None;
@@ -235,10 +235,17 @@ pub fn default_legacy_database_path(root: &Path) -> PathBuf {
     main_worktree_root(root).unwrap_or_else(|| root.to_path_buf()).join(".rag-rat/index.sqlite")
 }
 
+/// `path` as an absolute, canonical directory — the ONE production of `config.root`.
+///
+/// Everything downstream treats this spelling as authoritative: the worktree overlay strips it
+/// against the repository workdir gix reports, and callers hand paths derived from it to the `git`
+/// CLI. Both reject the Windows `\\?\` verbatim form, so the canonicalization goes through
+/// [`crate::paths::canonicalize`] rather than `std::fs::canonicalize` (#1048).
+/// `test_scratch::canonical_config_root` mirrors this for hand-built fixture `Config`s.
 pub(crate) fn normalize_existing_dir(path: &Path) -> Result<PathBuf, ConfigError> {
     let absolute =
         if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
-    let canonical = absolute.canonicalize()?;
+    let canonical = crate::paths::canonicalize(absolute)?;
     if !canonical.is_dir() {
         return Err(ConfigError::MissingDirectory(canonical));
     }

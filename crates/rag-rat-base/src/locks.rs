@@ -214,7 +214,7 @@ fn lock_dir(database: &Path) -> PathBuf {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = parent;
     loop {
-        if let Ok(canonical) = cur.canonicalize() {
+        if let Ok(canonical) = crate::paths::canonicalize(cur) {
             let mut out = canonical;
             out.extend(tail.iter().rev());
             return out;
@@ -560,7 +560,7 @@ pub const MAX_SOCKET_PATH_LEN: usize = 100;
 /// Stable per-worktree key: sha256 of the canonicalized root (see `election_lock_path` doc
 /// comment for why canonicalize-but-not-case-fold).
 fn worktree_hash(worktree_root: &Path) -> String {
-    let canonical = worktree_root.canonicalize().unwrap_or_else(|_| worktree_root.to_path_buf());
+    let canonical = crate::paths::canonicalize_or_simplified(worktree_root);
     let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
     let mut hash = String::with_capacity(32);
     for byte in &digest[..16] {

@@ -419,11 +419,10 @@ mod tests {
         let worktrees = worktree_dirs_for(&linked_a).unwrap();
         assert!(worktrees.warnings.is_empty());
         // gix returns canonical worktree paths; the raw temp paths do not match on macOS (TempDir
-        // under /var → /private/var symlink) or Windows (canonicalize adds a \\?\-verbatim
-        // long-name form, and the temp dir uses an 8.3 short name). Canonicalize BOTH sides
-        // — the worktrees exist — so the compare is separator/prefix/symlink agnostic (and
-        // the set dedups too).
-        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+        // under /var → /private/var symlink) or Windows (the temp dir uses an 8.3 short name that
+        // canonicalization expands). Canonicalize BOTH sides — the worktrees exist — so the
+        // compare is separator/prefix/symlink agnostic (and the set dedups too).
+        let canon = |p: &std::path::Path| rag_rat_base::paths::canonicalize(p).unwrap();
         let dirs: std::collections::BTreeSet<std::path::PathBuf> =
             worktrees.dirs.iter().map(|p| canon(p)).collect();
         assert!(dirs.contains(&canon(&main)));

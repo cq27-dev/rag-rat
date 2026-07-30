@@ -242,8 +242,8 @@ fn blob_line_counts(
 /// the old `git log -- .` (run from `root`) covered. Canonicalizes both sides so a symlink / path-
 /// representation mismatch doesn't spuriously scope (or fail to scope).
 fn scope_prefix(root: &Path, worktree_root: &Path) -> Option<String> {
-    let root = root.canonicalize().ok()?;
-    let worktree_root = worktree_root.canonicalize().ok()?;
+    let root = rag_rat_base::paths::canonicalize(root).ok()?;
+    let worktree_root = rag_rat_base::paths::canonicalize(worktree_root).ok()?;
     let relative = root.strip_prefix(&worktree_root).ok()?;
     let prefix = path_string(relative);
     (!prefix.is_empty()).then_some(prefix)

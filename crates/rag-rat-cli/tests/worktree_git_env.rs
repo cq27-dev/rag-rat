@@ -120,7 +120,7 @@ fn default_config_discovery_reaches_the_main_worktree_from_a_linked_checkout() {
     let out = run(&linked, &["gc"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let main_toml = main.canonicalize().unwrap().join("rag-rat.toml");
+    let main_toml = rag_rat_base::paths::canonicalize(&main).unwrap().join("rag-rat.toml");
     assert!(
         stderr.contains(&main_toml.display().to_string()),
         "the config-less hint names MAIN's config path from a linked checkout: {stderr}"

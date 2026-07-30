@@ -12,6 +12,7 @@ mod live_oracle;
 mod logical_rebuild;
 mod quiet_window;
 mod relink;
+mod root_spelling;
 mod visibility;
 
 use logical_rebuild::{logical_rebuild_pending, logical_symbol_named};

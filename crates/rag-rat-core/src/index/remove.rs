@@ -91,10 +91,15 @@ pub fn resolve_removable_repo(
     conn: &Connection,
     path: &Path,
 ) -> anyhow::Result<Option<ResolvedRepo>> {
-    let canonical = path
-        .canonicalize()
-        .or_else(|_| std::path::absolute(path).map(|path| lexically_normalize(&path)))
-        .unwrap_or_else(|_| path.to_path_buf());
+    // Every arm ends on a simplified spelling: the recorded roots this is matched against were
+    // written from a canonicalized `config.root`, so a fallback that kept a Windows `\\?\` verbatim
+    // prefix the argument happened to carry would never compare equal to them.
+    let canonical = rag_rat_base::paths::canonicalize(path)
+        .or_else(|_| {
+            std::path::absolute(path)
+                .map(|path| lexically_normalize(rag_rat_base::paths::simplified(&path)))
+        })
+        .unwrap_or_else(|_| rag_rat_base::paths::simplified(path).to_path_buf());
 
     // Route 1: a derivable git identity that is a REGISTERED repo, but ONLY when the argument is
     // the discovered worktree top. `discover_repo` walks upward, so running `rm --yes repo/src`
@@ -145,7 +150,7 @@ fn path_is_worktree_top(path: &Path) -> bool {
     rag_rat_base::repo_discover::discover_repo(path)
         .ok()
         .and_then(|repo| repo.workdir().map(Path::to_path_buf))
-        .and_then(|work_dir| work_dir.canonicalize().ok())
+        .and_then(|work_dir| rag_rat_base::paths::canonicalize(work_dir).ok())
         .is_some_and(|work_dir| work_dir == path)
 }
 

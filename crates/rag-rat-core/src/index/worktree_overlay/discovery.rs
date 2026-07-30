@@ -137,8 +137,11 @@ fn linked_config_subdir_and_root(
             config_root.display(),
         )
     })?;
-    let base_workdir = canonical_or_raw(base_workdir);
-    let config_subdir = canonical_or_raw(config_root)
+    // Both sides of the strip resolve the same way — canonical when the directory exists, the
+    // simplified original when it does not, so the strip fails on a genuine mismatch rather than on
+    // one side having been normalized and the other not.
+    let base_workdir = rag_rat_base::paths::canonicalize_or_simplified(base_workdir);
+    let config_subdir = rag_rat_base::paths::canonicalize_or_simplified(config_root)
         .strip_prefix(&base_workdir)
         .map_err(|_| {
             anyhow::anyhow!(
@@ -151,12 +154,6 @@ fn linked_config_subdir_and_root(
         .to_path_buf();
     let linked_config_root = linked_workdir.join(&config_subdir);
     Ok((config_subdir, linked_config_root))
-}
-
-/// `path` canonicalized, or `path` itself when it cannot be resolved (a vanished directory) — the
-/// caller then fails on the strip rather than on the canonicalization.
-fn canonical_or_raw(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub(crate) fn linked_source_root(

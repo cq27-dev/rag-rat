@@ -786,8 +786,8 @@ fn worktree_rel_path(file_path: &str, worktree_root: &Path) -> Option<String> {
     // so canonicalize BOTH (when they exist) to survive a symlinked/`..`-laden checkout path;
     // fall back to a raw strip when either can't be resolved (keeps this unit-testable with
     // synthetic paths).
-    let file_c = file.canonicalize();
-    let root_c = worktree_root.canonicalize();
+    let file_c = rag_rat_base::paths::canonicalize(file);
+    let root_c = rag_rat_base::paths::canonicalize(worktree_root);
     let (f, r): (&Path, &Path) = match (file_c.as_deref(), root_c.as_deref()) {
         (Ok(f), Ok(r)) => (f, r),
         _ => (file, worktree_root),

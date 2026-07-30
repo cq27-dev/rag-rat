@@ -37,7 +37,7 @@ impl ScratchRoot {
     }
 
     fn canonicalize(mut self) -> std::io::Result<Self> {
-        self.path = self.path.canonicalize()?;
+        self.path = rag_rat_base::paths::canonicalize(self.path)?;
         Ok(self)
     }
 }
@@ -154,7 +154,7 @@ fn the_watch_fixture_config_root_diverges_from_its_scratch_spelling() {
     );
     assert_eq!(
         config.root,
-        scratch.as_path().canonicalize().unwrap(),
+        rag_rat_base::paths::canonicalize(scratch.as_path()).unwrap(),
         "both spellings name the same directory",
     );
     assert_eq!(root, config.root, "the returned root is the one the Config carries");
@@ -1983,7 +1983,7 @@ fn linked_subdir_root_watch_placement_keeps_checkout_root_when_config_root_missi
     }
     std::fs::create_dir_all(checkout.join("packages")).unwrap();
     let checkout = checkout.canonicalize().unwrap();
-    let config_root = repo.join("packages/crate").canonicalize().unwrap();
+    let config_root = rag_rat_base::paths::canonicalize(repo.join("packages/crate")).unwrap();
     let target_dirs = vec![PathBuf::from("src")];
     let (config, _) = whole_root_config(&config_root, &target_dirs);
 
@@ -2289,7 +2289,7 @@ fn event_touches_worktree_rebases_subdir_rooted_config() {
         rag_rat_base::test_git::run(&repo, &args);
     }
     // `config.root` is the `crate` SUBDIR of the repo.
-    let config_root = repo.join("crate").canonicalize().unwrap();
+    let config_root = rag_rat_base::paths::canonicalize(repo.join("crate")).unwrap();
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
@@ -3089,7 +3089,7 @@ fn worktree_watch_targets_excludes_the_main_checkout_for_a_subdir_config_root() 
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
 
-    let sub = main.join("crate").canonicalize().unwrap(); // config.root is the subdir.
+    let sub = rag_rat_base::paths::canonicalize(main.join("crate")).unwrap(); // config.root is the subdir.
     let config = Config {
         trackers: Vec::new(),
         papertrail: Default::default(),
@@ -3118,7 +3118,7 @@ fn worktree_watch_targets_excludes_the_main_checkout_for_a_subdir_config_root() 
     };
 
     let (roots, _registry) = worktree_watch_targets(&config);
-    let main_id = crate::index::worktree_id_of(&std::fs::canonicalize(&main).unwrap());
+    let main_id = crate::index::worktree_id_of(&rag_rat_base::paths::canonicalize(&main).unwrap());
     assert!(
         !roots.iter().any(|r| crate::index::worktree_id_of(r) == main_id),
         "the main checkout must NOT be watched as a linked worktree: {roots:?}",

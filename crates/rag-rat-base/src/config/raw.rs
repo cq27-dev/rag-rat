@@ -685,7 +685,7 @@ pub(crate) fn resolve_relative_cookbook_path(cookbook: &str, config_dir: &Path) 
     // <path>` (spawned directly, not through a shell), and both accept the platform-native
     // separator — `\` on Windows, `/` on Unix — so the join output is already correct as-is.
     // Rewriting `\`→`/` would be wrong two ways: on Windows it corrupts a verbatim
-    // extended-length prefix (canonicalize can yield `\\?\C:\repo`, where the suffix MUST stay
+    // extended-length prefix (a long or UNC path stays `\\?\C:\repo`, where the suffix MUST stay
     // backslash-delimited), and on Unix it would mangle a literal backslash in a filename.
     // `to_string_lossy` touches neither.
     let mut out = resolved.to_string_lossy().into_owned();

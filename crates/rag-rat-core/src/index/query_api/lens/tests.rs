@@ -1920,7 +1920,7 @@ fn the_lens_fixture_config_root_diverges_from_its_scratch_spelling() {
     );
     assert_eq!(
         config.root,
-        temp.path().canonicalize().unwrap(),
+        rag_rat_base::paths::canonicalize(temp.path()).unwrap(),
         "both spellings must name the same directory",
     );
 }

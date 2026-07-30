@@ -178,7 +178,7 @@ fn the_fixture_config_canonicalizes_its_root_like_config_load() {
     let config = source_config(alias.join("crate"), Language::Rust);
     assert_eq!(
         config.root,
-        alias.join("crate").canonicalize().unwrap(),
+        rag_rat_base::paths::canonicalize(alias.join("crate")).unwrap(),
         "a fixture Config must normalize its root the way `Config::load` does",
     );
     assert!(

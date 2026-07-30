@@ -485,7 +485,7 @@ impl MarkerSearch<'_> {
         // A marker file that will not canonicalize is recorded under its own path rather than
         // dropped: it exists, and losing the checkout's only database is worse than the alias this
         // set exists to collapse.
-        let identity = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+        let identity = rag_rat_base::paths::canonicalize_or_simplified(&candidate);
         if !self.recorded_markers.insert(identity) {
             return;
         }
@@ -536,7 +536,7 @@ impl MarkerSearch<'_> {
             if !path.is_dir() {
                 return Step::Excluded;
             }
-            let Ok(target) = path.canonicalize() else {
+            let Ok(target) = rag_rat_base::paths::canonicalize(&path) else {
                 return Step::Indeterminate;
             };
             // Outside the checkout is EXCLUDED rather than indeterminate: indexing skips symlinks
@@ -829,7 +829,7 @@ impl EntryPaths {
         let resolved = self
             .canonical_parents
             .entry(parent.to_path_buf())
-            .or_insert_with(|| parent.canonicalize().ok());
+            .or_insert_with(|| rag_rat_base::paths::canonicalize(parent).ok());
         resolved.as_ref().is_some_and(|dir| corpus.indexes_file(&dir.join(name)))
     }
 }

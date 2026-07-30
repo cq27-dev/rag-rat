@@ -1430,7 +1430,7 @@ fn reconcile_heals_an_op_log_ghost_in_an_idle_repo() {
         "-m",
         "initial",
     ]);
-    let root = root.canonicalize().unwrap();
+    let root = rag_rat_base::paths::canonicalize(&root).unwrap();
 
     let mut config = source_config(root.clone(), Language::Rust);
     config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();

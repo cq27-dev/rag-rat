@@ -756,10 +756,10 @@ mod tests {
             .unwrap()
             .expect("the existing target checkout's governing config should load");
         // Config::load resolves the relative `database` against the CANONICALIZED config dir
-        // (normalize_existing_dir → fs::canonicalize): /var→/private/var on macOS, \\?\ + long name
+        // (normalize_existing_dir → paths::canonicalize): /var→/private/var on macOS, 8.3 expansion
         // on Windows. Canonicalize the base and join components so the expectation matches
         // natively.
-        let root = root.canonicalize().unwrap();
+        let root = rag_rat_base::paths::canonicalize(root).unwrap();
         assert_eq!(config.database, root.join("custom").join("index.sqlite"));
     }
 }

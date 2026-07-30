@@ -525,7 +525,7 @@ pub struct PrefixCorpus {
 impl PrefixCorpus {
     pub fn new(root: &Path, indexed: &[&str]) -> Self {
         Self {
-            root: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+            root: rag_rat_base::paths::canonicalize_or_simplified(root),
             indexed: indexed.iter().map(PathBuf::from).collect(),
         }
     }

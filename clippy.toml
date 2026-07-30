@@ -1,0 +1,17 @@
+# Clippy configuration for the rag-rat workspace.
+#
+# `disallowed-methods` is the enforcement seam for invariants that a reviewer would otherwise have
+# to catch by eye. Every entry names the replacement in its `reason`, which clippy prints at the
+# offending call site.
+
+disallowed-methods = [
+  # Windows' `canonicalize` returns a `\\?\` VERBATIM path, which neither the `git` CLI nor gix's
+  # `workdir()` matches — a verbatim `config.root` cannot even `git worktree add`, and strips to
+  # nothing against the repository workdir, so the worktree overlay scopes its refresh at the wrong
+  # directory (#1048). `rag_rat_base::paths::canonicalize` drops that prefix wherever the plain
+  # spelling names the same file and keeps it where it is load-bearing (UNC, >MAX_PATH, reserved DOS
+  # names). It is `std::fs::canonicalize` verbatim on Unix, so there is never a reason to prefer the
+  # std call. The one exception is the helper itself, which carries a local `expect`.
+  { path = "std::path::Path::canonicalize", reason = "use rag_rat_base::paths::canonicalize — std's returns a Windows \\\\?\\ verbatim path git and gix do not match (#1048)" },
+  { path = "std::fs::canonicalize", reason = "use rag_rat_base::paths::canonicalize — std's returns a Windows \\\\?\\ verbatim path git and gix do not match (#1048)" },
+]

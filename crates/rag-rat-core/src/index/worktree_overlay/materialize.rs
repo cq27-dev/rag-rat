@@ -243,7 +243,7 @@ impl IndexDatabase {
         // drift from the base one. `ignore` is the LINKED checkout's matcher (a branch
         // `.gitignore` governs the overlay's indexable set), recompiled per call so a
         // branch ignore edit takes effect immediately.
-        let canonical_source = source_root.canonicalize().unwrap_or_else(|_| source_root.clone());
+        let canonical_source = rag_rat_base::paths::canonicalize_or_simplified(&source_root);
         let ignore =
             ignore_rules::IgnoreMatcher::compile(&source_root, &config.target_directories());
         // Present + indexable = a regular, in-root, non-symlink-crossed, NON-ignored file the

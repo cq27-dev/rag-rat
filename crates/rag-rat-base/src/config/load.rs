@@ -141,8 +141,7 @@ impl Config {
                             Err(_) => true,
                         };
                         if divergent {
-                            let ignored =
-                                path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                            let ignored = crate::paths::canonicalize_or_simplified(path);
                             let invalid_note =
                                 if local_parse.is_err() { " (also invalid)" } else { "" };
                             eprintln!(
@@ -494,7 +493,8 @@ fn root_relative_within(root: &Path, path: &Path) -> Option<PathBuf> {
     // When both resolve, the filesystem has the final say on containment. When either does not — a
     // root the caller has not created, a directory racing a delete — the textual answer is all
     // there is, and it is the one this function gave before.
-    if let (Ok(canonical_root), Ok(canonical_path)) = (root.canonicalize(), path.canonicalize())
+    if let (Ok(canonical_root), Ok(canonical_path)) =
+        (crate::paths::canonicalize(root), crate::paths::canonicalize(path))
         && !canonical_path.starts_with(&canonical_root)
     {
         return None;
@@ -516,7 +516,7 @@ pub(crate) fn anchor_root_to_main_worktree(root: &Path) -> PathBuf {
     else {
         return root.to_path_buf();
     };
-    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    let workdir = crate::paths::canonicalize_or_simplified(workdir);
     if main_root == workdir {
         return root.to_path_buf(); // already the main worktree — keep the configured (sub)root
     }

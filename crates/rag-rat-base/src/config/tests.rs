@@ -80,7 +80,10 @@ fn config_load_resolves_main_and_linked_worktrees_to_one_database() {
         from_main.database, from_linked.database,
         "main and linked worktrees must share one index database",
     );
-    assert_eq!(from_main.database, main.canonicalize().unwrap().join(".rag-rat/index.sqlite"));
+    assert_eq!(
+        from_main.database,
+        crate::paths::canonicalize(&main).unwrap().join(".rag-rat/index.sqlite")
+    );
     // AND the `root` anchors to the main worktree from either launch point — so every process
     // uses the same base commit for the shared index, instead of a worktree-launched one
     // rooting at the worktree (a different base → conflicting overlay writes /
@@ -88,7 +91,7 @@ fn config_load_resolves_main_and_linked_worktrees_to_one_database() {
     assert_eq!(from_main.root, from_linked.root, "main and linked configs resolve to one root");
     assert_eq!(
         from_linked.root,
-        main.canonicalize().unwrap(),
+        crate::paths::canonicalize(&main).unwrap(),
         "a linked worktree's config root anchors to the main worktree",
     );
 }
@@ -441,7 +444,7 @@ fn config_load_falls_back_to_the_local_config_when_main_has_none() {
     )
     .unwrap();
     let cfg = Config::load(linked.join("rag-rat.toml")).unwrap();
-    let canonical_main = main.canonicalize().unwrap();
+    let canonical_main = crate::paths::canonicalize(&main).unwrap();
     assert_eq!(cfg.root, canonical_main, "root anchors to main even on the fallback");
     assert_eq!(
         cfg.database,
@@ -471,7 +474,7 @@ fn discover_config_path_resolves_the_governing_checkout() {
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
-    let main_c = main.canonicalize().unwrap();
+    let main_c = crate::paths::canonicalize(&main).unwrap();
 
     // Linked, no local file, main config not yet written: MAIN's path (where it belongs).
     assert_eq!(config::discover_config_path(&linked), main_c.join("rag-rat.toml"));
@@ -504,14 +507,14 @@ fn discover_config_path_walks_up_to_a_parent_repo_config() {
 
     // The walk returns a canonical absolute path (a found file), so compare canonically — temp
     // roots can be symlinked (macOS `/tmp` → `/private/tmp`).
-    let want = repo.join("rag-rat.toml").canonicalize().unwrap();
+    let want = crate::paths::canonicalize(repo.join("rag-rat.toml")).unwrap();
     assert_eq!(
-        config::discover_config_path(&nested).canonicalize().unwrap(),
+        crate::paths::canonicalize(config::discover_config_path(&nested)).unwrap(),
         want,
         "subdir → repo cfg"
     );
     assert_eq!(
-        config::discover_config_path(&repo).canonicalize().unwrap(),
+        crate::paths::canonicalize(config::discover_config_path(&repo)).unwrap(),
         want,
         "repo root → local"
     );
@@ -547,8 +550,8 @@ fn discover_config_path_does_not_cross_a_nested_repo_boundary() {
     let got = config::discover_config_path(&nested);
     assert_eq!(got, nested.join("rag-rat.toml"), "must not adopt the parent repo's config");
     assert_ne!(
-        got.canonicalize().ok(),
-        parent.join("rag-rat.toml").canonicalize().ok(),
+        crate::paths::canonicalize(&got).ok(),
+        crate::paths::canonicalize(parent.join("rag-rat.toml")).ok(),
         "the parent repo's rag-rat.toml must not leak across the nested boundary",
     );
 }
@@ -573,7 +576,7 @@ fn discover_config_path_finds_a_branch_local_config_from_a_linked_worktree_subdi
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
-    let main_c = main.canonicalize().unwrap();
+    let main_c = crate::paths::canonicalize(&main).unwrap();
     let sub = linked.join("src");
     std::fs::create_dir_all(&sub).unwrap();
 
@@ -588,8 +591,8 @@ fn discover_config_path_finds_a_branch_local_config_from_a_linked_worktree_subdi
     // climbing past the worktree root into main).
     std::fs::write(linked.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
     assert_eq!(
-        config::discover_config_path(&sub).canonicalize().unwrap(),
-        linked.join("rag-rat.toml").canonicalize().unwrap(),
+        crate::paths::canonicalize(config::discover_config_path(&sub)).unwrap(),
+        crate::paths::canonicalize(linked.join("rag-rat.toml")).unwrap(),
         "a subdir launch must find the branch-local config, not jump to main",
     );
 }
@@ -614,7 +617,7 @@ fn linked_worktree_main_root_derives_linkedness_from_topology() {
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
-    let main_c = main.canonicalize().unwrap();
+    let main_c = crate::paths::canonicalize(&main).unwrap();
 
     assert_eq!(config::linked_worktree_main_root(&main), None, "the main worktree is not linked");
     assert_eq!(
@@ -664,7 +667,7 @@ fn config_load_ignores_an_invalid_branch_config_when_main_governs() {
     std::fs::write(linked.join("rag-rat.toml"), "this is [not toml").unwrap();
     let cfg = Config::load(linked.join("rag-rat.toml"))
         .expect("a broken branch config is ignored when main governs");
-    let main_c = main.canonicalize().unwrap();
+    let main_c = crate::paths::canonicalize(&main).unwrap();
     assert_eq!(cfg.database, main_c.join("main.sqlite"));
 
     // The deprecated `[local_ai]` table on the branch: same posture (it is a VALIDATION
@@ -725,7 +728,7 @@ fn config_load_governs_from_main_even_when_a_branch_only_root_defeats_anchoring(
     )
     .unwrap();
     let cfg = Config::load(linked.join("rag-rat.toml")).unwrap();
-    let main_c = main.canonicalize().unwrap();
+    let main_c = crate::paths::canonicalize(&main).unwrap();
     assert_eq!(
         cfg.database,
         main_c.join("main.sqlite"),
@@ -871,7 +874,7 @@ fn config_load_without_a_database_key_prefers_an_existing_legacy_index() {
     let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
     assert_eq!(
         config.database,
-        tmp.canonicalize().unwrap().join(".rag-rat/index.sqlite"),
+        crate::paths::canonicalize(&tmp).unwrap().join(".rag-rat/index.sqlite"),
         "a pre-existing legacy index wins over the global default until consolidated",
     );
 
@@ -925,12 +928,12 @@ fn config_load_without_a_database_key_stays_per_root_for_identity_less_roots() {
     let config_b = Config::load(b.join("rag-rat.toml")).unwrap();
     assert_eq!(
         config_a.database,
-        a.canonicalize().unwrap().join(".rag-rat/index.sqlite"),
+        crate::paths::canonicalize(&a).unwrap().join(".rag-rat/index.sqlite"),
         "an identity-less root stays on its per-root legacy path",
     );
     assert_eq!(
         config_b.database,
-        b.canonicalize().unwrap().join(".rag-rat/index.sqlite"),
+        crate::paths::canonicalize(&b).unwrap().join(".rag-rat/index.sqlite"),
         "each identity-less root gets its own database",
     );
     assert_ne!(config_a.database, config_b.database, "identity-less roots never share scope");
@@ -946,7 +949,7 @@ fn config_load_without_a_database_key_stays_per_root_for_identity_less_roots() {
     let config = Config::load(unborn.join("rag-rat.toml")).unwrap();
     assert_eq!(
         config.database,
-        unborn.canonicalize().unwrap().join(".rag-rat/index.sqlite"),
+        crate::paths::canonicalize(&unborn).unwrap().join(".rag-rat/index.sqlite"),
         "an unborn repo stays per-root until its first commit mints an identity",
     );
     // A `[index] repo_id` pin IS an identity: the same root then resolves globally.
@@ -1032,7 +1035,7 @@ fn config_load_in_a_linked_worktree_uses_main_base_targets_not_the_branch() {
     // root still anchors to main (one shared base index).
     assert_eq!(
         from_linked.root,
-        main.canonicalize().unwrap(),
+        crate::paths::canonicalize(&main).unwrap(),
         "root anchors to the main worktree for the shared base index",
     );
     // The stored BASE targets come from MAIN's config (`src` only), NOT the branch's
@@ -1221,8 +1224,8 @@ fn load_records_the_pre_anchor_root_for_a_linked_worktree() {
     git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
     std::fs::write(linked.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
 
-    let main_c = main.canonicalize().unwrap();
-    let linked_c = linked.canonicalize().unwrap();
+    let main_c = crate::paths::canonicalize(&main).unwrap();
+    let linked_c = crate::paths::canonicalize(&linked).unwrap();
     let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
     assert_eq!(from_linked.root, main_c, "root anchors to main (existing behavior)");
     assert_eq!(
@@ -1293,8 +1296,8 @@ fn anchor_root_preserves_subdir_and_redirects_linked_to_main() {
     git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
     std::fs::create_dir_all(linked.join("src")).unwrap();
 
-    let main_c = main.canonicalize().unwrap();
-    let linked_c = linked.canonicalize().unwrap();
+    let main_c = crate::paths::canonicalize(&main).unwrap();
+    let linked_c = crate::paths::canonicalize(&linked).unwrap();
 
     // Main worktree (any root) resolves to itself.
     assert_eq!(config::anchor_root_to_main_worktree(&main_c), main_c);
@@ -1309,7 +1312,7 @@ fn anchor_root_preserves_subdir_and_redirects_linked_to_main() {
     // A non-git directory falls back to itself.
     let plain = tmp.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
-    let plain_c = plain.canonicalize().unwrap();
+    let plain_c = crate::paths::canonicalize(&plain).unwrap();
     assert_eq!(config::anchor_root_to_main_worktree(&plain_c), plain_c);
 
     // A linked-worktree subdir root that does NOT exist in main must NOT anchor to a missing
@@ -1318,7 +1321,7 @@ fn anchor_root_preserves_subdir_and_redirects_linked_to_main() {
     // (existing) root — otherwise `Config.root` would point outside any discoverable repo path.
     let branch_only = linked.join("branch_only");
     std::fs::create_dir_all(&branch_only).unwrap();
-    let branch_only_c = branch_only.canonicalize().unwrap();
+    let branch_only_c = crate::paths::canonicalize(&branch_only).unwrap();
     assert!(!main_c.join("branch_only").exists(), "main never had this dir");
     assert_eq!(
         config::anchor_root_to_main_worktree(&branch_only_c),
@@ -3204,4 +3207,62 @@ fn a_symlinked_target_directory_keeps_its_configured_spelling() {
         vec![PathBuf::from("src")],
         "stored as configured, because that is the spelling the walk produces",
     );
+}
+
+/// Whether `path` carries the Windows extended-length (`\\?\`) prefix — asked TEXTUALLY, because
+/// that is how `git` and gix see it.
+fn is_verbatim(path: &Path) -> bool {
+    path.as_os_str().to_string_lossy().starts_with(r"\\?\")
+}
+
+/// `Config::load` normalizes its root, and the rest of the system consumes that root as a `git`
+/// argument and compares it against gix's `workdir()`. Both consumers reject the `\\?\C:\…`
+/// verbatim spelling `std::fs::canonicalize` returns on Windows, so the normalized root must not
+/// carry it (#1048).
+///
+/// Not `cfg`-gated: on Unix the assertions hold trivially, and the Windows leg is the one that has
+/// to run them — a Unix-only probe would have caught none of this.
+#[test]
+fn a_loaded_config_root_is_a_spelling_git_and_gix_both_accept() {
+    let tmp = scratch("root-spelling");
+    let main = tmp.join("main");
+    std::fs::create_dir_all(main.join("crate/src")).unwrap();
+    crate::test_git::run(&main, &["init", "-q"]);
+    std::fs::write(main.join("crate/src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    crate::test_git::run(&main, &["add", "."]);
+    crate::test_git::run(&main, &["commit", "-qm", "seed"]);
+    std::fs::write(main.join("rag-rat.toml"), "[index]\nroot = \"crate\"\n").unwrap();
+
+    let cfg = Config::load(main.join("rag-rat.toml")).unwrap();
+    assert!(
+        !is_verbatim(&cfg.root),
+        "Config::load must not hand out a verbatim root: {:?}",
+        cfg.root,
+    );
+
+    // gix: the root strips against the workdir of the repository discovered from it, which is what
+    // the worktree overlay derives its config subdir from.
+    let repo = crate::repo_discover::discover_repo(&cfg.root).unwrap();
+    let workdir = crate::paths::canonicalize_or_simplified(repo.workdir().unwrap());
+    assert_eq!(
+        cfg.root.strip_prefix(&workdir).ok(),
+        Some(Path::new("crate")),
+        "the loaded root {:?} must strip against the repository workdir {:?}",
+        cfg.root,
+        workdir,
+    );
+
+    // git: a destination derived from the loaded root is usable as a `worktree add` argument. On
+    // the unfixed Windows path this fails with `could not create leading directories of
+    // '//?/C:/…'`.
+    let linked = cfg.root.parent().expect("the root has a repository above it").join("linked-wt");
+    assert!(!is_verbatim(&linked), "the derived destination is not verbatim: {linked:?}");
+    crate::test_git::run(&main, &[
+        "worktree",
+        "add",
+        "--detach",
+        "-q",
+        linked.to_str().expect("a scratch path is UTF-8"),
+    ]);
+    assert!(linked.join("crate/src/a.rs").is_file(), "the linked checkout was created");
 }

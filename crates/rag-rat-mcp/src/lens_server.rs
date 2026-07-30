@@ -452,7 +452,7 @@ fn indexed_root_relative(config: &Config, workspace_root: &Path) -> anyhow::Resu
 }
 
 fn path_case_insensitive(path: &Path) -> bool {
-    let Ok(canonical) = path.canonicalize() else { return false };
+    let Ok(canonical) = rag_rat_base::paths::canonicalize(path) else { return false };
     if path_has_case_alias(&canonical) {
         return true;
     }
@@ -470,9 +470,9 @@ fn path_has_case_alias(path: &Path) -> bool {
         toggled[index].to_ascii_lowercase()
     };
     let Ok(toggled) = String::from_utf8(toggled) else { return false };
-    let Ok(canonical) = path.canonicalize() else { return false };
+    let Ok(canonical) = rag_rat_base::paths::canonicalize(path) else { return false };
     path.parent()
-        .and_then(|parent| parent.join(toggled).canonicalize().ok())
+        .and_then(|parent| rag_rat_base::paths::canonicalize(parent.join(toggled)).ok())
         .is_some_and(|alias| alias == canonical)
 }
 
@@ -535,13 +535,15 @@ pub fn workspace_root(config: &Config) -> PathBuf {
 /// rather than serving the wrong repo.
 fn validated_linked_worktree(root: &Path, candidate: &Path) -> Option<PathBuf> {
     let repo = rag_rat_base::repo_discover::discover_repo(candidate).ok()?;
-    let git_dir = repo.git_dir().canonicalize().ok()?;
-    let common_dir = repo.common_dir().canonicalize().ok()?;
+    let git_dir = rag_rat_base::paths::canonicalize(repo.git_dir()).ok()?;
+    let common_dir = rag_rat_base::paths::canonicalize(repo.common_dir()).ok()?;
     if git_dir == common_dir {
         return None;
     }
-    let root_common =
-        rag_rat_base::repo_discover::discover_repo(root).ok()?.common_dir().canonicalize().ok()?;
+    let root_common = rag_rat_base::paths::canonicalize(
+        rag_rat_base::repo_discover::discover_repo(root).ok()?.common_dir(),
+    )
+    .ok()?;
     if common_dir != root_common {
         return None;
     }
@@ -1227,10 +1229,9 @@ mod tests {
         let probe = numeric_root.join("CaseProbe");
         fs::create_dir(&probe).unwrap();
         let alias = numeric_root.join("caseProbe");
-        let expected = alias
-            .canonicalize()
+        let expected = rag_rat_base::paths::canonicalize(alias)
             .ok()
-            .zip(probe.canonicalize().ok())
+            .zip(rag_rat_base::paths::canonicalize(&probe).ok())
             .is_some_and(|(alias, probe)| alias == probe);
 
         assert_eq!(path_case_insensitive(&probe), expected);

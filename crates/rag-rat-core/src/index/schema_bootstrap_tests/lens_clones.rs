@@ -226,7 +226,7 @@ fn lens_clone_graph_uses_scope_correct_live_fallback_for_a_linked_overlay() {
     // wherever the temp directory is already canonical and breaks where it is not — macOS
     // resolving `/var` to `/private/var`, Windows expanding 8.3 names. Doing it fixture-wide is
     // the real fix and is #1027; here it is done locally so this test states what it means to.
-    let main = main.canonicalize().unwrap_or_else(|_| main.to_path_buf());
+    let main = rag_rat_base::paths::canonicalize_or_simplified(&main);
     fs::write(main.join("crate/src/base.rs"), "pub fn tiny() -> i32 { 0 }\n").unwrap();
     init_git_repo(&main);
     run_git(&main, &["add", "."]);
@@ -257,7 +257,7 @@ fn lens_clone_graph_uses_scope_correct_live_fallback_for_a_linked_overlay() {
     // only on the revision below cannot tell "resolved and found no change" from "never resolved".
     assert_eq!(
         db.active_worktree_id,
-        linked.canonicalize().unwrap_or_else(|_| linked.clone()).display().to_string(),
+        rag_rat_base::paths::canonicalize_or_simplified(&linked).display().to_string(),
         "the overlay refresh must scope itself to the linked checkout"
     );
     let after_overlay = db.lens_version().unwrap();

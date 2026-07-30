@@ -240,8 +240,10 @@ fn dependency_tables(manifest: &toml::Value) -> Vec<&toml::value::Table> {
 /// unresolvable target (not present on disk) can't hold indexed symbols, so it's treated as
 /// outside.
 fn path_dependency_is_in_corpus(manifest_dir: &Path, path: &str, root: &Path) -> bool {
-    let Ok(target) = manifest_dir.join(path).canonicalize() else { return false };
-    match root.canonicalize() {
+    let Ok(target) = rag_rat_base::paths::canonicalize(manifest_dir.join(path)) else {
+        return false;
+    };
+    match rag_rat_base::paths::canonicalize(root) {
         Ok(canonical_root) => target.starts_with(&canonical_root),
         Err(_) => target.starts_with(root),
     }

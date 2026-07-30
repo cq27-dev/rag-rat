@@ -5,7 +5,7 @@ use crate::{hook_script, install_hook, is_rag_rat_hook, make_executable, write_a
 pub(crate) fn run(args: &crate::cli::InitArgs, config_path: &str) -> anyhow::Result<()> {
     let options = InitOptions::from_args(args, config_path);
     let _terminal_reset = TerminalResetGuard::install_if_interactive(!options.yes)?;
-    let root = env::current_dir()?.canonicalize()?;
+    let root = rag_rat_base::paths::canonicalize(env::current_dir()?)?;
 
     // A config authored in a LINKED worktree is a trap: `Config::load`'s governing seam resolves
     // every worktree of a repo through the MAIN worktree's `rag-rat.toml`, so a branch-local file
@@ -157,7 +157,7 @@ fn interactive_scan_root(existing: Option<&ExistingWizardConfig>) -> anyhow::Res
     if let Some((_, config)) = existing.and_then(|existing| existing.config.as_ref()) {
         return Ok(config.root.clone());
     }
-    Ok(env::current_dir()?.canonicalize()?)
+    Ok(rag_rat_base::paths::canonicalize(env::current_dir()?)?)
 }
 
 fn local_config_root_from_raw(raw: &str, config_path: &Path) -> anyhow::Result<Option<PathBuf>> {
@@ -178,7 +178,7 @@ fn local_config_root_from_raw(raw: &str, config_path: &Path) -> anyhow::Result<O
     } else {
         config_dir(config_path)?.join(root_path)
     };
-    match candidate.canonicalize() {
+    match rag_rat_base::paths::canonicalize(candidate) {
         Ok(path) => Ok(Some(path)),
         Err(_) => Ok(None),
     }
@@ -192,7 +192,7 @@ fn config_dir(config_path: &Path) -> anyhow::Result<PathBuf> {
         (false, Some(parent)) => env::current_dir()?.join(parent),
         (false, None) => env::current_dir()?,
     };
-    Ok(dir.canonicalize().unwrap_or(dir))
+    Ok(rag_rat_base::paths::canonicalize_or_simplified(&dir))
 }
 
 /// Apply the git maintenance hooks the wizard selected, honoring each foreign-hook conflict
@@ -515,7 +515,7 @@ mod default_plan_tests {
 
         assert_eq!(
             interactive_scan_root(Some(&existing)).unwrap(),
-            root.path().canonicalize().unwrap()
+            rag_rat_base::paths::canonicalize(root.path()).unwrap()
         );
         assert!(existing.config.is_some());
     }
@@ -530,7 +530,7 @@ mod default_plan_tests {
 
         assert_eq!(
             local_config_root_from_raw(raw, &config_path).unwrap(),
-            Some(config_dir.canonicalize().unwrap())
+            Some(rag_rat_base::paths::canonicalize(config_dir).unwrap())
         );
     }
 
@@ -557,7 +557,10 @@ mod default_plan_tests {
         let existing = load_existing_for_wizard(&options).unwrap();
 
         assert!(existing.config.is_none());
-        assert_eq!(existing.local_root, Some(root.path().canonicalize().unwrap()));
+        assert_eq!(
+            existing.local_root,
+            Some(rag_rat_base::paths::canonicalize(root.path()).unwrap())
+        );
     }
 
     /// #181: a repo whose only `.py` files live under a dependency tree must NOT get

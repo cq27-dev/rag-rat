@@ -552,7 +552,7 @@ async fn clones_uses_the_native_lens_composition() {
     // name like `RUNNER~1` — would otherwise fail this on a value that is perfectly correct.
     assert_eq!(
         status["worktree_id"],
-        root.canonicalize().unwrap_or_else(|_| root.clone()).display().to_string(),
+        rag_rat_base::paths::canonicalize_or_simplified(&root).display().to_string(),
     );
     assert_eq!(status["case_insensitive_paths"], true);
     assert_eq!(status["live_file_count"], 2);
@@ -1022,5 +1022,9 @@ fn the_http_fixture_config_root_diverges_from_its_scratch_spelling() {
          invisible on the per-PR matrix",
     );
     assert_eq!(config.root, root, "the Config carries the canonical spelling");
-    assert_eq!(root, scratch.path().canonicalize().unwrap(), "both spellings name one directory");
+    assert_eq!(
+        root,
+        rag_rat_base::paths::canonicalize(scratch.path()).unwrap(),
+        "both spellings name one directory"
+    );
 }

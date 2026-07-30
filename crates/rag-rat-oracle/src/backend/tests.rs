@@ -36,7 +36,11 @@ fn checkout(tag: &str) -> (ScratchDir, PathBuf) {
 fn a_scratch_checkouts_canonical_root_diverges_from_the_guards_spelling() {
     let (guard, root) = checkout("scope-root-spelling");
     assert_ne!(root, guard.path(), "the guard must reach its root through a symlinked ancestor");
-    assert_eq!(root, guard.path().canonicalize().unwrap(), "both spellings name one directory");
+    assert_eq!(
+        root,
+        rag_rat_base::paths::canonicalize(guard.path()).unwrap(),
+        "both spellings name one directory"
+    );
     assert_eq!(scope(&root).root(), root, "and the scope resolves to the canonical one");
 }
 
@@ -224,7 +228,7 @@ fn an_entry_that_configures_nothing_does_not_qualify_the_database() {
     std::fs::create_dir_all(dir.join("third_party")).unwrap();
     std::fs::create_dir_all(dir.join("build")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
-    let root = dir.canonicalize().unwrap();
+    let root = rag_rat_base::paths::canonicalize(&dir).unwrap();
     let database = format!(
         r#"[{{"directory":{d},"file":{indexed},"command":""}},
            {{"directory":{d},"file":{vendored},"command":"cc -c dep.c"}}]"#,
@@ -265,7 +269,7 @@ fn a_database_naming_one_indexed_file_among_vendored_ones_is_pinned() {
 
     assert_eq!(
         clangd.resolve_layout(&scope).sole_marker_dir(),
-        Some(dir.canonicalize().unwrap().join("build").as_path()),
+        Some(rag_rat_base::paths::canonicalize(&dir).unwrap().join("build").as_path()),
         "one indexed entry qualifies the database, wherever it sits in the list",
     );
 }
@@ -347,7 +351,7 @@ fn a_non_git_checkout_behaves_exactly_as_before() {
     assert_eq!(scope.ceiling(), scope.root(), "no checkout ⇒ no widening");
     assert_eq!(
         clangd.resolve_layout(&scope).sole_marker_dir(),
-        Some(dir.canonicalize().unwrap().as_path()),
+        Some(rag_rat_base::paths::canonicalize(&dir).unwrap().as_path()),
     );
 }
 
@@ -370,7 +374,7 @@ fn sources_under_a_hidden_directory_can_warm_the_session() {
 
     assert_eq!(
         clangd.warmup_document(&scope, &layout),
-        Some(dir.canonicalize().unwrap().join(".cache/generated/main.c")),
+        Some(rag_rat_base::paths::canonicalize(&dir).unwrap().join(".cache/generated/main.c")),
         "a hidden directory the checkout indexes is an ordinary source location",
     );
     assert!(clangd.checkout_can_signal_readiness(&scope, &layout), "so it is not blocked");
@@ -394,7 +398,7 @@ fn a_document_the_checkout_does_not_index_is_never_warmed_on() {
 
     assert_eq!(
         clangd.warmup_document(&scope, &layout),
-        Some(dir.canonicalize().unwrap().join("src/main.c")),
+        Some(rag_rat_base::paths::canonicalize(&dir).unwrap().join("src/main.c")),
         "the indexed source is chosen, never the one under clangd's own index",
     );
 }
@@ -456,7 +460,7 @@ fn a_build_directory_database_governing_indexed_sources_is_pinned() {
 
     assert_eq!(
         layout.sole_marker_dir(),
-        Some(dir.canonicalize().unwrap().join("build").as_path()),
+        Some(rag_rat_base::paths::canonicalize(&dir).unwrap().join("build").as_path()),
         "it governs `src/`, which this checkout indexes",
     );
 }
@@ -482,7 +486,7 @@ fn a_database_above_the_index_root_is_found_by_the_ancestor_leg() {
 
     assert_eq!(
         layout.sole_marker_dir(),
-        Some(checkout.canonicalize().unwrap().as_path()),
+        Some(rag_rat_base::paths::canonicalize(checkout).unwrap().as_path()),
         "the ancestor leg reaches the checkout top",
     );
     assert!(
@@ -535,8 +539,16 @@ fn the_ceiling_is_the_enclosing_checkout_not_the_index_root() {
 
     let scope = scope(&root);
 
-    assert_eq!(scope.ceiling(), checkout.canonicalize().unwrap(), "the ceiling is the checkout");
-    assert_eq!(scope.root(), root.canonicalize().unwrap(), "the root is left where it was");
+    assert_eq!(
+        scope.ceiling(),
+        rag_rat_base::paths::canonicalize(checkout).unwrap(),
+        "the ceiling is the checkout"
+    );
+    assert_eq!(
+        scope.root(),
+        rag_rat_base::paths::canonicalize(&root).unwrap(),
+        "the root is left where it was"
+    );
 }
 
 /// Outside a git checkout there is no boundary but the configured one, and inventing a wider one
@@ -578,7 +590,7 @@ fn a_linked_worktree_is_its_own_ceiling_not_the_main_checkout() {
 
     assert_eq!(
         scope.ceiling(),
-        linked.canonicalize().unwrap(),
+        rag_rat_base::paths::canonicalize(&linked).unwrap(),
         "a linked worktree is its own checkout, not a subdirectory of main",
     );
 }
@@ -890,7 +902,7 @@ fn the_warmup_search_refuses_a_document_the_checkout_does_not_index() {
 
     assert_eq!(
         ts.warmup_document(&scope, &ts.resolve_layout(&scope)),
-        Some(dir.canonicalize().unwrap().join(".cache/generated/main.ts")),
+        Some(rag_rat_base::paths::canonicalize(&dir).unwrap().join(".cache/generated/main.ts")),
     );
 }
 
@@ -1695,7 +1707,7 @@ fn the_ancestor_leg_never_leaves_the_checkout() {
 
     assert_eq!(
         clangd.resolve_layout(&scope).sole_marker_dir(),
-        Some(checkout.canonicalize().unwrap().join("build").as_path()),
+        Some(rag_rat_base::paths::canonicalize(checkout).unwrap().join("build").as_path()),
         "a database above the checkout is not this checkout's, and must not disqualify the pin",
     );
 }
@@ -1728,7 +1740,7 @@ fn a_real_linked_worktree_inside_the_checkout_is_not_this_checkouts_project() {
     let scope = super::CheckoutScope::resolve(&main, &corpus);
     assert_eq!(
         clangd.resolve_layout(&scope).sole_marker_dir(),
-        Some(main.canonicalize().unwrap().join("build").as_path()),
+        Some(rag_rat_base::paths::canonicalize(&main).unwrap().join("build").as_path()),
         "one database and nothing nested ⇒ pinned",
     );
 
@@ -1757,12 +1769,12 @@ fn a_real_linked_worktree_inside_the_checkout_is_not_this_checkouts_project() {
     let linked_scope = super::CheckoutScope::resolve(&linked, &linked_corpus);
     assert_eq!(
         linked_scope.ceiling(),
-        linked.canonicalize().unwrap(),
+        rag_rat_base::paths::canonicalize(&linked).unwrap(),
         "the linked worktree is its own checkout, not a subdirectory of main",
     );
     assert_eq!(
         clangd.resolve_layout(&linked_scope).sole_marker_dir(),
-        Some(linked.canonicalize().unwrap().join("build").as_path()),
+        Some(rag_rat_base::paths::canonicalize(&linked).unwrap().join("build").as_path()),
         "and it resolves its own database, not main's",
     );
 }
@@ -1789,7 +1801,7 @@ fn completeness_covers_the_ancestor_chain_and_ignores_sibling_subtrees() {
     let scope = super::CheckoutScope::resolve(&root, &corpus);
     assert_eq!(
         clangd.resolve_layout(&scope).sole_marker_dir(),
-        Some(root.canonicalize().unwrap().join("build").as_path()),
+        Some(rag_rat_base::paths::canonicalize(&root).unwrap().join("build").as_path()),
         "a sibling subtree of the index root is outside the question being asked",
     );
 

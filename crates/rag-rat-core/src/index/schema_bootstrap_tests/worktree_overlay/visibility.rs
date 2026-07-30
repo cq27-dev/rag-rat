@@ -820,7 +820,7 @@ fn a_reported_path_resolves_against_the_reported_source_root_not_the_checkout_ro
     fs::create_dir_all(main.join("crate/src")).unwrap();
     // Canonical root, mirroring `Config::load` — see
     // `worktree_overlay_serves_a_subdir_rooted_config`.
-    let main = main.canonicalize().unwrap();
+    let main = rag_rat_base::paths::canonicalize(&main).unwrap();
     fs::write(main.join("crate/src/lib.rs"), "pub fn base_fn() {}\n").unwrap();
     init_git_repo(&main);
     run_git(&main, &["add", "."]);

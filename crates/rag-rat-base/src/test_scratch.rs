@@ -376,9 +376,10 @@ const NON_CANONICAL_ALIAS: &str = "via-symlink";
 /// [`ScratchDir`] for that reason (the roots not on it today are synthetic paths, explicitly
 /// canonicalized ones, and the bench corpus, none of which carry a scratch spelling at all).
 ///
-/// It is also only an approximation of Windows: `std::fs::canonicalize` there returns a `\\?\`
-/// verbatim path and expands 8.3 names, neither of which a Unix symlink produces. A root-spelling
-/// bug specific to those two shapes still surfaces first on the cross-platform legs.
+/// It is also only an approximation of Windows: canonicalization there expands 8.3 names
+/// (`RUNNER~1`) and, for a long or UNC path, keeps the `\\?\` extended-length prefix — neither of
+/// which a Unix symlink produces. A root-spelling bug specific to those shapes still surfaces first
+/// on the cross-platform legs.
 fn aliased_root(root: &Path) -> PathBuf {
     #[cfg(unix)]
     {
@@ -396,25 +397,27 @@ fn aliased_root(root: &Path) -> PathBuf {
 
 /// `root` in the canonical form a `Config` loaded from disk would carry.
 ///
-/// `Config::load` normalizes its root through `canonicalize()`, and index/overlay code depends on
-/// that: the worktree overlay derives `config.root`'s subdir by stripping it against a
-/// canonicalized repo workdir, so a hand-built `Config` holding a non-canonical root strips to
-/// nothing and scopes the refresh at the repo root instead of the config root. A fixture that
-/// builds its `Config` by hand must therefore canonicalize the same way — otherwise it exercises a
-/// configuration production can never produce, and the mis-scoping stays invisible (#1027).
+/// `Config::load` normalizes its root through [`crate::paths::canonicalize`], and index/overlay
+/// code depends on that: the worktree overlay derives `config.root`'s subdir by stripping it
+/// against a canonicalized repo workdir, so a hand-built `Config` holding a non-canonical root
+/// strips to nothing and scopes the refresh at the repo root instead of the config root. A fixture
+/// that builds its `Config` by hand must therefore canonicalize the same way — otherwise it
+/// exercises a configuration production can never produce, and the mis-scoping stays invisible
+/// (#1027). Mirroring THAT helper rather than `std::fs::canonicalize` is what keeps fixture roots
+/// out of the Windows `\\?\` verbatim spelling `git` and gix reject (#1048).
 ///
 /// Fixtures hand roots over before creating them (a `git worktree add` destination must not
-/// exist), which plain `canonicalize()` rejects, so this canonicalizes the longest EXISTING
-/// ancestor and re-joins the remainder. For a root that exists it is exactly `canonicalize()`.
+/// exist), which plain canonicalization rejects, so this resolves the longest EXISTING ancestor and
+/// re-joins the remainder. For a root that exists it is exactly `paths::canonicalize`.
 ///
 /// A root with NO existing ancestor below the filesystem root comes back UNCHANGED, and that is
 /// load-bearing rather than a degenerate case. Placement and event-classification tests reason over
 /// SYNTHETIC paths (`/repo`, `/main/.git/worktrees`, `/checkout/packages`) that are never on disk;
 /// `Config::load` rejects such a root outright (`normalize_existing_dir` requires the directory to
 /// exist), so there is no production spelling to match and inventing one would only introduce a
-/// divergence. Windows is where that bites: `canonicalize()` on the bare root yields the current
-/// drive's `\\?\C:\` verbatim prefix, so a canonicalized `/repo` would stop matching the sibling
-/// literals the same test compares it against — a mismatch the Linux legs can never see (#1027).
+/// divergence. Windows is where that bites: canonicalizing the bare root yields the current drive
+/// (`C:\`), so a canonicalized `/repo` would stop matching the sibling literals the same test
+/// compares it against — a mismatch the Linux legs can never see (#1027).
 pub fn canonical_config_root(root: impl Into<PathBuf>) -> PathBuf {
     let root = root.into();
     resolve_through_existing_ancestor(&root).unwrap_or(root)
@@ -426,14 +429,14 @@ pub fn canonical_config_root(root: impl Into<PathBuf>) -> PathBuf {
 ///
 /// The ascent deliberately stops ABOVE the filesystem root instead of resolving it. A path with no
 /// existing ancestor at all names nothing on this machine, so there is no spelling to normalize
-/// toward — and on Windows `canonicalize()` of the bare root returns the current drive's `\\?\C:\`
-/// verbatim form, which would rewrite the path into one none of its siblings match.
+/// toward — and on Windows canonicalizing the bare root returns the current drive (`C:\`), which
+/// would rewrite the path into one none of its siblings match.
 fn resolve_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
     let mut probe = path;
     loop {
         let (parent, name) = (probe.parent()?, probe.file_name()?);
-        if let Ok(canonical) = probe.canonicalize() {
+        if let Ok(canonical) = crate::paths::canonicalize(probe) {
             return Some(tail.iter().rev().fold(canonical, |acc, part| acc.join(part)));
         }
         tail.push(name);
@@ -722,13 +725,13 @@ mod tests {
     fn canonical_config_root_resolves_an_absent_leaf_through_its_symlinked_ancestors() {
         let dir = ScratchDir::new("absent-leaf-probe");
         let existing = canonical_config_root(dir.path());
-        assert_eq!(existing, dir.path().canonicalize().unwrap());
+        assert_eq!(existing, crate::paths::canonicalize(dir.path()).unwrap());
 
         let absent = dir.path().join("not-created-yet/nested");
         assert_eq!(canonical_config_root(&absent), existing.join("not-created-yet/nested"));
         // Once it exists, plain canonicalization agrees.
         std::fs::create_dir_all(&absent).unwrap();
-        assert_eq!(canonical_config_root(&absent), absent.canonicalize().unwrap());
+        assert_eq!(canonical_config_root(&absent), crate::paths::canonicalize(absent).unwrap());
     }
 
     /// The ancestor search stops ABOVE the filesystem root, so a SYNTHETIC path — one with no
@@ -756,7 +759,7 @@ mod tests {
         let dir = ScratchDir::new("ancestor-search");
         assert_eq!(
             resolve_through_existing_ancestor(&dir.join("absent/leaf")),
-            Some(dir.path().canonicalize().unwrap().join("absent/leaf")),
+            Some(crate::paths::canonicalize(dir.path()).unwrap().join("absent/leaf")),
         );
     }
 

@@ -602,7 +602,7 @@ mod tests {
         );
         assert_eq!(
             config.root,
-            root.path().canonicalize().unwrap(),
+            rag_rat_base::paths::canonicalize(root.path()).unwrap(),
             "both spellings name the same directory",
         );
     }

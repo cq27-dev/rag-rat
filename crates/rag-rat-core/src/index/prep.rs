@@ -195,7 +195,7 @@ pub(crate) fn explicit_index_files_and_changes(
     } else {
         crate::index::git_changed_paths(&config.root).unwrap_or_default()
     };
-    let canonical_root = config.root.canonicalize().unwrap_or_else(|_| config.root.clone());
+    let canonical_root = rag_rat_base::paths::canonicalize_or_simplified(&config.root);
     let mut files = Vec::new();
     let mut changes = GitChangedPaths::default();
     // Whether a supplied path is a `Cargo.toml` (present, or a real deletion) — the package-map
@@ -380,7 +380,7 @@ pub(crate) fn root_relative_path(
 pub(crate) fn canonicalize_nearest_ancestor(path: &Path) -> Option<PathBuf> {
     let mut ancestor = path;
     loop {
-        if let Ok(canonical) = ancestor.canonicalize() {
+        if let Ok(canonical) = rag_rat_base::paths::canonicalize(ancestor) {
             let suffix = path.strip_prefix(ancestor).unwrap_or_else(|_| Path::new(""));
             return Some(canonical.join(suffix));
         }

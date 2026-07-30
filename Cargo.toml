@@ -75,6 +75,13 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 # line that rag-rat-core's own SHA-256 (`sha2` 0.11, used by oplog::cbor + oplog::device) already
 # links, so it adds NO second sha2/digest stack — `Hkdf::<sha2::Sha256>` reuses the existing hash.
 hkdf = "0.13"
+# Windows path normalization: strips the `\\?\` verbatim prefix `std::fs::canonicalize` returns
+# whenever the plain `C:\…` spelling names the same file, and keeps verbatim form where it is
+# load-bearing (UNC, >260 chars, reserved DOS names, trailing dot/space). `gix-discover` already
+# depends on it and runs `dunce::simplified` over the directory it discovers from, so routing our own
+# canonicalization through the same crate is what keeps our roots comparable to gix's `workdir()`.
+# No-op on non-Windows. Already in the tree via gix; this only makes it a direct dependency.
+dunce = "1.0"
 fastembed = { version = "5.17.3", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 # Cross-platform mtime setter, used only by `test_scratch`'s sweep test to age a fixture dir past
 # the sweep threshold (already in the tree transitively; a dev-dependency, not shipped).

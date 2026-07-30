@@ -158,7 +158,7 @@ pub fn resolve_git_context(root: &Path) -> (String, String) {
 /// (#219 review). Falls back to the literal path when it can't be resolved (a removed
 /// worktree mid-GC), trailing slash trimmed either way.
 pub(crate) fn worktree_id_of(path: &Path) -> String {
-    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let resolved = rag_rat_base::paths::canonicalize_or_simplified(path);
     resolved.to_string_lossy().trim_end_matches('/').to_string()
 }
 
@@ -186,15 +186,16 @@ pub(crate) fn resolve_worktree_scope(root: &Path, worktree: Option<&Path>) -> (S
 /// `live_worktree_contexts`.
 fn validated_sibling_worktree(root: &Path, candidate: &Path) -> Option<PathBuf> {
     let repo = discover_repo(candidate).ok()?;
-    let git_dir = repo.git_dir().canonicalize().ok()?;
-    let common_dir = repo.common_dir().canonicalize().ok()?;
+    let git_dir = rag_rat_base::paths::canonicalize(repo.git_dir()).ok()?;
+    let common_dir = rag_rat_base::paths::canonicalize(repo.common_dir()).ok()?;
     // The main worktree's per-worktree git dir IS the common dir; a linked worktree's differs. Main
     // → None → base scope (which already serves the main checkout).
     if git_dir == common_dir {
         return None;
     }
     // Same repository as `root` iff they share a common dir — rejects an unrelated repo's worktree.
-    let root_common = discover_repo(root).ok()?.common_dir().canonicalize().ok()?;
+    let root_common =
+        rag_rat_base::paths::canonicalize(discover_repo(root).ok()?.common_dir()).ok()?;
     if common_dir != root_common {
         return None;
     }
@@ -277,7 +278,7 @@ mod worktree_scope_tests {
         std::fs::write(dir.join("a.txt"), "hello").unwrap();
         git(&dir, &["add", "."]);
         git(&dir, &["commit", "-q", "-m", "init"]);
-        let canonical = dir.canonicalize().unwrap();
+        let canonical = rag_rat_base::paths::canonicalize(&dir).unwrap();
         (dir, canonical)
     }
 
@@ -395,7 +396,10 @@ mod worktree_scope_tests {
         // changes, selecting the linked worktree's overlay.
         assert_eq!(sha, base_sha, "base commit must remain the rooted checkout's HEAD");
         assert_ne!(wt, base_id, "worktree_id must select the linked worktree");
-        assert_eq!(PathBuf::from(&wt).canonicalize().unwrap(), linked.canonicalize().unwrap());
+        assert_eq!(
+            rag_rat_base::paths::canonicalize(PathBuf::from(&wt)).unwrap(),
+            rag_rat_base::paths::canonicalize(linked).unwrap()
+        );
     }
 
     #[test]

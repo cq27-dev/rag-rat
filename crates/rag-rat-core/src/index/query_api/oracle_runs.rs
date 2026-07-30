@@ -124,8 +124,7 @@ impl IndexDatabase {
         // checkout's root, and in the shared-database model an overlay-scoped pass legitimately
         // reads a DIFFERENT tree — the linked worktree its rows are keyed to. So the expected root
         // is the active scope's own checkout, and the caller must have rooted the session there.
-        let indexed_root =
-            indexed_root.canonicalize().unwrap_or_else(|_| indexed_root.to_path_buf());
+        let indexed_root = rag_rat_base::paths::canonicalize_or_simplified(indexed_root);
         // The base checkout's scope id is `worktree_id_of(indexed_root)`, not the empty string —
         // `resolve_worktree_scope` reports the root's own id for it. (Empty means no scope has
         // been installed on this handle yet, which is also the base.) Test it explicitly rather
@@ -149,7 +148,7 @@ impl IndexDatabase {
                 )
             })?
         };
-        let expected_root = expected_root.canonicalize().unwrap_or_else(|_| expected_root.clone());
+        let expected_root = rag_rat_base::paths::canonicalize_or_simplified(&expected_root);
         if expected_root != scope.root() {
             anyhow::bail!(
                 "the active scope's checkout is rooted at {} but the live oracle is scoped to {}; \

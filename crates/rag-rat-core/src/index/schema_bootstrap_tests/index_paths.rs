@@ -138,7 +138,7 @@ fn reindex_paths_routes_a_linked_worktree_path_to_its_overlay_not_the_base() {
     assert_eq!(partition.linked.len(), 1, "the linked path routes to exactly its checkout overlay",);
     let (root, root_paths) = partition.linked.iter().next().unwrap();
     assert!(
-        linked.canonicalize().is_ok_and(|canonical| *root == canonical),
+        rag_rat_base::paths::canonicalize(&linked).is_ok_and(|canonical| *root == canonical),
         "the routed root is the canonical linked checkout: {root:?}",
     );
     assert_eq!(
@@ -987,7 +987,7 @@ fn index_paths_indexes_an_absolute_path_through_a_symlinked_root_spelling() {
     fs::create_dir_all(realroot.join("src")).unwrap();
     fs::write(realroot.join("src/a.rs"), "pub fn alpha_v1() {}\n").unwrap();
     // config.root is the CANONICAL root (as `Config::load` would normalize it).
-    let canonical_root = realroot.canonicalize().unwrap();
+    let canonical_root = rag_rat_base::paths::canonicalize(&realroot).unwrap();
     let config = source_config(canonical_root.clone(), Language::Rust);
     let _ = IndexDatabase::rebuild(&config).unwrap();
 
