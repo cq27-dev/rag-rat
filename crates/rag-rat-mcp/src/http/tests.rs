@@ -765,7 +765,7 @@ pub fn run() {
 /// reachable and says, in the response, that it covered two symbols at once.
 #[tokio::test]
 async fn hop_routes_prefer_the_symbol_handle_over_the_shared_qualified_name() {
-    let (root, config) = test_config();
+    let (_scratch, root, config) = test_config();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), OVERLOAD_SOURCE).unwrap();
     fs::write(root.join("src/cfg.rs"), CFG_VARIANT_SOURCE).unwrap();
