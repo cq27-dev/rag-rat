@@ -405,19 +405,37 @@ fn aliased_root(root: &Path) -> PathBuf {
 ///
 /// Fixtures hand roots over before creating them (a `git worktree add` destination must not
 /// exist), which plain `canonicalize()` rejects, so this canonicalizes the longest EXISTING
-/// ancestor and re-joins the remainder. For a root that exists it is exactly `canonicalize()`;
-/// with no existing ancestor at all it returns `root` unchanged.
+/// ancestor and re-joins the remainder. For a root that exists it is exactly `canonicalize()`.
+///
+/// A root with NO existing ancestor below the filesystem root comes back UNCHANGED, and that is
+/// load-bearing rather than a degenerate case. Placement and event-classification tests reason over
+/// SYNTHETIC paths (`/repo`, `/main/.git/worktrees`, `/checkout/packages`) that are never on disk;
+/// `Config::load` rejects such a root outright (`normalize_existing_dir` requires the directory to
+/// exist), so there is no production spelling to match and inventing one would only introduce a
+/// divergence. Windows is where that bites: `canonicalize()` on the bare root yields the current
+/// drive's `\\?\C:\` verbatim prefix, so a canonicalized `/repo` would stop matching the sibling
+/// literals the same test compares it against — a mismatch the Linux legs can never see (#1027).
 pub fn canonical_config_root(root: impl Into<PathBuf>) -> PathBuf {
     let root = root.into();
+    resolve_through_existing_ancestor(&root).unwrap_or(root)
+}
+
+/// `path` resolved through its deepest EXISTING ancestor: that ancestor canonicalized, with the
+/// components below it re-joined verbatim. `None` when the ascent reaches a filesystem root or
+/// prefix without finding one.
+///
+/// The ascent deliberately stops ABOVE the filesystem root instead of resolving it. A path with no
+/// existing ancestor at all names nothing on this machine, so there is no spelling to normalize
+/// toward — and on Windows `canonicalize()` of the bare root returns the current drive's `\\?\C:\`
+/// verbatim form, which would rewrite the path into one none of its siblings match.
+fn resolve_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut probe = root.as_path();
+    let mut probe = path;
     loop {
+        let (parent, name) = (probe.parent()?, probe.file_name()?);
         if let Ok(canonical) = probe.canonicalize() {
-            return tail.iter().rev().fold(canonical, |acc, part| acc.join(part));
+            return Some(tail.iter().rev().fold(canonical, |acc, part| acc.join(part)));
         }
-        let (Some(parent), Some(name)) = (probe.parent(), probe.file_name()) else {
-            return root;
-        };
         tail.push(name);
         probe = parent;
     }
@@ -711,6 +729,35 @@ mod tests {
         // Once it exists, plain canonicalization agrees.
         std::fs::create_dir_all(&absent).unwrap();
         assert_eq!(canonical_config_root(&absent), absent.canonicalize().unwrap());
+    }
+
+    /// The ancestor search stops ABOVE the filesystem root, so a SYNTHETIC path — one with no
+    /// existing ancestor at all — resolves to nothing and [`canonical_config_root`] hands it back
+    /// untouched.
+    ///
+    /// The placement and event-classification tests reason over paths that are never on disk
+    /// (`/repo`, `/main/.git/worktrees`, `/checkout/packages`) and compare `config.root` against
+    /// sibling literals spelled the same way. Resolving the bare root would rewrite one side of
+    /// every one of those comparisons and neither of the others — on Windows into the current
+    /// drive's `\\?\C:\` verbatim form (#1027). The search is asserted directly because on Unix
+    /// canonicalizing `/` is the identity, so `canonical_config_root` alone cannot tell the two
+    /// behaviours apart here.
+    #[test]
+    fn the_existing_ancestor_search_stops_above_the_filesystem_root() {
+        let synthetic = PathBuf::from("/rag-rat-no-such-root/packages/crate");
+        assert!(!synthetic.exists(), "the probe must not exist: {synthetic:?}");
+        assert!(
+            resolve_through_existing_ancestor(&synthetic).is_none(),
+            "a path with no existing ancestor must not resolve through the filesystem root",
+        );
+        assert_eq!(canonical_config_root(&synthetic), synthetic);
+
+        // The contrast: an absent leaf whose ancestor DOES exist still resolves through it.
+        let dir = ScratchDir::new("ancestor-search");
+        assert_eq!(
+            resolve_through_existing_ancestor(&dir.join("absent/leaf")),
+            Some(dir.path().canonicalize().unwrap().join("absent/leaf")),
+        );
     }
 
     #[test]
