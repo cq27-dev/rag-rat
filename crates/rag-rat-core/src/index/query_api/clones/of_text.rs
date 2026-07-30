@@ -516,7 +516,9 @@ fn check_against(
     }
 
     let lang = language.as_str();
-    let in_file = path.to_string_lossy().into_owned();
+    // Through the shared seam, because `self_prefix` is compared against the indexed `path::name`
+    // ref form, and that half is rendered by `paths::path_string`.
+    let in_file = rag_rat_base::paths::path_string(path);
     let self_prefix = format!("{in_file}::"); // refs starting with this are the file's own code
 
     let mut id_set: BTreeSet<i64> = BTreeSet::new();

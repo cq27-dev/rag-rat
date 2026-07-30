@@ -108,11 +108,9 @@ pub(crate) fn scan_packages(root: &Path) -> (HashSet<String>, Vec<PackageRoots>)
         // Store `manifest_dir` RELATIVE to the indexed root (`/`-normalized) so it prefix-matches a
         // file's stored relative path when assigning `files.package_id`. The root manifest yields
         // an empty string, which is a prefix of every path (the root crate owns top-level files).
-        let relative = manifest_dir
-            .strip_prefix(root)
-            .unwrap_or(manifest_dir)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let relative = rag_rat_base::paths::path_string(
+            manifest_dir.strip_prefix(root).unwrap_or(manifest_dir),
+        );
         packages.push(PackageRoots { manifest_dir: relative, local_roots });
     }
     (global_roots, packages)

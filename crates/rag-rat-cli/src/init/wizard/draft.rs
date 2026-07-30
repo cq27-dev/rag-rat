@@ -1086,7 +1086,8 @@ mod tests {
         // Normalize separators: the display path uses `\` on Windows (correct for the user), but
         // the suffix check is separator-agnostic.
         assert!(
-            d.db_path.replace('\\', "/").ends_with("custom/index.sqlite"),
+            rag_rat_base::paths::path_string(std::path::Path::new(&d.db_path))
+                .ends_with("custom/index.sqlite"),
             "reconfigure displays the explicit database path, got {}",
             d.db_path
         );

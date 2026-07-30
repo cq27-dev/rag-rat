@@ -48,8 +48,8 @@ use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::time::Instant;
 
-use path_slash::PathExt as _;
 use rag_rat_base::hash::hex_sha256;
+use rag_rat_base::paths;
 use rusqlite::Connection;
 use serde::Serialize;
 use url::Url;
@@ -972,7 +972,8 @@ fn path_from_uri(root_uri: &str, uri: &str) -> Option<String> {
     let root = Url::parse(root_uri).ok()?.to_file_path().ok()?;
     let target = Url::parse(uri).ok()?.to_file_path().ok()?;
     let relative = target.strip_prefix(root).ok()?;
-    Some(relative.to_slash_lossy().into_owned())
+    // Through the shared seam, so this reads back exactly as `files.path` stored it.
+    Some(paths::path_string(relative))
 }
 
 #[cfg(test)]

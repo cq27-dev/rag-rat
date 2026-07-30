@@ -655,7 +655,7 @@ mod default_plan_tests {
         // A Windows path (C:\...) in a TOML BASIC (double-quoted) string parses its backslashes as
         // escape sequences (\U, \r, …) → a load error. Forward slashes are valid TOML and stay
         // absolute on Windows, so `database` resolves to the same path.
-        let db_literal = db_path.display().to_string().replace('\\', "/");
+        let db_literal = rag_rat_base::paths::path_string(&db_path);
         std::fs::write(
             &config_path,
             format!(

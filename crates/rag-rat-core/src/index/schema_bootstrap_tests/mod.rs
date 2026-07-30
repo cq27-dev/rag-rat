@@ -969,6 +969,11 @@ fn fingerprinted_symbol_id_for_ref(db: &IndexDatabase, qualified_name: &str) -> 
         .unwrap_or_else(|e| panic!("no fingerprinted symbol id for ref {qualified_name}: {e}"))
 }
 
+// Unix-only: the fixture needs a file whose NAME contains `\`, which Windows forbids. Gating the
+// module — rather than each item inside it — keeps its helpers from becoming `dead_code` on a
+// platform where none of its tests compile in.
+#[cfg(unix)]
+mod backslash_file_names;
 mod change_coupling;
 mod chunk_store_migrations;
 mod clones;

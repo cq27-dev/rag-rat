@@ -201,7 +201,7 @@ fn push_uncovered_chunk(
             "code",
             Some(format!(
                 "{}::#context-{}{}",
-                path.to_string_lossy().replace('\\', "/"),
+                rag_rat_base::paths::path_string(path),
                 context_index + 1,
                 if part_idx == 0 { String::new() } else { format!("-{part_idx}") }
             )),

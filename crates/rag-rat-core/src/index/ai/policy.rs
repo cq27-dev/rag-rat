@@ -517,6 +517,55 @@ mod low_signal_span_tests {
     }
 }
 
+/// On Unix a backslash is part of the file NAME, so `pkg/target\a.rs` is one file called
+/// `target\a.rs` under `pkg/` — NOT a file under a `target/` directory (#1032). Classifying it as
+/// generated would skip embedding a real source file, and would also disagree with the reconcile
+/// recompute, which reads the same name back out of `files.path`.
+///
+/// Deliberately NOT in the `policy_version_tests` corpus: that corpus's hash must be identical on
+/// Unix and Windows, and this input cannot exist on Windows at all. The whole module is gated so
+/// nothing inside it is dead code on the Windows leg.
+#[cfg(all(test, unix))]
+mod backslash_path_tests {
+    use std::path::Path;
+
+    /// Long enough to clear `MIN_EMBEDDING_CHARS`, so "no cheap skip applies" is reachable and the
+    /// assertion is not satisfied by an unrelated SkipTooSmall.
+    const SRC: &str =
+        "fn a() { let value = compute(input); let other = process(value); combine(value, other) }";
+
+    #[test]
+    fn a_literal_backslash_in_a_unix_file_name_is_not_a_generated_directory() {
+        let decision = super::cheap_skip_policy(
+            Path::new("pkg/target\\a.rs"),
+            "rust",
+            "source",
+            "code",
+            Some("s"),
+            SRC,
+            4000,
+        );
+        assert!(
+            decision.is_none(),
+            "a backslash in the file name must not read as a `target/` directory: {decision:?}"
+        );
+        // The same segment spelled as a real directory still classifies as generated.
+        assert_eq!(
+            super::cheap_skip_policy(
+                Path::new("pkg/target/a.rs"),
+                "rust",
+                "source",
+                "code",
+                Some("s"),
+                SRC,
+                4000,
+            )
+            .map(|decision| decision.policy),
+            Some("SkipGenerated".to_string()),
+        );
+    }
+}
+
 /// Behavior-hash tripwire for [`EMBEDDING_POLICY_VERSION`] (#530). The corpus routes through every
 /// embedding-policy gate — the parse-free cheap gates and the low-signal gate, the latter both
 /// `FromText` and `FromSpan` across every grammar — so any classifier change (a threshold, a gate,
@@ -550,6 +599,17 @@ mod policy_version_tests {
         // hash.
         let at_min = "a".repeat(80);
         let below_min = "a".repeat(79);
+        // The two `backslash_*` cases below: a path spelled with the PLATFORM separator, which on
+        // Windows IS `\`. They classify as SkipGenerated / SkipTestFixture only because the policy
+        // renders them through `paths::path_string` before matching the `/`-spelled `/target/` and
+        // `/fixtures/` heuristics, so they pin that normalization on the platform where it does
+        // work. Spelled from `MAIN_SEPARATOR` rather than a hardcoded `\`: on Unix a backslash is a
+        // legal file NAME character, `path_string` correctly leaves it alone, and a hardcoded
+        // spelling would make this corpus — and therefore EMBEDDING_POLICY_VERSION — classify
+        // differently on Unix than on Windows.
+        let separator = std::path::MAIN_SEPARATOR;
+        let native_generated_path = format!("pkg{separator}target{separator}a.rs");
+        let native_fixture_path = format!("pkg{separator}fixtures{separator}a.rs");
 
         // Parse-free cheap gates (FromText — no tree needed for these to decide).
         // (label, path, language, file_kind, chunk_kind, symbol_path, text, cap)
@@ -626,14 +686,10 @@ mod policy_version_tests {
                 "fn a() { let value = compute(); process(value); }",
                 4000,
             ),
-            // Backslash paths (Windows `relative_path`): these classify as SkipGenerated /
-            // SkipTestFixture ONLY because the policy `/`-normalizes via `paths::path_string` — so
-            // they pin that normalization AND bump the version, which forces existing Windows
-            // indexes (stamped before the normalization) to re-stamp their
-            // `chunks.embedding_policy`.
+            // Native-separator paths — `\` on Windows. See the `native_*_path` bindings above.
             (
                 "backslash_generated_path",
-                "pkg\\target\\a.rs",
+                native_generated_path.as_str(),
                 "rust",
                 "source",
                 "code",
@@ -643,7 +699,7 @@ mod policy_version_tests {
             ),
             (
                 "backslash_test_fixture_path",
-                "pkg\\fixtures\\a.rs",
+                native_fixture_path.as_str(),
                 "rust",
                 "source",
                 "code",

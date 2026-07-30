@@ -190,8 +190,13 @@ pub(crate) fn normal_component(component: &std::path::Component<'_>) -> bool {
 pub(crate) fn toml_string(value: &str) -> String {
     format!("{value:?}")
 }
+/// A repo-relative path as the config renders it — `/`-separated, with the empty (root) path
+/// spelled `.`. The value lands in `rag-rat.toml` as a target directory and is later matched
+/// against `files.path`, so it goes through the same `path_string` seam the index stores with
+/// rather than a blanket backslash rewrite, which would rename a Unix directory whose name
+/// contains a backslash.
 pub(crate) fn display_rel(path: &Path) -> String {
-    let text = path.to_string_lossy().replace('\\', "/");
+    let text = rag_rat_base::paths::path_string(path);
     if text.is_empty() { ".".to_string() } else { text }
 }
 pub(crate) fn supported_languages() -> Vec<Language> {

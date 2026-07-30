@@ -5184,7 +5184,6 @@ name = "rag-rat-oracle"
 version = "0.21.1"
 dependencies = [
  "anyhow",
- "path-slash",
  "protobuf",
  "rag-rat-base",
  "rag-rat-clones",

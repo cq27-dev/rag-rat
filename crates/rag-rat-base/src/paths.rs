@@ -180,11 +180,26 @@ fn windows_utf16_len(s: &str) -> usize {
 const MAX_PLAIN_PATH_UNITS: usize = 260;
 const MAX_COMPONENT_UNITS: usize = 255;
 
+use path_slash::PathExt as _;
+
 /// The canonical `/`-separated rendering used everywhere a path is persisted or compared against
 /// the `files` table — Windows separators normalize so the same file hashes/joins identically on
 /// every platform.
+///
+/// Rewrites the platform SEPARATOR only, never a `\` that is part of a file NAME. On Windows `\`
+/// is the separator and cannot occur inside a name, so `src\lib.rs` renders `src/lib.rs`. On Unix
+/// `\` is an ordinary filename character, so `src/foo\bar.rs` and `src/foo/bar.rs` are two
+/// different files and must render as two different strings. Rewriting every backslash in the
+/// lossy string — a blanket `String::replace` of the escape character with `/` — collapsed them
+/// onto one `files.path`, and because this is the write path, both files shared a single row:
+/// chunks, clone postings, memory bindings, change coupling, and symbol `qualified_name`s all
+/// inherited the collision.
+///
+/// This function is the ONE place that normalization lives: an inlined copy at a call site
+/// reintroduces the collision for whatever it feeds, so `no_inlined_separator_normalization`
+/// below fails the build when a new one appears.
 pub fn path_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    path.to_slash_lossy().into_owned()
 }
 
 /// `path` with `.` dropped and `..` applied to the preceding component, TEXTUALLY — no filesystem
@@ -371,5 +386,103 @@ mod tests {
         // And the success arm is plain `canonicalize`.
         std::fs::create_dir_all(&absent).unwrap();
         assert_eq!(canonicalize_or_simplified(&absent), canonicalize(&absent).unwrap());
+    }
+
+    #[test]
+    fn path_string_renders_the_platform_separator_as_a_slash() {
+        let nested: PathBuf = ["src", "index", "walker.rs"].iter().collect();
+        assert_eq!(path_string(&nested), "src/index/walker.rs");
+    }
+
+    /// A backslash is a legal Unix filename character, so it must survive `path_string` — the
+    /// stored `files.path` is what distinguishes this file from the nested `src/foo/bar.rs`, and
+    /// `qualified_name` (`path::name`) inherits the same distinction. Unix-only: Windows forbids
+    /// `\` in a name, so the file this asserts about cannot exist there.
+    #[cfg(unix)]
+    #[test]
+    fn path_string_keeps_a_literal_backslash_in_a_unix_file_name() {
+        assert_eq!(path_string(Path::new("src/foo\\bar.rs")), "src/foo\\bar.rs");
+        assert_ne!(
+            path_string(Path::new("src/foo\\bar.rs")),
+            path_string(Path::new("src/foo/bar.rs")),
+            "a backslash-named file and a nested file must not share one files.path",
+        );
+    }
+
+    /// `path_string` is the single seam that decides what a path LOOKS like everywhere it is
+    /// persisted, compared against `files.path`, or folded into a symbol's `qualified_name`. An
+    /// inlined `to_string_lossy()` + blanket backslash rewrite at a call site silently opts that
+    /// call site out and reintroduces the Unix filename collision for whatever it feeds — which is
+    /// how the defect reached the walker, the chunker, the parser, the edge extractor and a
+    /// verbatim second copy of this function. Scan the workspace so a new copy fails here rather
+    /// than in a user's index.
+    #[test]
+    fn no_inlined_separator_normalization() {
+        // Written with doubled escapes so this test's own source does not match the needle.
+        let needle = "replace('\\\\', \"/\")";
+        // Files that rewrite backslashes in something that is NOT a path, where `path_string` does
+        // not apply. Each entry pins the exact number of occurrences, so an inlined path rewrite
+        // added to the same file still trips this — and a stale entry trips it too.
+        let allowed: &[(&str, usize, &str)] = &[(
+            "rag-rat-cli/tests/consolidate.rs",
+            1,
+            "normalizes a whole stderr MESSAGE with paths interpolated into it, not a path",
+        )];
+        let Some(crates_dir) = workspace_crates_dir() else {
+            // A packaged crate has no workspace around it; nothing to scan.
+            return;
+        };
+        let mut offenders = Vec::new();
+        for file in rust_sources(&crates_dir) {
+            let Ok(text) = std::fs::read_to_string(&file) else { continue };
+            let relative = path_string(file.strip_prefix(&crates_dir).unwrap_or(&file));
+            let hits: Vec<usize> = text
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains(needle))
+                .map(|(index, _)| index + 1)
+                .collect();
+            let exempt = allowed
+                .iter()
+                .find(|(allowed_path, ..)| *allowed_path == relative)
+                .map_or(0, |(_, count, _)| *count);
+            if hits.len() != exempt {
+                offenders.push(format!("{relative} lines {hits:?} (allowed: {exempt})"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "inlined path-separator normalization found — call `rag_rat_base::paths::path_string` \
+             instead, which leaves a literal backslash in a Unix file name intact:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
+    /// `<workspace>/crates`, derived from this crate's manifest dir. `None` when the crate is
+    /// built outside its workspace checkout (a packaged/vendored copy).
+    fn workspace_crates_dir() -> Option<PathBuf> {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.to_path_buf();
+        crates_dir.is_dir().then_some(crates_dir)
+    }
+
+    fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(current) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&current) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                // `target/` holds build output, including generated sources we do not own.
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name == "target") {
+                        continue;
+                    }
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        found
     }
 }

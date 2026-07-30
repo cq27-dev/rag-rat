@@ -454,7 +454,9 @@ fn make_symbol(
     let is_test = rag_rat_base::path_class::is_test_path(path)
         || backend.is_test_symbol(text, node, &scope_path, &name);
     ParsedSymbol {
-        qualified_name: format!("{}::{name}", path.to_string_lossy().replace('\\', "/")),
+        // `path::name` is the symbol's human-readable identity every graph and MCP surface
+        // round-trips, so the path half must be spelled exactly as `files.path` spells it.
+        qualified_name: format!("{}::{name}", rag_rat_base::paths::path_string(path)),
         scope_path,
         name,
         kind: kind.to_string(),

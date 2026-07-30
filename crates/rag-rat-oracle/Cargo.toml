@@ -13,7 +13,6 @@ categories.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-path-slash.workspace = true
 protobuf.workspace = true
 rag-rat-base.workspace = true
 rag-rat-clones.workspace = true

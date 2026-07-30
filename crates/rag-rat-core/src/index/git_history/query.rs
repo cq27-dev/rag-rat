@@ -281,7 +281,3 @@ fn fts_query(query: &str) -> String {
         .collect::<Vec<_>>();
     if terms.is_empty() { "\"\"".to_string() } else { terms.join(" OR ") }
 }
-
-pub(super) fn path_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}

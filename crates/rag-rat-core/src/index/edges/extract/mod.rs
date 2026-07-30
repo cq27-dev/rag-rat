@@ -384,7 +384,7 @@ pub(crate) fn file_edge(
 ) -> EdgeCandidate {
     EdgeCandidate {
         from_symbol_id: None,
-        from_name: Some(path.to_string_lossy().replace('\\', "/")),
+        from_name: Some(rag_rat_base::paths::path_string(path)),
         to_name,
         target_qualified_name: None,
         evidence: Some(edge_evidence(node, text)),
@@ -414,7 +414,7 @@ pub(crate) fn file_edge_scoped(
 ) -> EdgeCandidate {
     EdgeCandidate {
         from_symbol_id: None,
-        from_name: Some(path.to_string_lossy().replace('\\', "/")),
+        from_name: Some(rag_rat_base::paths::path_string(path)),
         to_name,
         target_qualified_name: None,
         evidence,

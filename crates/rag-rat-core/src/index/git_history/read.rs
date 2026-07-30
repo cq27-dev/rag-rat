@@ -1,4 +1,5 @@
-use super::query::path_string;
+use rag_rat_base::paths::path_string;
+
 use super::*;
 
 /// Walk the commit history reachable from `head` with gix (gitoxide), producing the commit records

@@ -70,7 +70,10 @@ fn is_target_file(root: &Path, path: &Path, target: &ResolvedTarget) -> bool {
         return false;
     }
     let relative = path.strip_prefix(root).unwrap_or(path);
-    let relative = relative.to_string_lossy().replace('\\', "/");
+    // The include/exclude patterns are `/`-spelled, so match against the SAME rendering
+    // `files.path` is stored with — never a blanket backslash rewrite, which would let a pattern
+    // claim (or exclude) a Unix file whose NAME contains a backslash by pretending it is nested.
+    let relative = rag_rat_base::paths::path_string(relative);
     if target.exclude.iter().any(|pattern| matches_simple_pattern(&relative, pattern)) {
         return false;
     }
@@ -141,7 +144,7 @@ mod tests {
         let rel: Vec<String> = walk_target(&root, &target, &ignore)
             .unwrap()
             .iter()
-            .map(|p| p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
+            .map(|p| rag_rat_base::paths::path_string(p.strip_prefix(&root).unwrap()))
             .collect();
 
         // The `.h` header is claimed by the cpp binding (the header-resolution fix)...
@@ -171,7 +174,7 @@ mod tests {
         found.sort();
         let rel: Vec<String> = found
             .iter()
-            .map(|p| p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
+            .map(|p| rag_rat_base::paths::path_string(p.strip_prefix(&root).unwrap()))
             .collect();
 
         assert!(rel.contains(&"crates/app/keep.rs".to_string()), "kept: {rel:?}");
@@ -201,7 +204,7 @@ mod tests {
         let found = walk_target(&root, &target, &ignore).expect("missing dir must not error");
         let rel: Vec<String> = found
             .iter()
-            .map(|p| p.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"))
+            .map(|p| rag_rat_base::paths::path_string(p.strip_prefix(&root).unwrap()))
             .collect();
         assert_eq!(rel, vec!["present/lib.rs".to_string()], "present dir indexed, missing skipped");
     }
