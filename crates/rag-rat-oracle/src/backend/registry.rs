@@ -45,26 +45,19 @@ pub struct LiveBackend {
     /// This is the same file the backend's `prerequisite_blocked` gate looks for, because it is
     /// the same question: a checkout with no such project emits no readiness signal, so the
     /// backend could only ever sit in `Warming`.
-    pub(crate) project_marker: Option<ProjectMarker>,
+    pub(crate) project_model: Option<ProjectModel>,
 }
 
-/// A backend's project marker, and how it relates to the documents it governs.
+/// What makes a checkout a PROJECT for one backend: how its marker is read, where that marker has
+/// to sit, and what the operator loses while it is missing.
+///
+/// One declaration rather than three fields plus a hardcoded flag: the reading decides how many
+/// names the marker can have and whether the discovered directory is handed to the server, and
+/// those were previously spread across the registry, `spawn_args`, and the prerequisite hint.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ProjectMarker {
-    /// The filenames that declare this project, any one of which is enough. First match wins.
-    ///
-    /// Several because a build system often accepts several spellings of the same declaration —
-    /// Gradle takes `build.gradle.kts` or `build.gradle`, and a checkout using the one the backend
-    /// did not name would read as having no project at all: its readiness signal never fires, so
-    /// the session could only ever sit in `Warming` while its prerequisite gate reported the
-    /// project missing.
-    ///
-    /// A `ProjectScope::Checkout` marker declares exactly ONE, and a test pins that. It is not a
-    /// sentinel — it is PARSED, as a `compile_commands.json` compilation database, to decide
-    /// whether it configures an indexed file and whether it can be pinned with
-    /// `--compile-commands-dir`. A second name there would mean a second format and a second
-    /// reader, which is a different change from widening a presence test.
-    pub(crate) files: &'static [&'static str],
+pub(crate) struct ProjectModel {
+    /// How the marker is read — see [`MarkerKind`]. Independent of `scope`.
+    pub(crate) kind: MarkerKind,
     scope: ProjectScope,
     /// What the operator loses while this marker is missing, and what to do about it — the tail of
     /// the prerequisite hint. The two progress-signalled backends share the gate and the sentence
@@ -73,9 +66,68 @@ pub(crate) struct ProjectMarker {
     pub(crate) hint_detail: &'static str,
 }
 
+/// How a backend's project marker is read, which is what decides how many names it may have.
+///
+/// Distinct from `layout::MarkerReading`, which is a per-FILE outcome (is this database loadable,
+/// and does it govern anything indexed). This is the per-BACKEND declaration.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MarkerKind {
+    /// PRESENCE alone declares the project, so any of these names will do; first match wins.
+    ///
+    /// Several because a build system often accepts several spellings of the same declaration —
+    /// Gradle takes `build.gradle.kts` or `build.gradle`, and a checkout using the one the backend
+    /// did not name would read as having no project at all: its readiness signal never fires, so
+    /// the session could only ever sit in `Warming` while its prerequisite gate reported the
+    /// project missing.
+    Sentinel { files: &'static [&'static str] },
+    /// The marker is PARSED as a specific file format, so it has exactly one name: the name and
+    /// the reader that understands it are one decision, and a second name would mean a second
+    /// format and a second reader. Today the only such marker is a `compile_commands.json`
+    /// compilation database, read to decide whether it configures an indexed file.
+    ///
+    /// `pin` is the flag that hands the directory holding it to the server. It lives here rather
+    /// than in the spawn arguments because it is meaningless without this marker: clangd discovers
+    /// a database only in an opened file's ancestor directories and their `build/` subdirectory,
+    /// so a database anywhere else is invisible to it, and passing the directory found is what
+    /// makes every layout behave the same.
+    Parsed { file: &'static str, pin: &'static str },
+}
+
+impl ProjectModel {
+    /// Every name that would satisfy this marker. Borrowed from `self`, which is `Copy` — hold the
+    /// model in a binding rather than calling this on a temporary.
+    pub(crate) fn files(&self) -> &[&'static str] {
+        match &self.kind {
+            MarkerKind::Sentinel { files } => files,
+            MarkerKind::Parsed { file, .. } => std::slice::from_ref(file),
+        }
+    }
+
+    /// The single name this marker is parsed from, or `None` when presence alone declares it.
+    pub(crate) fn parsed_file(&self) -> Option<&'static str> {
+        match self.kind {
+            MarkerKind::Parsed { file, .. } => Some(file),
+            MarkerKind::Sentinel { .. } => None,
+        }
+    }
+
+    /// The flag that hands the discovered marker directory to the server, if this marker has one.
+    fn pin_flag(&self) -> Option<&'static str> {
+        match self.kind {
+            MarkerKind::Parsed { pin, .. } => Some(pin),
+            MarkerKind::Sentinel { .. } => None,
+        }
+    }
+}
+
 /// Where a project marker has to sit relative to a document for that document to belong to it.
 /// The two live backends genuinely differ, and assuming either shape for the other misclassifies
 /// ordinary layouts.
+///
+/// Deliberately separate from [`MarkerKind`]. The two coincide today — the sentinel is
+/// enclosing, the parsed one is checkout-wide — but they are different questions, and a Gradle
+/// sentinel is enclosing while nothing forces a sentinel to be. Fusing them would have to be undone
+/// by the first backend that breaks the pairing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProjectScope {
     /// The marker governs its own SUBTREE: a document belongs to it only when the marker sits in
@@ -106,7 +158,7 @@ impl LiveBackend {
                 // rust-analyzer reports load/index quiescence explicitly, for any checkout.
                 readiness: ReadinessPolicy::ServerStatus,
                 language_ids: &[("rs", "rust")],
-                project_marker: None,
+                project_model: None,
             }),
             OracleTool::TsLsp => Some(Self {
                 tool,
@@ -121,8 +173,8 @@ impl LiveBackend {
                 // tsconfig.json, where no such cycle is ever emitted.
                 readiness: ReadinessPolicy::WorkDoneProgress,
                 language_ids: &[("tsx", "typescriptreact"), ("ts", "typescript")],
-                project_marker: Some(ProjectMarker {
-                    files: &["tsconfig.json"],
+                project_model: Some(ProjectModel {
+                    kind: MarkerKind::Sentinel { files: &["tsconfig.json"] },
                     scope: ProjectScope::Enclosing,
                     hint_detail: "Asked mid-load, typescript-language-server resolves an imported \
                                   callee to the import statement instead of the definition. Add a \
@@ -162,8 +214,11 @@ impl LiveBackend {
                 // that index from the compilation database. Without one it answers with the
                 // header declaration and emits no progress at all (measured) — the same
                 // no-signal state a tsconfig-less TypeScript checkout is in.
-                project_marker: Some(ProjectMarker {
-                    files: &["compile_commands.json"],
+                project_model: Some(ProjectModel {
+                    kind: MarkerKind::Parsed {
+                        file: "compile_commands.json",
+                        pin: "--compile-commands-dir",
+                    },
                     scope: ProjectScope::Checkout,
                     hint_detail: "Without a compilation database clangd resolves a call into \
                                   another translation unit only to the callee's header \
@@ -209,29 +264,23 @@ impl LiveBackend {
         self.languages.contains(&language)
     }
 
-    /// Whether this backend's project marker is PARSED rather than merely present.
-    ///
-    /// A parsed marker is read as a specific file format (today: a `compile_commands.json`
-    /// compilation database), so its name and its reader are one decision — which is why it
-    /// declares a single name while a presence-tested marker may declare several.
-    #[cfg(test)]
-    pub(crate) fn marker_is_parsed(&self) -> bool {
-        self.project_marker.is_some_and(|marker| marker.scope == ProjectScope::Checkout)
-    }
-
     /// Resolve this checkout's project layout — the one filesystem scan a session performs.
     pub fn resolve_layout(&self, checkout: &CheckoutScope<'_>) -> ProjectLayout {
-        let Some(marker) = self.project_marker else {
+        let Some(model) = self.project_model else {
             return ProjectLayout::default();
         };
-        match marker.scope {
+        match model.scope {
             // An enclosing-scoped marker is answered per document by walking UP, which is cheap
             // and needs no precomputed set.
             ProjectScope::Enclosing => ProjectLayout::default(),
             // The governing marker is PARSED, so the scan takes the one name it declares. An
-            // empty declaration is a registry bug (a test pins it); treat it as "no project"
+            // empty NAME is a registry bug (`every_declared_marker_name_is_usable` pins it, since
+            // the type guarantees one name but not a non-empty one); treat it as "no project"
             // rather than scanning for a nameless file, which would match every directory.
-            ProjectScope::Checkout => match marker.files.first() {
+            // Only a PARSED marker names a file this scan can look for — `marker_sites` searches
+            // for one filename. A checkout-scoped SENTINEL would need a multi-name site scan,
+            // which nothing declares; no layout rather than a wrong one.
+            ProjectScope::Checkout => match model.parsed_file() {
                 Some(file) => ProjectLayout::from_marker_sites(file, marker_sites(checkout, file)),
                 None => ProjectLayout::default(),
             },
@@ -262,11 +311,11 @@ impl LiveBackend {
         match self.readiness {
             ReadinessPolicy::ServerStatus => true,
             ReadinessPolicy::WorkDoneProgress =>
-                self.project_marker.is_some_and(|marker| match marker.scope {
+                self.project_model.is_some_and(|model| match model.scope {
                     ProjectScope::Enclosing => documents::enclosing_project_dir(
                         checkout,
                         &checkout.root().join(path),
-                        marker.files,
+                        model.files(),
                     )
                     .is_some(),
                     // Readiness, not resolution — [`Trust::Possible`] for the same reason as
@@ -275,7 +324,7 @@ impl LiveBackend {
                         checkout,
                         &checkout.root().join(path),
                         layout,
-                        marker,
+                        model,
                         Trust::Possible,
                     ),
                 }),
@@ -303,12 +352,12 @@ impl LiveBackend {
             // Session-level quiescence needs no document.
             ReadinessPolicy::ServerStatus => None,
             ReadinessPolicy::WorkDoneProgress =>
-                self.project_marker.and_then(|marker| match marker.scope {
+                self.project_model.and_then(|model| match model.scope {
                     ProjectScope::Enclosing => documents::find_document_in_project(
                         checkout,
                         checkout.root(),
                         self.languages,
-                        marker.files,
+                        model.files(),
                         false,
                     ),
                     // The marker can sit anywhere, so the two halves are searched independently
@@ -334,7 +383,7 @@ impl LiveBackend {
                                 checkout,
                                 document,
                                 layout,
-                                marker,
+                                model,
                                 Trust::Possible,
                             )
                         },
@@ -346,19 +395,30 @@ impl LiveBackend {
     /// The argv this backend's server is spawned with for `root`: the manifest's static arguments
     /// plus any that depend on the checkout.
     ///
+    /// The checkout-dependent part is the marker PIN: a backend whose marker is parsed declares the
+    /// flag that hands the directory holding it to the server (`MarkerKind::Parsed::pin`), and
+    /// it is appended when the layout found exactly one such directory.
+    ///
     /// clangd is the reason this is not just the static list. It discovers a compilation database
     /// only in an opened file's ancestor directories and their `build/` subdirectory, so a
     /// database anywhere else — `out/`, `cmake-build-debug/`, any project-specific name — is
     /// invisible to it. Passing the directory we found makes every layout behave the same, and
     /// keeps the prerequisite gate honest: it accepts a database wherever it sits precisely
     /// because the session is then told where that is.
+    ///
+    /// The flag is declared rather than written here: it is meaningless without the marker it
+    /// points at, so a second backend with a discovered artifact would otherwise have to be
+    /// special-cased in this shared method, or silently receive clangd's flag.
     pub(crate) fn spawn_args(&self, layout: &ProjectLayout) -> Vec<OsString> {
         let mut args: Vec<OsString> = self.stdio_args.iter().map(OsString::from).collect();
-        if let Some(dir) = layout.sole_marker_dir() {
+        if let Some(pin) = self.project_model.and_then(|model| model.pin_flag())
+            && let Some(dir) = layout.sole_marker_dir()
+        {
             // Built as an OsString, never through `Path::display()`: on Unix a path is bytes, and
             // formatting a non-UTF-8 component would substitute replacement characters and hand
             // the server a directory that does not exist.
-            let mut arg = OsString::from("--compile-commands-dir=");
+            let mut arg = OsString::from(pin);
+            arg.push("=");
             arg.push(dir.as_os_str());
             args.push(arg);
         }
@@ -377,15 +437,15 @@ impl LiveBackend {
         checkout: &CheckoutScope<'_>,
         absolute: &Path,
         layout: &ProjectLayout,
-        marker: ProjectMarker,
+        model: ProjectModel,
         trust: Trust,
     ) -> bool {
         if layout.is_empty() {
             return false;
         }
-        // The governing marker's single parsed name; an empty declaration is a registry bug, and
-        // resolving nothing is the safe reading of it.
-        let Some(file) = marker.files.first() else {
+        // Only a PARSED marker has a database to point the session at; a sentinel declares no
+        // file this gate could read.
+        let Some(file) = model.parsed_file() else {
             return false;
         };
         layout.sole_marker_dir().is_some()
@@ -404,7 +464,7 @@ impl LiveBackend {
         path: &str,
         layout: &ProjectLayout,
     ) -> bool {
-        match self.project_marker {
+        match self.project_model {
             Some(marker) if marker.scope == ProjectScope::Checkout => self.session_resolves(
                 checkout,
                 &checkout.root().join(path),

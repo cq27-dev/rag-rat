@@ -695,6 +695,57 @@ fn enclosing_tsconfig_walks_up_to_the_nearest_project_and_stops_at_the_root() {
 }
 
 #[test]
+fn every_declared_marker_name_is_usable() {
+    // `MarkerKind::Parsed` guarantees a parsed marker has exactly ONE name — that part of the old
+    // invariant is now in the type. What the type does not say is that a name is non-empty, and an
+    // empty one is worse than useless: `dir.join("")` is the directory itself, so a nameless
+    // sentinel would match every directory in the checkout, and an empty pin would hand the server
+    // a bare `=<dir>`. Every reader fails closed on it, but nothing should ever declare one.
+    for backend in LiveBackend::all() {
+        let Some(model) = backend.project_model else {
+            continue;
+        };
+        let names = model.files();
+        assert!(!names.is_empty(), "{:?} declares a marker with no name", backend.tool);
+        for name in names {
+            assert!(!name.is_empty(), "{:?} declares an empty marker name", backend.tool);
+        }
+        if let super::registry::MarkerKind::Parsed { pin, .. } = model.kind {
+            assert!(!pin.is_empty(), "{:?} declares an empty marker pin flag", backend.tool);
+        }
+    }
+}
+
+#[test]
+fn only_a_backend_that_declares_a_pin_receives_one() {
+    // The marker pin is a property of the MARKER, not of spawning: it is meaningless without the
+    // file it points at. Writing `--compile-commands-dir` into the shared argv builder meant any
+    // backend whose layout happened to find a sole marker directory would receive clangd's flag —
+    // harmless only because clangd is the one backend that produces such a layout today (#1042).
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let ts = LiveBackend::for_tool(OracleTool::TsLsp).unwrap();
+    let (_dir_guard, dir) = checkout("pin-is-declared");
+    std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
+    std::fs::write(dir.join("main.c"), "int m(void){return 0;}\n").unwrap();
+
+    // A layout that DOES name a sole marker directory.
+    let layout = clangd.resolve_layout(&scope(&dir));
+    assert!(layout.sole_marker_dir().is_some(), "the fixture really pins a directory");
+
+    assert!(
+        clangd.spawn_args(&layout).contains(&compdb_arg(&dir)),
+        "the backend that declares a pin gets it: {:?}",
+        clangd.spawn_args(&layout),
+    );
+    assert_eq!(
+        ts.spawn_args(&layout),
+        vec![OsString::from("--stdio")],
+        "a backend whose marker is a sentinel declares no pin, so it receives none even from a \
+         layout that has one",
+    );
+}
+
+#[test]
 fn any_declared_marker_name_identifies_a_project() {
     // A build system often accepts several spellings of the same declaration — Gradle takes
     // `build.gradle.kts` or `build.gradle`. With one name per marker a checkout using the other
@@ -789,29 +840,6 @@ fn the_prerequisite_hint_names_every_spelling_that_would_satisfy_the_marker() {
 }
 
 #[test]
-fn a_governing_marker_declares_exactly_one_name() {
-    // A `Checkout`-scoped marker is not a sentinel: it is PARSED, as a `compile_commands.json`
-    // compilation database, to decide whether it configures an indexed file and whether it can be
-    // pinned with `--compile-commands-dir`. A second name there would mean a second FORMAT and a
-    // second reader — widening the presence test buys nothing without them, and the scan silently
-    // takes the first name. If you are adding one, that reader is what you also have to write.
-    for backend in LiveBackend::all() {
-        let Some(marker) = backend.project_marker else {
-            continue;
-        };
-        assert!(!marker.files.is_empty(), "{:?} declares a marker with no name", backend.tool);
-        if backend.marker_is_parsed() {
-            assert_eq!(
-                marker.files.len(),
-                1,
-                "{:?} declares a PARSED marker with several names, but only the first is read",
-                backend.tool,
-            );
-        }
-    }
-}
-
-#[test]
 fn a_warmup_document_is_found_at_any_depth_and_only_inside_a_project() {
     // A project can sit arbitrarily deep in a monorepo; a depth limit would silently disable
     // those checkouts entirely, which is worse than the walk it saves.
@@ -881,7 +909,7 @@ fn a_server_status_backend_needs_no_warmup_document_and_is_never_blocked_on_one(
         rust.open_signals_readiness(&scope(&dir), "src/lib.rs", &rust.resolve_layout(&scope(&dir))),
         "any document will do"
     );
-    assert!(rust.project_marker.is_none(), "session-level readiness needs no project");
+    assert!(rust.project_model.is_none(), "session-level readiness needs no project");
 }
 
 #[test]
@@ -917,7 +945,11 @@ fn a_backends_project_marker_is_the_file_its_prerequisite_looks_for() {
     // could pass the gate and still have nothing to warm on (or vice versa).
     let (_dir_guard, dir) = checkout("clangd-marker");
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    assert_eq!(clangd.project_marker.map(|m| m.files), Some(&["compile_commands.json"][..]),);
+    assert_eq!(
+        clangd.project_model.and_then(|m| m.parsed_file()),
+        Some("compile_commands.json"),
+        "the compilation database is PARSED, so it declares exactly one name",
+    );
     assert!(
         !clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         "no compdb ⇒ no signal possible"

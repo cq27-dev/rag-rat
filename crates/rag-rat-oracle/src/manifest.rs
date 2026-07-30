@@ -296,15 +296,16 @@ impl ToolManifest {
                 // with no marker at all: joining an empty list renders "found no  project under",
                 // which names nothing while looking like it does. Every other reader of an empty
                 // declaration already fails closed; this is the one that has to say so in prose.
-                let (marker, detail) = backend.project_marker.map_or(
+                let (marker, detail) = backend.project_model.map_or(
                     (hint_marker_names(&[]), "Add one to enable it."),
-                    |marker| {
-                        let detail = if marker.files.is_empty() {
+                    |model| {
+                        let names = model.files();
+                        let detail = if names.is_empty() {
                             "Add one to enable it."
                         } else {
-                            marker.hint_detail
+                            model.hint_detail
                         };
-                        (hint_marker_names(marker.files), detail)
+                        (hint_marker_names(names), detail)
                     },
                 );
                 if backend.checkout_can_signal_readiness(checkout, layout) {
