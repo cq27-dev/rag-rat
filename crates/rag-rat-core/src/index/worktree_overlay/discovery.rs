@@ -68,15 +68,22 @@ pub struct WorktreeOverlayReport {
     /// a consumer opening files both stay in the same coordinate system.
     pub source_root: PathBuf,
     pub indexed: usize,
-    /// The config-root-relative paths whose effective indexed content this refresh may have
-    /// changed: files it WROTE (readable), files it SHADOWED (tombstoned), and files it
-    /// UNSHADOWED (pruned — dropping an overlay row makes the base version visible to this
-    /// checkout again, which changes what a query serves just as much as a write does).
+    /// The config-root-relative paths whose effective indexed content this refresh changed: files
+    /// it WROTE, files it SHADOWED (tombstoned), and files it UNSHADOWED (pruned — dropping an
+    /// overlay row makes the base version visible to this checkout again, which changes what a
+    /// query serves just as much as a write does).
     ///
-    /// A SUPERSET of what changed, deliberately and soundly: a consumer that only needs "which of
-    /// this checkout's files may be stale" (the live oracle's per-checkout worklist, #1010)
-    /// filters it further anyway, and over-reporting costs a skipped candidate rather than a
-    /// missed one. Read [`Self::coverage`] first — a `Partial` list is not a superset.
+    /// Built from what the transaction COMMITTED, not from the candidates it considered. That
+    /// distinction is the whole value of the field: the candidate set of a diverged worktree is
+    /// its entire branch diff, and reporting that on every pass would name the same files forever
+    /// while nothing changed — leaving a consumer no better off than re-scanning the checkout, and
+    /// contradicting the empty-entry meaning [`crate::watch::OverlayRefresh`] documents. An idle
+    /// refresh of a static worktree reports nothing, matching its write-free behaviour.
+    ///
+    /// Still a SUPERSET, by a small and bounded margin: a path that survived the identity skip but
+    /// then failed to parse is listed though no row moved. That direction is deliberate —
+    /// over-reporting costs a consumer one redundant look, omitting a path leaves it serving stale
+    /// content. Read [`Self::coverage`] first: a `Partial` list is not even a superset.
     pub changed_paths: Vec<PathBuf>,
     /// Whether [`Self::changed_paths`] is the complete set. See [`ChangedPathsCoverage`].
     pub coverage: ChangedPathsCoverage,

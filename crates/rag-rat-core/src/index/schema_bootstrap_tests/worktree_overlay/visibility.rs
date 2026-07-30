@@ -922,6 +922,68 @@ fn an_overlay_refresh_reports_paths_whose_rows_it_pruned() {
 }
 
 #[test]
+fn an_idle_refresh_of_a_diverged_checkout_reports_a_visit_with_no_paths() {
+    // A diverged worktree's CANDIDATE set is its whole branch diff, and the refresh re-derives it
+    // every sweep — but an unchanged file is identity-skipped and no row moves. Reporting the
+    // candidates would name the same files on every pass forever while nothing changed, which is
+    // no better for a consumer than re-scanning the checkout and contradicts the empty-entry
+    // meaning ("visited, no work"). The list is built from what the transaction committed (#1010).
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/base.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // A committed divergence, so the branch diff stays NON-EMPTY on every later pass.
+    fs::write(linked.join("src/base.rs"), "pub fn base_fn() { let branch = 1; }\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch edit"]);
+
+    let linked_id = crate::watch::enclosing_worktree_id(&linked);
+    let first = crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    assert!(
+        first.reindexed.get(&linked_id).is_some_and(|entry| !entry.paths.is_empty()),
+        "the first refresh really did write the diverged file: {:?}",
+        first.reindexed,
+    );
+
+    // Nothing touched since. The candidate set is unchanged (still the whole branch diff), but
+    // every candidate identity-skips.
+    let second = crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+
+    assert!(!second.changed, "an idle overlay refresh writes nothing");
+    let entry = second
+        .reindexed
+        .get(&linked_id)
+        .unwrap_or_else(|| panic!("the checkout was still VISITED: {:?}", second.reindexed));
+    assert!(
+        entry.paths.is_empty(),
+        "an idle refresh must report the visit with NO paths, not re-report its branch diff: \
+         {entry:?}",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
 fn a_path_scoped_refresh_reports_complete_coverage_despite_an_incomplete_status() {
     // Two different questions share the word "complete". `status_complete` asks "may this
     // refresh's outcome arm the #577 skip?" — always false on the path-scoped route, which never
