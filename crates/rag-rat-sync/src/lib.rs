@@ -17,6 +17,7 @@
 
 pub mod auth;
 pub mod codec;
+pub mod discovery;
 pub mod endpoint;
 pub mod enrollment;
 pub mod session;
