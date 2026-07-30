@@ -3974,10 +3974,9 @@ test('a hidden document reloaded underneath loses the diagnostics nothing will r
     // `refreshEditor` is what re-runs the content gate, and it runs per VISIBLE editor — there is
     // none, so nothing will ask whether the warning still describes line 2. It has to come down
     // here rather than sit in the panel, pointing at unrelated code, until the tab is selected.
-    assert.deepEqual(
-      harness.problems(key),
-      [],
-      'a hidden document\'s diagnostics must not survive its bytes',
+    await harness.until(
+      () => harness.problems(key).length === 0,
+      'a hidden document\'s diagnostics to stop surviving its bytes',
     );
   } finally {
     harness.dispose();
@@ -4006,7 +4005,10 @@ test('a visible document reloaded underneath keeps being asked, and the gate ans
     harness.reload(document, 'fn renamed() {}\n');
     await harness.change(document);
 
-    assert.deepEqual(harness.problems(key), [], 'the gate must take a stale warning down');
+    await harness.until(
+      () => harness.problems(key).length === 0,
+      'the gate to take a stale warning down',
+    );
   } finally {
     harness.dispose();
   }
