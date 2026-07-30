@@ -607,7 +607,20 @@ impl IndexDatabase {
         .ok_or_else(|| {
             anyhow::anyhow!("timed out waiting for the schema-migration lock to apply the schema")
         })?;
-        let state = schema::status(conn)?.state;
+        let current = schema::status(conn)?;
+        let state = current.state;
+        // A store whose roster carries an id THIS binary does not recognize was written by a newer
+        // rag-rat, and `schema::apply` would replay this binary's ladder over it and hand the
+        // caller a connection to write through — which is how an `index --full` from a stale
+        // binary rewrites a store that a newer one has already converted (its `files.path`
+        // spellings, its rekeyed worktree ids) back into the shape this binary knows. Every OTHER
+        // schema path already refuses `Newer`; refusing it HERE — the one function that calls
+        // `apply` — is what makes the refusal hold on every route into the store rather than on
+        // the routes someone remembered. `Dirty` still proceeds: `index --full` is the recovery
+        // its own message names.
+        if state == schema::SchemaState::Newer {
+            anyhow::bail!("{}", current.message);
+        }
         if state != schema::SchemaState::Compatible {
             // #585: a dev/test build must not silently forward-migrate the shared global store —
             // it would strand every process still on an older binary. Refused here (Older only;

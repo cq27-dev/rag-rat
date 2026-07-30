@@ -332,3 +332,218 @@ fn an_upgrade_rekeys_stale_checkout_spellings_instead_of_collecting_them() {
         "the overlay refresh basis is rekeyed alongside its overlay rows",
     );
 }
+
+/// Record a migration id this binary does not know — the exact `schema_version` state a store
+/// carries once a NEWER binary has migrated it, and therefore the state a pre-upgrade binary sees
+/// after V097 lands.
+///
+/// Written as an unknown id rather than by tampering with V097's own row because the fence is the
+/// LADDER's, not this migration's: `known_migration` is a closed set, so any id outside it makes
+/// `status` answer `Newer`. V097 arms that fence purely by being on the ladder, which
+/// `schema::migration_arming` already pins mechanically.
+fn stamp_a_migration_from_a_newer_binary(db: &IndexDatabase) {
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO schema_version(id, applied_at_ms, checksum, description)
+             VALUES ('097_applied_by_a_newer_binary', 0, 'sha256:future', 'future migration')",
+            [],
+        )
+        .unwrap();
+}
+
+/// What a pre-upgrade binary is looking at once a newer one has converted the store: a main
+/// checkout plus a linked worktree whose overlay rows are keyed by a spelling this binary no
+/// longer derives, and a `schema_version` roster carrying an id it does not know.
+///
+/// Returned so each route into the store can be driven against the SAME state. The scratch roots
+/// come back with it because dropping them deletes the checkouts.
+struct AStoreANewerBinaryMigrated {
+    config: Config,
+    db: IndexDatabase,
+    stale_id: String,
+    stale_rows: i64,
+    _main: ScratchRoot,
+    _linked: ScratchRoot,
+}
+
+fn a_store_a_newer_binary_migrated() -> AStoreANewerBinaryMigrated {
+    let (main, config) = canonical_root_repo();
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let (linked_scratch, first) = canonical_worktree_destination();
+    run_git(&main, &["worktree", "add", "-q", "-b", "first", first.to_str().unwrap()]);
+    fs::write(first.join("crate/src/first.rs"), "pub fn first_fn() {}\n").unwrap();
+    run_git(&first, &["add", "."]);
+    run_git(&first, &["commit", "-q", "-m", "first"]);
+    let first_report = db.index_worktree_overlay(&config, &first, &mut |_| {}).unwrap();
+
+    // Only the CHECKOUT keys go stale — not `repo_roots.root` / `source_root`, which the
+    // empty-index guard reads: a stale root there would abort the pass for an unrelated reason and
+    // the mutation this test exists to catch would hide behind it.
+    let conn = db.storage.connection();
+    for table in ["files", "packages", "oracle_runs", "external_symbols"] {
+        conn.execute(
+            &format!(
+                "UPDATE main.{table} SET worktree_id = ?1 || worktree_id WHERE worktree_id != ''"
+            ),
+            [STALE_SPELLING_MARKER],
+        )
+        .unwrap();
+    }
+    let stale_id = format!("{STALE_SPELLING_MARKER}{}", first_report.worktree_id);
+    let stale_rows = rows_keyed_to(&db, &stale_id);
+    assert!(stale_rows > 0, "the linked worktree's overlay is keyed to the stale spelling");
+
+    // A newer binary migrated the store while this one stayed resident, holding its connection.
+    stamp_a_migration_from_a_newer_binary(&db);
+    let status = rag_rat_db::schema::status(db.storage.connection()).unwrap();
+    assert_eq!(status.state, rag_rat_db::schema::SchemaState::Newer);
+
+    AStoreANewerBinaryMigrated {
+        config,
+        db,
+        stale_id,
+        stale_rows,
+        _main: main,
+        _linked: linked_scratch,
+    }
+}
+
+/// The coexistence question a store-converting migration has to answer: what stops a binary that
+/// predates the conversion from garbage-collecting the rows it just rekeyed?
+///
+/// The answer is the schema version, and this pins that it reaches a RESIDENT process and not only
+/// a fresh command. A maintenance pass re-opens the database through `open_and_migrate` at its
+/// start — inside the per-repo write flock, and long before its gc stage — so the pass after an
+/// upgrade fails at the version gate with nothing read, written, or collected. Without that, an
+/// older build would derive its live worktree set from the OLD spelling, find every rekeyed id
+/// outside it, and prune registered linked worktrees as dead checkouts.
+///
+/// Driven with the checkout spellings left STALE on disk, so the assertion is not merely "the pass
+/// returned an error": if the gate ever stopped refusing, gc would run with a live set that cannot
+/// match those rows and would delete them, and the surviving-rows assertion fails too.
+#[test]
+fn a_pre_upgrade_binary_cannot_collect_a_store_a_newer_one_migrated() {
+    let store = a_store_a_newer_binary_migrated();
+
+    // The resident process's NEXT pass — the gc-cadence one, the only kind that prunes.
+    let err = crate::watch::maintenance_pass(&store.config, true)
+        .expect_err("a pass must refuse a store migrated by a newer binary");
+    assert!(
+        err.to_string().contains("newer rag-rat"),
+        "the pass must fail at the schema version gate, not incidentally: {err}",
+    );
+
+    assert_eq!(
+        rows_keyed_to(&store.db, &store.stale_id),
+        store.stale_rows,
+        "the refused pass collected nothing — an older binary cannot prune rows keyed by a \
+         spelling it no longer derives",
+    );
+}
+
+/// The same fence over the OTHER route into the store: `rag-rat index --full`.
+///
+/// A full rebuild does not open through `open_and_migrate` — it reaches `schema::apply` through
+/// `create_or_migrate`, which asks only whether the state is `Compatible` and migrates whenever it
+/// is not. `Newer` fell into that "not" and the rebuild proceeded: this binary's ladder replayed
+/// over a store a newer one had already converted, and the rebuild then re-registered
+/// `repo_roots.root` / `source_root` and re-staged the base scope in the spelling THIS binary
+/// derives, stranding the converted overlay rows for the next collector to prune. Refused inside
+/// `apply_schema_under_lock`, the single function that calls `schema::apply`, so the refusal holds
+/// on every route rather than on the ones an enumeration remembered.
+///
+/// Asserted on the error MESSAGE and on the surviving rows, for the same reason as the pass test —
+/// "it returned an error" would also be satisfied by a rebuild that failed after writing.
+#[test]
+fn a_pre_upgrade_full_index_cannot_replay_its_ladder_over_a_store_a_newer_one_migrated() {
+    let store = a_store_a_newer_binary_migrated();
+
+    // `expect_err` would need `IndexDatabase: Debug`, which it deliberately is not.
+    let Err(err) = IndexDatabase::rebuild(&store.config) else {
+        panic!("a full rebuild must refuse a store migrated by a newer binary")
+    };
+    assert!(
+        err.to_string().contains("newer rag-rat"),
+        "the rebuild must fail at the schema version gate, not incidentally: {err}",
+    );
+
+    assert_eq!(
+        rows_keyed_to(&store.db, &store.stale_id),
+        store.stale_rows,
+        "the refused rebuild rewrote nothing — the converted overlay rows are still keyed as the \
+         newer binary left them",
+    );
+}
+
+/// `repo_meta` / `index_meta` are the open-ended half of the persisted surface: a table growing a
+/// `worktree_id` is caught by
+/// `migration_097_covers_every_worktree_id_column_in_the_schema`, but a new meta key is just a
+/// string, and a path-valued one goes stale on the same upgrade with nothing to notice it.
+///
+/// So classify by VALUE rather than by memory: every meta value in a real, exercised index that is
+/// an absolute path must be one the rekey rewrites, or an explicitly reviewed exception. A new key
+/// that starts holding a checkout path fails here, by name, instead of quietly missing the sweep.
+#[test]
+fn every_absolute_path_in_the_meta_bag_is_rekeyed_or_reviewed() {
+    /// Reviewed and deliberately NOT rekeyed. Each is an absolute path, and each is left alone for
+    /// a reason that is about what the value MEANS, not about it being awkward to rewrite.
+    const REVIEWED_NOT_REKEYED: &[&str] = &[
+        // Provenance of the binary that last migrated this store (#585), read by humans
+        // diagnosing a fleet stranding. Never compared against a canonicalized path — and
+        // rewriting it would falsify the record of what actually ran.
+        "last_migration_binary_exe",
+        // A composite freshness key that FOLDS the history cursor, root spelling included.
+        // Rekeying the cursor makes it stale, which is the change-coupling table's ordinary
+        // invalidation path (a bounded window recompute the next history apply would trigger
+        // anyway); rewriting a stamp from a migration would couple the ladder to its format.
+        "git_coupling_stamp",
+    ];
+
+    let (main, config) = canonical_root_repo();
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    let (_first_scratch, first) = canonical_worktree_destination();
+    run_git(&main, &["worktree", "add", "-q", "-b", "first", first.to_str().unwrap()]);
+    fs::write(first.join("crate/src/first.rs"), "pub fn first_fn() {}\n").unwrap();
+    run_git(&first, &["add", "."]);
+    run_git(&first, &["commit", "-q", "-m", "first"]);
+    let first_report = db.index_worktree_overlay(&config, &first, &mut |_| {}).unwrap();
+    db.record_worktree_overlay_basis(&first_report.worktree_id, "base-sha", "linked-sha", 42)
+        .unwrap();
+
+    let basis_prefix = rag_rat_db::meta::WORKTREE_OVERLAY_BASIS_META_PREFIX;
+    let conn = db.storage.connection();
+    for table in ["repo_meta", "index_meta"] {
+        let mut stmt = conn.prepare(&format!("SELECT key, value FROM main.{table}")).unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for (key, value) in rows {
+            // The overlay basis carries its checkout in the KEY; the value is a sha triple.
+            if let Some(worktree_id) = key.strip_prefix(basis_prefix) {
+                assert!(
+                    Path::new(worktree_id).is_absolute(),
+                    "the overlay-basis key suffix is a checkout path, so V097 rekeys the KEY: \
+                     {key}",
+                );
+                continue;
+            }
+            if !Path::new(&value).is_absolute() {
+                continue;
+            }
+            let covered =
+                rag_rat_db::schema::migrations::V097_PATH_VALUED_META_KEYS.contains(&key.as_str());
+            assert!(
+                covered || REVIEWED_NOT_REKEYED.contains(&key.as_str()),
+                "`{table}[{key}]` holds an absolute path ({value:?}) that V097 neither rekeys nor \
+                 records as reviewed. A persisted path is compared TEXTUALLY against a \
+                 freshly-canonicalized one, so on the next Windows upgrade this value stops \
+                 matching. Add it to V097_PATH_VALUED_META_KEYS, or to REVIEWED_NOT_REKEYED with \
+                 the reason it must keep the spelling it was written with.",
+            );
+        }
+    }
+}
