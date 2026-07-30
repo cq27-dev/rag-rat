@@ -36,6 +36,19 @@ pub async fn run_stdio(
 /// `run_stdio(Config)` signature stays source-compatible, while a globally-registered `rag-rat mcp`
 /// can still stay alive in a non-rag-rat project instead of dying (#603).
 pub async fn run_stdio_dormant(output_format: rag_rat_core::OutputFormat) -> anyhow::Result<()> {
+    // A dormant server never hot-upgrades — with no config there is no handoff directory, and no
+    // index state worth carrying across an `exec`. It is still a `rag-rat mcp` process, though, so
+    // a globally-registered launcher hands it `RAG_RAT_UPGRADE_BIN` like any other, which is
+    // exactly what makes the fleet trigger consider it a signal target. Observe SIGUSR1 so the
+    // trigger cannot terminate it; it keeps serving the dormant notice until the client
+    // disconnects, and the next launch picks up the new binary.
+    #[cfg(unix)]
+    if let Some(mut sigusr1) =
+        crate::upgrade::install_path().and_then(|_| crate::upgrade::arm_sigusr1())
+    {
+        // Detached: the drain's useful lifetime IS the process's, so there is nothing to abort.
+        tokio::spawn(async move { while sigusr1.recv().await.is_some() {} });
+    }
     let running = RagRatService::new_dormant(output_format).serve(rmcp::transport::stdio()).await?;
     running.waiting().await?;
     Ok(())
@@ -63,13 +76,18 @@ async fn run_stdio_unix(
     use std::sync::Arc;
 
     use rmcp::service::serve_directly;
-    use tokio::signal::unix::{SignalKind, signal};
 
     use crate::upgrade::{self, GatedStdin, Upgrade, UpgradeGate};
 
     let gate = UpgradeGate::new();
     let service = RagRatService::new(config.clone(), output_format);
     let inflight = service.inflight();
+
+    // Observe SIGUSR1 before serving, not after — see [`upgrade::arm_sigusr1`]. Only when an
+    // install target is configured, since that env var is precisely what makes this process a
+    // fleet target.
+    let install_path = upgrade::install_path();
+    let sigusr1 = install_path.as_ref().and_then(|_| upgrade::arm_sigusr1());
 
     let transport = (GatedStdin::new(tokio::io::stdin(), Arc::clone(&gate)), tokio::io::stdout());
 
@@ -92,7 +110,6 @@ async fn run_stdio_unix(
     // Keep the index fresh while connected. Its lock fds are CLOEXEC, so a hot-`exec` releases
     // them automatically; on normal EOF the drop runs a final timeout-skip pass. When hot-upgrade
     // is armed, the elected watcher also watches the binary dir to drive the fleet trigger.
-    let install_path = upgrade::install_path();
     let _watcher =
         rag_rat_core::watch::Watcher::spawn_with_fleet(config.clone(), install_path.clone());
 
@@ -107,51 +124,52 @@ async fn run_stdio_unix(
     // terminate the stdio MCP service.
     let _lens_server = crate::lens_server::spawn(config.clone());
 
-    // Arm the SIGUSR1 hot-upgrade handler only when an install target is configured AND the client
-    // reached us through the `initialize` handshake. A peer that used the stateless lifecycle
-    // (protocol 2026-07-28 drops `initialize` and carries its version + capabilities in each
-    // request's `_meta`) leaves `peer_info()` empty: there is no negotiated session state to hand
-    // across the `exec`, and fabricating a default one would resume the successor claiming a
-    // protocol version and capability set the client never sent. Leaving hot-upgrade unarmed is
-    // the safe outcome — SIGUSR1 is ignored and this process keeps serving until the client
-    // disconnects, after which the next launch picks up the new binary.
+    // The signal is already observed; now that the session is understood, decide what it DOES.
+    //
+    // A peer that used the stateless lifecycle — protocol 2026-07-28 drops `initialize` and carries
+    // its version + capabilities in each request's `_meta` — leaves `peer_info()` empty. There is
+    // no negotiated session state to hand across the `exec`, and fabricating a default one would
+    // resume the successor claiming a protocol version and capability set the client never sent, so
+    // such a session consumes the signal without upgrading: it keeps serving until the client
+    // disconnects, after which the next launch picks up the new binary. Consuming rather than
+    // leaving the signal unhandled is what keeps the fleet trigger from killing the server.
     //
     // `peer_info()` yields `Option<Arc<_>>`; deref-and-clone to the owned `InitializeRequestParams`
     // the `Upgrade`/handoff want.
     let peer_info = running.peer().peer_info().map(|p| (*p).clone());
-    if let Some(install_path) = install_path {
-        if let Some(peer_info) = peer_info {
+    if let Some(mut sigusr1) = sigusr1 {
+        // `sigusr1` is armed only when `install_path` is set, so `zip` drops nothing else.
+        let upgrade = install_path.zip(peer_info).map(|(install_path, peer_info)| {
             let negotiated_protocol_version = peer_info.protocol_version.as_str().to_string();
             let handoff_dir = config
                 .database
                 .parent()
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_else(std::env::temp_dir);
-            let upgrade = Upgrade {
+            Upgrade {
                 gate: Arc::clone(&gate),
                 inflight,
                 install_path,
                 handoff_dir,
                 peer_info,
                 negotiated_protocol_version,
-            };
-            tokio::spawn(async move {
-                let Ok(mut sigusr1) = signal(SignalKind::user_defined1()) else {
-                    eprintln!("hot-upgrade: could not install SIGUSR1 handler; disabled");
-                    return;
-                };
-                // On success `run()` never returns (it `exec`s or exits); on a drain-timeout abort
-                // it returns and we wait for the next signal.
-                while sigusr1.recv().await.is_some() {
-                    upgrade.run().await;
-                }
-            });
-        } else {
+            }
+        });
+        if upgrade.is_none() {
             eprintln!(
                 "hot-upgrade: client connected without `initialize` (stateless lifecycle); no \
-                 session state to hand off, so hot-upgrade stays disabled for this session"
+                 session state to hand off, so SIGUSR1 will be observed and ignored"
             );
         }
+        tokio::spawn(async move {
+            // On success `run()` never returns (it `exec`s or exits); on a drain-timeout abort it
+            // returns and we wait for the next signal.
+            while sigusr1.recv().await.is_some() {
+                if let Some(upgrade) = &upgrade {
+                    upgrade.run().await;
+                }
+            }
+        });
     }
 
     running.waiting().await?;

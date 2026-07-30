@@ -73,6 +73,69 @@ fn sigusr1_exec_failure_exits_nonzero() {
     assert!(!status.success(), "exec failure must exit non-zero, got {status:?}");
 }
 
+/// `fleet::trigger` selects its targets by reading other processes' environ: a `rag-rat mcp`
+/// carrying `RAG_RAT_UPGRADE_BIN` is taken as proof that a `SIGUSR1` handler is installed, and is
+/// signaled on that basis. A server carrying that variable must therefore NEVER leave the signal on
+/// its default disposition, which terminates the process — mid-request, and with no diagnostic —
+/// instead of upgrading it.
+///
+/// This covers the two states where there is nothing to upgrade *to*: before the client has said
+/// anything at all, and after it opened a session through the stateless lifecycle (protocol
+/// 2026-07-28 drops `initialize` and carries the version + capabilities in each request's `_meta`,
+/// so the server never learns the peer info an `exec` handoff would need). Both must absorb the
+/// signal and keep serving.
+#[test]
+fn sigusr1_is_survivable_before_and_without_an_initialize_handshake() {
+    let env = TestEnv::setup();
+    let sentinel = env.root.join("must-not-run.marker");
+    let wrapper = env.write_upgrade_wrapper(&sentinel);
+
+    let mut session = env.spawn_mcp(&[("RAG_RAT_UPGRADE_BIN", wrapper.to_str().unwrap())]);
+
+    // (1) Signal arrives while the server is still blocked waiting for the client's first message.
+    // `ping` is the one request MCP permits before `initialize`, so it proves the server is up and
+    // serving without moving it out of the pre-handshake state the signal has to survive.
+    session.ping();
+    session.send_sigusr1();
+    session.assert_still_running("pre-handshake SIGUSR1 must not terminate the server");
+
+    // (2) The client then opens a session WITHOUT `initialize`. Serving must be unaffected.
+    let text = session.call_semantic_search_stateless();
+    assert!(text.contains("chunk_id"), "stateless session serves tool calls: {text}");
+
+    // (3) Signal again, now that the server knows the session has no handoff state.
+    session.send_sigusr1();
+    session.assert_still_running("SIGUSR1 on a stateless session must not terminate the server");
+    let text = session.call_semantic_search_stateless();
+    assert!(text.contains("chunk_id"), "stateless session still serves after SIGUSR1: {text}");
+
+    assert!(!sentinel.exists(), "a session with no handoff state must not `exec` the new binary");
+    session.stop();
+}
+
+/// The dormant server (launched outside any indexed repo) never hot-upgrades — with no config
+/// there is no handoff directory. It is still a `rag-rat mcp` process that a globally-registered
+/// launcher hands `RAG_RAT_UPGRADE_BIN`, so it is a fleet target like any other and must absorb
+/// `SIGUSR1` rather than die on it.
+#[test]
+fn sigusr1_does_not_kill_a_dormant_server() {
+    let elsewhere = unique_dir("hot-upgrade-dormant");
+    fs::create_dir_all(&*elsewhere).unwrap();
+    let installed = elsewhere.join("rag-rat-installed");
+    fs::write(&installed, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut session = Session::spawn_dormant(&elsewhere, &installed);
+    let notice = session.call_semantic_search_stateless();
+    assert!(notice.contains("no_index"), "server is dormant: {notice}");
+
+    session.send_sigusr1();
+    session.assert_still_running("SIGUSR1 must not terminate a dormant server");
+    let notice = session.call_semantic_search_stateless();
+    assert!(notice.contains("no_index"), "dormant server still serves after SIGUSR1: {notice}");
+    session.stop();
+}
+
 struct TestEnv {
     root: ScratchRoot,
     config_path: PathBuf,
@@ -183,10 +246,76 @@ impl Session {
             .to_string()
     }
 
+    /// Issue a `semantic_search` through the STATELESS lifecycle — no `initialize`, with the
+    /// protocol version and client capabilities riding in the request's own `_meta`. A server
+    /// reached this way never learns its peer's `initialize` params.
+    fn call_semantic_search_stateless(&mut self) -> String {
+        let id = self.take_id();
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo":
+                        {"name": "rag-rat-upgrade-test", "version": "0.1"},
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "name": "semantic_search",
+                "arguments": {"query": "search", "limit": 1}
+            }
+        }));
+        let response = self.recv();
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tool call had no text result: {response}"))
+            .to_string()
+    }
+
+    /// A dormant server: no `--config`, and a working directory with no config to discover, so the
+    /// server activates nothing and every `tools/call` returns the `no_index` notice.
+    fn spawn_dormant(cwd: &Path, install_path: &Path) -> Session {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rag-rat"))
+            .arg("mcp")
+            .current_dir(cwd)
+            .env("RAG_RAT_UPGRADE_BIN", install_path)
+            .env("RAG_RAT_NO_WATCH", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let reader = BufReader::new(child.stdout.take().unwrap());
+        Session { child, stdin, reader, next_id: 1 }
+    }
+
+    /// The one request MCP permits before `initialize`. Used to prove the server is up and
+    /// serving while still in the pre-handshake state.
+    fn ping(&mut self) {
+        let id = self.take_id();
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "ping", "params": {}}));
+        let response = self.recv();
+        assert_eq!(response["id"], id, "ping response");
+    }
+
     fn send_sigusr1(&self) {
         let pid = self.child.id();
         let status = Command::new("kill").arg("-USR1").arg(pid.to_string()).status().unwrap();
         assert!(status.success(), "failed to deliver SIGUSR1 to {pid}");
+    }
+
+    /// Give the signal time to be delivered and acted on, then assert the process is still up.
+    /// A default-disposition `SIGUSR1` kills within microseconds, so a short settle is enough;
+    /// the follow-up tool call is what proves it is still *serving*, not merely un-reaped.
+    fn assert_still_running(&mut self, what: &str) {
+        std::thread::sleep(Duration::from_millis(750));
+        assert!(
+            self.child.try_wait().unwrap().is_none(),
+            "{what} (exited with {:?})",
+            self.child.try_wait().unwrap()
+        );
     }
 
     fn wait_for_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {

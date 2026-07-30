@@ -274,6 +274,57 @@ pub fn take_handoff() -> Option<HandoffV1> {
     }
 }
 
+/// Drop `SIGUSR1` on the floor for now — the FIRST half of the fleet interlock, and the first
+/// thing `rag-rat mcp` should do.
+///
+/// [`rag_rat_core::fleet::trigger`] picks its targets by reading other processes' environ: a
+/// `rag-rat mcp` carrying [`UPGRADE_BIN_ENV`] is taken as proof that a `SIGUSR1` handler is
+/// installed, and is signaled on that basis. That environ is visible from `execve` onward, while
+/// the real handler cannot exist until there is a Tokio runtime to own it — and config discovery,
+/// logging setup, and runtime construction all happen in between. Left alone, a trigger landing in
+/// that gap terminates the server outright (`SIGUSR1`'s default disposition) instead of upgrading
+/// it. Ignoring costs the process at most one upgrade opportunity — it stays on the old binary
+/// until the client disconnects, exactly like a session with nothing to hand off — which is the
+/// documented fallback, and infinitely better than dying.
+///
+/// [`arm_sigusr1`] replaces this with the real handler as soon as the runtime is up.
+pub fn suppress_sigusr1_until_armed() {
+    if install_path().is_none() {
+        // Not fleet-eligible (the trigger skips processes without the env var), so leave the
+        // default disposition alone rather than silently changing signal behavior for everyone.
+        return;
+    }
+    // SAFETY: `signal(2)` with a valid signal number and the standard `SIG_IGN` disposition. No
+    // handler runs and no memory is touched.
+    unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
+}
+
+/// Observe `SIGUSR1` on the Tokio runtime — the SECOND half of the interlock, replacing the
+/// blanket ignore installed by [`suppress_sigusr1_until_armed`] with a stream the server can act
+/// on. Returns `None` when the OS refused, having left the signal ignored rather than fatal.
+///
+/// Call this BEFORE serving. Serving blocks on the client's first message, which may never arrive,
+/// so arming afterwards would leave the process merely ignoring upgrades for an unbounded stretch.
+/// What the signal *does* is decided later, once the session is understood.
+pub(crate) fn arm_sigusr1() -> Option<tokio::signal::unix::Signal> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    match signal(SignalKind::user_defined1()) {
+        Ok(stream) => Some(stream),
+        Err(err) => {
+            eprintln!(
+                "hot-upgrade: could not install SIGUSR1 handler ({err}); ignoring the signal"
+            );
+            // Stay ignored (already the case if `suppress_sigusr1_until_armed` ran): this process
+            // advertises itself as signal-safe through its environ either way, so it must not die
+            // on a signal it turned out it cannot handle. Hot-upgrade is lost for this session.
+            // SAFETY: as in `suppress_sigusr1_until_armed`.
+            unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
+            None
+        },
+    }
+}
+
 /// Whether this binary speaks `version` — the resume version gate. An unknown version means the
 /// new binary can't honor the client's negotiated session, so it must not skip `initialize`.
 pub fn protocol_supported(version: &str) -> bool {

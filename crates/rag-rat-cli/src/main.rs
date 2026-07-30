@@ -429,6 +429,12 @@ fn discover_config_optional(explicit: Option<&str>) -> anyhow::Result<Option<Con
 /// taking repo intelligence down for the whole session (#603). A config that is PRESENT but invalid
 /// — or an explicit `--config` path that is missing — is still a loud error.
 fn run_mcp(explicit: Option<&str>, json: bool) -> anyhow::Result<()> {
+    // FIRST, before any other startup work: this process's environ already advertises it as a
+    // hot-upgrade target, and the fleet trigger reads environs. Everything below — config
+    // discovery, logging, the Tokio runtime the real handler needs — is time in which an
+    // unhandled SIGUSR1 would kill the server outright instead of upgrading it.
+    #[cfg(unix)]
+    rag_rat_mcp::upgrade::suppress_sigusr1_until_armed();
     let output_format =
         if json { rag_rat_core::OutputFormat::Json } else { rag_rat_core::OutputFormat::Toon };
     let config = discover_config_optional(explicit)?;
