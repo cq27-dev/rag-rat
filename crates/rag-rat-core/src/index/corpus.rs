@@ -124,6 +124,13 @@ mod tests {
 
     /// A checkout with `src` bound as a Rust target, a gitignored `generated/`, and the usual
     /// machine-written trees.
+    ///
+    /// Assert against `config.root`, NEVER the guard's own spelling. `Config::load` canonicalizes
+    /// its root and [`ConfiguredCorpus`] strips exactly that root off the path it is asked about,
+    /// while a scratch path reaches its directory through a symlinked ancestor — so a test holding
+    /// the guard's spelling asks about a root production never produces, and every answer comes
+    /// back `false` for the wrong reason. Non-canonical temp roots are what macOS (`/var` →
+    /// `/private/var`) and Windows (8.3 `RUNNER~1`) hand over by default (#1027).
     fn fixture(tag: &str) -> (rag_rat_base::test_scratch::ScratchDir, Config) {
         let dir = rag_rat_base::test_scratch::ScratchDir::new(tag);
         for relative in ["src", "vendor", "node_modules", "generated", "build"] {
@@ -143,14 +150,59 @@ mod tests {
         (dir, config)
     }
 
+    /// The guard's spelling of the root and `config.root` must be two names for ONE directory —
+    /// the shape `Config::load` produces wherever the system temp is reached through a symlink
+    /// (macOS `/var` → `/private/var`) or an 8.3 alias (Windows `RUNNER~1`). Without the
+    /// divergence every assertion in this module would pass whether it derived its paths from
+    /// `config.root` or from the guard, and the root-spelling class would only redden the
+    /// cross-platform legs (#1027).
+    #[cfg(unix)]
     #[test]
-    fn a_bound_source_is_in_the_corpus_and_an_unbound_sibling_is_not() {
-        let (dir, config) = fixture("corpus-bound-target");
+    fn the_fixture_config_root_diverges_from_its_scratch_spelling() {
+        let (scratch, config) = fixture("corpus-root-spelling");
+        assert_ne!(
+            config.root,
+            scratch.path(),
+            "the fixture must reach its root through a symlinked ancestor",
+        );
+        assert_eq!(
+            config.root,
+            scratch.path().canonicalize().unwrap(),
+            "both spellings name the same directory",
+        );
+    }
+
+    /// Corpus membership answers about the CONFIG-ROOT spelling and no other, and an alias of an
+    /// indexed file is refused rather than resolved.
+    ///
+    /// Deliberate: this predicate mirrors what `walk_target` yields, and the walk yields paths
+    /// under the canonical root. Resolving an alias here would have to canonicalize the path's
+    /// ancestors, which is exactly what the symlink rules above must see un-resolved — a file
+    /// under a symlinked ancestor would come back rebased onto its target and be admitted. The
+    /// caller's fallback for a refusal is to treat a compilation database as governing nothing,
+    /// which declines analysis rather than trusting the wrong flags (#1008).
+    #[cfg(unix)]
+    #[test]
+    fn an_aliased_spelling_of_an_indexed_file_is_refused_not_resolved() {
+        let (scratch, config) = fixture("corpus-aliased-spelling");
         let corpus = ConfiguredCorpus::new(&config);
 
-        assert!(corpus.indexes_file(&dir.join("src/main.rs")), "a bound target's source");
+        assert!(corpus.indexes_file(&config.root.join("src/main.rs")), "the control");
         assert!(
-            !corpus.indexes_file(&dir.join("vendor/dep.rs")),
+            !corpus.indexes_file(&scratch.join("src/main.rs")),
+            "the same file spelled through a symlinked ancestor is not answered for",
+        );
+    }
+
+    #[test]
+    fn a_bound_source_is_in_the_corpus_and_an_unbound_sibling_is_not() {
+        let (_scratch, config) = fixture("corpus-bound-target");
+        let root = config.root.clone();
+        let corpus = ConfiguredCorpus::new(&config);
+
+        assert!(corpus.indexes_file(&root.join("src/main.rs")), "a bound target's source");
+        assert!(
+            !corpus.indexes_file(&root.join("vendor/dep.rs")),
             "a Rust file no target binds is not this checkout's corpus — which is exactly the \
              vendored-database case (#1008)",
         );
@@ -167,19 +219,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_source_reached_through_a_symlink_is_not_in_the_corpus() {
-        let (dir, config) = fixture("corpus-symlinked-source");
-        std::fs::write(dir.join("vendor/real.rs"), "pub fn real() {}\n").unwrap();
-        std::os::unix::fs::symlink(dir.join("vendor/real.rs"), dir.join("src/linked.rs")).unwrap();
-        std::os::unix::fs::symlink(dir.join("vendor"), dir.join("src/linked_dir")).unwrap();
+        let (_scratch, config) = fixture("corpus-symlinked-source");
+        let root = config.root.clone();
+        std::fs::write(root.join("vendor/real.rs"), "pub fn real() {}\n").unwrap();
+        std::os::unix::fs::symlink(root.join("vendor/real.rs"), root.join("src/linked.rs"))
+            .unwrap();
+        std::os::unix::fs::symlink(root.join("vendor"), root.join("src/linked_dir")).unwrap();
         let corpus = ConfiguredCorpus::new(&config);
 
-        assert!(corpus.indexes_file(&dir.join("src/main.rs")), "the control: a real bound source");
+        assert!(corpus.indexes_file(&root.join("src/main.rs")), "the control: a real bound source");
         assert!(
-            !corpus.indexes_file(&dir.join("src/linked.rs")),
+            !corpus.indexes_file(&root.join("src/linked.rs")),
             "a symlinked LEAF under a bound target is not indexed, so it is not in the corpus",
         );
         assert!(
-            !corpus.indexes_file(&dir.join("src/linked_dir/real.rs")),
+            !corpus.indexes_file(&root.join("src/linked_dir/real.rs")),
             "nor is a path crossing a symlinked ancestor",
         );
     }
@@ -190,17 +244,18 @@ mod tests {
     /// entry's flags inferred for the files that do exist.
     #[test]
     fn a_path_that_is_not_a_regular_file_is_not_in_the_corpus() {
-        let (dir, config) = fixture("corpus-not-a-regular-file");
+        let (_scratch, config) = fixture("corpus-not-a-regular-file");
+        let root = config.root.clone();
         let corpus = ConfiguredCorpus::new(&config);
 
-        assert!(corpus.indexes_file(&dir.join("src/main.rs")), "the control: a real bound source");
+        assert!(corpus.indexes_file(&root.join("src/main.rs")), "the control: a real bound source");
         assert!(
-            !corpus.indexes_file(&dir.join("src/deleted.rs")),
+            !corpus.indexes_file(&root.join("src/deleted.rs")),
             "a path the database still names but the checkout no longer has",
         );
-        std::fs::create_dir_all(dir.join("src/looks_like.rs")).unwrap();
+        std::fs::create_dir_all(root.join("src/looks_like.rs")).unwrap();
         assert!(
-            !corpus.indexes_file(&dir.join("src/looks_like.rs")),
+            !corpus.indexes_file(&root.join("src/looks_like.rs")),
             "a DIRECTORY with a source-shaped name is not a translation unit either",
         );
     }
@@ -227,17 +282,22 @@ mod tests {
         let corpus = ConfiguredCorpus::new(&config);
 
         assert!(
-            corpus.indexes_file(&dir.join("src/main.rs")),
+            corpus.indexes_file(&config.root.join("src/main.rs")),
             "the walk starts AT the target, so the target's own link is not a crossing",
         );
     }
 
     #[test]
     fn a_gitignored_source_is_not_in_the_corpus() {
-        let (dir, config) = fixture("corpus-gitignored");
+        let (_scratch, config) = fixture("corpus-gitignored");
         let corpus = ConfiguredCorpus::new(&config);
 
-        assert!(!corpus.indexes_file(&dir.join("generated/out.rs")));
+        assert!(
+            corpus.indexes_file(&config.root.join("src/main.rs")),
+            "the control: without it the gitignore assertion below would also hold for a path the \
+             corpus simply failed to recognize",
+        );
+        assert!(!corpus.indexes_file(&config.root.join("generated/out.rs")));
     }
 
     /// The floor removes `.cache/clangd` SPECIFICALLY, not all of `.cache` — so a checkout whose
@@ -260,14 +320,15 @@ mod tests {
         )
         .unwrap();
         let config = Config::load(dir.join("rag-rat.toml")).unwrap();
+        let root = config.root.clone();
         let corpus = ConfiguredCorpus::new(&config);
 
         assert!(
-            corpus.indexes_file(&dir.join(".cache/generated/gen.rs")),
+            corpus.indexes_file(&root.join(".cache/generated/gen.rs")),
             "a hidden directory bound as a target is an ordinary source location",
         );
         assert!(
-            !corpus.may_hold_indexed_files(&dir.join(".cache/clangd")),
+            !corpus.may_hold_indexed_files(&root.join(".cache/clangd")),
             "clangd's own index never holds this checkout's source",
         );
     }
@@ -292,17 +353,18 @@ mod tests {
         )
         .unwrap();
         let config = Config::load(dir.join("rag-rat.toml")).unwrap();
+        let root = config.root.clone();
         let corpus = ConfiguredCorpus::new(&config);
 
-        assert!(corpus.may_hold_indexed_files(&dir), "the root is on the way to every target");
-        assert!(corpus.may_hold_indexed_files(&dir.join("src")), "a target subtree");
+        assert!(corpus.may_hold_indexed_files(&root), "the root is on the way to every target");
+        assert!(corpus.may_hold_indexed_files(&root.join("src")), "a target subtree");
         assert!(
-            corpus.may_hold_indexed_files(&dir.join("deep")),
+            corpus.may_hold_indexed_files(&root.join("deep")),
             "an ancestor of a target must be entered to reach it",
         );
-        assert!(corpus.may_hold_indexed_files(&dir.join("deep/nested/gen")));
+        assert!(corpus.may_hold_indexed_files(&root.join("deep/nested/gen")));
         assert!(
-            !corpus.may_hold_indexed_files(&dir.join(".cache/big")),
+            !corpus.may_hold_indexed_files(&root.join(".cache/big")),
             "unignored but unreachable by any target — no indexed file can live here",
         );
     }
@@ -320,24 +382,29 @@ mod tests {
         )
         .unwrap();
         let config = Config::load(dir.join("rag-rat.toml")).unwrap();
+        let root = config.root.clone();
         let corpus = ConfiguredCorpus::new(&config);
 
-        assert!(corpus.may_hold_indexed_files(&dir.join("anywhere/deep")));
+        assert!(corpus.may_hold_indexed_files(&root.join("anywhere/deep")));
         assert!(
-            !corpus.may_hold_indexed_files(&dir.join("node_modules")),
+            !corpus.may_hold_indexed_files(&root.join("node_modules")),
             "the floor still applies"
         );
     }
 
     #[test]
     fn a_floored_directory_holds_no_indexed_files() {
-        let (dir, config) = fixture("corpus-floored-dirs");
+        let (_scratch, config) = fixture("corpus-floored-dirs");
+        let root = config.root.clone();
         let corpus = ConfiguredCorpus::new(&config);
 
-        assert!(corpus.may_hold_indexed_files(&dir.join("src")), "an ordinary source directory");
-        assert!(!corpus.may_hold_indexed_files(&dir.join("node_modules")), "vendored dependencies");
+        assert!(corpus.may_hold_indexed_files(&root.join("src")), "an ordinary source directory");
         assert!(
-            !corpus.may_hold_indexed_files(&dir.join("build")),
+            !corpus.may_hold_indexed_files(&root.join("node_modules")),
+            "vendored dependencies"
+        );
+        assert!(
+            !corpus.may_hold_indexed_files(&root.join("build")),
             "a build tree is floored — which is why the MARKER search must not use this \
              predicate: it is where compilation databases live",
         );

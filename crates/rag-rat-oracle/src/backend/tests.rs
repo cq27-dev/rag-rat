@@ -1,15 +1,44 @@
 //! Registry, layout, and warm-up-document behaviour for the live backends.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rag_rat_base::language::Language;
+use rag_rat_base::test_scratch::{self, ScratchDir};
 
 use super::documents::enclosing_project_dir;
 use super::registry::LiveBackend;
 use crate::OracleTool;
 use crate::test_support::every_path_scope as scope;
+
+/// A scratch checkout, paired with the CANONICAL spelling of its root — the only spelling these
+/// tests may build paths from.
+///
+/// [`CheckoutScope::resolve`](super::CheckoutScope::resolve) canonicalizes the root it is handed
+/// (as `Config::load` does), so every path a layout, marker search or warm-up document comes back
+/// as is spelled through that root. Scratch paths reach their directory through a symlinked
+/// ancestor, so the guard's own spelling is a SECOND name for it — comparing against that name is
+/// the divergence macOS (`/var` → `/private/var`) and Windows (8.3 `RUNNER~1`) hand over by
+/// default, and it is why the guard is returned opaque here (#1027).
+fn checkout(tag: &str) -> (ScratchDir, PathBuf) {
+    let scratch = ScratchDir::new(tag);
+    let root = test_scratch::canonical_config_root(scratch.path());
+    (scratch, root)
+}
+
+/// The guard's spelling of a scratch root and the canonical one [`checkout`] hands back must be
+/// two names for ONE directory. Without the divergence every assertion in this module would pass
+/// whether it derived its paths from the canonical root or from the guard, and the root-spelling
+/// class would only redden the cross-platform legs (#1027).
+#[cfg(unix)]
+#[test]
+fn a_scratch_checkouts_canonical_root_diverges_from_the_guards_spelling() {
+    let (guard, root) = checkout("scope-root-spelling");
+    assert_ne!(root, guard.path(), "the guard must reach its root through a symlinked ancestor");
+    assert_eq!(root, guard.path().canonicalize().unwrap(), "both spellings name one directory");
+    assert_eq!(scope(&root).root(), root, "and the scope resolves to the canonical one");
+}
 
 /// A compilation database naming `files`, written at `dir/relative`.
 fn write_database(dir: &Path, relative: &str, files: &[&str]) {
@@ -37,7 +66,7 @@ fn write_database(dir: &Path, relative: &str, files: &[&str]) {
 #[test]
 fn a_database_that_governs_nothing_is_reported_apart_from_the_other_reasons() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-governs-nothing-reported");
+    let (_dir_guard, dir) = checkout("clangd-governs-nothing-reported");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::create_dir_all(dir.join("third_party")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
@@ -69,7 +98,7 @@ fn a_database_that_governs_nothing_is_reported_apart_from_the_other_reasons() {
 /// compilation database that none was found, and sends them to generate one.
 #[test]
 fn a_checkout_whose_database_governs_nothing_is_blocked_with_the_reason() {
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-blocked-governs-nothing");
+    let (_dir_guard, dir) = checkout("clangd-blocked-governs-nothing");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::create_dir_all(dir.join("third_party")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
@@ -98,7 +127,7 @@ fn a_checkout_whose_database_governs_nothing_is_blocked_with_the_reason() {
 #[test]
 fn an_empty_file_string_is_known_non_governance_not_an_unreadable_path() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-empty-file-string");
+    let (_dir_guard, dir) = checkout("clangd-empty-file-string");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
     std::fs::write(
@@ -131,7 +160,7 @@ fn an_empty_file_string_is_known_non_governance_not_an_unreadable_path() {
 #[test]
 fn a_database_written_through_a_symlinked_root_still_governs_the_checkout() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-aliased-root");
+    let (_dir_guard, dir) = checkout("clangd-aliased-root");
     let real = dir.join("real");
     std::fs::create_dir_all(real.join("src")).unwrap();
     std::fs::write(real.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
@@ -161,7 +190,7 @@ fn a_database_written_through_a_symlinked_root_still_governs_the_checkout() {
 #[test]
 fn an_ancestor_database_that_governs_nothing_does_not_configure_a_file() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-ancestor-governs-nothing");
+    let (_dir_guard, dir) = checkout("clangd-ancestor-governs-nothing");
     let checkout = dir.join("repo");
     std::fs::create_dir_all(checkout.join("sub/src")).unwrap();
     std::fs::create_dir_all(checkout.join("other")).unwrap();
@@ -190,7 +219,7 @@ fn an_ancestor_database_that_governs_nothing_does_not_configure_a_file() {
 #[test]
 fn an_entry_that_configures_nothing_does_not_qualify_the_database() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-degenerate-indexed-entry");
+    let (_dir_guard, dir) = checkout("clangd-degenerate-indexed-entry");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::create_dir_all(dir.join("third_party")).unwrap();
     std::fs::create_dir_all(dir.join("build")).unwrap();
@@ -222,7 +251,7 @@ fn an_entry_that_configures_nothing_does_not_qualify_the_database() {
 #[test]
 fn a_database_naming_one_indexed_file_among_vendored_ones_is_pinned() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-mixed-database");
+    let (_dir_guard, dir) = checkout("clangd-mixed-database");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::create_dir_all(dir.join("third_party/foo")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
@@ -247,7 +276,7 @@ fn a_database_naming_one_indexed_file_among_vendored_ones_is_pinned() {
 #[test]
 fn an_absolute_path_database_governs_only_when_its_paths_land_in_this_checkout() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-absolute-paths");
+    let (_dir_guard, dir) = checkout("clangd-absolute-paths");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
     // `write_database` already emits absolute `file` paths rooted at the fixture.
@@ -282,7 +311,7 @@ fn an_absolute_path_database_governs_only_when_its_paths_land_in_this_checkout()
 #[test]
 fn a_symlinked_build_directory_inside_the_checkout_is_followed() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-symlink-sibling");
+    let (_dir_guard, dir) = checkout("clangd-symlink-sibling");
     let checkout = dir.join("repo");
     std::fs::create_dir_all(checkout.join("sub/src")).unwrap();
     std::fs::create_dir_all(checkout.join("out")).unwrap();
@@ -308,7 +337,7 @@ fn a_symlinked_build_directory_inside_the_checkout_is_followed() {
 #[test]
 fn a_non_git_checkout_behaves_exactly_as_before() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-non-git");
+    let (_dir_guard, dir) = checkout("clangd-non-git");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
     write_database(&dir, "compile_commands.json", &["src/main.c"]);
@@ -331,7 +360,7 @@ fn a_non_git_checkout_behaves_exactly_as_before() {
 #[test]
 fn sources_under_a_hidden_directory_can_warm_the_session() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-hidden-sources");
+    let (_dir_guard, dir) = checkout("clangd-hidden-sources");
     std::fs::create_dir_all(dir.join(".cache/generated")).unwrap();
     std::fs::write(dir.join(".cache/generated/main.c"), "int main(void) { return 0; }\n").unwrap();
     write_database(&dir, "build/compile_commands.json", &[".cache/generated/main.c"]);
@@ -352,7 +381,7 @@ fn sources_under_a_hidden_directory_can_warm_the_session() {
 #[test]
 fn a_document_the_checkout_does_not_index_is_never_warmed_on() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-unindexed-documents");
+    let (_dir_guard, dir) = checkout("clangd-unindexed-documents");
     std::fs::create_dir_all(dir.join(".cache/clangd")).unwrap();
     std::fs::create_dir_all(dir.join("src")).unwrap();
     // Source-shaped files inside a machine-written tree, and one real source.
@@ -378,7 +407,7 @@ fn a_document_the_checkout_does_not_index_is_never_warmed_on() {
 #[test]
 fn a_database_governing_nothing_indexed_is_not_pinned() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-governs-nothing");
+    let (_dir_guard, dir) = checkout("clangd-governs-nothing");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::create_dir_all(dir.join("third_party/foo")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
@@ -406,7 +435,7 @@ fn a_database_governing_nothing_indexed_is_not_pinned() {
 #[test]
 fn a_build_directory_database_governing_indexed_sources_is_pinned() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-build-dir-governs");
+    let (_dir_guard, dir) = checkout("clangd-build-dir-governs");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
     write_database(&dir, "build/compile_commands.json", &["src/main.c"]);
@@ -441,7 +470,7 @@ fn a_build_directory_database_governing_indexed_sources_is_pinned() {
 #[test]
 fn a_database_above_the_index_root_is_found_by_the_ancestor_leg() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-db-above-index-root");
+    let (_dir_guard, dir) = checkout("clangd-db-above-index-root");
     let checkout = dir.join("repo");
     std::fs::create_dir_all(checkout.join("sub/src")).unwrap();
     rag_rat_base::test_git::run(&checkout, &["init"]);
@@ -467,7 +496,7 @@ fn a_database_above_the_index_root_is_found_by_the_ancestor_leg() {
 #[test]
 fn a_file_resolves_through_a_database_above_the_index_root() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-resolve-above-root");
+    let (_dir_guard, dir) = checkout("clangd-resolve-above-root");
     let checkout = dir.join("repo");
     std::fs::create_dir_all(checkout.join("sub/src")).unwrap();
     std::fs::create_dir_all(checkout.join("sub/other")).unwrap();
@@ -498,7 +527,7 @@ fn a_file_resolves_through_a_database_above_the_index_root() {
 /// for a checkout it could have served (#1008).
 #[test]
 fn the_ceiling_is_the_enclosing_checkout_not_the_index_root() {
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("scope-ceiling-subdir");
+    let (_dir_guard, dir) = checkout("scope-ceiling-subdir");
     let checkout = dir.join("repo");
     std::fs::create_dir_all(checkout.join("sub")).unwrap();
     rag_rat_base::test_git::run(&checkout, &["init"]);
@@ -514,7 +543,7 @@ fn the_ceiling_is_the_enclosing_checkout_not_the_index_root() {
 /// would let a walk wander into unrelated trees.
 #[test]
 fn a_root_outside_a_git_checkout_is_its_own_ceiling() {
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("scope-ceiling-no-git");
+    let (_dir_guard, dir) = checkout("scope-ceiling-no-git");
     std::fs::create_dir_all(dir.join("plain")).unwrap();
     let root = dir.join("plain");
 
@@ -529,7 +558,7 @@ fn a_root_outside_a_git_checkout_is_its_own_ceiling() {
 /// per-checkout live sessions (#1010) will need, pinned now so it cannot regress before then.
 #[test]
 fn a_linked_worktree_is_its_own_ceiling_not_the_main_checkout() {
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("scope-ceiling-linked");
+    let (_dir_guard, dir) = checkout("scope-ceiling-linked");
     let main = dir.join("main");
     std::fs::create_dir_all(&main).unwrap();
     rag_rat_base::test_git::run(&main, &["init"]);
@@ -646,7 +675,7 @@ fn enclosing_tsconfig_walks_up_to_the_nearest_project_and_stops_at_the_root() {
     // This is how tsserver assigns a file to a project, and it decides whether opening the
     // file produces an observable load. A file under no project opens as an inferred project
     // SILENTLY, so warming on it teaches the session nothing.
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("ts-lsp-enclosing");
+    let (_dir_guard, dir) = checkout("ts-lsp-enclosing");
     std::fs::create_dir_all(dir.join("packages/app/src")).unwrap();
     std::fs::create_dir_all(dir.join("scripts")).unwrap();
     std::fs::write(dir.join("packages/app/tsconfig.json"), "{}").unwrap();
@@ -668,7 +697,7 @@ fn a_warmup_document_is_found_at_any_depth_and_only_inside_a_project() {
     // A project can sit arbitrarily deep in a monorepo; a depth limit would silently disable
     // those checkouts entirely, which is worse than the walk it saves.
     let ts = LiveBackend::for_tool(OracleTool::TsLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("ts-lsp-warmup-doc");
+    let (_dir_guard, dir) = checkout("ts-lsp-warmup-doc");
     std::fs::create_dir_all(dir.join("scripts")).unwrap();
     std::fs::write(dir.join("scripts/tool.ts"), "export function x() {}\n").unwrap();
     assert_eq!(
@@ -697,7 +726,7 @@ fn the_warmup_search_refuses_a_document_the_checkout_does_not_index() {
     // nothing. That is the point of the change — the indexer's own answer decides, so the warm-up
     // search cannot disagree with what the pass will actually resolve.
     let ts = LiveBackend::for_tool(OracleTool::TsLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("ts-lsp-vendored-warmup");
+    let (_dir_guard, dir) = checkout("ts-lsp-vendored-warmup");
     write_project(&dir, "node_modules/some-dep");
     write_project(&dir, ".cache/tooling");
     let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
@@ -723,7 +752,7 @@ fn a_server_status_backend_needs_no_warmup_document_and_is_never_blocked_on_one(
     // rust-analyzer reports quiescence for any checkout, so the whole notion is TS-specific
     // and must not leak into the other backend's gating.
     let rust = LiveBackend::for_tool(OracleTool::RaLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("ra-lsp-warmup-doc");
+    let (_dir_guard, dir) = checkout("ra-lsp-warmup-doc");
     assert_eq!(rust.warmup_document(&scope(&dir), &rust.resolve_layout(&scope(&dir))), None);
     assert!(
         rust.checkout_can_signal_readiness(&scope(&dir), &rust.resolve_layout(&scope(&dir))),
@@ -767,7 +796,7 @@ fn clangd_opens_each_dialect_under_its_own_language_id() {
 fn a_backends_project_marker_is_the_file_its_prerequisite_looks_for() {
     // The warm-up search and the prerequisite gate must ask the SAME question, or a checkout
     // could pass the gate and still have nothing to warm on (or vice versa).
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-marker");
+    let (_dir_guard, dir) = checkout("clangd-marker");
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
     assert_eq!(clangd.project_marker.map(|m| m.file), Some("compile_commands.json"));
     assert!(
@@ -814,7 +843,7 @@ fn an_out_of_tree_compilation_database_still_counts_as_a_project() {
     // there just fine, so requiring the marker to be an ancestor would report an ordinary
     // CMake project as Blocked.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-out-of-tree");
+    let (_dir_guard, dir) = checkout("clangd-out-of-tree");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::create_dir_all(dir.join("build")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
@@ -849,7 +878,7 @@ fn clangd_is_told_where_a_compilation_database_it_could_not_find_lives() {
     // resolves calls to header declarations; with `--compile-commands-dir` it resolves across
     // translation units. Accepting the checkout is only honest because we pass the directory.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-compdb-dir");
+    let (_dir_guard, dir) = checkout("clangd-compdb-dir");
     std::fs::create_dir_all(dir.join("out")).unwrap();
     std::fs::write(dir.join("out/compile_commands.json"), COMPDB).unwrap();
 
@@ -868,7 +897,7 @@ fn a_file_whose_database_the_session_cannot_reach_is_not_resolvable() {
     // measured, that resolves a cross-unit call to the callee's HEADER DECLARATION. The live
     // pass must skip such files rather than persist the wrong answer.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-unreachable-db");
+    let (_dir_guard, dir) = checkout("clangd-unreachable-db");
     // `proj-a` keeps its database where clangd looks (`build/`); `proj-b` does not.
     std::fs::create_dir_all(dir.join("proj-a/build")).unwrap();
     std::fs::create_dir_all(dir.join("proj-b/out")).unwrap();
@@ -889,7 +918,7 @@ fn a_file_whose_database_the_session_cannot_reach_is_not_resolvable() {
 
     // With a SINGLE database the session is pointed at it, so every file is configured —
     // including one whose database is nowhere near it.
-    let single = rag_rat_base::test_scratch::ScratchDir::new("clangd-single-db");
+    let (_single_guard, single) = checkout("clangd-single-db");
     std::fs::create_dir_all(single.join("out")).unwrap();
     std::fs::create_dir_all(single.join("src")).unwrap();
     std::fs::write(single.join("out/compile_commands.json"), COMPDB).unwrap();
@@ -907,7 +936,7 @@ fn a_re_resolved_layout_reports_when_the_pinned_database_changed() {
     // the database leaves the server pointed at a directory that no longer exists, and gaining
     // one leaves the new project's files analysed with the old project's flags.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-relayout");
+    let (_dir_guard, dir) = checkout("clangd-relayout");
     std::fs::create_dir_all(dir.join("build")).unwrap();
     std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
     let pinned = clangd.resolve_layout(&scope(&dir));
@@ -942,7 +971,7 @@ fn a_nearer_empty_database_does_not_make_a_file_configured() {
     // clangd picks up the NEAREST database — if that one is empty it configures nothing, and
     // the file must not count as resolvable merely because some other project has a real one.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-nearer-empty");
+    let (_dir_guard, dir) = checkout("clangd-nearer-empty");
     // THREE projects, so the checkout stays multi-database after one is hollowed out —
     // otherwise it would collapse to the single-database case, where the session pins the one
     // remaining database and every file is configured by it.
@@ -974,7 +1003,7 @@ fn a_databases_usability_is_read_once_per_layout() {
     // with the layout held, replacing the database with an unusable one cannot change the
     // answer, because the file is not read a second time.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-usability-memo");
+    let (_dir_guard, dir) = checkout("clangd-usability-memo");
     // Two databases, so the per-file discovery path is what decides — a single-database
     // checkout pins instead and never asks about a file's own database at all.
     for project in ["proj-a", "proj-b"] {
@@ -1007,7 +1036,7 @@ fn a_broken_second_database_still_disqualifies_global_pinning() {
     // resolve by stopping at their own nearer database. Both are wrong for those files, but
     // only pinning also makes them look configured.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-broken-second-db");
+    let (_dir_guard, dir) = checkout("clangd-broken-second-db");
     std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
     std::fs::create_dir_all(dir.join("sub/build")).unwrap();
     std::fs::write(dir.join("sub/build/compile_commands.json"), "[]").unwrap();
@@ -1038,7 +1067,7 @@ fn an_entry_missing_a_required_field_is_not_a_usable_database() {
     // clangd rejects an entry lacking `directory` or a compiler invocation and falls back to
     // generic flags, so a well-formed entry naming only a file is not a usable database.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-entry-fields");
+    let (_dir_guard, dir) = checkout("clangd-entry-fields");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
     let incomplete = [
@@ -1075,7 +1104,7 @@ fn the_nearest_database_decides_even_when_it_is_unusable() {
     // unusable nearer database would declare the file configured by one clangd never
     // consults, and the pass would trust a fallback-flags answer.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-nearest-wins");
+    let (_dir_guard, dir) = checkout("clangd-nearest-wins");
     // A usable database at the root, plus a second project so the layout stays multi-database
     // (single-database checkouts pin instead of using per-file discovery).
     std::fs::write(dir.join("compile_commands.json"), COMPDB).unwrap();
@@ -1105,7 +1134,7 @@ fn a_database_is_parsed_not_pattern_matched() {
     // entries are larger than the window, and accepts a hollow one that merely contains the
     // token inside an unrelated string. Parsing the file settles both.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-db-shape");
+    let (_dir_guard, dir) = checkout("clangd-db-shape");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
     // A database whose text merely MENTIONS the key names no translation unit.
@@ -1148,7 +1177,7 @@ fn one_malformed_entry_anywhere_makes_the_whole_database_unusable() {
     // first entry would call that database usable, pin the session to it, and persist
     // fallback-flag answers — which resolve a cross-unit call to the callee's header declaration.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-later-entry");
+    let (_dir_guard, dir) = checkout("clangd-later-entry");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
     const GOOD: &str = r#"{"directory":"/x","file":"/x/a.c","command":"cc -c a.c"}"#;
@@ -1197,7 +1226,7 @@ fn an_entrys_shape_is_judged_the_way_clangd_judges_it() {
     // `--compile-commands-dir`; `Compile command from CDB` means loaded, `Failed to load
     // compilation database` / `Generic fallback command` means the whole file was discarded.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-entry-types");
+    let (_dir_guard, dir) = checkout("clangd-entry-types");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
 
@@ -1288,7 +1317,7 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
     // an order of magnitude above that, so it documents the cost without failing on a loaded
     // machine; only a change that made validation super-linear would trip it.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-large-db");
+    let (_dir_guard, dir) = checkout("clangd-large-db");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
 
@@ -1348,7 +1377,7 @@ fn a_symlinked_build_directory_is_still_searched() {
     // `build -> cmake-build-debug` is an ordinary layout, and the database is reachable
     // through the checkout path — but a symlink is not a directory to `DirEntry::file_type`.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-symlinked-build");
+    let (_dir_guard, dir) = checkout("clangd-symlinked-build");
     std::fs::create_dir_all(dir.join("cmake-build-debug")).unwrap();
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("cmake-build-debug/compile_commands.json"), COMPDB).unwrap();
@@ -1372,7 +1401,7 @@ fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
     // `--compile-commands-dir` is dropped, and a source outside clangd's own ancestor/`build/`
     // search stops being resolvable even though the checkout is perfectly ordinary.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-aliased-db");
+    let (_dir_guard, dir) = checkout("clangd-aliased-db");
     std::fs::create_dir_all(dir.join("out")).unwrap();
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("out/compile_commands.json"), COMPDB).unwrap();
@@ -1427,7 +1456,7 @@ fn a_nested_checkout_makes_the_layout_unprovable_rather_than_simply_smaller() {
     // pinning is declined. clangd's own per-file lookup takes over, which is correct by
     // construction.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-nested-checkout");
+    let (_dir_guard, dir) = checkout("clangd-nested-checkout");
     std::fs::create_dir_all(dir.join("build")).unwrap();
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
@@ -1474,7 +1503,7 @@ fn a_scan_that_could_not_look_everywhere_never_reports_a_sole_database() {
     // sources, and pinning would then hand them another project's flags. A truncated scan therefore
     // yields no sole database, whatever it happened to find.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-deep-tree");
+    let (_dir_guard, dir) = checkout("clangd-deep-tree");
     std::fs::create_dir_all(dir.join("build")).unwrap();
     std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
 
@@ -1506,7 +1535,7 @@ fn a_scan_that_could_not_look_everywhere_never_reports_a_sole_database() {
 #[test]
 fn the_ancestor_leg_never_leaves_the_checkout() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-climb-stops-at-checkout");
+    let (_dir_guard, dir) = checkout("clangd-climb-stops-at-checkout");
     let checkout = dir.join("repo");
     std::fs::create_dir_all(checkout.join("src")).unwrap();
     rag_rat_base::test_git::run(&checkout, &["init"]);
@@ -1538,7 +1567,7 @@ fn the_ancestor_leg_never_leaves_the_checkout() {
 #[test]
 fn a_real_linked_worktree_inside_the_checkout_is_not_this_checkouts_project() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-real-linked-worktree");
+    let (_dir_guard, dir) = checkout("clangd-real-linked-worktree");
     let main = dir.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     rag_rat_base::test_git::run(&main, &["init"]);
@@ -1597,7 +1626,7 @@ fn a_real_linked_worktree_inside_the_checkout_is_not_this_checkouts_project() {
 #[test]
 fn completeness_covers_the_ancestor_chain_and_ignores_sibling_subtrees() {
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-completeness-scope");
+    let (_dir_guard, dir) = checkout("clangd-completeness-scope");
     let checkout = dir.join("repo");
     std::fs::create_dir_all(checkout.join("sub/src")).unwrap();
     std::fs::create_dir_all(checkout.join("elsewhere/deep")).unwrap();
@@ -1636,7 +1665,7 @@ fn the_invocation_clangd_selects_is_the_one_that_must_configure_the_file() {
     // own would call that entry usable and let the checkout be pinned to a database that configures
     // nothing.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-invocation-choice");
+    let (_dir_guard, dir) = checkout("clangd-invocation-choice");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
 
@@ -1679,7 +1708,7 @@ fn a_key_outside_the_modelled_format_is_uncertainty_rather_than_acceptance() {
     // pinning and decline resolving through it, not enough to declare the checkout unwarmable on
     // the strength of a list that could be out of date.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-unmodelled-key");
+    let (_dir_guard, dir) = checkout("clangd-unmodelled-key");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
     std::fs::write(
@@ -1730,7 +1759,7 @@ fn a_database_this_crate_cannot_parse_is_not_trusted_but_does_not_block_the_back
     // trailing commas, and block syntax that `serde_json` refuses (#1016). Such a file is therefore
     // UNKNOWN rather than bad: it must not be pinned or resolved through, and it must not block.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-unreadable-db");
+    let (_dir_guard, dir) = checkout("clangd-unreadable-db");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
     // Valid YAML that clangd loads and `serde_json` cannot parse.
@@ -1768,7 +1797,7 @@ fn a_database_clangd_can_read_is_not_refused_over_a_bom_or_trailing_bytes() {
     // evidence — the expensive direction to be wrong in. A BOM is what a generator on Windows can
     // emit; trailing bytes are what a hand-edited file can end up with.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-db-syntax");
+    let (_dir_guard, dir) = checkout("clangd-db-syntax");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
 
@@ -1806,17 +1835,17 @@ fn the_marker_search_does_not_follow_a_symlink_out_of_the_checkout() {
     // repository write lock, and — worse — counts a database found out there as this checkout's,
     // which flips the pinning decision for files that have nothing to do with it.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let outside = rag_rat_base::test_scratch::ScratchDir::new("clangd-outside-tree");
+    let (_outside_guard, outside) = checkout("clangd-outside-tree");
     std::fs::create_dir_all(outside.join("vendor/build")).unwrap();
     std::fs::write(outside.join("vendor/build/compile_commands.json"), COMPDB).unwrap();
 
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-escaping-link");
+    let (_dir_guard, dir) = checkout("clangd-escaping-link");
     std::fs::create_dir_all(dir.join("build")).unwrap();
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("build/compile_commands.json"), COMPDB).unwrap();
     std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
     // The escape: a link to a tree that holds its own database.
-    std::os::unix::fs::symlink(outside.path(), dir.join("sdk")).unwrap();
+    std::os::unix::fs::symlink(outside.as_path(), dir.join("sdk")).unwrap();
 
     let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
@@ -1844,9 +1873,9 @@ fn a_symlink_cycle_cannot_hang_the_marker_search() {
     // Following directory symlinks is what makes the case above work, and it is also what
     // makes a cycle possible. The search must terminate rather than recurse forever.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-symlink-cycle");
+    let (_dir_guard, dir) = checkout("clangd-symlink-cycle");
     std::fs::create_dir_all(dir.join("nested")).unwrap();
-    std::os::unix::fs::symlink(dir.path(), dir.join("nested/loop")).unwrap();
+    std::os::unix::fs::symlink(dir.as_path(), dir.join("nested/loop")).unwrap();
     // Terminates; the checkout has no database, so it reports none.
     assert!(clangd.resolve_layout(&scope(&dir)).sole_marker_dir().is_none());
 }
@@ -1864,13 +1893,13 @@ fn two_symlink_cycles_cannot_make_the_marker_search_explode() {
     // No database anywhere, deliberately: the search stops at two sites, and a database
     // reachable through the links would supply the second one and mask the explosion.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-two-symlink-cycles");
-    std::os::unix::fs::symlink(dir.path(), dir.join("loop-a")).unwrap();
-    std::os::unix::fs::symlink(dir.path(), dir.join("loop-b")).unwrap();
+    let (_dir_guard, dir) = checkout("clangd-two-symlink-cycles");
+    std::os::unix::fs::symlink(dir.as_path(), dir.join("loop-a")).unwrap();
+    std::os::unix::fs::symlink(dir.as_path(), dir.join("loop-b")).unwrap();
 
     // Run the search off-thread with a bounded wait, so a regression fails this test in
     // seconds instead of hanging the suite for as long as CI allows.
-    let root = dir.path().to_path_buf();
+    let root = dir.as_path().to_path_buf();
     let (done, resolved) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let pinned = clangd.resolve_layout(&scope(&root)).sole_marker_dir().map(Path::to_path_buf);
@@ -1887,7 +1916,7 @@ fn a_hidden_build_under_dot_cache_is_still_a_database() {
     // Only clangd's OWN index is off-limits under `.cache` — excluding the whole subtree would
     // contradict supporting hidden build directories at all.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-dot-cache-build");
+    let (_dir_guard, dir) = checkout("clangd-dot-cache-build");
     std::fs::create_dir_all(dir.join(".cache/cmake-build")).unwrap();
     std::fs::create_dir_all(dir.join(".cache/clangd/index")).unwrap();
     std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -1910,7 +1939,7 @@ fn an_empty_compilation_database_is_not_a_project() {
     // clangd emits no readiness cycle for it at all. Accepting it would report the backend
     // runnable while it could only ever sit in `Warming`.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-empty-db");
+    let (_dir_guard, dir) = checkout("clangd-empty-db");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("src/main.c"), "int main(void){return 0;}\n").unwrap();
     std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
@@ -1930,7 +1959,7 @@ fn a_hidden_build_directory_still_counts_as_a_compilation_database() {
     // real as one in `build/`. The DOCUMENT search still skips dot-directories — those hold
     // tooling state, not this checkout's sources — so the two searches differ on purpose.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-hidden-build");
+    let (_dir_guard, dir) = checkout("clangd-hidden-build");
     std::fs::create_dir_all(dir.join(".build")).unwrap();
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join(".build/compile_commands.json"), COMPDB).unwrap();
@@ -1957,7 +1986,7 @@ fn a_vendored_or_vcs_database_is_never_mistaken_for_the_checkouts_own() {
     // single-database checkout into the multi-database mode and drop the flag that makes it
     // resolvable.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-vendored-db");
+    let (_dir_guard, dir) = checkout("clangd-vendored-db");
     std::fs::create_dir_all(dir.join("node_modules/dep")).unwrap();
     std::fs::create_dir_all(dir.join(".git/weird")).unwrap();
     std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -1983,7 +2012,7 @@ fn several_compilation_databases_are_left_to_the_servers_own_per_file_lookup() {
     // unambiguous, and otherwise clangd's own per-file lookup (ancestors and their `build/`)
     // decides, which is correct by construction.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-multi-db");
+    let (_dir_guard, dir) = checkout("clangd-multi-db");
     for project in ["proj-a", "proj-b"] {
         std::fs::create_dir_all(dir.join(project).join("build")).unwrap();
         std::fs::write(dir.join(project).join("build/compile_commands.json"), COMPDB).unwrap();
@@ -2018,7 +2047,7 @@ fn several_compilation_databases_are_left_to_the_servers_own_per_file_lookup() {
 fn a_backend_with_no_checkout_scoped_marker_gets_only_its_static_argv() {
     // The dynamic argument is clangd-shaped; the other backends must not acquire a stray flag
     // their server would reject.
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("static-argv");
+    let (_dir_guard, dir) = checkout("static-argv");
     std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
     let ts = LiveBackend::for_tool(OracleTool::TsLsp).unwrap();
     assert_eq!(ts.spawn_args(&["--stdio"], &ts.resolve_layout(&scope(&dir))), vec![
@@ -2027,7 +2056,7 @@ fn a_backend_with_no_checkout_scoped_marker_gets_only_its_static_argv() {
     let rust = LiveBackend::for_tool(OracleTool::RaLsp).unwrap();
     assert!(rust.spawn_args(&[], &rust.resolve_layout(&scope(&dir))).is_empty());
     // And with no database anywhere, clangd gets no directory to point at either.
-    let empty = rag_rat_base::test_scratch::ScratchDir::new("static-argv-empty");
+    let (_empty_guard, empty) = checkout("static-argv-empty");
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
     assert_eq!(
         clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&scope(&empty))),
@@ -2041,7 +2070,7 @@ fn a_typescript_project_still_has_to_enclose_its_documents() {
     // of the sources governs nothing, because tsserver resolves a file's project by walking UP
     // from the file.
     let ts = LiveBackend::for_tool(OracleTool::TsLsp).unwrap();
-    let dir = rag_rat_base::test_scratch::ScratchDir::new("ts-sibling-config");
+    let (_dir_guard, dir) = checkout("ts-sibling-config");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::create_dir_all(dir.join("config")).unwrap();
     std::fs::write(dir.join("src/main.ts"), "export const x = 1;\n").unwrap();
