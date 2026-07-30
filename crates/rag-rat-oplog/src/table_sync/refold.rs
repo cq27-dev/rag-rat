@@ -7,6 +7,14 @@
 //! the outstanding set. Without the replay the payload is unrecoverable, because redelivery
 //! short-circuits on `entry_exists` and never reconsiders the op.
 //!
+//! An entry can also be outstanding for a reason that has nothing to do with understanding: the row
+//! it would land on holds LOCAL WORK no peer has seen, so replaying it would destroy a change
+//! before anything had a chance to author it. The two families are marked apart
+//! ([`PendingReason::is_deferral`]) because they are redeemed by different events, and therefore
+//! need different retry triggers: a version gap clears when the binary widens, which the projector
+//! version records; a deferral clears when the ROW changes, which nothing stamps and no version can
+//! express. See [`refold_owed`].
+//!
 //! Two properties keep the replay boring, and both are deliberate:
 //!
 //! - **It goes through the unmodified [`super::apply::apply_row_op`] gates**, with each entry's
@@ -16,11 +24,15 @@
 //!   needs no winner lookup. A bypass would have to re-derive all of that, and a bypass that skips
 //!   the clock comparison is one refactor away from skipping the tombstone comparison too.
 //! - **It is bounded by the pending set**, not the log: the steady state (nothing pending) costs
-//!   one indexed probe, so the cost is proportional to what is actually outstanding.
+//!   one indexed probe, so the cost is proportional to what is actually outstanding. A pass owed
+//!   ONLY by a deferral narrows further, to the deferral family alone — that trigger fires at every
+//!   open for as long as the row stays in the way, so it must not drag the rest along.
 //!
 //! Version discipline mirrors the `/3` content projector: [`refold_stale_table_sync_projections`]
-//! is the ONLY writer of the stamp, and a store stamped by a NEWER projector is refused rather than
-//! folded down by an older binary.
+//! is the ONLY writer of the stamps, and a store stamped by a NEWER projector is refused rather
+//! than folded down by an older binary. Two versions are stamped, answering different questions —
+//! [`TABLE_SYNC_PROJECTOR_VERSION`] for what this binary can PROJECT, and
+//! [`TABLE_SYNC_DEFERRAL_VOCABULARY`] for how it CLASSIFIES what it could not.
 
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -28,7 +40,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use super::apply::{self, ApplyOutcome};
 use super::registry::TableSpec;
 use super::row_op::{self, DecodedRowOp};
-use super::store::{self, PendingEntry, PendingReason};
+use super::store::{self, PendingEntry, PendingReason, Worklist};
 use crate::entry;
 use crate::op::OpMeta;
 
@@ -48,6 +60,25 @@ use crate::op::OpMeta;
 pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 1;
 
 const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
+
+/// How this binary CLASSIFIES a retained entry — the [`PendingReason`] vocabulary and, through
+/// [`PendingReason::is_deferral`], which retry trigger each reason answers to.
+///
+/// BUMP THIS whenever a reason changes families, or a new reason lands in a family an existing
+/// state used to be recorded under. Deliberately separate from
+/// [`TABLE_SYNC_PROJECTOR_VERSION`], which answers a different question — what this binary can
+/// PROJECT — and is mechanically pinned to the registry, so it cannot be moved for a
+/// classification change and would say the wrong thing if it were.
+///
+/// It exists because the classification is recorded DURABLY, and a mark left by a binary with an
+/// older vocabulary is indistinguishable from one this binary would write. #1005 is the worked
+/// example: before it, an entry blocked behind local row state kept whatever reason it was parked
+/// with at ingest, so after the upgrade it reads as a version gap at the current version — no
+/// trigger owns it, and it is stranded exactly the way #1005 exists to prevent. One full pass
+/// re-derives every pending entry's reason under the current vocabulary, which is all it takes.
+const TABLE_SYNC_DEFERRAL_VOCABULARY: i64 = 1;
+
+const TABLE_SYNC_DEFERRAL_VOCABULARY_KEY: &str = "table_sync_deferral_vocabulary";
 
 /// Replay every pending entry against this binary's registry, then stamp the projector version.
 /// Returns whether a refold ran.
@@ -70,23 +101,53 @@ pub(crate) fn refold_stale_projections_against(
     if !projection_state_present(conn)? {
         return Ok(false);
     }
-    if !refold_owed(conn)? {
+    let owed = refold_owed(conn)?;
+    if !owed.any() {
         return Ok(false);
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // `refold_owed` already excludes a newer stamp; re-assert inside the write txn so this stays
     // honest if that predicate ever changes.
     assert_projector_not_newer(&tx)?;
-    for pending in store::pending_entries(&tx)? {
+    for pending in store::pending_entries(&tx, owed.worklist())? {
         replay_pending_entry(&tx, registry, &pending)?;
     }
-    stamp_projector_version(&tx)?;
+    stamp_fold_versions(&tx)?;
     tx.commit()?;
     Ok(true)
 }
 
-/// Whether a refold is owed. TWO independent triggers, because the store-global stamp alone is not
-/// a complete record of what has been evaluated:
+/// What a refold pass is owed, and therefore how much of the pending set it has to replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RefoldOwed {
+    /// Triggers 1 or 2 — this binary may understand more than whatever last evaluated the pending
+    /// set, so every entry's outcome is back in question.
+    widened: bool,
+    /// Trigger 3 — at least one entry is blocked behind local row state.
+    deferrals: bool,
+}
+
+impl RefoldOwed {
+    const NOTHING: Self = Self { widened: false, deferrals: false };
+
+    fn any(self) -> bool {
+        self.widened || self.deferrals
+    }
+
+    /// Narrow the pass to the deferral family when a deferral is the ONLY thing owing it.
+    ///
+    /// Safe because a version gap's outcome is decided on the PAYLOAD ALONE — the version gate and
+    /// the projection, neither of which reads row state — so under an unchanged binary replaying
+    /// one is guaranteed to re-park it at the same reason. And the stamp stays honest: "trigger 3
+    /// alone" means the stamp and every pending entry are already AT this projector version, so
+    /// re-stamping claims nothing that was not already claimed.
+    fn worklist(self) -> Worklist {
+        if self.widened { Worklist::All } else { Worklist::Deferrals }
+    }
+}
+
+/// Whether a refold is owed. THREE independent triggers, because neither the store-global stamp nor
+/// the per-entry one is a complete record of what could have changed:
 ///
 /// 1. **The stamp is behind** — the ordinary upgrade: this binary understands more than whatever
 ///    last folded the store.
@@ -96,21 +157,40 @@ pub(crate) fn refold_stale_projections_against(
 ///    older one then ingests and parks an entry it cannot project, marking it with ITS version. On
 ///    the stamp alone the newer binary would short-circuit and never replay an entry it fully
 ///    understands — and redelivery cannot rescue it, because that short-circuits on `entry_exists`.
+/// 3. **Some entry is deferred behind LOCAL ROW STATE** ([`PendingReason::is_deferral`]), at any
+///    version. Versions cannot carry this trigger: such an entry is redeemed by the row changing —
+///    the unsent edit gets authored, the unreadable cell repaired — which no stamp records and no
+///    binary upgrade implies. Parked by an OLDER binary it is already covered by trigger 2; parked
+///    by THIS one it carries the current version, and without this trigger nothing would ever look
+///    at it again (#1005). Its cost is bounded by narrowing the pass — see
+///    [`RefoldOwed::worklist`].
 ///
-/// A newer stamp is never a trigger: an older binary must not re-park what a newer one understood.
-fn refold_owed(conn: &Connection) -> anyhow::Result<bool> {
+/// Trigger 1 covers the CLASSIFICATION vocabulary as well as the projector version, because a mark
+/// written under an older vocabulary is not re-derivable from the mark itself
+/// ([`TABLE_SYNC_DEFERRAL_VOCABULARY`]). It owes a FULL pass, not a narrowed one: the entries
+/// needing reclassification are exactly the ones the deferral probe cannot yet recognize.
+///
+/// A newer stamp is never a trigger, for any of the three: an older binary must not re-park what a
+/// newer one understood, and must not act on deferral tokens it may not even have names for.
+fn refold_owed(conn: &Connection) -> anyhow::Result<RefoldOwed> {
     let stamp_behind = match stored_projector_version(conn)? {
         Some(version) => {
             if version > TABLE_SYNC_PROJECTOR_VERSION {
-                return Ok(false);
+                return Ok(RefoldOwed::NOTHING);
             }
             version < TABLE_SYNC_PROJECTOR_VERSION
         },
         None => true,
     };
-    Ok(stamp_behind
-        || oldest_pending_projector_version(conn)?
-            .is_some_and(|oldest| oldest < TABLE_SYNC_PROJECTOR_VERSION))
+    let vocabulary_behind = stored_meta_i64(conn, TABLE_SYNC_DEFERRAL_VOCABULARY_KEY)?
+        .is_none_or(|stored| stored < TABLE_SYNC_DEFERRAL_VOCABULARY);
+    let pending = pending_summary(conn)?;
+    Ok(RefoldOwed {
+        widened: stamp_behind
+            || vocabulary_behind
+            || pending.oldest_projector_version.is_some_and(|v| v < TABLE_SYNC_PROJECTOR_VERSION),
+        deferrals: pending.any_deferral,
+    })
 }
 
 /// Re-attempt one retained entry under this binary's understanding.
@@ -127,15 +207,16 @@ fn replay_pending_entry(
 ) -> anyhow::Result<()> {
     // The stream id is a ONE-WAY hash of (repo_id, account_id, scope_id), so an entry with no
     // directory row cannot be placed at all — there is no repo to apply it to and no scope to
-    // resolve its spec. Skip it, still pending.
+    // resolve its spec. Record that and leave it: a purged repo's history must not project, and
+    // the state is now legible rather than an unexplained pending mark.
     //
-    // Legitimately reachable, not just defensive: `rag-rat rm` sweeps every table carrying
-    // `repo_id`, which includes the directory, while the stream-keyed entry log is deliberately
-    // retained (the sync substrate is excluded from repo purge). A removed repo therefore leaves
-    // exactly this shape, and skipping is the RIGHT answer — a purged repo's history must not
-    // project. See #1004 for aligning the two halves of that purge.
+    // Re-parking is what makes it CHEAP, not just legible. The mark is what the entry carried when
+    // some older binary last touched it, so without this the entry keeps a stale version forever
+    // and trigger 2 is permanently true — an IMMEDIATE transaction and a pending scan at every
+    // store open, for an entry that can never be placed. `NoStreamContext` is not a deferral, so
+    // once it is stamped at the current version nothing retries it.
     let Some(context) = store::stream_context(tx, pending.stream_id)? else {
-        return Ok(());
+        return repark(tx, pending, PendingReason::NoStreamContext);
     };
     // These bytes were signature-verified when accepted and have not left this store since, so a
     // decode failure here means LOCAL corruption. Record it TERMINALLY rather than propagating or
@@ -161,15 +242,34 @@ fn replay_pending_entry(
     else {
         return repark(tx, pending, PendingReason::TableNotInScope);
     };
-    // NEVER replay over an unsent local edit. A raw local write does not advance the row clock, so
-    // the LWW comparison cannot see it and this older entry would simply win — silently destroying
-    // a change no peer has ever seen, at store open, before anything has had a chance to author
-    // it. Leaving the entry pending costs nothing: once the producer authors that edit (at a
-    // lamport above this entry's, since authoring counts parked entries), a later replay lands
-    // and loses on the merits.
-    if apply::replay_would_destroy_unsent_work(tx, spec, &context.repo_id, pending.stream_id, &op)?
-    {
-        return Ok(());
+    // Settle the PAYLOAD question before the ROW question. Whatever the payload alone decides, the
+    // row cannot change — so consulting the guard first would file a version gap, or a payload
+    // terminal on its own merits, under the deferral family instead: replayed at every open until
+    // some unrelated local edit happened to be authored, with the real reason no longer recorded
+    // anywhere. The verdict is pure, so asking it first is free.
+    match apply::payload_verdict(spec, &context.repo_id, &op) {
+        apply::PayloadVerdict::Gap(reason) => return repark(tx, pending, reason),
+        // Terminal. Falls through to the apply path below, which records the quarantine — one
+        // writer of that verdict rather than two.
+        apply::PayloadVerdict::Rejected(_) => {},
+        // Only here does the row have a say. NEVER replay over an unsent local edit: a raw local
+        // write does not advance the row clock, so the LWW comparison cannot see it and this older
+        // entry would simply win — silently destroying a change no peer has ever seen, at store
+        // open, before anything has had a chance to author it. Park it on WHICH local state is in
+        // the way: once the producer authors that edit (at a lamport above this entry's, since
+        // authoring counts parked entries), a later replay lands and loses on the merits — and
+        // until then the deferral reason is what brings the entry back for another look at every
+        // open, since no version bump can signal that the row moved.
+        apply::PayloadVerdict::RowDecides(_) =>
+            if let Some(deferral) = apply::unsent_work_blocking_replay(
+                tx,
+                spec,
+                &context.repo_id,
+                pending.stream_id,
+                &op,
+            )? {
+                return repark(tx, pending, deferral);
+            },
     }
     let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
     match apply::apply_row_op(tx, spec, &context.repo_id, &op, meta)? {
@@ -192,11 +292,21 @@ fn replay_pending_entry(
     }
 }
 
+/// Re-record why an entry is still outstanding, under THIS projector version.
+///
+/// Skips the write when nothing would change. A steady deferral is re-evaluated at every store open
+/// by design (trigger 3), and re-marking it would rewrite an identical row every time — WAL traffic
+/// proportional to opens rather than to anything happening.
 fn repark(
     tx: &Transaction<'_>,
     pending: &PendingEntry,
     reason: PendingReason,
 ) -> anyhow::Result<()> {
+    if pending.reason == Some(reason)
+        && pending.projector_version == Some(TABLE_SYNC_PROJECTOR_VERSION)
+    {
+        return Ok(());
+    }
     store::mark_entry_pending(tx, &pending.entry_hash, reason, TABLE_SYNC_PROJECTOR_VERSION)
 }
 
@@ -232,36 +342,66 @@ pub(crate) fn assert_projector_not_newer(conn: &Connection) -> anyhow::Result<()
     Ok(())
 }
 
-fn stamp_projector_version(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+/// Record what this pass folded: the projection understanding it applied, and the vocabulary it
+/// classified the pending set under.
+///
+/// The vocabulary is raised, never lowered — an older binary sharing the store must not walk it
+/// back and make a newer one redo the reclassification. (The projector version is guarded more
+/// strongly, by refusing the pass outright; that guard cannot be reused here, because a store
+/// folded by a newer vocabulary is still perfectly foldable by this binary.)
+fn stamp_fold_versions(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO oplog_meta(key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![TABLE_SYNC_PROJECTOR_VERSION_KEY, TABLE_SYNC_PROJECTOR_VERSION.to_string()],
     )?;
+    tx.execute(
+        "INSERT INTO oplog_meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE CAST(excluded.value AS INTEGER) > CAST(oplog_meta.value AS INTEGER)",
+        params![TABLE_SYNC_DEFERRAL_VOCABULARY_KEY, TABLE_SYNC_DEFERRAL_VOCABULARY.to_string()],
+    )?;
     Ok(())
 }
 
-/// The oldest projector version that evaluated any still-pending entry, or `None` when nothing is
-/// pending — the second refold trigger (see [`refold_owed`]).
-fn oldest_pending_projector_version(conn: &Connection) -> anyhow::Result<Option<i64>> {
+/// The two facts [`refold_owed`]'s triggers 2 and 3 need, read in ONE pass over the partial
+/// `pending_reason` index — the same cost the single fact used to take, which matters because this
+/// runs at every store open and the steady state (nothing pending) must stay one cheap probe.
+struct PendingSummary {
+    /// The oldest projector version that evaluated any still-pending entry; `None` when nothing is
+    /// pending.
+    oldest_projector_version: Option<i64>,
+    any_deferral: bool,
+}
+
+fn pending_summary(conn: &Connection) -> anyhow::Result<PendingSummary> {
+    let deferrals = store::deferral_tokens_sql();
     Ok(conn.query_row(
-        "SELECT MIN(pending_projector_version) FROM table_sync_entries
-          WHERE pending_reason IS NOT NULL",
+        &format!(
+            "SELECT MIN(pending_projector_version), MAX(pending_reason IN ({deferrals}))
+               FROM table_sync_entries
+              WHERE pending_reason IS NOT NULL"
+        ),
         [],
-        |row| row.get::<_, Option<i64>>(0),
+        |row| {
+            Ok(PendingSummary {
+                oldest_projector_version: row.get(0)?,
+                any_deferral: row.get::<_, Option<bool>>(1)?.unwrap_or(false),
+            })
+        },
     )?)
 }
 
 fn stored_projector_version(conn: &Connection) -> anyhow::Result<Option<i64>> {
-    conn.query_row(
-        "SELECT value FROM oplog_meta WHERE key = ?1",
-        params![TABLE_SYNC_PROJECTOR_VERSION_KEY],
-        |row| row.get::<_, String>(0),
-    )
-    .optional()?
-    .map(|value| {
-        value.parse::<i64>().context("oplog table_sync_projector_version is not an integer")
+    stored_meta_i64(conn, TABLE_SYNC_PROJECTOR_VERSION_KEY)
+}
+
+fn stored_meta_i64(conn: &Connection, key: &str) -> anyhow::Result<Option<i64>> {
+    conn.query_row("SELECT value FROM oplog_meta WHERE key = ?1", params![key], |row| {
+        row.get::<_, String>(0)
     })
+    .optional()?
+    .map(|value| value.parse::<i64>().with_context(|| format!("oplog {key} is not an integer")))
     .transpose()
 }
 
@@ -403,6 +543,33 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap()
+        }
+
+        /// The `(reason token, projector version)` on the first pending entry. Which entry that is
+        /// only matters where more than one is outstanding, so callers pin `pending_count` too.
+        fn pending_mark(&self) -> Option<(String, i64)> {
+            self.conn
+                .query_row(
+                    "SELECT pending_reason, pending_projector_version FROM table_sync_entries
+                      WHERE pending_reason IS NOT NULL
+                      ORDER BY lamport",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .unwrap()
+        }
+
+        /// Pretend an OLDER binary was the last to evaluate every pending entry — the mixed-version
+        /// shared store, which is what makes trigger 2 fire under a current stamp.
+        fn age_pending_marks(&self) {
+            self.conn
+                .execute(
+                    "UPDATE table_sync_entries SET pending_projector_version = ?1
+                      WHERE pending_reason IS NOT NULL",
+                    params![TABLE_SYNC_PROJECTOR_VERSION - 1],
+                )
+                .unwrap();
         }
     }
 
@@ -694,6 +861,12 @@ mod tests {
             b.row().unwrap().0,
             "edited",
             "an unresolvable winner must not license replaying over the row"
+        );
+        assert_eq!(
+            b.pending_mark().unwrap().0,
+            PendingReason::DeferredUnresolvedWinner.as_db_str(),
+            "and the entry says WHY it is stuck — this reason, unlike the other three, is the one \
+             retention/GC has to be able to find"
         );
     }
 
@@ -1180,20 +1353,42 @@ mod tests {
         // no such floor: it deletes the row outright — local-only columns included — so a row whose
         // unreadable cell is an unsent local edit would be destroyed at store open, before anything
         // had a chance to author it.
-        const BOOL: TableSpec = TableSpec {
-            name: "t_bool",
-            scope_id: "demo/1",
-            spec_version: 1,
-            pk: &[ColumnSpec::required("id", ValueType::Text)],
-            columns: &[ColumnSpec::required("flag", ValueType::Bool)],
-            local_columns: &["local_only"],
-            repo_column: None,
-        };
-        let table =
-            "CREATE TABLE t_bool(id TEXT PRIMARY KEY, flag INTEGER, local_only TEXT) STRICT;";
-
         let mut a = Device::new();
         let mut b = Device::new();
+        park_a_remove_over_an_unreadable_row(&mut a, &mut b);
+
+        assert!(refold_stale_projections_against(&b.conn, &[BOOL]).unwrap());
+        let survived: (i64, Option<String>) = b
+            .conn
+            .query_row("SELECT flag, local_only FROM t_bool WHERE id = 'r1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            survived,
+            (2, Some("keep me".to_string())),
+            "the unsent row survives the replayed remove, local-only column included",
+        );
+        assert_eq!(b.pending_count(), 1, "and the entry stays outstanding rather than being lost");
+    }
+
+    /// A table whose synced column is a `Bool`, so a stored `2` is a cell no binary can read
+    /// (#1017), plus a local-only column a delete would take with it.
+    const BOOL: TableSpec = TableSpec {
+        name: "t_bool",
+        scope_id: "demo/1",
+        spec_version: 1,
+        pk: &[ColumnSpec::required("id", ValueType::Text)],
+        columns: &[ColumnSpec::required("flag", ValueType::Bool)],
+        local_columns: &["local_only"],
+        repo_column: None,
+    };
+
+    /// A publishes r1 and B ingests it; B edits its copy raw into a state it cannot read; A then
+    /// deletes the row and authors the `Remove`, which B retains rather than applies.
+    fn park_a_remove_over_an_unreadable_row(a: &mut Device, b: &mut Device) {
+        let table =
+            "CREATE TABLE t_bool(id TEXT PRIMARY KEY, flag INTEGER, local_only TEXT) STRICT;";
         a.conn.execute_batch(table).unwrap();
         b.conn.execute_batch(table).unwrap();
 
@@ -1220,20 +1415,6 @@ mod tests {
             IngestOutcome::Retained(PendingReason::TableNotInScope.as_db_str())
         ]);
         assert_eq!(b.pending_count(), 1);
-
-        assert!(refold_stale_projections_against(&b.conn, &[BOOL]).unwrap());
-        let survived: (i64, Option<String>) = b
-            .conn
-            .query_row("SELECT flag, local_only FROM t_bool WHERE id = 'r1'", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(
-            survived,
-            (2, Some("keep me".to_string())),
-            "the unsent row survives the replayed remove, local-only column included",
-        );
-        assert_eq!(b.pending_count(), 1, "and the entry stays outstanding rather than being lost");
     }
 
     #[test]
@@ -1344,16 +1525,26 @@ mod tests {
         // sees no delta and the deletion is gone for good.
         let mut a = Device::new();
         let mut b = Device::new();
+        park_over_an_unauthored_local_delete(&mut a, &mut b);
 
-        // B holds r1 from its own authored write, so the row is published at B's lamport 0.
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.row(), None, "the unsent deletion survives the refold");
+        // And it is still authorable, so the removal reaches peers.
+        assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1, "the delete is still authorable");
+    }
+
+    /// B holds r1 published, A authors r1 twice under the wide column set (so both entries park on
+    /// B), and B then deletes the row locally without authoring the removal.
+    ///
+    /// A authors TWICE so the entry that matters sits at a strictly HIGHER lamport than B's row
+    /// clock. Without that the replay could lose the lamport-0 tie on fingerprint, and the row
+    /// would stay deleted for reasons having nothing to do with the guard.
+    fn park_over_an_unauthored_local_delete(a: &mut Device, b: &mut Device) {
         b.conn
             .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'v1', NULL)", [])
             .unwrap();
         b.produce(OLD_REGISTRY, "repo");
 
-        // A authors r1 TWICE, so the entry that matters sits at a strictly HIGHER lamport than B's
-        // row clock. Without that the replay could lose the lamport-0 tie on fingerprint and the
-        // row would stay deleted for reasons having nothing to do with the guard under test.
         a.conn
             .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'first', 'wide')", [])
             .unwrap();
@@ -1368,13 +1559,7 @@ mod tests {
         b.ingest(OLD_REGISTRY, "repo", &second, &a.pubkey());
         assert_eq!(b.pending_count(), 2);
 
-        // B deletes the row locally and exits before the producer can author the removal.
         b.conn.execute("DELETE FROM t_demo WHERE id = 'r1'", []).unwrap();
-
-        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
-        assert_eq!(b.row(), None, "the unsent deletion survives the refold");
-        // And it is still authorable, so the removal reaches peers.
-        assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1, "the delete is still authorable");
     }
 
     #[test]
@@ -1471,6 +1656,413 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_payload_over_an_unsent_edit_is_quarantined_not_deferred() {
+        // The cross-product the ordering rule exists for. This op is broken on its own merits (it
+        // types `later_col` as an integer), AND the row it names holds an unsent local edit, so the
+        // guard would fire too. Asking the guard first files it as a deferral — and a deferral is
+        // retried at EVERY store open, forever, for a payload that can never apply. The payload
+        // question has to be settled first, and it is terminal, so the row never gets a say.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let mistyped = RowOp::Upsert {
+            spec_version: 2,
+            table: "t_demo".to_string(),
+            pk: vec![TypedValue::Text("r1".to_string())],
+            cells: vec![
+                Cell { column: "later_col".to_string(), value: TypedValue::I64(7) },
+                Cell { column: "title".to_string(), value: TypedValue::Text("v".to_string()) },
+            ],
+        };
+        let signed = {
+            let tx = a.conn.transaction().unwrap();
+            let stream = scope_stream_id("repo", account(), "demo/1");
+            let signed =
+                store::author_row_entry(&tx, stream, a.local.secret(), &mistyped, 0).unwrap();
+            tx.commit().unwrap();
+            signed.signed_bytes
+        };
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(OLD_REGISTRY, "repo", &[signed], &a.pubkey());
+
+        // The blocking row state: written raw, never authored, so the guard has something to find.
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'unsent', NULL)", [])
+            .unwrap();
+
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.pending_count(), 0, "the broken payload leaves the worklist for good");
+        assert_eq!(
+            b.row().unwrap().0,
+            "unsent",
+            "and quarantining it wrote nothing, so the edit is untouched either way",
+        );
+        assert!(
+            !refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap(),
+            "nothing is owed afterwards — a terminal payload must not join the every-open family",
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Deferrals: entries blocked behind LOCAL ROW STATE rather than behind this binary's
+    // understanding (#1005). They are redeemed by the row changing, which nothing stamps, so they
+    // need a retry trigger of their own — and a bound on what that trigger costs.
+
+    /// Ingest A's wide entry on B, then write r1 locally raw so the replay is refused, and fold.
+    /// Leaves B holding exactly one entry deferred behind an unsent local edit, AT THIS PROJECTOR
+    /// VERSION.
+    ///
+    /// The last part is the whole point of the fixture and easy to lose: an entry left at an OLDER
+    /// version rides trigger 2, and a test built that way passes with trigger 3 deleted.
+    fn defer_over_an_unsent_edit(a: &mut Device, b: &mut Device) {
+        let entries = author_wide_row(a);
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey());
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'unsent', NULL)", [])
+            .unwrap();
+
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(
+            b.pending_mark(),
+            Some((
+                PendingReason::DeferredUnsentEdit.as_db_str().to_string(),
+                TABLE_SYNC_PROJECTOR_VERSION
+            )),
+            "the replay is refused to protect the unsent edit, and parked on WHICH state is in \
+             the way — at this version, which is what strands it",
+        );
+        assert_eq!(
+            stored_projector_version(&b.conn).unwrap(),
+            Some(TABLE_SYNC_PROJECTOR_VERSION),
+            "and the store is stamped, so neither of the version triggers can carry it either",
+        );
+    }
+
+    #[test]
+    fn a_deferral_marked_at_the_current_version_is_retried_on_the_next_open() {
+        // The #1005 bug. An entry deferred behind local row state is redeemed by the ROW changing —
+        // the edit gets authored, the unreadable cell repaired — which no projector version can
+        // express and no upgrade implies. Without a trigger keyed on the deferral itself, an entry
+        // parked by THIS binary is never looked at again, and redelivery cannot rescue it (it
+        // short-circuits on `entry_exists`).
+        let mut a = Device::new();
+        let mut b = Device::new();
+        defer_over_an_unsent_edit(&mut a, &mut b);
+
+        // Authoring the edit publishes the row, so nothing stands in the replay's way any more.
+        assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1, "the local edit is authored");
+
+        assert!(
+            refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap(),
+            "a deferral is owed a look at every open, because only the row can redeem it"
+        );
+        assert_eq!(b.pending_count(), 0, "and the entry finally settles, on the merits");
+        assert_eq!(
+            b.row().unwrap().0,
+            "unsent",
+            "losing the LWW comparison to the edit it was protecting"
+        );
+    }
+
+    #[test]
+    fn a_deferral_left_by_a_binary_with_the_older_vocabulary_is_reclassified_on_upgrade() {
+        // The upgrade boundary. A binary predating this classification left a deferred entry
+        // carrying its INGEST reason — a version gap, at the then-current projector version — and
+        // stamped the store. Nothing in that mark says the entry is actually blocked behind the
+        // row, and no projector version moved, so all three triggers read false and the entry is
+        // stranded in precisely the way #1005 exists to prevent. The vocabulary stamp is what
+        // buys the one full pass that re-derives the reason.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let entries = author_wide_row(&mut a);
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey());
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'unsent', NULL)", [])
+            .unwrap();
+
+        // Exactly the state the older binary leaves: the ingest reason, at the current projector
+        // version, under a store it has already stamped — and no vocabulary marker, because it had
+        // no vocabulary to record.
+        b.conn
+            .execute("INSERT INTO oplog_meta(key, value) VALUES (?1, ?2)", params![
+                TABLE_SYNC_PROJECTOR_VERSION_KEY,
+                TABLE_SYNC_PROJECTOR_VERSION.to_string()
+            ])
+            .unwrap();
+        assert_eq!(
+            b.pending_mark(),
+            Some((
+                PendingReason::NewerSpecVersion.as_db_str().to_string(),
+                TABLE_SYNC_PROJECTOR_VERSION
+            )),
+            "the fixture is the legacy shape: a version-gap reason at the current version",
+        );
+
+        assert!(
+            refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap(),
+            "an older classification vocabulary owes one full pass"
+        );
+        assert_eq!(
+            b.pending_mark().unwrap().0,
+            PendingReason::DeferredUnsentEdit.as_db_str(),
+            "which re-derives the reason, moving the entry into the family that can redeem it",
+        );
+
+        // From here the ordinary deferral machinery takes over, and the entry is no longer
+        // stranded.
+        assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1);
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.pending_count(), 0);
+    }
+
+    #[test]
+    fn the_vocabulary_stamp_is_raised_once_and_never_lowered() {
+        // The pass is one-shot: having reclassified, it must not keep paying for a full pass at
+        // every open. And an older binary sharing the store must not walk the stamp back and make a
+        // newer one redo the work — a store folded by a newer vocabulary is still foldable here,
+        // so the projector's refuse-outright guard does not apply and cannot be reused.
+        let b = Device::new();
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(
+            stored_meta_i64(&b.conn, TABLE_SYNC_DEFERRAL_VOCABULARY_KEY).unwrap(),
+            Some(TABLE_SYNC_DEFERRAL_VOCABULARY),
+        );
+        assert!(
+            !refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap(),
+            "the reclassifying pass is owed once, not at every open"
+        );
+
+        // A newer binary has since reclassified under a wider vocabulary. Force a pass anyway — an
+        // older projector stamp is the state that gets one — so the stamp write is genuinely
+        // exercised rather than skipped along with the whole pass.
+        b.conn
+            .execute("UPDATE oplog_meta SET value = ?2 WHERE key = ?1", params![
+                TABLE_SYNC_DEFERRAL_VOCABULARY_KEY,
+                (TABLE_SYNC_DEFERRAL_VOCABULARY + 1).to_string()
+            ])
+            .unwrap();
+        b.conn
+            .execute("UPDATE oplog_meta SET value = ?2 WHERE key = ?1", params![
+                TABLE_SYNC_PROJECTOR_VERSION_KEY,
+                (TABLE_SYNC_PROJECTOR_VERSION - 1).to_string()
+            ])
+            .unwrap();
+        assert!(
+            refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap(),
+            "the pass runs, so its stamp writes are the thing under test"
+        );
+        assert_eq!(
+            stored_meta_i64(&b.conn, TABLE_SYNC_DEFERRAL_VOCABULARY_KEY).unwrap(),
+            Some(TABLE_SYNC_DEFERRAL_VOCABULARY + 1),
+            "a newer vocabulary survives an older binary's pass",
+        );
+    }
+
+    #[test]
+    fn a_deferred_delete_settles_once_the_removal_is_authored() {
+        let mut a = Device::new();
+        let mut b = Device::new();
+        park_over_an_unauthored_local_delete(&mut a, &mut b);
+
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(
+            b.pending_mark(),
+            Some((
+                PendingReason::DeferredUnsentDelete.as_db_str().to_string(),
+                TABLE_SYNC_PROJECTOR_VERSION
+            )),
+        );
+        assert_eq!(b.produce(NEW_REGISTRY, "repo").len(), 1, "the removal is authored");
+
+        // SETTLEMENT is the observable here, not the row. The authored `Remove` takes
+        // `MAX(lamport) + 1` counting the parked entries, so the row stays deleted whether or not
+        // they are ever replayed — a content assertion would pass with the retry deleted.
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.pending_count(), 0, "both deferred upserts lose to the tombstone and clear");
+        assert_eq!(b.row(), None);
+    }
+
+    #[test]
+    fn a_deferred_remove_replays_once_the_unreadable_cell_is_repaired() {
+        // The stuck state #1017 chose deliberately: a `Remove` over a row this binary cannot read
+        // is deferred rather than applied, because it would delete the row outright and repair
+        // nothing. Redemption is the cell being fixed — an event with no version and no stamp, so
+        // without a deferral trigger the entry would sit there after the repair, forever.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        park_a_remove_over_an_unreadable_row(&mut a, &mut b);
+        assert!(refold_stale_projections_against(&b.conn, &[BOOL]).unwrap());
+        assert_eq!(
+            b.pending_mark(),
+            Some((
+                PendingReason::DeferredUnreadableRow.as_db_str().to_string(),
+                TABLE_SYNC_PROJECTOR_VERSION
+            )),
+        );
+
+        // The cell is repaired back into the Bool domain, matching what was published.
+        b.conn.execute("UPDATE t_bool SET flag = 1 WHERE id = 'r1'", []).unwrap();
+
+        assert!(refold_stale_projections_against(&b.conn, &[BOOL]).unwrap());
+        assert_eq!(
+            b.conn.query_row("SELECT COUNT(*) FROM t_bool", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0,
+            "the deferred remove lands, taking the whole row — which is what a synced delete means",
+        );
+        assert_eq!(b.pending_count(), 0);
+    }
+
+    #[test]
+    fn a_version_gap_is_not_retried_before_the_next_bump() {
+        // The other family, and why the partition has to be exact. A version gap's outcome is
+        // decided on the payload alone, so replaying one under an unchanged binary is guaranteed to
+        // re-park it at the same reason. Retrying it at every open is pure cost.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let entries = author_wide_row(&mut a);
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey());
+
+        assert!(refold_stale_projections_against(&b.conn, OLD_REGISTRY).unwrap());
+        assert_eq!(b.pending_mark().unwrap().0, PendingReason::NewerSpecVersion.as_db_str());
+        assert!(
+            !refold_stale_projections_against(&b.conn, OLD_REGISTRY).unwrap(),
+            "a version gap waits for the binary to widen, not for another look"
+        );
+    }
+
+    #[test]
+    fn a_version_gapped_entry_over_an_unsent_edit_stays_a_version_gap() {
+        // The ordering rule, as behavior. The guard fires here too — the row holds an unsent local
+        // edit — but this entry cannot project whatever the row holds. Asking the guard first would
+        // record the deferral instead, which both erases the version gap and moves the entry into
+        // the family replayed at EVERY open, where nothing could redeem it until some unrelated
+        // local edit happened to be authored.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let entries = author_wide_row(&mut a);
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey());
+        b.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'unsent', NULL)", [])
+            .unwrap();
+
+        assert!(refold_stale_projections_against(&b.conn, OLD_REGISTRY).unwrap());
+        assert_eq!(
+            b.pending_mark().unwrap().0,
+            PendingReason::NewerSpecVersion.as_db_str(),
+            "the payload question is settled before the row question",
+        );
+        assert!(
+            !refold_stale_projections_against(&b.conn, OLD_REGISTRY).unwrap(),
+            "so it stays in the family whose trigger can actually redeem it",
+        );
+    }
+
+    #[test]
+    fn a_deferral_alone_replays_only_the_deferral_family() {
+        // Trigger 3 fires at every open for as long as a deferral is steady, so it must not drag
+        // the whole pending set along: nothing else's outcome can have changed under an unchanged
+        // binary. Probed with an entry carrying a token this binary has no name for — a NEWER
+        // binary's reason — over a row that projects cleanly, so a full pass would visibly clear it
+        // and a narrowed pass visibly cannot.
+        let mut a = Device::new();
+        let mut b = Device::new();
+
+        // r2 first, under the old column set, so B applies it outright.
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'v1')", []).unwrap();
+        let narrow = a.produce(OLD_REGISTRY, "repo");
+        assert_eq!(narrow.len(), 1);
+        b.enroll(a.pubkey().fingerprint());
+        assert_eq!(b.ingest(OLD_REGISTRY, "repo", &narrow, &a.pubkey()), vec![
+            IngestOutcome::Applied
+        ]);
+
+        defer_over_an_unsent_edit(&mut a, &mut b);
+        let poisoned = b
+            .conn
+            .execute(
+                "UPDATE table_sync_entries
+                    SET pending_reason = 'a_reason_from_the_future',
+                        pending_projector_version = ?1
+                  WHERE pending_reason IS NULL",
+                params![TABLE_SYNC_PROJECTOR_VERSION],
+            )
+            .unwrap();
+        assert_eq!(poisoned, 1, "exactly r2's applied entry is marked");
+
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(
+            future_token_count(&b.conn),
+            1,
+            "a pass owed only by a deferral leaves the rest of the pending set alone",
+        );
+
+        // And the narrowing is CONDITIONAL, not absolute: once a version trigger fires, everything
+        // outstanding is back in question and that same entry is replayed and cleared.
+        b.age_pending_marks();
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(future_token_count(&b.conn), 0, "a widened pass covers the whole pending set");
+    }
+
+    fn future_token_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM table_sync_entries
+              WHERE pending_reason = 'a_reason_from_the_future'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_steady_deferral_is_not_rewritten_on_every_open() {
+        // Trigger 3 brings the entry back at every open by design, so re-marking it unconditionally
+        // would write an identical row every time — WAL traffic proportional to opens rather than
+        // to anything happening.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        defer_over_an_unsent_edit(&mut a, &mut b);
+
+        let before = b.conn.total_changes();
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.conn.total_changes() - before, 1, "the projector stamp, and nothing else",);
+    }
+
+    #[test]
+    fn an_entry_whose_stream_directory_is_gone_stops_owing_a_refold() {
+        // A stream id is a ONE-WAY hash of (repo_id, account_id, scope_id), so an entry with no
+        // directory row can never be placed. It used to be skipped in silence, keeping whatever
+        // version it was last marked at — which made trigger 2 permanently true, and cost every
+        // open of every checkout an IMMEDIATE transaction and a full pending scan for an entry that
+        // can never project. Recording it at this version, in a family nothing retries, is what
+        // ends that.
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let entries = author_wide_row(&mut a);
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey());
+        b.conn.execute("DELETE FROM table_sync_streams", []).unwrap();
+        b.age_pending_marks();
+
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(
+            b.pending_mark(),
+            Some((
+                PendingReason::NoStreamContext.as_db_str().to_string(),
+                TABLE_SYNC_PROJECTOR_VERSION
+            )),
+            "the state is recorded rather than left as an unexplained pending mark",
+        );
+        assert!(
+            !refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap(),
+            "and it stops costing a write transaction at every store open",
+        );
+        assert_eq!(b.row(), None, "a purged repo's history still must not project");
+    }
+
+    #[test]
     fn pending_reasons_round_trip_through_their_stored_tokens() {
         // Exhaustive over the enum, so a variant added later cannot skip the round trip.
         for reason in <PendingReason as strum::IntoEnumIterator>::iter() {
@@ -1494,21 +2086,49 @@ mod tests {
         // variant added later (`NewerSpecVersion` was added and left unpinned exactly that way),
         // which is the case that most needs the pin. Adding a variant now fails here until it is
         // listed.
-        let pinned: Vec<(PendingReason, &str)> = <PendingReason as strum::IntoEnumIterator>::iter()
-            .map(|reason| (reason, reason.as_db_str()))
-            .collect::<Vec<_>>();
+        //
+        // The third column pins the RETRY FAMILY (`is_deferral`), for the same reason and with the
+        // same consequences: it decides whether an entry is replayed at every store open or waits
+        // for a projector bump, and the default a new variant lands in should be a decision, not a
+        // match-arm accident.
+        let pinned: Vec<(PendingReason, &str, bool)> =
+            <PendingReason as strum::IntoEnumIterator>::iter()
+                .map(|reason| (reason, reason.as_db_str(), reason.is_deferral()))
+                .collect::<Vec<_>>();
         assert_eq!(
             pinned,
             vec![
-                (PendingReason::UnknownColumn, "unknown_column"),
-                (PendingReason::NewerSpecVersion, "newer_spec_version"),
-                (PendingReason::PartialAfterImage, "partial_after_image"),
-                (PendingReason::MisstampedSpecVersion, "misstamped_spec_version"),
-                (PendingReason::UnknownOpKind, "unknown_op_kind"),
-                (PendingReason::UndecodablePayload, "undecodable_payload"),
-                (PendingReason::TableNotInScope, "table_not_in_scope"),
+                (PendingReason::UnknownColumn, "unknown_column", false),
+                (PendingReason::NewerSpecVersion, "newer_spec_version", false),
+                (PendingReason::PartialAfterImage, "partial_after_image", false),
+                (PendingReason::MisstampedSpecVersion, "misstamped_spec_version", false),
+                (PendingReason::UnknownOpKind, "unknown_op_kind", false),
+                (PendingReason::UndecodablePayload, "undecodable_payload", false),
+                (PendingReason::TableNotInScope, "table_not_in_scope", false),
+                (PendingReason::NoStreamContext, "no_stream_context", false),
+                (PendingReason::DeferredUnsentEdit, "deferred_unsent_edit", true),
+                (PendingReason::DeferredUnsentDelete, "deferred_unsent_delete", true),
+                (PendingReason::DeferredUnreadableRow, "deferred_unreadable_row", true),
+                (PendingReason::DeferredUnresolvedWinner, "deferred_unresolved_winner", true),
             ],
             "a stored classification token moved, or a new variant is unpinned"
+        );
+    }
+
+    #[test]
+    fn the_deferral_sql_list_is_derived_from_the_enum() {
+        // The narrowed worklist and trigger 3 both probe by TOKEN, in SQL, where the compiler
+        // cannot see the enum. Deriving the list is what keeps a new deferral variant from being
+        // marked by the refold and then never picked up by the query that retries it — a silent
+        // regression to the #1005 bug, for one reason only.
+        let expected: Vec<String> = <PendingReason as strum::IntoEnumIterator>::iter()
+            .filter(|reason| reason.is_deferral())
+            .map(|reason| format!("'{}'", reason.as_db_str()))
+            .collect();
+        assert_eq!(store::deferral_tokens_sql(), expected.join(", "));
+        assert!(
+            store::deferral_tokens_sql().contains("'deferred_unsent_edit'"),
+            "and it is not vacuously empty"
         );
     }
 
@@ -1669,6 +2289,37 @@ mod tests {
             IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
         ]);
         assert_eq!(opener.pending_count(), 1, "the fixture leaves exactly one entry parked");
+    }
+
+    #[test]
+    fn a_deferral_recorded_by_one_opener_is_retried_by_the_other() {
+        // Deferral marks and their trigger have to be FILE state, like every other part of the
+        // pending record. Linked worktrees share one database, so the opener that records a
+        // deferral is routinely not the one that later removes what it was blocked behind.
+        let store = SharedStore::new("table-sync-two-openers-deferral");
+        park_wide_entry(&store);
+
+        let first = store.open();
+        first
+            .conn()
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'unsent', NULL)", [])
+            .unwrap();
+        assert!(first.refold(NEW_REGISTRY).unwrap());
+        assert_eq!(first.pending_count(), 1, "the replay is refused to protect the unsent edit");
+        drop(first);
+
+        let second = store.open();
+        assert_eq!(
+            second.produce(NEW_REGISTRY, "repo").unwrap().len(),
+            1,
+            "this opener authors the edit"
+        );
+        assert!(
+            second.refold(NEW_REGISTRY).unwrap(),
+            "and is the one owed the deferred entry's replay"
+        );
+        assert_eq!(second.pending_count(), 0);
+        assert_eq!(second.row().unwrap().0, "unsent");
     }
 
     #[test]

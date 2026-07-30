@@ -60,6 +60,43 @@ pub(crate) fn apply_row_op(
     meta: OpMeta,
 ) -> anyhow::Result<ApplyOutcome> {
     debug_assert_eq!(op.table(), spec.name, "caller resolves the spec from the op's table");
+    let known = match payload_verdict(spec, repo_id, op) {
+        PayloadVerdict::Gap(reason) => return Ok(ApplyOutcome::Unprojectable(reason)),
+        PayloadVerdict::Rejected(why) => return Ok(ApplyOutcome::Quarantined(why)),
+        PayloadVerdict::RowDecides(known) => known,
+    };
+    let pk_vals = op.pk();
+    match known {
+        // A complete after-image: an upsert, whose whole column set the row will take.
+        Some(known) => apply_upsert(tx, spec, repo_id, pk_vals, known, meta),
+        // Nothing to project — a remove names only the row identity.
+        None => apply_remove(tx, spec, repo_id, pk_vals, meta),
+    }
+}
+
+/// What [`apply_row_op`] decides on the PAYLOAD ALONE, before any row state is read.
+#[derive(Debug, PartialEq)]
+pub(crate) enum PayloadVerdict {
+    /// Nothing in the payload stands in the way; the ROW STATE decides what happens next. Carries
+    /// the complete after-image for an upsert, and `None` for a remove, which has no column set.
+    RowDecides(Option<Vec<(&'static str, TypedValue)>>),
+    /// A version gap: this binary does not understand the payload yet. No row read changes that.
+    Gap(PendingReason),
+    /// Terminal on its own merits — a broken producer. No row read changes that either.
+    Rejected(String),
+}
+
+/// Everything [`apply_row_op`] can settle without touching the database, in the order it settles
+/// it.
+///
+/// Factored out because it has a SECOND caller with a different question. The refold has to know,
+/// before it consults [`unsent_work_blocking_replay`], whether an entry's fate depends on the row
+/// at all: a version gap and a terminal payload are both settled here, and filing either as a
+/// deferral would move it into the family replayed at every store open, where nothing could redeem
+/// it. Two copies of these checks would drift, and the drift would be invisible — each copy reads
+/// correctly on its own, and the disagreement only shows up as an entry stuck in the wrong retry
+/// family.
+pub(crate) fn payload_verdict(spec: &TableSpec, repo_id: &str, op: &RowOp) -> PayloadVerdict {
     // "We do not understand this generation" OUTRANKS "this op looks malformed to us", so the
     // version gate goes before every structural check below — those all return `Quarantined`, which
     // is TERMINAL. A newer producer's UPSERT that happens to trip one of them would be discarded
@@ -74,24 +111,24 @@ pub(crate) fn apply_row_op(
     // would delay a deletion across a version skew for no benefit, and a row deleted after a column
     // change would become permanently undeletable — a convergence wedge.
     if matches!(op, RowOp::Upsert { .. }) && op.spec_version() > spec.spec_version {
-        return Ok(ApplyOutcome::Unprojectable(PendingReason::NewerSpecVersion));
+        return PayloadVerdict::Gap(PendingReason::NewerSpecVersion);
     }
     let pk_vals = op.pk();
     if pk_vals.len() != spec.pk.len() {
-        return Ok(ApplyOutcome::Quarantined(format!(
+        return PayloadVerdict::Rejected(format!(
             "pk arity {} does not match `{}`'s {} identity columns",
             pk_vals.len(),
             spec.name,
             spec.pk.len()
-        )));
+        ));
     }
     // A NULL identity value is unaddressable: `WHERE pk = NULL` never matches, so upserts would
     // insert duplicate unreachable rows and removes could never delete them. Reject the whole op.
     if pk_vals.iter().any(|v| matches!(v, TypedValue::Null)) {
-        return Ok(ApplyOutcome::Quarantined(format!(
+        return PayloadVerdict::Rejected(format!(
             "a null primary-key value is not addressable on `{}`",
             spec.name
-        )));
+        ));
     }
     // Validate each pk value against its declared type before it reaches a WHERE clause. SQLite
     // affinity would otherwise coerce a mismatched pk (e.g. `I64(1)` matching a TEXT key `'1'`)
@@ -100,10 +137,10 @@ pub(crate) fn apply_row_op(
     // every pk.)
     for (column, value) in spec.pk.iter().zip(pk_vals) {
         if !value_matches(value, column.value_type) {
-            return Ok(ApplyOutcome::Quarantined(format!(
+            return PayloadVerdict::Rejected(format!(
                 "pk column `{}` value does not match its declared type on `{}`",
                 column.name, spec.name
-            )));
+            ));
         }
     }
     // Repo-identity gate: for a table scoped by a pk column, an op naming a different repo than the
@@ -112,18 +149,24 @@ pub(crate) fn apply_row_op(
     if let Some(idx) = spec.repo_pk_index()
         && pk_vals.get(idx) != Some(&TypedValue::Text(repo_id.to_string()))
     {
-        return Ok(ApplyOutcome::Quarantined(format!(
+        return PayloadVerdict::Rejected(format!(
             "op names a different repo than the `{}` stream being synced",
             spec.name
-        )));
+        ));
     }
     match op {
         // A remove names only the row identity, so no column set is involved: its `spec_version` is
         // carried for wire symmetry and diagnostics, never acted on. Gating a deletion on a version
         // skew would delay it for no benefit.
-        RowOp::Remove { .. } => apply_remove(tx, spec, repo_id, pk_vals, meta),
+        RowOp::Remove { .. } => PayloadVerdict::RowDecides(None),
+        // Resolve the payload into the full after-image THIS registry expects, from the payload
+        // alone, so the decision is deterministic and idempotent.
         RowOp::Upsert { spec_version, cells, .. } =>
-            apply_upsert(tx, spec, repo_id, pk_vals, *spec_version, cells, meta),
+            match project_cells(spec, *spec_version, cells) {
+                Projection::Complete(known) => PayloadVerdict::RowDecides(Some(known)),
+                Projection::Park(reason) => PayloadVerdict::Gap(reason),
+                Projection::Quarantine(why) => PayloadVerdict::Rejected(why),
+            },
     }
 }
 
@@ -261,23 +304,16 @@ fn default_as_value(default: DefaultValue) -> TypedValue {
     }
 }
 
+/// Apply an upsert whose after-image [`payload_verdict`] has already resolved — every synced column
+/// this registry knows, in registry order.
 fn apply_upsert(
     tx: &Transaction<'_>,
     spec: &TableSpec,
     repo_id: &str,
     pk_vals: &[TypedValue],
-    op_spec_version: u32,
-    cells: &[Cell],
+    known: Vec<(&'static str, TypedValue)>,
     meta: OpMeta,
 ) -> anyhow::Result<ApplyOutcome> {
-    // Resolve the payload into the full after-image THIS registry expects, decided on the PAYLOAD
-    // ALONE — before any row state is read, so the decision is deterministic and idempotent.
-    let known = match project_cells(spec, op_spec_version, cells) {
-        Projection::Complete(cells) => cells,
-        Projection::Park(reason) => return Ok(ApplyOutcome::Unprojectable(reason)),
-        Projection::Quarantine(why) => return Ok(ApplyOutcome::Quarantined(why)),
-    };
-
     let row_pk = &row_op::row_pk_string(pk_vals);
     let device_hex = &meta.device.to_string();
 
@@ -733,8 +769,10 @@ pub(crate) fn stale_row_disposition(
     }
 }
 
-/// Whether replaying `op` over this row would DESTROY local work no peer has seen — normally
-/// because the row holds a change that has not been authored yet.
+/// The unsent local work that blocks replaying `op` over this row, or `None` when the replay is
+/// safe. Every reason it returns is a [`PendingReason::is_deferral`]: the entry is waiting on the
+/// ROW, not on a later binary, so naming which one is what lets the refold retry it at the right
+/// time (#1005) instead of leaving it silently skipped.
 ///
 /// The question is asked about the OP and not only the row, because the two kinds have different
 /// floors when the row's state cannot be established: an `Upsert` rewrites every synced column and
@@ -754,13 +792,13 @@ pub(crate) fn stale_row_disposition(
 /// the rows it exists to repair. Those rows are in the ordinary last-writer-wins regime, where the
 /// refold behaves exactly as live ingest does and the driver's author-before-apply ordering
 /// governs.
-pub(crate) fn replay_would_destroy_unsent_work(
+pub(crate) fn unsent_work_blocking_replay(
     tx: &Transaction<'_>,
     spec: &TableSpec,
     repo_id: &str,
     stream: StreamId,
     op: &RowOp,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<PendingReason>> {
     let pk_vals = op.pk();
     // A malformed key never reached `apply_row_op`'s arity check (an entry parked as out-of-scope
     // or unknown-kind was never validated), and binding it against `spec.pk`'s placeholders
@@ -768,7 +806,7 @@ pub(crate) fn replay_would_destroy_unsent_work(
     // the transaction and fail every subsequent store open on the same entry. Defer to the
     // normal path, which quarantines it.
     if pk_vals.len() != spec.pk.len() {
-        return Ok(false);
+        return Ok(None);
     }
     let row_pk = row_op::row_pk_string(pk_vals);
     let current_cells = match read_synced_cells(tx, spec, pk_vals)? {
@@ -778,7 +816,9 @@ pub(crate) fn replay_would_destroy_unsent_work(
             // yet authored. That is precisely what the producer's `Remove` branch keys on, so
             // replaying an upsert here would recreate the row and discard the unsent deletion for
             // good.
-            return Ok(published_hash(tx, repo_id, spec.name, &row_pk)?.is_some());
+            return Ok(published_hash(tx, repo_id, spec.name, &row_pk)?
+                .is_some()
+                .then_some(PendingReason::DeferredUnsentDelete));
         },
         // The row is there but has no hash, so nothing about it can be PROVEN either way — and what
         // to do about that is NOT the same for the two op kinds.
@@ -794,12 +834,16 @@ pub(crate) fn replay_would_destroy_unsent_work(
         // and repairs nothing, so a winning remove would destroy an unsent local edit that merely
         // happens to be unreadable. Deferring it is the safe stuck state: the row survives, and the
         // entry replays on the merits once the cell is repaired.
-        SyncedRow::Unreadable(_) => return Ok(matches!(op, RowOp::Remove { .. })),
+        SyncedRow::Unreadable(_) =>
+            return Ok(
+                matches!(op, RowOp::Remove { .. }).then_some(PendingReason::DeferredUnreadableRow)
+            ),
     };
     let current = row_op::cells_hash(&current_cells);
     Ok(match published_hash(tx, repo_id, spec.name, &row_pk)? {
         // Comparable: a differing hash is a demonstrably unsent local change.
-        Some((published, version)) if version == spec.spec_version => published != current,
+        Some((published, version)) if version == spec.spec_version =>
+            (published != current).then_some(PendingReason::DeferredUnsentEdit),
         // Published under a different column set, so the hashes cannot be compared — but the row's
         // WINNING op can be, projected under this spec. This proof path is required, not an
         // optimization: once an older-spec op can be filled from declared defaults (#1002) a parked
@@ -807,12 +851,13 @@ pub(crate) fn replay_would_destroy_unsent_work(
         // Unprovable stays conservative: refuse to replay rather than risk overwriting.
         Some(_) => match stale_row_disposition(tx, spec, repo_id, stream, pk_vals, &current_cells)?
         {
-            StaleRow::LocallyChanged | StaleRow::Unknown => true,
-            StaleRow::Unchanged => false,
+            StaleRow::LocallyChanged => Some(PendingReason::DeferredUnsentEdit),
+            StaleRow::Unknown => Some(PendingReason::DeferredUnresolvedWinner),
+            StaleRow::Unchanged => None,
         },
         // A live row no apply ever published is purely local: the only content there came from this
         // device, and no peer has seen it.
-        None => true,
+        None => Some(PendingReason::DeferredUnsentEdit),
     })
 }
 
@@ -1957,15 +2002,10 @@ mod tests {
         // on the clock, and a winner rewrites the column that is unreadable.
         let mut c = flagged_store(2);
         let tx = c.transaction().unwrap();
-        assert!(
-            !replay_would_destroy_unsent_work(
-                &tx,
-                &FLAGGED,
-                "repo",
-                guard_stream(),
-                &flagged_op(false)
-            )
-            .unwrap(),
+        assert_eq!(
+            unsent_work_blocking_replay(&tx, &FLAGGED, "repo", guard_stream(), &flagged_op(false))
+                .unwrap(),
+            None,
             "an unreadable row proves nothing against an upsert that would repair it",
         );
     }
@@ -1978,15 +2018,10 @@ mod tests {
         // entry replays on the merits once the cell is repaired.
         let mut c = flagged_store(2);
         let tx = c.transaction().unwrap();
-        assert!(
-            replay_would_destroy_unsent_work(
-                &tx,
-                &FLAGGED,
-                "repo",
-                guard_stream(),
-                &flagged_op(true)
-            )
-            .unwrap(),
+        assert_eq!(
+            unsent_work_blocking_replay(&tx, &FLAGGED, "repo", guard_stream(), &flagged_op(true))
+                .unwrap(),
+            Some(PendingReason::DeferredUnreadableRow),
             "a remove over an unreadable row has no repair to offer, so it must defer",
         );
     }

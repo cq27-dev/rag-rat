@@ -80,11 +80,62 @@ pub(crate) enum PendingReason {
     UndecodablePayload,
     /// The op's table is not in this binary's registry for the entry's scope.
     TableNotInScope,
+    /// The entry's stream has no directory row, so it cannot be placed at all — no repo to apply it
+    /// to and no scope to resolve its spec (the stream id hashes both away).
+    ///
+    /// Deliberately NOT a deferral. Every author and every ingest records the context first, and
+    /// repo purge sweeps the entries with the directory, so reaching this state at all means
+    /// something outside the engine removed the row — and if it happened it is almost certainly
+    /// permanent. Retrying it on every open would be the one reason that makes every store open pay
+    /// forever. It is recorded so the state is diagnosable, and left alone.
+    NoStreamContext,
+    /// A live row whose content differs from what was last published: an edit no peer has seen,
+    /// which replaying this entry would silently overwrite.
+    DeferredUnsentEdit,
+    /// The row is gone but its published identity survives — a local delete not yet authored, which
+    /// replaying an upsert would undo by recreating the row.
+    DeferredUnsentDelete,
+    /// A `Remove` over a row holding a cell this binary cannot read (#1017). Applying it would
+    /// delete the row outright, local-only columns included, and repair nothing.
+    DeferredUnreadableRow,
+    /// The row was published under a different column set AND its winning op could not be resolved,
+    /// so whether it holds an unsent edit cannot be established either way. Conservative by design:
+    /// refuse to replay rather than risk overwriting.
+    DeferredUnresolvedWinner,
 }
 
 impl PendingReason {
     pub(crate) fn as_db_str(self) -> &'static str {
         self.into()
+    }
+
+    /// Whether this entry is waiting on LOCAL ROW STATE rather than on a later binary.
+    ///
+    /// The two families are redeemed by different events and so have different retry triggers. A
+    /// version gap clears when this binary understands more, which the projector version records —
+    /// so replaying one before the next bump is pure cost. A deferral clears when the row it is
+    /// blocked behind changes (the edit gets authored, the unreadable cell is repaired), which
+    /// nothing stamps and no version can express; the only way to find out is to look again, so a
+    /// deferral is owed a replay at every open (#1005).
+    ///
+    /// Every non-deferral variant is a version gap, INCLUDING `PartialAfterImage` (a broken
+    /// producer its own doc says will not clear here) and `NoStreamContext`: as deferrals those
+    /// would retry forever with nothing able to redeem them.
+    pub(crate) fn is_deferral(self) -> bool {
+        match self {
+            Self::DeferredUnsentEdit
+            | Self::DeferredUnsentDelete
+            | Self::DeferredUnreadableRow
+            | Self::DeferredUnresolvedWinner => true,
+            Self::UnknownColumn
+            | Self::NewerSpecVersion
+            | Self::PartialAfterImage
+            | Self::MisstampedSpecVersion
+            | Self::UnknownOpKind
+            | Self::UndecodablePayload
+            | Self::TableNotInScope
+            | Self::NoStreamContext => false,
+        }
     }
 
     /// Exact-token parse: an unrecognized value is `None`, never coerced to a default — a stored
@@ -471,31 +522,74 @@ pub(crate) struct PendingEntry {
     pub(crate) entry_hash: [u8; 32],
     pub(crate) stream_id: StreamId,
     pub(crate) signed_bytes: Vec<u8>,
+    /// The mark this entry currently carries. `None` when the stored token is not in this binary's
+    /// vocabulary — a NEWER binary parked it for a reason this one has no name for. Exact-token
+    /// parsing keeps that legible instead of coercing it to a wrong reason; the replay itself does
+    /// not consult it, so an unknown token costs nothing beyond one re-mark.
+    pub(crate) reason: Option<PendingReason>,
+    pub(crate) projector_version: Option<i64>,
 }
 
-/// Every entry this binary has not fully projected, in stream/lamport order. Ordered for
+/// Which retained entries a refold pass replays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Worklist {
+    /// Everything outstanding — this binary may understand more than whatever last evaluated them.
+    All,
+    /// Only the entries blocked behind local row state ([`PendingReason::is_deferral`]).
+    Deferrals,
+}
+
+/// The entries this binary has not fully projected, in stream/lamport order. Ordered for
 /// determinism and reproducible diagnostics, NOT for correctness: each replay goes through the
 /// unchanged LWW gates, which are arrival-order independent.
-pub(crate) fn pending_entries(tx: &Transaction<'_>) -> anyhow::Result<Vec<PendingEntry>> {
-    let mut stmt = tx.prepare(
-        "SELECT entry_hash, stream_id, signed_bytes FROM table_sync_entries
-          WHERE pending_reason IS NOT NULL
-          ORDER BY stream_id, lamport, device_fingerprint",
-    )?;
+pub(crate) fn pending_entries(
+    tx: &Transaction<'_>,
+    worklist: Worklist,
+) -> anyhow::Result<Vec<PendingEntry>> {
+    let filter = match worklist {
+        Worklist::All => "pending_reason IS NOT NULL".to_string(),
+        Worklist::Deferrals => format!("pending_reason IN ({})", deferral_tokens_sql()),
+    };
+    let mut stmt = tx.prepare(&format!(
+        "SELECT entry_hash, stream_id, signed_bytes, pending_reason, pending_projector_version
+           FROM table_sync_entries
+          WHERE {filter}
+          ORDER BY stream_id, lamport, device_fingerprint"
+    ))?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?))
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
-        .map(|(hash, stream, signed_bytes)| {
+        .map(|(hash, stream, signed_bytes, reason, projector_version)| {
             Ok(PendingEntry {
                 entry_hash: fixed32(hash)?,
                 stream_id: StreamId::from_bytes(fixed32(stream)?),
                 signed_bytes,
+                reason: reason.as_deref().and_then(PendingReason::from_db_str),
+                projector_version,
             })
         })
         .collect()
+}
+
+/// The deferral family's tokens as a SQL literal list, DERIVED from the enum rather than written
+/// out: a new variant answers [`PendingReason::is_deferral`] and the query follows it, so the two
+/// cannot drift apart. The tokens are `serialize_all = "snake_case"` renderings of a closed enum,
+/// so there is no untrusted text here to quote against.
+pub(crate) fn deferral_tokens_sql() -> String {
+    <PendingReason as strum::IntoEnumIterator>::iter()
+        .filter(|reason| reason.is_deferral())
+        .map(|reason| format!("'{}'", reason.as_db_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The apply context a stored entry needs to be replayed. `scope_stream_id` is a ONE-WAY sha256 of
