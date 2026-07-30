@@ -65,9 +65,9 @@ fn a_linked_only_pass_acts_for_the_linked_checkout_and_leaves_the_base_scope_res
     // stage keyed to THAT checkout. It must also not leave the connection scoped there — the base
     // reconcile, gc, and memory validation that follow all assume base scope.
     let (main_dir, linked_dirs) = repo_with_worktrees(2, None);
-    let main = main_dir.canonicalize().unwrap();
-    let edited = linked_dirs[0].canonicalize().unwrap();
-    let quiet = linked_dirs[1].canonicalize().unwrap();
+    let main = rag_rat_base::paths::canonicalize(&main_dir).unwrap();
+    let edited = rag_rat_base::paths::canonicalize(&linked_dirs[0]).unwrap();
+    let quiet = rag_rat_base::paths::canonicalize(&linked_dirs[1]).unwrap();
     let (edited, quiet) = (&edited, &quiet);
     let config = live_source_config(main.clone());
     let mut db = IndexDatabase::rebuild(&config).unwrap();
@@ -115,8 +115,8 @@ fn a_linked_checkouts_server_is_rooted_at_its_own_equivalent_of_the_config_root(
     // `<linked>/crate`). A server rooted at the checkout would initialize a workspace that does
     // not contain the indexed sources, and the pass's own guard would then reject its verdicts.
     let (main_dir, linked_dirs) = repo_with_worktrees(1, Some("crate"));
-    let main = main_dir.canonicalize().unwrap();
-    let linked = linked_dirs[0].canonicalize().unwrap();
+    let main = rag_rat_base::paths::canonicalize(&main_dir).unwrap();
+    let linked = rag_rat_base::paths::canonicalize(&linked_dirs[0]).unwrap();
     let config = live_source_config(main.join("crate"));
     let mut db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -151,8 +151,8 @@ fn a_linked_checkout_is_judged_against_its_own_target_bindings() {
     // config's targets the backend's language gate rejects the added language — and that arm has
     // already taken the backlog — so the linked edit is dropped outright rather than deferred.
     let (main_dir, linked_dirs) = repo_with_worktrees(1, None);
-    let main = main_dir.canonicalize().unwrap();
-    let linked = linked_dirs[0].canonicalize().unwrap();
+    let main = rag_rat_base::paths::canonicalize(&main_dir).unwrap();
+    let linked = rag_rat_base::paths::canonicalize(&linked_dirs[0]).unwrap();
 
     // The branch adds a TypeScript target; the main config below stays Rust-only.
     fs::write(
@@ -204,9 +204,9 @@ fn a_checkout_whose_work_turns_out_not_to_be_real_releases_its_slot_to_a_sibling
     // (#1010).
     let _no_server = crate::watch::suppress_live_spawn();
     let (main_dir, linked_dirs) = repo_with_worktrees(2, None);
-    let main = main_dir.canonicalize().unwrap();
-    let stale = linked_dirs[0].canonicalize().unwrap();
-    let sibling = linked_dirs[1].canonicalize().unwrap();
+    let main = rag_rat_base::paths::canonicalize(&main_dir).unwrap();
+    let stale = rag_rat_base::paths::canonicalize(&linked_dirs[0]).unwrap();
+    let sibling = rag_rat_base::paths::canonicalize(&linked_dirs[1]).unwrap();
     let config = live_source_config(main.clone());
     let mut db = IndexDatabase::rebuild(&config).unwrap();
     let stale_id = crate::index::worktree_id_of(&stale);
@@ -281,9 +281,9 @@ fn a_checkout_that_stops_being_a_live_sibling_drops_its_state() {
     // and falls back to the BASE scope. A removed checkout would otherwise stay resident with a
     // backlog nothing can resolve, holding a cap slot the live checkouts need.
     let (main_dir, linked_dirs) = repo_with_worktrees(2, None);
-    let main = main_dir.canonicalize().unwrap();
-    let linked = linked_dirs[0].canonicalize().unwrap();
-    let survivor = linked_dirs[1].canonicalize().unwrap();
+    let main = rag_rat_base::paths::canonicalize(&main_dir).unwrap();
+    let linked = rag_rat_base::paths::canonicalize(&linked_dirs[0]).unwrap();
+    let survivor = rag_rat_base::paths::canonicalize(&linked_dirs[1]).unwrap();
     let config = live_source_config(main.clone());
     let mut db = IndexDatabase::rebuild(&config).unwrap();
     let gone_id = crate::index::worktree_id_of(&linked);

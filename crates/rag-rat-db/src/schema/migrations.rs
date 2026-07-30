@@ -6635,7 +6635,7 @@ pub fn apply_table_sync_gapped_entries(conn: &Connection) -> rusqlite::Result<()
 /// `(commit_sha, worktree_id)` pair is the active-scope view every read goes through); the other
 /// three are keyed the same way, and GC prunes all four off the same live worktree set.
 ///
-/// `migration_096_covers_every_worktree_id_column_in_the_schema` pins this list against the live
+/// `migration_097_covers_every_worktree_id_column_in_the_schema` pins this list against the live
 /// schema, so a table that grows a `worktree_id` cannot silently miss the rekey.
 pub const V097_WORKTREE_ID_SCOPED_TABLES: &[&str] =
     &["files", "packages", "oracle_runs", "external_symbols"];
@@ -6654,7 +6654,12 @@ const V097_WORKTREE_OVERLAY_BASIS_PREFIX: &str = crate::meta::WORKTREE_OVERLAY_B
 /// `local_crate_roots` (Cargo crate NAMES), and everything model/embedding/FTS-related (ids,
 /// versions, counters). `files.path` and `packages.manifest_dir` are stored RELATIVE to the root,
 /// so a root respelling never reaches them.
-const V097_PATH_VALUED_META_KEYS: &[&str] =
+///
+/// `pub` for the same reason as [`V097_WORKTREE_ID_SCOPED_TABLES`]: a meta key is just a string, so
+/// nothing about adding a path-valued one fails to compile.
+/// `every_absolute_path_in_the_meta_bag_is_rekeyed_or_reviewed` walks a real index and requires
+/// every absolute-path value to be either in this list or in an explicitly reviewed exception set.
+pub const V097_PATH_VALUED_META_KEYS: &[&str] =
     &["source_root", crate::meta::GIT_HISTORY_INDEXED_ROOT_META];
 
 /// V097 (#1048): rewrite every persisted path spelling that the pre-fix `canonicalize` wrote in
@@ -6690,8 +6695,41 @@ const V097_PATH_VALUED_META_KEYS: &[&str] =
 /// Rewriting goes through `paths::rekeyed_from_verbatim`, the SAME rule production canonicalizes
 /// with, not a blind prefix strip: verbatim form is still produced (and still correct) for UNC
 /// shares, paths past `MAX_PATH`, and reserved DOS names, and rewriting those would BREAK the match
-/// this exists to preserve. On Unix that rule is the identity for every input, so this migration is
-/// a strict no-op there.
+/// this exists to preserve.
+///
+/// WHAT KEEPS A PRE-UPGRADE BINARY OFF A STORE THIS HAS CONVERTED. Rekeying is only safe if no
+/// binary that predates it can still write to, or garbage-collect, the rekeyed rows — an older
+/// build derives the live worktree set from the OLD spelling, so it would read every rekeyed id as
+/// a checkout that no longer exists. The fence is the SCHEMA VERSION, and it is the ladder's, not
+/// this migration's: recording V097 puts a migration id in `schema_version` that a pre-V097 binary
+/// does not know, so [`super::status`] answers `Newer` and every open refuses. It covers a RESIDENT
+/// process, not just a fresh command, because no long-lived component holds a connection across
+/// that check — a watcher pass re-opens through `open_and_migrate` at its start, inside the
+/// per-repo write flock and long before its gc stage, so the pass after the upgrade fails at the
+/// gate with nothing written. The same is true of the lighter watch-counter flush, which tests
+/// `status() == Compatible` on its own connection before writing.
+///
+/// The one case the version cannot fence is a pass ALREADY past that check when the upgrade
+/// commits. A new binary's INDEXING opens cannot cause it (they take the per-repo write flock
+/// before migrating, so they wait behind the in-flight pass); only a non-indexing open — a query,
+/// an MCP read — migrates under the global schema lock alone, which by design does not serialize
+/// against per-repo writers. Deliberately left: the migration must not take per-repo flocks it
+/// would have to enumerate and order across every repo in a consolidated store, and the exposure
+/// is bounded — the rows at risk are derived overlay/dirty rows, which the next overlay refresh
+/// re-derives, and committed base rows (`worktree_id = ''`, a live `commit_sha`) are outside it.
+///
+/// IT RUNS ON EVERY PLATFORM, not only on Windows. Which spellings a store carries is a property of
+/// the STORE, not of the host reading it: one repository directory reachable from both a Windows
+/// path and a WSL/container mount is one SQLite file, and whichever binary opens first is the one
+/// that runs the ladder. Skipping the sweep off Windows would let that first opener record V097 as
+/// applied without converting anything — and the ladder is forward-only, so the Windows binary
+/// would never revisit it and would keep the spellings that get its rows collected as a dead
+/// checkout, which is the failure this migration exists to prevent. `rekeyed_from_verbatim` decides
+/// droppability textually for that reason. The cost of dropping the host skip is small and was
+/// measured rather than assumed: the sweep's reads are `SELECT DISTINCT` over four `worktree_id`
+/// columns, and `files` — the only large one — answers from `idx_files_worktree_path` as a covering
+/// scan; on a ~2 GB twenty-repo store the whole sweep is tens of milliseconds, once, on the open
+/// that upgrades it.
 pub fn apply_windows_verbatim_path_rekey(conn: &Connection) -> rusqlite::Result<()> {
     rekey_persisted_path_spellings(conn, rag_rat_base::paths::rekeyed_from_verbatim)
 }
@@ -6699,12 +6737,11 @@ pub fn apply_windows_verbatim_path_rekey(conn: &Connection) -> rusqlite::Result<
 /// [`apply_windows_verbatim_path_rekey`] with the spelling rule injected.
 ///
 /// The rule is a parameter so the ROW-WALKING half — which columns and which meta keys the pass
-/// covers — is testable on every platform. The real rule is inert off Windows, so a Unix-only test
-/// of the production entry point can only ever observe "nothing happened" and would pass just as
-/// well against a pass that covers no tables at all. `pub` for that reason alone: the engine's
-/// upgrade regression test drives a real multi-worktree index through this with a rule that is
-/// active everywhere, so the Linux gate sees the scope-restore and the GC-survival that the
-/// Windows leg then confirms under the production rule.
+/// covers — can be driven over a REAL index built on the host running the test. The production rule
+/// only ever rewrites the Windows verbatim shape, which no checkout on a Unix CI runner is spelled
+/// in; injecting a rule that maps the spellings such an index actually holds is what lets the Linux
+/// leg observe the scope-restore and the GC-survival, rather than observing "nothing happened" and
+/// passing just as well against a pass that covers no tables at all. `pub` for that reason alone.
 pub fn rekey_persisted_path_spellings(
     conn: &Connection,
     rekey: fn(&str) -> Option<String>,
@@ -6835,10 +6872,11 @@ fn rekey_worktree_overlay_basis_keys(
 mod windows_verbatim_rekey_tests {
     use super::*;
 
-    /// The stand-in spelling rule. The production rule (`paths::rekeyed_from_verbatim`) is the
-    /// identity on Unix by design, so driving this pass with it here would assert nothing: this
-    /// one is active on every platform, which is what lets the Linux gate observe that each
-    /// covered column and meta key is actually rewritten.
+    /// The stand-in spelling rule: a blind prefix strip. Used for the ROW-WALKING assertions —
+    /// which columns and which meta keys the sweep reaches — so those stay legible against a rule
+    /// with one obvious answer per input, and so the two halves fail separately. Which spellings
+    /// the PRODUCTION rule declines is `paths`' concern and is asserted there;
+    /// `the_production_pass_rekeys_a_windows_store_on_any_host` covers the two composed.
     fn strip_verbatim(stored: &str) -> Option<String> {
         stored.strip_prefix(r"\\?\").map(str::to_string)
     }
@@ -7012,23 +7050,20 @@ mod windows_verbatim_rekey_tests {
         assert_eq!(live, 1, "the row production just wrote is intact, not replaced or cascaded");
     }
 
-    /// The real entry point is a no-op on Unix: nothing in a Unix store was ever spelled verbatim,
-    /// and a pass that rewrote a path merely because it starts with those bytes would corrupt it.
-    #[cfg(unix)]
+    /// The real entry point, end-to-end, on WHICHEVER platform runs it — deliberately not
+    /// `cfg`-gated.
+    ///
+    /// Which spellings a store holds is a property of the store, not of the host that opens it: one
+    /// repository directory reachable from both a Windows path and a WSL/container mount is one
+    /// SQLite file, and whichever binary opens first is the one that runs the ladder. A pass that
+    /// converted only on Windows would let a non-Windows opener stamp V097 as applied without
+    /// converting anything, and the forward-only ladder would never revisit it — leaving the
+    /// Windows binary with exactly the spellings whose rows its next GC prunes as a dead checkout.
+    ///
+    /// So this asserts the conversion on Unix too, where the host-gated version returned before
+    /// opening the transaction and left every value below verbatim.
     #[test]
-    fn the_production_pass_is_inert_on_unix() {
-        let conn = poisoned_store();
-        apply_windows_verbatim_path_rekey(&conn).unwrap();
-        assert_eq!(
-            scalar(&conn, "SELECT worktree_id FROM files WHERE path = 'src/a.rs'"),
-            r"\\?\C:\repo",
-        );
-    }
-
-    /// The real entry point end-to-end on the platform that has the hazard.
-    #[cfg(windows)]
-    #[test]
-    fn the_production_pass_rekeys_on_windows() {
+    fn the_production_pass_rekeys_a_windows_store_on_any_host() {
         let conn = poisoned_store();
         apply_windows_verbatim_path_rekey(&conn).unwrap();
         assert_eq!(
@@ -7036,6 +7071,10 @@ mod windows_verbatim_rekey_tests {
             r"C:\repo",
         );
         assert_eq!(scalar(&conn, "SELECT root FROM repo_roots"), r"C:\repo");
+        assert_eq!(
+            scalar(&conn, "SELECT value FROM repo_meta WHERE key = 'git_history_indexed_root'"),
+            r"C:\repo",
+        );
         assert_eq!(
             scalar(&conn, "SELECT key FROM repo_meta WHERE key LIKE 'worktree_overlay_basis:%'"),
             r"worktree_overlay_basis:C:\linked",

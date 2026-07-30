@@ -1480,8 +1480,6 @@ fn migration_092_normalizes_invite_receipts() {
 /// it, so the assertion keeps meaning something when a later migration also touches it.
 #[test]
 fn migration_096_holds_entries_awaiting_a_chain_predecessor() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 96, "move this pin with the next schema migration");
-
     let bare = rusqlite::Connection::open_in_memory().unwrap();
     assert!(
         !schema::table_exists(&bare, "table_sync_gapped_entries").unwrap(),
@@ -1976,13 +1974,31 @@ fn migration_094_tracks_lens_enrichment_changes_in_constant_time() {
 
 /// V097 (#1048) rekeys the persisted Windows path spellings an older binary wrote in the `\\?\`
 /// verbatim form, so an upgrade does not orphan every scoped row it indexed.
+///
+/// Both halves have to be host-independent, and this pins the LEDGER half. A store migrated on
+/// Linux must read as current to a Windows binary — otherwise it is `Older` there and the whole
+/// tail re-runs — and a store migrated on Windows must not read as `Newer` on Linux and refuse to
+/// open at all. Asserted on whichever platform runs it, so the legs of CI check it between them.
+///
+/// The ROW half is host-independent too, and is pinned separately by
+/// `the_production_pass_rekeys_a_windows_store_on_any_host`: the rekey rule decides a property of
+/// the stored string rather than of the host, precisely so this ledger row cannot be stamped by a
+/// binary that did not do the work.
 #[test]
-fn migration_096_rekeys_the_persisted_windows_path_spellings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 96, "move this pin with the next schema migration");
+fn migration_097_records_the_same_ladder_entry_on_every_platform() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 97, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    let status = schema::status(&conn).unwrap();
+    assert_eq!(status.current_version, schema::LATEST_SCHEMA_VERSION);
+    // `Compatible` is the load-bearing half: a ledger row that recorded a DIFFERENT checksum on
+    // this platform would surface as `Dirty` here, and a skipped stamp as `Older`.
+    assert_eq!(
+        status.state,
+        schema::SchemaState::Compatible,
+        "V097's ledger row must be stamped identically wherever the migration runs",
+    );
     let recorded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM schema_version WHERE id = '097_windows_verbatim_path_rekey'",
@@ -2004,7 +2020,7 @@ fn migration_096_rekeys_the_persisted_windows_path_spellings() {
 /// `worktree_id` silently misses the rekey and its rows are pruned as a dead checkout on the next
 /// Windows upgrade — exactly the failure V097 exists to prevent, one table at a time.
 #[test]
-fn migration_096_covers_every_worktree_id_column_in_the_schema() {
+fn migration_097_covers_every_worktree_id_column_in_the_schema() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 

@@ -44,7 +44,7 @@ pub(crate) use discovery::{
 /// dedicated table: it is a marker, not queried relationally, and the
 /// `watch_shutdown_reconcile_pending` marker set the pattern.
 ///
-/// The literal itself is owned by `rag-rat-db`: the V096 rekey (#1048) has to find these keys to
+/// The literal itself is owned by `rag-rat-db`: the V097 rekey (#1048) has to find these keys to
 /// rewrite a stale Windows path spelling in their `worktree_id` suffix, and migrations sit below
 /// this crate. Aliasing it here rather than repeating it is what keeps the rekey and these reads
 /// from drifting into a silent miss.
