@@ -40,6 +40,15 @@
 //! log — no `repo_id`, keyed by device/account/`stream_id`, and excluded from the per-repo
 //! consolidate import for the same reason). None of these carry a `repo_id` column, so the
 //! class-level sweep leaves them untouched.
+//!
+//! `table_sync_entries` is the ONE stream-keyed sync table that departs from that posture, and the
+//! reason is that its stream id is DERIVED rather than random (#1004): `scope_stream_id` is a pure
+//! function of `(repo_id, account_id, scope_id)`, so re-registering the same repo recreates the
+//! identical stream mapping and a later projector bump replays the removed repo's parked operations
+//! straight back into it. Retention is only safe where the key cannot be regenerated. The stream
+//! directory `table_sync_streams` carries a `repo_id` and is swept by the class sweep, so the two
+//! halves have to agree — retaining the entries while dropping the directory that places them is
+//! the shape that resurrects history.
 
 use rusqlite::{Connection, params};
 
@@ -65,6 +74,7 @@ mod purge_ids {
     pub const SYMBOLS: &str = "temp.rmp_symbol_ids";
     pub const MEMORIES: &str = "temp.rmp_memory_ids";
     pub const GENERATIONS: &str = "temp.rmp_generation_ids";
+    pub const STREAMS: &str = "temp.rmp_stream_ids";
 }
 
 /// Every transitively-scoped child, child-first (a child appears before the parent whose id set it
@@ -146,6 +156,14 @@ const TRANSITIVE_SCOPED_TABLES: &[TransitiveTable] = &[
         table: "clone_df_epoch",
         id_column: "build_generation",
         parent_ids: purge_ids::GENERATIONS,
+    },
+    // The table-sync entry log (table_sync_streams.stream_id → stream_id). Captured through the
+    // directory because the stream id is a one-way hash and cannot be re-derived once the
+    // directory row is swept — see the module docs for why this log is purged at all.
+    TransitiveTable {
+        table: "table_sync_entries",
+        id_column: "stream_id",
+        parent_ids: purge_ids::STREAMS,
     },
 ];
 
@@ -264,6 +282,7 @@ fn parent_id_select(parent_ids: &str) -> &'static str {
         purge_ids::MEMORIES => "SELECT id FROM repo_memories WHERE repo_id = ?1",
         purge_ids::GENERATIONS =>
             "SELECT generation FROM clone_graph_generations WHERE repo_id = ?1",
+        purge_ids::STREAMS => "SELECT stream_id FROM table_sync_streams WHERE repo_id = ?1",
         other => unreachable!("unknown purge id set {other}"),
     }
 }
@@ -373,6 +392,17 @@ fn capture_purge_ids(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
         ),
         params![repo_id],
     )?;
+    // Same aliasing for the sync stream directory. This capture is what makes the entry-log delete
+    // possible at all: `stream_id` is a one-way hash of `(repo_id, account_id, scope_id)`, so once
+    // the class sweep removes the directory row there is no way back from an entry to its repo.
+    conn.execute(
+        &format!(
+            "CREATE TEMP TABLE {} AS SELECT stream_id AS id FROM table_sync_streams WHERE repo_id \
+             = ?1",
+            temp_name(purge_ids::STREAMS)
+        ),
+        params![repo_id],
+    )?;
     Ok(())
 }
 
@@ -383,6 +413,7 @@ fn drop_purge_ids(conn: &Connection) -> anyhow::Result<()> {
         purge_ids::SYMBOLS,
         purge_ids::MEMORIES,
         purge_ids::GENERATIONS,
+        purge_ids::STREAMS,
     ] {
         conn.execute(&format!("DROP TABLE IF EXISTS {temp}"), [])?;
     }

@@ -555,6 +555,34 @@ mod tests {
         .unwrap();
     }
 
+    /// Seed one table-sync stream directory row for `repo_id` plus one entry on that stream, and
+    /// return the stream id. The entry log carries no `repo_id` and is reached ONLY through the
+    /// directory (#1004), so without this the stream-keyed half of the purge is unobservable — the
+    /// class-level assertion below would pass on an empty table and prove nothing.
+    fn seed_table_sync_stream(conn: &rusqlite::Connection, repo_id: &str, seed: u8) -> Vec<u8> {
+        let stream_id = vec![seed; 32];
+        conn.execute(
+            "INSERT INTO table_sync_streams(stream_id, repo_id, account_id, scope_id) VALUES (?1, \
+             ?2, ?3, 'demo/1')",
+            params![stream_id, repo_id, vec![seed; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO table_sync_entries(entry_hash, stream_id, device_fingerprint, lamport, \
+             prev_hash, signed_bytes, received_at_ms) VALUES (?1, ?2, ?3, 1, NULL, ?4, 0)",
+            params![vec![seed; 32], stream_id, vec![seed; 32], vec![seed; 8]],
+        )
+        .unwrap();
+        stream_id
+    }
+
+    /// A blob as a SQL `X'..'` literal, for the stream-keyed orphan check (the other id sets are
+    /// integers or text).
+    fn blob_literal(bytes: &[u8]) -> String {
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        format!("X'{hex}'")
+    }
+
     /// Assert NO orphan survives the purge in ANY transitive child — checked against the parent id
     /// sets CAPTURED BEFORE the purge, so a row whose parent was deleted but which itself was
     /// missed (the exact escape a hand-list allows) is still caught. `NULL` id sets match
@@ -567,6 +595,7 @@ mod tests {
         symbols: &[i64],
         memory_id: &str,
         generation: Option<i64>,
+        stream_id: &[u8],
     ) {
         let file_in = in_clause(files);
         let chunk_in = in_clause(chunks);
@@ -592,6 +621,7 @@ mod tests {
             ("clone_edges", "build_generation", generation_in.clone()),
             ("clone_subblock_postings", "build_generation", generation_in.clone()),
             ("clone_df_epoch", "build_generation", generation_in),
+            ("table_sync_entries", "stream_id", blob_literal(stream_id)),
         ];
         for (table, column, in_body) in checks {
             let count: i64 = conn
@@ -696,6 +726,12 @@ mod tests {
             .unwrap();
         let a_null_source_edge = seed_chunk_symbol_children(conn, "a", a_chunk, a_symbol);
 
+        // A table-sync stream + one entry on it for each repo. Seeded BEFORE the counts below so
+        // A's entry is inside the parity check: the entry log has no `repo_id`, so a purge that
+        // deleted it by anything other than B's captured stream ids would show up as A losing rows.
+        let b_stream = seed_table_sync_stream(conn, POISON_REPO_ID, 0xbb);
+        let a_stream = seed_table_sync_stream(conn, &repo_a, 0xaa);
+
         // The full class-level table set, captured from the LIVE schema. A subset here would
         // silently narrow the guarantee, so pin a floor on its breadth.
         let repo_id_tables = repo_scoped_table_names(conn).unwrap();
@@ -745,7 +781,31 @@ mod tests {
             &b_symbols,
             &b_memory,
             Some(b_generation),
+            &b_stream,
         );
+        // The stream-keyed half of #1004 explicitly: the directory row is gone via the class sweep,
+        // and the entries that only it could place are gone with it. Retaining them would let a
+        // re-registration of the same repo — whose stream id is a pure function of
+        // `(repo_id, account_id, scope_id)` — replay the removed repo's operations back into it.
+        let b_streams_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM table_sync_streams WHERE repo_id = ?1",
+                params![POISON_REPO_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_streams_left, 0, "the removed repo's stream directory rows are swept");
+        let a_entries: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM table_sync_entries WHERE stream_id = {}",
+                    blob_literal(&a_stream)
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_entries, 1, "the sibling's stream-keyed entries survive the scoped purge");
         let edge_exists = |id: i64| -> bool {
             conn.query_row("SELECT EXISTS(SELECT 1 FROM edges_data WHERE id = ?1)", [id], |row| {
                 row.get(0)
