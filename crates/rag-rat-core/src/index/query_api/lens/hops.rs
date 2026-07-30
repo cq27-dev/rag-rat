@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 
 use rag_rat_query::graph::{self, GraphTraversalOptions};
-use rusqlite::{Connection, OptionalExtension as _, params_from_iter};
+use rusqlite::{Connection, params_from_iter};
 use serde::Serialize;
 
+use super::handles;
 use crate::index::IndexDatabase;
 
 /// How a hop request names the symbol it wants the neighbours of.
@@ -15,13 +16,15 @@ use crate::index::IndexDatabase;
 /// — the grouping key folds the signature in, so `Alpha::run(&self)` and `Beta::run(&self, extra:
 /// i64)` are different logical symbols even though both qualify as `src/lib.rs::run`.
 ///
-/// It separates them exactly as far as that key does, and no further: the signature the key folds
-/// in is the declaration's first line, so overloads that DECLARE identically (`fn new() -> Self {`
-/// on two impls, one trait method implemented for several types in a file) land in one logical
-/// symbol and behind one handle, which then answers for the group. That is a property of the
-/// grouping key — which is deliberately body-insensitive so a symbol keeps its handle, and its
-/// bound memories, across an edit — not something a hop route can narrow. What the route owes a
-/// reader instead is an honest count: see [`LensCallers::matched_symbols`].
+/// It separates them exactly as far as that key does, and no further. Some declarations belong in
+/// one logical symbol on purpose — a function's cfg variants are one entity the build picks one
+/// spelling of — and others land there because the key cannot yet tell them apart. Either way the
+/// handle answers for the whole group, and how precise the grouping is belongs to the layer that
+/// computes the key, not to a hop route: minting a second, declaration-level identity here would
+/// answer differently from every other handle-keyed surface (repo-memory bindings included) for
+/// the same declaration. What the route owes a reader instead is an honest count of what the
+/// handle it was given reached — see [`LensCallers::matched_symbols`], and
+/// `LensSymbol::logical_symbol_declarations` where the handle is handed out.
 #[derive(Clone, Debug)]
 pub enum LensHopSelector {
     /// Preferred: the `sym_<hex>` handle, already decoded to its logical-symbol id.
@@ -58,13 +61,12 @@ pub struct LensCallers {
     /// answer precisely where the handle covers a group.
     ///
     /// The lanes count different sets. On the handle lane it is the logical symbol's scope-visible
-    /// member rows: one for almost every symbol, more for a group holding a symbol's cfg variants
-    /// or several same-file symbols the grouping key could not tell apart (identical declaration
-    /// lines — see [`LensHopSelector`]). On the fallback lane it is every symbol the traversal
-    /// seeds from the name — by qualified name, or by short name while that short name is
-    /// unambiguous. Zero therefore means the name expanded to no symbol at all, never that the
-    /// answer is unknown, and only the fallback lane can report it: a handle with no scope-visible
-    /// member is absent, not empty.
+    /// member rows — the same number `/api/file/{symbols,graph}` reports as `id_declarations`
+    /// beside that handle (see [`LensHopSelector`]). On the fallback lane it is every symbol the
+    /// traversal seeds from the name — by qualified name, or by short name while that short name
+    /// is unambiguous. Zero therefore means the name expanded to no symbol at all, never that
+    /// the answer is unknown, and only the fallback lane can report it: a handle with no
+    /// scope-visible member is absent, not empty.
     pub matched_symbols: u64,
 }
 
@@ -180,8 +182,10 @@ impl IndexDatabase {
     ) -> anyhow::Result<Option<HopTraversal>> {
         match selector {
             LensHopSelector::Handle(logical_symbol_id) => {
-                let Some((seed, matched_symbols)) =
-                    logical_symbol_in_scope(self.storage.connection(), *logical_symbol_id)?
+                let Some((seed, matched_symbols)) = handles::logical_symbol_in_scope(
+                    self.storage.connection(),
+                    *logical_symbol_id,
+                )?
                 else {
                     return Ok(None);
                 };
@@ -209,32 +213,6 @@ impl IndexDatabase {
             })),
         }
     }
-}
-
-/// The logical symbol's qualified name and how many members it has IN THE ACTIVE SCOPE. Scoping
-/// through the `files` view is what makes a handle minted in a sibling checkout read as absent
-/// instead of resolving against rows this checkout cannot see; `None` means no member survives.
-fn logical_symbol_in_scope(
-    conn: &Connection,
-    logical_symbol_id: i64,
-) -> anyhow::Result<Option<(String, u64)>> {
-    let row = conn
-        .query_row(
-            // Short name as the second-choice seed: `qualified_name_id` is nullable, and a seed of
-            // `''` leaves the traversal's query log naming nothing at all.
-            "SELECT COALESCE(MIN(qn.value), MIN(symbols.name), ''), COUNT(*)
-             FROM logical_symbol_members member
-             JOIN symbols ON symbols.id = member.symbol_id
-             JOIN files ON files.id = symbols.file_id
-             LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
-             WHERE member.logical_symbol_id = ?1",
-            [logical_symbol_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()?;
-    Ok(row
-        .filter(|(_, members)| *members > 0)
-        .map(|(qualified_name, members)| (qualified_name, u64::try_from(members).unwrap_or(0))))
 }
 
 pub(super) fn adapt_hops(

@@ -17,10 +17,10 @@ export interface Status {
 /**
  * How a hop request names its symbol. `id` — the server's opaque `sym_<hex>` symbol handle — is
  * the stable identity and the only selector that separates two overloads: they share a qualified
- * name, so `qname` alone reports the union of their callers. Overloads that DECLARE identically
- * share a handle too, and the answer then reports how many symbols it covered. `qname` remains as
- * the fallback for a row the server could not hand a handle for, and for a handle it no longer
- * knows.
+ * name, so `qname` alone reports the union of their callers. Declarations the server groups under
+ * one identity share a handle too, and both the row that hands it out and the answer it produces
+ * report how far it reaches. `qname` remains as the fallback for a row the server could not hand a
+ * handle for, and for a handle it no longer knows.
  */
 export interface SymbolSelector {
   id: string | null;
@@ -46,6 +46,8 @@ export interface SymbolCallers {
 export interface FileSymbol {
   /** Opaque `sym_<hex>` symbol handle — pass it back verbatim; never parse it as a number. */
   id: string | null;
+  /** Declarations `id` covers — see [`SymbolGraph.id_declarations`]. */
+  id_declarations?: number;
   name: string;
   qname: string | null;
   kind: string;
@@ -117,6 +119,15 @@ export interface FileMemory {
 export interface SymbolGraph {
   /** Opaque `sym_<hex>` symbol handle — pass it back verbatim; never parse it as a number. */
   id: string | null;
+  /**
+   * How many declarations `id` covers. `1` for almost every row; `> 1` where the server groups
+   * several declarations — a function's cfg variants, say — under one identity, so a hop request
+   * carrying this handle is answered for all of them and no selector can narrow it further.
+   *
+   * OPTIONAL because a server built before this field sends nothing, and absence must read as
+   * "this server cannot say" rather than an assumed `1`.
+   */
+  id_declarations?: number;
   name: string;
   qname: string | null;
   kind: string;

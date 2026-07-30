@@ -2418,6 +2418,82 @@ test('each overload lens carries its own symbol handle', async () => {
   ]);
 });
 
+test('a lens whose handle covers several declarations says so before it is clicked', async () => {
+  const lenses = [];
+  const vscode = {
+    CodeLens: class {
+      constructor(range, command) {
+        Object.assign(this, { range, command });
+        lenses.push(this);
+      }
+    },
+    EventEmitter: class {
+      constructor() {
+        this.event = () => ({ dispose() {} });
+      }
+      fire() {}
+      dispose() {}
+    },
+    Range: class {
+      constructor(startLine) {
+        this.startLine = startLine;
+      }
+    },
+  };
+  const { SignalLensProvider, sharedHandleMarker } = await loadSourceModule('lenses.ts', vscode);
+
+  // The reach is only worth rendering when it exceeds this row: `1` is what almost every symbol
+  // reports, and an absent field is a server that cannot say — neither qualifies anything.
+  assert.equal(sharedHandleMarker(undefined), undefined);
+  assert.equal(sharedHandleMarker(1), undefined);
+  assert.equal(sharedHandleMarker(0), undefined);
+  assert.equal(sharedHandleMarker(2).title, '  ⧉2');
+  assert.match(sharedHandleMarker(2).tooltip, /1 other declaration —/);
+  assert.match(sharedHandleMarker(3).tooltip, /2 other declarations —/);
+
+  const symbol = (id_declarations, startLine) => ({
+    id: 'sym_shared',
+    id_declarations,
+    name: 'run',
+    qname: 'src/lib.rs::run',
+    kind: 'function',
+    start_line: startLine,
+    end_line: startLine,
+    is_test: false,
+    callers: { exact: 1, syntactic: 0, name_only: 0, ambiguous: 0, tests: 0, dispatch: 0 },
+    fan_in_score: 1,
+    fan_in_bucket: 'low',
+    dispatch: [],
+  });
+  const alone = symbol(1, 9);
+  const legacy = symbol(undefined, 17);
+  delete legacy.id_declarations;
+  const provider = new SignalLensProvider({
+    dataFor: async () => ({
+      data: {
+        symbols: [alone, symbol(2, 13), legacy],
+        coupling: [],
+        refs: [],
+        decisions: [],
+        clones: [],
+      },
+    }),
+  });
+
+  await provider.provideCodeLenses({ lineCount: 40 });
+  const callerLenses = lenses.filter((lens) => lens.command.command === 'rag-rat-lens.showCallers');
+  // The count in the title is this declaration's own, but the quick pick behind the grouped row
+  // answers for both — so that row, and only that row, carries the qualifier.
+  assert.deepEqual(
+    callerLenses.map((lens) => lens.command.title),
+    ['⤴ 1 (1 exact)', '⤴ 1 (1 exact)  ⧉2', '⤴ 1 (1 exact)'],
+  );
+  assert.deepEqual(
+    callerLenses.map((lens) => lens.command.tooltip),
+    [undefined, sharedHandleMarker(2).tooltip, undefined],
+  );
+});
+
 test('the hover link dispatches show callers exactly as the lens does', async () => {
   const vscode = {
     MarkdownString: class {
@@ -2459,14 +2535,18 @@ test('the hover link dispatches show callers exactly as the lens does', async ()
   // rather than a null one.
   const legacy = row(null, 'src/lib.rs::legacy', 25);
   delete legacy.id;
+  const grouped = row('sym_shared', 'src/lib.rs::grouped', 29);
+  grouped.id_declarations = 2;
   const symbols = [
     row('sym_alpha', 'src/lib.rs::run', 9),
     row('sym_beta', 'src/lib.rs::run', 13),
     row(null, 'src/lib.rs::only_named', 17),
     row(null, null, 21),
     legacy,
+    grouped,
   ];
   const provider = new GraphHoverProvider({ dataFor: async () => ({ data: { symbols } }) });
+  const hoverText = async (line) => (await provider.provideHover({}, { line: line - 1 })).contents.value;
   const commandArguments = async (line) => {
     const hover = await provider.provideHover({}, { line: line - 1 });
     const link = /command:rag-rat-lens\.showCallers\?([^)]*)\)/.exec(hover.contents.value);
@@ -2488,6 +2568,10 @@ test('the hover link dispatches show callers exactly as the lens does', async ()
   // `undefined` field, so the hover would otherwise ship a selector one key short of the one the
   // CodeLens dispatches — a shape difference no typecheck can see across a `command:` URI.
   assert.deepEqual(await commandArguments(25), [{ id: null, qname: 'src/lib.rs::legacy' }, 'run']);
+  // The hover offers the same link, so it owes the same qualifier: the counts above it are this
+  // declaration's, the link below it answers for both.
+  assert.match(await hoverText(29), /⧉ This symbol shares one identity with 1 other declaration/);
+  assert.doesNotMatch(await hoverText(9), /⧉/);
 });
 
 test('a symbol handle the server no longer knows falls back to the name, not to rediscovery', async (t) => {

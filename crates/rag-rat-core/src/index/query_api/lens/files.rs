@@ -9,6 +9,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use unicase::UniCase;
 
+use super::handles;
 use crate::index::IndexDatabase;
 
 #[derive(Debug, Serialize)]
@@ -20,14 +21,17 @@ pub struct LensFileSymbols {
 pub struct LensSymbol {
     /// The stable `sym_<hex>` logical-symbol handle, and the selector a hop request should send
     /// back: a qualified name is shared by every overload in the file, while this is shared only
-    /// by overloads the grouping key cannot tell apart (identical declaration lines), and a hop
-    /// answer says how many symbols the handle it was given covered. `None` only where the symbol
-    /// has no logical-symbol member row in the active scope.
+    /// by declarations the grouping key cannot tell apart. `None` only where the symbol has no
+    /// logical-symbol member row in the active scope.
     #[serde(
         rename = "id",
         serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize"
     )]
     pub logical_symbol_id: Option<i64>,
+    /// How many declarations `id` covers in the active checkout — see
+    /// [`LensFileSymbolGraph::logical_symbol_declarations`], which carries the same contract.
+    #[serde(rename = "id_declarations")]
+    pub logical_symbol_declarations: u64,
     pub name: String,
     pub qname: Option<String>,
     pub kind: String,
@@ -54,6 +58,23 @@ pub struct LensFileSymbolGraph {
         serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize"
     )]
     pub logical_symbol_id: Option<i64>,
+    /// How many DECLARATIONS `id` covers in the active checkout. `1` for almost every row; `0`
+    /// where there is no handle at all.
+    ///
+    /// `> 1` is the case a handle cannot express, and it has to be on the wire rather than left
+    /// for a reader to infer. The grouping key is deliberately coarser than a declaration — cfg
+    /// variants of one function are one symbol on purpose, and languages whose overloads the key
+    /// cannot separate land in one group the same way — so a hop request carrying this handle is
+    /// answered for the whole group, and the answer's `matched_symbols` repeats this number. A row
+    /// that offered the handle while saying nothing about its reach would present a union as a
+    /// definite answer, which is the failure mode the handle exists to remove.
+    ///
+    /// Narrowing a genuinely-shared handle is the identity layer's job, not this route's: what
+    /// belongs in one logical symbol is decided where the grouping key is computed, and a second,
+    /// declaration-level identity minted here would answer differently from every other
+    /// handle-keyed surface (repo-memory bindings included) for the same declaration.
+    #[serde(rename = "id_declarations")]
+    pub logical_symbol_declarations: u64,
     pub name: String,
     pub qname: Option<String>,
     pub kind: String,
@@ -89,6 +110,7 @@ pub struct LensDispatchDetail {
 struct FileSymbolRow {
     id: i64,
     logical_symbol_id: Option<i64>,
+    logical_symbol_declarations: u64,
     name: String,
     qname: Option<String>,
     kind: String,
@@ -154,6 +176,7 @@ impl IndexDatabase {
             .into_iter()
             .map(|row| LensSymbol {
                 logical_symbol_id: row.logical_symbol_id,
+                logical_symbol_declarations: row.logical_symbol_declarations,
                 name: row.name,
                 qname: row.qname,
                 kind: row.kind,
@@ -212,6 +235,7 @@ impl IndexDatabase {
                 let load = importance.get(&row.id);
                 LensFileSymbolGraph {
                     logical_symbol_id: row.logical_symbol_id,
+                    logical_symbol_declarations: row.logical_symbol_declarations,
                     name: row.name,
                     qname: row.qname,
                     kind: row.kind,
@@ -246,7 +270,11 @@ fn list_file_symbols_with_graph_counts(
     conn: &Connection,
     path: &str,
 ) -> anyhow::Result<Vec<FileSymbolRow>> {
-    let mut stmt = conn.prepare(
+    // Counted in the same statement rather than per row: a file lens is drawn on every open, and
+    // the handle's reach has to travel WITH the handle — a client that has to ask a second route
+    // whether the selector it was just handed disambiguates has already rendered it as if it did.
+    let declarations = handles::scope_visible_members_sql("requested.logical_symbol_id");
+    let mut stmt = conn.prepare(&format!(
         // `logical_symbol_members` is keyed `(logical_symbol_id, symbol_id)`, and a symbol belongs
         // to at most one logical symbol, so the LEFT JOIN cannot duplicate a requested row.
         "WITH requested AS MATERIALIZED (
@@ -281,7 +309,8 @@ fn list_file_symbols_with_graph_counts(
              JOIN files target_file ON target_file.id = target_symbol.file_id
              GROUP BY e.from_symbol_id
          )
-         SELECT requested.id, requested.logical_symbol_id, requested.name, requested.qname,
+         SELECT requested.id, requested.logical_symbol_id, {declarations},
+                requested.name, requested.qname,
                 requested.kind, requested.start_line, requested.end_line, requested.is_test,
                 requested.signature,
                 COALESCE(incoming.fan_in, 0), COALESCE(outgoing.fan_out, 0),
@@ -291,28 +320,29 @@ fn list_file_symbols_with_graph_counts(
          FROM requested
          LEFT JOIN incoming ON incoming.symbol_id = requested.id
          LEFT JOIN outgoing ON outgoing.symbol_id = requested.id
-         ORDER BY requested.start_line, requested.id",
-    )?;
+         ORDER BY requested.start_line, requested.id"
+    ))?;
     let rows = stmt.query_map([path], |row| {
         Ok(FileSymbolRow {
             id: row.get(0)?,
             logical_symbol_id: row.get(1)?,
-            name: row.get(2)?,
-            qname: row.get(3)?,
-            kind: row.get(4)?,
-            start_line: row.get(5)?,
-            end_line: row.get(6)?,
-            is_test: row.get(7)?,
-            signature: row.get(8)?,
-            fan_in: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
-            fan_out: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
+            logical_symbol_declarations: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+            name: row.get(3)?,
+            qname: row.get(4)?,
+            kind: row.get(5)?,
+            start_line: row.get(6)?,
+            end_line: row.get(7)?,
+            is_test: row.get(8)?,
+            signature: row.get(9)?,
+            fan_in: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
+            fan_out: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
             callers: LensGraphCallerCounts {
-                exact: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
-                syntactic: u64::try_from(row.get::<_, i64>(12)?).unwrap_or(0),
-                name_only: u64::try_from(row.get::<_, i64>(13)?).unwrap_or(0),
-                ambiguous: u64::try_from(row.get::<_, i64>(14)?).unwrap_or(0),
-                tests: u64::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
-                dispatch: u64::try_from(row.get::<_, i64>(16)?).unwrap_or(0),
+                exact: u64::try_from(row.get::<_, i64>(12)?).unwrap_or(0),
+                syntactic: u64::try_from(row.get::<_, i64>(13)?).unwrap_or(0),
+                name_only: u64::try_from(row.get::<_, i64>(14)?).unwrap_or(0),
+                ambiguous: u64::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
+                tests: u64::try_from(row.get::<_, i64>(16)?).unwrap_or(0),
+                dispatch: u64::try_from(row.get::<_, i64>(17)?).unwrap_or(0),
             },
         })
     })?;

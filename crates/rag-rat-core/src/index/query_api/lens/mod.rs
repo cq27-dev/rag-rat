@@ -9,6 +9,7 @@ mod chunks;
 pub(crate) mod clones;
 mod enrichments;
 mod files;
+mod handles;
 mod hops;
 mod status;
 mod treemap;

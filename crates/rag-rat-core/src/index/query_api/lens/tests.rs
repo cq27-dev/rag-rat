@@ -1225,8 +1225,8 @@ fn file_papertrail_deduplicates_items_before_applying_the_limit() {
 
 /// Two `run` overloads in one file. Both qualify as `src/lib.rs::run`; only their declarations —
 /// and therefore their logical-symbol handles — differ, which is exactly the case a qualified-name
-/// selector cannot express. [`COLLAPSED_OVERLOAD_SOURCE`] is the other half of the story: what
-/// happens when the declarations do not differ either.
+/// selector cannot express. [`CFG_VARIANT_SOURCE`] is the other half of the story: what a handle
+/// answers when the declarations behind it are one symbol.
 const OVERLOAD_SOURCE: &str = r#"
 pub struct Alpha;
 pub struct Beta;
@@ -1352,60 +1352,67 @@ fn a_handle_attributes_a_bound_edge_by_membership_and_an_unbound_one_by_name() {
     assert_eq!(callers(beta), ["calls_beta"]);
 }
 
-/// Two `run` overloads whose DECLARATION LINES are byte-identical, so the only thing that told the
-/// overloads in [`OVERLOAD_SOURCE`] apart is gone. The bodies are multi-line on purpose: the
-/// signature the grouping key folds in is the declaration's first non-empty line, which for a
-/// single-line body would include the body and separate these two again.
-const COLLAPSED_OVERLOAD_SOURCE: &str = r#"
-pub struct Alpha;
-pub struct Beta;
+/// One function, two cfg variants. This is what the grouping key is FOR — a single entity the
+/// build picks one spelling of — so unlike two impls that merely happen to declare alike, these
+/// stay one logical symbol behind one handle no matter how precise symbol identity becomes.
+const CFG_VARIANT_SOURCE: &str = r#"
+pub fn unix_leaf() {}
+pub fn windows_leaf() {}
 
-pub fn alpha_leaf() {}
-pub fn beta_leaf() {}
-
-impl Alpha {
-    pub fn run(&self) {
-        alpha_leaf();
-    }
+#[cfg(unix)]
+pub fn run() {
+    unix_leaf();
 }
 
-impl Beta {
-    pub fn run(&self) {
-        beta_leaf();
-    }
+#[cfg(windows)]
+pub fn run() {
+    windows_leaf();
 }
 "#;
 
-/// PINS THE LIMIT OF THE HANDLE. Overloads that declare identically land in ONE logical symbol, so
-/// they share one handle and the handle lane answers for the whole group — `fn new() -> Self {` on
-/// two impls, or one trait method implemented for several types in a module, are the everyday
-/// shapes of this. Separating them is a property of the grouping key (which folds in the
-/// declaration line so a symbol keeps its handle when its body changes), not of the hop routes.
+/// PINS THE LIMIT OF THE HANDLE, on the case where the limit is permanent. Members of one logical
+/// symbol share one handle, so a hop request carrying it is answered for the whole group — and
+/// there is no identity refinement that could separate cfg variants, because they ARE one symbol.
 ///
-/// What the routes owe a reader is therefore not precision they cannot have but an honest count:
-/// `matched_symbols` reports the group's members on the handle lane exactly as it reports the
-/// name's symbols on the fallback lane, so `> 1` means "a union" on BOTH lanes and a surface has
-/// one rule to render. Were this to report 1, a client would state the narrow claim over the wide
-/// answer with nothing on the wire to contradict it.
+/// What the routes owe a reader is therefore not precision they cannot have but an honest count,
+/// on both surfaces: `id_declarations` beside the handle that is handed out, and `matched_symbols`
+/// beside the answer it produces. Were either to report 1, a client would state the narrow claim
+/// over the wide answer with nothing on the wire to contradict it.
 #[test]
-fn a_handle_covering_identically_declared_overloads_reports_them_all() {
-    let (_temp, config) = collapsed_overload_config();
+fn a_handle_covering_one_symbols_cfg_variants_reports_them_all() {
+    let (_temp, config) = cfg_variant_config();
     let db = IndexDatabase::try_open_config_read_only(&config).unwrap().expect("read-only index");
 
     let symbols = db.lens_file_symbols("src/lib.rs").unwrap().symbols;
     let runs = symbols.iter().filter(|symbol| symbol.name == "run").collect::<Vec<_>>();
     assert_eq!(runs.len(), 2);
-    assert!(runs.iter().all(|symbol| symbol.signature.as_deref() == Some("pub fn run(&self) {")));
     let shared = runs[0].logical_symbol_id.expect("both rows carry a handle");
     assert_eq!(
         runs[1].logical_symbol_id,
         Some(shared),
-        "identical declaration lines collapse into one logical symbol, so one handle"
+        "cfg variants of one function are one logical symbol, so one handle"
     );
+    assert!(
+        runs.iter().all(|symbol| symbol.logical_symbol_declarations == 2),
+        "the row that hands out a grouped handle must say how far it reaches: {runs:?}"
+    );
+    let graph = db.lens_file_graph("src/lib.rs").unwrap().symbols;
+    assert!(
+        graph
+            .iter()
+            .filter(|symbol| symbol.name == "run")
+            .all(|symbol| symbol.logical_symbol_declarations == 2),
+        "both file lanes hand out the same handle, so both owe the same reach: {graph:?}"
+    );
+    let leaf = symbols
+        .iter()
+        .find(|symbol| symbol.name == "unix_leaf")
+        .expect("the fixture must index unix_leaf");
+    assert_eq!(leaf.logical_symbol_declarations, 1, "an ungrouped handle covers its one row");
 
     let callees =
         db.lens_symbol_callees(&LensHopSelector::Handle(shared), 50).unwrap().expect("shared");
-    assert_eq!(hop_names(&callees.callees), ["alpha_leaf", "beta_leaf"]);
+    assert_eq!(hop_names(&callees.callees), ["unix_leaf", "windows_leaf"]);
     assert_eq!(callees.resolved_by, LensHopResolvedBy::Id);
     assert_eq!(
         callees.matched_symbols, 2,
@@ -1704,10 +1711,10 @@ fn overloaded_config() -> (tempfile::TempDir, Config) {
     (temp, config)
 }
 
-/// Index [`COLLAPSED_OVERLOAD_SOURCE`]. No call sites to rewire: each overload's own body reaches
-/// its own leaf, so the callee direction alone shows what the shared handle expands to.
-fn collapsed_overload_config() -> (tempfile::TempDir, Config) {
-    let (temp, config) = rust_source_config(COLLAPSED_OVERLOAD_SOURCE);
+/// Index [`CFG_VARIANT_SOURCE`]. No call sites to rewire: each variant's own body reaches its own
+/// leaf, so the callee direction alone shows what the shared handle expands to.
+fn cfg_variant_config() -> (tempfile::TempDir, Config) {
+    let (temp, config) = rust_source_config(CFG_VARIANT_SOURCE);
     drop(IndexDatabase::rebuild(&config).unwrap());
     (temp, config)
 }

@@ -730,6 +730,23 @@ pub fn calls_alpha(alpha: &Alpha) { alpha.run(); }
 pub fn calls_beta(beta: &Beta) { beta.run(1); }
 "#;
 
+/// One function's cfg variants: one logical symbol, one handle, two declarations behind it — the
+/// case no selector can narrow, so the route has to report the reach instead.
+const CFG_VARIANT_SOURCE: &str = r#"
+pub fn unix_leaf() {}
+pub fn windows_leaf() {}
+
+#[cfg(unix)]
+pub fn run() {
+    unix_leaf();
+}
+
+#[cfg(windows)]
+pub fn run() {
+    windows_leaf();
+}
+"#;
+
 /// The whole protocol on one fixture: `/api/file/graph` hands out a handle per overload, and the
 /// hop routes answer each handle with that overload's own neighbours. The `qname` fallback stays
 /// reachable and says, in the response, that it covered two symbols at once.
@@ -738,6 +755,7 @@ async fn hop_routes_prefer_the_symbol_handle_over_the_shared_qualified_name() {
     let (root, config) = test_config();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), OVERLOAD_SOURCE).unwrap();
+    fs::write(root.join("src/cfg.rs"), CFG_VARIANT_SOURCE).unwrap();
     drop(IndexDatabase::rebuild(&config).unwrap());
     let conn = rusqlite::Connection::open(&config.database).unwrap();
     resolve_overload_call_sites(&conn);
@@ -754,6 +772,10 @@ async fn hop_routes_prefer_the_symbol_handle_over_the_shared_qualified_name() {
         .collect::<Vec<_>>();
     assert_eq!(handles.len(), 2);
     assert_ne!(handles[0], handles[1], "overloads must not share one handle");
+    assert!(
+        graph["symbols"].as_array().unwrap().iter().all(|row| row["id_declarations"] == 1),
+        "every handle here covers exactly the row it sits on: {graph}"
+    );
     let symbols = get_json(&app, "/api/file/symbols?path=src/lib.rs").await;
     assert_eq!(
         symbols["symbols"]
@@ -841,6 +863,45 @@ async fn hop_routes_prefer_the_symbol_handle_over_the_shared_qualified_name() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(json_body(response).await["error"], "unknown symbol handle");
     }
+
+    // A handle that CANNOT single out its row says so where it is handed out, so a client never
+    // renders a grouped selector as if it disambiguated. Both file lanes report it, and the hop
+    // answer repeats the same number rather than leaving the two to be reconciled.
+    let cfg = get_json(&app, "/api/file/graph?path=src/cfg.rs").await;
+    let variants = cfg["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["name"] == "run")
+        .collect::<Vec<_>>();
+    assert_eq!(variants.len(), 2);
+    assert_eq!(variants[0]["id"], variants[1]["id"], "cfg variants are one logical symbol");
+    assert!(
+        variants.iter().all(|row| row["id_declarations"] == 2),
+        "a grouped handle must state its reach: {cfg}"
+    );
+    assert_eq!(
+        get_json(&app, "/api/file/symbols?path=src/cfg.rs").await["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["name"] == "run")
+            .map(|row| (row["id"].clone(), row["id_declarations"].clone()))
+            .collect::<Vec<_>>(),
+        variants
+            .iter()
+            .map(|row| (row["id"].clone(), row["id_declarations"].clone()))
+            .collect::<Vec<_>>(),
+        "both file lanes must agree on the handle and on its reach"
+    );
+    let shared = variants[0]["id"].as_str().unwrap();
+    let grouped = get_json(&app, &format!("/api/symbol/callees?id={shared}")).await;
+    assert_eq!(hop_names(&grouped["callees"]), ["unix_leaf", "windows_leaf"]);
+    assert_eq!(grouped["resolved_by"], "id");
+    assert_eq!(
+        grouped["matched_symbols"], 2,
+        "the answer repeats the reach the file lane already reported"
+    );
     let _ = fs::remove_dir_all(root);
 }
 

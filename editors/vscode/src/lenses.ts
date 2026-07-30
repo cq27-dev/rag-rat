@@ -115,15 +115,40 @@ export function callerCommandArguments(
 }
 
 /**
+ * How a caller lens says its handle covers more than the declaration it sits on.
+ *
+ * The count in the lens title is this row's own, but the drill-down behind it is answered for
+ * every declaration the row's handle covers — and where those differ, the reader is entitled to
+ * know BEFORE clicking, not only from the quick pick's placeholder afterwards. A grouped handle is
+ * the server's answer about identity (cfg variants of one function are one symbol), so the lens
+ * neither hides it nor pretends a narrower selector exists.
+ *
+ * `undefined` = a server that does not report the reach, and `1` = a handle that covers this row
+ * alone; neither gets a marker, because there is nothing to qualify.
+ */
+export function sharedHandleMarker(
+  declarations: number | undefined,
+): { title: string; tooltip: string } | undefined {
+  return declarations !== undefined && declarations > 1
+    ? {
+        title: `  ⧉${declarations}`,
+        tooltip: `This symbol shares one identity with ${declarations - 1} other declaration${
+          declarations > 2 ? 's' : ''
+        } — cfg variants, or declarations the index cannot tell apart. Callers are reported for all of them.`,
+      }
+    : undefined;
+}
+
+/**
  * What the caller quick pick says it is showing.
  *
  * `matched_symbols` is the whole answer, and it is read the same way on BOTH lanes: `> 1` means
  * the rows are a union over that many symbols, so `N callers of foo` would state a narrower claim
  * than the server made. Which selector produced the union does not change what a reader is
  * looking at, and both selectors can produce one — a qualified name covers every overload in the
- * file, and a handle covers every overload the grouping key could not tell apart, which is every
- * overload declared on an identical line (`fn new() -> Self {` on two impls). Reading the count
- * only on the fallback lane discards the one signal that is present and correct on the other.
+ * file, and a handle covers every declaration grouped under one identity (a function's cfg
+ * variants, say). Reading the count only on the fallback lane discards the one signal that is
+ * present and correct on the other.
  *
  * `0` is reachable only from the fallback lane — a handle with no symbol behind it is a 404, not
  * an empty answer — and means the name named nothing indexed, so the rows came from unresolved
@@ -181,18 +206,21 @@ export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Dispo
         ]
           .filter(Boolean)
           .join(' · ');
+        const shared = sharedHandleMarker(s.id_declarations);
         lenses.push(
           new vscode.CodeLens(range, {
             title:
               `⤴ ${total} (${tiers})` +
               (s.fan_in_bucket === 'critical' || s.fan_in_bucket === 'high'
                 ? `  ⚑${s.fan_in_bucket} load`
-                : ''),
+                : '') +
+              (shared?.title ?? ''),
+            ...(shared ? { tooltip: shared.tooltip } : {}),
             command: 'rag-rat-lens.showCallers',
-            // The lens is built from ONE symbol row, so it carries that row's handle: two
-            // overloads always share a qualified name, and share a handle only when they declare
-            // on an identical line. The count in this title is counted per symbol. Passing the
-            // name alone is what made every lens on a name answer alike.
+            // The lens is built from ONE symbol row, so it carries that row's handle, and the
+            // count in this title is that row's own. Where the handle covers a group, the
+            // drill-down behind it is wider than the count in front of it — which is what the
+            // marker says. Passing the name alone is what made every lens on a name answer alike.
             arguments: callers,
           }),
         );
