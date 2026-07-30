@@ -12,6 +12,7 @@ pub(super) struct LogicalSymbolKey {
     pub(super) path: String,
     pub(super) name: String,
     pub(super) qualified_name: String,
+    pub(super) scope_path: String,
     pub(super) kind: String,
     // Signature is part of the identity so that two distinct same-named symbols in one file (e.g.
     // `new` on two different impls — same `qualified_name`, different signatures) do NOT collapse
@@ -26,6 +27,7 @@ impl LogicalSymbolKey {
             path: row.path.clone(),
             name: row.name.clone(),
             qualified_name: row.qualified_name.clone(),
+            scope_path: row.scope_path.clone(),
             kind: row.kind.clone(),
             signature: row.signature.clone(),
         }
@@ -46,12 +48,13 @@ impl LogicalSymbolKey {
     /// primary-key error on rebuild rather than silent merging.
     pub(super) fn stable_id(&self, repo_id: &str) -> i64 {
         let canonical = format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
             repo_id,
             self.language,
             self.path,
             self.name,
             self.qualified_name,
+            self.scope_path,
             self.kind,
             self.signature.as_deref().unwrap_or(""),
         );
@@ -95,29 +98,66 @@ pub(crate) fn realign_logical_symbol_ids(conn: &rusqlite::Connection) -> rusqlit
         path: String,
         name: String,
         qualified_name: Option<String>,
+        scope_path: Option<String>,
         kind: String,
         signature: Option<String>,
     }
-    let mut stmt = conn.prepare(
+    let has_scope_path = conn.prepare("SELECT scope_path FROM symbols LIMIT 0").is_ok();
+    // Take the members' scope only when they AGREE on it. A pre-V040 group can hold the very
+    // collision this version fixes — same-named, same-signature methods under different impl
+    // owners — and picking one member arbitrarily would move the whole group's durable references
+    // onto that one owner's new id. If the chosen owner then happens to be the surviving exact
+    // key, the drift heal sees an unchanged reference and silently hands shared memories or
+    // monikers to an arbitrary owner. A disagreeing group yields NULL and is skipped here, so the
+    // key-drift relocation path handles the split as the ambiguity it is. The unanimity test
+    // itself (how the collected member scopes are compared) is documented at the comparison below.
+    let scope_path_subquery = if has_scope_path {
+        "(SELECT GROUP_CONCAT(COALESCE(s.scope_path, ''), char(31))
+            FROM logical_symbol_members m JOIN symbols s ON s.id = m.symbol_id
+           WHERE m.logical_symbol_id = ls.id)"
+    } else {
+        "''"
+    };
+    let mut stmt = conn.prepare(&format!(
         "SELECT ls.id, ls.repo_id, ls.language, ls.path, ls.logical_name,
                 (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
                 ls.kind,
                 (SELECT s.signature FROM logical_symbol_members m
                    JOIN symbols s ON s.id = m.symbol_id
-                  WHERE m.logical_symbol_id = ls.id LIMIT 1)
+                  WHERE m.logical_symbol_id = ls.id LIMIT 1),
+                {scope_path_subquery}
          FROM logical_symbols ls",
-    )?;
+    ))?;
     let rows = stmt
         .query_map([], |r| {
+            let language: String = r.get(2)?;
             Ok(Row {
                 old_id: r.get(0)?,
                 repo_id: r.get(1)?,
-                language: r.get(2)?,
                 path: r.get(3)?,
                 name: r.get(4)?,
                 qualified_name: r.get(5)?,
                 kind: r.get(6)?,
                 signature: r.get(7)?,
+                scope_path: r.get::<_, Option<String>>(8)?.and_then(|joined| {
+                    // One IDENTICAL scope across every member, or nothing. A group whose members
+                    // disagree is the pre-upgrade owner collision — version 1 keyed without the
+                    // scope, so `Foo<T>::run` and `Foo<U>::run` could share a group — and
+                    // realigning it would hand the whole group's references to one arbitrary owner.
+                    //
+                    // Deliberately compared RAW. Folding first would let the check pass for members
+                    // that are genuinely different entities: the only string-level fold available
+                    // here drops generic arguments, so it equates `Foo<u8>::run` with
+                    // `Foo<u16>::run`, which coexist. Recovering binder-only equivalence would mean
+                    // re-canonicalizing a stored string without its tree, and the renderer is
+                    // deliberately AST-driven. So an equivalent-under-renaming group is skipped
+                    // rather than adopted — a decline, which this design tolerates, instead of a
+                    // mis-adoption, which it does not.
+                    let mut canonical = joined.split('\u{1f}').map(str::to_string);
+                    let first = canonical.next()?;
+                    canonical.all(|path| path == first).then_some(first)
+                }),
+                language,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -129,11 +169,17 @@ pub(crate) fn realign_logical_symbol_ids(conn: &rusqlite::Connection) -> rusqlit
         let Some(qualified_name) = row.qualified_name else {
             continue;
         };
+        // NULL here means the group's members disagree on their owner scope (or it has none):
+        // leave it for the drift relocation rather than prealigning it to one member's identity.
+        let Some(scope_path) = row.scope_path else {
+            continue;
+        };
         let key = LogicalSymbolKey {
             language: row.language,
             path: row.path,
             name: row.name,
             qualified_name,
+            scope_path,
             kind: row.kind,
             signature: row.signature,
         };
@@ -383,6 +429,7 @@ pub(super) struct LogicalKeyDriftRow {
     path: String,
     name: String,
     qualified_name: Option<String>,
+    scope_path: Option<String>,
     kind: String,
     pub(super) signature: Option<String>,
 }
@@ -396,6 +443,7 @@ impl LogicalKeyDriftRow {
             path: self.path.clone(),
             name: self.name.clone(),
             qualified_name: self.qualified_name.clone(),
+            scope_path: self.scope_path.clone(),
             kind: self.kind.clone(),
             signature: self.signature.clone(),
         }
@@ -410,6 +458,7 @@ struct DriftKey {
     path: String,
     name: String,
     qualified_name: Option<String>,
+    scope_path: Option<String>,
     kind: String,
     signature: Option<String>,
 }
@@ -497,7 +546,7 @@ impl LogicalGroupingUpkeep {
     }
 }
 
-/// The six logical-key columns of one symbol row in the scope being rewritten — exactly the
+/// The seven logical-key columns of one symbol row in the scope being rewritten — exactly the
 /// identity [`IndexDatabase::rebuild_logical_symbols`] groups by. `Ord` so the multiset
 /// comparison is a `BTreeMap` walk; `Option` fields compare `None`-first, and `None` never
 /// equals `Some` (an absent qualified name or signature is no wildcard).
@@ -507,6 +556,7 @@ pub(super) struct ReplacedSymbolKey {
     path: String,
     name: String,
     qualified_name: Option<String>,
+    scope_path: Option<String>,
     kind: String,
     signature: Option<String>,
 }
@@ -620,10 +670,24 @@ pub(super) struct LogicalSymbolMemberRow {
     pub(super) language: String,
     pub(super) name: String,
     pub(super) qualified_name: String,
+    pub(super) scope_path: String,
     pub(super) kind: String,
     pub(super) signature: Option<String>,
     pub(super) start_line: i64,
     pub(super) end_line: i64,
+}
+
+/// The `#<part>` tail a continuation chunk carries, or `""`. Only a tail of DIGITS counts: a
+/// qualified name can hold a `#` of its own (a markdown context chunk is `…::#context-…`), and
+/// treating that as a part marker would cut the name in half.
+fn chunk_part_suffix(symbol_path: &str) -> &str {
+    match symbol_path.rfind('#') {
+        Some(at)
+            if symbol_path.len() > at + 1
+                && symbol_path[at + 1..].bytes().all(|b| b.is_ascii_digit()) =>
+            &symbol_path[at..],
+        _ => "",
+    }
 }
 
 impl IndexDatabase {
@@ -764,31 +828,71 @@ impl IndexDatabase {
         let mut stmt = conn.prepare(&format!(
             "
             SELECT symbols.id, main.files.path, symbols.language, symbols.name,
-                   qn.value, symbols.kind, symbols.signature, symbols.start_line,
-                   symbols.end_line, symbols.file_id
+                   qn.value, COALESCE(symbols.scope_path, ''), symbols.kind, symbols.signature,
+                   symbols.start_line, symbols.end_line, symbols.file_id
             FROM main.symbols AS symbols
             JOIN main.files ON main.files.id = symbols.file_id
             LEFT JOIN main.name_strings qn ON qn.id = symbols.qualified_name_id
             WHERE main.files.repo_id = ?1 AND main.files.generation = ?2{extra_where}
             ORDER BY symbols.language, main.files.path, symbols.name, qn.value,
-                     symbols.kind, symbols.signature, symbols.start_byte, symbols.end_byte
+                     COALESCE(symbols.scope_path, ''), symbols.kind, symbols.signature,
+                     symbols.start_byte, symbols.end_byte
             "
         ))?;
         let mut rows = stmt.query(params![self.active_repo_id, self.active_generation])?;
-        let mut current: Option<(LogicalSymbolKey, Vec<LogicalSymbolMemberRow>)> = None;
+        // SQL keeps `(language, path)` contiguous. Normalize and sort ONE file partition at a
+        // time: `path` is part of LogicalSymbolKey, so no group can cross this boundary. This
+        // preserves the exact normalized-key ordering without retaining the whole corpus's symbol
+        // strings in Rust memory.
+        let mut members_sorted = Vec::new();
         while let Some(row) = rows.next()? {
+            let language: String = row.get(2)?;
+            let scope_path: String = row.get(5)?;
             let member = LogicalSymbolMemberRow {
                 symbol_id: row.get(0)?,
                 path: row.get(1)?,
-                language: row.get(2)?,
+                language,
                 name: row.get(3)?,
                 qualified_name: row.get(4)?,
-                kind: row.get(5)?,
-                signature: row.get(6)?,
-                start_line: row.get(7)?,
-                end_line: row.get(8)?,
-                file_id: row.get(9)?,
+                scope_path,
+                kind: row.get(6)?,
+                signature: row.get(7)?,
+                start_line: row.get(8)?,
+                end_line: row.get(9)?,
+                file_id: row.get(10)?,
             };
+            if members_sorted.last().is_some_and(|previous: &LogicalSymbolMemberRow| {
+                previous.language != member.language || previous.path != member.path
+            }) {
+                Self::insert_logical_partition(conn, &self.active_repo_id, &mut members_sorted)?;
+            }
+            members_sorted.push(member);
+        }
+        Self::insert_logical_partition(conn, &self.active_repo_id, &mut members_sorted)
+    }
+
+    /// Sort and insert one `(language, path)` partition using the exact normalized logical key.
+    fn insert_logical_partition(
+        conn: &rusqlite::Connection,
+        repo_id: &str,
+        members_sorted: &mut Vec<LogicalSymbolMemberRow>,
+    ) -> anyhow::Result<()> {
+        // SQL orders the RAW scope, while grouping compares the NORMALIZED one. Re-sort this file
+        // partition so equal-normalized rows are adjacent; spans/id are deterministic member order.
+        members_sorted.sort_by(|a, b| {
+            (&a.language, &a.path, &a.name, &a.qualified_name, &a.scope_path, &a.kind)
+                .cmp(&(&b.language, &b.path, &b.name, &b.qualified_name, &b.scope_path, &b.kind))
+                .then_with(|| a.signature.cmp(&b.signature))
+                .then_with(|| {
+                    (a.start_line, a.end_line, a.symbol_id).cmp(&(
+                        b.start_line,
+                        b.end_line,
+                        b.symbol_id,
+                    ))
+                })
+        });
+        let mut current: Option<(LogicalSymbolKey, Vec<LogicalSymbolMemberRow>)> = None;
+        for member in members_sorted.drain(..) {
             // Compare the member's key fields against the current group WITHOUT allocating a key
             // per row (only per group, on a boundary).
             let same_group = current.as_ref().is_some_and(|(key, _)| {
@@ -796,6 +900,7 @@ impl IndexDatabase {
                     && key.path == member.path
                     && key.name == member.name
                     && key.qualified_name == member.qualified_name
+                    && key.scope_path == member.scope_path
                     && key.kind == member.kind
                     && key.signature == member.signature
             });
@@ -803,14 +908,14 @@ impl IndexDatabase {
                 current.as_mut().expect("same_group implies Some").1.push(member);
             } else {
                 if let Some((key, members)) = current.take() {
-                    Self::insert_logical_group(conn, &self.active_repo_id, &key, &members)?;
+                    Self::insert_logical_group(conn, repo_id, &key, &members)?;
                 }
                 let key = LogicalSymbolKey::from(&member);
                 current = Some((key, vec![member]));
             }
         }
         if let Some((key, members)) = current.take() {
-            Self::insert_logical_group(conn, &self.active_repo_id, &key, &members)?;
+            Self::insert_logical_group(conn, repo_id, &key, &members)?;
         }
         Ok(())
     }
@@ -894,8 +999,8 @@ impl IndexDatabase {
         // narrowed to the one scope row being replaced.
         let mut stmt = conn.prepare_cached(
             "
-            SELECT s.language, f.path, s.name, qn.value, s.kind, s.signature,
-                   m.logical_symbol_id
+            SELECT s.language, f.path, s.name, qn.value, COALESCE(s.scope_path, ''), s.kind,
+                   s.signature, m.logical_symbol_id
             FROM main.symbols s
             JOIN main.files f ON f.id = s.file_id
             LEFT JOIN main.name_strings qn ON qn.id = s.qualified_name_id
@@ -913,15 +1018,17 @@ impl IndexDatabase {
         ])?;
         let mut claims: BTreeMap<ReplacedSymbolKey, GroupedKeyClaim> = BTreeMap::new();
         while let Some(row) = rows.next()? {
+            let language: String = row.get(0)?;
             let key = ReplacedSymbolKey {
-                language: row.get(0)?,
                 path: row.get(1)?,
                 name: row.get(2)?,
                 qualified_name: row.get(3)?,
-                kind: row.get(4)?,
-                signature: row.get(5)?,
+                scope_path: row.get::<_, Option<String>>(4)?,
+                language,
+                kind: row.get(5)?,
+                signature: row.get(6)?,
             };
-            let Some(logical_symbol_id) = row.get::<_, Option<i64>>(6)? else {
+            let Some(logical_symbol_id) = row.get::<_, Option<i64>>(7)? else {
                 return Ok(None); // ungrouped symbol — the grouping cannot vouch for this file
             };
             match claims.entry(key) {
@@ -964,8 +1071,8 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         let mut stmt = conn.prepare_cached(
             "
-            SELECT s.language, f.path, s.name, qn.value, s.kind, s.signature,
-                   s.id, s.start_line, s.end_line
+            SELECT s.language, f.path, s.name, qn.value, COALESCE(s.scope_path, ''), s.kind,
+                   s.signature, s.id, s.start_line, s.end_line
             FROM main.symbols s
             JOIN main.files f ON f.id = s.file_id
             LEFT JOIN main.name_strings qn ON qn.id = s.qualified_name_id
@@ -982,18 +1089,20 @@ impl IndexDatabase {
         ])?;
         let mut inserted: BTreeMap<ReplacedSymbolKey, Vec<ReplacementSymbolSpan>> = BTreeMap::new();
         while let Some(row) = rows.next()? {
+            let language: String = row.get(0)?;
             let key = ReplacedSymbolKey {
-                language: row.get(0)?,
                 path: row.get(1)?,
                 name: row.get(2)?,
                 qualified_name: row.get(3)?,
-                kind: row.get(4)?,
-                signature: row.get(5)?,
+                scope_path: row.get::<_, Option<String>>(4)?,
+                language,
+                kind: row.get(5)?,
+                signature: row.get(6)?,
             };
             inserted.entry(key).or_default().push(ReplacementSymbolSpan {
-                symbol_id: row.get(6)?,
-                start_line: row.get(7)?,
-                end_line: row.get(8)?,
+                symbol_id: row.get(7)?,
+                start_line: row.get(8)?,
+                end_line: row.get(9)?,
             });
         }
         // Every inserted key must exist in the replaced set with the SAME member count, and the
@@ -1136,8 +1245,12 @@ impl IndexDatabase {
             "
             SELECT ls.id, ls.path, ls.logical_name,
                    (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
+                   (SELECT COALESCE(s.scope_path, '') FROM logical_symbol_members m
+                      JOIN symbols s ON s.id = m.symbol_id
+                     WHERE m.logical_symbol_id = ls.id LIMIT 1),
                    ls.kind,
-                   {UNANIMOUS_MEMBER_SIGNATURE_SQL}
+                   {UNANIMOUS_MEMBER_SIGNATURE_SQL},
+                   ls.language
             FROM main.logical_symbols ls
             WHERE ls.repo_id = ?1
               AND ls.id IN ({reference_sources}
@@ -1151,8 +1264,9 @@ impl IndexDatabase {
                     path: row.get(1)?,
                     name: row.get(2)?,
                     qualified_name: row.get(3)?,
-                    kind: row.get(4)?,
-                    signature: row.get(5)?,
+                    scope_path: row.get::<_, Option<String>>(4)?,
+                    kind: row.get(5)?,
+                    signature: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1216,8 +1330,12 @@ impl IndexDatabase {
                         "
                         SELECT ls.path, ls.logical_name,
                                (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
+                               (SELECT COALESCE(s.scope_path, '') FROM logical_symbol_members m
+                                  JOIN symbols s ON s.id = m.symbol_id
+                                 WHERE m.logical_symbol_id = ls.id LIMIT 1),
                                ls.kind,
-                               {UNANIMOUS_MEMBER_SIGNATURE_SQL}
+                               {UNANIMOUS_MEMBER_SIGNATURE_SQL},
+                               ls.language
                         FROM main.logical_symbols ls
                         WHERE ls.id = ?1 AND ls.repo_id = ?2
                         "
@@ -1228,8 +1346,9 @@ impl IndexDatabase {
                             path: row.get(0)?,
                             name: row.get(1)?,
                             qualified_name: row.get(2)?,
-                            kind: row.get(3)?,
-                            signature: row.get(4)?,
+                            scope_path: row.get::<_, Option<String>>(3)?,
+                            kind: row.get(4)?,
+                            signature: row.get(5)?,
                         })
                     },
                 )
@@ -1516,7 +1635,14 @@ impl IndexDatabase {
     }
 
     pub(super) fn ensure_graph_index_current(&self) -> anyhow::Result<()> {
-        if self.repo_meta("graph_index_version")?.as_deref() == Some(GRAPH_INDEX_VERSION) {
+        let graph_current =
+            self.repo_meta("graph_index_version")?.as_deref() == Some(GRAPH_INDEX_VERSION);
+        let logical_current =
+            self.repo_meta(LOGICAL_KEY_VERSION_KEY)?.as_deref() == Some(LOGICAL_KEY_VERSION);
+        // A logical-key mismatch by itself is handled by the normal full-rederive gate. This
+        // on-open path owns the graph-version migration only; when both versions lag together it
+        // must refresh symbol extraction before that full regroup.
+        if graph_current {
             return Ok(());
         }
         let Some(root) = self.storage.source_root().map(Path::to_path_buf) else {
@@ -1524,27 +1650,6 @@ impl IndexDatabase {
         };
         self.storage.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| -> anyhow::Result<()> {
-            // Scope the wipe to the ACTIVE REPO's edges (A3): `graph_index_version` is per-repo, so
-            // a stale/missing version for repo A must not wipe repo B's edges in a
-            // consolidated DB. An edge belongs to its `source_file_id`'s repo;
-            // `source_file_id` is always set (its FK is `ON DELETE CASCADE`, every edge
-            // is inserted with a file id), so this removes exactly this repo's edges —
-            // the same set the repopulate below (over the repo-scoped `files`
-            // view) re-derives. Within the repo this matches the prior wholesale behavior; only
-            // sibling repos are now spared.
-            // The `generation` predicate (A6) makes the sentence above literally true: the wipe
-            // removes exactly the set the repopulate re-derives (the ACTIVE generation's edges).
-            // Without it, a heal would also wipe a superseded generation's edges (merely early gc)
-            // — and, in the rare concurrent case of a version-bump heal racing another
-            // connection's staged rebuild, the STAGED generation's edges, which nothing would
-            // re-resolve.
-            self.storage.connection().execute(
-                "DELETE FROM edges_data
-                  WHERE source_file_id IN (
-                      SELECT id FROM main.files WHERE repo_id = ?1 AND generation = ?2
-                  )",
-                params![self.active_repo_id, self.active_generation],
-            )?;
             // Repopulate the per-package import scope BEFORE re-resolving (#61). A bare
             // version-bump re-resolve would re-derive `import_scope_*` on the new edges
             // but read an empty `packages` table (V022 only ADDED the column; it did not
@@ -1554,18 +1659,82 @@ impl IndexDatabase {
             // `local_crate_roots` union; `resolve_edges` below then computes each file's
             // package at load time (`load_package_roots_into_scope`) from those rows.
             self.refresh_packages(&root)?;
-            let files = self.graph_reindex_files()?;
+            let (files, unreadable) = self.graph_reindex_files()?;
+            // The heal walks the repo+generation's WHOLE file set (A3 + A6 scope it to this
+            // repo's live generation), which spans every commit/worktree scope — but it has
+            // exactly ONE checkout to read from. So each row is re-derived only from bytes
+            // PROVEN to be its own: `files.sha256` is the digest of the very text that produced
+            // the row, so a match means this checkout holds that file's indexed content, whoever
+            // else shares the path. Everything else — a sibling worktree whose copy differs, a
+            // path absent from this checkout, a file edited since it was indexed — keeps the
+            // graph and scopes it already has. Re-deriving those from the active root instead
+            // would stamp this checkout's graph onto another scope's rows; failing the open over
+            // them would brick every later open, since this runs ON the open path.
+            //
+            // A skipped row is then STALE, and stays stale: `graph_index_version` is per-repo and
+            // is stamped below regardless, so this heal never revisits it, and no later pass
+            // re-extracts a file whose content did not change. For a sibling worktree row that
+            // diverges from the active checkout, that can be indefinite. Accepted here because
+            // the alternative on this code path is worse — pre-digest-gate, such a row was wiped
+            // and rebuilt from the WRONG checkout's bytes — and because a lagging row degrades
+            // (it carries the older extractor's facts) rather than answering wrongly. Making the
+            // heal resumable per row, so a later pass can finish what this one could not vouch
+            // for, is #1014.
+            // Rows the row reader could not name are uncovered exactly like an unreadable file.
+            let mut unverified = unreadable;
+            let mut unrefreshed = 0usize;
             for file in files {
-                if file.kind == TargetKind::Generated || file.language == Language::Markdown {
-                    continue;
-                }
                 let full_path = root.join(&file.path);
                 let Ok(text) = fs::read_to_string(full_path) else {
+                    unverified += 1;
                     continue;
                 };
-                if text.len() > edges::MAX_GRAPH_PARSE_BYTES {
+                if rag_rat_base::hash::hex_sha256(text.as_bytes()) != file.sha256 {
+                    unverified += 1;
                     continue;
                 }
+                // Above the parse limit there are no persisted symbols to refresh at all
+                // (`prepare_index_content_from_text` skips the same bound), so the scope shape
+                // is vacuously current for this file.
+                // Rust because a scope-affecting key bump changed what its impl scopes ARE. Any
+                // other language because the scope entered the key at all: `scope_path` landed
+                // nullable with no backfill, so a row indexed before it reads as `''` here while a
+                // fresh index hashes a real enclosing scope. Left alone, those rows would take the
+                // new stamp holding a key no fresh index produces, and nested same-named symbols
+                // would stay collapsed with no later pass owing them a re-derivation.
+                let scope_is_owed = !logical_current
+                    && file.kind != TargetKind::Generated
+                    && file.language != Language::Markdown
+                    && text.len() <= edges::MAX_GRAPH_PARSE_BYTES
+                    && (file.language == Language::Rust
+                        || self.file_has_unscoped_symbols(file.id)?);
+                if scope_is_owed
+                    && !self.refresh_symbol_scopes(
+                        file.id,
+                        Path::new(&file.path),
+                        &text,
+                        file.language,
+                    )?
+                {
+                    unrefreshed += 1;
+                }
+                if file.kind == TargetKind::Generated
+                    || file.language == Language::Markdown
+                    || text.len() > edges::MAX_GRAPH_PARSE_BYTES
+                {
+                    continue;
+                }
+                // Wipe exactly the row being re-derived, immediately before re-deriving it.
+                // A repo-wide DELETE up front is what turned an unreadable or diverged row into
+                // silent edge LOSS: nothing repopulates a row this loop skips. Per-row, the wipe
+                // removes precisely the set the insert below replaces, and a skipped row keeps
+                // the edges it already has — which `resolve_edges` will NOT revisit on a scoped
+                // open (it writes only rows the connection's `files` view admits), so leaving
+                // them in place is the difference between stale and absent.
+                self.storage
+                    .connection()
+                    .prepare_cached("DELETE FROM edges_data WHERE source_file_id = ?1")?
+                    .execute([file.id])?;
                 edges::index_file_edges(
                     self.storage.connection(),
                     file.id,
@@ -1574,7 +1743,79 @@ impl IndexDatabase {
                     &text,
                 )?;
             }
+            // Rows this connection's view does not admit are never walked above, so their scope
+            // shape is untouched — and `regroup_logical_symbols` reads raw `main.files` across
+            // EVERY scope, so one stale row is enough to change logical identity. Count them for
+            // the stamp decision even though the edge pass deliberately leaves them alone.
+            let out_of_scope: i64 = self.storage.connection().query_row(
+                "SELECT COUNT(*) FROM main.files
+                  WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                    AND id NOT IN (SELECT id FROM files)",
+                params![self.active_repo_id, self.active_generation],
+                |row| row.get(0),
+            )?;
+            if unverified > 0 || unrefreshed > 0 || out_of_scope > 0 {
+                tracing::warn!(
+                    unverified,
+                    unrefreshed,
+                    out_of_scope,
+                    "graph heal skipped file rows this checkout could not vouch for; their graph \
+                     stays on the previous extraction, and the logical-key stamp is deferred so \
+                     later passes keep trying (#1014)"
+                );
+            }
+            // `resolve_edges` and `rebuild_logical_symbols` are SIBLINGS, not a chain: both
+            // consume `symbols.scope_path`, and neither consumes the other's output
+            // (`same_logical_symbol` compares in-memory `IndexedSymbol` fields, not
+            // `logical_symbols` rows — edge resolution never reads that table). What is
+            // load-bearing is that the refresh loop above completed for the whole corpus first;
+            // their relative order here is free.
             self.resolve_edges()?;
+            // A lagging `logical_key_version` must not survive an on-open graph heal: without
+            // this, an index upgraded across a key-derivation change (e.g. scope_path joining
+            // the key) keeps its OLD merged/split logical ids until some unrelated source
+            // mutation triggers a rebuilding pass — memory bindings and symbol surfaces keep
+            // leaking across owners indefinitely on an otherwise idle repo.
+            //
+            // Stamp the new key version only when this pass actually refreshed EVERY row. The
+            // regroup reads raw `main.files` across every scope, so a row whose scope stayed on
+            // the old shape does not merely lag — it changes IDENTITY: a cross-scope group that
+            // was one logical symbol splits, the stale row keeps the original `stable_id`, and
+            // the refreshed row gets a new one. Stamping that as current would also disarm the
+            // two mechanisms built to recover from it — `logical_key_drift_snapshot` goes quiet
+            // and `can_scope_logical_rederive` starts allowing the scoped re-derive, which by
+            // construction never revisits the untouched rows. Deferring keeps both armed, at the
+            // cost of a whole-corpus regroup on later passes until coverage completes (#1014).
+            if self.repo_meta(LOGICAL_KEY_VERSION_KEY)?.as_deref() != Some(LOGICAL_KEY_VERSION) {
+                let stamp = if unverified == 0 && unrefreshed == 0 && out_of_scope == 0 {
+                    KeyVersionStamp::FullRederive
+                } else {
+                    KeyVersionStamp::Defer
+                };
+                self.rebuild_logical_symbols(stamp)?;
+            }
+            // The GRAPH stamp advances even when rows were skipped, unlike the key stamp above.
+            // That is deliberate, and the symmetry is tempting enough to be worth writing down.
+            //
+            // `out_of_scope` counts rows this connection's view does not admit — it is blind to
+            // whether those rows are FRESH. In a repo with two checkouts, each one always sees the
+            // other's rows as out of scope, however recently the other re-derived them. So gating
+            // this stamp on full coverage would not defer it until coverage completed; it would
+            // defer it forever, and every open of a multi-checkout repo would re-read and
+            // re-extract the entire corpus. That trades a bounded staleness for an unbounded cost.
+            //
+            // The key stamp can afford the same gate because deferring it only repeats a regroup,
+            // and because leaving it deferred keeps the drift-recovery mechanisms armed.
+            //
+            // The deferred KEY stamp is not free either, and the cost is worth naming: because
+            // `out_of_scope` is permanent in a multi-checkout repo, that stamp never becomes
+            // current there, so `can_scope_logical_rederive` stays false and every mutating pass
+            // takes the full rebuild instead of the scoped re-derive. Correct, but it gives up the
+            // write-amplification win indefinitely rather than for one pass.
+            //
+            // The real fix for both is per-row provenance — a version on the row, so the repo
+            // stamp can advance while individual rows stay owed and a checkout that CAN read those
+            // bytes finishes them later. That needs a migration and its own review (#1082).
             self.mark_graph_index_current()?;
             Ok(())
         })();
@@ -1590,26 +1831,197 @@ impl IndexDatabase {
         self.set_repo_meta("graph_index_version", GRAPH_INDEX_VERSION)
     }
 
-    fn graph_reindex_files(&self) -> anyhow::Result<Vec<GraphReindexFile>> {
-        let mut stmt = self
+    /// Refresh symbol fields whose extraction semantics changed without rewriting chunks or
+    /// embeddings. Version 2 gives a Rust trait impl a trait-qualified scope
+    /// (`Type as std.fmt.Display`), and logical regrouping is only correct after persisted
+    /// symbols carry that new scope.
+    ///
+    /// Returns whether EVERY persisted symbol of the file was refreshed. Rows are matched on
+    /// their exact byte span, so a file edited since it was indexed matches only the symbols
+    /// ahead of the edit — an ordinary state between an edit and the next watcher pass, and one
+    /// the next index of that file resolves on its own. The caller reports the shortfall rather
+    /// than failing the open on it.
+    /// Whether this file holds a symbol from before `scope_path` existed. The column landed
+    /// nullable and unbackfilled, so NULL means "never derived" — a parsed row always carries at
+    /// least its own name.
+    fn file_has_unscoped_symbols(&self, file_id: i64) -> anyhow::Result<bool> {
+        Ok(self.storage.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.symbols WHERE file_id = ?1 AND scope_path IS NULL)",
+            [file_id],
+            |row| row.get::<_, i64>(0),
+        )? == 1)
+    }
+
+    fn refresh_symbol_scopes(
+        &self,
+        file_id: i64,
+        path: &Path,
+        text: &str,
+        language: Language,
+    ) -> anyhow::Result<bool> {
+        let Some(parsed) = parser::parse_file(path, language, text) else {
+            return Ok(false);
+        };
+        let expected: i64 = self.storage.connection().query_row(
+            "SELECT COUNT(*) FROM main.symbols WHERE file_id = ?1",
+            [file_id],
+            |row| row.get(0),
+        )?;
+        // Match on the SPAN, not the name. Version 2 also changed what an `impl` symbol is NAMED —
+        // the old extractor took the first nominal child, which for `impl Trait for Type` is the
+        // TRAIT, and it is now the self type. Keeping `name` in the predicate would leave exactly
+        // those rows unmatched, so an upgraded index would carry impl identities a fresh index
+        // never produces, and the shortfall would be reported forever. A span plus kind is unique
+        // per file — spans come from the AST — so the name can be an OUTPUT of the refresh.
+        // `qualified_name` is `{path}::{name}`, so a renamed symbol needs it re-interned too —
+        // both fields are hashed into `LogicalSymbolKey`, and refreshing one without the other
+        // mints an identity no fresh index ever produces.
+        let mut update = self.storage.connection().prepare_cached(
+            "UPDATE main.symbols
+             SET scope_path = ?1, name = ?2, qualified_name_id = ?3
+             WHERE file_id = ?4 AND start_byte = ?5 AND end_byte = ?6 AND kind = ?7",
+        )?;
+        let mut refreshed = 0usize;
+        for symbol in parsed.symbols {
+            let qualified_name_id =
+                edges::intern_edge_string(self.storage.connection(), &symbol.qualified_name)?;
+            refreshed += update.execute(params![
+                symbol.scope_path,
+                symbol.name,
+                qualified_name_id,
+                file_id,
+                i64::try_from(symbol.start_byte)?,
+                i64::try_from(symbol.end_byte)?,
+                symbol.kind,
+            ])?;
+        }
+        // A chunk records the symbol it covers by PATH as well as by id, and readers still match on
+        // the path — so a rename that moves `A` to `W` and stops there leaves every chunk-keyed
+        // lookup for that impl searching a name nothing answers to, and its chunk-bound memories
+        // vanish on upgrade. Realign the linked chunks to the names their symbols now carry.
+        // The vector for a chunk is built from its symbol_path among other fields, and a stored
+        // embedding is served while its `input_hash` is non-empty — so moving the path without
+        // touching that hash leaves semantic search answering from a vector labelled with a name
+        // the chunk no longer has. Clearing it first puts those chunks back in the reconcile queue.
+        // Same predicate as the update below, and run BEFORE it, while the rows still differ.
+        // A chunk whose symbol is longer than one chunk is stored as `<qualified_name>#<part>`,
+        // so the realign replaces the BASE and keeps the part. Overwriting the whole value
+        // collapsed every part of a long symbol onto the same path, which is both a loss of the
+        // part labels and a divergence from what a fresh index produces for the same file.
+        //
+        // Computed here rather than in SQL so the embedding invalidation and the path rewrite
+        // cannot disagree about which rows are affected — they read one `desired` value.
+        let mut linked = self.storage.connection().prepare(
+            "SELECT c.id, c.symbol_path, ns.value
+               FROM main.chunks c
+               JOIN main.symbols s ON s.id = c.symbol_id
+               JOIN main.name_strings ns ON ns.id = s.qualified_name_id
+              WHERE c.file_id = ?1 AND c.symbol_id IS NOT NULL AND c.symbol_path IS NOT NULL",
+        )?;
+        let realigned: Vec<(i64, String)> = linked
+            .query_map([file_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|(id, current, qualified_name)| {
+                let desired = format!("{qualified_name}{}", chunk_part_suffix(&current));
+                (desired != current).then_some((id, desired))
+            })
+            .collect();
+        // The vector for a chunk is built from its symbol_path among other fields, and a stored
+        // embedding is served while its `input_hash` is non-empty — so moving the path without
+        // touching that hash leaves semantic search answering from a vector labelled with a name
+        // the chunk no longer has. Clearing it puts those chunks back in the reconcile queue.
+        // Prepared once: this heal renames every impl symbol in the repo, so `realigned` is the
+        // corpus's impl count and `execute` would re-plan both statements for each of them.
+        let mut clear_embedding = self
             .storage
             .connection()
-            .prepare("SELECT id, path, language, kind FROM files ORDER BY path")?;
-        let rows = stmt.query_map([], |row| {
+            .prepare("UPDATE main.chunk_embeddings SET input_hash = '' WHERE chunk_id = ?1")?;
+        let mut move_path = self
+            .storage
+            .connection()
+            .prepare("UPDATE main.chunks SET symbol_path = ?2 WHERE id = ?1")?;
+        for (chunk_id, desired) in &realigned {
+            clear_embedding.execute([chunk_id])?;
+            move_path.execute(params![chunk_id, desired])?;
+        }
+        Ok(i64::try_from(refreshed)? == expected)
+    }
+
+    /// The rows this heal will re-derive, plus the count it could NOT name — the caller folds that
+    /// into its coverage so an unrecognized row defers the key stamp instead of being stamped over.
+    fn graph_reindex_files(&self) -> anyhow::Result<(Vec<GraphReindexFile>, usize)> {
+        // Read raw `main.files` for the A3/A6 predicates the view cannot supply on a bare open,
+        // but INTERSECT with the connection's `files` view — the heal must re-extract exactly the
+        // rows its own `resolve_edges` will re-resolve, and that pass writes only rows the view
+        // admits. Re-extracting a row outside the view replaces its resolved edges with fresh
+        // unresolved candidates that nothing then resolves, so a sibling commit or worktree scope
+        // would permanently lose its targets — worse than leaving it on the previous extraction.
+        // On a bare open the view is repo+generation-wide, so cross-scope coverage is unchanged.
+        //
+        // `kind != 'deleted'` guards the bare-open view, which does not filter tombstones:
+        // `mark_file_deleted` leaves `language='unknown', kind='deleted'`, and neither parses, so
+        // letting one through would turn every open into a hard error.
+        let mut stmt = self.storage.connection().prepare(
+            "SELECT id, path, language, kind, sha256
+                 FROM main.files
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                   AND id IN (SELECT id FROM files)
+                 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![self.active_repo_id, self.active_generation], |row| {
             let language: String = row.get(2)?;
             let kind: String = row.get(3)?;
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, language, kind))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                language,
+                kind,
+                row.get::<_, String>(4)?,
+            ))
         })?;
         let mut files = Vec::new();
+        // A row this build cannot name is still a row the heal did not cover, so the caller has to
+        // hear about it: with the count lost, a repo whose every OTHER row refreshed would take the
+        // new key stamp, and once the stamp matches nothing ever owes this row a re-derivation.
+        let mut unreadable = 0usize;
         for row in rows {
-            let (id, path, language, kind) = row?;
-            files.push(GraphReindexFile {
-                id,
-                path,
-                language: language.parse()?,
-                kind: kind.parse()?,
-            });
+            let (id, path, language, kind, sha256) = row?;
+            // A marker row this build cannot name is a row to LEAVE ALONE, not a reason to fail
+            // the open. `ensure_graph_index_current` is on the open path, so an unparseable
+            // language/kind here would wedge the database for every later open too.
+            let (Ok(language), Ok(kind)) =
+                (language.parse::<Language>(), kind.parse::<TargetKind>())
+            else {
+                tracing::warn!(path = %path, "skipping unrecognized file row during graph heal");
+                unreadable += 1;
+                continue;
+            };
+            files.push(GraphReindexFile { id, path, language, kind, sha256 });
         }
-        Ok(files)
+        Ok((files, unreadable))
+    }
+}
+
+#[cfg(test)]
+mod chunk_path_tests {
+    use super::chunk_part_suffix;
+
+    /// A symbol longer than one chunk is stored as `<qualified_name>#<part>`, and the realign
+    /// replaces the base while keeping the part. Rewriting the whole value collapsed every part of
+    /// a long symbol onto one path, so an upgraded index stopped matching a fresh one.
+    #[test]
+    fn a_continuation_part_survives_a_rename() {
+        assert_eq!(chunk_part_suffix("src/lib.rs::Foo<T>#1"), "#1");
+        assert_eq!(chunk_part_suffix("src/lib.rs::Foo<T>#12"), "#12");
+        assert_eq!(chunk_part_suffix("src/lib.rs::Foo<T>"), "");
+        // A `#` that is part of the NAME is not a part marker — a markdown context chunk carries
+        // one, and cutting there would halve the name.
+        assert_eq!(chunk_part_suffix("docs/x.md::#context-intro"), "");
+        assert_eq!(chunk_part_suffix("docs/x.md::#context-intro#3"), "#3");
+        // A bare trailing `#` marks nothing.
+        assert_eq!(chunk_part_suffix("src/lib.rs::Foo#"), "");
     }
 }

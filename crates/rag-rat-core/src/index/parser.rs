@@ -395,7 +395,13 @@ fn scope_path(
         current = parent.parent();
     }
     segments.reverse();
-    segments.push(name.to_string());
+    // A kind whose NAME is not its whole identity ends its own path with the fuller segment. An
+    // impl is the case: its name is the self type, so `impl A for W` and `impl B for W` are both
+    // `W` — and with the trait on a later line the captured signature is `impl` for both too, so
+    // the two impl symbols carry one logical key and a handle or memory bound to either answers
+    // for both. Asked per backend rather than reusing `scope_segment`, which several languages
+    // define for a symbol's CHILDREN in a shape its own path should not take.
+    segments.push(backend.own_scope_segment(node, text).unwrap_or_else(|| name.to_string()));
     segments.join("::")
 }
 

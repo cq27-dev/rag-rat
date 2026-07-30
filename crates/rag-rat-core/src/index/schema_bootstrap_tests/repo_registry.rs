@@ -3766,3 +3766,121 @@ fn adoption_repoints_change_couplings_consistently_with_its_stamp() {
         .unwrap();
     assert_eq!(computed_at, 50, "matching stamp => no recompute; the adopted rows survive intact");
 }
+
+/// `realign_logical_symbol_ids` recomputes a group's content-derived id and moves every durable
+/// reference onto it. It may only do that when the group's members AGREE on their owner scope.
+///
+/// A pre-upgrade group can hold the exact collision this version fixes — same-named,
+/// same-signature methods under different impl owners merged into one logical symbol. Reading one
+/// member's scope arbitrarily would realign the shared group, and every memory bound to it, onto
+/// that single owner's identity; the drift heal would then see an unchanged reference and hand the
+/// shared bindings to an arbitrary owner instead of treating the split as ambiguous.
+#[test]
+fn realign_skips_a_group_whose_members_disagree_on_their_owner() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    conn.execute(
+        "INSERT INTO files(repo_id, path, language, kind, sha256, modified_at_ms, indexed_at_ms,
+             commit_sha, worktree_id)
+         VALUES ('r', 'src/lib.rs', 'rust', 'source', 's', 0, 0, '', '')",
+        [],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES ('src/lib.rs::run')", [])
+        .unwrap();
+    let qn: i64 = conn
+        .query_row("SELECT id FROM name_strings WHERE value = 'src/lib.rs::run'", [], |r| r.get(0))
+        .unwrap();
+
+    // Two DISTINCT owners' methods, merged under one legacy logical symbol.
+    let mut members = Vec::new();
+    for (owner, line) in [("Alpha", 1), ("Beta", 5)] {
+        conn.execute(
+            "INSERT INTO symbols(file_id, name, kind, language, qualified_name_id, scope_path,
+                 signature, start_line, end_line, start_byte, end_byte)
+             VALUES (?1, 'run', 'function', 'rust', ?2, ?3, 'fn run(&self)', ?4, ?4, ?4, ?4)",
+            rusqlite::params![file_id, qn, format!("{owner}::run"), line],
+        )
+        .unwrap();
+        members.push(conn.last_insert_rowid());
+    }
+    conn.execute(
+        "INSERT INTO logical_symbols(id, repo_id, language, path, logical_name, qualified_name_id,
+             kind, variant_count, group_reason)
+         VALUES (4242, 'r', 'rust', 'src/lib.rs', 'run', ?1, 'function', 2, 'cfg')",
+        [qn],
+    )
+    .unwrap();
+    for symbol_id in &members {
+        conn.execute(
+            "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, start_line, \
+             end_line)
+             VALUES (4242, ?1, 1, 1)",
+            [symbol_id],
+        )
+        .unwrap();
+    }
+
+    let remapped = crate::index::graph_index::realign_logical_symbol_ids(&conn).unwrap();
+
+    assert_eq!(remapped, 0, "a group with disagreeing member scopes must not be realigned");
+    let still_there: i64 = conn
+        .query_row("SELECT COUNT(*) FROM logical_symbols WHERE id = 4242", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(still_there, 1, "the merged group is left for the key-drift relocation path");
+}
+
+/// Binder spelling is canonicalized at EXTRACTION, so `impl<T> Foo<T>` and `impl<U> Foo<U>` both
+/// store `Foo<_>` and are one legitimate group. It must still realign; deferring it would strand
+/// the row and its durable references on an id hashed from the OLD repo id after adoption
+/// re-points `repo_id`.
+#[test]
+fn realign_still_moves_a_group_of_canonically_equal_scopes() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    conn.execute(
+        "INSERT INTO files(repo_id, path, language, kind, sha256, modified_at_ms, indexed_at_ms,
+             commit_sha, worktree_id)
+         VALUES ('r', 'src/lib.rs', 'rust', 'source', 's', 0, 0, '', '')",
+        [],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES ('src/lib.rs::run')", [])
+        .unwrap();
+    let qn: i64 = conn
+        .query_row("SELECT id FROM name_strings WHERE value = 'src/lib.rs::run'", [], |r| r.get(0))
+        .unwrap();
+    for (scope, line) in [("Foo<_>::run", 1), ("Foo<_>::run", 5)] {
+        conn.execute(
+            "INSERT INTO symbols(file_id, name, kind, language, qualified_name_id, scope_path,
+                 signature, start_line, end_line, start_byte, end_byte)
+             VALUES (?1, 'run', 'function', 'rust', ?2, ?3, 'fn run(&self)', ?4, ?4, ?4, ?4)",
+            rusqlite::params![file_id, qn, scope, line],
+        )
+        .unwrap();
+        let symbol_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO logical_symbols(id, repo_id, language, path, logical_name,
+                 qualified_name_id, kind, variant_count, group_reason)
+             VALUES (4243, 'r', 'rust', 'src/lib.rs', 'run', ?1, 'function', 2, 'cfg')
+             ON CONFLICT(id) DO NOTHING",
+            [qn],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, start_line, \
+             end_line)
+             VALUES (4243, ?1, 1, 1)",
+            [symbol_id],
+        )
+        .unwrap();
+    }
+
+    let remapped = crate::index::graph_index::realign_logical_symbol_ids(&conn).unwrap();
+
+    assert_eq!(remapped, 1, "one canonical owner is one group and must be realigned");
+}

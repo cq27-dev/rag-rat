@@ -372,7 +372,13 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // re-extract so the corrected `dispatch_handle` set reaches deployed indexes.
 // 11: #208 review round 11 — effect-only fallback records the direct call (no shadowing
 // misresolve); method calls on scoped receivers (`worker.run()`) are recorded again; re-extract.
-const GRAPH_INDEX_VERSION: &str = "11";
+// 12: #567 — Rust impl scopes carry their rendered self type and trait path, so the resolution
+// surface (`scope_degeneric`) changes shape; re-extract.
+// 13: #567 — that rendering settled: binder substitution is decided by AST position, macro
+// argument tokens stay verbatim, and an impl symbol's OWN path ends at its `Type as Trait`
+// segment. An index built from an interim 12 carries the earlier shape and no longer differs from
+// the stamp, so it would never re-derive; re-extract.
+const GRAPH_INDEX_VERSION: &str = "13";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
 // on next open. Incremental discovery only rewrites a file row when its sha/language/kind changes —
@@ -394,7 +400,10 @@ const GENERATED_FLAGS_VERSION_KEY: &str = "generated_flags_version";
 // validate at a time. Per-repo (`repo_meta`, like `graph_index_version`): a shared DB holds repos
 // rebuilt by different binaries.
 // 1: initial version (#493).
-const LOGICAL_KEY_VERSION: &str = "1";
+// 2: canonical scope_path included in LogicalSymbolKey derivation (#567).
+// 3: #567 — the canonical form itself settled (see `GRAPH_INDEX_VERSION` 13), and an impl symbol's
+// qualified name now carries its trait, so every impl's key moves.
+const LOGICAL_KEY_VERSION: &str = "3";
 const LOGICAL_KEY_VERSION_KEY: &str = "logical_key_version";
 
 #[derive(Debug, Error)]
@@ -419,6 +428,9 @@ struct GraphReindexFile {
     path: String,
     language: Language,
     kind: TargetKind,
+    /// Digest of the text that produced this row — the graph heal's proof that the bytes it read
+    /// from the active checkout are this row's own (rows span every commit/worktree scope).
+    sha256: String,
 }
 
 #[derive(Debug)]

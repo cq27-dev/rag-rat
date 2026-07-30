@@ -835,6 +835,35 @@ pub(crate) fn resolve_symbol<'a>(
                 return Some((scope_exact[0], EdgeConfidence::Syntactic, "logical_variant")),
             _ => {},
         }
+        // Reaching here means the exact stage found NOTHING or found an AMBIGUITY. Either way the
+        // raw candidates at the normalized key belong in this set: when normalization was a no-op
+        // they ARE the exact stage's candidates, and dropping them as "already tried" would let a
+        // single normalization-only match (`&W as Tr::run` folding to `W::run`) win as a unique
+        // `scope_degeneric` over two raw `W::run` definitions the exact stage correctly refused
+        // to choose between. Re-including them is what keeps that ambiguity visible; a genuinely
+        // unique exact hit already returned above, so nothing is double-counted.
+        let qualified_normalized = normalized_scope_path(qualified, request.source_language);
+        let scope_normalized = index
+            .by_scope_path
+            .get(qualified_normalized.as_ref())
+            .into_iter()
+            .flatten()
+            .chain(
+                index
+                    .by_normalized_scope_path
+                    .get(qualified_normalized.as_ref())
+                    .into_iter()
+                    .flatten(),
+            )
+            .copied()
+            .filter(|symbol| kind_matches(symbol))
+            .collect::<Vec<_>>();
+        match scope_normalized.as_slice() {
+            [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "scope_degeneric")),
+            [_, ..] if same_logical_symbol(&scope_normalized) =>
+                return Some((scope_normalized[0], EdgeConfidence::Syntactic, "scope_degeneric")),
+            _ => {},
+        }
         let scope_suffix = format!("::{qualified}");
         let scope_matches = index
             .by_name

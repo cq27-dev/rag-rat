@@ -640,6 +640,7 @@ mod logical_group_reason_tests {
             language: "rust".to_string(),
             name: "describe".to_string(),
             qualified_name: "src/lib.rs::describe".to_string(),
+            scope_path: "describe".to_string(),
             kind: "function".to_string(),
             signature: Some("pub fn describe(&self) -> u32 {".to_string()),
             start_line: 1,

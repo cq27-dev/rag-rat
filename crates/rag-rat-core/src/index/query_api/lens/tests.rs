@@ -1489,6 +1489,10 @@ pub fn calls_leaf() { leaf(); }
 /// Pinned so the gap is not read as a handle-lane regression: it predates that lane and the
 /// qualified-name lane shows it identically. Closing it is a change to what the counts count, and
 /// this test is what would have to change with them.
+///
+/// Note what `matched_symbols` here is NOT evidence of: the two `go` bodies live in different
+/// impls, so they are two logical symbols with two handles, and each handle covers one. A handle
+/// spanning several symbols is the cfg-variant case, not the two-owners case.
 #[test]
 fn a_caller_count_spans_edge_kinds_a_hop_traversal_does_not() {
     let (_temp, config) = rust_source_config(NON_CALL_INBOUND_SOURCE);
@@ -1527,13 +1531,22 @@ fn a_caller_count_spans_edge_kinds_a_hop_traversal_does_not() {
     );
 
     // Same divergence one level down, where the counted edge is a `contains` from each impl block
-    // — so the count outrunning the hop list is not particular to the trait row.
+    // — so the count outrunning the hop list is not particular to the trait row. Each `go` body
+    // carries its OWN handle: the impl's owner is part of a member's identity, so
+    // `Alpha as Runner::go` and `Beta as Runner::go` are two logical symbols, not one.
+    let go_rows = graph
+        .iter()
+        .filter(|symbol| symbol.name == "go" && symbol.kind == "function")
+        .map(|symbol| symbol.logical_symbol_id.expect("an indexed row carries a handle"))
+        .collect::<Vec<_>>();
+    assert_eq!(go_rows.len(), 2, "the fixture declares `go` in two impls");
+    assert_ne!(go_rows[0], go_rows[1], "one type's method is not the other's");
     let (go, go_counted) = counted_callers("go", "function");
     assert!(
         go_counted > 0,
         "the impl blocks must draw `contains` edges at the method: {go_counted}"
     );
-    assert_eq!(hops(go), (0, 2), "the two `go` bodies share a handle and neither is called");
+    assert_eq!(hops(go), (0, 1), "the `contains` edge is counted as a caller and is not a hop");
 
     // The control: where the inbound edge IS a call, the count and the drill-down agree.
     let (leaf, leaf_counted) = counted_callers("leaf", "function");

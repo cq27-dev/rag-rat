@@ -3,6 +3,7 @@ mod helpers;
 mod imports;
 mod intern;
 mod resolve;
+pub(crate) mod scope_grammar;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -550,6 +551,96 @@ impl IndexedSymbol {
     }
 }
 
+/// Drop generic ARGUMENTS from a path — see [`scope_grammar::degeneric`], which owns the parsing
+/// rules every consumer of these strings shares.
+pub(crate) fn degeneric_path(path: &str) -> String {
+    scope_grammar::degeneric(path)
+}
+
+#[cfg(test)]
+mod degeneric_tests {
+    use super::degeneric_path;
+    use crate::index::edges::helpers::strip_generics;
+
+    /// A const-generic block holds an expression, so its `<`/`>` are operators. Getting this wrong
+    /// swallows everything after the block — and the call side (`strip_generics`) already treats
+    /// braces this way, so the two must agree or the definition and the call never meet.
+    #[test]
+    fn a_const_generic_block_is_not_a_generic_delimiter() {
+        for path in ["Foo<{ 1 < 2 }>::run", "Foo<{ 2 > 1 }>::run", "Foo<[u8; { 1 < 2 }]>::run"] {
+            assert_eq!(degeneric_path(path), "Foo::run", "{path}");
+        }
+        // A block OUTSIDE any generic argument is part of the type itself and survives.
+        assert_eq!(degeneric_path("[u8; { 1 < 2 }] as Tr::f"), "[u8; { 1 < 2 }] as Tr::f");
+    }
+
+    /// The def-side (`degeneric_path`, a full scan) and the call-side (`strip_generics`, a lighter
+    /// brace/angle counter) normalizer meet on the shapes a real path takes.
+    #[test]
+    fn degeneric_path_agrees_with_the_call_side_stripper() {
+        for path in ["Foo<T>::run", "Foo<{ 1 < 2 }>::run", "A<B<C>>::run", "plain::run"] {
+            assert_eq!(degeneric_path(path), strip_generics(path), "{path}");
+        }
+    }
+
+    /// Where they DIVERGE, the divergence is one-sided: the call side is string- and comment-blind,
+    /// so a `{`/`}`/`<`/`>` inside a literal unbalances its counter and it drops the whole tail —
+    /// yielding a form with no `::`, which resolution treats as a bare name and declines. The def
+    /// side keeps the real qualified key. So the two never disagree into a DIFFERENT qualified key
+    /// (which would let a call meet the wrong definition); the worst case is a missed edge that
+    /// falls back to bare-name matching. This pins that safe direction so a future change to either
+    /// side that turned a divergence into a colliding key would fail here. Full unification of the
+    /// two onto the scanner is #1094.
+    #[test]
+    fn a_divergence_between_the_normalizers_only_ever_declines() {
+        for path in [
+            r#"Foo<{ "{".len() }>::run"#,
+            r#"Foo<{ "}".len() }>::run"#,
+            r##"Bar<{ r#"<"#.len() }>::run"##,
+        ] {
+            let call = strip_generics(path);
+            let def = degeneric_path(path);
+            assert!(
+                call == def || !call.contains("::"),
+                "{path}: call `{call}` must equal def `{def}` or carry no `::`"
+            );
+        }
+    }
+}
+
+/// [`degeneric_path`] plus trait-impl owner folding: the `Type as Trait` scope segment emitted
+/// for `impl Trait for Type` collapses to `Type`, so a source-form target (`Type::method`, a
+/// receiver-type hint) finds trait-impl methods while their RAW scope keeps the trait — two
+/// traits' same-named methods stay distinct logical symbols yet expose the same receiver
+/// surface, and a call that could hit either declines as ambiguous (#567). The marker's trait
+/// path is emitted with `::` rewritten to `.` (see the Rust `trait_marker`), so it is always ONE
+/// `::`-segment and per-`::`-segment splitting is sound.
+/// Borrowed ⇔ the path needs no normalization — the hot rebuild path allocates nothing for the
+/// plain-scope majority.
+pub(crate) fn normalized_scope_path<'a>(
+    path: &'a str,
+    language: Option<&str>,
+) -> std::borrow::Cow<'a, str> {
+    if language != Some(Language::Rust.as_str())
+        || (!path.contains('<')
+            && !path.contains(" as ")
+            && !path.contains('&')
+            && !path.contains('*'))
+    {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let degeneric = degeneric_path(path);
+    std::borrow::Cow::Owned(
+        scope_grammar::segments(&degeneric)
+            .into_iter()
+            .map(|segment| {
+                scope_grammar::strip_receiver_wrappers(scope_grammar::strip_trait_marker(segment))
+            })
+            .collect::<Vec<_>>()
+            .join("::"),
+    )
+}
+
 /// Name-keyed indexes over the symbol set, built once per resolve pass. Edge resolution used to
 /// scan the entire `Vec<IndexedSymbol>` (several times) per edge — O(edges × symbols), the single
 /// biggest cost in a full rebuild. These maps make each lookup ~O(1). Bucket order mirrors the
@@ -562,6 +653,9 @@ pub(crate) struct SymbolIndex<'a> {
     /// qualified path fires for methods/nested items instead of collapsing to bare-name
     /// collisions.
     by_scope_path: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    /// Scope path with generics stripped and trait-impl owners folded (`SymbolIndex::build`
+    /// matching `SymbolIndex<'a>::build`; `Worker::run` matching `Worker as Service::run`).
+    by_normalized_scope_path: HashMap<String, Vec<&'a IndexedSymbol>>,
     /// Short-name fallback (`symbol.name`).
     by_name: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
     /// Candidates for the `qualified_name.ends_with("::{q}")` suffix match, keyed by the last
@@ -574,15 +668,25 @@ impl<'a> SymbolIndex<'a> {
     fn build(symbols: &'a [IndexedSymbol]) -> Self {
         let mut by_qualified: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_scope_path: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
+        let mut by_normalized_scope_path: HashMap<String, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_name: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_qn_tail: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         for symbol in symbols {
             by_qualified.entry(symbol.qualified_name.as_str()).or_default().push(symbol);
             by_scope_path.entry(symbol.scope_path.as_str()).or_default().push(symbol);
+            // Only paths the normalization actually changes go into the normalized map (`Owned`
+            // ⇔ changed) — a plain scope is already reachable through `by_scope_path`, and
+            // skipping it avoids one String per symbol on the hot rebuild path. Lookups consult
+            // BOTH maps.
+            if let std::borrow::Cow::Owned(normalized) =
+                normalized_scope_path(&symbol.scope_path, Some(&symbol.language))
+            {
+                by_normalized_scope_path.entry(normalized).or_default().push(symbol);
+            }
             by_name.entry(symbol.name.as_str()).or_default().push(symbol);
             by_qn_tail.entry(qn_tail(&symbol.qualified_name)).or_default().push(symbol);
         }
-        Self { by_qualified, by_scope_path, by_name, by_qn_tail }
+        Self { by_qualified, by_scope_path, by_normalized_scope_path, by_name, by_qn_tail }
     }
 
     /// Whether `file_id` itself defines a symbol named `name`. Import-alias rebinding defers when

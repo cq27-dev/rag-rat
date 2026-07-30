@@ -590,14 +590,10 @@ fn a_rebuild_carrying_a_committed_leftover_defers_the_stamp() {
 /// Overlap rather than containment: a chunk begins BEFORE its symbol when it captures the leading
 /// doc comment, so `symbol.start <= chunk.start` would reject the right answer.
 ///
-/// NOTE the second half of this test. These two methods have BYTE-IDENTICAL declaration lines, and
-/// `signature` — the trimmed first line — is part of `LogicalSymbolKey`, so they collapse into ONE
-/// logical symbol. Every logical-id-anchored surface therefore still applies to both, and no
-/// chunk-side resolution can change that; it is a defect in the identity key. (When the
-/// declaration lines DIFFER the two are distinct logical symbols and the leak is real and fixed —
-/// see `a_decision_record_does_not_leak_between_distinct_same_named_methods`.) This test pins the
-/// raw-`symbol_id` precision that IS fixable here, plus the collapse itself, so the day the
-/// identity key gains a scope discriminator, this test notices.
+/// The two methods also have byte-identical declaration lines. Their owner scope must therefore
+/// remain part of logical identity; otherwise logical-id-anchored data leaks between `Alpha` and
+/// `Beta`. This test pins both guarantees: chunk binding selects the concrete overlapping method,
+/// and logical grouping keeps methods owned by different types separate.
 #[test]
 fn a_chunk_binding_resolves_the_symbol_it_overlaps_not_an_arbitrary_same_named_sibling() {
     let root = unique_temp_root();
@@ -661,13 +657,9 @@ fn a_chunk_binding_resolves_the_symbol_it_overlaps_not_an_arbitrary_same_named_s
     );
     assert_eq!(beta.symbol_id, Some(beta_symbol), "and the second method's chunk binds the second",);
 
-    // The known remaining imprecision, pinned deliberately: logical grouping is
-    // `(repo_id, path, logical_name)`, so these two distinct methods are ONE logical symbol and
-    // anything anchored to it applies to both.
-    assert_eq!(
+    assert_ne!(
         alpha.logical_symbol_id, beta.logical_symbol_id,
-        "same-named symbols in one file still share a logical id — if this ever fails, grouping \
-         gained a discriminator and the logical-id-anchored surfaces became per-method",
+        "same-named methods owned by different Rust types must remain distinct logical symbols",
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -1247,6 +1239,436 @@ fn a_no_winner_drift_on_a_vanished_id_also_clears_the_anchor_and_the_node_edge()
         .unwrap();
     assert_eq!(edge.0, None, "a dead target is cleared");
     assert_eq!(edge.1, "gone", "and stops claiming to be current");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A raw `symbol` binding survives a RENAME IN PLACE — the row id is untouched, only the name on it
+/// moves. That is what an index upgrade re-deriving an impl's identity does: the impl symbol stops
+/// being named for its trait and starts being named for its type.
+///
+/// The row id proves which symbol the memory is on, so validation reports it current — but
+/// `binding_id` is the qualified name every later relocation searches by, and it is the ONLY
+/// discriminator once an ordinary reindex churns the row id. Left stale, that search finds whatever
+/// else answers to the old name, or nothing. It has to be refreshed while the id still vouches.
+#[test]
+fn a_symbol_binding_refreshes_its_name_when_the_row_is_renamed_in_place() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn renamed_fn(a: u8) -> u8 { a }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let (symbol_id, live_name): (i64, String) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT s.id, (SELECT value FROM name_strings WHERE id = s.qualified_name_id)
+               FROM symbols s WHERE s.name = 'renamed_fn'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+
+    let created = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Bound to a raw symbol row".to_string(),
+            body: "The name on this row is about to move under it.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(symbol_id),
+                logical_symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                tracker: None,
+                project: None,
+                item_key: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+                edge_path: None,
+                dir: None,
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+
+    // The pre-upgrade name, still on the binding after the row itself was renamed in place.
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE repo_memory_bindings SET binding_id = 'src/lib.rs::old_impl_name'
+              WHERE memory_id = ?1 AND binding_kind = 'symbol'",
+            params![memory_id],
+        )
+        .unwrap();
+
+    db.memory_validate().unwrap();
+
+    let refreshed: String = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT binding_id FROM repo_memory_bindings
+              WHERE memory_id = ?1 AND binding_kind = 'symbol'",
+            params![memory_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        refreshed, live_name,
+        "the binding must carry the name the row answers to now, not the one it was made against"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// An impl symbol is named for its self type, so `{path}::{name}` is shared by `struct Worker` and
+/// its `impl Worker` block. Once a reindex churns the raw row id, relocation searches that shared
+/// name — and picking the first row is a coin flip that can move an impl memory onto the struct.
+/// The binding's own kind and signature decide instead.
+#[test]
+fn a_symbol_binding_relocates_onto_its_own_twin_not_a_same_named_sibling() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub struct Twin;\n\nimpl Twin {\n    pub fn method(&self) {}\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let impl_id: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM symbols WHERE name = 'Twin' AND kind = 'impl'", [], |r| r.get(0))
+        .unwrap();
+    let struct_id: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM symbols WHERE name = 'Twin' AND kind = 'struct'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_ne!(impl_id, struct_id, "the fixture must produce both twins");
+
+    let created = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Bound to the impl block".to_string(),
+            body: "This memory is about the impl, not the struct.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(impl_id),
+                logical_symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                tracker: None,
+                project: None,
+                item_key: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+                edge_path: None,
+                dir: None,
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+    // Both twins answer to this name; only the discriminators separate them.
+    let shared_name: String = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT (SELECT value FROM name_strings WHERE id = s.qualified_name_id)
+               FROM symbols s WHERE s.id = ?1",
+            params![impl_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let struct_name: String = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT (SELECT value FROM name_strings WHERE id = s.qualified_name_id)
+               FROM symbols s WHERE s.id = ?1",
+            params![struct_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared_name, struct_name, "the twins must share a qualified name");
+
+    // The raw id is gone, exactly as a reindex leaves it; only the name and discriminators remain.
+    db.storage
+        .connection()
+        .execute("UPDATE repo_memory_bindings SET symbol_id = NULL WHERE memory_id = ?1", params![
+            memory_id
+        ])
+        .unwrap();
+
+    db.memory_validate().unwrap();
+
+    let landed: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT symbol_id FROM repo_memory_bindings
+              WHERE memory_id = ?1 AND binding_kind = 'symbol'",
+            params![memory_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(landed, impl_id, "the impl memory must relocate onto the impl, not its struct");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Two impls of different traits for one type are indistinguishable by the shape discriminators:
+/// both are named for the self type, both are kind `impl`, and with the trait on the line after
+/// `impl` — what a formatter produces for long bounds — both capture the same signature. Only the
+/// logical handle, derived from a key that hashes `scope_path`, tells `Twin as Alpha` from
+/// `Twin as Beta`.
+#[test]
+fn a_symbol_binding_separates_two_trait_impls_on_one_type() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), TWO_TRAIT_IMPLS_FIXTURE).unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let (alpha_id, beta_id) = trait_impl_twins(&db);
+
+    let created = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Bound to the Beta impl".to_string(),
+            body: "This memory is about Beta for Twin, not Alpha for Twin.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(beta_id),
+                logical_symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                tracker: None,
+                project: None,
+                item_key: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+                edge_path: None,
+                dir: None,
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+
+    // The raw id is gone, exactly as a reindex leaves it; only the name, the shape discriminators
+    // — which both impls satisfy — and the logical handle remain.
+    db.storage
+        .connection()
+        .execute("UPDATE repo_memory_bindings SET symbol_id = NULL WHERE memory_id = ?1", params![
+            memory_id
+        ])
+        .unwrap();
+
+    db.memory_validate().unwrap();
+
+    let landed: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT symbol_id FROM repo_memory_bindings
+              WHERE memory_id = ?1 AND binding_kind = 'symbol'",
+            params![memory_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        landed, beta_id,
+        "the Beta memory must relocate onto Beta, not the lower-id Alpha ({alpha_id})"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Strip the logical handle too and the two impls become genuinely indistinguishable. The contract
+/// there is a deterministic pick — the lowest id — not a guess that can move between runs.
+#[test]
+fn a_symbol_binding_without_a_logical_handle_keeps_the_deterministic_pick() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), TWO_TRAIT_IMPLS_FIXTURE).unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let (alpha_id, beta_id) = trait_impl_twins(&db);
+
+    let created = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Bound to the Beta impl with no handle".to_string(),
+            body: "Nothing left on the binding can tell the two impls apart.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(beta_id),
+                logical_symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                tracker: None,
+                project: None,
+                item_key: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+                edge_path: None,
+                dir: None,
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE repo_memory_bindings SET symbol_id = NULL, logical_symbol_id = NULL
+              WHERE memory_id = ?1",
+            params![memory_id],
+        )
+        .unwrap();
+
+    db.memory_validate().unwrap();
+
+    let (landed, status): (i64, String) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT symbol_id, anchor_status FROM repo_memory_bindings
+              WHERE memory_id = ?1 AND binding_kind = 'symbol'",
+            params![memory_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(landed, alpha_id, "with no evidence left the pick must stay the lowest id");
+    assert_eq!(status, "relocated");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Each trait sits on the line AFTER `impl` so both impl symbols capture the same signature text,
+/// which is what leaves the logical handle as the only discriminator.
+const TWO_TRAIT_IMPLS_FIXTURE: &str = "pub struct Twin;\npub trait Alpha { fn run(&self); }\npub \
+                                       trait Beta { fn run(&self); }\nimpl\nAlpha for Twin { fn \
+                                       run(&self) {} }\nimpl\nBeta for Twin { fn run(&self) {} }\n";
+
+/// The two impl rows, id-ascending, with the preconditions that make the twin tests load-bearing:
+/// they must agree on qualified name, kind and signature, and differ only in `scope_path`.
+fn trait_impl_twins(db: &IndexDatabase) -> (i64, i64) {
+    let rows: Vec<(i64, i64, String, String, String)> = {
+        let conn = db.storage.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, qualified_name_id, kind, COALESCE(signature, ''), scope_path
+                   FROM symbols WHERE name = 'Twin' AND kind = 'impl' ORDER BY id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    };
+    assert_eq!(rows.len(), 2, "the fixture must produce exactly two impl rows: {rows:?}");
+    let (alpha, beta) = (&rows[0], &rows[1]);
+    assert_eq!(alpha.1, beta.1, "the impls must share a qualified name");
+    assert_eq!(alpha.2, beta.2, "the impls must share a kind");
+    assert_eq!(alpha.3, beta.3, "the impls must capture the same signature: {rows:?}");
+    assert_eq!(alpha.4, "Twin as Alpha", "the lower-id impl must be the Alpha one");
+    assert_eq!(beta.4, "Twin as Beta", "the higher-id impl must be the Beta one");
+    (alpha.0, beta.0)
+}
+
+/// Version 2 hashes `scope_path` for EVERY language, but the column landed nullable with no
+/// backfill — a row indexed before it reads as `''` here while a fresh index hashes a real
+/// enclosing scope. Refreshing only Rust would let a non-Rust legacy row take a version-2 stamp
+/// carrying a key no fresh index produces, and nothing afterwards would owe it a re-derivation.
+#[test]
+fn a_legacy_row_in_any_language_has_its_scope_re_derived() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/app.py"), "class Outer:\n    def inner(self):\n        return 1\n")
+        .unwrap();
+    let config = source_config(root.clone(), Language::Python);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let fresh: String = db
+        .storage
+        .connection()
+        .query_row("SELECT scope_path FROM symbols WHERE name = 'inner'", [], |r| r.get(0))
+        .unwrap();
+    assert!(fresh.contains("Outer"), "the fresh scope must carry the enclosing class: {fresh}");
+    drop(db);
+
+    // A pre-`scope_path` index: the column exists but was never derived for this row, and the key
+    // version is unstamped so the heal runs.
+    {
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        conn.execute("UPDATE symbols SET scope_path = NULL WHERE name = 'inner'", []).unwrap();
+        conn.execute("DELETE FROM repo_meta WHERE key = 'logical_key_version'", []).unwrap();
+        conn.execute("UPDATE repo_meta SET value = '0' WHERE key = 'graph_index_version'", [])
+            .unwrap();
+    }
+
+    let db = IndexDatabase::open_config(&config).unwrap();
+    let healed: Option<String> = db
+        .storage
+        .connection()
+        .query_row("SELECT scope_path FROM symbols WHERE name = 'inner'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        healed.as_deref(),
+        Some(fresh.as_str()),
+        "a legacy non-Rust row must be re-derived to the scope a fresh index gives it"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

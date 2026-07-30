@@ -402,9 +402,18 @@ pub(crate) fn chunk_for_symbol(
         JOIN files ON files.id = symbols.file_id
         LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         LEFT JOIN chunks ON chunks.file_id = files.id
-            AND (chunks.symbol_path = qn.value OR chunks.symbol_path = ?2)
+            AND (chunks.symbol_id = symbols.id
+                 OR chunks.symbol_path = qn.value
+                 OR chunks.symbol_path = ?2)
         WHERE symbols.id = ?1
-        ORDER BY CASE WHEN chunks.symbol_path = qn.value THEN 0 ELSE 1 END,
+        -- The id first, because the PATH is not unique: an impl is named for its self type, so
+        -- `struct W`, `impl A for W` and `impl B for W` all answer to `src/lib.rs::W`. Ordering by
+        -- path alone then hands whichever starts earliest in the file — usually the struct — so a
+        -- memory on one impl would carry another symbol's source hash and line range. The path
+        -- match stays for rows indexed before chunks carried a symbol id.
+        ORDER BY CASE WHEN chunks.symbol_id = symbols.id THEN 0
+                      WHEN chunks.symbol_path = qn.value THEN 1
+                      ELSE 2 END,
                  chunks.start_line
         LIMIT 1
         ",
@@ -432,9 +441,14 @@ pub(crate) fn chunk_for_logical_symbol(
         JOIN files ON files.id = symbols.file_id
         LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
         LEFT JOIN chunks ON chunks.file_id = files.id
-            AND chunks.symbol_path = qn.value
+            AND (chunks.symbol_id = symbols.id OR chunks.symbol_path = qn.value)
         WHERE logical_symbol_members.logical_symbol_id = ?1
-        ORDER BY logical_symbol_members.start_line, chunks.start_line
+        -- Same reason as `chunk_for_symbol`: the path is shared by a type and every impl on it,
+        -- so the member's own id has to win before the file-order tiebreak sends the group to a
+        -- neighbour's chunk.
+        ORDER BY CASE WHEN chunks.symbol_id = symbols.id THEN 0 ELSE 1 END,
+                 logical_symbol_members.start_line,
+                 chunks.start_line
         LIMIT 1
         ",
         [logical_symbol_id],

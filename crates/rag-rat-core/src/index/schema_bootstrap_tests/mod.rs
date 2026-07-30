@@ -981,6 +981,7 @@ mod generation_rebuild;
 mod git_history_reload;
 mod go_corpus;
 mod graph_edges;
+mod graph_heal_robustness;
 mod head_move_carry;
 mod index_paths;
 mod lens_clones;

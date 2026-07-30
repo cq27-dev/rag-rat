@@ -89,7 +89,8 @@ pub(crate) fn validate_logical_symbol_binding(
             SELECT ls.id, ls.path, ls.kind,
                    (SELECT s.signature FROM logical_symbol_members m
                       JOIN symbols s ON s.id = m.symbol_id
-                     WHERE m.logical_symbol_id = ls.id LIMIT 1)
+                     WHERE m.logical_symbol_id = ls.id LIMIT 1),
+                   ls.id
             FROM logical_symbols ls
             WHERE ls.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
               AND ls.repo_id = ?2
@@ -102,15 +103,16 @@ pub(crate) fn validate_logical_symbol_binding(
                 path: row.get(1)?,
                 kind: row.get(2)?,
                 signature: row.get(3)?,
+                logical_symbol_id: row.get(4)?,
             })
         })?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    let relocated = pick_relocation_twin(
-        candidates,
-        binding.symbol_kind.as_deref(),
-        binding.signature_hash.as_deref(),
-    );
+    // The group axis is inert here by construction: this arm is only reached when the binding's
+    // handle is absent or names a row that no longer exists, and a dead id can never equal a live
+    // candidate's. Impl twins are still separated where it matters — the stable-id arm above
+    // resolves them on its own, since the logical key hashes `scope_path`.
+    let relocated = pick_relocation_twin(candidates, binding);
     if let Some((id, path)) = relocated {
         binding.logical_symbol_id = Some(id);
         binding.path = Some(path);
@@ -150,30 +152,44 @@ struct RelocationTwin {
     path: String,
     kind: String,
     signature: Option<String>,
+    /// The logical group this twin belongs to — for a logical-symbol candidate, itself.
+    logical_symbol_id: Option<i64>,
 }
 
 /// Choose which same-qualified-name twin a gone binding relocates onto (#491): the stored
-/// discriminators win — kind agreement outranks signature-hash agreement (a rename usually keeps
-/// the kind but changes the signature text) — and equal evidence falls back to the lowest id, so
-/// the pick is deterministic instead of plan-order. `None` evidence on the binding degrades
-/// gracefully: every candidate scores equally and the id tiebreak decides, matching the old
-/// behavior for bindings that predate the V014 discriminators.
+/// discriminators win, and equal evidence falls back to the lowest id, so the pick is deterministic
+/// instead of plan-order.
+///
+/// The logical handle outranks both shape axes because it is derived from the whole logical key,
+/// `scope_path` included, which makes it the only stored evidence that separates two impls of
+/// different traits for one type: an impl symbol is named for its self type, so `impl Alpha for W`
+/// and `impl Beta for W` agree on the qualified name, agree on `impl`, and — with the trait on a
+/// later line, as a formatter produces for long bounds — agree on the captured signature too. Kind
+/// then outranks signature, since a rename usually keeps the kind but changes the signature text.
+/// `None` evidence on the binding degrades gracefully: every candidate scores equally on the axes
+/// it can't speak to, and the id tiebreak decides, matching the behavior for bindings that predate
+/// the V014 discriminators.
 fn pick_relocation_twin(
     candidates: Vec<RelocationTwin>,
-    bound_kind: Option<&str>,
-    bound_signature_hash: Option<&str>,
+    binding: &RepoMemoryBinding,
 ) -> Option<(i64, String)> {
     candidates
         .into_iter()
         .map(|twin| {
-            let kind_agrees = bound_kind == Some(twin.kind.as_str());
-            let signature_agrees = match (bound_signature_hash, &twin.signature) {
+            let group_agrees = matches!(
+                (binding.logical_symbol_id, twin.logical_symbol_id),
+                (Some(bound), Some(group)) if bound == group
+            );
+            let kind_agrees = binding.symbol_kind.as_deref() == Some(twin.kind.as_str());
+            let signature_agrees = match (binding.signature_hash.as_deref(), &twin.signature) {
                 (Some(bound), Some(sig)) => bound == hex_sha256(sig.trim().as_bytes()),
                 _ => false,
             };
             // Candidates arrive id-ascending; max_by_key keeps the LAST maximum, so compare on
             // (score, negated id) to keep the lowest-id winner among evidence ties.
-            let score = (u8::from(kind_agrees) << 1) | u8::from(signature_agrees);
+            let score = (u8::from(group_agrees) << 2)
+                | (u8::from(kind_agrees) << 1)
+                | u8::from(signature_agrees);
             (score, -twin.id, twin)
         })
         .max_by_key(|(score, neg_id, _)| (*score, *neg_id))
@@ -185,23 +201,54 @@ pub(crate) fn validate_symbol_binding(
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
     if let Some(id) = binding.symbol_id
-        && crate::symbol::lookup_by_id(conn, id)?.is_some()
+        && let Some(hit) = crate::symbol::lookup_by_id(conn, id)?
     {
+        // The row id proves WHICH symbol this is; `binding_id` is only the qualified name every
+        // later relocation searches by. A rename in place — an index upgrade re-deriving an impl's
+        // identity moves the row's name from the trait to the type — leaves the two disagreeing,
+        // and nothing notices until the next reindex churns the row id. Relocation then looks up a
+        // name that no longer belongs to this symbol and attaches the memory to whatever else
+        // answers to it, or calls it gone. Refresh the name while the id still vouches for it.
+        if hit.qualified_name != binding.binding_id {
+            binding.binding_id = hit.qualified_name;
+        }
+        // The row can also be REGROUPED without moving: a key-version rebuild mints a new logical
+        // id for the same impl. The raw id still proves the binding's identity, so re-read the
+        // handle here — leaving the vanished one in place reports `current` forever while every
+        // logical-id-keyed surface stays disconnected from the symbol.
+        binding.logical_symbol_id = logical_symbol_id_for_symbol(conn, id)?;
         return validate_bound_chunk(conn, binding);
     }
-    let relocated = conn
-        .query_row(
+    // One qualified name can hold several live rows: `{path}::{name}` is shared by a `struct
+    // Worker` and its `impl Worker` block, since an impl symbol is named for its self type. A
+    // `LIMIT 1` here is a plan-order coin flip between them, so the binding's own discriminators
+    // pick — the same rule, and the same helper, the logical-symbol path uses. Each candidate
+    // carries its logical group, keyed on its own row id so the correlated read adds no scope
+    // surface, because the group is what separates two impls of different traits for one type.
+    let candidates: Vec<RelocationTwin> = {
+        let mut stmt = conn.prepare(
             "
-            SELECT symbols.id, files.path
+            SELECT symbols.id, files.path, symbols.kind, symbols.signature,
+                   (SELECT m.logical_symbol_id FROM logical_symbol_members m
+                     WHERE m.symbol_id = symbols.id LIMIT 1)
             FROM symbols
             JOIN files ON files.id = symbols.file_id
             WHERE symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
-            LIMIT 1
+            ORDER BY symbols.id
             ",
-            [&binding.binding_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
+        )?;
+        let rows = stmt.query_map([&binding.binding_id], |row| {
+            Ok(RelocationTwin {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                kind: row.get(2)?,
+                signature: row.get(3)?,
+                logical_symbol_id: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let relocated = pick_relocation_twin(candidates, binding);
     if let Some((id, path)) = relocated {
         binding.symbol_id = Some(id);
         binding.logical_symbol_id = logical_symbol_id_for_symbol(conn, id)?;

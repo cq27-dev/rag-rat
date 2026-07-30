@@ -68,6 +68,16 @@ pub(super) trait ParserBackend: Sync {
 
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String>;
 
+    /// The segment a symbol ends its OWN path with, when its `name` is not its whole identity.
+    ///
+    /// Defaults to `None`, meaning the name IS the identity — true for nearly every kind. Rust's
+    /// impl is the exception: its name is the self type, so two impls of different traits for one
+    /// type would otherwise share a scope path. Deliberately not `scope_segment`, which several
+    /// backends define for a symbol's CHILDREN in a shape its own path should not take.
+    fn own_scope_segment(&self, _node: Node<'_>, _text: &str) -> Option<String> {
+        None
+    }
+
     fn is_test_symbol(&self, _text: &str, _node: Node<'_>, _scope_path: &str, _name: &str) -> bool {
         false
     }
