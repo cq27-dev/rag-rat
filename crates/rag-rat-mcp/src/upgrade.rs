@@ -387,6 +387,36 @@ mod tests {
         assert!(!path.exists(), "temp file is unlinked after read");
     }
 
+    /// The handoff file is a contract between two DIFFERENT binaries: the predecessor writes it,
+    /// then `exec`s the newly installed one, which reads it. Those binaries can be built against
+    /// different rmcp releases, so `peer_info` must stay readable across an rmcp upgrade — the
+    /// whole point of the hot path is resuming without re-`initialize`. A model change that
+    /// renames or newly requires a field inside `InitializeRequestParams` silently downgrades
+    /// every hot-upgrade to a cold restart (`take_handoff` swallows the parse error), which no
+    /// same-version round-trip test can catch. This literal is the exact JSON a predecessor emits.
+    #[test]
+    fn handoff_written_by_a_differently_built_binary_still_deserializes() {
+        let written_by_predecessor = r#"{
+            "format_version": 1,
+            "negotiated_protocol_version": "2025-06-18",
+            "peer_info": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "claude-code", "version": "2.0.0" }
+            },
+            "residue": [],
+            "old_binary_inode": 42,
+            "upgrade_started_unix_ms": 1700000000000
+        }"#;
+        let handoff: HandoffV1 = serde_json::from_str(written_by_predecessor)
+            .expect("a predecessor's handoff must deserialize after an rmcp upgrade");
+        assert_eq!(handoff.format_version, HandoffV1::FORMAT_VERSION);
+        assert_eq!(handoff.negotiated_protocol_version, "2025-06-18");
+        assert_eq!(handoff.peer_info.protocol_version.as_str(), "2025-06-18");
+        assert_eq!(handoff.peer_info.client_info.name, "claude-code");
+        assert!(protocol_supported(&handoff.negotiated_protocol_version));
+    }
+
     #[tokio::test]
     async fn inflight_wait_zero_resolves_after_guards_drop() {
         let inflight = Inflight::new();

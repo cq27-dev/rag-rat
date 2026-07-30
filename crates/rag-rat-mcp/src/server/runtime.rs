@@ -107,37 +107,51 @@ async fn run_stdio_unix(
     // terminate the stdio MCP service.
     let _lens_server = crate::lens_server::spawn(config.clone());
 
-    // Arm the SIGUSR1 hot-upgrade handler only when an install target is configured.
+    // Arm the SIGUSR1 hot-upgrade handler only when an install target is configured AND the client
+    // reached us through the `initialize` handshake. A peer that used the stateless lifecycle
+    // (protocol 2026-07-28 drops `initialize` and carries its version + capabilities in each
+    // request's `_meta`) leaves `peer_info()` empty: there is no negotiated session state to hand
+    // across the `exec`, and fabricating a default one would resume the successor claiming a
+    // protocol version and capability set the client never sent. Leaving hot-upgrade unarmed is
+    // the safe outcome — SIGUSR1 is ignored and this process keeps serving until the client
+    // disconnects, after which the next launch picks up the new binary.
+    //
+    // `peer_info()` yields `Option<Arc<_>>`; deref-and-clone to the owned `InitializeRequestParams`
+    // the `Upgrade`/handoff want.
+    let peer_info = running.peer().peer_info().map(|p| (*p).clone());
     if let Some(install_path) = install_path {
-        // rmcp 1.8 changed `peer_info()` from `Option<&_>` to `Option<Arc<_>>`; deref-and-clone to
-        // the owned `InitializeRequestParams` the `Upgrade`/handoff want. `*p` derefs either form,
-        // so this compiles on 1.7 and 1.8 alike.
-        let peer_info = running.peer().peer_info().map(|p| (*p).clone()).unwrap_or_default();
-        let negotiated_protocol_version = peer_info.protocol_version.as_str().to_string();
-        let handoff_dir = config
-            .database
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(std::env::temp_dir);
-        let upgrade = Upgrade {
-            gate: Arc::clone(&gate),
-            inflight,
-            install_path,
-            handoff_dir,
-            peer_info,
-            negotiated_protocol_version,
-        };
-        tokio::spawn(async move {
-            let Ok(mut sigusr1) = signal(SignalKind::user_defined1()) else {
-                eprintln!("hot-upgrade: could not install SIGUSR1 handler; disabled");
-                return;
+        if let Some(peer_info) = peer_info {
+            let negotiated_protocol_version = peer_info.protocol_version.as_str().to_string();
+            let handoff_dir = config
+                .database
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(std::env::temp_dir);
+            let upgrade = Upgrade {
+                gate: Arc::clone(&gate),
+                inflight,
+                install_path,
+                handoff_dir,
+                peer_info,
+                negotiated_protocol_version,
             };
-            // On success `run()` never returns (it `exec`s or exits); on a drain-timeout abort it
-            // returns and we wait for the next signal.
-            while sigusr1.recv().await.is_some() {
-                upgrade.run().await;
-            }
-        });
+            tokio::spawn(async move {
+                let Ok(mut sigusr1) = signal(SignalKind::user_defined1()) else {
+                    eprintln!("hot-upgrade: could not install SIGUSR1 handler; disabled");
+                    return;
+                };
+                // On success `run()` never returns (it `exec`s or exits); on a drain-timeout abort
+                // it returns and we wait for the next signal.
+                while sigusr1.recv().await.is_some() {
+                    upgrade.run().await;
+                }
+            });
+        } else {
+            eprintln!(
+                "hot-upgrade: client connected without `initialize` (stateless lifecycle); no \
+                 session state to hand off, so hot-upgrade stays disabled for this session"
+            );
+        }
     }
 
     running.waiting().await?;

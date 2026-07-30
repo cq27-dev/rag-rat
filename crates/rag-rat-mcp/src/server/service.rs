@@ -1,6 +1,6 @@
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Implementation, ListToolsResult, PaginatedRequestParams,
-    ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -22,14 +22,17 @@ impl ServerHandler for RagRatService {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         // The catalog (TOOL_NAMES / schema / description) is the single source of truth advertised
         // by `list_tools`, and `call_tool_for_config` (via `call`) is the by-name dispatcher.
         // Forward the raw request arguments straight to the `call()` chokepoint: no per-tool
         // `#[tool]` forwarder and no `Parameters<T>` serialize->deserialize round-trip — the client
         // JSON reaches exactly one deserialize, in `call_tool_with_db`.
         let args = request.arguments.map(Value::Object).unwrap_or(Value::Null);
-        self.call_async(request.name.to_string(), args).await
+        // Every rag-rat tool answers in one round trip: the arguments fully determine the result,
+        // so there is nothing to elicit mid-call. Always the `Complete` arm — a multi-round-trip
+        // `InputRequired` response would stall an agent waiting on a read-only lookup.
+        self.call_async(request.name.to_string(), args).await.map(CallToolResponse::from)
     }
 
     async fn list_tools(
@@ -47,6 +50,10 @@ impl ServerHandler for RagRatService {
                 Tool::new((*name).to_string(), crate::tools::description(name), input_schema)
             })
             .collect();
-        Ok(ListToolsResult { tools, meta: None, next_cursor: None })
+        // `with_all_items` fills the SEP-2322 / SEP-2549 result fields with their protocol
+        // defaults (`result_type: complete`, no TTL, no cache scope). The whole catalog ships in
+        // one page, so there is no cursor; rmcp strips `result_type` again for peers that
+        // negotiated a protocol version predating the field.
+        Ok(ListToolsResult::with_all_items(tools))
     }
 }
