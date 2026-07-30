@@ -49,6 +49,15 @@
 //! directory `table_sync_streams` carries a `repo_id` and is swept by the class sweep, so the two
 //! halves have to agree — retaining the entries while dropping the directory that places them is
 //! the shape that resurrects history.
+//!
+//! That same determinism leaves the OTHER half of the problem open, and deleting the log does not
+//! settle it: a re-registration derives the same stream id over an empty log, so this device
+//! authors a second genesis at lamport 0 and a peer holding the old chain reads it as a fork (and
+//! an old entry redelivered from that peer is chain-continuous, so it repopulates what was purged).
+//! The resolution is a stream epoch or durable chain high-water state, which has to be agreed with
+//! peers and therefore belongs to the transport milestone — tracked in #1049. Unreachable until a
+//! transport exists; purging is still the better interim, because the resurrection path above needs
+//! no peer at all.
 
 use rusqlite::{Connection, params};
 
@@ -217,13 +226,19 @@ pub fn count_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<RepoR
         )?;
         counts.record(&table, count);
     }
-    // Transitive children: count through the live parent scope (the parents still exist at count
-    // time — this is the read path). An older schema may predate a table (e.g. `clone_df_epoch`,
-    // V051); this count runs BEFORE `rm` migrates (so `--dry-run` never writes), so a table that
-    // does not exist is skipped — its row count is 0, and the destructive purge runs post-migration
-    // where every listed table exists.
+    // Transitive children: count through the live parent scope. An older schema may predate a table
+    // (e.g. `clone_df_epoch`, V051); this count runs BEFORE `rm` migrates (so `--dry-run` never
+    // writes), so a table that does not exist is skipped — its row count is 0, and the destructive
+    // purge runs post-migration (the `rm` command applies the schema after the preview, before
+    // taking the write lock) where every listed table exists.
+    //
+    // BOTH halves are guarded, not just the child: a child can predate the parent that scopes it
+    // (see [`parent_table`]), and an unguarded subquery against a missing parent fails the whole
+    // plan on a store the preview is explicitly meant to tolerate.
     for transitive in TRANSITIVE_SCOPED_TABLES {
-        if !crate::schema::table_exists(conn, transitive.table)? {
+        if !crate::schema::table_exists(conn, transitive.table)?
+            || !crate::schema::table_exists(conn, parent_table(transitive.parent_ids))?
+        {
             continue;
         }
         let count: i64 = conn.query_row(
@@ -283,6 +298,22 @@ fn parent_id_select(parent_ids: &str) -> &'static str {
         purge_ids::GENERATIONS =>
             "SELECT generation FROM clone_graph_generations WHERE repo_id = ?1",
         purge_ids::STREAMS => "SELECT stream_id FROM table_sync_streams WHERE repo_id = ?1",
+        other => unreachable!("unknown purge id set {other}"),
+    }
+}
+
+/// The `repo_id`-bearing table each id set reads from — the PARENT half of the count-path existence
+/// check. A child can outlive its parent's introduction: `table_sync_entries` arrived in V087 and
+/// the `table_sync_streams` directory that scopes it only in V093, so on a store in between, the
+/// child exists while the subquery's table does not. `count_repo_rows` runs on exactly such a store
+/// (planning is read-only and pre-migration, so `--dry-run` never writes), and an unguarded
+/// reference there fails the plan before the destructive path can migrate.
+fn parent_table(parent_ids: &str) -> &'static str {
+    match parent_ids {
+        purge_ids::FILES | purge_ids::CHUNKS | purge_ids::SYMBOLS => "files",
+        purge_ids::MEMORIES => "repo_memories",
+        purge_ids::GENERATIONS => "clone_graph_generations",
+        purge_ids::STREAMS => "table_sync_streams",
         other => unreachable!("unknown purge id set {other}"),
     }
 }
@@ -424,4 +455,26 @@ fn drop_purge_ids(conn: &Connection) -> anyhow::Result<()> {
 /// names the table unqualified while later reads qualify it `temp.<name>`.
 fn temp_name(qualified: &str) -> &str {
     qualified.strip_prefix("temp.").unwrap_or(qualified)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `count_repo_rows` is the read-only planning path, and `rag-rat rm` runs it BEFORE migrating
+    /// so `--dry-run` never writes. Every transitive child must therefore tolerate a schema
+    /// that predates it — including one that predates its PARENT: `table_sync_entries` shipped
+    /// in V087 and the `table_sync_streams` directory that scopes it only in V093, so on a
+    /// store in between the child exists while the subquery's table does not. Dropping the
+    /// parent reproduces that shape.
+    #[test]
+    fn counting_tolerates_a_transitive_child_whose_parent_table_does_not_exist_yet() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        conn.execute_batch("DROP TABLE table_sync_streams;").unwrap();
+
+        let counts = count_repo_rows(&conn, "some-repo")
+            .expect("planning must survive a store whose directory table predates the entry log");
+        assert_eq!(counts.total_rows, 0, "nothing is counted for an unknown repo");
+    }
 }

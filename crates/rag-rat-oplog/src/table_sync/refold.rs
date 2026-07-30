@@ -167,7 +167,8 @@ fn replay_pending_entry(
     // it. Leaving the entry pending costs nothing: once the producer authors that edit (at a
     // lamport above this entry's, since authoring counts parked entries), a later replay lands
     // and loses on the merits.
-    if apply::row_has_unsent_local_change(tx, spec, &context.repo_id, pending.stream_id, op.pk())? {
+    if apply::replay_would_destroy_unsent_work(tx, spec, &context.repo_id, pending.stream_id, &op)?
+    {
         return Ok(());
     }
     let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
@@ -1170,6 +1171,69 @@ mod tests {
             "and the replayed winner rewrites the whole row, which is what repairs the bad cell",
         );
         assert_eq!(b.pending_count(), 0, "the entry is no longer outstanding");
+    }
+
+    #[test]
+    fn a_parked_remove_does_not_delete_a_row_this_binary_cannot_read() {
+        // The other half of #1017's guard, and the destructive one. An UPSERT may replay over an
+        // unreadable row because a winner rewrites every synced column and repairs it. A REMOVE has
+        // no such floor: it deletes the row outright — local-only columns included — so a row whose
+        // unreadable cell is an unsent local edit would be destroyed at store open, before anything
+        // had a chance to author it.
+        const BOOL: TableSpec = TableSpec {
+            name: "t_bool",
+            scope_id: "demo/1",
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("flag", ValueType::Bool)],
+            local_columns: &["local_only"],
+            repo_column: None,
+        };
+        let table =
+            "CREATE TABLE t_bool(id TEXT PRIMARY KEY, flag INTEGER, local_only TEXT) STRICT;";
+
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute_batch(table).unwrap();
+        b.conn.execute_batch(table).unwrap();
+
+        // A publishes r1; B ingests it normally, so B's chain holds the Remove's predecessor.
+        a.conn.execute("INSERT INTO t_bool(id, flag) VALUES ('r1', 1)", []).unwrap();
+        let upserts = a.produce(&[BOOL], "repo");
+        assert_eq!(upserts.len(), 1, "the row is published first");
+        b.enroll(a.pubkey().fingerprint());
+        assert_eq!(b.ingest(&[BOOL], "repo", &upserts, &a.pubkey()), vec![IngestOutcome::Applied]);
+
+        // B then edits its copy raw — unsent, outside the Bool domain, and carrying a local-only
+        // column a delete would take with it.
+        b.conn
+            .execute("UPDATE t_bool SET flag = 2, local_only = 'keep me' WHERE id = 'r1'", [])
+            .unwrap();
+
+        // A deletes the row and authors the `Remove`. B ingests it through a binary whose registry
+        // does not carry the table — the mixed-version shared store this engine treats as
+        // first-class — so it is retained for the refold rather than applied.
+        a.conn.execute("DELETE FROM t_bool WHERE id = 'r1'", []).unwrap();
+        let removes = a.produce(&[BOOL], "repo");
+        assert_eq!(removes.len(), 1, "the local delete is authored as a Remove");
+        assert_eq!(b.ingest(OLD_REGISTRY, "repo", &removes, &a.pubkey()), vec![
+            IngestOutcome::Retained(PendingReason::TableNotInScope.as_db_str())
+        ]);
+        assert_eq!(b.pending_count(), 1);
+
+        assert!(refold_stale_projections_against(&b.conn, &[BOOL]).unwrap());
+        let survived: (i64, Option<String>) = b
+            .conn
+            .query_row("SELECT flag, local_only FROM t_bool WHERE id = 'r1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            survived,
+            (2, Some("keep me".to_string())),
+            "the unsent row survives the replayed remove, local-only column included",
+        );
+        assert_eq!(b.pending_count(), 1, "and the entry stays outstanding rather than being lost");
     }
 
     #[test]

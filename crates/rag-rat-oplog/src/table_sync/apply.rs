@@ -733,8 +733,13 @@ pub(crate) fn stale_row_disposition(
     }
 }
 
-/// Whether this row holds a local change that has not been authored yet, so a caller replaying an
-/// older retained entry over it would DESTROY work no peer has seen.
+/// Whether replaying `op` over this row would DESTROY local work no peer has seen — normally
+/// because the row holds a change that has not been authored yet.
+///
+/// The question is asked about the OP and not only the row, because the two kinds have different
+/// floors when the row's state cannot be established: an `Upsert` rewrites every synced column and
+/// can therefore repair a row, while a `Remove` deletes it outright, local-only columns included,
+/// and repairs nothing. See the `Unreadable` arm.
 ///
 /// A raw local write does not advance `sync_row_clocks` — only authoring-and-self-applying does —
 /// so the ordinary LWW comparison cannot see an unsent edit at all: it compares the incoming op
@@ -749,13 +754,14 @@ pub(crate) fn stale_row_disposition(
 /// the rows it exists to repair. Those rows are in the ordinary last-writer-wins regime, where the
 /// refold behaves exactly as live ingest does and the driver's author-before-apply ordering
 /// governs.
-pub(crate) fn row_has_unsent_local_change(
+pub(crate) fn replay_would_destroy_unsent_work(
     tx: &Transaction<'_>,
     spec: &TableSpec,
     repo_id: &str,
     stream: StreamId,
-    pk_vals: &[TypedValue],
+    op: &RowOp,
 ) -> anyhow::Result<bool> {
+    let pk_vals = op.pk();
     // A malformed key never reached `apply_row_op`'s arity check (an entry parked as out-of-scope
     // or unknown-kind was never validated), and binding it against `spec.pk`'s placeholders
     // would be a parameter-count ERROR — which, propagating out of the refold, would roll back
@@ -774,14 +780,21 @@ pub(crate) fn row_has_unsent_local_change(
             // good.
             return Ok(published_hash(tx, repo_id, spec.name, &row_pk)?.is_some());
         },
-        // The row is there but has no hash, so nothing about it can be PROVEN unsent — and this
-        // verdict has two readers that must not both defer. The producer cannot author an
-        // unreadable row either ([`ScannedRow::Unpublishable`]), so answering "there may be an
-        // unsent edit" here would leave the row unauthorable AND permanently block its own pending
-        // entries, with no way out. Replaying is the direction with a floor: the entry still has to
-        // win the ordinary clock comparison, and a winner rewrites every synced column, which is
-        // the only thing that makes the row syncable again.
-        SyncedRow::Unreadable(_) => return Ok(false),
+        // The row is there but has no hash, so nothing about it can be PROVEN either way — and what
+        // to do about that is NOT the same for the two op kinds.
+        //
+        // An `Upsert` may replay. This verdict has two readers that must not both defer, and the
+        // producer cannot author an unreadable row either ([`ScannedRow::Unpublishable`]), so
+        // answering "there may be an unsent edit" for every op would leave the row unauthorable AND
+        // permanently block its own pending entries, with no way out. The upsert has a floor: it
+        // still has to win the ordinary clock comparison, and a winner rewrites every synced
+        // column, which is the only thing that makes the row syncable again.
+        //
+        // A `Remove` has no such floor. It deletes the row outright — local-only columns included —
+        // and repairs nothing, so a winning remove would destroy an unsent local edit that merely
+        // happens to be unreadable. Deferring it is the safe stuck state: the row survives, and the
+        // entry replays on the merits once the cell is repaired.
+        SyncedRow::Unreadable(_) => return Ok(matches!(op, RowOp::Remove { .. })),
     };
     let current = row_op::cells_hash(&current_cells);
     Ok(match published_hash(tx, repo_id, spec.name, &row_pk)? {
@@ -868,34 +881,59 @@ fn sql_value(value: &TypedValue) -> SqlValue {
 /// Mapping one stored value back to its declared type: the value, or the reason it has none.
 ///
 /// A REASON rather than an `Err`, because every read below sits under a path that must not fail —
-/// see [`SyncedRow`]. `Malformed` has exactly ONE producer, and that is a property of the schema
-/// rules, not a coincidence: the registry lint requires a STRICT table, so a `Text` / `I64` /
-/// `Blob` column can only ever hold its declared storage type and those three mappings are total.
-/// `Bool` is the sole value type whose domain SQLite does not enforce — 0/1 needs a
-/// `CHECK (col IN (0, 1))`, which no pragma exposes for the lint to require.
+/// see [`SyncedRow`].
 enum ReadCell {
     Value(TypedValue),
     Malformed(String),
 }
 
+/// Map the stored value at `idx` to its DECLARED type.
+///
+/// TOTAL over (declared type, storage class) by construction: every pair either produces a value or
+/// names why it cannot, and the only `Err` left is a genuine statement fault (a column index that
+/// does not exist). That totality is the whole point — this runs under the refold at STORE OPEN,
+/// where an error fails the open itself rather than one read, so no stored byte pattern may be able
+/// to reach a `?`.
+///
+/// It is deliberately NOT argued from `STRICT`. STRICT pins the storage CLASS, not the value's
+/// domain within it, and two domains escape it:
+///   * a `Bool` needs `CHECK (col IN (0, 1))` to exclude other integers, and no pragma exposes that
+///     for the registry lint to require;
+///   * a `Text` column can hold bytes that are not valid UTF-8 (`CAST(X'80' AS TEXT)` stores with
+///     `typeof() = 'text'`), which is a conversion failure the moment it is read as a `String`.
+///
+/// A mismatched storage class is folded in for the same reason: it should be unreachable on a
+/// STRICT table, and "should be unreachable" is exactly the argument that made the previous version
+/// fail an open.
 fn read_typed(row: &rusqlite::Row<'_>, idx: usize, vt: ValueType) -> rusqlite::Result<ReadCell> {
-    let value = match vt {
-        ValueType::Text =>
-            row.get::<_, Option<String>>(idx)?.map_or(TypedValue::Null, TypedValue::Text),
-        ValueType::I64 => row.get::<_, Option<i64>>(idx)?.map_or(TypedValue::Null, TypedValue::I64),
+    use rusqlite::types::ValueRef;
+
+    let raw = row.get_ref(idx)?;
+    let value = match (vt, raw) {
+        (_, ValueRef::Null) => TypedValue::Null,
+        // Not `get::<String>`: that maps invalid UTF-8 to a conversion ERROR, which is precisely
+        // the failure this function exists to keep out of the store-open path.
+        (ValueType::Text, ValueRef::Text(bytes)) => match std::str::from_utf8(bytes) {
+            Ok(text) => TypedValue::Text(text.to_string()),
+            Err(_) =>
+                return Ok(ReadCell::Malformed(
+                    "a Text column holds bytes that are not valid UTF-8".to_string(),
+                )),
+        },
+        (ValueType::I64, ValueRef::Integer(n)) => TypedValue::I64(n),
+        (ValueType::Blob, ValueRef::Blob(bytes)) => TypedValue::Blob(bytes.to_vec()),
         // A Bool column must hold exactly 0 or 1. Coercing any other integer to `true` (the old
         // `n != 0`) would silently rewrite the source value to 1 on self-apply and replicate a
-        // value that differs from the row — report the malformed value instead of normalizing it
-        // away, and let the caller decide (never by failing, see [`ReadCell`]).
-        ValueType::Bool => match row.get::<_, Option<i64>>(idx)? {
-            None => TypedValue::Null,
-            Some(0) => TypedValue::Bool(false),
-            Some(1) => TypedValue::Bool(true),
-            Some(other) =>
-                return Ok(ReadCell::Malformed(format!("a Bool column holds {other}, not 0 or 1"))),
-        },
-        ValueType::Blob =>
-            row.get::<_, Option<Vec<u8>>>(idx)?.map_or(TypedValue::Null, TypedValue::Blob),
+        // value that differs from the row.
+        (ValueType::Bool, ValueRef::Integer(0)) => TypedValue::Bool(false),
+        (ValueType::Bool, ValueRef::Integer(1)) => TypedValue::Bool(true),
+        (ValueType::Bool, ValueRef::Integer(other)) =>
+            return Ok(ReadCell::Malformed(format!("a Bool column holds {other}, not 0 or 1"))),
+        (declared, other) =>
+            return Ok(ReadCell::Malformed(format!(
+                "a {declared:?} column holds {:?} storage",
+                other.data_type()
+            ))),
     };
     Ok(ReadCell::Value(value))
 }
@@ -1887,25 +1925,136 @@ mod tests {
         assert!(matches!(rows[0], ScannedRow::Unaddressable), "no pk means no identity");
     }
 
-    #[test]
-    fn the_unsent_edit_guard_does_not_defer_on_a_row_it_cannot_read() {
-        // Both readers of "is there an unsent edit here" must not defer: the producer cannot author
-        // an unreadable row either, so answering `true` here would leave the row unauthorable AND
-        // permanently block its own pending entries. Replaying is the direction with a floor — the
-        // entry still has to win on the clock, and a winner rewrites the column that is unreadable.
-        let mut c = flagged_store(2);
-        let tx = c.transaction().unwrap();
-        let stream = crate::table_sync::scope_stream::scope_stream_id(
+    /// A stable stream id for the guard tests, which never reach the winner lookup.
+    fn guard_stream() -> StreamId {
+        crate::table_sync::scope_stream::scope_stream_id(
             "repo",
             crate::AccountId::from_bytes([7; 32]),
             "demo/1",
-        );
+        )
+    }
+
+    /// An op of each kind against the `FLAGGED` row, for the asymmetry below.
+    fn flagged_op(remove: bool) -> RowOp {
+        let pk = vec![TypedValue::Text("r".into())];
+        if remove {
+            RowOp::Remove { table: "t_flagged".to_string(), spec_version: 1, pk }
+        } else {
+            RowOp::Upsert {
+                table: "t_flagged".to_string(),
+                spec_version: 1,
+                pk,
+                cells: vec![Cell { column: "flag".to_string(), value: TypedValue::Bool(true) }],
+            }
+        }
+    }
+
+    #[test]
+    fn an_upsert_may_replay_over_a_row_it_cannot_read() {
+        // Both readers of "is there unsent work here" must not defer: the producer cannot author an
+        // unreadable row either, so deferring every op would leave the row unauthorable AND
+        // permanently block its own pending entries. The upsert has a floor — it still has to win
+        // on the clock, and a winner rewrites the column that is unreadable.
+        let mut c = flagged_store(2);
+        let tx = c.transaction().unwrap();
         assert!(
-            !row_has_unsent_local_change(&tx, &FLAGGED, "repo", stream, &[TypedValue::Text(
-                "r".into()
-            )],)
+            !replay_would_destroy_unsent_work(
+                &tx,
+                &FLAGGED,
+                "repo",
+                guard_stream(),
+                &flagged_op(false)
+            )
             .unwrap(),
-            "an unreadable row proves nothing, so it must not block the replay",
+            "an unreadable row proves nothing against an upsert that would repair it",
+        );
+    }
+
+    #[test]
+    fn a_remove_may_not_replay_over_a_row_it_cannot_read() {
+        // The asymmetry. A remove deletes the row outright — local-only columns included — and
+        // repairs nothing, so letting it through would destroy an unsent local edit that merely
+        // happens to be unreadable. Deferring is the safe stuck state: the row survives, and the
+        // entry replays on the merits once the cell is repaired.
+        let mut c = flagged_store(2);
+        let tx = c.transaction().unwrap();
+        assert!(
+            replay_would_destroy_unsent_work(
+                &tx,
+                &FLAGGED,
+                "repo",
+                guard_stream(),
+                &flagged_op(true)
+            )
+            .unwrap(),
+            "a remove over an unreadable row has no repair to offer, so it must defer",
+        );
+    }
+
+    #[test]
+    fn a_text_column_holding_invalid_utf8_is_unreadable_too() {
+        // STRICT pins the storage CLASS, not the value's domain within it: `CAST(X'80' AS TEXT)`
+        // stores with `typeof() = 'text'` and fails the moment it is read as a `String`. Reading it
+        // as an error would fail the store open exactly the way a malformed Bool used to, so the
+        // mapping is total over (declared type, storage class) rather than argued from STRICT.
+        const LABELLED: TableSpec = TableSpec {
+            name: "t_labelled",
+            scope_id: "demo/1",
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("label", ValueType::Text)],
+            local_columns: &[],
+            repo_column: None,
+        };
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&c, &crate::test_hooks()).unwrap();
+        c.execute_batch(
+            "CREATE TABLE t_labelled(id TEXT PRIMARY KEY, label TEXT) STRICT;
+             INSERT INTO t_labelled(id, label) VALUES ('r', CAST(X'80' AS TEXT));",
+        )
+        .unwrap();
+        let tx = c.transaction().unwrap();
+
+        let cells = read_synced_cells(&tx, &LABELLED, &[TypedValue::Text("r".into())]).unwrap();
+        assert!(
+            matches!(cells, SyncedRow::Unreadable(_)),
+            "invalid UTF-8 is unreadable, not an error"
+        );
+        let rows = read_all_rows(&tx, &LABELLED, "repo").unwrap();
+        assert!(
+            matches!(&rows[0], ScannedRow::Unpublishable { .. }),
+            "and the scan carries the row rather than failing the pass",
+        );
+    }
+
+    #[test]
+    fn a_storage_class_that_does_not_match_the_declared_type_is_unreadable() {
+        // Unreachable on a STRICT table — which is exactly the argument that let the previous
+        // version fail an open, so the mapping covers it as a value instead of assuming it away.
+        const LABELLED: TableSpec = TableSpec {
+            name: "t_loose",
+            scope_id: "demo/1",
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("label", ValueType::Text)],
+            local_columns: &[],
+            repo_column: None,
+        };
+        let mut c = rusqlite::Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&c, &crate::test_hooks()).unwrap();
+        // No STRICT here: that is what lets an INTEGER land in a column declared TEXT.
+        c.execute_batch(
+            "CREATE TABLE t_loose(id TEXT PRIMARY KEY, label BLOB);
+             INSERT INTO t_loose(id, label) VALUES ('r', 7);",
+        )
+        .unwrap();
+        let tx = c.transaction().unwrap();
+        assert!(
+            matches!(
+                read_synced_cells(&tx, &LABELLED, &[TypedValue::Text("r".into())]).unwrap(),
+                SyncedRow::Unreadable(_)
+            ),
+            "a mismatched storage class is carried, not raised",
         );
     }
 
