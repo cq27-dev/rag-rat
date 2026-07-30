@@ -1,6 +1,7 @@
 use super::*;
 
 mod delta_refresh;
+mod lens_handles;
 mod lifecycle;
 mod logical_rebuild;
 mod quiet_window;
