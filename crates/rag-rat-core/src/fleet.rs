@@ -19,6 +19,20 @@ use std::path::Path;
 /// this constant) and used here to read other processes' environ.
 pub const UPGRADE_BIN_ENV: &str = "RAG_RAT_UPGRADE_BIN";
 
+/// Whether THIS process advertises hot-upgrade eligibility — i.e. whether a `trigger` running
+/// elsewhere may decide to send it `SIGUSR1`. The mirror of the scan-side `has_upgrade_env`
+/// predicate, and the thing a server must consult before deciding whether it has to defend itself
+/// against the signal.
+///
+/// Keyed on PRESENCE, deliberately: `has_upgrade_env` matches any `RAG_RAT_UPGRADE_BIN=` entry,
+/// including an empty value, so a process whose variable is set-but-empty is a target even though
+/// it cannot actually upgrade (`install_path` filters empty). Defending has to use the trigger's
+/// rule, not the can-I-upgrade rule — and it must stay the LOOSER of the two, since an older binary
+/// elsewhere in the fleet is running an older copy of the scan predicate.
+pub fn self_advertises_upgrade() -> bool {
+    std::env::var_os(UPGRADE_BIN_ENV).is_some()
+}
+
 /// A candidate process discovered under `/proc`, reduced to what target selection needs.
 // Linux-only: the only consumers are `trigger`/`scan_proc`/`select_targets`, all gated to Linux —
 // without this gate it is dead code under `-D warnings` on macOS/Windows.

@@ -113,6 +113,25 @@ fn sigusr1_is_survivable_before_and_without_an_initialize_handshake() {
     session.stop();
 }
 
+/// A set-but-EMPTY `RAG_RAT_UPGRADE_BIN` disables hot-upgrade for this process (`install_path`
+/// filters it out) while still making it a fleet target: the scan predicate matches any
+/// `RAG_RAT_UPGRADE_BIN=` entry, value included or not. That gap between "can upgrade" and "will be
+/// signaled" is exactly where a server must still defend itself.
+#[test]
+fn sigusr1_is_survivable_with_an_empty_upgrade_bin() {
+    let env = TestEnv::setup();
+    let mut session = env.spawn_mcp(&[("RAG_RAT_UPGRADE_BIN", "")]);
+    session.initialize();
+    let before = session.call_semantic_search();
+    assert!(before.contains("chunk_id"), "tool call works before the signal: {before}");
+
+    session.send_sigusr1();
+    session.assert_still_running("an empty RAG_RAT_UPGRADE_BIN must not leave SIGUSR1 fatal");
+    let after = session.call_semantic_search();
+    assert!(after.contains("chunk_id"), "server still serves after SIGUSR1: {after}");
+    session.stop();
+}
+
 /// The dormant server (launched outside any indexed repo) never hot-upgrades — with no config
 /// there is no handoff directory. It is still a `rag-rat mcp` process that a globally-registered
 /// launcher hands `RAG_RAT_UPGRADE_BIN`, so it is a fleet target like any other and must absorb

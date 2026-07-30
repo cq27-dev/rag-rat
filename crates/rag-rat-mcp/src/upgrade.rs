@@ -289,9 +289,13 @@ pub fn take_handoff() -> Option<HandoffV1> {
 ///
 /// [`arm_sigusr1`] replaces this with the real handler as soon as the runtime is up.
 pub fn suppress_sigusr1_until_armed() {
-    if install_path().is_none() {
-        // Not fleet-eligible (the trigger skips processes without the env var), so leave the
-        // default disposition alone rather than silently changing signal behavior for everyone.
+    // Gate on what the TRIGGER considers eligible, not on whether we could actually upgrade. Those
+    // differ: `install_path` rejects a set-but-empty variable, while the scan predicate matches on
+    // presence alone — so an empty value yields a process that is targetable but cannot upgrade,
+    // which is exactly the case that must not die on the signal.
+    if !rag_rat_core::fleet::self_advertises_upgrade() {
+        // Not a target, so leave the default disposition alone rather than silently changing
+        // signal behavior for every `rag-rat mcp`.
         return;
     }
     // SAFETY: `signal(2)` with a valid signal number and the standard `SIG_IGN` disposition. No
