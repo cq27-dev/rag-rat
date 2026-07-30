@@ -289,10 +289,24 @@ impl ToolManifest {
                 };
                 // A progress-signalled backend that declared no marker could never signal either,
                 // so it still blocks — with the generic wording, since there is no file to name.
-                let (marker, detail) =
-                    backend.project_marker.map_or(("project", "Add one to enable it."), |marker| {
-                        (marker.file, marker.hint_detail)
-                    });
+                // Every name that would satisfy the marker, so an operator is not sent to create
+                // the one spelling the backend happened to list first when another would do.
+                //
+                // A marker declaring NO name falls back to the generic wording, like a backend
+                // with no marker at all: joining an empty list renders "found no  project under",
+                // which names nothing while looking like it does. Every other reader of an empty
+                // declaration already fails closed; this is the one that has to say so in prose.
+                let (marker, detail) = backend.project_marker.map_or(
+                    (hint_marker_names(&[]), "Add one to enable it."),
+                    |marker| {
+                        let detail = if marker.files.is_empty() {
+                            "Add one to enable it."
+                        } else {
+                            marker.hint_detail
+                        };
+                        (hint_marker_names(marker.files), detail)
+                    },
+                );
                 if backend.checkout_can_signal_readiness(checkout, layout) {
                     return None;
                 }
@@ -431,6 +445,17 @@ fn detect_version_in(program: &str, cwd: Option<&Path>) -> Option<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout.lines().map(str::trim).find(|line| !line.is_empty())?;
     Some(line.to_string())
+}
+
+/// How a project marker's names read in the prerequisite hint: every spelling that would satisfy
+/// it, joined, so an operator is not sent to create the one the backend happened to list first
+/// when another would do.
+///
+/// An empty list renders as the generic word rather than as nothing. Joining it would produce
+/// "found no  project under", which names no file while looking like it does — and every other
+/// reader of an empty declaration already fails closed.
+pub(crate) fn hint_marker_names(files: &[&str]) -> String {
+    if files.is_empty() { "project".to_string() } else { files.join(" or ") }
 }
 
 #[cfg(test)]

@@ -681,15 +681,134 @@ fn enclosing_tsconfig_walks_up_to_the_nearest_project_and_stops_at_the_root() {
     std::fs::write(dir.join("packages/app/tsconfig.json"), "{}").unwrap();
 
     assert_eq!(
-        enclosing_project_dir(&scope(&dir), &dir.join("packages/app/src/main.ts"), "tsconfig.json"),
+        enclosing_project_dir(&scope(&dir), &dir.join("packages/app/src/main.ts"), &[
+            "tsconfig.json"
+        ]),
         Some(dir.join("packages/app")),
         "the nearest enclosing project wins",
     );
     assert_eq!(
-        enclosing_project_dir(&scope(&dir), &dir.join("scripts/tool.ts"), "tsconfig.json"),
+        enclosing_project_dir(&scope(&dir), &dir.join("scripts/tool.ts"), &["tsconfig.json"]),
         None,
         "a file under no project has none",
     );
+}
+
+#[test]
+fn any_declared_marker_name_identifies_a_project() {
+    // A build system often accepts several spellings of the same declaration — Gradle takes
+    // `build.gradle.kts` or `build.gradle`. With one name per marker a checkout using the other
+    // spelling reads as having no project at all: the readiness signal never fires, so the session
+    // can only sit in `Warming` while the prerequisite gate reports the project missing (#1042).
+    let (_dir_guard, dir) = checkout("marker-alternates");
+    std::fs::create_dir_all(dir.join("app/src")).unwrap();
+    std::fs::create_dir_all(dir.join("lib/src")).unwrap();
+    // One module declares itself with the first name, the other with the second.
+    std::fs::write(dir.join("app/build.gradle.kts"), "").unwrap();
+    std::fs::write(dir.join("lib/build.gradle"), "").unwrap();
+    let names = &["build.gradle.kts", "build.gradle"];
+
+    assert_eq!(
+        enclosing_project_dir(&scope(&dir), &dir.join("app/src/Main.kt"), names),
+        Some(dir.join("app")),
+        "the first name identifies its project",
+    );
+    assert_eq!(
+        enclosing_project_dir(&scope(&dir), &dir.join("lib/src/Lib.kt"), names),
+        Some(dir.join("lib")),
+        "and so does any other declared name — this is what one name per marker could not do",
+    );
+    assert_eq!(
+        enclosing_project_dir(&scope(&dir), &dir.join("src/Stray.kt"), names),
+        None,
+        "a file under none of them still has no project",
+    );
+}
+
+#[test]
+fn a_warmup_document_is_found_under_a_project_declared_by_any_name() {
+    // The second widened path. The warm-up search is what makes a backend usable on a checkout
+    // whose changed files all sit outside a project, so a name it does not recognise there costs
+    // the same thing as one the ancestor walk misses: the session never warms (#1042).
+    let (_dir_guard, dir) = checkout("warmup-marker-alternates");
+    std::fs::create_dir_all(dir.join("lib/src")).unwrap();
+    // Only the SECOND declared name, and the document sits beneath it.
+    std::fs::write(dir.join("lib/build.gradle"), "").unwrap();
+    std::fs::write(dir.join("lib/src/main.ts"), "export function greet() {}\n").unwrap();
+
+    let found = super::documents::find_document_in_project(
+        &scope(&dir),
+        &dir,
+        &[Language::TypeScript],
+        &["build.gradle.kts", "build.gradle"],
+        false,
+    );
+
+    assert_eq!(
+        found,
+        Some(dir.join("lib/src/main.ts")),
+        "a project declared by any name yields a warm-up document",
+    );
+}
+
+#[test]
+fn the_prerequisite_hint_names_every_spelling_that_would_satisfy_the_marker() {
+    // The third widened path. An operator reading the hint must not be sent to create the one
+    // spelling the backend happened to list first when another would have done (#1042).
+    use crate::manifest::hint_marker_names;
+
+    assert_eq!(
+        hint_marker_names(&["build.gradle.kts", "build.gradle"]),
+        "build.gradle.kts or build.gradle",
+        "every declared name appears",
+    );
+    assert_eq!(
+        hint_marker_names(&["tsconfig.json"]),
+        "tsconfig.json",
+        "and a single-name marker reads exactly as it did before",
+    );
+    assert_eq!(
+        hint_marker_names(&[]),
+        "project",
+        "a marker declaring no name falls back to the generic wording rather than naming nothing",
+    );
+
+    // And through the real hint, for a shipped single-name backend: the rendering above is the
+    // one an operator actually reads.
+    let (_dir_guard, dir) = checkout("hint-single-name");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.ts"), "export function greet() {}\n").unwrap();
+    let corpus = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
+    let hint = crate::ToolManifest::for_tool(OracleTool::TsLsp)
+        .prerequisite_blocked_with(&super::CheckoutScope::resolve(&dir, &corpus), None)
+        .expect("a checkout with no tsconfig blocks the TypeScript backend");
+    assert!(
+        hint.contains("found no tsconfig.json project"),
+        "the shipped single-name hint is unchanged: {hint}",
+    );
+}
+
+#[test]
+fn a_governing_marker_declares_exactly_one_name() {
+    // A `Checkout`-scoped marker is not a sentinel: it is PARSED, as a `compile_commands.json`
+    // compilation database, to decide whether it configures an indexed file and whether it can be
+    // pinned with `--compile-commands-dir`. A second name there would mean a second FORMAT and a
+    // second reader — widening the presence test buys nothing without them, and the scan silently
+    // takes the first name. If you are adding one, that reader is what you also have to write.
+    for backend in LiveBackend::all() {
+        let Some(marker) = backend.project_marker else {
+            continue;
+        };
+        assert!(!marker.files.is_empty(), "{:?} declares a marker with no name", backend.tool);
+        if backend.marker_is_parsed() {
+            assert_eq!(
+                marker.files.len(),
+                1,
+                "{:?} declares a PARSED marker with several names, but only the first is read",
+                backend.tool,
+            );
+        }
+    }
 }
 
 #[test]
@@ -798,7 +917,7 @@ fn a_backends_project_marker_is_the_file_its_prerequisite_looks_for() {
     // could pass the gate and still have nothing to warm on (or vice versa).
     let (_dir_guard, dir) = checkout("clangd-marker");
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    assert_eq!(clangd.project_marker.map(|m| m.file), Some("compile_commands.json"));
+    assert_eq!(clangd.project_marker.map(|m| m.files), Some(&["compile_commands.json"][..]),);
     assert!(
         !clangd.checkout_can_signal_readiness(&scope(&dir), &clangd.resolve_layout(&scope(&dir))),
         "no compdb ⇒ no signal possible"

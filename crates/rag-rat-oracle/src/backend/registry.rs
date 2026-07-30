@@ -51,7 +51,20 @@ pub struct LiveBackend {
 /// A backend's project marker, and how it relates to the documents it governs.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProjectMarker {
-    pub(crate) file: &'static str,
+    /// The filenames that declare this project, any one of which is enough. First match wins.
+    ///
+    /// Several because a build system often accepts several spellings of the same declaration —
+    /// Gradle takes `build.gradle.kts` or `build.gradle`, and a checkout using the one the backend
+    /// did not name would read as having no project at all: its readiness signal never fires, so
+    /// the session could only ever sit in `Warming` while its prerequisite gate reported the
+    /// project missing.
+    ///
+    /// A `ProjectScope::Checkout` marker declares exactly ONE, and a test pins that. It is not a
+    /// sentinel — it is PARSED, as a `compile_commands.json` compilation database, to decide
+    /// whether it configures an indexed file and whether it can be pinned with
+    /// `--compile-commands-dir`. A second name there would mean a second format and a second
+    /// reader, which is a different change from widening a presence test.
+    pub(crate) files: &'static [&'static str],
     scope: ProjectScope,
     /// What the operator loses while this marker is missing, and what to do about it — the tail of
     /// the prerequisite hint. The two progress-signalled backends share the gate and the sentence
@@ -109,7 +122,7 @@ impl LiveBackend {
                 readiness: ReadinessPolicy::WorkDoneProgress,
                 language_ids: &[("tsx", "typescriptreact"), ("ts", "typescript")],
                 project_marker: Some(ProjectMarker {
-                    file: "tsconfig.json",
+                    files: &["tsconfig.json"],
                     scope: ProjectScope::Enclosing,
                     hint_detail: "Asked mid-load, typescript-language-server resolves an imported \
                                   callee to the import statement instead of the definition. Add a \
@@ -150,7 +163,7 @@ impl LiveBackend {
                 // header declaration and emits no progress at all (measured) — the same
                 // no-signal state a tsconfig-less TypeScript checkout is in.
                 project_marker: Some(ProjectMarker {
-                    file: "compile_commands.json",
+                    files: &["compile_commands.json"],
                     scope: ProjectScope::Checkout,
                     hint_detail: "Without a compilation database clangd resolves a call into \
                                   another translation unit only to the callee's header \
@@ -196,6 +209,16 @@ impl LiveBackend {
         self.languages.contains(&language)
     }
 
+    /// Whether this backend's project marker is PARSED rather than merely present.
+    ///
+    /// A parsed marker is read as a specific file format (today: a `compile_commands.json`
+    /// compilation database), so its name and its reader are one decision — which is why it
+    /// declares a single name while a presence-tested marker may declare several.
+    #[cfg(test)]
+    pub(crate) fn marker_is_parsed(&self) -> bool {
+        self.project_marker.is_some_and(|marker| marker.scope == ProjectScope::Checkout)
+    }
+
     /// Resolve this checkout's project layout — the one filesystem scan a session performs.
     pub fn resolve_layout(&self, checkout: &CheckoutScope<'_>) -> ProjectLayout {
         let Some(marker) = self.project_marker else {
@@ -205,8 +228,13 @@ impl LiveBackend {
             // An enclosing-scoped marker is answered per document by walking UP, which is cheap
             // and needs no precomputed set.
             ProjectScope::Enclosing => ProjectLayout::default(),
-            ProjectScope::Checkout =>
-                ProjectLayout::from_marker_sites(marker.file, marker_sites(checkout, marker.file)),
+            // The governing marker is PARSED, so the scan takes the one name it declares. An
+            // empty declaration is a registry bug (a test pins it); treat it as "no project"
+            // rather than scanning for a nameless file, which would match every directory.
+            ProjectScope::Checkout => match marker.files.first() {
+                Some(file) => ProjectLayout::from_marker_sites(file, marker_sites(checkout, file)),
+                None => ProjectLayout::default(),
+            },
         }
     }
 
@@ -238,7 +266,7 @@ impl LiveBackend {
                     ProjectScope::Enclosing => documents::enclosing_project_dir(
                         checkout,
                         &checkout.root().join(path),
-                        marker.file,
+                        marker.files,
                     )
                     .is_some(),
                     // Readiness, not resolution — [`Trust::Possible`] for the same reason as
@@ -280,7 +308,7 @@ impl LiveBackend {
                         checkout,
                         checkout.root(),
                         self.languages,
-                        marker.file,
+                        marker.files,
                         false,
                     ),
                     // The marker can sit anywhere, so the two halves are searched independently
@@ -355,8 +383,13 @@ impl LiveBackend {
         if layout.is_empty() {
             return false;
         }
+        // The governing marker's single parsed name; an empty declaration is a registry bug, and
+        // resolving nothing is the safe reading of it.
+        let Some(file) = marker.files.first() else {
+            return false;
+        };
         layout.sole_marker_dir().is_some()
-            || layout.discoverable_marker_dir(checkout, absolute, marker.file, trust).is_some()
+            || layout.discoverable_marker_dir(checkout, absolute, file, trust).is_some()
     }
 
     /// Whether this session can resolve `path` (repo-relative) — the live pass's per-file gate.

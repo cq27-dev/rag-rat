@@ -26,12 +26,12 @@ use super::scope::CheckoutScope;
 pub(super) fn enclosing_project_dir(
     checkout: &CheckoutScope<'_>,
     path: &Path,
-    marker: &str,
+    markers: &[&str],
 ) -> Option<PathBuf> {
     let ceiling = checkout.ceiling();
     let mut dir = path.parent()?;
     loop {
-        if dir.join(marker).exists() {
+        if markers.iter().any(|marker| dir.join(marker).exists()) {
             return Some(dir.to_path_buf());
         }
         if dir == ceiling {
@@ -86,10 +86,10 @@ pub(super) fn find_document_in_project(
     checkout: &CheckoutScope<'_>,
     dir: &Path,
     languages: &[Language],
-    marker: &str,
+    markers: &[&str],
     inside_project: bool,
 ) -> Option<PathBuf> {
-    let inside_project = inside_project || dir.join(marker).exists();
+    let inside_project = inside_project || markers.iter().any(|marker| dir.join(marker).exists());
     let mut subdirectories = Vec::new();
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let Ok(kind) = entry.file_type() else {
@@ -107,7 +107,7 @@ pub(super) fn find_document_in_project(
             return Some(path);
         }
     }
-    subdirectories
-        .into_iter()
-        .find_map(|sub| find_document_in_project(checkout, &sub, languages, marker, inside_project))
+    subdirectories.into_iter().find_map(|sub| {
+        find_document_in_project(checkout, &sub, languages, markers, inside_project)
+    })
 }
