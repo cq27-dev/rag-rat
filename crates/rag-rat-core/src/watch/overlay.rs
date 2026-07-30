@@ -142,6 +142,22 @@ impl OverlayScope {
 /// held back. With the sweep disabled the gate turns itself off (see the clamp below): deferring
 /// an edit that no later event or sweep would deliver would leave the overlay stale forever.
 ///
+/// What one pass's overlay refresh did.
+///
+/// This used to be a bare `bool` — whether anything, anywhere, changed. That is the only question
+/// the pass's own control flow asks, but it is not enough for a consumer that must act ON a
+/// particular checkout: the live oracle needs to know WHICH checkout reindexed WHICH paths, because
+/// a resident language server is rooted at one tree and can only answer for that tree (#1010).
+pub struct OverlayRefresh {
+    /// Whether any overlay changed. The answer this function used to return alone.
+    pub changed: bool,
+    /// Repo-relative paths each visited linked checkout reindexed, keyed by its worktree id —
+    /// which is that checkout's root. A checkout the pass skipped (unchanged basis, quiet
+    /// window, not implicated by events) has NO entry; one it visited with nothing to do has
+    /// an empty one.
+    pub reindexed: BTreeMap<String, Vec<PathBuf>>,
+}
+
 /// `pub` so the hook-driven CLI `maintenance` command shares this exact path: the git hooks invoke
 /// `rag-rat maintenance` (not the foreground watcher), so without calling this a commit/checkout/
 /// merge in a linked worktree would index the base `config.root` but leave that worktree's overlay
@@ -151,7 +167,7 @@ pub fn refresh_worktree_overlays(
     config: &Config,
     reconcile: Option<&ReconcileBudget>,
     scope: &OverlayScope,
-) -> bool {
+) -> OverlayRefresh {
     let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
     // The base id is the ENCLOSING worktree root, not `config.root` itself — see
     // `enclosing_worktree_id` (a repo-SUBDIR `config.root` would otherwise mis-classify the main
@@ -173,6 +189,7 @@ pub fn refresh_worktree_overlays(
     let overlay_quiet_secs =
         if config.watch.periodic_sweep_secs == 0 { 0 } else { config.watch.overlay_quiet_secs };
     let mut changed = false;
+    let mut reindexed: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for worktree in worktrees {
         if worktree == base_id {
             continue; // the rooted checkout is the base scope, not an overlay
@@ -247,6 +264,12 @@ pub fn refresh_worktree_overlays(
                 }
                 let this_changed = report.indexed > 0 || report.tombstoned > 0 || report.pruned > 0;
                 changed |= this_changed;
+                // Keyed by the WORKTREE ID, which is this checkout's root — the two things a
+                // consumer needs to act on the paths: a scope to write rows under, and a directory
+                // to root a tool at. Recorded even when the refresh reindexed nothing, so an empty
+                // entry reads as "this checkout was visited and had no work" rather than as
+                // "this checkout was never looked at".
+                reindexed.insert(worktree.clone(), report.reindexed_paths.clone());
                 // Embed the overlay's chunks NOW, while the connection is still scoped to this
                 // overlay (index_worktree_overlay left it there) — the trailing base reconcile
                 // won't see them (#219 review). Run when the overlay CHANGED, OR — on an `All`
@@ -295,7 +318,7 @@ pub fn refresh_worktree_overlays(
     // Restore the base scope for the rest of the pass (index_worktree_overlay leaves the connection
     // scoped to the last worktree it touched).
     let _ = db.use_worktree_scope(&config.root, None);
-    changed
+    OverlayRefresh { changed, reindexed }
 }
 
 /// Whether the #822 quiet window still holds for a heads-unchanged worktree: the last COMPLETE

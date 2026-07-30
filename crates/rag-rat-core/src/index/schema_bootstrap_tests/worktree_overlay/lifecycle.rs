@@ -868,7 +868,7 @@ fn scoped_overlay_refresh_skips_an_unlisted_worktree_with_unchanged_basis() {
 
     let scope =
         crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([listed.clone()]));
-    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope);
+    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope).changed;
     assert!(changed, "the listed worktree's dirty edit is refreshed");
 
     db.use_worktree_scope(&main, Some(&listed)).unwrap();
@@ -936,7 +936,7 @@ fn path_scoped_overlay_refresh_indexes_only_event_paths_and_clears_the_basis() {
         linked.clone(),
         std::collections::BTreeSet::from([linked.join("src/a.rs")]),
     )]));
-    assert!(crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope));
+    assert!(crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope).changed);
 
     db.use_worktree_scope(&main, Some(&linked)).unwrap();
     assert_eq!(names_in_scope(&db, "src/a.rs"), vec!["event_edit".to_string()]);
@@ -987,7 +987,7 @@ fn widened_directory_removal_prunes_descendants_without_a_periodic_sweep() {
         linked.clone(),
         std::collections::BTreeSet::new(),
     )]));
-    assert!(crate::watch::refresh_worktree_overlays(&mut db, &config, None, &widened));
+    assert!(crate::watch::refresh_worktree_overlays(&mut db, &config, None, &widened).changed);
     db.use_worktree_scope(&main, Some(&linked)).unwrap();
     assert!(
         names_in_scope(&db, "src/removed/stale.rs").is_empty(),
@@ -1026,7 +1026,7 @@ fn scoped_overlay_refresh_refreshes_an_unlisted_worktree_whose_head_moved() {
     // Control: with an unchanged basis, an empty-scoped pass is a no-op for this worktree.
     let empty = crate::watch::OverlayScope::Linked(std::collections::BTreeSet::new());
     assert!(
-        !crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty),
+        !crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty).changed,
         "unchanged basis + empty scope refreshes nothing"
     );
 
@@ -1035,7 +1035,7 @@ fn scoped_overlay_refresh_refreshes_an_unlisted_worktree_whose_head_moved() {
     run_git(&linked, &["add", "."]);
     run_git(&linked, &["commit", "-q", "-m", "branch adds file"]);
 
-    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty);
+    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty).changed;
     assert!(changed, "the moved linked HEAD invalidates the basis and forces the refresh");
     db.use_worktree_scope(&main, Some(&linked)).unwrap();
     assert_eq!(
@@ -1078,7 +1078,7 @@ fn scoped_overlay_refresh_refreshes_after_a_base_commit_changes_the_diff_basis()
     // Control: empty scope + unchanged basis refreshes nothing.
     let empty = crate::watch::OverlayScope::Linked(std::collections::BTreeSet::new());
     assert!(
-        !crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty),
+        !crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty).changed,
         "unchanged basis + empty scope refreshes nothing"
     );
 
@@ -1087,7 +1087,7 @@ fn scoped_overlay_refresh_refreshes_after_a_base_commit_changes_the_diff_basis()
     run_git(&main, &["add", "."]);
     run_git(&main, &["commit", "-q", "-m", "v2"]);
 
-    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty);
+    let changed = crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty).changed;
     assert!(changed, "the moved base HEAD invalidates every worktree's basis");
     set_base_scope(&mut db, &main);
     assert!(

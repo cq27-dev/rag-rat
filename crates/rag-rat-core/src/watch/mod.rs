@@ -31,10 +31,11 @@ pub use event_loop::Watcher;
 #[cfg(test)]
 pub(crate) use event_loop::{EventLoop, flush_watch_placement_failures, shutdown_discover};
 pub use overlay::{
-    OverlayScope, ReconcileBudget, is_manifest_path, refresh_worktree_overlays, reindex_paths,
+    OverlayRefresh, OverlayScope, ReconcileBudget, is_manifest_path, refresh_worktree_overlays,
+    reindex_paths,
 };
 #[cfg(test)]
-pub(crate) use overlay::{overlay_needs_embed, partition_paths_by_worktree};
+pub(crate) use overlay::{enclosing_worktree_id, overlay_needs_embed, partition_paths_by_worktree};
 #[cfg(test)]
 pub(crate) use papertrail::{PapertrailClock, PapertrailScheduler, papertrail_tick_interval};
 pub use pass::{CLONE_GRAPH_QUIET_MS, maintenance_pass, maintenance_pass_or_skip};

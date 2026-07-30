@@ -38,6 +38,13 @@ pub struct WorktreeOverlayReport {
     /// (the pass was skipped).
     pub worktree_id: String,
     pub indexed: usize,
+    /// The repo-relative paths this refresh handed to the indexer.
+    ///
+    /// A SUPERSET of what changed, deliberately and soundly: a consumer that only needs "which of
+    /// this checkout's files may be stale" (the live oracle's per-checkout worklist, #1010)
+    /// filters it further anyway, and over-reporting costs a skipped candidate rather than a
+    /// missed one. Empty when the refresh indexed nothing.
+    pub reindexed_paths: Vec<PathBuf>,
     pub tombstoned: usize,
     pub pruned: usize,
     /// Whether the working-tree status portion of the delta was read in FULL (see

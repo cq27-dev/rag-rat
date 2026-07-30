@@ -161,6 +161,7 @@ impl IndexDatabase {
         Ok(WorktreeOverlayReport {
             worktree_id,
             indexed,
+            reindexed_paths: delta.readable.clone(),
             tombstoned,
             pruned,
             status_complete: delta.status_complete,
@@ -351,6 +352,7 @@ impl IndexDatabase {
         Ok(WorktreeOverlayReport {
             worktree_id,
             indexed,
+            reindexed_paths: readable.clone(),
             tombstoned,
             pruned,
             // A path-scoped pass never fully reconciles the overlay — signal incomplete so the

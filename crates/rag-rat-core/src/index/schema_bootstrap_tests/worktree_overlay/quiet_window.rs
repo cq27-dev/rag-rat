@@ -42,7 +42,7 @@ fn overlay_quiet_window_skips_a_dirty_only_listed_worktree_inside_the_window() {
     let scope =
         crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([linked.clone()]));
     assert!(
-        !crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        !crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope).changed,
         "inside the window a dirty-only listed worktree is skipped"
     );
     db.use_worktree_scope(&main, Some(&linked)).unwrap();
@@ -64,7 +64,7 @@ fn overlay_quiet_window_skips_a_dirty_only_listed_worktree_inside_the_window() {
     )
     .unwrap();
     assert!(
-        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope).changed,
         "an elapsed window refreshes the dirty-only worktree"
     );
     db.use_worktree_scope(&main, Some(&linked)).unwrap();
@@ -99,7 +99,7 @@ fn overlay_quiet_window_never_defers_a_head_move() {
     let scope =
         crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([linked.clone()]));
     assert!(
-        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope).changed,
         "a linked HEAD move refreshes immediately inside the window"
     );
     db.use_worktree_scope(&main, Some(&linked)).unwrap();
@@ -112,7 +112,7 @@ fn overlay_quiet_window_never_defers_a_head_move() {
     set_base_scope(&mut db, &main);
     let empty = crate::watch::OverlayScope::Linked(std::collections::BTreeSet::new());
     assert!(
-        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty),
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &empty).changed,
         "a base HEAD move refreshes immediately inside the window"
     );
 
@@ -137,7 +137,7 @@ fn overlay_quiet_window_zero_disables_and_sweeps_ignore_it() {
     let scope =
         crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([linked.clone()]));
     assert!(
-        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope).changed,
         "0 disables the window: a dirty-only listed worktree refreshes every pass"
     );
     db.use_worktree_scope(&main, Some(&linked)).unwrap();
@@ -189,7 +189,7 @@ fn overlay_quiet_window_is_ignored_when_the_periodic_sweep_is_disabled() {
     let scope =
         crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([linked.clone()]));
     assert!(
-        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope).changed,
         "no sweep backstop → the window is ignored and the pass refreshes"
     );
     db.use_worktree_scope(&main, Some(&linked)).unwrap();
@@ -219,7 +219,7 @@ fn a_cleared_basis_never_quiet_skips() {
     let scope =
         crate::watch::OverlayScope::Linked(std::collections::BTreeSet::from([linked.clone()]));
     assert!(
-        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope),
+        crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope).changed,
         "no recorded basis, no quiet skip — the pass refreshes"
     );
     db.use_worktree_scope(&main, Some(&linked)).unwrap();

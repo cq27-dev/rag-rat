@@ -373,9 +373,10 @@ fn run_pass(
     // worktree change counts toward running the tail below even when config.root itself didn't
     // change. Reconcile a CHANGED overlay's embeddings INLINE (while scoped to it) so a worktree
     // query isn't BM25-only for branch content — the base reconcile below can't see overlay chunks.
-    let overlays_changed = timings.stage("overlays", || {
+    let overlays = timings.stage("overlays", || {
         refresh_worktree_overlays(&mut db, config, Some(&budget), overlay_scope)
     });
+    let overlays_changed = overlays.changed;
     let base_tail_forced =
         base_tail_forced_by_state(content_changed, run_gc, shutdown_reconcile_pending);
     let base_embedding_backlog = base_embedding_backlog_needs_tail(

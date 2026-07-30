@@ -188,13 +188,13 @@ fn refresh_worktree_overlays_reconciles_overlay_scope_embeddings() {
     let options = ai::ReconcileOptions { batch_size: Some(8), ..Default::default() };
     let budget = crate::watch::ReconcileBudget::new(options, std::time::Instant::now());
     // The pass refreshes the overlay AND reconciles its embeddings inline.
-    let changed = crate::watch::refresh_worktree_overlays(
+    let refresh = crate::watch::refresh_worktree_overlays(
         &mut db,
         &config,
         Some(&budget),
         &crate::watch::OverlayScope::All,
     );
-    assert!(changed, "the overlay changed (a new branch file was indexed)");
+    assert!(refresh.changed, "the overlay changed (a new branch file was indexed)");
 
     // In the overlay scope, the new branch file's chunk must carry a Current embedding — not be
     // left BM25-only. `refresh_worktree_overlays` restored the base scope, so re-enter the
@@ -748,4 +748,62 @@ fn lens_content_hash_follows_the_active_checkout_not_main() {
 
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn an_overlay_refresh_reports_which_checkout_reindexed_which_paths() {
+    // The refresh used to answer only "did anything change". That is enough for the pass's own
+    // control flow but not for a consumer that must act ON a particular checkout: a resident
+    // language server is rooted at one tree and can only answer for that tree (#1010).
+    //
+    // Two linked worktrees sharing one database, only ONE of them edited: the report must name the
+    // edited checkout and its path, and must not attribute that work to its sibling.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/base.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let edited = unique_temp_root();
+    let quiet = unique_temp_root();
+    let _ = fs::remove_dir_all(&edited);
+    let _ = fs::remove_dir_all(&quiet);
+    run_git(&main, &["worktree", "add", "-q", "-b", "edited", edited.to_str().unwrap()]);
+    run_git(&main, &["worktree", "add", "-q", "-b", "quiet", quiet.to_str().unwrap()]);
+    // Only the first worktree diverges.
+    fs::write(edited.join("src/base.rs"), "pub fn base_fn() { let branch = 1; }\n").unwrap();
+    run_git(&edited, &["add", "."]);
+    run_git(&edited, &["commit", "-q", "-m", "branch edit"]);
+
+    let refresh = crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+
+    assert!(refresh.changed, "the edited worktree changed, so the pass changed something");
+    let edited_id = crate::watch::enclosing_worktree_id(&edited);
+    let quiet_id = crate::watch::enclosing_worktree_id(&quiet);
+    assert!(
+        refresh
+            .reindexed
+            .get(&edited_id)
+            .is_some_and(|paths| paths.iter().any(|path| path.ends_with("src/base.rs"))),
+        "the edited checkout must name the path it reindexed: {:?}",
+        refresh.reindexed,
+    );
+    assert!(
+        refresh.reindexed.get(&quiet_id).is_none_or(|paths| paths.is_empty()),
+        "an unedited sibling must not be credited with the other's work: {:?}",
+        refresh.reindexed,
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&edited);
+    let _ = fs::remove_dir_all(&quiet);
 }
