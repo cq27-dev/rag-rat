@@ -80,16 +80,6 @@ pub(crate) fn repo_relative_path_to_config_path(
     worktree_root.join(path).strip_prefix(config_root).ok().map(Path::to_path_buf)
 }
 
-pub(crate) fn matches_simple_pattern(path: &str, pattern: &str) -> bool {
-    if let Some(extension) = pattern.strip_prefix("**/*.") {
-        return path.ends_with(&format!(".{extension}"));
-    }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path.starts_with(prefix);
-    }
-    path == pattern || path.contains(pattern.trim_matches('*'))
-}
-
 /// HEAD commit sha for `root` via gix, or empty if unborn / not a repo (matching the old
 /// `rev-parse HEAD` failure behavior).
 pub(crate) fn head_sha(root: &Path) -> String {

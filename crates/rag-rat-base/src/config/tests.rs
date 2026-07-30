@@ -3315,3 +3315,47 @@ fn a_loaded_config_root_is_a_spelling_git_and_gix_both_accept() {
     ]);
     assert!(linked.join("crate/src/a.rs").is_file(), "the linked checkout was created");
 }
+
+/// A `dir/**` glob claims what is INSIDE `dir/`, so the prefix has to end at a separator. A bare
+/// `starts_with` reads a prefix of a NAME as a directory boundary, which excluded a Unix file
+/// called `drafts\secret.md` (and `draftsman.md`) as though it sat in `drafts/` — undoing, at the
+/// matcher, exactly what preserving a literal backslash in `path_string` accomplishes.
+#[test]
+fn a_directory_glob_needs_a_separator_after_its_prefix() {
+    let target = ResolvedTarget {
+        name: "docs".to_string(),
+        language: Language::Markdown,
+        directories: vec![PathBuf::from(".")],
+        include: vec!["**/*.md".to_string()],
+        exclude: vec!["drafts/**".to_string()],
+        kind: TargetKind::Docs,
+    };
+
+    assert!(!target.globs_claim("drafts/secret.md"), "a real child of drafts/ is excluded");
+    assert!(
+        target.globs_claim("drafts\\secret.md"),
+        "a Unix file NAMED `drafts\\secret.md` is not in drafts/ and must not be excluded"
+    );
+    assert!(
+        target.globs_claim("draftsman.md"),
+        "a sibling whose name merely starts with the prefix is not in drafts/"
+    );
+    assert!(target.globs_claim("notes/keep.md"), "an unrelated path is claimed by the include");
+}
+
+/// The same boundary on the INCLUDE side: `foo/**` must not claim a file merely named `foo\bar.rs`.
+#[test]
+fn a_directory_include_glob_does_not_claim_a_backslash_named_sibling() {
+    let target = ResolvedTarget {
+        name: "rust".to_string(),
+        language: Language::Rust,
+        directories: vec![PathBuf::from(".")],
+        include: vec!["foo/**".to_string()],
+        exclude: Vec::new(),
+        kind: TargetKind::Source,
+    };
+
+    assert!(target.globs_claim("foo/bar.rs"), "a real child of foo/ is claimed");
+    assert!(!target.globs_claim("foo\\bar.rs"), "a file NAMED `foo\\bar.rs` is not under foo/");
+    assert!(!target.globs_claim("foobar.rs"), "a prefix of the NAME is not a directory boundary");
+}

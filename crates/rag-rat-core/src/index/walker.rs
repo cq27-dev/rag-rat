@@ -74,20 +74,7 @@ fn is_target_file(root: &Path, path: &Path, target: &ResolvedTarget) -> bool {
     // `files.path` is stored with — never a blanket backslash rewrite, which would let a pattern
     // claim (or exclude) a Unix file whose NAME contains a backslash by pretending it is nested.
     let relative = rag_rat_base::paths::path_string(relative);
-    if target.exclude.iter().any(|pattern| matches_simple_pattern(&relative, pattern)) {
-        return false;
-    }
-    target.include.iter().any(|pattern| matches_simple_pattern(&relative, pattern))
-}
-
-fn matches_simple_pattern(path: &str, pattern: &str) -> bool {
-    if let Some(extension) = pattern.strip_prefix("**/*.") {
-        return path.ends_with(&format!(".{extension}"));
-    }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path.starts_with(prefix);
-    }
-    path == pattern || path.contains(pattern.trim_matches('*'))
+    target.globs_claim(&relative)
 }
 
 #[cfg(test)]
@@ -207,5 +194,37 @@ mod tests {
             .map(|p| rag_rat_base::paths::path_string(p.strip_prefix(&root).unwrap()))
             .collect();
         assert_eq!(rel, vec!["present/lib.rs".to_string()], "present dir indexed, missing skipped");
+    }
+
+    /// Unix-only: Windows forbids `\` in a file name, so the fixture cannot exist there.
+    ///
+    /// Preserving the backslash in the rendering accomplishes nothing if the exclude matcher then
+    /// claims the file for a directory it is not in. `drafts/**` used to `starts_with("drafts")`,
+    /// so a real source file NAMED `drafts\secret.rs` was dropped from the walk entirely.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_exclude_does_not_claim_a_backslash_named_file() {
+        let root = tempdir();
+        write(&root.join("drafts/secret.rs"), "fn inside_drafts() {}\n");
+        write(&root.join("drafts\\secret.rs"), "fn named_with_a_backslash() {}\n");
+        write(&root.join("draftsman.rs"), "fn a_longer_name() {}\n");
+
+        let target = ResolvedTarget { exclude: vec!["drafts/**".to_string()], ..rust_target() };
+        let ignore = IgnoreMatcher::compile(&root, &target.directories);
+        let rel: Vec<String> = walk_target(&root, &target, &ignore)
+            .unwrap()
+            .iter()
+            .map(|p| rag_rat_base::paths::path_string(p.strip_prefix(&root).unwrap()))
+            .collect();
+
+        assert!(
+            !rel.contains(&"drafts/secret.rs".to_string()),
+            "a real child is excluded: {rel:?}"
+        );
+        assert!(
+            rel.contains(&"drafts\\secret.rs".to_string()),
+            "a file NAMED `drafts\\secret.rs` is not under drafts/: {rel:?}"
+        );
+        assert!(rel.contains(&"draftsman.rs".to_string()), "a name prefix is not a dir: {rel:?}");
     }
 }

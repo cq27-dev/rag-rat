@@ -1090,6 +1090,41 @@ impl ResolvedTarget {
         let upgrade_rank = u8::from(!self.language.upgrades_ambiguous_extension());
         (kind_rank, upgrade_rank)
     }
+
+    /// Whether this target's `include` / `exclude` globs claim `relative_path` — exclude first, so
+    /// an excluded path is never claimed by a broader include.
+    ///
+    /// `relative_path` MUST be the `/`-separated rendering `files.path` is stored with
+    /// ([`crate::paths::path_string`]), never an OS-native spelling: the patterns are `/`-spelled,
+    /// and matching them against a different rendering is how a file ends up claimed for a
+    /// directory it is not in.
+    ///
+    /// The single definition of that matching, deliberately: the walk decides what to index and
+    /// the per-path resolver decides what an already-known path belongs to, and a second copy of
+    /// the rules lets those two answers drift.
+    pub fn globs_claim(&self, relative_path: &str) -> bool {
+        !self.exclude.iter().any(|pattern| glob_claims(relative_path, pattern))
+            && self.include.iter().any(|pattern| glob_claims(relative_path, pattern))
+    }
+}
+
+/// Whether one config glob claims `path` (a `/`-separated repo-relative rendering). Three shapes:
+/// a `**/*.ext` suffix, a `dir/**` subtree, and a literal (exact or substring).
+///
+/// A `dir/**` subtree requires the prefix to END AT A SEPARATOR. A bare `starts_with` reads a
+/// PREFIX OF A NAME as a directory boundary, so `drafts/**` also claimed the Unix file
+/// `drafts\secret.md` (and `draftsman.md`), excluding a file that is not in `drafts/` at all —
+/// which is exactly what preserving a literal backslash in the rendering exists to prevent.
+fn glob_claims(path: &str, pattern: &str) -> bool {
+    if let Some(extension) = pattern.strip_prefix("**/*.") {
+        return path.ends_with(&format!(".{extension}"));
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+    }
+    path == pattern || path.contains(pattern.trim_matches('*'))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

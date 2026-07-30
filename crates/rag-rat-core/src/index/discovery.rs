@@ -251,10 +251,7 @@ pub(crate) fn target_claims_path(
         }) {
             return None;
         }
-        if target.exclude.iter().any(|pattern| matches_simple_pattern(&relative, pattern)) {
-            return None;
-        }
-        if !target.include.iter().any(|pattern| matches_simple_pattern(&relative, pattern)) {
+        if !target.globs_claim(&relative) {
             return None;
         }
         Some((target.language, target.kind))
