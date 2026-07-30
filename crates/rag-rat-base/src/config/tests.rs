@@ -2777,6 +2777,7 @@ fn oracle_defaults_off_and_parses_overrides() {
             enabled: true,
             idle_shutdown_secs: 120,
             max_requests_per_pass: 50,
+            max_checkouts: 1,
         },
     });
 
@@ -2802,6 +2803,30 @@ fn oracle_live_rejects_a_zero_request_budget() {
     let path = dir.path().join("rag-rat.toml");
     std::fs::write(&path, "[oracle.live]\nenabled = true\nmax_requests_per_pass = 0\n").unwrap();
     assert!(matches!(Config::load(path), Err(ConfigError::OracleLiveRequestBudgetZero)));
+}
+
+#[test]
+fn oracle_live_serves_one_checkout_by_default_and_takes_an_override() {
+    // A resident language server per (backend x checkout) multiplies by the worktree fleet, so the
+    // shipped default serves only the checkout being edited. The knob is how an operator pays for
+    // more (#1010).
+    let default = OracleLiveConfig::default();
+    assert_eq!(default.max_checkouts, 1, "the shipped default serves one checkout");
+
+    let raw: RawConfig =
+        toml::from_str("[oracle.live]\nenabled = true\nmax_checkouts = 4\n").unwrap();
+    let oracle: OracleConfig = raw.oracle.into();
+    assert_eq!(oracle.live.max_checkouts, 4, "the override is honoured");
+}
+
+#[test]
+fn oracle_live_rejects_a_zero_checkout_cap() {
+    // Zero would admit no checkout at all, so every checkout's live work would sit in a backlog
+    // that nothing ever drains — silently, since the stage never fails a pass.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rag-rat.toml");
+    std::fs::write(&path, "[oracle.live]\nenabled = true\nmax_checkouts = 0\n").unwrap();
+    assert!(matches!(Config::load(path), Err(ConfigError::OracleLiveCheckoutCapZero)));
 }
 
 #[test]

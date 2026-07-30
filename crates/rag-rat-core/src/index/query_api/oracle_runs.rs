@@ -3,6 +3,7 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
 use rag_rat_base::time::now_ms;
 use rag_rat_oracle::{
     self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls, ToolManifest,
@@ -114,24 +115,46 @@ impl IndexDatabase {
                 "index has no source_root metadata; rebuild required for the live oracle pass"
             );
         };
-        // The two disagreeing means the rows describe a different checkout than the session is
-        // serving (an index carried to a new path, a root reconfigured since the last build). A
+        // The rows a pass patches must belong to the checkout its server reads. Disagreement means
+        // an index carried to a new path or a root reconfigured since the last build, and a
         // per-pass freshness patch cannot reconcile that: it would write verdicts keyed to these
-        // rows from a server reading other files. Say so rather than patching the wrong checkout.
+        // rows from a server reading other files.
         //
-        // NOTE for per-checkout live sessions (#1010): `source_root` is the MAIN checkout's root in
-        // the shared-database model, so a pass scoped to a linked worktree trips this by
-        // construction. The predicate is right — the rows a pass patches must belong to the
-        // checkout its server reads — but the implementation encodes the single-checkout
-        // assumption. The rows are already keyed by `worktree_id`; this comparison has to
-        // become worktree-aware alongside that work.
+        // WHICH checkout that is depends on the active scope (#1010). `source_root` is the MAIN
+        // checkout's root, and in the shared-database model an overlay-scoped pass legitimately
+        // reads a DIFFERENT tree — the linked worktree its rows are keyed to. So the expected root
+        // is the active scope's own checkout, and the caller must have rooted the session there.
         let indexed_root =
             indexed_root.canonicalize().unwrap_or_else(|_| indexed_root.to_path_buf());
-        if indexed_root != scope.root() {
+        // The base checkout's scope id is `worktree_id_of(indexed_root)`, not the empty string —
+        // `resolve_worktree_scope` reports the root's own id for it. (Empty means no scope has
+        // been installed on this handle yet, which is also the base.) Test it explicitly rather
+        // than letting the linked derivation below round-trip back to the same answer.
+        let base_scope = self.active_worktree_id.is_empty()
+            || self.active_worktree_id == crate::index::worktree_id_of(&indexed_root);
+        let expected_root = if base_scope {
+            indexed_root.clone()
+        } else {
+            // The linked checkout's equivalent of the indexed root — NOT the checkout root itself,
+            // which differs whenever the indexed root is a repo subdir (`<linked>/crate` vs
+            // `<linked>`). Same derivation the overlay uses to read that checkout's bytes, so the
+            // guard and the rows agree by construction.
+            let worktree = std::path::Path::new(&self.active_worktree_id);
+            crate::index::linked_source_root(&indexed_root, worktree).with_context(|| {
+                format!(
+                    "the live oracle is scoped to worktree {} but its source root could not be \
+                     resolved against the indexed root {}",
+                    self.active_worktree_id,
+                    indexed_root.display(),
+                )
+            })?
+        };
+        let expected_root = expected_root.canonicalize().unwrap_or_else(|_| expected_root.clone());
+        if expected_root != scope.root() {
             anyhow::bail!(
-                "the index was built from {} but the live oracle is scoped to {}; reindex before \
-                 the live oracle can patch these rows",
-                indexed_root.display(),
+                "the active scope's checkout is rooted at {} but the live oracle is scoped to {}; \
+                 the server must be rooted at the tree whose rows the pass patches",
+                expected_root.display(),
                 scope.root().display(),
             );
         }

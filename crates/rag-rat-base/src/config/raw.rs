@@ -330,6 +330,7 @@ pub(crate) struct RawOracleLive {
     enabled: Option<bool>,
     idle_shutdown_secs: Option<u64>,
     pub(crate) max_requests_per_pass: Option<u64>,
+    pub(crate) max_checkouts: Option<usize>,
 }
 
 impl From<RawOracleLive> for OracleLiveConfig {
@@ -341,6 +342,7 @@ impl From<RawOracleLive> for OracleLiveConfig {
             max_requests_per_pass: raw
                 .max_requests_per_pass
                 .unwrap_or(default.max_requests_per_pass),
+            max_checkouts: raw.max_checkouts.unwrap_or(default.max_checkouts),
         }
     }
 }

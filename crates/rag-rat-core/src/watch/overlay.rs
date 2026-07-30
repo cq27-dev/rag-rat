@@ -171,12 +171,18 @@ pub struct CheckoutReindex {
     /// `config.root`, which is NOT the checkout root when `config.root` is a repo subdir. See
     /// [`crate::index::WorktreeOverlayReport::source_root`].
     pub source_root: PathBuf,
-    /// Paths whose effective indexed content this refresh may have changed, relative to
-    /// [`Self::source_root`]. A superset when `coverage` is
-    /// [`ChangedPathsCoverage::Complete`]; otherwise not even that.
+    /// Paths whose effective indexed content this refresh changed, relative to
+    /// [`Self::source_root`]. Always SOUND — every path listed really did change — and a superset
+    /// of the change set only when `coverage` is [`ChangedPathsCoverage::Complete`].
     pub paths: Vec<PathBuf>,
-    /// Whether `paths` is the complete set. `Partial` means the consumer must treat the whole
-    /// checkout as suspect rather than trusting the list.
+    /// Whether `paths` accounts for everything that changed. `Partial` means paths may be MISSING
+    /// (the checkout's working-tree status read failed); it does NOT devalue the ones listed.
+    ///
+    /// So what a consumer should do with `Partial` depends on the question it is asking. One that
+    /// needs completeness — "may I skip re-examining this checkout?" — must answer no. One
+    /// building a best-effort worklist should still take the paths: refreshing a sound subset is
+    /// strictly better than refreshing nothing, and the omitted half surfaces on the next refresh,
+    /// which a partial pass guarantees by clearing the overlay basis.
     pub coverage: ChangedPathsCoverage,
 }
 

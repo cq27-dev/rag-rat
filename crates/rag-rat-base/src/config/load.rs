@@ -372,6 +372,9 @@ fn validate_raw(raw: RawConfig) -> Result<RawConfig, ConfigError> {
     if raw.oracle.live.max_requests_per_pass == Some(0) {
         return Err(ConfigError::OracleLiveRequestBudgetZero);
     }
+    if raw.oracle.live.max_checkouts == Some(0) {
+        return Err(ConfigError::OracleLiveCheckoutCapZero);
+    }
     Ok(raw)
 }
 

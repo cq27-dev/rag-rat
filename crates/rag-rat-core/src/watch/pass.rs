@@ -416,7 +416,17 @@ fn run_pass(
     // must still fire so a gone-quiet server releases the resident language server. Only the
     // resident watcher passes the state in — hook/CLI passes skip the stage entirely.
     if let Some(live) = live_oracle {
-        timings.stage("live_oracle", || live.on_pass(&db, config, clone_delta_hint.as_ref()));
+        // Both halves of the pass's changed set (#1010): the base scope's paths, and what each
+        // linked checkout's overlay refresh above changed. A linked worktree is a different source
+        // tree, so its edits can only be answered by a server rooted there — handing them to the
+        // main checkout's session would resolve them against the wrong files.
+        let changed = super::live_oracle::LiveChangedSets {
+            base: clone_delta_hint.as_ref(),
+            overlays: &overlays.reindexed,
+        };
+        // The only failure this stage propagates is a base scope it could not restore — see
+        // `on_pass`. Everything else about the live oracle is best-effort and logged.
+        timings.stage("live_oracle", || live.on_pass(&mut db, config, &changed))?;
     }
     // Idle backstop (issue #63, facet 2): when the sweep changed nothing, skip everything past
     // discovery — an idle server should do no work. `run_gc` (every GC_EVERY_PASSES) still forces

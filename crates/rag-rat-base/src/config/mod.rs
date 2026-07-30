@@ -185,6 +185,11 @@ pub enum ConfigError {
          permanently backlogged"
     )]
     OracleLiveRequestBudgetZero,
+    #[error(
+        "[oracle.live] `max_checkouts` must be positive — zero would leave every checkout's live \
+         work permanently backlogged"
+    )]
+    OracleLiveCheckoutCapZero,
 }
 
 pub use discovery::{

@@ -43,6 +43,7 @@ patch for files being edited, and where both tools cover the same edge the batch
 enabled = false               # off by default — opt in explicitly
 idle_shutdown_secs = 900      # shut each language server down after 15 min idle
 max_requests_per_pass = 200   # positive cap per maintenance pass; zero is rejected
+max_checkouts = 1             # how many checkouts hold resident servers; zero is rejected
 ```
 
 One setting configures every live backend. A checkout indexed in several of these languages runs
@@ -50,6 +51,20 @@ one resident server per language, each with its own backlog and respawn backoff,
 server for one language never stalls another. `max_requests_per_pass` is **shared** across them —
 it bounds the pass, which holds the repository write lock — and the backends take turns claiming
 it so none is starved.
+
+**Linked worktrees and `max_checkouts`.** A linked worktree is a different source tree, so its
+edits can only be answered by a server rooted there — the main checkout's server would resolve
+them against the wrong files. Live state is therefore per checkout, and the straightforward
+reading (one server per backend per checkout) multiplies resident servers by the size of your
+worktree fleet. A language server is routinely gigabytes, so `max_checkouts` bounds how many
+checkouts hold servers at once.
+
+The default of `1` serves whichever checkout you are editing. Checkouts are ranked by how recently
+they had work; one that falls outside the cap has its servers shut down but **keeps its backlog**,
+so its work is deferred rather than lost, and it is served again once it is current. Editing two
+checkouts in alternation at the default will spawn and shut down repeatedly — raise `max_checkouts`
+to cover them concurrently. (The batch pass covers every checkout regardless; this only affects the
+per-pass live freshness patch.)
 
 **TypeScript needs a `tsconfig.json`.** `typescript-language-server` reports that it has finished
 loading a project only for a real tsconfig project, and the oracle waits for that signal before it

@@ -670,9 +670,11 @@ impl IndexDatabase {
         worktree_id: &str,
         generation: i64,
     ) -> anyhow::Result<()> {
-        self.active_commit_sha = commit_sha.to_string();
-        self.active_worktree_id = worktree_id.to_string();
-        self.active_generation = generation;
+        // Install the SQL scope view FIRST, and only commit the in-memory fields once it succeeded.
+        // The two are one scope: a failed view write that had already moved `active_worktree_id`
+        // would leave every subsequent direct-scoped write stamping a scope the view does not
+        // serve, and the caller's error handling cannot tell that the handle is now lying.
+        //
         // The repo dimension comes from `self.active_repo_id` (resolved at open), not re-derived
         // from the connection — a consolidated DB's sole-repo fallback would be ambiguous. This is
         // the one caller that scopes to a SPECIFIC repo without reading it back from the context.
@@ -682,6 +684,9 @@ impl IndexDatabase {
             worktree_id: worktree_id.to_string(),
             generation,
         })?;
+        self.active_commit_sha = commit_sha.to_string();
+        self.active_worktree_id = worktree_id.to_string();
+        self.active_generation = generation;
         Ok(())
     }
 
@@ -811,7 +816,28 @@ pub fn install_scope_view(
 /// and see only the active context. The `files` view filters on `repo_id` FIRST (A3) so a
 /// consolidated DB never leaks another repo's rows through the view — every read path that goes
 /// through `temp.files` is repo-scoped for free.
+/// Install the connection's scope, ALL-OR-NOTHING.
+///
+/// The view body reads `temp.connection_context` through sub-selects at query time, so writing
+/// those rows IS the scope switch — the view recreation below is idempotent boilerplate. Four
+/// separate statements therefore have four chances to leave a MIXED scope (a new `worktree_id`
+/// beside an old `commit_sha`), and the caller's `Err` handling cannot see that: it reasonably
+/// treats a failed switch as "still on the previous scope" and keeps using the handle, which would
+/// then read across checkouts. A savepoint makes the failure mean what the caller assumes it does.
+/// Nestable on purpose — callers switch scope inside an open transaction.
 fn write_scope_view(conn: &rusqlite::Connection, ctx: &ScopeContext) -> rusqlite::Result<()> {
+    conn.execute_batch("SAVEPOINT rag_rat_scope_view")?;
+    match write_scope_view_inner(conn, ctx) {
+        Ok(()) => conn.execute_batch("RELEASE rag_rat_scope_view"),
+        Err(err) => {
+            let _ =
+                conn.execute_batch("ROLLBACK TO rag_rat_scope_view; RELEASE rag_rat_scope_view");
+            Err(err)
+        },
+    }
+}
+
+fn write_scope_view_inner(conn: &rusqlite::Connection, ctx: &ScopeContext) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
             CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);

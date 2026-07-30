@@ -30,9 +30,11 @@ mod placement;
 pub use event_loop::Watcher;
 #[cfg(test)]
 pub(crate) use event_loop::{EventLoop, flush_watch_placement_failures, shutdown_discover};
+#[cfg(test)]
+pub(crate) use live_oracle::{LiveChangedSets, LiveOracleTail, suppress_live_spawn};
 pub use overlay::{
-    OverlayRefresh, OverlayScope, ReconcileBudget, is_manifest_path, refresh_worktree_overlays,
-    reindex_paths,
+    CheckoutReindex, OverlayRefresh, OverlayScope, ReconcileBudget, is_manifest_path,
+    refresh_worktree_overlays, reindex_paths,
 };
 #[cfg(test)]
 pub(crate) use overlay::{enclosing_worktree_id, overlay_needs_embed, partition_paths_by_worktree};

@@ -8,6 +8,7 @@ mod config_root;
 mod delta_refresh;
 mod lens_handles;
 mod lifecycle;
+mod live_oracle;
 mod logical_rebuild;
 mod quiet_window;
 mod relink;

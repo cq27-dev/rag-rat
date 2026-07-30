@@ -250,11 +250,35 @@ pub struct OracleLiveConfig {
     /// while it runs, so this is a lock-hold bound, and a mixed-language checkout must not spend
     /// one allowance per language. The backends draw from it in a rotating order so none starves.
     pub max_requests_per_pass: u64,
+    /// How many CHECKOUTS may hold resident language servers at once (default 1). Must be
+    /// positive; zero is rejected at config load.
+    ///
+    /// A linked worktree is a different source tree, so it needs its own server rooted there —
+    /// one per (backend x checkout) is the straightforward reading and it multiplies resident
+    /// servers by the number of active worktrees. That is the resource this bounds: a language
+    /// server is routinely gigabytes, and a repo with a worktree per in-flight branch can easily
+    /// have dozens.
+    ///
+    /// The default of 1 serves the checkout being edited and no more. Checkouts with work are
+    /// ranked by how recently they had any, and one that falls outside the cap has its sessions
+    /// shut down but KEEPS its backlog, so the work is served rather than lost once it becomes
+    /// current again.
+    ///
+    /// Editing two checkouts in alternation at the default will spawn and shut down repeatedly —
+    /// raise this to cover them concurrently. The alternative (refusing to switch until some
+    /// dwell time elapsed) would starve whichever checkout is being edited NOW, which is worse
+    /// than paying for a respawn.
+    pub max_checkouts: usize,
 }
 
 impl Default for OracleLiveConfig {
     fn default() -> Self {
-        Self { enabled: false, idle_shutdown_secs: 900, max_requests_per_pass: 200 }
+        Self {
+            enabled: false,
+            idle_shutdown_secs: 900,
+            max_requests_per_pass: 200,
+            max_checkouts: 1,
+        }
     }
 }
 
