@@ -88,6 +88,22 @@ so they surface for **every** agent that queries it — Claude Code, Codex, any 
 the one that wrote them. Your harness's private memory is invisible to the others. rag-rat is the
 **cross-agent memory layer**.
 
+**Write the present tense, not a changelog.** A memory is read by someone about to change the code,
+so it must say **what is true now and what to do about it**. Narrating what shipped is unactionable:
+"this was fixed in #123", "the predicate used to fail open", "stage 2 landed the split" all cost the
+reader attention and tell them nothing they can act on. Worse, a memory written as history goes stale
+the moment the next change lands, and it teaches the reader to distrust the rest of the entry.
+
+The same applies when you **update** one. If the thing a memory warned about has been fixed, do not
+append a status section — rewrite the body to state the rule that now holds, and delete the warning.
+If nothing actionable survives, `memory_mark_obsolete` it. A memory whose top half is a list of
+completed work is one nobody finishes reading.
+
+Keep: invariants, the reasoning behind a decision, traps and their failure modes, what to reach for,
+what is still unresolved. Drop: PR/stage narration, "used to be", anything whose only value is that
+it happened. Referencing an issue or test *name* is fine when it is a pointer the reader can follow —
+it is the story that does not belong.
+
 Do it well:
 - **`memory_search` first** to avoid duplicates.
 - **Anchor to the tightest stable target:** prefer an `id` binding (the `sym_<hex>` handle —
@@ -96,7 +112,7 @@ Do it well:
 - **Pick the right `kind`:** `Invariant` (must stay true), `Decision`/`RejectedAlternative` (why
   this / why not that), `Risk`/`BugPattern` (footguns), `PerformanceNote`, `PlatformQuirk`,
   `FFIBoundary`. Write a concrete title and a body with the **why** + **how to apply** — not just the
-  what.
+  what, and not what changed.
 - **`memory_update` / `memory_mark_obsolete`** when a memory is wrong or superseded — don't leave
   stale guidance. After a large refactor, **`memory_doctor`** flags `gone` anchors and
   **`memory_rebind`** re-anchors them.

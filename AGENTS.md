@@ -67,6 +67,12 @@ How to do it well:
 - **Pick the right `kind`:** `Invariant` (must stay true), `Decision`/`RejectedAlternative` (why it's
   this way / why not the other), `Risk` / `BugPattern` (footguns), `PerformanceNote`, `PlatformQuirk`,
   `FFIBoundary`. Write a concrete title, and a body with the *why* and *how to apply* — not just *what*.
+- **Write the present tense, not a changelog.** A memory says what is true NOW and what to do about
+  it. "Fixed in #123", "used to fail open", "stage 2 landed the split" are unactionable: they cost
+  the reader attention, go stale on the next change, and teach them to distrust the rest of the
+  entry. When updating a memory whose warning no longer applies, rewrite the body to state the rule
+  that now holds — do not append a status section — and `memory_mark_obsolete` it if nothing
+  actionable survives. An issue or test *name* is a fine pointer; the story is not.
 - **`memory_search` first** to avoid duplicates; **`memory_update` / `memory_mark_obsolete`** when a
   memory is wrong or superseded (don't leave stale guidance).
 - **After large refactors**, run `rag-rat memory doctor` and re-anchor anything it flags `gone`
