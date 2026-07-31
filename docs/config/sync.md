@@ -20,15 +20,19 @@ per-database session lock enforces that:
 | **Host** | `rag-rat sync serve` (long-running) | no | yes |
 | **Device** | the git-hook pass (automatic) | yes | no |
 
-Two consequences that decide how you arrange things:
+Two consequences follow, and the first is a limitation rather than a design goal:
 
-- **Two devices can never sync directly with each other.** Neither is listening. This is true with
-  or without discovery — discovery can only tell you where something is, not make it answer.
-- **You need at least one host.** Every device reconciles *through* it: a device pushes what the
-  host lacks and pulls what it lacks, so changes reach the other devices on their next pass. The
-  host does not have to be dedicated or hosted anywhere — a desktop that is usually on is a host.
+- **Two devices cannot currently sync directly with each other.** Neither is listening. This is not
+  a NAT problem — a device behind NAT is perfectly reachable through the relay *if something on it
+  is listening* — it is that the maintenance pass is a short batch job with nothing alive to accept.
+  Discovery does not help: it can say where a node is, not make it answer. Lifting this is
+  [#1079](https://github.com/cq27-dev/rag-rat/issues/1079); until then, arrange things as below.
+- **So you need at least one host today.** Every device reconciles *through* it: a device pushes
+  what the host lacks and pulls what it lacks, so changes reach the other devices on their next
+  pass. The host does not have to be dedicated or hosted anywhere — a desktop that is usually on is
+  a host.
 
-So the arrangement is always the same shape: **one or more always-on hosts, and any number of
+Until #1079 lands the arrangement is therefore: **one or more always-on hosts, and any number of
 devices reconciling through them.**
 
 ```toml
@@ -52,13 +56,17 @@ discovery service and dials what it finds without advertising anything itself. T
 deliberate: a laptop behind NAT reaches the host without becoming reachable, or discoverable, in
 turn.
 
-### Why `discoverable` belongs only on hosts
+### Why `discoverable` belongs only on hosts, for now
 
 Setting it on a device would announce an address that cannot accept a connection and that stops
 existing seconds later when the pass ends, while the announcement itself lives on for its whole TTL.
 Every device that discovered it would spend a dial that can only time out, and it would occupy one
 of the few per-tag slots a reachable host needs. The device-side pass therefore ignores the flag and
 only ever fetches; `discoverable` is read by `sync serve`.
+
+This restriction is a consequence of the limitation above, not of the discovery design. Once
+devices can accept connections ([#1079](https://github.com/cq27-dev/rag-rat/issues/1079)) the flag
+becomes meaningful on any device, because a device that advertises itself will be reachable.
 
 ### Scale
 

@@ -336,7 +336,8 @@ pub struct SyncConfig {
     /// Advertise this node to the peer-discovery service so the account's devices can dial it
     /// without a static `server_peers` entry (default false).
     ///
-    /// Read by `rag-rat sync serve` ONLY. The device-side maintenance pass never publishes,
+    /// Read by `rag-rat sync serve` ONLY, for as long as a device cannot accept connections
+    /// (#1079). The device-side maintenance pass never publishes,
     /// whatever this says: it dials outward and never listens, so announcing it would advertise an
     /// address that cannot accept a connection and that stops existing when the pass ends seconds
     /// later — costing every device that discovered it a dial that can only time out, and holding
