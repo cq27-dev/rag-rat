@@ -449,8 +449,29 @@ fn full_ladder_replay_on_a_two_repo_db_is_idempotent() {
     schema::apply(&conn, &crate::index::migration_hooks())
         .expect("full-ladder replay on a consolidated 2-repo DB must not error");
 
-    // A no-op: no meta relocated, no rows resurrected in the source tables, no files moved.
-    assert_eq!(dump_repo_meta(&conn), repo_meta_before, "the replay moved no repo_meta rows");
+    // A no-op on the identity-bearing rows, with ONE deliberate exception: V098 clears the
+    // path-rendering freshness markers (`files_base_scope_discovered`, the
+    // `git_history_indexed_root` cursor) so the next pass re-walks. That is harmless on the
+    // replay path — `index --full`, the only production caller that re-runs the ladder,
+    // re-derives them in the same command — but it does move repo_meta, so the idempotence
+    // check expects exactly those keys gone and nothing else.
+    let expected_repo_meta: Vec<_> = repo_meta_before
+        .iter()
+        .filter(|(_, key, _)| {
+            key.as_str() != rag_rat_db::meta::BASE_SCOPE_DISCOVERED_META
+                && key.as_str() != rag_rat_db::meta::GIT_HISTORY_INDEXED_ROOT_META
+        })
+        .cloned()
+        .collect();
+    assert!(
+        expected_repo_meta.len() < repo_meta_before.len(),
+        "the fixture must carry the freshness markers V098 clears, or this proves nothing",
+    );
+    assert_eq!(
+        dump_repo_meta(&conn),
+        expected_repo_meta,
+        "the replay moved no repo_meta rows beyond V098's deliberate freshness-marker invalidation",
+    );
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM index_meta", [], |r| r.get::<_, i64>(0)).unwrap(),
         index_meta_before,

@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 97;
+pub const LATEST_SCHEMA_VERSION: u32 = 98;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -732,6 +732,23 @@ const MIGRATION_097_DESCRIPTION: &str =
      kept. Runs on every host: which spellings a store carries is a property of the store, not of \
      the binary that opens it";
 
+const MIGRATION_098_ID: &str = "098_reindex_after_unix_backslash_rendering";
+const MIGRATION_098_CHECKSUM: &str = "sha256:rag-rat-reindex-after-unix-backslash-rendering-v98";
+const MIGRATION_098_DESCRIPTION: &str =
+    "Force the next ordinary index pass to re-walk the tree and reload git history, so a store an \
+     older binary wrote before the Unix backslash-rendering fix (#1032) re-derives its path-keyed \
+     rows off the corrected spelling. That binary collapsed a literal backslash in a Unix \
+     filename to a separator, so files.path and the symbol identities keyed on it could not be \
+     told apart from a genuinely nested sibling; the old rendering was lossy, so the stored \
+     spelling cannot be repaired in place — only a re-walk recovers the truth. This deletes the \
+     freshness markers that gate that work: the base-scope discovery marker (files re-walk, which \
+     cascades chunks, symbols, and edges), the git-history root cursor (a full revwalk, which \
+     re-derives the commit and file-change rows and the change couplings folded off its freshness \
+     key), and the worktree_overlay_basis keys (per-checkout overlay re-derive); it also clears \
+     parser_failures, the one path-keyed derived table a file re-walk does not cascade. Runs on \
+     every host: which spellings a store carries is a property of the store, not of the binary \
+     that opens it";
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SchemaState {
@@ -937,7 +954,8 @@ impl MigrationFn {
 /// A listed migration's body must NOT open a transaction of its own — the ladder owns one here, and
 /// `BEGIN` inside a transaction fails. `blocking_the_ledger_stamp_rolls_the_body_back` drives every
 /// entry and pins the atomicity behaviorally.
-const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID];
+const LEDGER_ATOMIC_MIGRATIONS: &[&str] =
+    &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID, MIGRATION_098_ID];
 
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
 /// older binary can still act on (see [`LEDGER_ATOMIC_MIGRATIONS`]).
@@ -1539,6 +1557,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_097_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_windows_verbatim_path_rekey),
     },
+    Migration {
+        id: MIGRATION_098_ID,
+        checksum: MIGRATION_098_CHECKSUM,
+        description: MIGRATION_098_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_reindex_after_unix_backslash_rendering),
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -1759,7 +1783,7 @@ mod ledger_atomicity {
     /// test with it, so the regression that reintroduces the two-commit window would pass. These
     /// tests range over the UNION, so removing an id from production fails here instead.
     const DATA_CONVERTING_MIGRATIONS: &[&str] =
-        &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID];
+        &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID, MIGRATION_098_ID];
 
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.
     fn ledger_atomic_under_test() -> Vec<&'static str> {
@@ -1888,11 +1912,31 @@ mod ledger_atomicity {
         hooks: &MigrationHooks,
     ) {
         let target = step.id;
-        // Poisoned AFTER the earlier migrations, so nothing relocates it out from under V097.
-        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('source_root', ?1)", [
-            POISONED_SOURCE_ROOT,
-        ])
-        .unwrap();
+        // Give this target's body a change that must NOT survive a blocked stamp. Seeded AFTER the
+        // earlier migrations, so nothing relocates it out from under the probe, and per-target so
+        // it lands where that body acts: V097 converts a verbatim `source_root`, V098
+        // deletes the path-rendering freshness markers. Restated per id rather than
+        // poisoning `source_root` for everything, so V098's probe cannot re-poison the root
+        // V097 already converted.
+        if target == MIGRATION_097_ID {
+            conn.execute(
+                "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('source_root', ?1)",
+                [POISONED_SOURCE_ROOT],
+            )
+            .unwrap();
+        }
+        if target == MIGRATION_098_ID {
+            // The placeholder repo the registry always carries, so the `repo_meta` FK to
+            // `repo_roots` holds; V098 deletes by key regardless of repo_id.
+            conn.execute(
+                "INSERT OR REPLACE INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, '/x')",
+                rusqlite::params![
+                    rag_rat_base::repo_identity::LEGACY_REPO_ID,
+                    crate::meta::GIT_HISTORY_INDEXED_ROOT_META
+                ],
+            )
+            .unwrap();
+        }
         conn.execute_batch(&format!(
             "CREATE TRIGGER block_ledger_stamp BEFORE INSERT ON schema_version
              WHEN new.id = '{target}'

@@ -1986,7 +1986,7 @@ fn migration_094_tracks_lens_enrichment_changes_in_constant_time() {
 /// binary that did not do the work.
 #[test]
 fn migration_097_records_the_same_ladder_entry_on_every_platform() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 97, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 98, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();

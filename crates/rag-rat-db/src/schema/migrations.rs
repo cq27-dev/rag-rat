@@ -1383,6 +1383,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_095_ID => Some(95),
             MIGRATION_096_ID => Some(96),
             MIGRATION_097_ID => Some(97),
+            MIGRATION_098_ID => Some(98),
             _ => None,
         })
         .max()
@@ -1489,6 +1490,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_095_ID
             | MIGRATION_096_ID
             | MIGRATION_097_ID
+            | MIGRATION_098_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1592,6 +1594,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_095_ID => migration.checksum != MIGRATION_095_CHECKSUM,
         MIGRATION_096_ID => migration.checksum != MIGRATION_096_CHECKSUM,
         MIGRATION_097_ID => migration.checksum != MIGRATION_097_CHECKSUM,
+        MIGRATION_098_ID => migration.checksum != MIGRATION_098_CHECKSUM,
         _ => false,
     }
 }
@@ -6662,6 +6665,85 @@ const V097_WORKTREE_OVERLAY_BASIS_PREFIX: &str = crate::meta::WORKTREE_OVERLAY_B
 pub const V097_PATH_VALUED_META_KEYS: &[&str] =
     &["source_root", crate::meta::GIT_HISTORY_INDEXED_ROOT_META];
 
+/// The `repo_meta` freshness markers V098 deletes to force the next ordinary index pass to
+/// re-derive the path-keyed rows an older binary keyed under a collapsed backslash spelling.
+/// Deleting the marker is the lever, not deleting the table: each gates a re-derivation the indexer
+/// already owns. `BASE_SCOPE_DISCOVERED_META` gone promotes the next pass to a full tree re-walk,
+/// which replaces `files` and everything that CASCADES from it (chunks, symbols, edges, embeddings,
+/// blame). `GIT_HISTORY_INDEXED_ROOT_META` gone fails `is_history_current`, forcing a full revwalk
+/// that re-reads the commit and file-change rows and restamps the change couplings folded off its
+/// freshness key. The `worktree_overlay_basis` keys are cleared separately (their suffix is a
+/// worktree_id, so they need a prefix match, not an equality).
+const V098_CLEARED_FRESHNESS_KEYS: &[&str] =
+    &[crate::meta::BASE_SCOPE_DISCOVERED_META, crate::meta::GIT_HISTORY_INDEXED_ROOT_META];
+
+/// V098 (#1032): make the next ordinary `index` pass re-walk the tree and reload git history, so a
+/// store written before the Unix backslash-rendering fix re-derives its path-keyed rows off the
+/// corrected spelling.
+///
+/// The pre-fix binary rendered a path by replacing every backslash with a separator — right on
+/// Windows, where a backslash IS the separator, but wrong on Unix, where a literal backslash is an
+/// ordinary filename byte. So `foo\bar.rs` was persisted as `foo/bar.rs`: one `files.path`, one
+/// `path::name` symbol identity, shared with a genuinely nested `foo/bar.rs`. That rendering was
+/// LOSSY, so unlike the Windows verbatim rekey (V097) the stored spelling cannot be repaired in
+/// place — `foo/bar.rs` in the store cannot be told apart from a rewritten `foo\bar.rs`. Only a
+/// re-walk off the corrected renderer recovers the truth, and this forces one by deleting the
+/// freshness markers that would otherwise let the pass skip an unchanged file.
+///
+/// WHAT KEEPS A PRE-FIX BINARY OFF A STORE THIS HAS CONVERTED — and why that is the whole story.
+/// The fence is the SCHEMA VERSION, the ladder's, not this migration's: recording V098 puts an id
+/// in `schema_version` a pre-V098 binary does not know, so [`super::status`] answers `Newer` and
+/// every open refuses. It reaches a resident process wherever it re-opens — a watcher pass, a CLI
+/// or MCP read — because those re-open per operation. This is the SAME fence V097 relies on for the
+/// sibling bug; that reasoning applies here unchanged, including the one bounded residual it
+/// documents: a pass already past its status check when the upgrade commits can still write once
+/// under the old rendering, self-healing on the following pass. That residual is accepted rather
+/// than closed with cross-repo write-lock enumeration, which a consolidated store cannot order.
+///
+/// LEDGER-ATOMIC because the marker deletion and the `schema_version` stamp must never be
+/// separately visible: a store whose markers are gone but whose V098 row has not landed still
+/// answers `Compatible` to a pre-V098 binary, which would re-walk under the OLD renderer and
+/// re-collapse the very spellings this exists to correct — for a moment on a healthy upgrade,
+/// indefinitely after a crash between two commits. So the body takes the ladder's transaction and
+/// opens none of its own.
+///
+/// DELIBERATELY LEFT to a read-time filter or an ordinary later pass, not swept here:
+///  * the oracle verdict tables — `edge_oracle` is joined on `file_sha = files.sha256`, so a stale
+///    row only resurfaces against a real sibling of identical content and edge geometry, and it
+///    re-derives on the next `oracle run`;
+///  * the clone posting family — rotated out by the next clone generation;
+///  * durable path-anchored DECISION data — a persisted human/model choice keyed by a path, which a
+///    reindex must not destroy. Two tables hold it today: `repo_memory_bindings` (re-anchored by
+///    the relocation engine) and `papertrail_distill_anchors` rows with `selected = 1` (a model
+///    selection the distill extractor preserves across a rerun of unchanged input, by its own V078
+///    invariant — so quarantining or regenerating them here would lose the decision, which is why
+///    the reindex leaves them). Any future table of this shape belongs in this bucket, not in the
+///    sweep.
+///
+/// Reaching any of those needs a lossy collision with a real slash-spelled sibling AND a
+/// pre-existing backslash-named Unix file — the near-impossible case the correctness fix stops from
+/// ever recurring. Without a sibling the stale row simply points at a path no file has, and is
+/// inert.
+///
+/// Runs on every platform: which spellings a store carries is a property of the store, not of the
+/// host reading it, and the ladder is forward-only, so a skip would record V098 as applied without
+/// doing the work.
+pub fn apply_reindex_after_unix_backslash_rendering(conn: &Connection) -> rusqlite::Result<()> {
+    for key in V098_CLEARED_FRESHNESS_KEYS {
+        conn.execute("DELETE FROM repo_meta WHERE key = ?1", [key])?;
+    }
+    // The overlay basis lives under one key PER checkout, its worktree_id in the suffix — a prefix
+    // match clears them all. The constant holds no `%`/`_`/`\`, so a bare LIKE needs no ESCAPE.
+    conn.execute("DELETE FROM repo_meta WHERE key LIKE ?1 || '%'", [
+        crate::meta::WORKTREE_OVERLAY_BASIS_META_PREFIX,
+    ])?;
+    // The one path-keyed DERIVED table a file re-walk does not cascade: no FK to `files`, keyed by
+    // a bare path, re-recorded per file on the next parse. Whole-table because every row
+    // re-derives.
+    conn.execute("DELETE FROM parser_failures", [])?;
+    Ok(())
+}
+
 /// V097 (#1048): rewrite every persisted path spelling that the pre-fix `canonicalize` wrote in
 /// the Windows `\\?\` VERBATIM form into the plain spelling this binary now produces.
 ///
@@ -7217,5 +7299,75 @@ mod sync_security_events_migration_tests {
             [],
         );
         assert!(inserted.is_err(), "STRICT rejects an INTEGER in the BLOB account_id column");
+    }
+}
+
+#[cfg(test)]
+mod reindex_after_unix_backslash_rendering_tests {
+    use super::*;
+
+    /// A `repo_meta` + `parser_failures` pair minimal enough to drive the V098 body, seeded with
+    /// every marker the migration clears plus one control row it must leave untouched.
+    fn seed(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE repo_meta(
+                 repo_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+                 PRIMARY KEY(repo_id, key));
+             CREATE TABLE parser_failures(
+                 repo_id TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY(repo_id, path));",
+        )
+        .unwrap();
+        let put = |key: &str, value: &str| {
+            conn.execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('r', ?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .unwrap();
+        };
+        put(crate::meta::BASE_SCOPE_DISCOVERED_META, "1");
+        put(crate::meta::GIT_HISTORY_INDEXED_ROOT_META, "/some/root");
+        put(
+            &format!("{}abc123", crate::meta::WORKTREE_OVERLAY_BASIS_META_PREFIX),
+            "base\nlinked\n42",
+        );
+        // A control the migration must NOT touch: source_root is a path-valued key too, but it is a
+        // config record the next index resets from config, not a walk gate — deleting it would
+        // break reads until that pass rather than merely forcing one.
+        put("source_root", "/some/root");
+        conn.execute("INSERT INTO parser_failures(repo_id, path) VALUES ('r', 'foo/bar.rs')", [])
+            .unwrap();
+    }
+
+    fn has_key(conn: &Connection, key: &str) -> bool {
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM repo_meta WHERE key = ?1)", [key], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn clears_every_freshness_marker_and_leaves_the_control_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        seed(&conn);
+
+        apply_reindex_after_unix_backslash_rendering(&conn).unwrap();
+
+        assert!(
+            !has_key(&conn, crate::meta::BASE_SCOPE_DISCOVERED_META),
+            "base-scope marker gone → the next pass re-walks the tree",
+        );
+        assert!(
+            !has_key(&conn, crate::meta::GIT_HISTORY_INDEXED_ROOT_META),
+            "history root cursor gone → the next pass full-revwalks and re-reads file changes",
+        );
+        assert!(
+            !has_key(&conn, &format!("{}abc123", crate::meta::WORKTREE_OVERLAY_BASIS_META_PREFIX)),
+            "overlay basis gone → each linked checkout re-derives its overlay",
+        );
+        let failures: i64 =
+            conn.query_row("SELECT COUNT(*) FROM parser_failures", [], |r| r.get(0)).unwrap();
+        assert_eq!(failures, 0, "the standalone parser-failure row is cleared for re-derivation");
+        assert!(
+            has_key(&conn, "source_root"),
+            "a path record the next index resets from config, not a walk gate, is left intact",
+        );
     }
 }
