@@ -6709,6 +6709,13 @@ pub const V097_PATH_VALUED_META_KEYS: &[&str] =
 /// gate with nothing written. The same is true of the lighter watch-counter flush, which tests
 /// `status() == Compatible` on its own connection before writing.
 ///
+/// That fence only holds if the conversion and the stamp are never separately visible, so this
+/// migration is in `LEDGER_ATOMIC_MIGRATIONS`: the ladder runs the sweep inside the same IMMEDIATE
+/// transaction that writes the `schema_version` row. Committed separately, the rekeyed store would
+/// answer `Compatible` to a pre-V097 binary until the stamp landed — for a moment on a healthy
+/// upgrade, indefinitely after a crash between the two commits — and every refusal above would wave
+/// that binary through onto rows it reads as dead checkouts.
+///
 /// The one case the version cannot fence is a pass ALREADY past that check when the upgrade
 /// commits. A new binary's INDEXING opens cannot cause it (they take the per-repo write flock
 /// before migrating, so they wait behind the in-flight pass); only a non-indexing open — a query,
@@ -6742,18 +6749,22 @@ pub fn apply_windows_verbatim_path_rekey(conn: &Connection) -> rusqlite::Result<
 /// in; injecting a rule that maps the spellings such an index actually holds is what lets the Linux
 /// leg observe the scope-restore and the GC-survival, rather than observing "nothing happened" and
 /// passing just as well against a pass that covers no tables at all. `pub` for that reason alone.
+///
+/// No transaction of its own: the ladder runs this migration inside one and commits it WITH the
+/// `schema_version` row, because a converted store that is not yet stamped still answers
+/// `Compatible` to the pre-V097 binary the conversion locks out. Opening a nested transaction here
+/// would fail outright, and committing one would reintroduce that window.
 pub fn rekey_persisted_path_spellings(
     conn: &Connection,
     rekey: fn(&str) -> Option<String>,
 ) -> rusqlite::Result<()> {
-    let tx = conn.unchecked_transaction()?;
     for table in V097_WORKTREE_ID_SCOPED_TABLES {
-        if column_exists(&tx, table, "worktree_id")? {
-            rekey_column(&tx, table, "worktree_id", rekey)?;
+        if column_exists(conn, table, "worktree_id")? {
+            rekey_column(conn, table, "worktree_id", rekey)?;
         }
     }
-    if column_exists(&tx, "repo_roots", "root")? {
-        rekey_column(&tx, "repo_roots", "root", rekey)?;
+    if column_exists(conn, "repo_roots", "root")? {
+        rekey_column(conn, "repo_roots", "root", rekey)?;
     }
     // These keys land in `repo_meta` at V039; a pre-V039 store still carries them in the global
     // `index_meta`, and the ladder replays in order, so by here they have moved. Both are swept
@@ -6761,16 +6772,16 @@ pub fn rekey_persisted_path_spellings(
     // sweep is KEY-SCOPED: most meta values are not paths, and rewriting one that merely starts
     // with those bytes would corrupt it.
     for (table, column) in [("repo_meta", "value"), ("index_meta", "value")] {
-        if column_exists(&tx, table, column)? {
+        if column_exists(conn, table, column)? {
             for key in V097_PATH_VALUED_META_KEYS {
-                rekey_meta_value_at_key(&tx, table, key, rekey)?;
+                rekey_meta_value_at_key(conn, table, key, rekey)?;
             }
         }
     }
-    if column_exists(&tx, "repo_meta", "key")? {
-        rekey_worktree_overlay_basis_keys(&tx, rekey)?;
+    if column_exists(conn, "repo_meta", "key")? {
+        rekey_worktree_overlay_basis_keys(conn, rekey)?;
     }
-    tx.commit()
+    Ok(())
 }
 
 /// Rewrite the stale spellings in `table.column` in place.

@@ -911,23 +911,52 @@ impl MigrationFn {
     }
 }
 
-/// Apply one migration and stamp its ledger row. V064 is special because it projects existing
-/// grow-only account history: DDL, source snapshot, all-account refold, and the ledger stamp must
-/// share one IMMEDIATE transaction so older writers cannot land an unprojected candidate in a
-/// migration race.
+/// Every migration whose ledger row MUST commit in the SAME transaction as its body.
+///
+/// The default is body-then-stamp, in two commits. That is safe for a migration that only ADDS
+/// structure: in the window between the two, an older binary reads a store carrying tables it does
+/// not know but DATA it still interprets correctly. It is NOT safe for a migration that CONVERTS
+/// data an older binary reads and acts on, because `schema_version` is the entire coexistence
+/// fence — an unrecognized migration id is what makes [`status`] answer `Newer`, and every refusal
+/// (`ensure_compatible_or_migrate`, `migrate_schema_only`, the read-only config open) is downstream
+/// of that answer. A converted-but-unstamped store answers `Compatible` to exactly the binary the
+/// conversion locks out, and nothing else serializes the two: the migrating process holds only the
+/// global schema lock, which an old binary opening a `Compatible` store never takes. The window is
+/// normally sub-millisecond but it is not bounded — the stamp can block on another writer up to the
+/// busy timeout, and a crash between the two commits leaves the store durably converted with an old
+/// roster until some newer binary happens to re-open it.
+///
+/// * V064/V065 project existing grow-only account history: DDL, source snapshot, and the
+///   all-account refold must land with the stamp so an older writer cannot slip an unprojected
+///   candidate into a migration race.
+/// * V097 rewrites the persisted checkout-path spellings. An older binary derives its live worktree
+///   set from the OLD spelling, so inside the window its GC reads every rekeyed row as a dead
+///   checkout and prunes a registered, live worktree's overlay.
+///
+/// A listed migration's body must NOT open a transaction of its own — the ladder owns one here, and
+/// `BEGIN` inside a transaction fails. `blocking_the_ledger_stamp_rolls_the_body_back` drives every
+/// entry and pins the atomicity behaviorally.
+const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID];
+
+/// Apply one migration and stamp its ledger row, atomically when the migration converts data an
+/// older binary can still act on (see [`LEDGER_ATOMIC_MIGRATIONS`]).
 fn apply_and_record_migration(
     conn: &Connection,
     step: &Migration,
     hooks: &MigrationHooks,
 ) -> rusqlite::Result<()> {
-    if !matches!(step.id, MIGRATION_064_ID | MIGRATION_065_ID) {
+    if !LEDGER_ATOMIC_MIGRATIONS.contains(&step.id) {
         step.apply.run(conn, hooks)?;
         return migrations::record_migration(conn, step.id, step.checksum, step.description);
     }
 
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     step.apply.run(&tx, hooks)?;
-    (hooks.backfill_authority_projection)(&tx)?;
+    // The authority refold is the account-projection pair's own requirement, not the ledger's: it
+    // rebuilds what V064 creates and V065 bounds, off a domain builder this crate cannot link.
+    if matches!(step.id, MIGRATION_064_ID | MIGRATION_065_ID) {
+        (hooks.backfill_authority_projection)(&tx)?;
+    }
     migrations::record_migration(&tx, step.id, step.checksum, step.description)?;
     tx.commit()
 }
@@ -1702,6 +1731,227 @@ pub fn ensure_compatible_or_migrate(
             "no index at this path yet; build one with `rag-rat index` or `rag-rat index --full`"
         ),
         SchemaState::Newer | SchemaState::Dirty => anyhow::bail!("{}", current.message),
+    }
+}
+
+/// The coexistence fence for a data-CONVERTING migration: its rewrite and its `schema_version` row
+/// are one commit, never two (see [`LEDGER_ATOMIC_MIGRATIONS`]).
+///
+/// A converted-but-unstamped store is the failure these tests exist for, and it is invisible by
+/// construction: on a healthy run the two commits are microseconds apart, and every gate downstream
+/// of [`status`] reads the ledger, not the data. So the tests reach the state the only way it can
+/// be held still — by making the ledger stamp FAIL, then asking a second connection what the store
+/// committed. Under a two-commit ladder the body's rewrite is durably there with no ledger row: a
+/// pre-upgrade binary reads that store as `Compatible` and walks straight into it.
+#[cfg(test)]
+mod ledger_atomicity {
+    use super::*;
+
+    /// A pre-V097 Windows spelling parked where the V097 sweep will find it. The sweep decides
+    /// droppability TEXTUALLY, so this converts on any host — without it the V097 leg would run a
+    /// body that rewrites nothing and would pass just as well against a separate commit.
+    const POISONED_SOURCE_ROOT: &str = r"\\?\C:\repo";
+
+    /// The migrations known to CONVERT data an older binary reads and acts on — restated here
+    /// rather than read from [`LEDGER_ATOMIC_MIGRATIONS`] on purpose. Driving the behavioral test
+    /// off the production list alone would let a migration dropped from that list drop out of the
+    /// test with it, so the regression that reintroduces the two-commit window would pass. These
+    /// tests range over the UNION, so removing an id from production fails here instead.
+    const DATA_CONVERTING_MIGRATIONS: &[&str] =
+        &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID];
+
+    /// Every migration whose ledger stamp must be atomic, from both statements of the set.
+    fn ledger_atomic_under_test() -> Vec<&'static str> {
+        let mut ids: Vec<&'static str> =
+            LEDGER_ATOMIC_MIGRATIONS.iter().chain(DATA_CONVERTING_MIGRATIONS).copied().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Everything a SECOND connection can see: the schema, plus every row of every ordinary table,
+    /// order-normalized. Opened fresh, so it reads COMMITTED state only — the same state a
+    /// pre-upgrade binary opening the store mid-ladder would read.
+    fn committed_state(path: &std::path::Path) -> Vec<String> {
+        let conn = Connection::open(path).unwrap();
+        let tables: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE \
+                     'sqlite_%' ORDER BY name",
+                )
+                .unwrap();
+            let names = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+            names.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        // The DDL first (a migration's structure is as observable as its data), then the contents.
+        let mut state: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(format!(
+                        "{} {} {}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?.unwrap_or_default()
+                    ))
+                })
+                .unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        for table in tables {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM main.\"{table}\"")).unwrap();
+            let width = stmt.column_count();
+            let mut rows: Vec<String> = stmt
+                .query_map([], |row| {
+                    let mut cells = Vec::with_capacity(width);
+                    for column in 0..width {
+                        // Text rendered as text, so a leaked path spelling is readable in the
+                        // failure rather than a byte array.
+                        cells.push(match row.get_ref(column)? {
+                            rusqlite::types::ValueRef::Text(text) =>
+                                String::from_utf8_lossy(text).into_owned(),
+                            other => format!("{other:?}"),
+                        });
+                    }
+                    Ok(format!("{table}: {}", cells.join("|")))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            // Row order is not part of what a reader observes; content is.
+            rows.sort();
+            state.extend(rows);
+        }
+        state.sort();
+        state
+    }
+
+    /// What the store gained and lost between two snapshots, capped so a failure prints the leak
+    /// rather than a dump of every row in the schema.
+    fn committed_delta(before: &[String], after: &[String]) -> Vec<String> {
+        let before_set: std::collections::BTreeSet<&str> =
+            before.iter().map(String::as_str).collect();
+        let after_set: std::collections::BTreeSet<&str> =
+            after.iter().map(String::as_str).collect();
+        after_set
+            .difference(&before_set)
+            .map(|line| format!("+ {line}"))
+            .chain(before_set.difference(&after_set).map(|line| format!("- {line}")))
+            .take(20)
+            .collect()
+    }
+
+    /// The value `index_meta[source_root]` currently commits to, as a second connection sees it.
+    fn committed_source_root(path: &std::path::Path) -> Option<String> {
+        let conn = Connection::open(path).unwrap();
+        conn.query_row("SELECT value FROM index_meta WHERE key = 'source_root'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .unwrap()
+    }
+
+    #[test]
+    fn every_ledger_atomic_migration_is_in_the_ladder() {
+        for id in ledger_atomic_under_test() {
+            assert!(
+                ADDITIVE_MIGRATIONS.iter().any(|step| step.id == id),
+                "{id} is listed as ledger-atomic but is not a shipped migration, so the arm that \
+                 stamps it atomically never runs",
+            );
+        }
+    }
+
+    #[test]
+    fn every_data_converting_migration_is_ledger_atomic() {
+        for id in DATA_CONVERTING_MIGRATIONS {
+            assert!(
+                LEDGER_ATOMIC_MIGRATIONS.contains(id),
+                "{id} converts data an older binary acts on but is not in \
+                 `LEDGER_ATOMIC_MIGRATIONS`, so its rewrite commits before its `schema_version` \
+                 row and the store reads as `Compatible` while already converted",
+            );
+        }
+    }
+
+    #[test]
+    fn blocking_the_ledger_stamp_rolls_the_body_back() {
+        for target in &ledger_atomic_under_test() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("index.db");
+            let conn = Connection::open(&path).unwrap();
+            let hooks = MigrationHooks::noop();
+            crate::content_digest::register_content_digest_fold(&conn).unwrap();
+            provision_baseline(&conn).unwrap();
+
+            // Replay the ladder up to — not including — the migration under test, so its body runs
+            // against the store shape it actually ships against.
+            let mut under_test = None;
+            for step in ADDITIVE_MIGRATIONS {
+                if step.id == *target {
+                    under_test = Some(step);
+                    break;
+                }
+                apply_and_record_migration(&conn, step, &hooks).unwrap();
+            }
+            let step = under_test.unwrap_or_else(|| panic!("{target} is not in the ladder"));
+
+            // Poisoned AFTER the earlier migrations, so nothing relocates it out from under V097.
+            conn.execute(
+                "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('source_root', ?1)",
+                [POISONED_SOURCE_ROOT],
+            )
+            .unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER block_ledger_stamp BEFORE INSERT ON schema_version
+                 WHEN new.id = '{target}'
+                 BEGIN SELECT RAISE(ABORT, 'ledger stamp blocked'); END;"
+            ))
+            .unwrap();
+
+            let before = committed_state(&path);
+            let err = apply_and_record_migration(&conn, step, &hooks).unwrap_err();
+            assert!(
+                err.to_string().contains("ledger stamp blocked"),
+                "{target}: expected the blocked stamp to surface, got {err}",
+            );
+
+            let leaked = committed_delta(&before, &committed_state(&path));
+            assert!(
+                leaked.is_empty(),
+                "{target} committed changes without its `schema_version` row: until the stamp \
+                 lands, `status` answers `Compatible` to a binary that predates the migration, so \
+                 every `Newer` refusal lets it onto converted data\n{}",
+                leaked.join("\n"),
+            );
+            if *target == MIGRATION_097_ID {
+                assert_eq!(
+                    committed_source_root(&path).as_deref(),
+                    Some(POISONED_SOURCE_ROOT),
+                    "V097 rekeyed the stored root and left the ledger at V096",
+                );
+            }
+
+            // The store is not wedged: the aborted step is simply owed, and the next open runs it.
+            conn.execute_batch("DROP TRIGGER block_ledger_stamp").unwrap();
+            migrate_forward(&conn, &hooks).unwrap();
+            let applied: Vec<String> = migrations::applied_migrations(&conn)
+                .unwrap()
+                .into_iter()
+                .map(|migration| migration.id)
+                .collect();
+            assert!(applied.iter().any(|id| id == target), "{target} never landed on retry");
+            if *target == MIGRATION_097_ID {
+                assert_eq!(
+                    committed_source_root(&path).as_deref(),
+                    Some(r"C:\repo"),
+                    "the retried V097 did not convert the stored root",
+                );
+            }
+        }
     }
 }
 
