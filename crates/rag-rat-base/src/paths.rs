@@ -69,6 +69,24 @@ pub fn canonicalize_or_simplified(path: &Path) -> PathBuf {
 /// Only the verbatim DISK shape (`\\?\C:\…`) is ever rewritten. No rag-rat writes a value in that
 /// shape today on any platform — post-fix Windows records `C:\…`, Unix records `/…` — so a Unix
 /// directory deliberately named to look like one is out of scope rather than defended against.
+///
+/// TWO LIMITS, DISCLOSED RATHER THAN DEFENDED AGAINST — see the corpus in
+/// `rekeyed_from_verbatim_rewrites_only_the_droppable_prefix`, which pins both.
+///  * A stored spelling reaches this rule ALREADY LOSSY. `worktree_id_of` persists
+///    `canonicalize_or_simplified(path).to_string_lossy()`, so a checkout path carrying an unpaired
+///    UTF-16 surrogate arrives here with U+FFFD in that component's place. Production keeps the
+///    prefix for such a path (`dunce` judges a component through `to_str()` and declines when that
+///    fails), but the stored string is well-formed UTF-8 by the time it gets here and U+FFFD is an
+///    ordinary character, so the rule strips — rewriting a value production still spells verbatim,
+///    and moving the row out of the active scope and the GC live set. Declining every U+FFFD breaks
+///    the opposite case (a component genuinely NAMED with U+FFFD, which production does simplify)
+///    and the stored string cannot tell the two apart, so the rewrite stands.
+///  * `names_a_reserved_dos_device` matches `dunce` 1.0.5, which lists only the ASCII device names
+///    and misses `COM¹`/`COM²`/`COM³` and the `LPT` equivalents. Here the rule and production
+///    AGREE, so no row is rekeyed to a spelling production does not produce; the cost is inherited
+///    from [`canonicalize`], which strips a prefix that is load-bearing for such a path. Widening
+///    the list here rather than upstream would BREAK that agreement — the rule would decline a
+///    rewrite production performs — which is the worse trade.
 pub fn rekeyed_from_verbatim(stored: &str) -> Option<String> {
     let plain = stored.strip_prefix(VERBATIM_PREFIX)?;
     verbatim_disk_prefix_is_droppable(stored, plain).then(|| plain.to_string())
@@ -271,6 +289,16 @@ mod tests {
         (r"\\?\C:\repo\..\sibling", None),
         // A character the plain spelling cannot carry.
         (r"\\?\C:\repo\pipe|name", None),
+        // The two disclosed limits (see `rekeyed_from_verbatim`). U+FFFD is an ordinary character
+        // to this rule, so a stored id that reached it through `to_string_lossy` over an unpaired
+        // surrogate is rewritten even though production keeps the prefix for that path; and the
+        // superscript DOS device names are absent from `dunce`'s list, so both sides strip. Pinned
+        // as expectations because "fixing" either one would make the rule DISAGREE with production
+        // — which is the failure mode the rekey exists to avoid, not a hardening. U+FFFD is
+        // spelled as an escape rather than literally so it cannot be read as this file
+        // being mis-decoded.
+        ("\\\\?\\C:\\repo\\lossy\u{FFFD}name", Some("C:\\repo\\lossy\u{FFFD}name")),
+        (r"\\?\C:\repo\COM¹", Some(r"C:\repo\COM¹")),
     ];
 
     /// The rekey rule, on every platform. It decides a property of a STORED STRING, so it cannot be

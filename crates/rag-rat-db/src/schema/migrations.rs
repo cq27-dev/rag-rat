@@ -6703,11 +6703,24 @@ pub const V097_PATH_VALUED_META_KEYS: &[&str] =
 /// a checkout that no longer exists. The fence is the SCHEMA VERSION, and it is the ladder's, not
 /// this migration's: recording V097 puts a migration id in `schema_version` that a pre-V097 binary
 /// does not know, so [`super::status`] answers `Newer` and every open refuses. It covers a RESIDENT
-/// process, not just a fresh command, because no long-lived component holds a connection across
-/// that check — a watcher pass re-opens through `open_and_migrate` at its start, inside the
-/// per-repo write flock and long before its gc stage, so the pass after the upgrade fails at the
-/// gate with nothing written. The same is true of the lighter watch-counter flush, which tests
-/// `status() == Compatible` on its own connection before writing.
+/// process, not just a fresh command, WHEREVER THAT PROCESS RE-OPENS, which every path that
+/// indexes, queries, or garbage-collects does per operation: a watcher pass re-opens through
+/// `open_and_migrate` at its start, inside the per-repo write flock and long before its gc stage,
+/// so the pass after the upgrade fails at the gate with nothing written; the lighter watch-counter
+/// flush tests `status() == Compatible` on its own connection before writing; CLI and MCP reads go
+/// through `open_and_migrate` or `try_open_config_read_only`.
+///
+/// ONE resident writer does hold a connection across that check, and it is the reason this
+/// paragraph is not a general rule: `sync serve` / `sync init` open the index once and then run the
+/// accept loop on that same connection for the process's whole life, ingesting peer op-log entries
+/// without re-checking the schema. A server started before the upgrade keeps writing to a store a
+/// newer binary has converted. That is outside THIS migration's hazard for reasons specific to what
+/// the loop writes, not because the fence reaches it: no table is registered for table-sync
+/// (`SYNCABLE_TABLES` is empty), `repo_roots` is written only by the indexing path's
+/// `register_repo`, and the loop runs no gc and derives no live-worktree set — so it can neither
+/// prune a rekeyed row nor write a path-spelled column back in the old spelling. A FUTURE
+/// data-converting migration over a table the op-log projection or table-sync touches must re-check
+/// that for itself rather than inherit this conclusion.
 ///
 /// That fence only holds if the conversion and the stamp are never separately visible, so this
 /// migration is in `LEDGER_ATOMIC_MIGRATIONS`: the ladder runs the sweep inside the same IMMEDIATE

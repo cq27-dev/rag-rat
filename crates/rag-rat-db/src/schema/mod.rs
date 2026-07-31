@@ -729,7 +729,8 @@ const MIGRATION_097_DESCRIPTION: &str =
      out of the active scope and GC prunes them as a dead checkout, and the git-history gate \
      forces a full revwalk plus a blame-cache wipe. Rewriting uses the same rule canonicalization \
      does, so a verbatim path that is still load-bearing (UNC, >MAX_PATH, reserved DOS names) is \
-     kept. A no-op on Unix";
+     kept. Runs on every host: which spellings a store carries is a property of the store, not of \
+     the binary that opens it";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -2069,5 +2070,48 @@ mod migration_arming {
             (1..=LATEST_SCHEMA_VERSION).collect::<Vec<u32>>(),
             "the shipped ladder must be 1..=LATEST_SCHEMA_VERSION in order, with no gaps or reuse",
         );
+    }
+
+    /// A migration description is not a comment: [`apply_and_record_migration`] writes it into
+    /// `schema_version.description`, so it ships into every store's ledger and is what a maintainer
+    /// reads back out of it. The ladder applies every body UNCONDITIONALLY on whichever host opens
+    /// the store, so a description claiming a per-platform no-op documents behaviour the ladder
+    /// cannot perform — and worse, it is the belief that produces the bug: a body that skips off
+    /// its "own" platform still gets its ledger row stamped, the forward-only ladder never revisits
+    /// it, and the store carries an unconverted value the migration was written to convert.
+    ///
+    /// Ranged over the shipped ladder so a future description inherits the check rather than
+    /// relying on a reviewer noticing the phrasing.
+    #[test]
+    fn no_migration_description_claims_a_host_skip() {
+        // Phrasings that assert the ladder does different work on different hosts. Wording, not
+        // meaning, so it is a lint rather than a proof — but it catches the shape the mistake takes
+        // and costs nothing.
+        const HOST_SKIP_PHRASES: &[&str] = &[
+            "no-op on unix",
+            "no-op on linux",
+            "no-op on macos",
+            "no-op on windows",
+            "no-op off windows",
+            "only on windows",
+            "only on unix",
+            "windows only",
+            "unix only",
+            "windows-only",
+            "unix-only",
+        ];
+        let described = std::iter::once((MIGRATION_001_ID, MIGRATION_001_DESCRIPTION))
+            .chain(ADDITIVE_MIGRATIONS.iter().map(|step| (step.id, step.description)));
+        for (id, description) in described {
+            let lowered = description.to_lowercase();
+            for phrase in HOST_SKIP_PHRASES {
+                assert!(
+                    !lowered.contains(phrase),
+                    "{id}'s ledger description claims {phrase:?}, but the ladder runs every \
+                     migration body on every host; describe what the migration converts, not a \
+                     host it supposedly skips",
+                );
+            }
+        }
     }
 }
