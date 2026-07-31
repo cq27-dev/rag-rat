@@ -5,8 +5,8 @@ use iroh::{Endpoint, RelayMode};
 
 use super::stub::{Behaviour, PER_TAG_CAP, StubService};
 use super::{
-    DISCOVERY_TAG_DOMAIN, DISCOVERY_TIMEOUT, DiscoveryExchange, PEER_DISCOVERY_ALPN, PublishState,
-    account_tag, exchange, publish_ttl_seconds,
+    DISCOVERY_TAG_DOMAIN, DISCOVERY_TIMEOUT, DiscoveryExchange, DiscoveryOutcome,
+    PEER_DISCOVERY_ALPN, PublishState, account_tag, exchange, publish_ttl_seconds,
 };
 
 /// A fixed instant: the announcement arithmetic under test is about durations, and a real clock
@@ -25,6 +25,21 @@ async fn client() -> Endpoint {
 
 fn local_node(endpoint: &Endpoint) -> [u8; 32] {
     *endpoint.id().as_bytes()
+}
+
+/// These tests publish a bare node id as the announcement payload and read it straight back.
+///
+/// Real announcements are sealed envelopes, but sealing is the op-log crate's concern and is
+/// covered there; what this module tests is the transport — publish, fetch, renew, bound, fail
+/// open — and it should not have to build a roster to do so. The opener is the seam that lets the
+/// two be tested separately.
+fn as_node_id(payload: &[u8]) -> Option<[u8; 32]> {
+    <[u8; 32]>::try_from(payload).ok()
+}
+
+/// The node ids in an outcome, as the composing caller would recover them.
+fn opened(outcome: &DiscoveryOutcome) -> Vec<[u8; 32]> {
+    outcome.announcements.iter().filter_map(|payload| as_node_id(payload)).collect()
 }
 
 /// Poll `ready` until it holds, up to a few seconds. Returns whether it ever did.
@@ -107,7 +122,7 @@ async fn a_published_node_id_is_fetched_back_by_another_device() {
         endpoint: &publisher,
         service: service.addr(),
         tag,
-        publish: Some(published),
+        publish: Some(&published),
         ttl_seconds: 600,
         now_ms: NOW_MS,
     })
@@ -124,7 +139,7 @@ async fn a_published_node_id_is_fetched_back_by_another_device() {
         now_ms: NOW_MS,
     })
     .await;
-    assert_eq!(out.peers, vec![published], "the fetcher sees the publisher");
+    assert_eq!(opened(&out), vec![published], "the fetcher sees the publisher");
     assert_eq!(
         out.publish,
         PublishState::NotAttempted,
@@ -152,7 +167,7 @@ async fn a_device_that_does_not_advertise_itself_still_learns_its_peers() {
         now_ms: NOW_MS,
     })
     .await;
-    assert_eq!(out.peers, vec![peer]);
+    assert_eq!(opened(&out), vec![peer]);
     assert_eq!(service.stored(&tag).len(), 1, "nothing of ours was added");
 }
 
@@ -170,13 +185,13 @@ async fn a_refused_publish_does_not_suppress_the_fetch() {
         endpoint: &endpoint,
         service: service.addr(),
         tag,
-        publish: Some(local_node(&endpoint)),
+        publish: Some(&local_node(&endpoint)),
         ttl_seconds: 600,
         now_ms: NOW_MS,
     })
     .await;
     assert_eq!(out.publish, PublishState::Failed);
-    assert_eq!(out.peers, vec![peer], "the fetched peers survive the publish failure");
+    assert_eq!(opened(&out), vec![peer], "the fetched peers survive the publish failure");
     assert!(out.degraded.is_some(), "and the failure is reported for logging");
 }
 
@@ -200,13 +215,13 @@ async fn a_stalled_publish_does_not_discard_the_peers_already_fetched() {
         endpoint: &endpoint,
         service: service.addr(),
         tag,
-        publish: Some(local_node(&endpoint)),
+        publish: Some(&local_node(&endpoint)),
         ttl_seconds: 600,
         now_ms: NOW_MS,
     })
     .await;
 
-    assert_eq!(out.peers, vec![peer], "the fetched peer survives the stalled publish");
+    assert_eq!(opened(&out), vec![peer], "the fetched peer survives the stalled publish");
     assert_eq!(out.publish, PublishState::Failed);
     assert!(out.degraded.is_some_and(|d| d.contains("timed out")), "and the stall is reported");
     assert!(
@@ -238,7 +253,7 @@ async fn a_malformed_announcement_is_dropped_individually() {
         now_ms: NOW_MS,
     })
     .await;
-    assert_eq!(out.peers, vec![good], "the well-formed peer survives its malformed neighbour");
+    assert_eq!(opened(&out), vec![good], "the well-formed peer survives its malformed neighbour");
 }
 
 /// The timeout's whole reason for existing.
@@ -258,14 +273,14 @@ async fn a_service_that_accepts_and_never_answers_does_not_stall_the_pass() {
         endpoint: &endpoint,
         service: service.addr(),
         tag: account_tag(&[7; 32]),
-        publish: Some(local_node(&endpoint)),
+        publish: Some(&local_node(&endpoint)),
         ttl_seconds: 600,
         now_ms: NOW_MS,
     })
     .await;
     let elapsed = started.elapsed();
 
-    assert!(out.peers.is_empty(), "a stalled service yields no peers");
+    assert!(opened(&out).is_empty(), "a stalled service yields no peers");
     assert!(out.degraded.is_some_and(|d| d.contains("timed out")), "and says why");
     assert!(
         elapsed >= DISCOVERY_TIMEOUT,
@@ -302,7 +317,7 @@ async fn an_unreachable_service_fails_open() {
         now_ms: NOW_MS,
     })
     .await;
-    assert!(out.peers.is_empty());
+    assert!(opened(&out).is_empty());
     assert!(out.degraded.is_some(), "the failure is reported, never propagated as an error");
     assert!(
         started.elapsed() < DISCOVERY_TIMEOUT,
@@ -326,7 +341,7 @@ async fn a_still_fresh_announcement_is_not_republished() {
         endpoint: &endpoint,
         service: service.addr(),
         tag,
-        publish: Some(node),
+        publish: Some(&node),
         ttl_seconds: 600,
         now_ms: NOW_MS,
     })
@@ -350,7 +365,7 @@ async fn an_announcement_near_expiry_is_republished() {
         endpoint: &endpoint,
         service: service.addr(),
         tag,
-        publish: Some(node),
+        publish: Some(&node),
         ttl_seconds: 600,
         now_ms: NOW_MS,
     })
@@ -394,7 +409,7 @@ async fn a_three_device_account_on_the_default_cadence_stays_under_the_per_tag_c
                 endpoint,
                 service: service.addr(),
                 tag,
-                publish: Some(local_node(endpoint)),
+                publish: Some(&local_node(endpoint)),
                 ttl_seconds: ttl,
                 now_ms: pass_now_ms,
             })
@@ -429,7 +444,7 @@ async fn a_three_device_account_on_the_default_cadence_stays_under_the_per_tag_c
     })
     .await;
     for id in &ids {
-        assert!(out.peers.contains(id), "a device stopped being discoverable");
+        assert!(opened(&out).contains(id), "a device stopped being discoverable");
     }
 }
 
@@ -457,7 +472,7 @@ async fn rapid_passes_do_not_fill_the_tag_with_copies_of_one_device() {
                 endpoint,
                 service: service.addr(),
                 tag,
-                publish: Some(local_node(endpoint)),
+                publish: Some(&local_node(endpoint)),
                 ttl_seconds: ttl,
                 now_ms: pass_now_ms,
             })
@@ -506,7 +521,7 @@ async fn beyond_roughly_four_devices_the_service_starts_refusing_publishes() {
                 endpoint,
                 service: service.addr(),
                 tag,
-                publish: Some(local_node(endpoint)),
+                publish: Some(&local_node(endpoint)),
                 ttl_seconds: ttl,
                 now_ms: pass_now_ms,
             })
@@ -516,7 +531,7 @@ async fn beyond_roughly_four_devices_the_service_starts_refusing_publishes() {
                 // The point of the limit being survivable: a device that cannot advertise ITSELF
                 // still learns where everyone else is. (A refusal only happens once the tag is
                 // full, so there is certainly something to have fetched.)
-                assert!(!out.peers.is_empty(), "a refused publish must not cost us the fetch");
+                assert!(!opened(&out).is_empty(), "a refused publish must not cost us the fetch");
             }
         }
     }
@@ -558,10 +573,11 @@ async fn discovered_peers_join_the_configured_ones_without_this_node_or_duplicat
             endpoint: &endpoint,
             service: service.addr(),
             tag,
-            publish: Some(me),
+            publish: Some(&me),
             ttl_seconds: 600,
             now_ms: NOW_MS,
         }),
+        &as_node_id,
     )
     .await;
 
@@ -600,6 +616,7 @@ async fn an_empty_discovery_result_leaves_the_configured_peers_untouched() {
             ttl_seconds: 600,
             now_ms: NOW_MS,
         }),
+        &as_node_id,
     )
     .await;
     assert_eq!(resolved.peers.len(), 1);
@@ -641,11 +658,12 @@ async fn a_serving_host_advertises_itself_immediately_and_keeps_renewing() {
     let host = client().await;
     let node = local_node(&host);
 
+    let (_tx, announcement) = tokio::sync::watch::channel(Some(node.to_vec()));
     let advertiser = tokio::spawn(super::advertise(super::Advertise {
         endpoint: host.clone(),
         service: service.addr(),
         tag,
-        node,
+        announcement,
         ttl_seconds: TTL,
         now_ms: wall_clock_ms,
     }));

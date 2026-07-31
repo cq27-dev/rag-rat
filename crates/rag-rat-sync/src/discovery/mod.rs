@@ -163,10 +163,14 @@ pub enum PublishState {
 /// What one discovery pass produced. Never an `Err`: see the module docs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DiscoveryOutcome {
-    /// Node ids advertised for this account, already filtered to well-formed ones. Includes this
-    /// node when it advertises itself — self-exclusion belongs to the composing caller, which
-    /// needs the raw set to decide whether its own announcement is still live.
-    pub peers: Vec<[u8; 32]>,
+    /// The announcement payloads found under this tag: sealed envelopes, de-duplicated and capped.
+    ///
+    /// Returned UNOPENED. Opening needs the account roster and this device's key, which live in
+    /// the op-log crate behind a connection — and a connection is not `Sync`, so an opener
+    /// carried here would travel across an await inside the spawned advertise loop and make
+    /// that future unspawnable. The composing caller opens them; the advertise loop discards
+    /// them.
+    pub announcements: Vec<Vec<u8>>,
     /// What happened to this node's own announcement.
     pub publish: PublishState,
     /// Why the pass produced less than it might have — for logging only. A caller that branches on
@@ -181,9 +185,13 @@ pub struct DiscoveryExchange<'a> {
     /// testable against the real code path.
     pub service: EndpointAddr,
     pub tag: [u8; TAG_LEN],
-    /// `Some(node)` advertises `node`; `None` fetches only — which is what lets a machine behind
-    /// NAT find a server without becoming discoverable itself.
-    pub publish: Option<[u8; 32]>,
+    /// The sealed announcement to publish, or `None` to fetch only — which is what lets a machine
+    /// behind NAT find a host without becoming discoverable itself.
+    ///
+    /// Opaque bytes here on purpose: sealing needs the account roster and the device key, both of
+    /// which live in the op-log crate, so this layer carries the result rather than the
+    /// ingredients.
+    pub publish: Option<&'a [u8]>,
     pub ttl_seconds: u32,
     /// "Now" as a VALUE, not a clock: the exchange reads it exactly once, to judge whether this
     /// node's existing announcement has enough life left to skip republishing.
@@ -262,12 +270,12 @@ async fn exchange_inner(
     // silently ceasing to advertise.
     let publish_state = match publish {
         None => PublishState::NotAttempted,
-        Some(node) if is_live(&announcements, node, *ttl_seconds, *now_ms) =>
+        Some(envelope) if is_live(&announcements, envelope, *ttl_seconds, *now_ms) =>
             PublishState::AlreadyLive,
-        Some(node) => {
+        Some(envelope) => {
             let publish = DiscoveryRequest::Publish {
                 tag: *tag,
-                payload: node.to_vec(),
+                payload: envelope.to_vec(),
                 ttl_seconds: *ttl_seconds,
             };
             // Whatever happens here, the peers fetched above are already in hand and are returned.
@@ -289,16 +297,23 @@ async fn exchange_inner(
         },
     };
 
-    let peers = announcements
+    // DEDUPLICATE, then cap — in that order. Capping first would spend the budget on duplicates: a
+    // publisher holds about two live copies of itself at any moment, so a cap applied to raw
+    // announcements admits roughly half the peers it promises.
+    //
+    // De-duplicating by BYTES works, and only because a publisher seals once per roster change and
+    // republishes the result verbatim: its copies are byte-identical. Were the envelope re-sealed
+    // per publish, each copy would carry a fresh ephemeral and none of this would collapse.
+    let mut seen = std::collections::HashSet::new();
+    let announcements = announcements
         .into_iter()
-        // A malformed payload is dropped INDIVIDUALLY. Failing the batch would let one bad entry —
-        // which any party that can compute the tag may publish — hide every good one.
-        .filter_map(|announcement| <[u8; 32]>::try_from(announcement.payload.as_slice()).ok())
+        .map(|announcement| announcement.payload)
+        .filter(|payload| seen.insert(payload.clone()))
         .take(MAX_ANNOUNCEMENTS)
         .collect();
 
     DiscoveryOutcome {
-        peers,
+        announcements,
         publish: publish_state,
         degraded: (!degraded.is_empty()).then(|| degraded.join("; ")),
     }
@@ -312,8 +327,13 @@ pub struct Advertise {
     /// [`DiscoveryExchange`] takes one: it is what makes an in-process stub testable.
     pub service: EndpointAddr,
     pub tag: [u8; TAG_LEN],
-    /// The node id to advertise — this host's own.
-    pub node: [u8; 32],
+    /// The sealed announcement to publish, re-read on EVERY tick.
+    ///
+    /// A channel rather than a value because the roster moves under a long-running host: a device
+    /// enrolled an hour after it started must become a recipient at the next renewal, not never.
+    /// `None` means there is nothing to advertise — no account, or a roster holding only this
+    /// device, which has no one to be discovered by.
+    pub announcement: tokio::sync::watch::Receiver<Option<Vec<u8>>>,
     pub ttl_seconds: u32,
     /// A clock, not an instant: unlike a single [`exchange`], this loop runs for the host's
     /// lifetime and must read the time afresh on every tick.
@@ -336,18 +356,31 @@ pub struct Advertise {
 /// Publish-only in effect: the fetched peers are discarded, because peers dial a serving host
 /// rather than the other way round.
 pub async fn advertise(params: Advertise) {
-    let Advertise { endpoint, service, tag, node, ttl_seconds, now_ms } = params;
+    let Advertise { endpoint, service, tag, mut announcement, ttl_seconds, now_ms } = params;
     // `.max(4)` keeps the interval positive even if a future TTL floor drops below 4s; a zero
     // period would make `interval` panic.
     let mut ticks =
         tokio::time::interval(Duration::from_secs(u64::from(ttl_seconds).max(4) / TICKS_PER_TTL));
     loop {
         ticks.tick().await;
+        // Re-read per tick, not once at spawn: this is what makes a roster change take effect.
+        //
+        // Scoped so the borrow guard is dropped before the await below. A `watch::Ref` is not
+        // `Send`, and a temporary living to the end of its statement would be held across the
+        // suspension point, making this whole future unspawnable.
+        let envelope = {
+            let borrowed = announcement.borrow_and_update();
+            borrowed.clone()
+        };
+        let Some(envelope) = envelope else {
+            tracing::debug!("nothing to advertise yet; skipping this tick");
+            continue;
+        };
         let outcome = exchange(DiscoveryExchange {
             endpoint: &endpoint,
             service: service.clone(),
             tag,
-            publish: Some(node),
+            publish: Some(&envelope),
             ttl_seconds,
             now_ms: now_ms(),
         })
@@ -361,8 +394,16 @@ pub async fn advertise(params: Advertise) {
     }
 }
 
-/// Whether `node` already has an announcement with comfortably more than [`RENEWAL_THRESHOLD`] of
-/// its TTL left — i.e. one that does not need renewing yet.
+/// Whether this host's own announcement is already live with comfortably more than
+/// [`RENEWAL_THRESHOLD`] of its TTL left — i.e. does not need renewing yet.
+///
+/// Compares the announcement BYTES against the envelope this host is currently publishing. That
+/// works because the envelope is sealed once per roster change and republished verbatim, not
+/// re-sealed per tick — a fresh ephemeral per publish would make every copy differ, the host would
+/// never recognise itself, and it would republish on every tick until the tag was full of its own
+/// announcements. It also earns a property: when the roster moves the envelope changes, so the old
+/// announcement stops matching and the host republishes at the NEXT tick instead of waiting out a
+/// renewal.
 ///
 /// **The margin is the point, and getting it wrong is silent.** `expires_at_ms` is stamped by the
 /// SERVICE when it receives the publish, not by this client when it sends one, so an entry written
@@ -378,13 +419,13 @@ pub async fn advertise(params: Advertise) {
 /// tolerable only because the margin dwarfs any plausible skew. It would not be at zero margin.
 fn is_live(
     announcements: &[wire::WireAnnouncement],
-    node: &[u8; 32],
+    envelope: &[u8],
     ttl_seconds: u32,
     now_ms: i64,
 ) -> bool {
     let headroom_ms = i64::from(ttl_seconds) * 1000 * RENEWAL_THRESHOLD_NUM / RENEWAL_THRESHOLD_DEN;
     announcements.iter().any(|announcement| {
-        announcement.payload.as_slice() == node.as_slice()
+        announcement.payload.as_slice() == envelope
             && announcement.expires_at_ms.saturating_sub(now_ms) > headroom_ms
     })
 }

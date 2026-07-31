@@ -232,16 +232,31 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
             .transpose()?
             .flatten()
             .map(|secret| rag_rat_sync::discovery::account_tag(&secret));
+        // Seal ONCE per roster change, not once per publish, and hand the advertiser the bytes.
+        //
+        // Sealing needs a connection; the advertiser is a spawned task and cannot hold one. So this
+        // loop — which already owns the connection and already folds the WAL between sessions — is
+        // where sealing happens, and the watch carries the result. Republishing identical bytes is
+        // safe (same key, same nonce, same plaintext) and buys two things: the advertiser stays
+        // database-free, and `is_live` can recognise this host's own announcement by comparing
+        // bytes rather than opening anything.
+        let announcement = discovery_tag.map(|tag| {
+            let (tx, rx) = tokio::sync::watch::channel(seal_announcement(conn, &tag, &local_node));
+            (tag, tx, rx)
+        });
         // Aborted on the way out of this scope, so the loop cannot outlive the endpoint it
         // advertises.
-        let _advertiser =
-            discovery_tag.zip(discovery_service_addr(config, &relay)).map(|(tag, service)| {
+        let _advertiser = announcement
+            .as_ref()
+            .map(|(tag, _, rx)| (*tag, rx.clone()))
+            .zip(discovery_service_addr(config, &relay))
+            .map(|((tag, announcement), service)| {
                 AbortOnDrop(tokio::spawn(rag_rat_sync::discovery::advertise(
                     rag_rat_sync::discovery::Advertise {
                         endpoint: endpoint.clone(),
                         service,
                         tag,
-                        node: local_node,
+                        announcement,
                         ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
                             config.sync.push_interval_secs,
                         ),
@@ -327,6 +342,18 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
             // `-wal` sidecar grows unbounded (passive autocheckpoint is pinned off). Size-gated and
             // best-effort, mirroring the watcher's per-pass fold.
             db.fold_wal();
+            // Re-seal between sessions, where the roster can have moved: an accept-loop ingest is
+            // the only way it changes under a serving host, since the session lock excludes a
+            // colocated device sync and no command authors roster changes. A device enrolled while
+            // this host is running therefore becomes a recipient at the next renewal; the
+            // advertiser re-reads the watch every tick, so the update needs no signal beyond this.
+            if let Some((tag, tx, _)) = &announcement {
+                let resealed = seal_announcement(conn, tag, &local_node);
+                if *tx.borrow() != resealed {
+                    tracing::debug!("the roster moved; re-sealing this host's announcement");
+                    let _ = tx.send(resealed);
+                }
+            }
             if once {
                 break;
             }
@@ -639,6 +666,19 @@ pub(crate) fn device_sync_run(
                     now_ms: time::now_ms(),
                 }
             }),
+            // Opening happens here, where a connection is available. An announcement sealed to a
+            // roster this device is no longer on simply will not open, and is dropped with the
+            // malformed ones — a device that has been removed stops finding its former peers by
+            // discovery, which is the point of sealing them.
+            &|payload| {
+                discovery_tag.and_then(|tag| {
+                    rag_rat_oplog::discovery::open_discovery_announcement(conn, &tag, payload)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(%error, "could not open a discovered announcement");
+                            None
+                        })
+                })
+            },
         )
         .await;
         let peers = resolved.peers;
@@ -749,6 +789,28 @@ fn discovery_service_addr(config: &Config, relay: &str) -> Option<rag_rat_sync::
                 %error,
                 "skipping peer discovery: [sync] discovery_node_id is not a usable node id"
             );
+            None
+        },
+    }
+}
+
+/// Seal this host's announcement to the account's current roster, or `None` when there is nothing
+/// to advertise.
+///
+/// `None` covers a store with no account and a roster holding only this device — the latter has no
+/// one to be discovered BY, so publishing would spend a slot to tell nobody. A sealing failure is
+/// logged and treated the same way: discovery is routing advice, and a host that cannot advertise
+/// still serves every peer that reaches it through a configured `server_peers` entry.
+fn seal_announcement(conn: &Connection, tag: &[u8; 32], local_node: &[u8; 32]) -> Option<Vec<u8>> {
+    match rag_rat_oplog::discovery::seal_discovery_announcement(conn, tag, local_node) {
+        Ok(Some(sealed)) if sealed.recipients > 1 => Some(sealed.bytes),
+        Ok(Some(_)) => {
+            tracing::debug!("not advertising: this device is the account's only roster member");
+            None
+        },
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(%error, "not advertising: sealing this host's announcement failed");
             None
         },
     }
