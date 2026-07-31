@@ -93,9 +93,6 @@ iai-callgrind = "0.16"
 # Wall-clock benchmarking (full-index time on a larger corpus). default-features off to skip the
 # plotting deps — Bencher parses criterion's stdout estimates.
 criterion = { version = "0.8", default-features = false }
-# Test-only: forward-slashes a filesystem path so it can be embedded in a double-quoted TOML string
-# value without Windows `\U`/`\R` invalid-escape parse errors (config load tests).
-path-slash.workspace = true
 tempfile.workspace = true
 
 # iai-callgrind: deterministic instruction counts (index + cold/warm query).

@@ -103,6 +103,82 @@ fn a_backslash_named_file_gets_its_own_row_chunks_and_qualified_names() {
     );
 }
 
+/// A memory's stored binding path is the CALLER'S OWN string — `resolve_binding` copies
+/// `bind.path` verbatim, and no writer ever put a walked path through the rendering seam on its way
+/// into `repo_memory_bindings` — so the rendering change does not move it and there is nothing for
+/// the conversion to rekey. What the change does is make the binding RESOLVE: pre-fix the two files
+/// shared one `files.path`, so a memory bound to the backslash-named one answered for whichever row
+/// survived the collision.
+///
+/// Pinned because the alternative — quarantining every path-bearing binding on upgrade — would
+/// discard correct anchors wholesale, and because the old rendering was lossy: a stored
+/// `src/foo/bar.rs` cannot be told apart from a collapsed `src/foo\bar.rs`, so no rekey is
+/// derivable even in principle.
+#[test]
+fn a_path_bound_memory_resolves_to_the_file_it_names_not_its_slash_sibling() {
+    use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    write_colliding_pair(
+        &root,
+        "pub fn nested_fn() -> i32 { 1 }\n",
+        "pub fn backslash_fn() -> i32 { 2 }\n",
+    );
+    init_git_repo(&root);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "seed"]);
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let bind_to = |path: &str, title: &str| {
+        crate::memory_write::create_memory(db.storage.connection(), RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: title.to_string(),
+            body: "body".to_string(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget {
+                path: Some(path.to_string()),
+                ..RepoMemoryBindTarget::default()
+            },
+        })
+        .unwrap()
+    };
+    let backslash = bind_to(BACKSLASH_PATH, "about the backslash-named file");
+    let nested = bind_to(NESTED_PATH, "about the nested file");
+    assert_eq!(
+        backslash.memory.bindings[0].anchor_status, "current",
+        "the binding resolves against a real row, not a collapsed sibling's"
+    );
+
+    let titles = |path: &str| {
+        let mut found: Vec<String> =
+            rag_rat_query::memory::memories_for_path(db.storage.connection(), path, 10)
+                .unwrap()
+                .into_iter()
+                .map(|memory| memory.title)
+                .collect();
+        found.sort();
+        found
+    };
+    assert_eq!(
+        titles(BACKSLASH_PATH),
+        vec![backslash.memory.title.clone()],
+        "the backslash-named file surfaces only its own memory"
+    );
+    assert_eq!(
+        titles(NESTED_PATH),
+        vec![nested.memory.title.clone()],
+        "and the nested sibling surfaces only its own — neither file inherits the other's"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_worktree_overlay_shadows_only_the_backslash_named_sibling() {
     // The worktree-correctness leg: main checkout and linked worktree share ONE database, and the

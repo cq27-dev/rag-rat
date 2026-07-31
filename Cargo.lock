@@ -5026,7 +5026,6 @@ dependencies = [
  "minicbor",
  "model2vec-rs",
  "notify",
- "path-slash",
  "protobuf",
  "pulldown-cmark",
  "rag-rat-base",
