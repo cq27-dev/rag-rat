@@ -237,17 +237,25 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
         // Sealing needs a connection; the advertiser is a spawned task and cannot hold one. So this
         // loop — which already owns the connection and already folds the WAL between sessions — is
         // where sealing happens, and the watch carries the result. Republishing identical bytes is
-        // safe (same key, same nonce, same plaintext) and buys two things: the advertiser stays
-        // database-free, and `is_live` can recognise this host's own announcement by comparing
-        // bytes rather than opening anything.
+        // safe (same key, same nonce, same plaintext) and keeps the advertiser database-free.
+        //
+        // A sealing error here is LOGGED, not swallowed: the advertiser cannot reseal on its own,
+        // and the between-sessions reseal below only runs after an inbound connection — which a
+        // host that was never advertised may never receive. A silent empty value would leave it
+        // undiscoverable with nothing in the log saying why. Recovering without inbound traffic is
+        // a known gap (#1086).
         let mut announcement = discovery_tag.map(|tag| {
             let sealed = seal_announcement(conn, &tag, &local_node);
-            let stamp = stamp_after_seal(
-                rag_rat_oplog::discovery::roster_stamp(conn).ok().flatten(),
-                None,
-                sealed.is_ok(),
-            );
-            let (tx, rx) = tokio::sync::watch::channel(sealed.unwrap_or_default());
+            let observed = rag_rat_oplog::discovery::roster_stamp(conn).ok().flatten();
+            let stamp = stamp_after_seal(observed, None, sealed.is_ok());
+            let bytes = match sealed {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(%error, "sealing this host's announcement failed; it will not be discoverable until the next successful reseal");
+                    None
+                },
+            };
+            let (tx, rx) = tokio::sync::watch::channel(bytes);
             (tag, tx, rx, stamp)
         });
         // Aborted on the way out of this scope, so the loop cannot outlive the endpoint it

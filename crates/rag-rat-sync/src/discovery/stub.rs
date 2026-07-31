@@ -80,6 +80,10 @@ pub(crate) enum Behaviour {
     StallPublish,
     /// Answer fetches with one unusable payload alongside the real ones.
     GarbageAmongTheGood,
+    /// STORE a publish, then never answer it — the client times out and sees the write as
+    /// ambiguous, though it did land. The failure #2's fix turns from unbounded slot churn into a
+    /// bounded gap: a service that accepts writes but cannot acknowledge them.
+    AckLostAfterStore,
     /// Store a publish immediately, then wait [`SLOW_PUBLISH_DELAY`] before answering it.
     ///
     /// A service under load, and the shape that separates two clocks a client could time renewal
@@ -160,6 +164,15 @@ impl StubService {
                             answer(&tags, &request, behaviour, now.load(Ordering::Relaxed));
                         // AFTER `answer` has stored it: a slow service has already accepted the
                         // announcement and started its TTL, and is merely slow to say so.
+                        if behaviour == Behaviour::AckLostAfterStore
+                            && matches!(request, DiscoveryRequest::Publish { .. })
+                        {
+                            // Stored by `answer` above; the ack is simply never sent. Parked, not
+                            // dropped: dropping the send stream would surface as a prompt error
+                            // rather than the timeout a lost ack actually produces.
+                            parked.push((send, recv));
+                            continue;
+                        }
                         if behaviour == Behaviour::SlowPublish
                             && matches!(request, DiscoveryRequest::Publish { .. })
                         {

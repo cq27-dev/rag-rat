@@ -202,10 +202,18 @@ pub enum PublishState {
     /// far enough to try.
     #[default]
     NotAttempted,
-    /// This pass wrote a fresh announcement.
+    /// The service acknowledged storing the announcement.
     Published,
-    /// The service refused or the write failed. Non-fatal: the fetch half still ran.
-    Failed,
+    /// The service RESPONDED and declined — rate-limited, or any non-`Published` answer. The
+    /// announcement is definitely not stored, so a caller renewing on a cadence should try again.
+    Refused,
+    /// No acknowledgement arrived: the publish stream errored or timed out. The announcement **may
+    /// or may not** be stored — the service stamps expiry and stores on RECEIPT, before it answers,
+    /// so a lost or late response says nothing about whether the write landed. A renewing caller
+    /// must treat this as possibly-live and NOT re-append every tick, or a service that stores but
+    /// cannot answer would drive one host to fill the whole tag. Non-fatal: the fetch half still
+    /// ran.
+    Uncertain,
 }
 
 /// What one discovery pass produced. Never an `Err`: see the module docs.
@@ -333,17 +341,22 @@ async fn exchange_inner(
             // Whatever happens here, the peers fetched above are already in hand and are returned.
             match tokio::time::timeout_at(deadline, request(&conn, &publish)).await {
                 Ok(Ok(DiscoveryResponse::Published { .. })) => PublishState::Published,
+                // A response arrived and it was not `Published`: the service saw the request and
+                // declined it, so nothing is stored.
                 Ok(Ok(other)) => {
                     degraded.push(format!("publish refused: {other:?}"));
-                    PublishState::Failed
+                    PublishState::Refused
                 },
+                // No response: the stream errored or the deadline passed. The service stores on
+                // receipt before answering, so the write may already have landed — see
+                // [`PublishState::Uncertain`].
                 Ok(Err(error)) => {
                     degraded.push(format!("publish failed: {error}"));
-                    PublishState::Failed
+                    PublishState::Uncertain
                 },
                 Err(_elapsed) => {
                     degraded.push(format!("publish timed out after {DISCOVERY_TIMEOUT:?}"));
-                    PublishState::Failed
+                    PublishState::Uncertain
                 },
             }
         },
@@ -369,6 +382,22 @@ async fn exchange_inner(
         publish: publish_state,
         degraded: (!degraded.is_empty()).then(|| degraded.join("; ")),
     }
+}
+
+/// Whether a publish outcome means "this announcement may be live", so the advertiser should time
+/// renewal from it rather than re-append on the next tick.
+///
+/// True for both a confirmed publish and an ambiguous one. The ambiguous case is the load-bearing
+/// one: the service stores on receipt before it answers, so a lost or timed-out ack does not mean
+/// the write failed, and re-appending because it went unacknowledged is how a host whose responses
+/// are dropped fills the whole tag (the service appends, never replaces). A `Refused` is the
+/// opposite — the service answered and declined, nothing is stored, so the next tick should retry.
+///
+/// The cost of treating a genuinely-failed `Uncertain` as live is one renewal interval of
+/// undiscoverability before the next republish; the cost of the other error is unbounded slot
+/// churn. This trades the bounded harm for the unbounded one.
+fn records_liveness(state: PublishState) -> bool {
+    matches!(state, PublishState::Published | PublishState::Uncertain)
 }
 
 /// A long-running host's standing advertisement — see [`advertise`].
@@ -427,6 +456,11 @@ pub async fn advertise(params: Advertise) {
     // clock and not the service's `expires_at_ms`: this is a pure "how long since we published"
     // question, so it needs neither a clock that can step backwards nor a comparison across two
     // machines' clocks.
+    //
+    // In memory only, so a restart forgets it — and because a fresh seal is byte-distinct, the
+    // restarted host cannot recognise its still-live announcement and appends another. Bounded and
+    // self-healing after one restart; a crash loop or rapid redeploy is the case that bites.
+    // Persisting or reusing the envelope across restart is #1086.
     let mut published: Option<(Vec<u8>, tokio::time::Instant)> = None;
     loop {
         ticks.tick().await;
@@ -466,7 +500,7 @@ pub async fn advertise(params: Advertise) {
             ttl_seconds,
         })
         .await;
-        if outcome.publish == PublishState::Published {
+        if records_liveness(outcome.publish) {
             published = Some((envelope, attempted_at));
         }
         match outcome.degraded {

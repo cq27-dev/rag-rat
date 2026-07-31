@@ -190,7 +190,7 @@ async fn a_refused_publish_does_not_suppress_the_fetch() {
         fetch: true,
     })
     .await;
-    assert_eq!(out.publish, PublishState::Failed);
+    assert_eq!(out.publish, PublishState::Refused, "the service answered and declined");
     assert_eq!(opened(&out), vec![peer], "the fetched peers survive the publish failure");
     assert!(out.degraded.is_some(), "and the failure is reported for logging");
 }
@@ -222,7 +222,11 @@ async fn a_stalled_publish_does_not_discard_the_peers_already_fetched() {
     .await;
 
     assert_eq!(opened(&out), vec![peer], "the fetched peer survives the stalled publish");
-    assert_eq!(out.publish, PublishState::Failed);
+    assert_eq!(
+        out.publish,
+        PublishState::Uncertain,
+        "a timed-out publish is ambiguous, not refused"
+    );
     assert!(out.degraded.is_some_and(|d| d.contains("timed out")), "and the stall is reported");
     assert!(
         started.elapsed() >= DISCOVERY_TIMEOUT,
@@ -367,10 +371,10 @@ async fn a_three_device_account_on_the_default_cadence_stays_under_the_per_tag_c
                 ttl_seconds: ttl,
             })
             .await;
-            assert_ne!(
+            assert_eq!(
                 out.publish,
-                PublishState::Failed,
-                "pass {pass}: a publish was refused — the tag filled up ({:?})",
+                PublishState::Published,
+                "pass {pass}: a publish did not succeed — the tag filled up ({:?})",
                 out.degraded
             );
         }
@@ -885,5 +889,62 @@ async fn renewal_is_timed_from_the_publish_being_sent_not_answered() {
         renewed,
         "renewal ran late; the clock is being started when the response arrives, not when the \
          publish is sent"
+    );
+}
+
+/// A publish the service stored but never acknowledged is reported as ambiguous, not failed.
+///
+/// The distinction the renewal fix rests on. The service stamps expiry and stores on receipt,
+/// before it answers, so a lost or late ack says nothing about whether the write landed — and the
+/// stub proves exactly that by storing the announcement and then withholding the response.
+/// Reporting this as `Refused` (definitely not stored) would make a renewing host re-append it
+/// every tick.
+#[tokio::test]
+async fn a_stored_publish_with_a_lost_ack_is_uncertain_not_refused() {
+    let service = StubService::start(NOW_MS, Behaviour::AckLostAfterStore).await;
+    let tag = account_tag(&[25; 32]);
+    let endpoint = client().await;
+    let node = local_node(&endpoint);
+    let started = Instant::now();
+
+    let out = exchange(DiscoveryExchange {
+        endpoint: &endpoint,
+        service: service.addr(),
+        tag,
+        fetch: false,
+        publish: Some(&node),
+        ttl_seconds: 600,
+    })
+    .await;
+
+    assert_eq!(out.publish, PublishState::Uncertain, "a stored-but-unacked publish is ambiguous");
+    assert_eq!(service.stored(&tag).len(), 1, "and it really was stored");
+    assert!(
+        started.elapsed() >= DISCOVERY_TIMEOUT,
+        "the deadline is what ends the wait for the missing ack"
+    );
+}
+
+/// The renewal-recording rule: possibly-live outcomes are recorded, a refusal is not.
+///
+/// This is the pure core of the lost-ack fix, unit-tested because exercising it through `advertise`
+/// would cost a full `DISCOVERY_TIMEOUT` stall per tick. `Uncertain` records BECAUSE the write may
+/// have landed — re-appending it every tick is how a host whose acks are dropped fills the tag.
+/// `Refused` does not, because the service answered and stored nothing, so the next tick must
+/// retry.
+#[test]
+fn only_possibly_live_publishes_reset_the_renewal_clock() {
+    assert!(super::records_liveness(PublishState::Published), "a confirmed publish is live");
+    assert!(
+        super::records_liveness(PublishState::Uncertain),
+        "an unacknowledged publish may be live and must not be re-appended every tick"
+    );
+    assert!(
+        !super::records_liveness(PublishState::Refused),
+        "a refusal stored nothing, so the next tick should retry"
+    );
+    assert!(
+        !super::records_liveness(PublishState::NotAttempted),
+        "nothing was published, so there is nothing to renew"
     );
 }

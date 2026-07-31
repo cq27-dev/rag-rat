@@ -186,12 +186,20 @@ take back:
 
 - **The discovery tag**, which is derived from immutable account material already in that device's
   database. It can therefore keep watching the tag: how many hosts advertise and when they renew or
-  stop. It can also publish junk under the tag, costing whoever fetches it a wasted slot. What it
-  can no longer do is read a host's node id out of any announcement sealed after its removal.
-  Rotating the tag itself is [#1081](https://github.com/cq27-dev/rag-rat/issues/1081).
-- **Announcements sealed before the removal**, which stay openable by it until they expire — at most
-  one TTL, so 15 minutes at the default cadence. A host re-seals at its next session after a roster
-  change, so the window closes on its own.
+  stop, and — because each sealed envelope is a version byte plus a fixed 80 bytes per recipient —
+  the exact number of devices on the account, `(len - 1) / 80`, tracked across enrollments and
+  removals without opening a single wrap. It can also publish junk under the tag, costing whoever
+  fetches it a wasted slot. What it can no longer do is read a host's node id out of any
+  announcement sealed after its removal. Rotating the tag itself is
+  [#1081](https://github.com/cq27-dev/rag-rat/issues/1081); padding the envelope to hide device
+  count is [#1087](https://github.com/cq27-dev/rag-rat/issues/1087).
+- **Announcements sealed before it stops being a recipient**, which stay openable by it until they
+  expire — at most one TTL, so 15 minutes at the default cadence. The window is measured from when a
+  host **learns** of the removal, not from when it was authored: a removal authored on another
+  device does not reach a host until an authorized peer syncs it there, and until then the host
+  keeps the removed device in its own effective roster and re-seals every renewal to include it. A
+  host that no remaining device ever reaches never learns, and keeps a removed device openable
+  indefinitely — one more reason a host is only as current as its last inbound sync.
 
 Neither grants access to data. Every peer, discovered or configured, still passes full mutual roster
 authorization before a single log entry moves, and a removed device fails it. Pin your hosts in
