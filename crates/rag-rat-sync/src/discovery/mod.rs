@@ -117,10 +117,11 @@ pub fn discovery_secret(conn: &rusqlite::Connection) -> anyhow::Result<Option<[u
 /// - `push_interval_secs > 450` clamps to the service maximum and the announcement then expires
 ///   between passes, so such a device is intermittently discoverable. The alternative is publishing
 ///   under a TTL the service would reject outright.
-/// - At ~2 slots per device the cap allows roughly four devices before publishes start being
-///   REFUSED (the service rejects rather than evicting). A refused device still fetches, and
-///   explicit `server_peers` are unaffected, so it degrades rather than breaking — but lifting the
-///   ceiling needs an evict-oldest policy on the SERVICE, not a change here.
+/// - At ~2 slots per advertiser the cap allows roughly four before publishes start being REFUSED
+///   (the service rejects rather than evicting). Only nodes that ACCEPT connections advertise, so
+///   this bounds serving hosts, not devices — a device fetches and costs nothing. A refused host
+///   keeps serving and is still reachable through `server_peers`, so it degrades rather than
+///   breaking; lifting the ceiling needs an evict-oldest policy on the SERVICE, not a change here.
 pub fn publish_ttl_seconds(push_interval_secs: u64) -> u32 {
     const MIN_TTL: u64 = 60;
     const MAX_TTL: u64 = 900;
@@ -184,40 +185,58 @@ pub struct DiscoveryExchange<'a> {
 /// the peers already fetched, or one device's rate-limiting would blind it to peers it can reach.
 /// They travel on separate bi-streams because the service answers exactly one request per stream.
 pub async fn exchange(params: DiscoveryExchange<'_>) -> DiscoveryOutcome {
-    match tokio::time::timeout(DISCOVERY_TIMEOUT, exchange_inner(&params)).await {
-        Ok(outcome) => outcome,
-        // The bound exists precisely for a service that accepts and then stalls, which no transport
-        // error would ever surface.
-        Err(_elapsed) => DiscoveryOutcome {
-            degraded: Some(format!("discovery timed out after {DISCOVERY_TIMEOUT:?}")),
-            ..Default::default()
-        },
-    }
+    exchange_inner(&params, tokio::time::Instant::now() + DISCOVERY_TIMEOUT).await
 }
 
-async fn exchange_inner(params: &DiscoveryExchange<'_>) -> DiscoveryOutcome {
+/// One shared deadline, applied per phase rather than once around the whole exchange.
+///
+/// A single outer `timeout` would bound the pass correctly but discard PARTIAL results: a service
+/// that answers the fetch and then stalls on the publish stream would cancel the whole future and
+/// throw away peers already in hand, so one stuck write would blind the device to every peer it had
+/// just learned about. That is exactly the independence the fetch/publish split exists to provide,
+/// and a stall is the one failure a `Result` never reports.
+///
+/// Per-phase deadlines keep the total bounded by [`DISCOVERY_TIMEOUT`] — they share one instant, so
+/// three phases cannot add up to three timeouts — while letting each phase's result survive a later
+/// phase running out of time.
+async fn exchange_inner(
+    params: &DiscoveryExchange<'_>,
+    deadline: tokio::time::Instant,
+) -> DiscoveryOutcome {
     let DiscoveryExchange { endpoint, service, tag, publish, ttl_seconds, now_ms } = params;
-    let conn = match endpoint.connect(service.clone(), PEER_DISCOVERY_ALPN).await {
-        Ok(conn) => conn,
+    let connecting = endpoint.connect(service.clone(), PEER_DISCOVERY_ALPN);
+    let conn = match tokio::time::timeout_at(deadline, connecting).await {
+        Ok(Ok(conn)) => conn,
         // Includes an ALPN the service does not know — the shape a client deployed ahead of the
         // service sees. Fail open: the configured peers are unaffected.
-        Err(error) => {
+        Ok(Err(error)) => {
             return DiscoveryOutcome {
                 degraded: Some(format!("discovery service unreachable: {error}")),
+                ..Default::default()
+            };
+        },
+        Err(_elapsed) => {
+            return DiscoveryOutcome {
+                degraded: Some(format!("discovery dial timed out after {DISCOVERY_TIMEOUT:?}")),
                 ..Default::default()
             };
         },
     };
 
     let mut degraded = Vec::new();
-    let announcements = match request(&conn, &DiscoveryRequest::Fetch { tag: *tag }).await {
-        Ok(DiscoveryResponse::Fetched { announcements }) => announcements,
-        Ok(other) => {
+    let fetch = DiscoveryRequest::Fetch { tag: *tag };
+    let announcements = match tokio::time::timeout_at(deadline, request(&conn, &fetch)).await {
+        Ok(Ok(DiscoveryResponse::Fetched { announcements })) => announcements,
+        Ok(Ok(other)) => {
             degraded.push(format!("fetch refused: {other:?}"));
             Vec::new()
         },
-        Err(error) => {
+        Ok(Err(error)) => {
             degraded.push(format!("fetch failed: {error}"));
+            Vec::new()
+        },
+        Err(_elapsed) => {
+            degraded.push(format!("fetch timed out after {DISCOVERY_TIMEOUT:?}"));
             Vec::new()
         },
     };
@@ -230,20 +249,24 @@ async fn exchange_inner(params: &DiscoveryExchange<'_>) -> DiscoveryOutcome {
         Some(node) if is_live(&announcements, node, *ttl_seconds, *now_ms) =>
             PublishState::AlreadyLive,
         Some(node) => {
-            match request(&conn, &DiscoveryRequest::Publish {
+            let publish = DiscoveryRequest::Publish {
                 tag: *tag,
                 payload: node.to_vec(),
                 ttl_seconds: *ttl_seconds,
-            })
-            .await
-            {
-                Ok(DiscoveryResponse::Published { .. }) => PublishState::Published,
-                Ok(other) => {
+            };
+            // Whatever happens here, the peers fetched above are already in hand and are returned.
+            match tokio::time::timeout_at(deadline, request(&conn, &publish)).await {
+                Ok(Ok(DiscoveryResponse::Published { .. })) => PublishState::Published,
+                Ok(Ok(other)) => {
                     degraded.push(format!("publish refused: {other:?}"));
                     PublishState::Failed
                 },
-                Err(error) => {
+                Ok(Err(error)) => {
                     degraded.push(format!("publish failed: {error}"));
+                    PublishState::Failed
+                },
+                Err(_elapsed) => {
+                    degraded.push(format!("publish timed out after {DISCOVERY_TIMEOUT:?}"));
                     PublishState::Failed
                 },
             }

@@ -626,9 +626,17 @@ pub(crate) fn device_sync_run(
                     endpoint: &endpoint,
                     service,
                     tag,
-                    // Publishing is opt-in; fetching is not. A device that does not advertise
-                    // itself still finds its peers.
-                    publish: config.sync.discoverable.then_some(local_node),
+                    // FETCH ONLY, whatever `[sync] discoverable` says — that flag is honoured by
+                    // `serve_with`, which is a different process state.
+                    //
+                    // This pass never calls `accept_and_dispatch`: it dials out and drops the
+                    // endpoint when it finishes, seconds later. Advertising here would publish an
+                    // address that cannot accept a connection and stops existing almost
+                    // immediately, while the announcement lives on for its whole TTL — costing
+                    // every device that discovers it a dial that can only time out, and occupying
+                    // one of the few per-tag slots that a REACHABLE peer needs. Only a node that
+                    // accepts connections is worth announcing.
+                    publish: None,
                     ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
                         config.sync.push_interval_secs,
                     ),

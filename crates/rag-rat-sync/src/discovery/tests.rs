@@ -180,6 +180,45 @@ async fn a_refused_publish_does_not_suppress_the_fetch() {
     assert!(out.degraded.is_some(), "and the failure is reported for logging");
 }
 
+/// A publish that STALLS must not discard the peers already fetched.
+///
+/// The failure mode a refusal cannot stand in for: a refusal returns promptly and leaves the
+/// fetched peers untouched by construction, whereas a stall has to be cut off by a deadline — and a
+/// single timeout wrapped around the whole exchange cancels the future that is already holding
+/// those peers, turning "the publish is stuck" into "there are no peers". A device would then skip
+/// every discovered sync target for the pass because of a write it did not need.
+#[tokio::test]
+async fn a_stalled_publish_does_not_discard_the_peers_already_fetched() {
+    let service = StubService::start(NOW_MS, Behaviour::StallPublish).await;
+    let tag = account_tag(&[18; 32]);
+    let peer = crate::node_id_from_secret([0x51; 32]);
+    service.seed(tag, peer.to_vec(), NOW_MS + 600_000);
+
+    let endpoint = client().await;
+    let started = Instant::now();
+    let out = exchange(DiscoveryExchange {
+        endpoint: &endpoint,
+        service: service.addr(),
+        tag,
+        publish: Some(local_node(&endpoint)),
+        ttl_seconds: 600,
+        now_ms: NOW_MS,
+    })
+    .await;
+
+    assert_eq!(out.peers, vec![peer], "the fetched peer survives the stalled publish");
+    assert_eq!(out.publish, PublishState::Failed);
+    assert!(out.degraded.is_some_and(|d| d.contains("timed out")), "and the stall is reported");
+    assert!(
+        started.elapsed() >= DISCOVERY_TIMEOUT,
+        "the deadline is what ends the stall, so it must actually be reached"
+    );
+    assert!(
+        started.elapsed() < DISCOVERY_TIMEOUT * 2,
+        "the phases SHARE one deadline; they must not each get a full timeout"
+    );
+}
+
 /// One unusable payload must not hide the good ones. Anyone who can compute the tag can publish
 /// garbage, so failing the batch would hand them a cheap way to blind the whole account.
 #[tokio::test]

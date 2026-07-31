@@ -40,6 +40,10 @@ pub(crate) enum Behaviour {
     /// Refuse every publish, answer fetches normally: a device that is rate-limited for writing
     /// must still learn where its peers are.
     RefusePublish,
+    /// Answer fetches normally, then swallow the publish and never respond. The failure a `Result`
+    /// cannot report, and the one that a single timeout around the whole exchange would turn into
+    /// "no peers at all" — see `exchange_inner`'s per-phase deadlines.
+    StallPublish,
     /// Answer fetches with one unusable payload alongside the real ones.
     GarbageAmongTheGood,
 }
@@ -83,7 +87,10 @@ impl StubService {
                     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                         let Ok(body) = read_frame(&mut recv).await else { return };
                         let Ok(request) = DiscoveryRequest::decode(&body) else { return };
-                        if behaviour == Behaviour::BlackHole {
+                        let stall_this = behaviour == Behaviour::BlackHole
+                            || (behaviour == Behaviour::StallPublish
+                                && matches!(request, DiscoveryRequest::Publish { .. }));
+                        if stall_this {
                             // Accepted, never answered, held open.
                             parked.push((send, recv));
                             continue;

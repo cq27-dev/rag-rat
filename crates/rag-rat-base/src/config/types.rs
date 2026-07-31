@@ -333,12 +333,18 @@ pub struct SyncConfig {
     /// `0` attempts on every trigger. Also sets the TTL this device publishes its own announcement
     /// under, when [`discoverable`](Self::discoverable) is on.
     pub push_interval_secs: u64,
-    /// Advertise this device's node id to the peer-discovery service so the account's other
-    /// devices can dial it without a static `server_peers` entry (default false).
+    /// Advertise this node to the peer-discovery service so the account's devices can dial it
+    /// without a static `server_peers` entry (default false).
     ///
-    /// Publishing is opt-in but FETCHING is not: a device that does not advertise itself still
-    /// learns where its peers are, which is what lets a machine behind NAT reach a server without
-    /// becoming discoverable itself. Turning this on is what makes an always-on host findable.
+    /// Read by `rag-rat sync serve` ONLY. The device-side maintenance pass never publishes,
+    /// whatever this says: it dials outward and never listens, so announcing it would advertise an
+    /// address that cannot accept a connection and that stops existing when the pass ends seconds
+    /// later — costing every device that discovered it a dial that can only time out, and holding
+    /// one of the few per-tag slots a reachable host needs.
+    ///
+    /// FETCHING is not gated on this. A device that advertises nothing still learns where its
+    /// host is, which is what lets a machine behind NAT reach one without becoming reachable
+    /// itself. Turning this on is what makes an always-on host findable.
     pub discoverable: bool,
     /// The peer-discovery service's node id — a NODE ID, not a URL, dialed through
     /// [`relay_url`](Self::relay_url). Defaults to [`DEFAULT_DISCOVERY_NODE`]. The

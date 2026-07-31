@@ -49,5 +49,5 @@ Each topic below has its own in-depth page under [`docs/config/`](config/):
 - **[Issue trackers & papertrail](config/trackers.md)** — `[[tracker]]` bindings, per-provider
   notes and ref grammars, the quota reserve, sync cadences, and automatic synchronization.
 - **[Peer sync](config/sync.md)** — replicating an account's memory op-log between devices
-  (`[sync]`): choosing between the mesh and hub topologies, peer discovery and what it does and
-  does not reveal, and the relay and cadence settings.
+  (`[sync]`): which device listens and which dial, finding a host through peer discovery and what
+  that does and does not reveal, and the relay and cadence settings.

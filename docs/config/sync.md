@@ -4,54 +4,37 @@ Sync replicates one account's signed memory op-log between that account's device
 transport. Every device holds the whole log; there is no server that owns the data, and the relay
 and discovery service both handle opaque bytes they cannot interpret.
 
-This page is about **how to arrange your devices** — the one decision that determines whether sync
-scales past a handful of machines — plus the `[sync]` table that expresses it. For minting an
-account and enrolling devices, see `rag-rat sync --help` (`enable`, `init`, `join`).
+This page is about **how to arrange your devices** — which of them listens, which dial, and how they
+find each other — plus the `[sync]` table that expresses it. For minting an account and enrolling
+devices, see `rag-rat sync --help` (`enable`, `init`, `join`).
 
-## The two topologies
+## How devices reach each other
 
-There are exactly two shapes worth running, and the difference is which devices **advertise
-themselves** to the discovery service.
+**Only a device running `rag-rat sync serve` can receive a sync connection.** Everything else dials
+outward: the maintenance-hook pass that runs after a git action opens connections, reconciles, and
+exits. It never listens. A device is therefore in exactly one of two roles at a time — the
+per-database session lock enforces that:
 
-### Mesh — every device talks to every other
+| Role | Command | Dials out | Accepts in |
+|---|---|:-:|:-:|
+| **Host** | `rag-rat sync serve` (long-running) | no | yes |
+| **Device** | the git-hook pass (automatic) | yes | no |
 
-Each device advertises itself, discovers the others, and dials all of them on its sync cadence.
-Nothing needs to be always-on: whichever devices happen to be awake together reconcile directly.
+Two consequences that decide how you arrange things:
 
-```toml
-[sync]
-discoverable = true          # on every device
-```
+- **Two devices can never sync directly with each other.** Neither is listening. This is true with
+  or without discovery — discovery can only tell you where something is, not make it answer.
+- **You need at least one host.** Every device reconciles *through* it: a device pushes what the
+  host lacks and pulls what it lacks, so changes reach the other devices on their next pass. The
+  host does not have to be dedicated or hosted anywhere — a desktop that is usually on is a host.
 
-Good for a few personal machines. It stops being the right shape quickly, for two independent
-reasons:
-
-- **Dials grow with the square of the device count.** Every device dials every other, and each dial
-  carries two sessions (the account log, then content). Four devices is 12 peer dials per cadence
-  across the account — 24 sessions; twenty devices is 380 dials. Nothing caps this, so it degrades
-  as a slowdown and a lot of pointless traffic rather than an error.
-- **The discovery service caps a tag at 8 live announcements** and refuses further publishes rather
-  than evicting. A device holds about two live announcements of itself, so **roughly four devices
-  can advertise at once**. Past that, some devices stop being discoverable — see
-  [When the cap is reached](#when-the-cap-is-reached).
-
-**Practical ceiling: about four devices.**
-
-### Hub — devices reach one always-on host
-
-One device (or a few) runs `rag-rat sync serve` and is the only thing that advertises itself.
-Everything else leaves `discoverable` off, finds the host, and reconciles through it. Devices never
-need to be awake at the same time: the host holds the log and hands it on.
+So the arrangement is always the same shape: **one or more always-on hosts, and any number of
+devices reconciling through them.**
 
 ```toml
-# On the always-on host
+# On the host — advertise it so devices can find it without hardcoding its node id
 [sync]
 discoverable = true
-```
-
-```toml
-# On every other device: nothing to set — `discoverable` is already false by default
-[sync]
 ```
 
 ```bash
@@ -59,46 +42,48 @@ discoverable = true
 rag-rat sync serve
 ```
 
-This works because **fetching is never gated on `discoverable`**. A device that does not advertise
-itself still queries the discovery service and finds the host. That asymmetry is deliberate: a
-laptop behind NAT can reach a host without becoming discoverable, or reachable, itself.
+```toml
+# On every device: nothing to set. `discoverable` is already false, and fetching is not gated on it.
+[sync]
+```
 
-The host does not have to be dedicated or hosted anywhere — a desktop that is usually on is a host.
+Devices find the host because **fetching is never gated on `discoverable`** — a device queries the
+discovery service and dials what it finds without advertising anything itself. That asymmetry is
+deliberate: a laptop behind NAT reaches the host without becoming reachable, or discoverable, in
+turn.
 
-**Practical ceiling: the number of advertisers, not the number of devices.** One or two hubs stay
-inside the cap no matter how many devices sync through them, and dials grow linearly rather than
-quadratically.
+### Why `discoverable` belongs only on hosts
 
-### Which to use
+Setting it on a device would announce an address that cannot accept a connection and that stops
+existing seconds later when the pass ends, while the announcement itself lives on for its whole TTL.
+Every device that discovered it would spend a dial that can only time out, and it would occupy one
+of the few per-tag slots a reachable host needs. The device-side pass therefore ignores the flag and
+only ever fetches; `discoverable` is read by `sync serve`.
 
-| | Mesh | Hub |
-|---|---|---|
-| `discoverable` | on everywhere | on the host(s) only |
-| Always-on machine needed | no | yes |
-| Devices must overlap in time | yes | no |
-| Sessions per cadence | grows as N² | grows as N |
-| Scales to | ~4 devices | many |
+### Scale
 
-Start with mesh if you have two or three machines and no server. Move to hub the moment you have a
-machine that is usually on, or a fourth device — it is a configuration change on each device plus
-one long-running command, not a migration.
+Dials grow linearly with the number of devices — each device dials the host, not every other device
+— and only the hosts advertise, so the per-tag announcement limit is a limit on **hosts**, not on
+devices. One or two hosts stay well inside it no matter how many devices sync through them.
 
-The two mix cleanly: a hub setup with one extra device also advertising is still a valid mesh of
-two advertisers. What matters is the count of advertisers, not the labels.
+Adding hosts is how you spread load or place one nearer a group of devices; devices that dial more
+than one host also propagate changes between those hosts.
 
-## When the cap is reached
+## The limit on advertised hosts
 
-If more devices advertise than the discovery service has room for, publishes start being refused.
-This degrades rather than breaking, and it is worth knowing exactly how:
+The discovery service holds at most 8 live announcements per account and refuses further publishes
+rather than evicting. A host keeps about two live announcements of itself, so **roughly four hosts
+can advertise at once**. Devices cost nothing here — they only fetch.
 
-- A device whose publish is refused **stops being discoverable itself**. It still fetches, still
-  finds every other advertised device, and still dials and syncs with them.
-- Peers listed in `server_peers` are unaffected — they never depended on discovery.
-- Which devices hold the free slots shifts as announcements expire, so **discoverability flaps**
-  rather than settling. A device that was findable this hour may not be next hour.
+Four hosts is far more than most accounts want, so this is unlikely to bind. If it does, it degrades
+rather than breaking:
 
-Nothing is lost and nothing errors; some devices are simply harder to find. The fix is to stop
-advertising the devices that do not need to be found — which is the hub shape.
+- A host whose publish is refused **stops being discoverable**. It keeps serving normally, and any
+  device that reaches it through `server_peers` is unaffected.
+- Which hosts hold the free slots shifts as announcements expire, so **discoverability flaps** — a
+  host findable this hour may not be next hour.
+
+The fix is to pin the hosts in `server_peers` rather than relying on discovery for all of them.
 
 ## Settings
 
@@ -106,8 +91,8 @@ advertising the devices that do not need to be found — which is the hub shape.
 |---|---|---|
 | `relay_url` | the shipped relay | The iroh relay peers pin. Discovery is pinned to a single relay with no third-party directory, so **two devices can only reach each other if they share this value**. `RAG_RAT_SYNC_RELAY` overrides per invocation. |
 | `server_peers` | empty | Node ids dialed unconditionally, without consulting the discovery service. Tried before discovered peers. |
-| `push_interval_secs` | `300` | Minimum seconds between device-side sync attempts. `0` attempts on every trigger. Also sets the TTL this device publishes its announcement under. |
-| `discoverable` | `false` | Advertise this device's node id so the account's other devices can find it. Fetching is **not** gated on this. |
+| `push_interval_secs` | `300` | Minimum seconds between device-side sync attempts. `0` attempts on every trigger. Also sets the TTL a serving host publishes its announcement under. |
+| `discoverable` | `false` | Advertise this node so devices can find it. Read by `rag-rat sync serve` only — see [Why `discoverable` belongs only on hosts](#why-discoverable-belongs-only-on-hosts). Fetching is **not** gated on it. |
 | `discovery_node_id` | the shipped service | The discovery service's node id — a node id, not a URL; it is a separate peer reached through `relay_url`. `RAG_RAT_SYNC_DISCOVERY_NODE` overrides per invocation. |
 
 ### `server_peers` versus discovery
@@ -123,6 +108,10 @@ two ways is recognised as one peer and dialed once.
 
 A device with no `server_peers` and no second device on its account roster does nothing — there is
 provably nobody to reach, so it never contacts the discovery service.
+
+Pinning a host in `server_peers` is also the answer when you would rather not depend on the
+discovery service at all: paste the node id `sync serve` prints at startup, and the device dials it
+whether or not discovery works.
 
 ## What each service learns
 
