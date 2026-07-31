@@ -492,54 +492,69 @@ async fn rapid_passes_do_not_fill_the_tag_with_copies_of_one_device() {
     );
 }
 
-/// The residual, pinned so it is a known limit rather than a surprise.
+/// A large account is never refused, and its fetches still fit a frame.
 ///
-/// The service caps a tag at 8 live announcements and REJECTS rather than evicting once full, so an
-/// account large enough to need more slots than that has publishes refused no matter how carefully
-/// this client rations them. Two live copies per device is the steady state, so the ceiling is
-/// around four devices. Fetching is unaffected — a refused device simply stops being discoverable
-/// itself while still finding everyone else — and explicit `server_peers` remain first-class, which
-/// is why this is a limit and not a blocker. Lifting it needs the SERVICE to evict oldest instead
-/// of refusing.
+/// This replaces a test that asserted the opposite. The service used to refuse a publish into a
+/// full tag, so an account past roughly four advertisers lost discovery outright; it now evicts the
+/// oldest entry instead, and bounds what a fetch returns. The observable flips: publishing always
+/// succeeds, and it is the RESPONSE that is limited.
+///
+/// The payload size here is deliberate — a sealed envelope for a sixteen-device roster, about 1,281
+/// bytes. Thirty-two of those is roughly 78 KiB once the wire's integer-array encoding is counted,
+/// comfortably past the 64 KiB frame, so this exercises the bound rather than passing under it.
 #[tokio::test]
-async fn beyond_roughly_four_devices_the_service_starts_refusing_publishes() {
+async fn a_large_account_is_never_refused_and_its_fetches_fit_one_frame() {
+    use super::wire::{DiscoveryResponse, MAX_FRAME_LEN, WireAnnouncement};
+
     let service = StubService::start(NOW_MS, Behaviour::Serve).await;
     let tag = account_tag(&[13; 32]);
-    let ttl = publish_ttl_seconds(300);
+    let realistic_envelope = |seed: u8| vec![seed.wrapping_add(100); 1 + 16 * 80];
 
-    let mut devices = Vec::new();
-    for _ in 0..5 {
-        devices.push(client().await);
+    let endpoint = client().await;
+    for seed in 0..32u8 {
+        let out = exchange(DiscoveryExchange {
+            endpoint: &endpoint,
+            service: service.addr(),
+            tag,
+            publish: Some(&realistic_envelope(seed)),
+            ttl_seconds: 600,
+            now_ms: NOW_MS,
+        })
+        .await;
+        assert_eq!(
+            out.publish,
+            PublishState::Published,
+            "publish {seed} was refused; a full tag must evict, not refuse ({:?})",
+            out.degraded
+        );
     }
 
-    let mut refused = false;
-    for pass in 0..4i64 {
-        let pass_now_ms = NOW_MS + pass * 300_000;
-        service.advance_to(pass_now_ms);
-        for endpoint in &devices {
-            let out = exchange(DiscoveryExchange {
-                endpoint,
-                service: service.addr(),
-                tag,
-                publish: Some(&local_node(endpoint)),
-                ttl_seconds: ttl,
-                now_ms: pass_now_ms,
-            })
-            .await;
-            if out.publish == PublishState::Failed {
-                refused = true;
-                // The point of the limit being survivable: a device that cannot advertise ITSELF
-                // still learns where everyone else is. (A refusal only happens once the tag is
-                // full, so there is certainly something to have fetched.)
-                assert!(!opened(&out).is_empty(), "a refused publish must not cost us the fetch");
-            }
-        }
-    }
+    let out = exchange(DiscoveryExchange {
+        endpoint: &endpoint,
+        service: service.addr(),
+        tag,
+        publish: None,
+        ttl_seconds: 600,
+        now_ms: NOW_MS,
+    })
+    .await;
+    assert!(!out.announcements.is_empty(), "an over-full tag must still answer");
     assert!(
-        refused,
-        "five devices are expected to hit the per-tag cap; if this stops happening the service \
-         changed its cap or its eviction policy and the limit above should be re-measured"
+        out.announcements.len() < 32,
+        "and must answer with a SUBSET, not everything: {}",
+        out.announcements.len()
     );
+
+    // The returned set must be one the service could actually have sent.
+    let response = DiscoveryResponse::Fetched {
+        announcements: out
+            .announcements
+            .iter()
+            .map(|payload| WireAnnouncement { payload: payload.clone(), expires_at_ms: NOW_MS })
+            .collect(),
+    };
+    let encoded = response.encode().len();
+    assert!(encoded <= MAX_FRAME_LEN, "response of {encoded} bytes exceeds the frame cap");
 }
 
 // ---------------------------------------------------------------- composition
