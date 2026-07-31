@@ -158,13 +158,19 @@ use — including any you add later.
 ## What each service learns
 
 - **The relay** forwards opaque encrypted QUIC traffic between peers.
-- **The discovery service** is a blind key-value store keyed on a tag it cannot link to an account.
-  The tag comes from account-scoped key material only enrolled devices hold — not from the account
-  id, which every host you have ever dialed knows — so an outsider cannot compute it or find your
-  hosts. What the service itself *can* see under that pseudonym is the advertised node ids
-  themselves — in the clear, and dialable — along with how many there are and when they stop
-  renewing. Unlinkability is the guarantee; hiding which hosts advertise, how many, and when, is
-  not.
+- **The discovery service** is a key-value store keyed on a tag it cannot link to an account. The
+  tag comes from account-scoped key material only enrolled devices hold — not from the account id,
+  which every host you have ever dialed knows — so an outsider cannot compute it or find your hosts.
+  Announcements are sealed to the account's current devices, so the service reads no node id out of
+  a payload.
+
+  It learns your node ids anyway, by a different route: publishes and fetches arrive over
+  authenticated connections, so the service sees the node id at the other end of each one. Under
+  that tag it can therefore see which nodes advertise, which nodes ask, how many there are, and when
+  they stop renewing — that is, your active device set and its liveness. Sealing is aimed at whoever
+  can compute the tag *without* being the service, which is the case that actually arises: a removed
+  device, or a leaked tag. Unlinkability of tag to account is the guarantee; hiding your devices from
+  the service is not.
 - **Neither is trusted.** A discovered address is routing advice only: every peer, discovered or
   configured, passes full mutual roster authorization before a single log entry is exchanged. A
   forged announcement costs a failed dial and nothing else.
@@ -172,8 +178,21 @@ use — including any you add later.
 Discovery failing — unreachable, slow, rate-limited, or answering with nonsense — never fails a
 sync. The configured peers are dialed exactly as they would have been.
 
-One known gap: a device removed from the roster can no longer sync, but keeps the ability to compute
-the account's discovery tag, so it can still see which hosts are advertised and when. Fixing that
-needs rotatable discovery key material —
-[#1080](https://github.com/cq27-dev/rag-rat/issues/1080). Pin your hosts in `server_peers` if that
-matters to you before it lands; discovery is then not in the path at all.
+### What a removed device keeps
+
+Removing a device stops it syncing immediately, and it stops appearing as a recipient of anything
+sealed afterwards. Two things survive that, because they do not depend on anything the account can
+take back:
+
+- **The discovery tag**, which is derived from immutable account material already in that device's
+  database. It can therefore keep watching the tag: how many hosts advertise and when they renew or
+  stop. It can also publish junk under the tag, costing whoever fetches it a wasted slot. What it
+  can no longer do is read a host's node id out of any announcement sealed after its removal.
+  Rotating the tag itself is [#1081](https://github.com/cq27-dev/rag-rat/issues/1081).
+- **Announcements sealed before the removal**, which stay openable by it until they expire — at most
+  one TTL, so 15 minutes at the default cadence. A host re-seals at its next session after a roster
+  change, so the window closes on its own.
+
+Neither grants access to data. Every peer, discovered or configured, still passes full mutual roster
+authorization before a single log entry moves, and a removed device fails it. Pin your hosts in
+`server_peers` and set `discovery = false` if you would rather the tag not be in the path at all.

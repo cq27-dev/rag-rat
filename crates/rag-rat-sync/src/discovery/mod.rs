@@ -6,11 +6,20 @@
 //!
 //! **What that does and does not hide.** The tag is a pseudonym the service cannot link to an
 //! account: it is keyed material, not a digest of the account id, so a party holding the account id
-//! — which every host a device has ever dialed does — cannot compute it. What the service DOES see,
-//! under that pseudonym, is the node ids advertised beneath a tag, their expiry timestamps, and the
-//! refreshes that renew them. It can therefore count how many nodes advertise under one tag and
-//! watch when they start and stop renewing. Unlinkability is the guarantee; hiding node count and
-//! liveness from the service is NOT, and code or documentation that implies otherwise is wrong.
+//! — which every host a device has ever dialed does — cannot compute it.
+//!
+//! Announcement payloads are sealed per roster-effective device, so the service reads no node id
+//! out of them. **That does not hide node ids from the service**, and believing otherwise is the
+//! easy mistake here: every publish and every fetch arrives over an authenticated iroh connection,
+//! whose remote id the service can read directly. It therefore learns which node ids publish under
+//! a tag and which node ids ask about one — that is, the account's whole active device set — plus
+//! expiry timestamps and renewal timing. Sealing is aimed at the OTHER reader, the party who can
+//! compute the tag but cannot terminate the connection: a removed device, or anyone the tag leaks
+//! to. Withholding node ids from the service itself would take publishing over a throwaway
+//! endpoint identity, which this does not do.
+//!
+//! So: unlinkability of tag to account is the guarantee. Hiding device count, device identity, or
+//! liveness FROM THE SERVICE is not, and code or documentation that implies otherwise is wrong.
 //!
 //! **Discovery is routing advice, never authority.** A discovered address is dialed exactly like a
 //! configured one and still passes the full mutual roster auth before a single byte of inventory is

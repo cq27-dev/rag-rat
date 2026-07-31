@@ -31,6 +31,15 @@ use crate::op::DeviceFingerprint;
 
 /// The envelope's leading byte. Bumping it is a wire break; the fetch side drops what it does not
 /// recognise rather than guessing.
+///
+/// **Version 1 is the first format that ships.** The cleartext 32-byte node id this replaced never
+/// appeared in a released version, so there is no deployed client to stay compatible with and no
+/// transition to provide. That will not be true of the next change: publishers and fetchers share
+/// one tag and one ALPN with no negotiation, so a future format that simply bumped this byte would
+/// partition a mixed fleet — each side silently discarding the other's announcements — for as long
+/// as the upgrade took, with discovery falling back to `server_peers` and nothing reporting why.
+/// A later format therefore needs a transition: publish both encodings for a release, or key the
+/// tag by version so the two populations do not share a namespace.
 pub const ANNOUNCEMENT_VERSION: u8 = 1;
 
 /// One sealed wrap on the wire: the ephemeral public key then the tagged ciphertext.
