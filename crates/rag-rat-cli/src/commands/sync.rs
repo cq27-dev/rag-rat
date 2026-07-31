@@ -381,8 +381,20 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
                     tracing::debug!("the roster moved; re-sealing this host's announcement");
                     let resealed = seal_announcement(conn, tag, &local_node);
                     *stamp = stamp_after_seal(observed, *stamp, resealed.is_ok());
-                    if let Ok(bytes) = resealed {
-                        let _ = tx.send(bytes);
+                    match resealed {
+                        Ok(bytes) => {
+                            let _ = tx.send(bytes);
+                        },
+                        // The roster moved but re-sealing failed. Withdraw the previous envelope
+                        // rather than let the advertiser keep renewing it: it is sealed to the OLD
+                        // roster, so a just-removed device could otherwise keep opening it — and
+                        // being observed through it — indefinitely, well past the one-TTL revocation
+                        // window. The stamp is left unchanged (a failed seal keeps it), so the next
+                        // session retries against the moved roster.
+                        Err(error) => {
+                            tracing::warn!(%error, "re-sealing failed after a roster change; withdrawing the stale announcement until a re-seal succeeds");
+                            let _ = tx.send(None);
+                        },
                     }
                 }
             }
