@@ -2,8 +2,15 @@
 //!
 //! Devices of one account publish their node id under a tag only that account can compute, and
 //! fetch the same tag to learn where their peers are. The service stores opaque bytes under opaque
-//! tags — it never learns which account a tag belongs to, how many devices an account has, or when
-//! they are online.
+//! tags.
+//!
+//! **What that does and does not hide.** The tag is a pseudonym the service cannot link to an
+//! account: it is keyed material, not a digest of the account id, so a party holding the account id
+//! — which every host a device has ever dialed does — cannot compute it. What the service DOES see,
+//! under that pseudonym, is the node ids advertised beneath a tag, their expiry timestamps, and the
+//! refreshes that renew them. It can therefore count how many nodes advertise under one tag and
+//! watch when they start and stop renewing. Unlinkability is the guarantee; hiding node count and
+//! liveness from the service is NOT, and code or documentation that implies otherwise is wrong.
 //!
 //! **Discovery is routing advice, never authority.** A discovered address is dialed exactly like a
 //! configured one and still passes the full mutual roster auth before a single byte of inventory is
@@ -87,13 +94,19 @@ pub fn account_tag(secret: &[u8; 32]) -> [u8; TAG_LEN] {
 /// selection may fall back to a lower epoch, so two devices could compute different tags at the
 /// same moment.
 ///
-/// The honest limitation: the genesis hash is an IDENTIFIER, not a rotatable secret. If it leaks —
-/// a log, a debug dump, a pasted diagnostic — the tag becomes computable by whoever saw it and
-/// CANNOT be rotated. It is still strictly better than the account id, which is broadcast to every
-/// dialed host by design (it is the dialer's first frame, sent before the peer proves anything).
-/// The upgrade is a purpose-built discovery secret sealed to roster-effective devices; routing all
-/// key material through this one function is what keeps that change from touching the wire, the tag
-/// domain, the client, or the driver.
+/// **The limitation, which bites on an ordinary operation and not only on a leak: REMOVING A DEVICE
+/// DOES NOT REVOKE ITS DISCOVERY ACCESS.** The genesis hash is immutable and already sits in that
+/// device's database, so a removed device computes this account's tag forever. Roster auth stops it
+/// syncing, but nothing stops it enumerating the account's advertised hosts and their liveness, or
+/// filling the service's per-tag announcement slots with garbage so no legitimate host can publish.
+/// Device removal cannot reach a database it no longer controls. A leaked hash (a log, a debug
+/// dump, a pasted diagnostic) has the same permanent effect.
+///
+/// This is still strictly better than the account id, which is broadcast to every dialed host by
+/// design, and it is a bounded exposure — routing advice and denial of service, never data. The fix
+/// is purpose-built discovery key material sealed to roster-effective devices and rotated on
+/// removal (#1080); routing every caller through this one function is what keeps that change from
+/// touching the wire, the tag domain, the client, or the driver.
 pub fn discovery_secret(conn: &rusqlite::Connection) -> anyhow::Result<Option<[u8; 32]>> {
     rag_rat_oplog::read_local_account_genesis(conn)
 }

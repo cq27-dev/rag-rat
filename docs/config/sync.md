@@ -124,13 +124,21 @@ whether or not discovery works.
 ## What each service learns
 
 - **The relay** forwards opaque encrypted QUIC traffic between peers.
-- **The discovery service** is a blind key-value store. Devices publish under a tag derived from
-  account-scoped key material that only enrolled devices hold, so the service cannot tell which
-  account a tag belongs to, and someone who has merely seen your account id cannot compute your tag
-  or enumerate your devices.
+- **The discovery service** is a blind key-value store keyed on a tag it cannot link to an account.
+  The tag comes from account-scoped key material only enrolled devices hold — not from the account
+  id, which every host you have ever dialed knows — so an outsider cannot compute it or find your
+  hosts. What the service itself *can* see under that pseudonym is how many nodes advertise beneath
+  a tag and when they stop renewing. Unlinkability is the guarantee; hiding host count and liveness
+  from the service is not.
 - **Neither is trusted.** A discovered address is routing advice only: every peer, discovered or
   configured, passes full mutual roster authorization before a single log entry is exchanged. A
   forged announcement costs a failed dial and nothing else.
 
 Discovery failing — unreachable, slow, rate-limited, or answering with nonsense — never fails a
 sync. The configured peers are dialed exactly as they would have been.
+
+One known gap: a device removed from the roster can no longer sync, but keeps the ability to compute
+the account's discovery tag, so it can still see which hosts are advertised and when. Fixing that
+needs rotatable discovery key material —
+[#1080](https://github.com/cq27-dev/rag-rat/issues/1080). Pin your hosts in `server_peers` if that
+matters to you before it lands; discovery is then not in the path at all.
