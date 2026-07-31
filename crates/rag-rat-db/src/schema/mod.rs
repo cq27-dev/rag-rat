@@ -1877,81 +1877,90 @@ mod ledger_atomicity {
         }
     }
 
+    /// Run `step` with its ledger stamp rigged to fail, and assert a second connection sees the
+    /// store exactly as it was. The step is left UNAPPLIED — the caller applies it for real
+    /// afterwards, which is also the assertion that an aborted step is merely owed, not wedging.
+    fn probe_ledger_atomicity(
+        conn: &Connection,
+        path: &std::path::Path,
+        step: &Migration,
+        hooks: &MigrationHooks,
+    ) {
+        let target = step.id;
+        // Poisoned AFTER the earlier migrations, so nothing relocates it out from under V097.
+        conn.execute("INSERT OR REPLACE INTO index_meta(key, value) VALUES ('source_root', ?1)", [
+            POISONED_SOURCE_ROOT,
+        ])
+        .unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER block_ledger_stamp BEFORE INSERT ON schema_version
+             WHEN new.id = '{target}'
+             BEGIN SELECT RAISE(ABORT, 'ledger stamp blocked'); END;"
+        ))
+        .unwrap();
+
+        let before = committed_state(path);
+        let err = apply_and_record_migration(conn, step, hooks).unwrap_err();
+        assert!(
+            err.to_string().contains("ledger stamp blocked"),
+            "{target}: expected the blocked stamp to surface, got {err}",
+        );
+
+        let leaked = committed_delta(&before, &committed_state(path));
+        assert!(
+            leaked.is_empty(),
+            "{target} committed changes without its `schema_version` row: until the stamp lands, \
+             `status` answers `Compatible` to a binary that predates the migration, so every \
+             `Newer` refusal lets it onto converted data\n{}",
+            leaked.join("\n"),
+        );
+        conn.execute_batch("DROP TRIGGER block_ledger_stamp").unwrap();
+    }
+
     #[test]
     fn blocking_the_ledger_stamp_rolls_the_body_back() {
-        for target in &ledger_atomic_under_test() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("index.db");
-            let conn = Connection::open(&path).unwrap();
-            let hooks = MigrationHooks::noop();
-            crate::content_digest::register_content_digest_fold(&conn).unwrap();
-            provision_baseline(&conn).unwrap();
+        let targets = ledger_atomic_under_test();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let conn = Connection::open(&path).unwrap();
+        // The ladder is fsync-bound, not logic-bound, and this test walks all of it. Durability
+        // across a crash is not what it observes — cross-connection VISIBILITY is, and that is a
+        // property of the commit, not of the journal reaching the platter.
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = OFF;").unwrap();
+        let hooks = MigrationHooks::noop();
+        crate::content_digest::register_content_digest_fold(&conn).unwrap();
+        provision_baseline(&conn).unwrap();
 
-            // Replay the ladder up to — not including — the migration under test, so its body runs
-            // against the store shape it actually ships against.
-            let mut under_test = None;
-            for step in ADDITIVE_MIGRATIONS {
-                if step.id == *target {
-                    under_test = Some(step);
-                    break;
-                }
-                apply_and_record_migration(&conn, step, &hooks).unwrap();
+        // ONE pass over the ladder, probing each target as it comes up: every target's body runs
+        // against the store shape it actually ships against, without replaying the ladder per
+        // target (which on a file-backed store costs minutes, not seconds).
+        let mut probed: Vec<&str> = Vec::new();
+        for step in ADDITIVE_MIGRATIONS {
+            if targets.contains(&step.id) {
+                probe_ledger_atomicity(&conn, &path, step, &hooks);
+                probed.push(step.id);
             }
-            let step = under_test.unwrap_or_else(|| panic!("{target} is not in the ladder"));
-
-            // Poisoned AFTER the earlier migrations, so nothing relocates it out from under V097.
-            conn.execute(
-                "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('source_root', ?1)",
-                [POISONED_SOURCE_ROOT],
-            )
-            .unwrap();
-            conn.execute_batch(&format!(
-                "CREATE TRIGGER block_ledger_stamp BEFORE INSERT ON schema_version
-                 WHEN new.id = '{target}'
-                 BEGIN SELECT RAISE(ABORT, 'ledger stamp blocked'); END;"
-            ))
-            .unwrap();
-
-            let before = committed_state(&path);
-            let err = apply_and_record_migration(&conn, step, &hooks).unwrap_err();
-            assert!(
-                err.to_string().contains("ledger stamp blocked"),
-                "{target}: expected the blocked stamp to surface, got {err}",
-            );
-
-            let leaked = committed_delta(&before, &committed_state(&path));
-            assert!(
-                leaked.is_empty(),
-                "{target} committed changes without its `schema_version` row: until the stamp \
-                 lands, `status` answers `Compatible` to a binary that predates the migration, so \
-                 every `Newer` refusal lets it onto converted data\n{}",
-                leaked.join("\n"),
-            );
-            if *target == MIGRATION_097_ID {
-                assert_eq!(
-                    committed_source_root(&path).as_deref(),
-                    Some(POISONED_SOURCE_ROOT),
-                    "V097 rekeyed the stored root and left the ledger at V096",
-                );
-            }
-
-            // The store is not wedged: the aborted step is simply owed, and the next open runs it.
-            conn.execute_batch("DROP TRIGGER block_ledger_stamp").unwrap();
-            migrate_forward(&conn, &hooks).unwrap();
-            let applied: Vec<String> = migrations::applied_migrations(&conn)
-                .unwrap()
-                .into_iter()
-                .map(|migration| migration.id)
-                .collect();
-            assert!(applied.iter().any(|id| id == target), "{target} never landed on retry");
-            if *target == MIGRATION_097_ID {
-                assert_eq!(
-                    committed_source_root(&path).as_deref(),
-                    Some(r"C:\repo"),
-                    "the retried V097 did not convert the stored root",
-                );
-            }
+            apply_and_record_migration(&conn, step, &hooks).unwrap();
         }
+        probed.sort_unstable();
+        assert_eq!(probed, targets, "a ledger-atomic migration was never reached by the ladder");
+
+        // The aborted steps were owed, not lost: the ladder is complete and V097 converted the
+        // spelling its probe had to see left alone.
+        migrate_forward(&conn, &hooks).unwrap();
+        let applied: std::collections::BTreeSet<String> = migrations::applied_migrations(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|migration| migration.id)
+            .collect();
+        for target in &targets {
+            assert!(applied.contains(*target), "{target} never landed after its aborted stamp");
+        }
+        assert_eq!(
+            committed_source_root(&path).as_deref(),
+            Some(r"C:\repo"),
+            "the applied V097 did not convert the stored root",
+        );
     }
 }
 
