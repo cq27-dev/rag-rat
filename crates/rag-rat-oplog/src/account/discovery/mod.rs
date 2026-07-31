@@ -21,10 +21,13 @@
 
 use anyhow::Context;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 use super::keywrap::{self, ContentKey, SealedKeyWrap, WrapContext};
 use super::{bootstrap, storage};
+use crate::device::DeviceX25519Public;
 use crate::identity;
+use crate::op::DeviceFingerprint;
 
 /// The envelope's leading byte. Bumping it is a wire break; the fetch side drops what it does not
 /// recognise rather than guessing.
@@ -38,6 +41,18 @@ const WRAP_LEN: usize = 32 + 48;
 /// rather than left to drift.
 const DISCOVERY_KEY_EPOCH: u64 = 0;
 
+/// A digest of the recipient set an announcement was sealed to.
+///
+/// The reason this exists: **sealing is not deterministic.** Every wrap carries a fresh ephemeral,
+/// so two seals of the same node id to an unchanged roster produce different bytes. A caller that
+/// wants to re-seal only when the roster actually moved therefore cannot compare envelopes — that
+/// predicate is true every time, and acting on it means republishing on every tick, which is the
+/// self-inflicted tag exhaustion the whole seal-once design exists to avoid.
+///
+/// Compare these instead. It is a digest, not the roster: fingerprints and public keys stay in this
+/// crate.
+pub type RosterStamp = [u8; 32];
+
 /// A sealed announcement, with the recipient count the caller needs for policy it owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedAnnouncement {
@@ -47,6 +62,9 @@ pub struct SealedAnnouncement {
     pub bytes: Vec<u8>,
     /// How many devices can open it — the whole roster-effective set, including this one.
     pub recipients: usize,
+    /// The recipient set this was sealed to. Compare against [`roster_stamp`] to decide whether a
+    /// re-seal is owed; see [`RosterStamp`] for why comparing `bytes` cannot work.
+    pub roster_stamp: RosterStamp,
 }
 
 /// Seal `node_id` to every roster-effective device, bound to `tag`.
@@ -81,7 +99,35 @@ pub fn seal_discovery_announcement(
             .with_context(|| format!("sealing a discovery announcement to device {fingerprint}"))?;
         push_wrap(&mut bytes, &sealed);
     }
-    Ok(Some(SealedAnnouncement { bytes, recipients: recipients.len() }))
+    Ok(Some(SealedAnnouncement {
+        bytes,
+        recipients: recipients.len(),
+        roster_stamp: stamp_of(&recipients),
+    }))
+}
+
+/// The current recipient set's stamp, without sealing anything.
+///
+/// Cheap enough to call on a cadence — it is one roster read — which is the point: a long-running
+/// host checks this between sessions and only pays for a re-seal when it changes.
+pub fn roster_stamp(conn: &Connection) -> anyhow::Result<Option<RosterStamp>> {
+    let Some(account) = bootstrap::read_local_account(conn)? else {
+        return Ok(None);
+    };
+    Ok(Some(stamp_of(&storage::list_effective_roster_x25519_pubkeys(conn, account)?)))
+}
+
+/// Digest the recipient set. Order is already stable — the roster read sorts by fingerprint — and
+/// both the fingerprint and the key go in, so a device whose enrolment key changed counts as a
+/// different recipient even at the same fingerprint.
+fn stamp_of(recipients: &[(DeviceFingerprint, DeviceX25519Public)]) -> RosterStamp {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rag-rat/discovery-roster-stamp/1");
+    for (fingerprint, public) in recipients {
+        hasher.update(fingerprint.to_bytes());
+        hasher.update(public.to_bytes());
+    }
+    hasher.finalize().into()
 }
 
 /// Recover the node id from an announcement sealed to this device, or `None`.

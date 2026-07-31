@@ -240,15 +240,17 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
         // safe (same key, same nonce, same plaintext) and buys two things: the advertiser stays
         // database-free, and `is_live` can recognise this host's own announcement by comparing
         // bytes rather than opening anything.
-        let announcement = discovery_tag.map(|tag| {
-            let (tx, rx) = tokio::sync::watch::channel(seal_announcement(conn, &tag, &local_node));
-            (tag, tx, rx)
+        let mut announcement = discovery_tag.map(|tag| {
+            let sealed = seal_announcement(conn, &tag, &local_node);
+            let stamp = sealed.as_ref().map(|(_, stamp)| *stamp);
+            let (tx, rx) = tokio::sync::watch::channel(sealed.map(|(bytes, _)| bytes));
+            (tag, tx, rx, stamp)
         });
         // Aborted on the way out of this scope, so the loop cannot outlive the endpoint it
         // advertises.
         let _advertiser = announcement
             .as_ref()
-            .map(|(tag, _, rx)| (*tag, rx.clone()))
+            .map(|(tag, _, rx, _)| (*tag, rx.clone()))
             .zip(discovery_service_addr(config, &relay))
             .map(|((tag, announcement), service)| {
                 AbortOnDrop(tokio::spawn(rag_rat_sync::discovery::advertise(
@@ -347,11 +349,27 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
             // colocated device sync and no command authors roster changes. A device enrolled while
             // this host is running therefore becomes a recipient at the next renewal; the
             // advertiser re-reads the watch every tick, so the update needs no signal beyond this.
-            if let Some((tag, tx, _)) = &announcement {
-                let resealed = seal_announcement(conn, tag, &local_node);
-                if *tx.borrow() != resealed {
+            if let Some((tag, tx, _, stamp)) = &mut announcement {
+                // Compare the ROSTER, not the envelope. Sealing draws a fresh ephemeral per wrap,
+                // so two seals of an unchanged roster differ in every byte — comparing envelopes
+                // would re-seal after every session, the advertiser would stop recognising its own
+                // live announcement, and it would republish on every tick until the tag was full of
+                // its own copies. That is precisely the failure seal-once exists to avoid.
+                let current = rag_rat_oplog::discovery::roster_stamp(conn).unwrap_or_else(|error| {
+                    tracing::warn!(%error, "could not read the roster; keeping the current announcement");
+                    *stamp
+                });
+                // No test reaches this comparison: `serve_with` binds an endpoint, takes the
+                // session lock, and loops until interrupted. **Replacing the condition with `true`
+                // survives the whole suite** — it re-seals every session, which is the bug this
+                // stamp exists to prevent. What IS pinned, in the op-log crate, is the pair of
+                // facts that make the bug possible and the fix correct: two seals of an unchanged
+                // roster differ in every byte, and the stamp does not.
+                if current != *stamp {
                     tracing::debug!("the roster moved; re-sealing this host's announcement");
-                    let _ = tx.send(resealed);
+                    let resealed = seal_announcement(conn, tag, &local_node);
+                    *stamp = resealed.as_ref().map(|(_, stamp)| *stamp);
+                    let _ = tx.send(resealed.map(|(bytes, _)| bytes));
                 }
             }
             if once {
@@ -801,9 +819,13 @@ fn discovery_service_addr(config: &Config, relay: &str) -> Option<rag_rat_sync::
 /// one to be discovered BY, so publishing would spend a slot to tell nobody. A sealing failure is
 /// logged and treated the same way: discovery is routing advice, and a host that cannot advertise
 /// still serves every peer that reaches it through a configured `server_peers` entry.
-fn seal_announcement(conn: &Connection, tag: &[u8; 32], local_node: &[u8; 32]) -> Option<Vec<u8>> {
+fn seal_announcement(
+    conn: &Connection,
+    tag: &[u8; 32],
+    local_node: &[u8; 32],
+) -> Option<(Vec<u8>, rag_rat_oplog::discovery::RosterStamp)> {
     match rag_rat_oplog::discovery::seal_discovery_announcement(conn, tag, local_node) {
-        Ok(Some(sealed)) if sealed.recipients > 1 => Some(sealed.bytes),
+        Ok(Some(sealed)) if sealed.recipients > 1 => Some((sealed.bytes, sealed.roster_stamp)),
         Ok(Some(_)) => {
             tracing::debug!("not advertising: this device is the account's only roster member");
             None

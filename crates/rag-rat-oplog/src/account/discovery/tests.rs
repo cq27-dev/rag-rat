@@ -147,6 +147,47 @@ fn every_roster_effective_device_can_open_the_announcement() {
     assert_eq!(opened.as_slice(), NODE_ID.as_slice());
 }
 
+/// Sealing is NOT deterministic: each wrap carries a fresh ephemeral. Anything that tries to detect
+/// a roster change by comparing envelope bytes therefore sees a change every time.
+#[test]
+fn two_seals_of_the_same_node_to_the_same_roster_differ() {
+    let conn = db();
+    bootstrap::local_account(&conn, NOW).unwrap();
+
+    let first = seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().unwrap();
+    let second = seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().unwrap();
+    assert_ne!(first.bytes, second.bytes, "a fresh ephemeral per wrap makes every seal differ");
+}
+
+/// The stamp is what a caller compares to decide whether a re-seal is owed, since envelope bytes
+/// cannot serve that purpose. It must be stable across reads and move when the roster does.
+#[test]
+fn the_roster_stamp_is_stable_until_the_roster_moves() {
+    let conn = db();
+    let account = bootstrap::local_account(&conn, NOW).unwrap();
+
+    let lone = roster_stamp(&conn).unwrap().expect("an account has a stamp");
+    assert_eq!(lone, roster_stamp(&conn).unwrap().unwrap(), "stable across reads");
+    assert_eq!(
+        lone,
+        seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().unwrap().roster_stamp,
+        "and matches what a seal reports, so the two cannot drift"
+    );
+
+    let member_x = DeviceX25519Secret::from_seed(&[0x5c; 32]);
+    let member_fp = add_member(&conn, account, &member_x);
+    let with_member = roster_stamp(&conn).unwrap().unwrap();
+    assert_ne!(lone, with_member, "enrolling a device moves the stamp");
+
+    close_roster_row(&conn, account, member_fp);
+    assert_eq!(roster_stamp(&conn).unwrap().unwrap(), lone, "removing it moves it back");
+}
+
+#[test]
+fn a_store_with_no_account_has_no_roster_stamp() {
+    assert!(roster_stamp(&db()).unwrap().is_none());
+}
+
 // ---------------------------------------------------------------- revocation
 
 /// The property this whole design exists for: a device off the roster at seal time gets no wrap.

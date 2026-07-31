@@ -673,7 +673,7 @@ async fn a_serving_host_advertises_itself_immediately_and_keeps_renewing() {
     let host = client().await;
     let node = local_node(&host);
 
-    let (_tx, announcement) = tokio::sync::watch::channel(Some(node.to_vec()));
+    let (envelopes, announcement) = tokio::sync::watch::channel(Some(node.to_vec()));
     let advertiser = tokio::spawn(super::advertise(super::Advertise {
         endpoint: host.clone(),
         service: service.addr(),
@@ -699,5 +699,53 @@ async fn a_serving_host_advertises_itself_immediately_and_keeps_renewing() {
     assert!(
         stored.iter().all(|payload| payload.as_slice() == node.as_slice()),
         "every announcement under this tag is this host's own node id"
+    );
+    drop(envelopes);
+}
+
+/// The advertiser must re-read the watch on EVERY tick, not once at spawn.
+///
+/// This is what makes a roster change reach a long-running host: a device enrolled an hour after it
+/// started becomes a recipient at the next renewal rather than never. Reading once at spawn passes
+/// the renewal test above — which only ever sees one value — so the property needs its own case
+/// that actually changes the value.
+#[tokio::test]
+async fn a_new_envelope_reaches_a_running_advertiser_at_the_next_tick() {
+    fn wall_clock_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_millis() as i64
+    }
+
+    const TTL: u32 = 4;
+    let service = StubService::start(wall_clock_ms(), Behaviour::Serve).await;
+    let tag = account_tag(&[19; 32]);
+    let host = client().await;
+
+    let before = vec![0xa1u8; 48];
+    let after = vec![0xb2u8; 48];
+    let (envelopes, announcement) = tokio::sync::watch::channel(Some(before.clone()));
+    let advertiser = tokio::spawn(super::advertise(super::Advertise {
+        endpoint: host.clone(),
+        service: service.addr(),
+        tag,
+        announcement,
+        ttl_seconds: TTL,
+        now_ms: wall_clock_ms,
+    }));
+
+    assert!(
+        wait_for(|| service.stored(&tag).contains(&before)).await,
+        "the first envelope is advertised"
+    );
+
+    // Swap it, as a roster change does.
+    envelopes.send(Some(after.clone())).unwrap();
+    let switched = wait_for(|| service.stored(&tag).contains(&after)).await;
+    advertiser.abort();
+    assert!(
+        switched,
+        "the replacement was never published; the watch is being read once, not per tick"
     );
 }
