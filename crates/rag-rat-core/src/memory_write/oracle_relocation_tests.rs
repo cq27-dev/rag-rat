@@ -182,6 +182,39 @@ fn dir_binding_to_unindexed_dir_present_on_disk_is_current() {
     );
 }
 
+/// A bound directory is DATA, not a pattern. `_` and `%` are SQLite `LIKE` wildcards, so the
+/// unescaped child pattern `src/foo_bar/%` also matched `src/fooXbar/lib.rs` and kept a binding to
+/// a directory that exists in neither the index nor the filesystem reading `current` on the
+/// strength of an unrelated sibling.
+#[test]
+fn dir_binding_is_not_kept_alive_by_a_like_wildcard_sibling() {
+    let h = Harness::new();
+    set_source_root(&h);
+    // Indexed, but under the SIBLING the wildcard reading would fold in. Neither directory exists
+    // on disk, so the off-index filesystem fallback cannot answer for either.
+    h.add_file_in_scope("src/fooXbar/lib.rs", "", "");
+    let created = create_memory(&h.conn, RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "underscore dir note".to_string(),
+        body: "nothing here".to_string(),
+        confidence: "high".to_string(),
+        created_by: None,
+        source: None,
+        tags: Vec::new(),
+        payload_json: None,
+        bind: RepoMemoryBindTarget { dir: Some("src/foo_bar".to_string()), ..Default::default() },
+    })
+    .unwrap();
+    validate_memories(&h.conn, None).unwrap();
+    validate_memories(&h.conn, None).unwrap();
+    let memory = memory_by_id(&h.conn, &created.memory.memory_id).unwrap().unwrap();
+    let db = memory.bindings.iter().find(|b| b.binding_kind == "dir").expect("dir binding");
+    assert_eq!(
+        db.anchor_status, "gone",
+        "an unrelated sibling matched only through a LIKE wildcard must not vouch for this dir"
+    );
+}
+
 /// #98 (dir analogue): a `dir` binding to a directory absent from index and filesystem is `gone`.
 #[test]
 fn dir_binding_to_missing_dir_is_gone() {

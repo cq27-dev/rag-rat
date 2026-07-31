@@ -134,17 +134,28 @@ pub(crate) fn resolve_dir_binding(conn: &Connection, dir: &str) -> anyhow::Resul
 
 /// Read: are there indexed files at or under `dir`?
 /// Root (`""`) matches any indexed file.
+///
+/// The child pattern is `<dir>/%`, and a bound path is DATA, not a pattern: `_` and `%` in a
+/// directory NAME are SQLite `LIKE` wildcards, so an un-escaped `src/foo_bar` also matches
+/// `src/fooXbar/…` and reports a binding to a vanished directory as still current on the strength
+/// of an unrelated sibling. Same escaping the evidence resolver applies to the same shape.
 pub(crate) fn dir_has_files(conn: &Connection, dir: &str) -> anyhow::Result<bool> {
     let n: i64 = if dir.is_empty() {
         conn.query_row("SELECT EXISTS(SELECT 1 FROM files)", [], |r| r.get(0))?
     } else {
         conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 OR path LIKE ?1 || '/%')",
-            [dir],
+            "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\')",
+            rusqlite::params![dir, format!("{}/%", like_escape(dir))],
             |r| r.get(0),
         )?
     };
     Ok(n != 0)
+}
+
+/// Escape a string for use as a SQLite `LIKE` pattern under `ESCAPE '\'`: the three special
+/// characters `\`, `%`, `_` are backslash-escaped so a path containing one matches literally.
+fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 pub(crate) fn resolve_logical_symbol_binding(

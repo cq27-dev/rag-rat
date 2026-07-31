@@ -44,8 +44,18 @@ pub(crate) fn git_changed_paths(root: &Path) -> anyhow::Result<GitChangedPaths> 
     Ok(paths)
 }
 
-/// The status pathspec for a SUBDIR config root (`<subdir>/**`), or `None` when the config root
-/// IS the worktree root.
+/// The status pathspec for a SUBDIR config root, or `None` when the config root IS the worktree
+/// root.
+///
+/// LITERAL MAGIC, NOT A GLOB. A repo-relative path rendered by `path_string` is DATA, and a bare
+/// pathspec is a PATTERN: gix parses one in shell-glob mode, where `\` escapes the following byte
+/// and `*`, `?`, `[` are wildcards, and a leading `:` opens a magic signature. So the subdir root
+/// `tools\api` (a legal Unix directory NAME, which the rendering now preserves instead of
+/// destroying) produced `tools\api/**`, which matches nothing under that directory — its
+/// modifications and deletions never reached `git_changed_paths`, and the default Changed pass
+/// left every file in it stale. `:(literal)<dir>` takes the rest of the spec as bytes, so no
+/// escaping is needed and no name can be misread as a pattern; git pathspec semantics already make
+/// a directory match everything under it, which is what the old `/**` suffix was for.
 ///
 /// #474: a pathspec disables gix's ignored-DIRECTORY pruning wherever the spec could still match —
 /// the former whole-root wildcard `"*"` could match anywhere, so the dirwalk descended into every
@@ -67,8 +77,18 @@ fn config_root_status_pathspec(worktree_root: &Path, config_root: &Path) -> Opti
     if relative.is_empty() || relative == "." {
         None
     } else {
-        Some(BString::from(format!("{relative}/**")))
+        Some(BString::from(literal_pathspec(&relative)))
     }
+}
+
+/// A path as a gix pathspec that matches it EXACTLY as bytes — `:(literal)` disables every
+/// wildcard, escape and magic-signature reading, so a name containing `\`, `*`, `?`, `[` or a
+/// leading `:` names the file it spells rather than a pattern that happens to look like it.
+///
+/// This is the only place a rendered path becomes a gix pathspec; the read-side conversions
+/// (`entry_by_path`, `blame_file`) take a literal path already and are not pattern-parsed.
+fn literal_pathspec(path: &str) -> String {
+    format!(":(literal){path}")
 }
 
 pub(crate) fn repo_relative_path_to_config_path(
@@ -120,7 +140,11 @@ pub(crate) fn path_is_dirty(repo: &gix::Repository, relative: &Path) -> bool {
     let Ok(platform) = repo.status(gix::progress::Discard) else {
         return false;
     };
-    let pathspec = gix::path::into_bstr(relative).into_owned();
+    // `:(literal)` over the `/`-separated rendering, for the reason
+    // `config_root_status_pathspec` documents: the OS-native bytes of a file NAME are not a
+    // pattern, and a name carrying `\`, `*`, `?`, `[` or a leading `:` would otherwise be parsed
+    // as one and report a file with uncommitted edits as clean.
+    let pathspec = BString::from(literal_pathspec(&path_string(relative)));
     let Ok(mut changes) = platform.untracked_files(UntrackedFiles::Files).into_iter([pathspec])
     else {
         return false;
@@ -368,6 +392,82 @@ mod worktree_scope_tests {
             intrusions.is_empty(),
             "a subdir pathspec must not open sibling ignored trees: {intrusions:?}"
         );
+    }
+
+    /// A rendered path is DATA; a bare gix pathspec is a PATTERN. Under a config root named
+    /// `tools\api` — a legal Unix directory name the rendering now preserves — the old
+    /// `<subdir>/**` spec spelled a backslash that gix's shell-glob parse reads as an escape, so it
+    /// matched nothing at all: every modification and deletion under that root was missing from
+    /// `git_changed_paths`, and the default Changed pass left those files stale forever.
+    ///
+    /// Unix-only: Windows forbids `\` in a name, so the fixture cannot exist there.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_named_subdir_root_still_reports_its_changes() {
+        let dir = temp_dir("backslash-subdir");
+        git(&dir, &["init", "-q"]);
+        // A directory whose NAME contains a backslash, plus a slash-nested sibling that a collapsed
+        // reading of the same spec would match instead.
+        std::fs::create_dir_all(dir.join("tools\\api")).unwrap();
+        std::fs::create_dir_all(dir.join("tools/api")).unwrap();
+        std::fs::write(dir.join("tools\\api").join("edited.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(dir.join("tools\\api").join("removed.rs"), "pub fn b() {}\n").unwrap();
+        std::fs::write(dir.join("tools/api").join("nested.rs"), "pub fn c() {}\n").unwrap();
+        git(&dir, &["add", "-A", "."]);
+        git(&dir, &["commit", "-q", "-m", "seed"]);
+
+        std::fs::write(dir.join("tools\\api").join("edited.rs"), "pub fn a2() {}\n").unwrap();
+        std::fs::remove_file(dir.join("tools\\api").join("removed.rs")).unwrap();
+
+        let paths = git_changed_paths(&dir.join("tools\\api")).unwrap();
+        assert!(
+            paths.changed.contains(&PathBuf::from("edited.rs")),
+            "a modification under a backslash-named root must be reported: {paths:?}"
+        );
+        assert!(
+            paths.deleted.contains(&PathBuf::from("removed.rs")),
+            "and so must a deletion: {paths:?}"
+        );
+        // The spec names one directory, not a pattern a sibling can also satisfy.
+        let nested = git_changed_paths(&dir.join("tools/api")).unwrap();
+        assert!(
+            nested.changed.is_empty() && nested.deleted.is_empty(),
+            "the slash-nested sibling is untouched and must report nothing: {nested:?}"
+        );
+    }
+
+    /// The same class on the per-path status probe blame gates on. A whole-path spec survives a
+    /// backslash by accident — pathspec matching tries a literal byte compare before the glob, and
+    /// an exact path wins there — but a LEADING `:` is read as a magic signature before any
+    /// matching happens at all, so a top-level file named `:notes.rs` reported clean no matter how
+    /// dirty it was, and blame then attributed its uncommitted lines to the last commit.
+    ///
+    /// Unix-only, like the sibling above: neither name is legal on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_whose_name_looks_like_pathspec_syntax_reads_as_dirty_when_it_is() {
+        let dir = temp_dir("pathspec-syntax-dirty");
+        git(&dir, &["init", "-q"]);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        // `:notes.rs` opens a magic signature; `src/foo\bar.rs` spells an escape in glob mode.
+        let names = [":notes.rs", "src/foo\\bar.rs"];
+        for name in names {
+            std::fs::write(dir.join(name), "pub fn a() {}\n").unwrap();
+        }
+        git(&dir, &["add", "-A", "."]);
+        git(&dir, &["commit", "-q", "-m", "seed"]);
+
+        let repo = discover_repo(&dir).unwrap();
+        for name in names {
+            assert!(!path_is_dirty(&repo, Path::new(name)), "{name} is committed and unmodified");
+        }
+        for name in names {
+            std::fs::write(dir.join(name), "pub fn a2() {}\n").unwrap();
+            assert!(
+                path_is_dirty(&repo, Path::new(name)),
+                "{name} has uncommitted edits and must not be read as a pattern"
+            );
+        }
     }
 
     #[test]
