@@ -225,7 +225,7 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
         // started with, and a host that stopped advertising because it was alone when it booted
         // would be invisible to the device enrolled an hour later. `--once` does not publish — it
         // is a scripted single-connection check, not a host.
-        let advertising = config.sync.discoverable && !once;
+        let advertising = serve_should_advertise(config.sync.discoverable, once);
         let discovery_tag = advertising
             .then(|| rag_rat_sync::discovery::discovery_secret(conn))
             .transpose()?
@@ -743,6 +743,19 @@ fn discovery_service_addr(config: &Config, relay: &str) -> Option<rag_rat_sync::
     }
 }
 
+/// Whether a serving host should advertise itself.
+///
+/// Two independent reasons not to, and both are easy to get wrong by omission rather than by
+/// writing something false: `[sync] discoverable` is opt-in, and `--once` is a scripted
+/// single-connection check rather than a host — advertising from it would publish an announcement
+/// that outlives the process by a whole TTL, pointing peers at a node that has already exited.
+///
+/// Named and tested separately because the composition it feeds is not reachable from a test: the
+/// caller binds an endpoint, takes the session lock, and runs an accept loop until interrupted.
+fn serve_should_advertise(discoverable: bool, once: bool) -> bool {
+    discoverable && !once
+}
+
 /// Whether querying the discovery service could possibly return a peer, given how many devices the
 /// roster holds.
 ///
@@ -907,7 +920,32 @@ mod tests {
         DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, decode_node_secret, device_can_serve,
         device_can_sync, device_sync_due, device_sync_run, discovery_could_find_a_peer,
         discovery_node_or_configured, fold_peer_outcomes, join, node_secret, record_device_sync,
+        serve_should_advertise,
     };
+
+    fn account_of(conn: &Connection) -> rag_rat_oplog::AccountId {
+        rag_rat_oplog::read_local_account(conn).unwrap().expect("the fixture minted an account")
+    }
+
+    /// Add a second roster-effective device by writing the roster row directly — the established
+    /// fixture shape for "this account has another device" without driving a full enrollment.
+    fn enroll_extra_roster_device(
+        conn: &Connection,
+        account: rag_rat_oplog::AccountId,
+        fingerprint: [u8; 32],
+    ) {
+        conn.execute(
+            "INSERT INTO account_roster_history(
+                 account_id, device_fingerprint, role, roster_ref, effective_at, closed_at)
+             VALUES(?1, ?2, 'member', ?3, 1, NULL)",
+            rusqlite::params![
+                account.to_bytes().as_slice(),
+                fingerprint.as_slice(),
+                fingerprint.as_slice(),
+            ],
+        )
+        .unwrap();
+    }
 
     fn schema_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -922,6 +960,16 @@ mod tests {
             PathBuf::from("/nonexistent/db.sqlite"),
             PathBuf::from("/nonexistent"),
         )
+    }
+
+    /// `min_config` with a real database path, for the tests that run far enough into
+    /// `device_sync_run` to take the per-database session lock — which needs a directory it can
+    /// actually create lock files in. The returned `TempDir` must outlive the config.
+    fn config_with_real_lock_dir() -> (Config, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config =
+            Config::minimal_for_database(dir.path().join("db.sqlite"), dir.path().to_path_buf());
+        (config, dir)
     }
 
     #[test]
@@ -1005,13 +1053,75 @@ mod tests {
         assert!(discovery_could_find_a_peer(9));
     }
 
+    /// Both reasons a serving host stays silent, enumerated — each is an omission-shaped mistake.
+    ///
+    /// `--once` matters more than it looks: an announcement outlives the process by a whole TTL, so
+    /// a one-shot check that advertised would leave peers dialing a node that has already exited.
     #[test]
-    fn device_sync_run_is_disabled_without_configured_peers() {
+    fn a_serving_host_advertises_only_when_opted_in_and_not_running_one_shot() {
+        assert!(serve_should_advertise(true, false), "a discoverable long-running host advertises");
+        assert!(!serve_should_advertise(false, false), "[sync] discoverable is opt-in");
+        assert!(
+            !serve_should_advertise(true, true),
+            "--once is a scripted check, not a host; its announcement would outlive the process"
+        );
+        assert!(!serve_should_advertise(false, true));
+    }
+
+    /// A lone device with nothing configured has nowhere to go — the ONE case where an empty
+    /// `server_peers` still means "off".
+    ///
+    /// This test used to pass for the wrong reason: with the account read now ahead of the peers
+    /// check, a store with no account returns `Disabled` before the peers gate is consulted, which
+    /// made the old fixture a duplicate of `device_sync_run_is_disabled_without_a_local_account`.
+    /// Minting the account is what makes it reach the gate it claims to test.
+    #[test]
+    fn device_sync_run_is_disabled_for_a_lone_device_with_no_configured_peers() {
         let conn = schema_conn();
+        rag_rat_oplog::local_account(&conn, 1_700_000_000_000).unwrap();
+        assert_eq!(
+            rag_rat_oplog::effective_roster_device_count(&conn, account_of(&conn)).unwrap(),
+            1,
+            "the fixture must really be a single-device roster, or the gate is not under test"
+        );
         assert_eq!(
             device_sync_run(&min_config(), &conn).unwrap(),
             DeviceSyncOutcome::Disabled,
-            "no [sync] server_peers => device-side sync is off"
+            "no configured peer and no second roster device => nothing this pass could reach"
+        );
+    }
+
+    /// The other side of that gate: a second roster device carries the pass all the way through
+    /// with `server_peers` EMPTY, reporting `Ran` rather than short-circuiting to `Disabled`.
+    ///
+    /// This is the composition the gate restructure exists for — before it, an empty `server_peers`
+    /// returned `Disabled` ahead of the account read, so discovery could never run for the account
+    /// that needs it most. Restore that early return and this goes red.
+    ///
+    /// Deliberately hermetic: the relay is a reserved-TLD URL that cannot resolve and the discovery
+    /// service id is unparseable, so the pass binds a local socket and makes NO network call. That
+    /// keeps this a test of the DRIVER's control flow; the discovery exchange itself is covered
+    /// against an in-process service in `rag_rat_sync::discovery::tests`. A genuinely networked
+    /// end-to-end pass needs a live relay, which this repository already gates behind
+    /// `RAG_RAT_SYNC_RELAY` for the tests that require one.
+    #[test]
+    fn a_second_roster_device_carries_the_pass_past_the_empty_peers_gate() {
+        let conn = schema_conn();
+        rag_rat_oplog::local_account(&conn, 1_700_000_000_000).unwrap();
+        let account = account_of(&conn);
+        enroll_extra_roster_device(&conn, account, [0x42; 32]);
+        assert_eq!(rag_rat_oplog::effective_roster_device_count(&conn, account).unwrap(), 2);
+
+        let (mut config, _dir) = config_with_real_lock_dir();
+        assert!(config.sync.server_peers.is_empty(), "the point of the test");
+        config.sync.relay_url = "https://relay.invalid".to_string();
+        config.sync.discovery_node_id = "not-a-node-id".to_string();
+
+        assert_eq!(
+            device_sync_run(&config, &conn).unwrap(),
+            DeviceSyncOutcome::Ran { peers: 0, ok: 0, errors: 0 },
+            "the pass runs to completion with no configured peers; zero peers were reachable \
+             because discovery is switched off here, and zero attempts is not an error"
         );
     }
 

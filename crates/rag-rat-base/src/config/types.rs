@@ -317,13 +317,21 @@ pub struct SyncConfig {
     /// `RAG_RAT_SYNC_RELAY` env var overrides this at the call site (ops/tests).
     pub relay_url: String,
     /// Server peer node ids this device replicates its account log with on the maintenance path,
-    /// each dialed via [`relay_url`](Self::relay_url). Empty (the default) disables device-side
-    /// sync entirely. Entries are trimmed, de-duplicated, and non-empty here; the node-id FORMAT
-    /// is validated at dial time (the config layer has no iroh dependency), where an
-    /// unparseable entry is warned and skipped rather than failing the whole sync.
+    /// each dialed via [`relay_url`](Self::relay_url).
+    ///
+    /// Empty (the default) no longer means device-side sync is off: peers the account advertises
+    /// to the discovery service are dialed too, so a pass runs whenever the roster holds a
+    /// second device. What an entry here buys is a peer that is reached WITHOUT the discovery
+    /// service — unconditional, unaffected by that service being down, and tried first.
+    ///
+    /// Entries are trimmed, de-duplicated, and non-empty here; the node-id FORMAT is validated at
+    /// dial time (the config layer has no iroh dependency), where an unparseable entry is warned
+    /// and skipped rather than failing the whole sync. De-duplication here is LITERAL, so one node
+    /// written two ways survives as two entries and is collapsed at dial time instead.
     pub server_peers: Vec<String>,
     /// Minimum seconds between device-side sync attempts on the maintenance path (default 300).
-    /// `0` attempts on every trigger. Only consulted when `server_peers` is non-empty.
+    /// `0` attempts on every trigger. Also sets the TTL this device publishes its own announcement
+    /// under, when [`discoverable`](Self::discoverable) is on.
     pub push_interval_secs: u64,
     /// Advertise this device's node id to the peer-discovery service so the account's other
     /// devices can dial it without a static `server_peers` entry (default false).
