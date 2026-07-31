@@ -225,7 +225,8 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
         // started with, and a host that stopped advertising because it was alone when it booted
         // would be invisible to the device enrolled an hour later. `--once` does not publish — it
         // is a scripted single-connection check, not a host.
-        let advertising = serve_should_advertise(config.sync.discoverable, once);
+        let advertising =
+            serve_should_advertise(config.sync.discovery, config.sync.discoverable, once);
         let discovery_tag = advertising
             .then(|| rag_rat_sync::discovery::discovery_secret(conn))
             .transpose()?
@@ -726,11 +727,18 @@ pub(crate) fn device_sync_run(
 
 /// The discovery service's dialable address, or `None` (logged) when the configured id is unusable.
 ///
-/// One seam for both callers — the device-sync pass and the serving host — so the resolution rule
-/// and its warning cannot drift apart, and so "a mistyped `discovery_node_id` disables discovery
-/// rather than failing the command" is decided once. The service is a separate iroh peer reached BY
-/// NODE ID through the same relay as the peers, not the relay itself.
+/// One seam for both callers — the device-sync pass and the serving host — so the resolution rule,
+/// the `[sync] discovery` switch, and the malformed-id warning cannot drift apart. `None` means
+/// this invocation does not talk to the discovery service, for either reason. The service is a
+/// separate iroh peer reached BY NODE ID through the same relay as the peers, not the relay
+/// itself.
 fn discovery_service_addr(config: &Config, relay: &str) -> Option<rag_rat_sync::EndpointAddr> {
+    // The single switch. Gating HERE rather than at each caller is what makes
+    // `[sync] discovery = false` mean "no contact with the service" rather than "no contact from
+    // whichever paths someone remembered to check" — a new caller inherits it by construction.
+    if !config.sync.discovery {
+        return None;
+    }
     let discovery_node = effective_discovery_node(config);
     match rag_rat_sync::peer_addr(&discovery_node, relay) {
         Ok(addr) => Some(addr),
@@ -747,15 +755,16 @@ fn discovery_service_addr(config: &Config, relay: &str) -> Option<rag_rat_sync::
 
 /// Whether a serving host should advertise itself.
 ///
-/// Two independent reasons not to, and both are easy to get wrong by omission rather than by
-/// writing something false: `[sync] discoverable` is opt-in, and `--once` is a scripted
-/// single-connection check rather than a host — advertising from it would publish an announcement
-/// that outlives the process by a whole TTL, pointing peers at a node that has already exited.
+/// Three independent reasons not to, each easy to get wrong by omission rather than by writing
+/// something false: `[sync] discovery` turns the service off entirely, `[sync] discoverable` is
+/// opt-in on top of that, and `--once` is a scripted single-connection check rather than a host —
+/// advertising from it would publish an announcement that outlives the process by a whole TTL,
+/// pointing peers at a node that has already exited.
 ///
 /// Named and tested separately because the composition it feeds is not reachable from a test: the
 /// caller binds an endpoint, takes the session lock, and runs an accept loop until interrupted.
-fn serve_should_advertise(discoverable: bool, once: bool) -> bool {
-    discoverable && !once
+fn serve_should_advertise(discovery: bool, discoverable: bool, once: bool) -> bool {
+    discovery && discoverable && !once
 }
 
 /// A spawned task that is aborted when this guard drops, so a background loop cannot outlive the
@@ -909,7 +918,8 @@ mod tests {
     use super::{
         DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, decode_node_secret, device_can_serve,
         device_can_sync, device_sync_due, device_sync_run, discovery_node_or_configured,
-        fold_peer_outcomes, join, node_secret, record_device_sync, serve_should_advertise,
+        discovery_service_addr, fold_peer_outcomes, join, node_secret, record_device_sync,
+        serve_should_advertise,
     };
 
     fn account_of(conn: &Connection) -> rag_rat_oplog::AccountId {
@@ -1028,13 +1038,43 @@ mod tests {
     /// a one-shot check that advertised would leave peers dialing a node that has already exited.
     #[test]
     fn a_serving_host_advertises_only_when_opted_in_and_not_running_one_shot() {
-        assert!(serve_should_advertise(true, false), "a discoverable long-running host advertises");
-        assert!(!serve_should_advertise(false, false), "[sync] discoverable is opt-in");
         assert!(
-            !serve_should_advertise(true, true),
+            serve_should_advertise(true, true, false),
+            "a discoverable long-running host advertises"
+        );
+        assert!(!serve_should_advertise(true, false, false), "[sync] discoverable is opt-in");
+        assert!(
+            !serve_should_advertise(false, true, false),
+            "[sync] discovery = false means there is no service to advertise to, whatever else \
+             says"
+        );
+        assert!(
+            !serve_should_advertise(true, true, true),
             "--once is a scripted check, not a host; its announcement would outlive the process"
         );
-        assert!(!serve_should_advertise(false, true));
+        assert!(!serve_should_advertise(false, false, true));
+    }
+
+    /// `[sync] discovery = false` silences the service for BOTH callers, because both resolve its
+    /// address through one seam. Gating at each call site instead would leave a new caller talking
+    /// to the service by default.
+    #[test]
+    fn switching_discovery_off_leaves_no_service_address_for_anyone_to_use() {
+        let (mut config, _dir) = config_with_real_lock_dir();
+        assert!(
+            discovery_service_addr(&config, "https://relay.invalid").is_some(),
+            "the shipped default resolves, or the negative below proves nothing"
+        );
+
+        config.sync.discovery = false;
+        assert!(
+            discovery_service_addr(&config, "https://relay.invalid").is_none(),
+            "no address means no fetch and nothing to advertise to"
+        );
+        assert!(
+            !serve_should_advertise(config.sync.discovery, true, false),
+            "and a host cannot advertise even with discoverable set"
+        );
     }
 
     /// A pass with NO configured peers and a roster that shows only this device still runs.

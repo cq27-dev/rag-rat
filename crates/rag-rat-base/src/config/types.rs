@@ -333,6 +333,16 @@ pub struct SyncConfig {
     /// `0` attempts on every trigger. Also sets the TTL this device publishes its own announcement
     /// under, when [`discoverable`](Self::discoverable) is on.
     pub push_interval_secs: u64,
+    /// Use the peer-discovery service at all (default true).
+    ///
+    /// Turning it off makes sync depend on nothing but the relay: peers come from `server_peers`
+    /// and nowhere else, and this device neither queries the service nor advertises to it. For an
+    /// operator who pins their hosts and would rather not talk to a third party on a cadence, this
+    /// is the switch — without it a pinned device is INDEPENDENT of the service but still queries
+    /// it each pass, in case the account advertises a host that was never pinned.
+    ///
+    /// With this off, [`discoverable`](Self::discoverable) has nothing to act on and is ignored.
+    pub discovery: bool,
     /// Advertise this node to the peer-discovery service so the account's devices can dial it
     /// without a static `server_peers` entry (default false).
     ///
@@ -363,6 +373,7 @@ impl Default for SyncConfig {
             relay_url: DEFAULT_SYNC_RELAY.to_string(),
             server_peers: Vec::new(),
             push_interval_secs: 300,
+            discovery: true,
             discoverable: false,
             discovery_node_id: DEFAULT_DISCOVERY_NODE.to_string(),
         }

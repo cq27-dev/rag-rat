@@ -2215,7 +2215,25 @@ fn sync_server_peers_default_empty_and_dedupe_while_push_interval_defaults() {
 }
 
 #[test]
-fn sync_discovery_defaults_to_off_for_publishing_and_to_the_shipped_service_node() {
+fn sync_discovery_is_on_by_default_and_can_be_switched_off_entirely() {
+    let default: SyncConfig = RawSync::default().into();
+    assert!(
+        default.discovery,
+        "peers are discovered by default; pinning every host is the opt-out"
+    );
+
+    let raw: RawConfig =
+        toml::from_str("[index]\nroot = \".\"\n\n[sync]\ndiscovery = false\n").unwrap();
+    let sync: SyncConfig = raw.sync.into();
+    assert!(!sync.discovery, "[sync] discovery = false stops all contact with the service");
+    assert!(
+        !sync.discoverable,
+        "and leaves nothing to advertise to — `discoverable` has no effect without it"
+    );
+}
+
+#[test]
+fn sync_discoverable_defaults_off_and_the_service_node_defaults_to_the_shipped_one() {
     let default: SyncConfig = RawSync::default().into();
     assert!(
         !default.discoverable,

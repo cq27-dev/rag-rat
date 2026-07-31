@@ -100,7 +100,8 @@ The fix is to pin the hosts in `server_peers` rather than relying on discovery f
 | `relay_url` | the shipped relay | The iroh relay peers pin. Discovery is pinned to a single relay with no third-party directory, so **two devices can only reach each other if they share this value**. `RAG_RAT_SYNC_RELAY` overrides per invocation. |
 | `server_peers` | empty | Node ids dialed unconditionally, without consulting the discovery service. Tried before discovered peers. |
 | `push_interval_secs` | `300` | Minimum seconds between device-side sync attempts. `0` attempts on every trigger. Also sets the TTL a serving host publishes its announcement under. |
-| `discoverable` | `false` | Advertise this node so devices can find it. Read by `rag-rat sync serve` only — see [Why `discoverable` belongs only on hosts](#why-discoverable-belongs-only-on-hosts). Fetching is **not** gated on it. |
+| `discovery` | `true` | Use the peer-discovery service at all. `false` means peers come from `server_peers` and nowhere else — no queries, no announcements. |
+| `discoverable` | `false` | Advertise this node so devices can find it. Requires `discovery`. Read by `rag-rat sync serve` only — see [Why `discoverable` belongs only on hosts](#why-discoverable-belongs-only-on-hosts). Fetching is **not** gated on it. |
 | `discovery_node_id` | the shipped service | The discovery service's node id — a node id, not a URL; it is a separate peer reached through `relay_url`. `RAG_RAT_SYNC_DISCOVERY_NODE` overrides per invocation. |
 
 ### `server_peers` versus discovery
@@ -129,9 +130,19 @@ Pinning a host in `server_peers` is the answer when you would rather not *depend
 service: paste the node id `sync serve` prints at startup, and the device dials it whether or not
 discovery is reachable.
 
-Note that this makes the device independent of discovery, not silent towards it — a pass still
-queries the service on its cadence, in case the account advertises a host you have not pinned.
-There is currently no switch that turns discovery off outright.
+On its own that makes the device independent of discovery, not silent towards it — a pass still
+queries the service on its cadence, in case the account advertises a host you have not pinned. Set
+`discovery = false` as well to stop that: peers then come from `server_peers` and nowhere else, and
+the device neither queries the service nor advertises to it.
+
+```toml
+[sync]
+discovery = false
+server_peers = ["<the node id `sync serve` printed>"]
+```
+
+The trade is that a host you have not pinned becomes unreachable, so pin every host you intend to
+use — including any you add later.
 
 ## What each service learns
 

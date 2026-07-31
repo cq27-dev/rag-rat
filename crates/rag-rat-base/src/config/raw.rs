@@ -368,6 +368,7 @@ pub(crate) struct RawSync {
     relay_url: Option<String>,
     server_peers: Option<Vec<String>>,
     push_interval_secs: Option<u64>,
+    discovery: Option<bool>,
     discoverable: Option<bool>,
     discovery_node_id: Option<String>,
 }
@@ -392,6 +393,7 @@ impl From<RawSync> for SyncConfig {
             }
         }
         let push_interval_secs = raw.push_interval_secs.unwrap_or(default.push_interval_secs);
+        let discovery = raw.discovery.unwrap_or(default.discovery);
         let discoverable = raw.discoverable.unwrap_or(default.discoverable);
         // Same blank-falls-back-to-shipped-default rule as `relay_url`: an empty node id would
         // otherwise disable discovery silently, which is indistinguishable from it just not
@@ -401,7 +403,14 @@ impl From<RawSync> for SyncConfig {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or(default.discovery_node_id);
-        Self { relay_url, server_peers, push_interval_secs, discoverable, discovery_node_id }
+        Self {
+            relay_url,
+            server_peers,
+            push_interval_secs,
+            discovery,
+            discoverable,
+            discovery_node_id,
+        }
     }
 }
 
