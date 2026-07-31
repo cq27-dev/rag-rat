@@ -180,9 +180,13 @@ sync. The configured peers are dialed exactly as they would have been.
 
 ### What a removed device keeps
 
-Removing a device stops it syncing immediately, and it stops appearing as a recipient of anything
-sealed afterwards. Two things survive that, because they do not depend on anything the account can
-take back:
+Removing a device revokes it, but per host and not instantly: a serving host authorizes every peer
+against its own local roster projection, so it stops syncing with the removed device only once it has
+learned and folded the removal — the same per-host propagation that governs sealing below. A removal
+authored on another device reaches a host only when an authorized peer syncs it there; until then
+that host still treats the device as enrolled and syncs with it. The device also stops appearing as a
+recipient of anything sealed afterwards. Two further things survive removal even at a host that has
+folded it, because they do not depend on anything the account can take back:
 
 - **The discovery tag**, which is derived from immutable account material already in that device's
   database. It can therefore keep watching the tag: how many hosts advertise and when they renew or
@@ -202,5 +206,6 @@ take back:
   indefinitely — one more reason a host is only as current as its last inbound sync.
 
 Neither grants access to data. Every peer, discovered or configured, still passes full mutual roster
-authorization before a single log entry moves, and a removed device fails it. Pin your hosts in
-`server_peers` and set `discovery = false` if you would rather the tag not be in the path at all.
+authorization before a single log entry moves, and a removed device fails it at any host that has
+folded the removal. Pin your hosts in `server_peers` and set `discovery = false` if you would rather
+the tag not be in the path at all.
