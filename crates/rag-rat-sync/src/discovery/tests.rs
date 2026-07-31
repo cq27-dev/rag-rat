@@ -833,3 +833,57 @@ async fn a_running_host_publishes_once_per_renewal_interval_however_often_it_tic
     assert_eq!(stored, 1, "the host republished on ticks where its announcement was still live");
     assert_eq!(fetches, 0, "the advertiser asked the service about its own liveness");
 }
+
+/// Renewal is timed from when the publish was SENT, not from when the answer came back.
+///
+/// The service stamps expiry on receipt, so a client that starts its clock on the response is a
+/// round trip behind the entry it is tracking, and renews that much nearer expiry. It is silent —
+/// every renewal still succeeds — until one fails, and by then the margin that was supposed to
+/// absorb it has been spent. At the exchange's ten-second deadline against the sixty-second TTL
+/// floor it halves, from four attempts to two.
+///
+/// The stub stores the announcement and only then delays its response, which is what a loaded
+/// service does. With an eight-second TTL renewal is due four seconds after the publish is sent,
+/// and six after the response is read; the assertion falls between the two, so it can only pass
+/// for a client timing from the send.
+#[tokio::test]
+async fn renewal_is_timed_from_the_publish_being_sent_not_answered() {
+    const TTL: u32 = 8;
+    let service = StubService::start(0, Behaviour::SlowPublish).await;
+    let tag = account_tag(&[24; 32]);
+    let host = client().await;
+    let node = local_node(&host);
+
+    let (envelopes, announcement) = tokio::sync::watch::channel(Some(node.to_vec()));
+    let started = tokio::time::Instant::now();
+    let advertiser = tokio::spawn(super::advertise(super::Advertise {
+        endpoint: host.clone(),
+        service: service.addr(),
+        tag,
+        announcement,
+        ttl_seconds: TTL,
+    }));
+
+    assert!(wait_for(|| !service.stored(&tag).is_empty()).await, "the host never advertised");
+    // Wait for the renewal up to a deadline that sits BETWEEN the two candidate schedules: a
+    // send-timed clock renews at four seconds, a response-timed one no earlier than six. Polling to
+    // a deadline rather than sampling at a fixed instant keeps the dial latency inside each
+    // exchange from deciding the result.
+    let deadline = started + Duration::from_millis(5_500);
+    let mut renewed = false;
+    while tokio::time::Instant::now() < deadline {
+        if service.stored(&tag).len() >= 2 {
+            renewed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    advertiser.abort();
+    drop(envelopes);
+
+    assert!(
+        renewed,
+        "renewal ran late; the clock is being started when the response arrives, not when the \
+         publish is sent"
+    );
+}

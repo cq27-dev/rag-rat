@@ -24,6 +24,10 @@ use super::wire::{
     WireAnnouncement, read_frame, write_frame,
 };
 
+/// How long [`Behaviour::SlowPublish`] holds a publish response back. Well inside the client's
+/// exchange deadline — the point is a slow answer, not a timeout.
+pub(crate) const SLOW_PUBLISH_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The real service's per-tag cap, mirrored so what the tests exercise is what deployments do.
 ///
 /// Mirroring matters more than the number: a stub pinned to a stale value tests a service that no
@@ -76,6 +80,12 @@ pub(crate) enum Behaviour {
     StallPublish,
     /// Answer fetches with one unusable payload alongside the real ones.
     GarbageAmongTheGood,
+    /// Store a publish immediately, then wait [`SLOW_PUBLISH_DELAY`] before answering it.
+    ///
+    /// A service under load, and the shape that separates two clocks a client could time renewal
+    /// from: the entry's TTL starts when the service STORES it, not when the client learns that it
+    /// did. Answering instantly makes the two indistinguishable.
+    SlowPublish,
     /// Store publishes normally, but answer every fetch with an EMPTY list.
     ///
     /// The real service returns a size-bounded random SAMPLE of a tag, so a live announcement —
@@ -148,6 +158,13 @@ impl StubService {
                         }
                         let response =
                             answer(&tags, &request, behaviour, now.load(Ordering::Relaxed));
+                        // AFTER `answer` has stored it: a slow service has already accepted the
+                        // announcement and started its TTL, and is merely slow to say so.
+                        if behaviour == Behaviour::SlowPublish
+                            && matches!(request, DiscoveryRequest::Publish { .. })
+                        {
+                            tokio::time::sleep(SLOW_PUBLISH_DELAY).await;
+                        }
                         if write_frame(&mut send, &response.encode()).await.is_err() {
                             return;
                         }

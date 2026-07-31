@@ -450,6 +450,13 @@ pub async fn advertise(params: Advertise) {
             tracing::trace!("this host's announcement is still live; not renewing yet");
             continue;
         }
+        // Started BEFORE the request, and read again only if it succeeds. The service stamps expiry
+        // when it RECEIVES the publish, so timing from the response would start this clock a round
+        // trip late and renew that much nearer expiry than intended — at the ten-second exchange
+        // deadline against the sixty-second TTL floor, half the retry margin. Erring early costs a
+        // fraction of a renewal interval; erring late costs the margin that exists to absorb a
+        // failed renewal.
+        let attempted_at = tokio::time::Instant::now();
         let outcome = exchange(DiscoveryExchange {
             endpoint: &endpoint,
             service: service.clone(),
@@ -460,7 +467,7 @@ pub async fn advertise(params: Advertise) {
         })
         .await;
         if outcome.publish == PublishState::Published {
-            published = Some((envelope, tokio::time::Instant::now()));
+            published = Some((envelope, attempted_at));
         }
         match outcome.degraded {
             // Never fatal: a host that cannot advertise itself still serves every peer that
