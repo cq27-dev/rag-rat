@@ -522,7 +522,8 @@ fn sync_hook_trigger(config: &Config) -> serde_json::Value {
     match device_sync_run(config, db.connection()) {
         Ok(DeviceSyncOutcome::Disabled) => serde_json::json!({
             "status": "disabled",
-            "reason": "no [sync] server_peers, no local account, or this device is not roster-effective",
+            "reason": "no local account, this device is not roster-effective, or there is neither \
+                       a configured [sync] server_peer nor a second roster device to discover",
         }),
         Ok(DeviceSyncOutcome::Skipped) => serde_json::json!({
             "status": "skipped",

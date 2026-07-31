@@ -125,8 +125,9 @@ pub use storage::{
     CapacityScope, IngestOutcome, SyncAccountEntry, account_effective_count,
     account_entries_for_enrollment, account_entries_for_sync, account_entry_ref, account_ingest,
     account_signed_entry_exists, account_signed_hash, auth_len_freshness,
-    backfill_authority_projection, grant_effective_for_device, owned_streams_for_account,
-    owner_control_authority, owner_control_authority_in_snapshot, owner_secrets_authority,
-    roster_content_authority, stream_owner_effective, verify_enrollment_device_add,
+    backfill_authority_projection, effective_roster_device_count, grant_effective_for_device,
+    owned_streams_for_account, owner_control_authority, owner_control_authority_in_snapshot,
+    owner_secrets_authority, roster_content_authority, stream_owner_effective,
+    verify_enrollment_device_add,
 };
 pub(crate) use storage::{device_is_effective_writer, stream_owner_account};

@@ -265,6 +265,62 @@ async fn exchange_inner(params: &DiscoveryExchange<'_>) -> DiscoveryOutcome {
     }
 }
 
+/// A long-running host's standing advertisement — see [`advertise`].
+pub struct Advertise {
+    /// Owned (clone the caller's) so the loop can be spawned and outlive the call that made it.
+    pub endpoint: Endpoint,
+    /// The service's dialable address, resolved by the caller for the same reason
+    /// [`DiscoveryExchange`] takes one: it is what makes an in-process stub testable.
+    pub service: EndpointAddr,
+    pub tag: [u8; TAG_LEN],
+    /// The node id to advertise — this host's own.
+    pub node: [u8; 32],
+    pub ttl_seconds: u32,
+    /// A clock, not an instant: unlike a single [`exchange`], this loop runs for the host's
+    /// lifetime and must read the time afresh on every tick.
+    pub now_ms: fn() -> i64,
+}
+
+/// Keep `node` advertised under `tag` for as long as this future is polled. Never returns.
+///
+/// For a host that serves rather than syncs on a cadence. It is the node that most needs
+/// announcing — the always-on peer a machine behind NAT is trying to reach — and the one node a
+/// maintenance-hook cadence can never announce, because a serving host has no maintenance hook.
+/// Without this the only publishers would be the only fetchers.
+///
+/// Ticks at half the TTL: the service reaps only on expiry, so a slower timer would let the
+/// announcement lapse between ticks and leave an always-on host intermittently findable, which is
+/// the exact failure this exists to prevent. The first tick fires immediately, so a host is
+/// discoverable from startup rather than half a TTL later. Each tick is a full [`exchange`], so the
+/// fetch-before-publish skip applies and a long-running host does not stack copies of itself.
+///
+/// Publish-only in effect: the fetched peers are discarded, because peers dial a serving host
+/// rather than the other way round.
+pub async fn advertise(params: Advertise) {
+    let Advertise { endpoint, service, tag, node, ttl_seconds, now_ms } = params;
+    // `.max(2)` keeps the interval positive even if a future TTL floor drops below 2s; a zero
+    // period would make `interval` panic.
+    let mut ticks = tokio::time::interval(Duration::from_secs(u64::from(ttl_seconds).max(2) / 2));
+    loop {
+        ticks.tick().await;
+        let outcome = exchange(DiscoveryExchange {
+            endpoint: &endpoint,
+            service: service.clone(),
+            tag,
+            publish: Some(node),
+            ttl_seconds,
+            now_ms: now_ms(),
+        })
+        .await;
+        match outcome.degraded {
+            // Never fatal: a host that cannot advertise itself still serves every peer that
+            // reaches it through a configured `server_peers` entry.
+            Some(reason) => tracing::warn!(reason, "advertising this host degraded"),
+            None => tracing::debug!(state = ?outcome.publish, "advertised this host"),
+        }
+    }
+}
+
 /// Whether `node` already has an announcement with more than half its TTL left.
 ///
 /// Half a TTL is one full cadence of headroom (the TTL is two cadences), so a node that skips here

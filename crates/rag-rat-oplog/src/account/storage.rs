@@ -2357,6 +2357,21 @@ pub(super) fn list_effective_roster_fingerprints(
     rows.into_iter().map(|fp| Ok(DeviceFingerprint::from_bytes(fixed(&fp)?))).collect()
 }
 
+/// How many devices are roster-effective on `account_id`, INCLUDING the local one.
+///
+/// A pure local read, for callers deciding whether a network round trip could possibly pay off: an
+/// account whose roster holds one device has provably nobody to find, so peer discovery should not
+/// touch the discovery service on its behalf. Counting is deliberately all it does — a caller that
+/// needs the identities wants [`list_effective_roster_fingerprints`], and a caller deciding whether
+/// THIS device may sync wants the roster-capability probe, which is a different question (this
+/// count says nothing about whether the local device is among the effective ones).
+pub fn effective_roster_device_count(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<usize> {
+    Ok(list_effective_roster_fingerprints(conn, account_id)?.len())
+}
+
 /// The effective enrollment entry and current role for `fingerprint`, read in the caller's
 /// snapshot. This is the exact fact an enrollment author verifies after refolding: the returned
 /// `roster_ref` identifies which `DeviceAdd` won, not merely that some enrollment exists.

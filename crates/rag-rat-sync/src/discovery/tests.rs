@@ -27,6 +27,20 @@ fn local_node(endpoint: &Endpoint) -> [u8; 32] {
     *endpoint.id().as_bytes()
 }
 
+/// Poll `ready` until it holds, up to a few seconds. Returns whether it ever did.
+///
+/// Used instead of sleeping a fixed interval: a fixed sleep is either flaky (too short) or slow
+/// (too long), and both are worse than asking the question repeatedly.
+async fn wait_for(mut ready: impl FnMut() -> bool) -> bool {
+    for _ in 0..200 {
+        if ready() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
 // ---------------------------------------------------------------- tag derivation
 
 /// The tag must depend on the secret, or every account shares one tag and discovery becomes a
@@ -551,4 +565,36 @@ async fn an_empty_discovery_result_leaves_the_configured_peers_untouched() {
     .await;
     assert_eq!(resolved.peers.len(), 1);
     assert_eq!(resolved.peers[0].0, configured[0]);
+}
+
+// ---------------------------------------------------------------- the serving host's advertisement
+
+/// A serving host advertises itself from startup, not half a TTL later.
+///
+/// `sync serve` is the node a machine behind NAT is trying to reach, and it is the one node the
+/// maintenance-hook cadence can never announce — it has no maintenance hook. Delete the advertise
+/// loop and the always-on host is invisible to every device that does not already have it in
+/// `server_peers`.
+#[tokio::test]
+async fn a_serving_host_advertises_itself_immediately_and_keeps_doing_so() {
+    let service = StubService::start(NOW_MS, Behaviour::Serve).await;
+    let tag = account_tag(&[16; 32]);
+    let host = client().await;
+    let node = local_node(&host);
+
+    let advertiser = tokio::spawn(super::advertise(super::Advertise {
+        endpoint: host.clone(),
+        service: service.addr(),
+        tag,
+        node,
+        ttl_seconds: 60,
+        now_ms: || NOW_MS,
+    }));
+
+    // Nothing here waits out a tick interval: the FIRST tick is immediate, so an announcement must
+    // appear promptly. Poll rather than sleep a fixed amount, so the test is neither flaky nor
+    // slower than it needs to be.
+    let appeared = wait_for(|| service.stored(&tag) == vec![node.to_vec()]).await;
+    advertiser.abort();
+    assert!(appeared, "the host did not advertise itself: {:?}", service.stored(&tag));
 }

@@ -38,6 +38,12 @@ pub use enrollment::{
     ENROLL_ALPN, EnrollmentReceipt, EnrollmentRequest, EnrollmentTicket, InviteError, InviteSpec,
     mint_invite, redeem_invite, run_enrollment_acceptor, run_enrollment_dialer,
 };
+/// The dialable address type every peer-facing helper here hands back.
+///
+/// Re-exported so a caller can NAME what `peer_addr` returns and what `DiscoveryExchange`
+/// wants without taking an iroh dependency of its own — the CLI has none, and keeping it that
+/// way is what makes this crate the single place the transport is chosen.
+pub use iroh::EndpointAddr;
 pub use session::{
     DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES, SessionError, SessionReport, SyncStore,
     run_session, run_session_with_idle_timeout,

@@ -214,10 +214,46 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
         };
         let policy = AuthPolicy::Closed;
 
+        // Advertise this host to the account's other devices for as long as it serves.
+        //
+        // `serve` is the node that most needs announcing — it is the always-on peer a laptop
+        // behind NAT is trying to reach — and it is the one node the device-sync path can never
+        // announce, because that path only runs on the maintenance hook and `serve` has no
+        // maintenance hook. Without its own timer the only publishers would be the only fetchers.
+        //
+        // Not gated on the roster count the device path uses: `serve` outlives the roster it
+        // started with, and a host that stopped advertising because it was alone when it booted
+        // would be invisible to the device enrolled an hour later. `--once` does not publish — it
+        // is a scripted single-connection check, not a host.
+        let advertising = config.sync.discoverable && !once;
+        let discovery_tag = advertising
+            .then(|| rag_rat_sync::discovery::discovery_secret(conn))
+            .transpose()?
+            .flatten()
+            .map(|secret| rag_rat_sync::discovery::account_tag(&secret));
+        // Aborted on the way out of this scope, so the loop cannot outlive the endpoint it
+        // advertises.
+        let _advertiser =
+            discovery_tag.zip(discovery_service_addr(config, &relay)).map(|(tag, service)| {
+                AbortOnDrop(tokio::spawn(rag_rat_sync::discovery::advertise(
+                    rag_rat_sync::discovery::Advertise {
+                        endpoint: endpoint.clone(),
+                        service,
+                        tag,
+                        node: local_node,
+                        ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
+                            config.sync.push_interval_secs,
+                        ),
+                        now_ms: time::now_ms,
+                    },
+                )))
+            });
+
         tracing::info!(
             node_id = %endpoint.id(),
             relay = %relay,
             minted_invite = invite.is_some(),
+            discoverable = config.sync.discoverable,
             "sync serve listening"
         );
         // The dialable node identity must reach the operator on stdout: repository logging is off
@@ -486,7 +522,8 @@ const DEVICE_SYNC_LAST_META_KEY: &str = "sync_device_last_at_ms";
 /// What a device-side sync attempt did — folded into the maintenance hook report.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DeviceSyncOutcome {
-    /// No server peers configured, no local account, or the device is not roster-effective.
+    /// Nothing to do: no local account, the device is not roster-effective, or there is neither a
+    /// configured peer nor a second roster device for discovery to find.
     Disabled,
     /// The cadence gate suppressed this attempt (a sync ran within `push_interval_secs`).
     Skipped,
@@ -512,13 +549,24 @@ pub(crate) fn device_sync_run(
     config: &Config,
     conn: &Connection,
 ) -> anyhow::Result<DeviceSyncOutcome> {
-    if config.sync.server_peers.is_empty() {
-        return Ok(DeviceSyncOutcome::Disabled);
-    }
     // Device-side sync must NOT mint identity: an unenrolled store simply has nothing to sync.
+    // Read the account FIRST — ahead of the configured-peers check it used to sit behind — because
+    // whether an empty `server_peers` means "nothing to do" is now an account-scoped question.
     let Some(account_id) = rag_rat_oplog::read_local_account(conn)? else {
         return Ok(DeviceSyncOutcome::Disabled);
     };
+    // Is there anything this pass could reach? Configured peers are one answer; peer discovery is
+    // the other, and it is only worth a network round trip when the roster says another device
+    // exists. Both reads are local, so a store with nothing to do still pays no socket.
+    //
+    // The count INCLUDES this device, hence >= 2. A single-device account provably has nobody to
+    // find, and asking the discovery service on its behalf would publish its existence and its
+    // liveness for no possible benefit.
+    let roster_devices = rag_rat_oplog::effective_roster_device_count(conn, account_id)?;
+    let discoverable_peers_possible = discovery_could_find_a_peer(roster_devices);
+    if config.sync.server_peers.is_empty() && !discoverable_peers_possible {
+        return Ok(DeviceSyncOutcome::Disabled);
+    }
     if !device_sync_due(conn, config.sync.push_interval_secs)? {
         return Ok(DeviceSyncOutcome::Skipped);
     }
@@ -550,23 +598,14 @@ pub(crate) fn device_sync_run(
     let relay = effective_relay_url(config);
     // Key material for the account's discovery tag. Absent only when no account is minted, which
     // the read above already ruled out; treat it as "no discovery" rather than an error either way.
-    let discovery_tag = rag_rat_sync::discovery::discovery_secret(conn)?
+    // Gated on the roster read above: a single-device account skips discovery entirely rather than
+    // announcing itself to a service that can only tell it about itself.
+    let discovery_tag = discoverable_peers_possible
+        .then(|| rag_rat_sync::discovery::discovery_secret(conn))
+        .transpose()?
+        .flatten()
         .map(|secret| rag_rat_sync::discovery::account_tag(&secret));
-    // The discovery service is a separate iroh peer reached BY NODE ID through the same relay — not
-    // the relay itself. An unusable id disables discovery for this pass rather than failing the
-    // sync: it is ordinary misconfiguration, and the configured peers stay perfectly dialable.
-    let discovery_node = effective_discovery_node(config);
-    let discovery_service = match rag_rat_sync::peer_addr(&discovery_node, &relay) {
-        Ok(addr) => Some(addr),
-        Err(error) => {
-            tracing::warn!(
-                service = discovery_node,
-                %error,
-                "skipping peer discovery: [sync] discovery_node_id is not a usable node id"
-            );
-            None
-        },
-    };
+    let discovery_service = discovery_service_addr(config, &relay);
 
     let runtime =
         tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
@@ -681,6 +720,49 @@ pub(crate) fn device_sync_run(
     record_device_sync(conn)?;
     let (peers, ok, errors) = result?;
     Ok(DeviceSyncOutcome::Ran { peers, ok, errors })
+}
+
+/// The discovery service's dialable address, or `None` (logged) when the configured id is unusable.
+///
+/// One seam for both callers — the device-sync pass and the serving host — so the resolution rule
+/// and its warning cannot drift apart, and so "a mistyped `discovery_node_id` disables discovery
+/// rather than failing the command" is decided once. The service is a separate iroh peer reached BY
+/// NODE ID through the same relay as the peers, not the relay itself.
+fn discovery_service_addr(config: &Config, relay: &str) -> Option<rag_rat_sync::EndpointAddr> {
+    let discovery_node = effective_discovery_node(config);
+    match rag_rat_sync::peer_addr(&discovery_node, relay) {
+        Ok(addr) => Some(addr),
+        Err(error) => {
+            tracing::warn!(
+                service = discovery_node,
+                %error,
+                "skipping peer discovery: [sync] discovery_node_id is not a usable node id"
+            );
+            None
+        },
+    }
+}
+
+/// Whether querying the discovery service could possibly return a peer, given how many devices the
+/// roster holds.
+///
+/// The count INCLUDES this device, so the threshold is TWO. Getting this off by one in the
+/// permissive direction is not a crash — it is every single-device account publishing its node id
+/// and its liveness to a shared service on every maintenance pass, learning nothing, forever. In
+/// the strict direction it silently disables discovery for real two-device accounts. Hence a named
+/// predicate with the boundary pinned rather than an inline `>= 2`.
+fn discovery_could_find_a_peer(effective_roster_devices: usize) -> bool {
+    effective_roster_devices >= 2
+}
+
+/// A spawned task that is aborted when this guard drops, so a background loop cannot outlive the
+/// resources it borrows conceptually (here: the endpoint `serve` advertises).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Fold the per-peer session results into the `(peers, ok, errors)` a [`DeviceSyncOutcome::Ran`]
@@ -823,8 +905,8 @@ mod tests {
 
     use super::{
         DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, decode_node_secret, device_can_serve,
-        device_can_sync, device_sync_due, device_sync_run, discovery_node_or_configured,
-        fold_peer_outcomes, join, node_secret, record_device_sync,
+        device_can_sync, device_sync_due, device_sync_run, discovery_could_find_a_peer,
+        discovery_node_or_configured, fold_peer_outcomes, join, node_secret, record_device_sync,
     };
 
     fn schema_conn() -> Connection {
@@ -909,6 +991,18 @@ mod tests {
                 "an unset or blank override falls through to the configured service ({absent:?})"
             );
         }
+    }
+
+    /// The roster count INCLUDES this device, so "someone else exists" is two, not one.
+    #[test]
+    fn discovery_is_only_worth_a_round_trip_once_a_second_device_is_on_the_roster() {
+        assert!(!discovery_could_find_a_peer(0), "no roster at all");
+        assert!(
+            !discovery_could_find_a_peer(1),
+            "a lone device would be querying a shared service about itself, every pass, forever"
+        );
+        assert!(discovery_could_find_a_peer(2), "one other device is the whole point");
+        assert!(discovery_could_find_a_peer(9));
     }
 
     #[test]
