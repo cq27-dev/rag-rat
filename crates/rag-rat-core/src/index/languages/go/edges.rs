@@ -111,7 +111,7 @@ fn go_call_edges(
         name,
         EdgeKind::CallsName,
         EdgeConfidence::NameOnly,
-        EdgeContext { target_qualified_name: None, receiver_hint },
+        EdgeContext { target_qualified_name: None, receiver_hint, receiver_type_hint: None },
         Some(CalleeRange::of_node(name_node)),
     ));
 }

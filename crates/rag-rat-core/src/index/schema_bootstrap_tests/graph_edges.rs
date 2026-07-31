@@ -301,3 +301,182 @@ fn scoped_incremental_pass_preserves_find_callers_both_directions() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn incremental_pass_refreshes_receiver_type_and_target() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    let alpha_source = "struct Alpha;\nstruct Beta;\nimpl Alpha { fn run(&self) {} }\nimpl Beta { \
+                        fn run(&self) {} }\nfn call(receiver: Alpha) { receiver.run(); }\n";
+    fs::write(root.join("src/lib.rs"), alpha_source).unwrap();
+    init_git_repo(&root);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "seed"]);
+    let config = source_config(root.clone(), Language::Rust);
+
+    let edge_state = |db: &IndexDatabase| -> (String, String, String, String) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT e.receiver_type_hint, e.confidence, e.resolution, s.scope_path
+                 FROM edges e
+                 JOIN files f ON f.id = e.source_file_id
+                 JOIN symbols s ON s.id = e.to_symbol_id
+                 WHERE COALESCE(e.from_name, '') LIKE '%call%' AND e.to_name = 'run'
+                   AND e.edge_kind = 'calls_name'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    };
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(
+        edge_state(&db),
+        (
+            "Alpha".to_string(),
+            "Syntactic".to_string(),
+            "receiver_type".to_string(),
+            "Alpha::run".to_string(),
+        )
+    );
+    drop(db);
+
+    let beta_source =
+        format!("// changed\n{}", alpha_source.replace("receiver: Alpha", "receiver: Beta"));
+    fs::write(root.join("src/lib.rs"), beta_source).unwrap();
+    let db = IndexDatabase::index_paths(&config, &[root.join("src/lib.rs")]).unwrap();
+    assert_eq!(
+        edge_state(&db),
+        (
+            "Beta".to_string(),
+            "Syntactic".to_string(),
+            "receiver_type".to_string(),
+            "Beta::run".to_string(),
+        )
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A receiver hint is persisted per FILE ROW, and a linked worktree holds its own row for a path
+/// the base checkout also has. So two checkouts can disagree about what type a call is made on, and
+/// each scope's resolved target has to be its own: re-resolving one must not stamp its answer onto
+/// the other, which would make every graph answer served from that worktree describe the wrong
+/// method.
+#[test]
+fn a_linked_worktree_keeps_its_own_receiver_hint_and_target() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    let base_source = "struct Alpha;\nstruct Beta;\nimpl Alpha { fn run(&self) {} }\nimpl Beta { \
+                       fn run(&self) {} }\nfn call(receiver: Alpha) { receiver.run(); }\n";
+    fs::write(main.join("src/lib.rs"), base_source).unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Per-scope read: the hint and the resolved owner for THIS file row alone.
+    let state_for = |db: &IndexDatabase, worktree_id: &str| -> (String, String) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT e.receiver_type_hint, s.scope_path
+                 FROM edges e
+                 JOIN main.files f ON f.id = e.source_file_id
+                 JOIN symbols s ON s.id = e.to_symbol_id
+                 WHERE e.to_name = 'run' AND e.edge_kind = 'calls_name'
+                   AND f.path LIKE '%lib.rs' AND COALESCE(f.worktree_id, '') = ?1",
+                [worktree_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+
+    assert_eq!(
+        state_for(&db, ""),
+        ("Alpha".to_string(), "Alpha::run".to_string()),
+        "the base checkout calls it on Alpha"
+    );
+
+    // The branch changes only the receiver's type, so the two rows differ in exactly the field
+    // this change added.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/lib.rs"), base_source.replace("receiver: Alpha", "receiver: Beta"))
+        .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch receiver"]);
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(report.indexed >= 1, "lib.rs indexed as an overlay row");
+
+    let overlay_worktree = crate::index::git_context::worktree_id_of(&linked);
+    assert_eq!(
+        state_for(&db, &overlay_worktree),
+        ("Beta".to_string(), "Beta::run".to_string()),
+        "the overlay row resolves against the branch's receiver"
+    );
+
+    set_base_scope(&mut db, &main);
+    assert_eq!(
+        state_for(&db, ""),
+        ("Alpha".to_string(), "Alpha::run".to_string()),
+        "and indexing the overlay left the base row's hint and target alone"
+    );
+
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&main);
+}
+
+/// A renaming import gives a type a name the index never stored: the method lives at `Worker::run`
+/// while the only spelling this file has is `Alias`. Probing `Alias::run` finds nothing, and a
+/// receiver type that is present but fails also closes the bare-name fallback, so the call loses
+/// its last chance. Asserted through the real indexer, because the rewrite depends on the import
+/// scope actually recording the rename — a version that recorded nothing looked identical here.
+#[test]
+fn a_renaming_import_resolves_to_the_type_it_renames() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/worker.rs"),
+        "pub struct Worker;\nimpl Worker { pub fn run(&self) {} }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod worker;\nuse crate::worker::Worker as Alias;\n\npub fn drive(w: Alias) { \
+         w.run(); }\n",
+    )
+    .unwrap();
+    init_git_repo(&root);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "seed"]);
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let resolved: Option<String> = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT s.scope_path
+               FROM edges e
+               JOIN symbols s ON s.id = e.to_symbol_id
+              WHERE e.to_name = 'run' AND e.edge_kind = 'calls_name'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(
+        resolved.as_deref(),
+        Some("Worker::run"),
+        "the alias resolves to the type it renames, not to a scope named for the alias"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

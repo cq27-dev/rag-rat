@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 99;
+pub const LATEST_SCHEMA_VERSION: u32 = 100;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -756,6 +756,11 @@ const MIGRATION_099_DESCRIPTION: &str =
      incarnation-bound stream contexts, stream-isolated row clocks/publication/tombstones, and \
      retained per-device chain-tip witnesses that survive local repository purge. Pre-transport \
      /4 table-sync state is cleared because it has no account-authorized incarnation identity";
+
+const MIGRATION_100_ID: &str = "100_receiver_type_hint_interning";
+const MIGRATION_100_CHECKSUM: &str = "sha256:rag-rat-receiver-type-hint-interning-v100";
+const MIGRATION_100_DESCRIPTION: &str =
+    "Add edges_data.receiver_type_hint_id for conservative Rust receiver-type resolution";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1577,6 +1582,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_099_CHECKSUM,
         description: MIGRATION_099_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_table_sync_repo_incarnations),
+    },
+    Migration {
+        id: MIGRATION_100_ID,
+        checksum: MIGRATION_100_CHECKSUM,
+        description: MIGRATION_100_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_receiver_type_hint_interning),
     },
 ];
 

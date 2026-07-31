@@ -1324,7 +1324,10 @@ fn call_path_gives_absence_authority(
         // the sibling that fell out of the index must stay missing.
         let matched = candidates
             .iter()
-            .position(|candidate| candidate.fingerprint == *fingerprint)
+            .position(|candidate| {
+                candidate.fingerprint == *fingerprint
+                    || candidate.legacy_fingerprint.as_deref() == Some(fingerprint.as_str())
+            })
             .or_else(|| {
                 candidates.iter().position(|candidate| {
                     (

@@ -372,13 +372,16 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // re-extract so the corrected `dispatch_handle` set reaches deployed indexes.
 // 11: #208 review round 11 — effect-only fallback records the direct call (no shadowing
 // misresolve); method calls on scoped receivers (`worker.run()`) are recorded again; re-extract.
-// 12: #567 — Rust impl scopes carry their rendered self type and trait path, so the resolution
-// surface (`scope_degeneric`) changes shape; re-extract.
+// 12: #567 — Rust impl scopes carry their rendered self type and trait path, and conservative
+// receiver-type extraction adds `receiver_type_hint_id`; both change edge shape, so re-extract.
 // 13: #567 — that rendering settled: binder substitution is decided by AST position, macro
 // argument tokens stay verbatim, and an impl symbol's OWN path ends at its `Type as Trait`
 // segment. An index built from an interim 12 carries the earlier shape and no longer differs from
 // the stamp, so it would never re-derive; re-extract.
-const GRAPH_INDEX_VERSION: &str = "13";
+// 14: #567 — the scope surfaces split in two, so a source-written path keeps the owner's pointer
+// wrapper while an inferred receiver still peels it; which definition a call resolves to changes.
+// Same reasoning as 13: an index stamped 13 by an interim build would never re-resolve.
+const GRAPH_INDEX_VERSION: &str = "14";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
 // on next open. Incremental discovery only rewrites a file row when its sha/language/kind changes —

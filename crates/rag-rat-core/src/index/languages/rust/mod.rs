@@ -9,6 +9,7 @@ use super::{
 use crate::index::edges::{EdgeKind, scope_grammar};
 use crate::index::parser::{self, ParsedSymbolFact, ParserKind};
 
+mod binders;
 mod dispatch;
 mod edges;
 pub(super) use edges::rust_edges;
@@ -71,7 +72,7 @@ impl ParserBackend for Rust {
                 // `impl Trait for Type`: keep the trait in the scope segment (`Type as Trait`)
                 // so two traits' same-named, same-signature methods on one type stay DISTINCT
                 // logical symbols instead of collapsing into one. Resolution folds the
-                // ` as Trait` marker away (`normalized_scope_path`), so the receiver surface both
+                // ` as Trait` marker away (`receiver_scope_path`), so the receiver surface both
                 // traits expose is still `Type::method` — and a call that could hit either
                 // declines as ambiguous (#567).
                 return match node.child_by_field_name("trait") {
@@ -351,7 +352,7 @@ pub(super) fn binding_scopes(from: Node<'_>) -> impl Iterator<Item = Node<'_>> {
 /// A const-generic block is carried through near-verbatim — it holds an expression whose text is
 /// part of the type, and whose `<`/`,` are not type punctuation. Only what cannot carry meaning is
 /// normalized inside it: comments, and the width of a whitespace run outside a literal.
-fn render_owner(node: Node<'_>, text: &str, binders: &[String]) -> String {
+pub(super) fn render_owner(node: Node<'_>, text: &str, binders: &[String]) -> String {
     let mut out = String::new();
     print_type(node, text, binders, Position::Type, &mut out);
     out.trim().to_string()
@@ -1085,7 +1086,7 @@ mod tests {
         // declines as ambiguous.
         for scope in &scopes {
             assert_eq!(
-                crate::index::edges::normalized_scope_path(scope, Some(Language::Rust.as_str()))
+                crate::index::edges::receiver_scope_path(scope, Some(Language::Rust.as_str()))
                     .as_ref(),
                 "W::neg",
                 "{scope} must still answer to the plain receiver surface"
@@ -1710,7 +1711,7 @@ mod tests {
     /// would give their identically-signatured methods one scope — and, with `scope_path` in the
     /// logical key, ONE logical symbol, so a memory or graph handle bound to either would answer
     /// for both. The whole trait path is what keeps them apart; `::` becomes `.` so the marker
-    /// stays a single `::`-segment for `normalized_scope_path` to fold.
+    /// stays a single `::`-segment for the scope folds to split.
     #[test]
     fn same_tailed_traits_on_one_type_keep_separate_scopes() {
         let scopes = scope_paths(
@@ -1750,7 +1751,7 @@ mod tests {
                 "the marker must stay ONE ::-segment, got {scope}"
             );
             let folded =
-                crate::index::edges::normalized_scope_path(&scope, Some(Language::Rust.as_str()));
+                crate::index::edges::receiver_scope_path(&scope, Some(Language::Rust.as_str()));
             assert_eq!(folded.as_ref(), "Worker::run", "{source} folded to {folded}");
         }
     }

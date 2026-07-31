@@ -284,6 +284,31 @@ pub(crate) fn degeneric(path: &str) -> String {
     out
 }
 
+/// `text` with every comment replaced by one space, so the tokens either side stay apart.
+///
+/// A comment is trivia the Rust lexer drops before anything sees the tokens, so any parser reading
+/// this text has to drop it too — `use crate::dep::{/* kept */ Worker};` binds `Worker`, and a leaf
+/// compared as raw text does not. Borrowed when there is nothing to strip.
+pub(crate) fn strip_comments(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("//") && !text.contains("/*") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut in_comment = false;
+    scan(text, |_, ch, _, span| match span {
+        Span::Comment =>
+            if !in_comment {
+                out.push(' ');
+                in_comment = true;
+            },
+        _ => {
+            in_comment = false;
+            out.push(ch);
+        },
+    });
+    std::borrow::Cow::Owned(out)
+}
+
 /// Peel `&`/`&mut`/`*const`/`*mut` off an owner segment.
 ///
 /// The impl scope KEEPS the wrapper — `impl Tr for W` and `impl Tr for &W` coexist, so they are

@@ -1,6 +1,7 @@
 pub(in crate::index) mod extract;
 mod helpers;
 mod imports;
+pub(crate) use imports::{ImportScope, use_binds_name};
 mod intern;
 mod resolve;
 pub(crate) mod scope_grammar;
@@ -224,6 +225,7 @@ pub(crate) struct EdgeCandidate {
     pub(in crate::index) target_qualified_name: Option<String>,
     pub(in crate::index) evidence: Option<String>,
     pub(in crate::index) receiver_hint: Option<String>,
+    pub(in crate::index) receiver_type_hint: Option<String>,
     pub(in crate::index) source_span: EdgeSpan,
     /// Byte range of the callee identifier token; see [`CalleeRange`]. `None` for non-symbol
     /// edges.
@@ -371,6 +373,7 @@ struct CompactEdge {
     target_qualified_name: OptSym,
     evidence: OptSym,
     receiver_hint: OptSym,
+    receiver_type_hint: OptSym,
     source_span: CompactSpan,
     /// Callee identifier byte range; `u32::MAX` in `callee_start_byte` is the `None` sentinel.
     callee_start_byte: u32,
@@ -509,6 +512,7 @@ impl FullRebuildGraph {
                 .intern_opt(candidate.target_qualified_name.as_deref()),
             evidence: self.arena.intern_opt(candidate.evidence.as_deref()),
             receiver_hint: self.arena.intern_opt(candidate.receiver_hint.as_deref()),
+            receiver_type_hint: self.arena.intern_opt(candidate.receiver_type_hint.as_deref()),
             source_span: CompactSpan::from_span(candidate.source_span),
             callee_start_byte,
             callee_end_byte,
@@ -538,6 +542,7 @@ pub(crate) struct EdgeSpan {
 pub(crate) struct EdgeContext {
     pub(in crate::index) target_qualified_name: Option<String>,
     pub(in crate::index) receiver_hint: Option<String>,
+    pub(in crate::index) receiver_type_hint: Option<String>,
 }
 
 impl IndexedSymbol {
@@ -608,16 +613,40 @@ mod degeneric_tests {
     }
 }
 
-/// [`degeneric_path`] plus trait-impl owner folding: the `Type as Trait` scope segment emitted
-/// for `impl Trait for Type` collapses to `Type`, so a source-form target (`Type::method`, a
-/// receiver-type hint) finds trait-impl methods while their RAW scope keeps the trait — two
-/// traits' same-named methods stay distinct logical symbols yet expose the same receiver
-/// surface, and a call that could hit either declines as ambiguous (#567). The marker's trait
-/// path is emitted with `::` rewritten to `.` (see the Rust `trait_marker`), so it is always ONE
-/// `::`-segment and per-`::`-segment splitting is sound.
-/// Borrowed ⇔ the path needs no normalization — the hot rebuild path allocates nothing for the
-/// plain-scope majority.
-pub(crate) fn normalized_scope_path<'a>(
+/// [`degeneric_path`] plus trait-impl owner folding, for a path a source file WROTE: the
+/// `Type as Trait` scope segment emitted for `impl Trait for Type` collapses to `Type`, so
+/// `Type::method` finds trait-impl methods while their RAW scope keeps the trait — two traits'
+/// same-named methods stay distinct logical symbols yet expose the same qualified surface, and a
+/// call that could hit either declines as ambiguous (#567). The marker's trait path is emitted
+/// with `::` rewritten to `.` (see the Rust `trait_marker`), so it is always ONE `::`-segment and
+/// per-`::`-segment splitting is sound.
+///
+/// The receiver WRAPPER is kept, because path syntax names one impl exactly: `W::neg` is
+/// `impl Neg for W`'s method and cannot reach `impl Neg for &W`. Peeling it would put every
+/// pointer shape of one owner on this key, and a written `W::neg` would decline as ambiguous
+/// against impls it could not have called. [`receiver_scope_path`] is the surface that peels,
+/// for the call syntax that really is ambiguous.
+///
+/// Borrowed ⇔ the fold changed nothing.
+pub(crate) fn qualified_scope_path<'a>(
+    path: &'a str,
+    language: Option<&str>,
+) -> std::borrow::Cow<'a, str> {
+    if language != Some(Language::Rust.as_str()) || (!path.contains('<') && !path.contains(" as "))
+    {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    fold_scope_path(path, scope_grammar::strip_trait_marker)
+}
+
+/// [`qualified_scope_path`] with the receiver wrappers peeled off every segment, for an INFERRED
+/// receiver hint: `&W as Neg::neg` answers to `W::neg`. An autoref call site reaches
+/// `impl Neg for W`, `for &W` and `for &mut W` alike, so a hint naming `W` has to see all of them
+/// — and decline when more than one is a candidate — instead of binding whichever impl happens to
+/// be spelled without a wrapper.
+///
+/// Borrowed ⇔ the fold changed nothing.
+pub(crate) fn receiver_scope_path<'a>(
     path: &'a str,
     language: Option<&str>,
 ) -> std::borrow::Cow<'a, str> {
@@ -629,16 +658,67 @@ pub(crate) fn normalized_scope_path<'a>(
     {
         return std::borrow::Cow::Borrowed(path);
     }
+    fold_scope_path(path, receiver_segment)
+}
+
+fn receiver_segment(segment: &str) -> &str {
+    scope_grammar::strip_receiver_wrappers(scope_grammar::strip_trait_marker(segment))
+}
+
+/// Rebuild a path from its top-level `::` segments, each put through `fold_segment`.
+///
+/// Borrowed when the result is byte-identical to the input. The `contains` guards above are a
+/// cheap prefilter, not a decision — `[u8; N as usize]::run` and `<W as a::Runs>::run` reach here
+/// and fold to themselves, and reporting those as changed would file the symbol in a normalized
+/// map under a key `by_scope_path` already holds, where it can only turn up as a duplicate
+/// candidate of itself.
+fn fold_scope_path<'a>(path: &'a str, fold_segment: fn(&str) -> &str) -> std::borrow::Cow<'a, str> {
     let degeneric = degeneric_path(path);
-    std::borrow::Cow::Owned(
-        scope_grammar::segments(&degeneric)
-            .into_iter()
-            .map(|segment| {
-                scope_grammar::strip_receiver_wrappers(scope_grammar::strip_trait_marker(segment))
-            })
-            .collect::<Vec<_>>()
-            .join("::"),
-    )
+    let folded = scope_grammar::segments(&degeneric)
+        .into_iter()
+        .map(fold_segment)
+        .collect::<Vec<_>>()
+        .join("::");
+    if folded == path { std::borrow::Cow::Borrowed(path) } else { std::borrow::Cow::Owned(folded) }
+}
+
+#[cfg(test)]
+mod scope_surface_tests {
+    use super::{Language, qualified_scope_path, receiver_scope_path};
+
+    /// A written path names one impl exactly; a method call cannot. `W::neg` must not collide with
+    /// `impl Neg for &W`, and a `W` receiver hint must reach all four pointer shapes.
+    #[test]
+    fn the_qualified_surface_keeps_the_wrapper_the_receiver_surface_peels() {
+        let rust = Some(Language::Rust.as_str());
+        for (scope, qualified, receiver) in [
+            ("W as Neg::neg", "W::neg", "W::neg"),
+            ("&W as Neg::neg", "&W::neg", "W::neg"),
+            ("&mut W as Neg::neg", "&mut W::neg", "W::neg"),
+            ("*const W as Neg::neg", "*const W::neg", "W::neg"),
+            ("SymbolIndex<'a>::build", "SymbolIndex::build", "SymbolIndex::build"),
+        ] {
+            assert_eq!(qualified_scope_path(scope, rust).as_ref(), qualified, "{scope}");
+            assert_eq!(receiver_scope_path(scope, rust).as_ref(), receiver, "{scope}");
+        }
+    }
+
+    /// `Owned` is what files a symbol under a second key, so a fold that changed nothing must say
+    /// so — the `contains` prefilter lets shapes through that fold to themselves.
+    #[test]
+    fn an_unchanged_fold_borrows() {
+        let rust = Some(Language::Rust.as_str());
+        for path in ["<W as a::Runs>::run", "[u8; N as usize]::run", "plain::run"] {
+            assert!(
+                matches!(qualified_scope_path(path, rust), std::borrow::Cow::Borrowed(_)),
+                "{path}"
+            );
+            assert!(
+                matches!(receiver_scope_path(path, rust), std::borrow::Cow::Borrowed(_)),
+                "{path}"
+            );
+        }
+    }
 }
 
 /// Name-keyed indexes over the symbol set, built once per resolve pass. Edge resolution used to
@@ -653,9 +733,13 @@ pub(crate) struct SymbolIndex<'a> {
     /// qualified path fires for methods/nested items instead of collapsing to bare-name
     /// collisions.
     by_scope_path: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
-    /// Scope path with generics stripped and trait-impl owners folded (`SymbolIndex::build`
-    /// matching `SymbolIndex<'a>::build`; `Worker::run` matching `Worker as Service::run`).
-    by_normalized_scope_path: HashMap<String, Vec<&'a IndexedSymbol>>,
+    /// Scope path with generics stripped and trait-impl owners folded, receiver wrappers KEPT —
+    /// what a written path resolves against (`SymbolIndex::build` matching
+    /// `SymbolIndex<'a>::build`; `Worker::run` matching `Worker as Service::run`).
+    by_qualified_scope_path: HashMap<String, Vec<&'a IndexedSymbol>>,
+    /// The same, with the wrappers peeled — what an inferred receiver type resolves against, where
+    /// `W`, `&W` and `*const W` are one surface.
+    by_receiver_scope_path: HashMap<String, Vec<&'a IndexedSymbol>>,
     /// Short-name fallback (`symbol.name`).
     by_name: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
     /// Candidates for the `qualified_name.ends_with("::{q}")` suffix match, keyed by the last
@@ -668,25 +752,41 @@ impl<'a> SymbolIndex<'a> {
     fn build(symbols: &'a [IndexedSymbol]) -> Self {
         let mut by_qualified: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_scope_path: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
-        let mut by_normalized_scope_path: HashMap<String, Vec<&IndexedSymbol>> = HashMap::new();
+        let mut by_qualified_scope_path: HashMap<String, Vec<&IndexedSymbol>> = HashMap::new();
+        let mut by_receiver_scope_path: HashMap<String, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_name: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_qn_tail: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         for symbol in symbols {
             by_qualified.entry(symbol.qualified_name.as_str()).or_default().push(symbol);
             by_scope_path.entry(symbol.scope_path.as_str()).or_default().push(symbol);
-            // Only paths the normalization actually changes go into the normalized map (`Owned`
-            // ⇔ changed) — a plain scope is already reachable through `by_scope_path`, and
-            // skipping it avoids one String per symbol on the hot rebuild path. Lookups consult
-            // BOTH maps.
-            if let std::borrow::Cow::Owned(normalized) =
-                normalized_scope_path(&symbol.scope_path, Some(&symbol.language))
+            // Only paths a fold actually changes get a normalized key (`Owned` ⇔ changed) — an
+            // unchanged scope is already reachable through `by_scope_path`, and skipping it keeps
+            // the plain-scope majority allocation-free on the hot rebuild path. Lookups consult
+            // `by_scope_path` PLUS the map for their own surface: the receiver fold strictly
+            // removes at least as much as the qualified one, so every symbol the qualified map
+            // holds has a changed receiver key too, and a fold that was a no-op leaves that
+            // surface's key equal to the raw `scope_path`.
+            if let std::borrow::Cow::Owned(key) =
+                qualified_scope_path(&symbol.scope_path, Some(&symbol.language))
             {
-                by_normalized_scope_path.entry(normalized).or_default().push(symbol);
+                by_qualified_scope_path.entry(key).or_default().push(symbol);
+            }
+            if let std::borrow::Cow::Owned(key) =
+                receiver_scope_path(&symbol.scope_path, Some(&symbol.language))
+            {
+                by_receiver_scope_path.entry(key).or_default().push(symbol);
             }
             by_name.entry(symbol.name.as_str()).or_default().push(symbol);
             by_qn_tail.entry(qn_tail(&symbol.qualified_name)).or_default().push(symbol);
         }
-        Self { by_qualified, by_scope_path, by_normalized_scope_path, by_name, by_qn_tail }
+        Self {
+            by_qualified,
+            by_scope_path,
+            by_qualified_scope_path,
+            by_receiver_scope_path,
+            by_name,
+            by_qn_tail,
+        }
     }
 
     /// Whether `file_id` itself defines a symbol named `name`. Import-alias rebinding defers when
@@ -700,16 +800,90 @@ impl<'a> SymbolIndex<'a> {
     }
 }
 
+/// The ONE explicit classification of a stored receiver-type hint (#567 review): computed once
+/// at request build — the only place the import scope is visible — and consumed by
+/// `resolve_symbol`, so every receiver-type rule hangs off this seam instead of independent
+/// guards. The shared rule set:
+/// - canonicalization (generics folded, `crate::`/`self::` resolved, `super::` declined) happened
+///   at EXTRACTION; the stored hint is already canonical;
+/// - `Local*` identities may resolve; tail matching is a conservative FALLBACK for a qualified
+///   local hint only, and only when the tail names exactly one viable target;
+/// - `ExternalQualified` and `Ambiguous` never resolve against local symbols — `use
+///   external::Worker; fn f(w: Worker) { w.run() }` must not bind to an unrelated local
+///   `Worker::run`, and the callee-name suppression (`imported_external` below) cannot see the TYPE
+///   (it inspects `run` and the value receiver `w`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiverTypeIdentity<'a> {
+    /// Module-qualified (`workers::Worker`) with a workspace-local root.
+    LocalQualified(&'a str),
+    /// A bare local type name (`Worker`) — nothing left to qualify.
+    LocalUnqualified(&'a str),
+    /// The root segment (or the bare name itself) names an external import.
+    ExternalQualified(&'a str),
+    /// Present but unusable evidence (empty after normalization, forms the classifier cannot
+    /// place). Never resolves, and still suppresses the bare-name fallback — unusable evidence
+    /// is not the same as no evidence.
+    Ambiguous,
+}
+
+/// Where a path root comes from, as far as the reference's import scope can tell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootOrigin {
+    /// In this workspace — a local symbol may answer to it.
+    Local,
+    /// A dependency's item; a local same-named symbol is not it.
+    External,
+    /// The scope holds conflicting answers (mutually exclusive `cfg` imports of one name), so
+    /// there is no root to act on.
+    Ambiguous,
+}
+
+impl<'a> ReceiverTypeIdentity<'a> {
+    /// Classify a stored hint against the reference's import scope; `None` when the edge carries
+    /// no hint at all. `root_origin` answers where a path segment comes from at the call site.
+    pub(crate) fn classify(
+        hint: Option<&'a str>,
+        root_origin: impl Fn(&str) -> RootOrigin,
+    ) -> Option<Self> {
+        let hint = hint?.trim();
+        if hint.is_empty() {
+            return Some(Self::Ambiguous);
+        }
+        let root = hint.split_once("::").map_or(hint, |(root, _)| root);
+        Some(match (root_origin(root), hint.contains("::")) {
+            (RootOrigin::Ambiguous, _) => Self::Ambiguous,
+            (RootOrigin::External, _) => Self::ExternalQualified(hint),
+            (RootOrigin::Local, true) => Self::LocalQualified(hint),
+            (RootOrigin::Local, false) => Self::LocalUnqualified(hint),
+        })
+    }
+}
+
 pub(crate) struct ResolveSymbolRequest<'a> {
     name: &'a str,
     target_qualified_name: Option<&'a str>,
     edge_kind: EdgeKind,
     evidence: Option<&'a str>,
     receiver_hint: Option<&'a str>,
+    receiver_type: Option<ReceiverTypeIdentity<'a>>,
     source_file_id: i64,
     source_language: Option<&'a str>,
     /// `name` is brought into this file by a `use` from an EXTERNAL dependency crate (#61 Project
     /// B). When set, the name denotes that dependency's item, so resolution must NOT bind it to a
     /// local same-named symbol — it stays unresolved (the oracle bins it `resolved-external`).
     imported_external: bool,
+    /// The package a receiver-type candidate must belong to, or `None` for no restriction.
+    ///
+    /// Set only when the hint is BARE and no `use` binds that name here. Such a type is one this
+    /// file names lexically, so its own package declares it — and a workspace where two crates
+    /// each declare a root-level `Worker` stores both members as `Worker::run`, with nothing
+    /// else in the key to tell them apart. Without this, a call on crate A's `Worker` binds
+    /// crate B's method whenever B is the only crate whose `Worker` carries that method (A's
+    /// may come from an external trait default, which mints no local symbol).
+    ///
+    /// An IMPORT-BOUND hint is deliberately unrestricted: `use sibling::Worker;` then `w.run()` is
+    /// the ordinary multi-crate idiom and its answer really does live in another package.
+    receiver_package: Option<i64>,
+    /// Candidate file → package, to apply [`Self::receiver_package`].
+    file_package: &'a HashMap<i64, i64>,
 }

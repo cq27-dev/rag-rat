@@ -21,6 +21,48 @@ fn import_scope_from_row(
     })
 }
 
+/// How a receiver hint's ROOT segment reaches this file.
+///
+/// A directly qualified external type (`std::string::String`) has no covering `use`, so the import
+/// scope alone cannot see it — the language policy's known-external roots participate too.
+fn receiver_root_origin(
+    import_scope: &ImportScope,
+    file_id: i64,
+    language: Option<&str>,
+    ref_byte: usize,
+    root: &str,
+) -> RootOrigin {
+    if import_scope.covering_roots_disagree(file_id, root, ref_byte) {
+        return RootOrigin::Ambiguous;
+    }
+    let external = import_scope.is_external_import(file_id, root, ref_byte)
+        || crate::index::languages::resolver_policy_for_name(language).is_some_and(|policy| {
+            (policy.qualified_root)(root) == crate::index::languages::QualifiedRoot::External
+        });
+    if external { RootOrigin::External } else { RootOrigin::Local }
+}
+
+/// The package a receiver hint is confined to, or `None` when it may name a type from anywhere.
+///
+/// The ROOT is the only segment an import can bind, and lexical qualification encodes no more crate
+/// identity than a bare name does: two crates each declaring `inner::Worker` store one key. So a
+/// qualified hint is restricted too unless a `use` says where it came from — `crate`/`self`/`super`
+/// are never import bindings, and they mean THIS crate, so they restrict as well.
+fn receiver_package(
+    import_scope: &ImportScope,
+    file_id: i64,
+    hint: Option<&str>,
+    ref_byte: usize,
+) -> Option<i64> {
+    hint.map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .filter(|hint| {
+            let root = hint.split_once("::").map_or(*hint, |(root, _)| root);
+            !import_scope.is_import_bound(file_id, root, ref_byte)
+        })
+        .and_then(|_| import_scope.package_of(file_id))
+}
+
 /// Apply a language package's import-alias rewrite. The shared resolver owns scope lookup and the
 /// collision guard; the policy owns which reference shapes are rewritten.
 struct ImportAliasResolveRequest<'a> {
@@ -30,6 +72,36 @@ struct ImportAliasResolveRequest<'a> {
     target_qualified_name: Option<&'a str>,
     receiver_hint: Option<&'a str>,
     ref_byte: usize,
+}
+
+/// The receiver-type hint with a RENAMING import resolved to the name the index stores.
+///
+/// `use crate::Worker as Alias;` makes `Alias` the only spelling the source has, but the method is
+/// stored under `Worker::run` — so the written hint probes a scope that cannot exist, and because a
+/// present receiver type also closes the bare-name fallback it takes the call's last chance with
+/// it. Only the ROOT segment can be an import binding, so only that is rewritten. Deferred, like
+/// the sibling name rebind, when the file itself defines the target name: two candidates for one
+/// spelling is not something this layer may choose between.
+fn alias_resolved_receiver_hint(
+    import_scope: &imports::ImportScope,
+    index: &SymbolIndex<'_>,
+    file_id: i64,
+    hint: Option<&str>,
+    ref_byte: usize,
+) -> Option<String> {
+    let hint = hint?.trim();
+    let (root, rest) = match hint.split_once("::") {
+        Some((root, rest)) => (root, Some(rest)),
+        None => (hint, None),
+    };
+    let target = import_scope.import_alias_target(file_id, root, ref_byte)?;
+    if target == root || index.file_defines(file_id, short_name(target)) {
+        return None;
+    }
+    Some(match rest {
+        Some(rest) => format!("{target}::{rest}"),
+        None => target.to_string(),
+    })
 }
 
 fn import_alias_rebind(
@@ -338,11 +410,12 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
     // rewritten; empty for the base/incremental/full-rebuild path.
     let mut stmt = conn.prepare(&format!(
         "SELECT d.id, d.source_file_id, tn.value, tqn.value, ek.value, conf.value, d.evidence, \
-         rh.value, d.source_start_byte, files.language FROM edges_data d JOIN files ON files.id = \
-         d.source_file_id LEFT JOIN name_strings tn ON tn.id = d.to_name_id LEFT JOIN \
+         rh.value, rth.value, d.source_start_byte, files.language FROM edges_data d JOIN files ON \
+         files.id = d.source_file_id LEFT JOIN name_strings tn ON tn.id = d.to_name_id LEFT JOIN \
          name_strings tqn ON tqn.id = d.target_qualified_name_id LEFT JOIN name_strings ek ON \
          ek.id = d.edge_kind_id LEFT JOIN name_strings conf ON conf.id = d.confidence_id LEFT \
-         JOIN name_strings rh ON rh.id = d.receiver_hint_id WHERE 1 = 1{} ORDER BY d.id",
+         JOIN name_strings rh ON rh.id = d.receiver_hint_id LEFT JOIN name_strings rth ON rth.id \
+         = d.receiver_type_hint_id WHERE 1 = 1{} ORDER BY d.id",
         write.files_write_predicate(),
     ))?;
     let rows = stmt.query_map([], |row| {
@@ -355,8 +428,9 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             row.get::<_, String>(5)?,
             row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<String>>(7)?,
-            row.get::<_, i64>(8)?,
-            row.get::<_, String>(9)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, String>(10)?,
         ))
     })?;
     let rows = rows.collect::<Result<Vec<_>, _>>()?;
@@ -369,6 +443,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         current_confidence,
         evidence,
         receiver_hint,
+        receiver_type_hint,
         source_start_byte,
         source_language,
     ) in rows
@@ -416,6 +491,15 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         let resolve_qualified =
             rebind.target_qualified_name.as_deref().or(target_qualified_name.as_deref());
         let resolve_receiver = rebind.receiver_hint.as_deref().or(receiver_hint.as_deref());
+        let aliased_receiver_type = alias_resolved_receiver_hint(
+            &import_scope,
+            &index,
+            source_file_id,
+            receiver_type_hint.as_deref(),
+            ref_byte,
+        );
+        let resolve_receiver_type =
+            aliased_receiver_type.as_deref().or(receiver_type_hint.as_deref());
         let resolution = resolve_symbol(
             ResolveSymbolRequest {
                 name: resolve_name,
@@ -423,6 +507,15 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                 edge_kind,
                 evidence: evidence.as_deref(),
                 receiver_hint: resolve_receiver,
+                receiver_type: ReceiverTypeIdentity::classify(resolve_receiver_type, |root| {
+                    receiver_root_origin(
+                        &import_scope,
+                        source_file_id,
+                        Some(source_language.as_str()),
+                        ref_byte,
+                        root,
+                    )
+                }),
                 source_file_id,
                 source_language: Some(source_language.as_str()),
                 imported_external: import_scope.is_external_import(
@@ -434,6 +527,13 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                     target_qualified_name.as_deref(),
                     ref_byte,
                 ),
+                receiver_package: receiver_package(
+                    &import_scope,
+                    source_file_id,
+                    receiver_type_hint.as_deref(),
+                    ref_byte,
+                ),
+                file_package: import_scope.file_packages(),
             },
             &index,
         );
@@ -618,6 +718,7 @@ pub(crate) fn resolve_and_insert_edges(
         let target_qualified_name = arena.get_opt(candidate.target_qualified_name);
         let evidence = arena.get_opt(candidate.evidence);
         let receiver_hint = arena.get_opt(candidate.receiver_hint);
+        let receiver_type_hint = arena.get_opt(candidate.receiver_type_hint);
         // The reference's byte position drives the module-aware covering test (#61) — same input
         // the DB driver reads from `source_start_byte`.
         let ref_byte = candidate.source_span.start_byte as usize;
@@ -638,6 +739,14 @@ pub(crate) fn resolve_and_insert_edges(
         let resolve_name = rebind.name.as_deref().unwrap_or(to_name);
         let resolve_qualified = rebind.target_qualified_name.as_deref().or(target_qualified_name);
         let resolve_receiver = rebind.receiver_hint.as_deref().or(receiver_hint);
+        let aliased_receiver_type = alias_resolved_receiver_hint(
+            &import_scope,
+            &index,
+            *file_id,
+            receiver_type_hint,
+            ref_byte,
+        );
+        let resolve_receiver_type = aliased_receiver_type.as_deref().or(receiver_type_hint);
         // #200: a `dispatch_construct` fact's `to_name` is a synthetic `Enum::Variant` key, not a
         // real target — never resolve it (synthesis reads only its `from_symbol_id`). Mirrors the
         // incremental driver's skip; `dispatch_handle` DOES resolve (synthesis needs its handler
@@ -652,6 +761,15 @@ pub(crate) fn resolve_and_insert_edges(
                     edge_kind: candidate.edge_kind,
                     evidence,
                     receiver_hint: resolve_receiver,
+                    receiver_type: ReceiverTypeIdentity::classify(resolve_receiver_type, |root| {
+                        receiver_root_origin(
+                            &import_scope,
+                            *file_id,
+                            file_language.get(file_id).map(String::as_str),
+                            ref_byte,
+                            root,
+                        )
+                    }),
                     source_file_id: *file_id,
                     source_language: file_language.get(file_id).map(String::as_str),
                     imported_external: import_scope.is_external_import(
@@ -663,6 +781,13 @@ pub(crate) fn resolve_and_insert_edges(
                         target_qualified_name,
                         ref_byte,
                     ),
+                    receiver_package: receiver_package(
+                        &import_scope,
+                        *file_id,
+                        receiver_type_hint,
+                        ref_byte,
+                    ),
+                    file_package: import_scope.file_packages(),
                 },
                 &index,
             )
@@ -710,6 +835,7 @@ pub(crate) fn resolve_and_insert_edges(
         let to_name_id = interner.get(conn, to_name)?;
         let target_qualified_name_id = interner.get_opt(conn, target_qualified_name)?;
         let receiver_hint_id = interner.get_opt(conn, receiver_hint)?;
+        let receiver_type_hint_id = interner.get_opt(conn, receiver_type_hint)?;
         let edge_kind_id = interner.get(conn, candidate.edge_kind.as_str())?;
         let confidence_id = interner.get(conn, confidence.as_str())?;
         let resolution_id = interner.get(conn, reason)?;
@@ -717,7 +843,7 @@ pub(crate) fn resolve_and_insert_edges(
             "
             INSERT INTO edges_data(
                 source_file_id, from_symbol_id, from_name_id, to_name_id,
-                target_qualified_name_id, evidence, receiver_hint_id,
+                target_qualified_name_id, evidence, receiver_hint_id, receiver_type_hint_id,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 callee_start_byte, callee_end_byte,
                 import_scope_start_byte, import_scope_end_byte, import_mod_id,
@@ -725,7 +851,7 @@ pub(crate) fn resolve_and_insert_edges(
                 to_symbol_id, target_start_line, target_end_line, resolution_id, hidden
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23)
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24)
             ",
         )?
         .execute(params![
@@ -736,6 +862,7 @@ pub(crate) fn resolve_and_insert_edges(
             target_qualified_name_id,
             evidence,
             receiver_hint_id,
+            receiver_type_hint_id,
             i64::from(candidate.source_span.start_line),
             i64::from(candidate.source_span.end_line),
             i64::from(candidate.source_span.start_byte),
@@ -807,6 +934,141 @@ pub(crate) fn resolve_symbol<'a>(
     }) {
         return None;
     }
+    // The receiver-type identity is classified ONCE at request build (see
+    // [`ReceiverTypeIdentity`]): only Local identities resolve here — External and Ambiguous
+    // never bind to local symbols. A qualified local hint additionally earns the conservative
+    // tail fallback below; a bare one IS its own tail.
+    let has_local_receiver_type = matches!(
+        request.receiver_type,
+        Some(ReceiverTypeIdentity::LocalQualified(_) | ReceiverTypeIdentity::LocalUnqualified(_))
+    );
+    let receiver_type = match request.receiver_type {
+        Some(ReceiverTypeIdentity::LocalQualified(path)) => Some((path, true)),
+        Some(ReceiverTypeIdentity::LocalUnqualified(name)) => Some((name, false)),
+        Some(ReceiverTypeIdentity::ExternalQualified(_) | ReceiverTypeIdentity::Ambiguous)
+        | None => None,
+    };
+    if let Some((type_hint, qualified)) = receiver_type {
+        let target = format!("{type_hint}::{}", request.name);
+        let target_normalized = receiver_scope_path(&target, request.source_language);
+        // A bare, non-import-bound receiver names this package's own type, and `Worker::run` is
+        // the same stored key in every crate that has one. Keep the answer inside the package so a
+        // sibling crate's same-named method cannot claim the call. `None` (qualified, imported, or
+        // a corpus with no package map) leaves every candidate eligible.
+        let in_receiver_package = |symbol: &IndexedSymbol| match request.receiver_package {
+            Some(package) => request.file_package.get(&symbol.file_id) == Some(&package),
+            None => true,
+        };
+
+        // One receiver target, two surfaces. Exact: the raw scope map (reason `receiver_type`).
+        // Normalized: BOTH maps — plain-scope symbols live only in `by_scope_path` (skipped when
+        // the target needed no normalization: that key was just tried), fold-changed symbols
+        // (generics, trait-impl owners, receiver wrappers) only in `by_receiver_scope_path`
+        // (reason `scope_degeneric`). This stage folds the ` as Trait` marker AND the receiver
+        // wrapper away, because the hint comes from a value receiver and autoref cannot tell
+        // `impl Tr for W` from `for &W`. Two traits' same-named methods on one type, and one
+        // trait's methods on several pointer shapes of one owner, therefore meet on this surface
+        // as DISTINCT logical symbols and decline as ambiguous.
+        let try_scope = |target: &str| -> Option<(&'a IndexedSymbol, &'static str)> {
+            let scope_exact = index
+                .by_scope_path
+                .get(target)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|symbol| kind_matches(symbol) && in_receiver_package(symbol))
+                .collect::<Vec<_>>();
+            match scope_exact.as_slice() {
+                [symbol] => return Some((*symbol, "receiver_type")),
+                [_, ..] if same_logical_symbol(&scope_exact) =>
+                    return Some((scope_exact[0], "receiver_type")),
+                _ => {},
+            }
+            // Reaching here means the exact stage found NOTHING or found an AMBIGUITY. Dropping
+            // the raw candidates as "already tried" hides that ambiguity: two crates' plain
+            // `Worker::run` plus one `impl Service for Worker` would leave the trait impl looking
+            // like the unique normalized winner, and a typed call would bind it instead of
+            // declining. A genuinely unique exact hit already returned, so nothing double-counts.
+            let target_normalized = receiver_scope_path(target, request.source_language);
+            let scope_normalized = index
+                .by_scope_path
+                .get(target_normalized.as_ref())
+                .into_iter()
+                .flatten()
+                .chain(
+                    index
+                        .by_receiver_scope_path
+                        .get(target_normalized.as_ref())
+                        .into_iter()
+                        .flatten(),
+                )
+                .copied()
+                .filter(|symbol| kind_matches(symbol) && in_receiver_package(symbol))
+                .collect::<Vec<_>>();
+            match scope_normalized.as_slice() {
+                [symbol] => Some((*symbol, "scope_degeneric")),
+                [_, ..] if same_logical_symbol(&scope_normalized) =>
+                    Some((scope_normalized[0], "scope_degeneric")),
+                _ => None,
+            }
+        };
+
+        if let Some((symbol, reason)) = try_scope(&target) {
+            return Some((symbol, EdgeConfidence::Syntactic, reason));
+        }
+        // Conservative tail FALLBACK, for a PROVEN-LOCAL qualified hint only (#567 review): a
+        // module-qualified hint (`workers::Worker`) rarely equals a container-based scope
+        // (`Worker::run`) verbatim, so retry with the type's tail — `try_scope` still requires
+        // the tail to name exactly one viable target (or one logical symbol's variants), so this
+        // never widens into guessing.
+        if qualified {
+            let tail_target = format!("{}::{}", qn_tail(type_hint), request.name);
+            if let Some((symbol, reason)) = try_scope(&tail_target) {
+                return Some((symbol, EdgeConfidence::Syntactic, reason));
+            }
+        }
+
+        // A suffix retry is meaningful only for an already-qualified LOCAL identity. Applying it
+        // to a bare root-module `Worker` would let it bind `inner::Worker::run`, undoing the
+        // lexical canonicalization that keeps same-tail owners isolated.
+        if qualified {
+            let scope_suffix = format!("::{target}");
+            let scope_normalized_suffix = format!("::{target_normalized}");
+            let receiver_suffix_matches = index
+                .by_name
+                .get(short_name(request.name))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|symbol| {
+                    kind_matches(symbol)
+                        && in_receiver_package(symbol)
+                        && (symbol.scope_path.ends_with(&scope_suffix)
+                            || receiver_scope_path(&symbol.scope_path, Some(&symbol.language))
+                                .ends_with(&scope_normalized_suffix))
+                })
+                .collect::<Vec<_>>();
+            match receiver_suffix_matches.as_slice() {
+                [symbol] => {
+                    let reason = if symbol.scope_path.ends_with(&scope_suffix) {
+                        "receiver_type"
+                    } else {
+                        "scope_degeneric"
+                    };
+                    return Some((*symbol, EdgeConfidence::Syntactic, reason));
+                },
+                [_, ..] if same_logical_symbol(&receiver_suffix_matches) => {
+                    let reason = if receiver_suffix_matches[0].scope_path.ends_with(&scope_suffix) {
+                        "receiver_type"
+                    } else {
+                        "scope_degeneric"
+                    };
+                    return Some((receiver_suffix_matches[0], EdgeConfidence::Syntactic, reason));
+                },
+                _ => {},
+            }
+        }
+    }
     if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
         // Semantic SCOPE-PATH match first (#61). An edge's `target_qualified_name` is a source-code
         // path (`Workspace::new`), which aligns with a symbol's `scope_path`
@@ -838,11 +1100,15 @@ pub(crate) fn resolve_symbol<'a>(
         // Reaching here means the exact stage found NOTHING or found an AMBIGUITY. Either way the
         // raw candidates at the normalized key belong in this set: when normalization was a no-op
         // they ARE the exact stage's candidates, and dropping them as "already tried" would let a
-        // single normalization-only match (`&W as Tr::run` folding to `W::run`) win as a unique
+        // single normalization-only match (`W as Tr::run` folding to `W::run`) win as a unique
         // `scope_degeneric` over two raw `W::run` definitions the exact stage correctly refused
         // to choose between. Re-including them is what keeps that ambiguity visible; a genuinely
         // unique exact hit already returned above, so nothing is double-counted.
-        let qualified_normalized = normalized_scope_path(qualified, request.source_language);
+        //
+        // `target_qualified_name` is text the source WROTE, so this surface keeps the receiver
+        // wrapper: `W::neg` names `impl Neg for W`'s method and could never have reached
+        // `impl Neg for &W`, hence `by_qualified_scope_path` rather than the receiver map.
+        let qualified_normalized = qualified_scope_path(qualified, request.source_language);
         let scope_normalized = index
             .by_scope_path
             .get(qualified_normalized.as_ref())
@@ -850,7 +1116,7 @@ pub(crate) fn resolve_symbol<'a>(
             .flatten()
             .chain(
                 index
-                    .by_normalized_scope_path
+                    .by_qualified_scope_path
                     .get(qualified_normalized.as_ref())
                     .into_iter()
                     .flatten(),
@@ -918,6 +1184,38 @@ pub(crate) fn resolve_symbol<'a>(
             return None;
         }
     }
+    // A typed receiver that did not match its owner is negative evidence for repository-wide
+    // bare-name resolution. A qualified target still gets its stronger scope-path pass above,
+    // which preserves `self.default_method()` calls in traits without letting `Worker::run`
+    // drift onto an unrelated same-tail owner.
+    //
+    // `self`/`Self` is the ONE case that must still reach here: a trait's default method is
+    // owned by the trait, not by the impl type the receiver hint names, so no scope pass above
+    // can find it. That escape hatch used to re-open the WHOLE bare-name pool, which is how
+    // `self.clone()` in a `#[derive(Clone)]` type — where the derive mints no symbol to find —
+    // bound the single unrelated `clone` body anywhere in the workspace. The receiver type is
+    // still evidence when it fails: it rules out any candidate that a DIFFERENT concrete type
+    // demonstrably owns. `receiver_type_admits_owner` below is that filter.
+    let trait_self_fallback = request.source_language == Some(Language::Rust.as_str())
+        && matches!(request.receiver_hint, Some("self" | "Self"));
+    // ANY receiver-type identity closes this door, not only a local one. An `ExternalQualified`
+    // receiver proves the owner is a dependency's, so no local symbol can be the answer — that is
+    // the whole point of classifying it — and `Ambiguous` is unusable evidence, which is still not
+    // the same as no evidence. Gating on `has_local_receiver_type` let both fall through to
+    // repo-wide bare-name matching, where `use dep::Worker; fn f(w: Worker) { w.run(); }` bound
+    // whatever unique local `run` existed.
+    if request.receiver_type.is_some() && !trait_self_fallback {
+        return None;
+    }
+    let receiver_owner_tail = has_local_receiver_type
+        .then(|| match request.receiver_type {
+            Some(
+                ReceiverTypeIdentity::LocalQualified(path)
+                | ReceiverTypeIdentity::LocalUnqualified(path),
+            ) => Some(qn_tail(path)),
+            _ => None,
+        })
+        .flatten();
     let short = short_name(request.name);
     // A reference that carried a qualifier or a receiver has already had its qualified shape tried
     // above; reaching the bare-name fallback means that shape found nothing. Some target kinds are
@@ -925,8 +1223,11 @@ pub(crate) fn resolve_symbol<'a>(
     // shorthand `.idle`), so binding one to a qualified/receiver-bearing reference here would
     // manufacture a dependency the source never expressed — `client.idle()` becoming a "caller" of
     // `enum Status { case idle }`. Let the language policy exclude those kinds from this fallback.
+    // ANY receiver-type identity — including Ambiguous — suppresses the bare fallback: unusable
+    // evidence is not the same as no evidence.
     let reference_is_bare = request.target_qualified_name.is_none_or(str::is_empty)
-        && request.receiver_hint.is_none_or(str::is_empty);
+        && request.receiver_hint.is_none_or(str::is_empty)
+        && request.receiver_type.is_none();
     let bare_shape_ok = |symbol: &IndexedSymbol| {
         reference_is_bare
             || !policy.is_some_and(|policy| {
@@ -940,7 +1241,11 @@ pub(crate) fn resolve_symbol<'a>(
         .into_iter()
         .flatten()
         .copied()
-        .filter(|symbol| kind_matches(symbol) && bare_shape_ok(symbol))
+        .filter(|symbol| {
+            kind_matches(symbol)
+                && bare_shape_ok(symbol)
+                && receiver_type_admits_owner(receiver_owner_tail, symbol, index)
+        })
         .collect::<Vec<_>>();
     let preferred = preferred_matches(request.edge_kind, request.source_language, &matches);
     // Language policy decides whether a type-position reference may bind a value declaration.
@@ -982,6 +1287,52 @@ pub(crate) fn resolve_symbol<'a>(
         [] => None,
     }
 }
+/// Whether a bare-name candidate is compatible with a receiver type that failed the scope passes.
+///
+/// `None` (no local receiver type) admits everything — the fallback is unchanged for references
+/// that carried no type evidence. With a receiver type, a candidate is admitted only when its
+/// scope does not name a CONFLICTING concrete owner:
+/// - a trait-impl scope (`Type as Trait::method`) is admitted only when `Type` is the receiver's
+///   own type, because `Other as Trait::method` is demonstrably a different type's impl;
+/// - an UNMARKED scope (`WorkerExt::run`) is a trait's own default method or a concrete type's
+///   inherent one, and the string alone cannot tell those apart. So the index is asked what the
+///   owner name IS: a trait admits, since the receiver may implement it, while a struct or enum
+///   that is not the receiver owns its method as demonstrably as a marked impl would. An owner this
+///   index does not know (an external trait) still admits, which is where the fallback started.
+///
+/// This is what keeps the `self`/`Self` escape hatch from re-opening the whole pool. Tails are
+/// compared (not full paths) because the hint is canonicalized per-file while the scope is a
+/// container chain — matching the tolerance the tail retry above already applies.
+fn receiver_type_admits_owner(
+    receiver_owner_tail: Option<&str>,
+    symbol: &IndexedSymbol,
+    index: &SymbolIndex<'_>,
+) -> bool {
+    let Some(receiver_tail) = receiver_owner_tail else {
+        return true;
+    };
+    let Some((owner, _)) = symbol.scope_path.rsplit_once("::") else {
+        return true;
+    };
+    if let Some((concrete_owner, _)) = owner.split_once(" as ") {
+        return qn_tail(concrete_owner.trim_end()) == receiver_tail;
+    }
+    let owner_tail = qn_tail(owner);
+    if owner_tail == receiver_tail {
+        return true;
+    }
+    let mut names_a_trait = false;
+    let mut names_a_type = false;
+    for owner_symbol in index.by_name.get(owner_tail).into_iter().flatten() {
+        match owner_symbol.kind.as_str() {
+            "trait" => names_a_trait = true,
+            "struct" | "enum" | "union" | "impl" => names_a_type = true,
+            _ => {},
+        }
+    }
+    names_a_trait || !names_a_type
+}
+
 /// Whether a set of same-name candidate symbols are all the SAME logical symbol — so the resolver
 /// may pick `matches[0]` and label it `Syntactic` (`logical_variant`) instead of bailing on
 /// ambiguity. This must hold ONLY for genuine variants of one item (e.g. a forward declaration +

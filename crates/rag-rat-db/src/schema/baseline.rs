@@ -201,6 +201,7 @@ pub fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             -- the lazy-materialization candidate (#79 step 3), which wants the raw text local.
             evidence TEXT,
             receiver_hint_id INTEGER,
+            receiver_type_hint_id INTEGER,
             resolution_id INTEGER NOT NULL,
             callee_start_byte INTEGER,
             callee_end_byte INTEGER,

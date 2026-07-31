@@ -534,12 +534,20 @@ pub(crate) struct ChunkAnchor {
 pub(crate) struct EdgeAnchor {
     edge_id: i64,
     fingerprint: String,
+    /// The pre-#567 8-field compatibility fingerprint. Present for every live edge because a
+    /// legacy binding cannot encode whether receiver inference would produce a hint today.
+    legacy_fingerprint: Option<String>,
+    /// The lookup matched the compatibility fingerprint rather than the current versioned
+    /// identity. Validation must demote this to relocated: legacy identity cannot prove the
+    /// receiver owner stayed unchanged.
+    matched_legacy_fingerprint: bool,
     path: String,
     start_line: i64,
     end_line: i64,
     source_hash: String,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct EdgeFingerprintParts<'a> {
     path: &'a str,
     start_line: i64,
@@ -549,6 +557,15 @@ pub(crate) struct EdgeFingerprintParts<'a> {
     edge_kind: &'a str,
     target_qualified_name: Option<&'a str>,
     receiver_hint: Option<&'a str>,
+    /// Rust-only conservative receiver type inference (`recv.run()` → `Alpha`/`Beta`, #567):
+    /// deliberately excluded from every LOOSE identity (`LiveEdgeMatch`, `CallPathEdge`,
+    /// `live_edges_matching_identities`'s identity tuple) so a receiver-type-driven re-resolution
+    /// still relocates rather than going `gone`, mirroring `receiver_hint`. It DOES participate in
+    /// the stable fingerprint so re-resolution to a different method target (Alpha::run →
+    /// Beta::run) is detected as a change instead of silently validating `current` against a stale
+    /// target. NULL/empty is folded away in `edge_fingerprint` so every pre-existing fingerprint
+    /// (computed before this field existed) is preserved byte-for-byte.
+    receiver_type_hint: Option<&'a str>,
 }
 
 #[cfg(test)]

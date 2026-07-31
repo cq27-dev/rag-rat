@@ -1651,7 +1651,7 @@ fn migration_095_records_the_table_spec_version() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(recorded, 1, "the forward migration records V095");
+    assert_eq!(recorded, 1, "the forward migration records V096");
 
     // `schema::apply` is the `index --full` recovery, and it re-runs the WHOLE ladder over an
     // EXISTING store — so V093 would re-add the column V095 replaced, and V095 can only restore its
@@ -1697,7 +1697,7 @@ fn migration_095_records_the_table_spec_version() {
 #[test]
 fn migration_093_adds_table_sync_projection_state() {
     // Absence is asserted against the PRE-V093 DDL in isolation, never against the full ladder
-    // (which now ends at V093 and would make the check vacuous).
+    // (which runs past V093 and would make the check vacuous).
     let bare = rusqlite::Connection::open_in_memory().unwrap();
     schema::migrations::apply_table_sync_tables(&bare).unwrap();
     assert!(
@@ -1760,6 +1760,29 @@ fn migration_093_adds_table_sync_projection_state() {
         )
         .unwrap();
     assert_eq!(recorded, 1, "the forward migration records V093");
+}
+
+/// V100 (#976) adds receiver_type_hint_id to edges_data and updates the edges view.
+#[test]
+fn migration_100_receiver_type_hint_interning() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 100, "move this pin with the next schema migration");
+
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&bare, &crate::index::migration_hooks()).unwrap();
+    schema::migrations::apply_receiver_type_hint_interning(&bare).unwrap();
+    schema::migrations::apply_receiver_type_hint_interning(&bare).expect("replay is a no-op");
+    assert!(schema::column_exists(&bare, "edges_data", "receiver_type_hint_id").unwrap());
+
+    assert_eq!(schema::status(&bare).unwrap().current_version, 100);
+    let recorded: i64 = bare
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version
+              WHERE id = '100_receiver_type_hint_interning'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V099");
 }
 
 /// V091 (#949) tracks the live key-target count each invite reservation covers, so fold-time
@@ -1987,8 +2010,7 @@ fn migration_094_tracks_lens_enrichment_changes_in_constant_time() {
 /// binary that did not do the work.
 #[test]
 fn migration_097_records_the_same_ladder_entry_on_every_platform() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 99, "move this pin with the next schema migration");
-
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 100, "move this pin with the next schema migration");
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     let status = schema::status(&conn).unwrap();

@@ -434,15 +434,37 @@ fn indexes_real_world_rust_graph_patterns() {
     // ambiguous (NameOnly) (#61 scope-path resolution).
     assert_edge(&db, "entry", "new", "calls_name", "Exact");
     assert_edge(&db, "entry", "Client", "references_type", "Syntactic");
-    assert_edge(&db, "drive", "serve", "calls_name", "NameOnly");
+    assert_edge(&db, "drive", "serve", "calls_name", "Syntactic");
     assert_edge(&db, "drive", "GenericRunner", "references_type", "Syntactic");
     assert_edge(&db, "Worker", "Service", "implements", "Syntactic");
     assert_edge(&db, "generic_call", "T", "references_type", "NameOnly");
     assert_edge(&db, "entry", "generated_call", "uses_macro", "NameOnly");
+    let (receiver_hint, receiver_type_hint, resolution): (Option<String>, Option<String>, String) =
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT e.receiver_hint, e.receiver_type_hint, e.resolution
+                 FROM edges e
+                 WHERE COALESCE(e.from_name, '') LIKE '%drive%'
+                   AND e.to_name = 'serve' AND e.edge_kind = 'calls_name'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(receiver_hint.as_deref(), Some("worker"));
+    assert_eq!(receiver_type_hint.as_deref(), Some("Worker"));
+    // `serve` lives in a TRAIT impl, so its raw scope carries the trait marker
+    // (`Worker as Service::serve`) and the hint target `Worker::serve` binds through the
+    // normalized surface — hence `scope_degeneric`, not the exact-scope `receiver_type`.
+    assert_eq!(resolution, "scope_degeneric");
     let syntactic_callers = db.find_callers("serve", 10).unwrap();
     assert!(
-        syntactic_callers.is_empty(),
-        "syntactic serve callers should avoid receiver/name fallback: {syntactic_callers:?}"
+        syntactic_callers.iter().any(|edge| {
+            edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("drive"))
+                && edge.confidence == "syntactic"
+                && edge.verified_target_symbol
+        }),
+        "syntactic serve callers now resolved via receiver type hint: {syntactic_callers:?}"
     );
     let callers = db
         .find_callers_with_options("serve", 10, &rag_rat_query::graph::GraphTraversalOptions {
@@ -2049,6 +2071,255 @@ fn papertrail_sync_caches_rationale_without_query_time_crawling() {
     assert!(papertrail.evidence.iter().all(|item| {
         matches!(item.evidence_kind, "historical_tracker" | "literal_tracker_ref")
     }));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The stable-id collision shape: cfg variants of a GENERIC impl with different binder names
+/// (`impl<A>` / `impl<B>`) plus an inherent method whose raw scope sorts BETWEEN the two trait
+/// rows (`Foo<A> as Runs::f` < `Foo<A>::f` < `Foo<B> as Runs::f`). Grouping compares the
+/// degeneric scope, so both trait rows carry one key — but under the raw SQL order they were
+/// non-adjacent, the group split, and the second half re-derived the same stable id straight
+/// into a `logical_symbols.id` UNIQUE violation.
+#[test]
+fn cfg_variant_generic_impls_rebuild_without_id_collisions() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct Foo<T>(T);
+
+pub trait Runs {
+    fn f(&self);
+}
+
+#[cfg(feature = "alpha")]
+impl<A> Foo<A> {
+    pub fn f(&self) {}
+}
+
+#[cfg(not(feature = "alpha"))]
+impl<B> Foo<B> {
+    pub fn f(&self) {}
+}
+
+#[cfg(feature = "alpha")]
+impl<A> Runs for Foo<A> {
+    fn f(&self) {}
+}
+
+#[cfg(not(feature = "alpha"))]
+impl<B> Runs for Foo<B> {
+    fn f(&self) {}
+}
+"#,
+    )
+    .unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Binder names fold away: the two inherent variants are ONE logical symbol, the two trait
+    // variants another — two distinct groups, four members.
+    let (groups, members): (i64, i64) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(DISTINCT m.logical_symbol_id), COUNT(*)
+             FROM logical_symbol_members m
+             JOIN symbols s ON s.id = m.symbol_id
+             WHERE s.name = 'f'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((groups, members), (2, 4), "two binder-folded groups covering all four variants");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn logical_symbol_grouping_preserves_rust_method_owners() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub trait Worker {
+    fn run(&self);
+}
+
+pub struct Alpha;
+
+impl Alpha {
+    pub fn new() -> Self { Alpha }
+}
+
+impl Worker for Alpha {
+    fn run(&self) {}
+}
+
+pub struct Beta;
+
+impl Beta {
+    pub fn new() -> Self { Beta }
+}
+
+impl Worker for Beta {
+    fn run(&self) {}
+}
+
+impl Alpha {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn process(&self) {}
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn process(&self) {}
+}
+
+pub fn call_alpha() {
+    Alpha::new();
+}
+"#,
+    )
+    .unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // 1. Alpha::new vs Beta::new with identical signatures must yield distinct logical symbols
+    let new_lookup = db
+        .symbol_candidates(
+            &rag_rat_query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("new".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            },
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(new_lookup.candidates.len(), 2, "2 candidates for new");
+    let scope_path = |symbol_id: i64| {
+        db.storage
+            .connection()
+            .query_row("SELECT scope_path FROM symbols WHERE id = ?1", [symbol_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+    };
+    let alpha_new = new_lookup
+        .candidates
+        .iter()
+        .find(|candidate| scope_path(candidate.symbol_id) == "Alpha::new")
+        .expect("Alpha::new candidate");
+    let beta_new = new_lookup
+        .candidates
+        .iter()
+        .find(|candidate| scope_path(candidate.symbol_id) == "Beta::new")
+        .expect("Beta::new candidate");
+    assert_ne!(
+        alpha_new.logical_symbol_id, beta_new.logical_symbol_id,
+        "Alpha::new and Beta::new must have distinct logical_symbol_ids"
+    );
+
+    // 2. Same-named methods in impl Trait for Alpha vs impl Trait for Beta
+    let run_lookup = db
+        .symbol_candidates(
+            &rag_rat_query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("run".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            },
+            false,
+        )
+        .unwrap();
+
+    assert_eq!(run_lookup.candidates.len(), 2, "2 candidates for run");
+    // Trait impls carry the trait marker in their raw scope (`Type as Trait::method`): the
+    // implementing type stays the owner for receiver matching (the resolver folds the marker
+    // away), while the trait keeps same-signature methods from TWO traits on one type apart.
+    let alpha_run = run_lookup
+        .candidates
+        .iter()
+        .find(|candidate| scope_path(candidate.symbol_id) == "Alpha as Worker::run")
+        .expect("impl Worker for Alpha must own its method as `Alpha as Worker`");
+    let beta_run = run_lookup
+        .candidates
+        .iter()
+        .find(|candidate| scope_path(candidate.symbol_id) == "Beta as Worker::run")
+        .expect("impl Worker for Beta must own its method as `Beta as Worker`");
+    assert_ne!(
+        alpha_run.logical_symbol_id, beta_run.logical_symbol_id,
+        "impl Worker for Alpha vs impl Worker for Beta must have distinct logical_symbol_ids"
+    );
+
+    // 3. cfg variants on the same owner still group
+    let alpha_process_lookup = db
+        .symbol_candidates(
+            &rag_rat_query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("process".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        alpha_process_lookup.candidates.len(),
+        2,
+        "cfg variants on the same owner must remain grouped"
+    );
+    assert_eq!(
+        alpha_process_lookup.candidates[0].logical_symbol_id,
+        alpha_process_lookup.candidates[1].logical_symbol_id,
+        "cfg variants on same owner share logical_symbol_id"
+    );
+
+    // 4. Exact logical lookup/caller behavior not crossing owners
+    let alpha_new_callers = db
+        .find_callers_with_options("Alpha::new", 10, &rag_rat_query::graph::GraphTraversalOptions {
+            resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
+            symbol_id: Some(alpha_new.symbol_id),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let beta_new_callers = db
+        .find_callers_with_options("Beta::new", 10, &rag_rat_query::graph::GraphTraversalOptions {
+            resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
+            symbol_id: Some(beta_new.symbol_id),
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(
+        alpha_new_callers
+            .iter()
+            .any(|edge| { edge.from_symbol.as_deref().is_some_and(|s| s.contains("call_alpha")) }),
+        "call_alpha calls Alpha::new"
+    );
+    assert!(
+        beta_new_callers
+            .iter()
+            .all(|edge| { !edge.from_symbol.as_deref().is_some_and(|s| s.contains("call_alpha")) }),
+        "call_alpha must not appear as a caller of Beta::new"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

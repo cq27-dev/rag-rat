@@ -260,6 +260,9 @@ fn path_dependency_is_in_corpus(manifest_dir: &Path, path: &str, root: &Path) ->
 /// no specific binding (the names it brings in are unknowable, so it fails open — suppresses
 /// nothing).
 pub(crate) fn parse_use(use_text: &str) -> Option<(String, Vec<String>)> {
+    // Comments are lexer trivia, so nothing downstream of the tokens may see them; a leaf compared
+    // as raw text otherwise reads `/* kept */ Worker` and reports `Worker` unbound.
+    let use_text = super::scope_grammar::strip_comments(use_text);
     let rest = strip_use_visibility(use_text.trim())?;
     let tree = rest.strip_suffix(';').unwrap_or(rest).trim();
     // Drop a leading path separator (`use ::external::X;`) so the root is `external`, not empty.
@@ -276,6 +279,90 @@ pub(crate) fn parse_use(use_text: &str) -> Option<(String, Vec<String>)> {
     Some((root.to_string(), leaves))
 }
 
+/// Whether a Rust `use` statement binds one exact name, without allocating the full leaf list.
+/// Receiver inference asks a membership question on a hot per-call path; rebuilding
+/// [`parse_use`]'s `Vec<String>` there multiplied work by every inferred method call.
+pub(crate) fn use_binds_name(use_text: &str, name: &str) -> bool {
+    let use_text = super::scope_grammar::strip_comments(use_text);
+    let Some(rest) = strip_use_visibility(use_text.trim()) else { return false };
+    let tree = rest.strip_suffix(';').unwrap_or(rest).trim();
+    let tree = tree.strip_prefix("::").unwrap_or(tree);
+    use_tree_binds_name(tree, name)
+}
+
+fn use_tree_binds_name(tree: &str, name: &str) -> bool {
+    let tree = tree.trim();
+    match tree.find('{') {
+        None => single_use_binds_name(tree, name),
+        Some(open) => {
+            let prefix = tree[..open].trim_end().trim_end_matches(':');
+            use_group_binds_name(brace_inner(&tree[open..]), prefix, name)
+        },
+    }
+}
+
+fn single_use_binds_name(path: &str, name: &str) -> bool {
+    if let Some(alias) = alias_of(path) {
+        return alias != "_" && alias == name;
+    }
+    path.rsplit("::")
+        .next()
+        .map(str::trim)
+        .is_some_and(|leaf| !matches!(leaf, "" | "*" | "self") && leaf == name)
+}
+
+/// The name a `use … as Alias` rebinds to, if the path carries a rename.
+///
+/// `as` is a TOKEN, so any Rust whitespace separates it — a `use dep::Worker as\n    Alias;`
+/// wrapped by a formatter is the same rename as the one-line spelling. Matching the literal `" as
+/// "` missed it and reported the alias unbound, which let a receiver annotated with it look local
+/// and bind an unrelated same-named method instead of being suppressed as external.
+fn alias_of(path: &str) -> Option<&str> {
+    let mut at = 0usize;
+    while let Some(found) = path[at..].find("as") {
+        let start = at + found;
+        let end = start + 2;
+        // Whitespace on BOTH sides, or this is not the keyword — `Chars::as_str` holds one, and a
+        // path segment could end in it.
+        let separated = path[..start].chars().next_back().is_some_and(char::is_whitespace)
+            && path[end..].chars().next().is_some_and(char::is_whitespace);
+        if separated {
+            let alias = path[end..].trim();
+            return (!alias.is_empty()).then_some(alias);
+        }
+        at = end;
+    }
+    None
+}
+
+fn use_group_binds_name(inner: &str, prefix: &str, name: &str) -> bool {
+    let mut depth = 0u32;
+    let mut start = 0usize;
+    for (index, byte) in inner.bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                if use_group_entry_binds_name(&inner[start..index], prefix, name) {
+                    return true;
+                }
+                start = index + 1;
+            },
+            _ => {},
+        }
+    }
+    use_group_entry_binds_name(&inner[start..], prefix, name)
+}
+
+fn use_group_entry_binds_name(entry: &str, prefix: &str, name: &str) -> bool {
+    let entry = entry.trim();
+    if entry == "self" {
+        prefix.rsplit("::").next().is_some_and(|parent| parent == name)
+    } else {
+        !entry.is_empty() && use_tree_binds_name(entry, name)
+    }
+}
+
 /// Strip an optional leading visibility modifier and the `use ` keyword, returning the use TREE
 /// (everything after `use `). `None` when the statement isn't a `use` (e.g. a `mod foo;` Imports
 /// edge), so the caller records nothing.
@@ -287,7 +374,57 @@ fn strip_use_visibility(s: &str) -> Option<&str> {
         Some(after) if after.starts_with(char::is_whitespace) => after.trim_start(),
         _ => s,
     };
-    s.strip_prefix("use ").map(str::trim_start)
+    // `use` is a TOKEN, so any Rust whitespace follows it — a tab, or a newline before a long
+    // path. Requiring a literal space read such a declaration as binding nothing, which makes an
+    // imported receiver look like the caller's own type.
+    let after = s.strip_prefix("use")?;
+    after.starts_with(char::is_whitespace).then(|| after.trim_start())
+}
+
+/// Every `… as Alias` rename in a use, as `(alias, the name it renames)`.
+///
+/// Only a rename produces a pair: an ordinary leaf already binds the name the index stores.
+fn use_alias_pairs(use_text: &str) -> Vec<(String, String)> {
+    let use_text = super::scope_grammar::strip_comments(use_text);
+    let Some(rest) = strip_use_visibility(use_text.trim()) else { return Vec::new() };
+    let tree = rest.strip_suffix(';').unwrap_or(rest).trim();
+    let tree = tree.strip_prefix("::").unwrap_or(tree);
+    let mut out = Vec::new();
+    collect_use_alias_pairs(tree, "", &mut out);
+    out
+}
+
+/// `prefix` is the path the enclosing group hangs off, which is what an aliased `self` renames.
+fn collect_use_alias_pairs(tree: &str, prefix: &str, out: &mut Vec<(String, String)>) {
+    let tree = tree.trim();
+    match tree.find('{') {
+        None => {
+            let Some(alias) = alias_of(tree).filter(|alias| *alias != "_") else { return };
+            // The target is the renamed path's own leaf: `a::b::Worker as Alias` records `Worker`,
+            // which is the bare name every other reader compares against.
+            let renamed = &tree[..tree.len() - alias.len()];
+            let renamed = renamed.trim_end().trim_end_matches("as").trim_end();
+            // `use a::foo::{self as bar}` renames the MODULE the group hangs off, not a leaf called
+            // `self`. Recording the literal `self` rewrote `bar::Worker` to `self::Worker` — a path
+            // that names the current module, so the exact lookup missed and the tail fallback was
+            // free to pick some other `Worker::run`.
+            let renamed = if renamed.trim() == "self" { prefix } else { renamed };
+            if let Some(target) =
+                renamed.rsplit("::").next().map(str::trim).filter(|target| !target.is_empty())
+            {
+                out.push((alias.to_string(), target.to_string()));
+            }
+        },
+        Some(open) => {
+            let group_prefix = tree[..open].trim().trim_end_matches(':').trim_end();
+            for entry in split_top_level(brace_inner(&tree[open..])) {
+                let entry = entry.trim();
+                if !entry.is_empty() && entry != "self" {
+                    collect_use_alias_pairs(entry, group_prefix, out);
+                }
+            }
+        },
+    }
 }
 
 /// The bound leaf names of a use (sub)tree, appended to `out`. A tree is either a single path
@@ -320,9 +457,8 @@ fn collect_use_leaves(tree: &str, out: &mut Vec<String>) {
 /// The bound name of a single (brace-free) use path: the alias after `as`, else the last `::`
 /// segment. A glob (`*`) or a bare `self`/empty tail binds nothing here (the caller fails open).
 fn single_use_binding(path: &str) -> Option<String> {
-    if let Some((_, alias)) = path.split_once(" as ") {
-        let alias = alias.trim();
-        return (!alias.is_empty() && alias != "_").then(|| alias.to_string());
+    if let Some(alias) = alias_of(path) {
+        return (alias != "_").then(|| alias.to_string());
     }
     match path.rsplit("::").next().map(str::trim) {
         Some("" | "*" | "self") | None => None,
@@ -429,11 +565,14 @@ struct ImportAlias {
     target: String,
     scope_start: usize,
     scope_end: usize,
+    /// The module the alias is declared in. A `use` is NOT inherited by a nested `mod`, so an
+    /// outer alias whose byte range encloses a child module must not rewrite names inside it.
+    mod_id: i64,
 }
 
 impl ImportAlias {
-    fn covers(&self, ref_byte: usize) -> bool {
-        ref_byte >= self.scope_start && ref_byte < self.scope_end
+    fn covers(&self, ref_byte: usize, ref_mod_id: i64) -> bool {
+        ref_byte >= self.scope_start && ref_byte < self.scope_end && ref_mod_id == self.mod_id
     }
 }
 
@@ -474,7 +613,14 @@ impl ImportScope {
         // A binding with no scope can't be range-tested; skip rather than bind file-wide blindly.
         let Some(scope) = scope else { return };
         self.import_aliases.entry(file_id).or_default().entry(alias).or_default().push(
-            ImportAlias { target, scope_start: scope.scope_start, scope_end: scope.scope_end },
+            ImportAlias {
+                target,
+                scope_start: scope.scope_start,
+                scope_end: scope.scope_end,
+                // Python has no inline-module ranges, so every reference in the file reports the
+                // file root and this matches exactly as it did before the column existed.
+                mod_id: scope.mod_id,
+            },
         );
     }
 
@@ -497,14 +643,25 @@ impl ImportScope {
         // those name DIFFERENT targets the alias is genuinely AMBIGUOUS, so resolve nothing rather
         // than pick one by byte order. All-same-target overlaps (try/except importing the same
         // symbol from different modules) still resolve.
-        let mut covering = self
+        //
+        // A nearer `use` SHADOWS a wider one, so only the innermost covering span is consulted —
+        // the same rule ordinary import bindings follow. Two aliases tie only when they are
+        // mutually-exclusive branches, and disagreeing targets there are genuinely ambiguous.
+        let ref_mod_id = self.ref_mod_id(file_id, ref_byte);
+        let covering: Vec<&ImportAlias> = self
             .import_aliases
             .get(&file_id)?
             .get(name)?
             .iter()
-            .filter(|alias| alias.covers(ref_byte));
-        let first = covering.next()?;
-        if covering.any(|alias| alias.target != first.target) {
+            .filter(|alias| alias.covers(ref_byte, ref_mod_id))
+            .collect();
+        let narrowest =
+            covering.iter().map(|alias| alias.scope_end.saturating_sub(alias.scope_start)).min()?;
+        let mut innermost = covering
+            .into_iter()
+            .filter(|alias| alias.scope_end.saturating_sub(alias.scope_start) == narrowest);
+        let first = innermost.next()?;
+        if innermost.any(|alias| alias.target != first.target) {
             return None;
         }
         Some(first.target.as_str())
@@ -542,6 +699,19 @@ impl ImportScope {
             // file-root scope — reproduces the original per-file behavior.
             None => (0, usize::MAX, MOD_FILE_ROOT),
         };
+        // A RENAMING leaf binds a name the index never stored: `use crate::Worker as Alias`
+        // makes `Alias` the only spelling this file has, while every symbol is under `Worker`. The
+        // alias map is what a reader consults to get back to the real name, and it was populated
+        // only by languages whose import edges carry the alias directly — a `use`-shaped language
+        // reached this branch instead and left the map empty, so the lookup always missed.
+        for (alias, target) in use_alias_pairs(use_text) {
+            self.import_aliases
+                .entry(file_id)
+                .or_default()
+                .entry(alias)
+                .or_default()
+                .push(ImportAlias { target, scope_start, scope_end, mod_id });
+        }
         let file = self.by_file.entry(file_id).or_default();
         for leaf in leaves {
             let binding = ImportBinding { root: root.clone(), scope_start, scope_end, mod_id };
@@ -616,6 +786,53 @@ impl ImportScope {
             .map(|binding| binding.root.as_str())
     }
 
+    /// Whether the narrowest `use` bindings covering `name` here DISAGREE about its root — two
+    /// `cfg` branches importing one name from different crates cover the same span, so the
+    /// innermost-wins rule has no tie-break left and [`covering_root`] returns whichever was
+    /// loaded first. That is a coin flip between a local and a dependency origin, so the honest
+    /// answer is that this reference has no usable root, not one picked by load order.
+    pub(crate) fn covering_roots_disagree(
+        &self,
+        file_id: i64,
+        name: &str,
+        ref_byte: usize,
+    ) -> bool {
+        let Some(bindings) = self.by_file.get(&file_id).and_then(|names| names.get(name)) else {
+            return false;
+        };
+        let ref_mod_id = self.ref_mod_id(file_id, ref_byte);
+        let covering = bindings
+            .iter()
+            .filter(|binding| binding.covers(ref_byte, ref_mod_id))
+            .collect::<Vec<_>>();
+        let Some(narrowest) = covering.iter().map(|binding| binding.span()).min() else {
+            return false;
+        };
+        let mut roots = covering
+            .iter()
+            .filter(|binding| binding.span() == narrowest)
+            .map(|binding| binding.root.as_str());
+        let Some(first) = roots.next() else { return false };
+        roots.any(|root| root != first)
+    }
+
+    /// The package `file_id` belongs to, when the corpus has a package map at all.
+    pub(crate) fn package_of(&self, file_id: i64) -> Option<i64> {
+        self.file_package.get(&file_id).copied()
+    }
+
+    /// Every file's package, for a candidate-side lookup that has no `ImportScope` in hand.
+    pub(crate) fn file_packages(&self) -> &HashMap<i64, i64> {
+        &self.file_package
+    }
+
+    /// Whether any `use` visible at `ref_byte` in `file_id` binds `name` — regardless of whether
+    /// its root is local or external. A name NOT bound by an import is one this file can see
+    /// lexically, which for a bare type means its own crate declares it.
+    pub(crate) fn is_import_bound(&self, file_id: i64, name: &str, ref_byte: usize) -> bool {
+        self.covering_root(file_id, name, ref_byte).is_some()
+    }
+
     /// Whether `name` at `ref_byte` in `file_id` was imported from an EXTERNAL dependency crate —
     /// not a local workspace/path-dep crate, not `crate`/`self`/`super`. When true, the name
     /// denotes that dependency's item and must NOT bind to a local same-named symbol. Fails
@@ -663,6 +880,58 @@ impl ImportScope {
 
 #[cfg(test)]
 mod tests {
+    use super::{ImportScope, ImportScopeRange, use_alias_pairs};
+
+    /// `use a::foo::{self as bar}` renames the MODULE the group hangs off. Recording the literal
+    /// `self` rewrote `bar::Worker` into `self::Worker` — a path naming the current module — so the
+    /// exact lookup missed and the tail fallback was free to pick a different `Worker`.
+    #[test]
+    fn an_aliased_self_renames_the_group_prefix() {
+        assert_eq!(use_alias_pairs("use crate::foo::{self as bar};"), vec![(
+            "bar".to_string(),
+            "foo".to_string()
+        )]);
+        assert_eq!(use_alias_pairs("use a::b::c::{self as z};"), vec![(
+            "z".to_string(),
+            "c".to_string()
+        )]);
+        // A leaf alias beside an aliased `self` keeps naming its own leaf.
+        let mut both = use_alias_pairs("use crate::foo::{self as bar, Worker as W};");
+        both.sort();
+        assert_eq!(both, vec![
+            ("W".to_string(), "Worker".to_string()),
+            ("bar".to_string(), "foo".to_string()),
+        ]);
+        // An ordinary rename is unchanged.
+        assert_eq!(use_alias_pairs("use a::b::Worker as Alias;"), vec![(
+            "Alias".to_string(),
+            "Worker".to_string()
+        )]);
+    }
+
+    /// A `use` is not inherited by a nested `mod`, so an outer alias must not rewrite names inside
+    /// a child module that binds the same name itself.
+    #[test]
+    fn an_outer_alias_stops_at_a_nested_module() {
+        let mut scope = ImportScope::default();
+        // An outer alias spanning the whole file, declared in the file root.
+        scope.add_use(
+            1,
+            "use crate::a::Worker as W;",
+            Some(ImportScopeRange { scope_start: 0, scope_end: 400, mod_id: MOD_FILE_ROOT }),
+        );
+        // A nested inline module at [100, 300) with its own unaliased import of the same name.
+        scope.add_use(
+            1,
+            "use crate::b::W;",
+            Some(ImportScopeRange { scope_start: 100, scope_end: 300, mod_id: 100 }),
+        );
+        // Inside the child module the outer alias does not apply.
+        assert_eq!(scope.import_alias_target(1, "W", 200), None);
+        // Outside it, it still does.
+        assert_eq!(scope.import_alias_target(1, "W", 50), Some("Worker"));
+    }
+
     use super::*;
 
     /// Helper: `(root, sorted leaves)` so the assertions don't depend on traversal order.
@@ -712,6 +981,95 @@ mod tests {
         assert_eq!(parse_use("use foo::*;"), Some(("foo".to_string(), Vec::new())));
         assert_eq!(parsed("use ::external::X;"), Some(("external".into(), s(&["X"]))));
         assert_eq!(parse_use("mod foo;"), None);
+    }
+
+    #[test]
+    fn use_membership_matches_bound_leaves_without_materializing_them() {
+        let declaration = "use crate::outer::{self, nested::{Worker as Alias, Other}, *};";
+        for bound in ["outer", "Alias", "Other"] {
+            assert!(use_binds_name(declaration, bound), "{bound} is bound");
+        }
+        for unbound in ["crate", "nested", "Worker", "Missing"] {
+            assert!(!use_binds_name(declaration, unbound), "{unbound} is not bound");
+        }
+    }
+
+    /// `as` is a token, so any Rust whitespace separates it from the alias — a formatter that wraps
+    /// the line writes the same rename. Missing it reported the alias unbound, which let a receiver
+    /// annotated with it look local instead of being suppressed as external.
+    #[test]
+    fn an_alias_is_bound_across_any_whitespace() {
+        for declaration in [
+            "use dep::Worker as Alias;",
+            "use dep::Worker as\n    Alias;",
+            "use dep::Worker\n    as Alias;",
+            "use dep::Worker  as  Alias;",
+            "use dep::{Worker as\n Alias, Other};",
+        ] {
+            assert!(use_binds_name(declaration, "Alias"), "{declaration:?} binds Alias");
+            assert!(!use_binds_name(declaration, "Worker"), "{declaration:?} rebinds the leaf");
+        }
+        // `as` inside a segment is not the keyword, and an underscore alias binds nothing.
+        assert!(use_binds_name("use dep::has_as;", "has_as"));
+        assert!(!use_binds_name("use dep::Worker as _;", "_"));
+    }
+
+    /// Comments are lexer trivia, so a parser reading the declaration text has to drop them the
+    /// way the compiler does. Comparing a leaf as raw text saw `/* kept */ Worker` and reported the
+    /// name unbound, which makes an imported receiver look like the file's own type.
+    #[test]
+    fn a_comment_does_not_hide_an_imported_leaf() {
+        for declaration in [
+            "use crate::dep::{/* kept */ Worker};",
+            "use crate::dep::{Worker /* kept */, Other};",
+            "use /* kept */ crate::dep::Worker;",
+            "use crate::dep::Worker; // trailing",
+            "use crate::dep::{Worker as /* kept */ Alias};",
+        ] {
+            let bound = if declaration.contains("Alias") { "Alias" } else { "Worker" };
+            assert!(use_binds_name(declaration, bound), "{declaration:?} binds {bound}");
+        }
+        assert_eq!(
+            parse_use("use crate::dep::{/* kept */ Worker};"),
+            Some(("crate".to_string(), vec!["Worker".to_string()]))
+        );
+        // A `//` inside a string is content, not a comment.
+        assert!(use_binds_name(r#"use crate::dep::Worker;"#, "Worker"));
+    }
+
+    /// `use` is a token like `as`, so any whitespace follows it. Reading a wrapped declaration as
+    /// binding nothing makes an imported name look like the file's own type.
+    #[test]
+    fn a_use_is_recognized_across_any_whitespace() {
+        for declaration in ["use dep::Worker;", "use\ndep::Worker;", "use\tdep::Worker;"] {
+            assert!(use_binds_name(declaration, "Worker"), "{declaration:?} binds Worker");
+        }
+        // `used_by::X` starts with `use` but is not the keyword.
+        assert!(!use_binds_name("used_by::Worker;", "Worker"));
+    }
+
+    /// Two mutually exclusive `cfg` imports of one name cover the same span, so the
+    /// innermost-wins rule has no tie-break and load order would decide between a local bind and
+    /// an external decline. Disagreeing roots at equal span are reported as no root at all.
+    #[test]
+    fn equal_span_imports_with_different_roots_are_ambiguous() {
+        let mut scope = ImportScope::new(HashSet::from(["local_crate".to_string()]));
+        scope.mark_has_manifests();
+        let span = Some(scope_at_file_root(0, 500));
+        scope.add_use(1, "use local_crate::Worker;", span);
+        scope.add_use(1, "use dep::Worker;", span);
+        scope.finalize();
+        assert!(
+            scope.covering_roots_disagree(1, "Worker", 10),
+            "a local and an external import of one name leave no root to act on"
+        );
+        // One root, however many bindings, is not ambiguous.
+        let mut agreed = ImportScope::new(HashSet::from(["local_crate".to_string()]));
+        agreed.mark_has_manifests();
+        agreed.add_use(2, "use local_crate::Worker;", span);
+        agreed.add_use(2, "use local_crate::Worker;", span);
+        agreed.finalize();
+        assert!(!agreed.covering_roots_disagree(2, "Worker", 10));
     }
 
     #[test]
