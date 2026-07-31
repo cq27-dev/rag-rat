@@ -20,6 +20,7 @@ mod bootstrap;
 mod candidate;
 mod content;
 mod cut;
+pub mod discovery;
 mod envelope;
 mod fold;
 mod id;

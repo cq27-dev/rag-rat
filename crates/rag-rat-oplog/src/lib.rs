@@ -89,6 +89,10 @@ mod table_sync;
 // take a `&DeviceSecret`, so — like `sign_content_entry` — they stay account-crate-internal.
 // Keep this crate-root API explicit: adding an account implementation seam must not silently
 // make it a public semver commitment.
+/// Sealing a discovery announcement to the account's roster-effective devices. Both halves
+/// live in the op-log crate because neither the device X25519 secret nor the roster's public
+/// keys may leave it.
+pub use account::discovery;
 pub use account::{
     AccountId, AuthoredDurability, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason,
     AuthorityQuery, CapacityScope, CatchUpReport, ContentCapacityScope, ContentEntryHeader,

@@ -1,0 +1,173 @@
+//! Sealing a discovery announcement to the account's roster-effective devices (#1080).
+//!
+//! A discovery announcement carries this node's iroh node id so the account's other devices can
+//! dial it. Published in the clear, that hands the shared discovery service — and anyone who can
+//! compute the account's tag, including a device removed from the roster — a list of dialable
+//! identities. Sealed per recipient, it hands them opaque bytes.
+//!
+//! **Why per recipient rather than under one shared account key.** A device that has been offline
+//! for a month and a device that has been removed look identical to the discovery service, so any
+//! scheme keyed on a shared rotating secret revokes the removed device and strands the offline one
+//! in the same stroke. They do not look identical to the PUBLISHER: the offline device is still
+//! roster-effective and its long-term X25519 key never rotates, while the removed device is simply
+//! not in the roster the publisher reads at seal time. Sealing per recipient therefore cuts exactly
+//! along roster membership, with no key epoch, no rotation, and nothing to distribute.
+//!
+//! Revocation applies to what is sealed NEXT. An announcement sealed before a device was removed
+//! stays openable by it until that announcement expires.
+//!
+//! Both halves live here, in the op-log crate, because neither the device's X25519 secret nor the
+//! roster's public keys may leave it — see [`crate::identity`].
+
+use anyhow::Context;
+use rusqlite::Connection;
+
+use super::keywrap::{self, ContentKey, SealedKeyWrap, WrapContext};
+use super::{bootstrap, storage};
+use crate::identity;
+
+/// The envelope's leading byte. Bumping it is a wire break; the fetch side drops what it does not
+/// recognise rather than guessing.
+pub const ANNOUNCEMENT_VERSION: u8 = 1;
+
+/// One sealed wrap on the wire: the ephemeral public key then the tagged ciphertext.
+const WRAP_LEN: usize = 32 + 48;
+
+/// The `key_epoch` slot of the wrap context. Discovery has no epochs — the whole point of sealing
+/// per recipient is that nothing rotates — so it is pinned at zero and covered by the golden vector
+/// rather than left to drift.
+const DISCOVERY_KEY_EPOCH: u64 = 0;
+
+/// A sealed announcement, with the recipient count the caller needs for policy it owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedAnnouncement {
+    /// `version || wrap*`, raw concatenation. Not CBOR: the payload already travels as an opaque
+    /// byte string, so a second CBOR layer would add nothing and cost about 30% against a size
+    /// budget that decides how many announcements fit one response frame.
+    pub bytes: Vec<u8>,
+    /// How many devices can open it — the whole roster-effective set, including this one.
+    pub recipients: usize,
+}
+
+/// Seal `node_id` to every roster-effective device, bound to `tag`.
+///
+/// `Ok(None)` when this store has no account: there is no roster to seal to, and nothing to
+/// discover. Errors only on a real database or crypto failure.
+///
+/// **This node is among the recipients.** Not for its own sake but because a publisher is also a
+/// device: it fetches on its own device-side pass, and a host that could not open announcements it
+/// had itself published would be a confusing hole the first time anyone looked.
+pub fn seal_discovery_announcement(
+    conn: &Connection,
+    tag: &[u8; 32],
+    node_id: &[u8; 32],
+) -> anyhow::Result<Option<SealedAnnouncement>> {
+    let Some(account) = bootstrap::read_local_account(conn)? else {
+        return Ok(None);
+    };
+    let recipients = storage::list_effective_roster_x25519_pubkeys(conn, account)?;
+    if recipients.is_empty() {
+        return Ok(None);
+    }
+
+    // The node id is 32 bytes of material to seal; `ContentKey` is the crate's 32-byte sealable
+    // payload and carries the zeroize-on-drop this wants anyway. It is not a content key.
+    let payload = ContentKey::from_seed(node_id);
+    let mut bytes = Vec::with_capacity(1 + recipients.len() * WRAP_LEN);
+    bytes.push(ANNOUNCEMENT_VERSION);
+    for (fingerprint, recipient_pub) in &recipients {
+        let ctx = wrap_context(account, tag, &recipient_pub.to_bytes());
+        let sealed = keywrap::seal_content_key(&payload, &ctx, recipient_pub)
+            .with_context(|| format!("sealing a discovery announcement to device {fingerprint}"))?;
+        push_wrap(&mut bytes, &sealed);
+    }
+    Ok(Some(SealedAnnouncement { bytes, recipients: recipients.len() }))
+}
+
+/// Recover the node id from an announcement sealed to this device, or `None`.
+///
+/// `None` covers every "not for us, or not ours to read" case: no local account or device, an
+/// unrecognised version, a malformed length, and — the ordinary case — no wrap that opens under
+/// this device's key.
+///
+/// **Silent when a wrap fails its tag.** Every announcement carries one wrap per roster device, so
+/// all but one are expected to fail here. The content path records unwrap failures as security
+/// events; doing that here would write a security event per foreign wrap per announcement per
+/// discovery pass, burying the real ones.
+pub fn open_discovery_announcement(
+    conn: &Connection,
+    tag: &[u8; 32],
+    envelope: &[u8],
+) -> anyhow::Result<Option<[u8; 32]>> {
+    let Some(wraps) = parse_wraps(envelope) else {
+        return Ok(None);
+    };
+    let Some(account) = bootstrap::read_local_account(conn)? else {
+        return Ok(None);
+    };
+    let Some(device) = identity::load_local_device(conn)? else {
+        return Ok(None);
+    };
+    let secret = device.x25519_secret();
+    let ctx = wrap_context(account, tag, &device.x25519_public().to_bytes());
+
+    for wrap in wraps {
+        // Failure here is the expected case, not an error: this device matches at most one wrap.
+        if let Ok(opened) = keywrap::unwrap_content_key(&wrap, secret, &ctx) {
+            let mut node_id = [0u8; 32];
+            node_id.copy_from_slice(opened.as_slice());
+            return Ok(Some(node_id));
+        }
+    }
+    Ok(None)
+}
+
+/// The AAD every wrap is bound to.
+///
+/// The slot that carries a stream id for content keys carries the discovery TAG here, so a wrap
+/// opens only under the tag it was published for and cannot be replayed under another. The account
+/// id is included for the same reason it is there for content keys: one device can belong to
+/// several accounts.
+fn wrap_context(
+    account: super::AccountId,
+    tag: &[u8; 32],
+    recipient_pub: &[u8; 32],
+) -> WrapContext {
+    WrapContext {
+        account_id: account.to_bytes(),
+        stream_id: *tag,
+        key_epoch: DISCOVERY_KEY_EPOCH,
+        recipient_pub: *recipient_pub,
+    }
+}
+
+fn push_wrap(bytes: &mut Vec<u8>, sealed: &SealedKeyWrap) {
+    bytes.extend_from_slice(&sealed.ephemeral_pubkey);
+    bytes.extend_from_slice(&sealed.ciphertext);
+}
+
+/// Split an envelope into its wraps, or `None` if it is not one of ours.
+///
+/// Rejects a wrong version and any length that is not exactly one version byte plus a whole number
+/// of wraps — including the empty case, which no publisher produces. A legacy raw 32-byte node id
+/// fails here on length even if its first byte happens to equal the version.
+fn parse_wraps(envelope: &[u8]) -> Option<Vec<SealedKeyWrap>> {
+    let (&version, rest) = envelope.split_first()?;
+    if version != ANNOUNCEMENT_VERSION || rest.is_empty() || rest.len() % WRAP_LEN != 0 {
+        return None;
+    }
+    Some(
+        rest.chunks_exact(WRAP_LEN)
+            .map(|chunk| {
+                let mut ephemeral_pubkey = [0u8; 32];
+                let mut ciphertext = [0u8; 48];
+                ephemeral_pubkey.copy_from_slice(&chunk[..32]);
+                ciphertext.copy_from_slice(&chunk[32..]);
+                SealedKeyWrap { ephemeral_pubkey, ciphertext }
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests;
