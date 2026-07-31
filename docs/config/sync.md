@@ -114,12 +114,24 @@ shows up as an error rather than silently shrinking the peer list to a healthy-l
 ids may be written as lowercase hex (the form the tools print) or as base32; the same node written
 two ways is recognised as one peer and dialed once.
 
-A device with no `server_peers` and no second device on its account roster does nothing — there is
-provably nobody to reach, so it never contacts the discovery service.
+A device with an enrolled account queries the discovery service once per cadence even when nothing
+is configured and its own roster shows no other device. That is deliberate, and it is the one place
+where the cheaper-looking behaviour is wrong: the roster is replicated state, so "I am the only
+device" is only as current as the last sync. A machine restored from a backup taken before your
+other devices were enrolled believes it is alone — and if that belief stopped it looking, it would
+never receive the entries that would correct it. It would stay stuck forever while a perfectly
+reachable host advertised. The cost of looking anyway is one small request per cadence for an
+account that really is alone.
 
-Pinning a host in `server_peers` is also the answer when you would rather not depend on the
-discovery service at all: paste the node id `sync serve` prints at startup, and the device dials it
-whether or not discovery works.
+A device with **no** account does nothing at all: there is nothing to sync and nothing to look for.
+
+Pinning a host in `server_peers` is the answer when you would rather not *depend* on the discovery
+service: paste the node id `sync serve` prints at startup, and the device dials it whether or not
+discovery is reachable.
+
+Note that this makes the device independent of discovery, not silent towards it — a pass still
+queries the service on its cadence, in case the account advertises a host you have not pinned.
+There is currently no switch that turns discovery off outright.
 
 ## What each service learns
 
