@@ -63,6 +63,10 @@ const DISCOVERY_KEY_EPOCH: u64 = 0;
 pub type RosterStamp = [u8; 32];
 
 /// A sealed announcement, with the recipient count the caller needs for policy it owns.
+///
+/// It carries no roster stamp: whether a re-seal is owed is decided by comparing [`roster_stamp`]
+/// across sessions, not by anything a single seal reports — see [`RosterStamp`] for why the
+/// envelope bytes cannot serve that purpose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedAnnouncement {
     /// `version || wrap*`, raw concatenation. Not CBOR: the payload already travels as an opaque
@@ -71,9 +75,6 @@ pub struct SealedAnnouncement {
     pub bytes: Vec<u8>,
     /// How many devices can open it — the whole roster-effective set, including this one.
     pub recipients: usize,
-    /// The recipient set this was sealed to. Compare against [`roster_stamp`] to decide whether a
-    /// re-seal is owed; see [`RosterStamp`] for why comparing `bytes` cannot work.
-    pub roster_stamp: RosterStamp,
 }
 
 /// Seal `node_id` to every roster-effective device, bound to `tag`.
@@ -108,11 +109,7 @@ pub fn seal_discovery_announcement(
             .with_context(|| format!("sealing a discovery announcement to device {fingerprint}"))?;
         push_wrap(&mut bytes, &sealed);
     }
-    Ok(Some(SealedAnnouncement {
-        bytes,
-        recipients: recipients.len(),
-        roster_stamp: stamp_of(&recipients),
-    }))
+    Ok(Some(SealedAnnouncement { bytes, recipients: recipients.len() }))
 }
 
 /// The current recipient set's stamp, without sealing anything.

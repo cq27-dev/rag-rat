@@ -168,11 +168,9 @@ fn the_roster_stamp_is_stable_until_the_roster_moves() {
 
     let lone = roster_stamp(&conn).unwrap().expect("an account has a stamp");
     assert_eq!(lone, roster_stamp(&conn).unwrap().unwrap(), "stable across reads");
-    assert_eq!(
-        lone,
-        seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().unwrap().roster_stamp,
-        "and matches what a seal reports, so the two cannot drift"
-    );
+    // Sealing does not perturb the stamp: a seal draws fresh ephemerals but reads the same roster.
+    seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().unwrap();
+    assert_eq!(lone, roster_stamp(&conn).unwrap().unwrap(), "stable across a seal in between");
 
     let member_x = DeviceX25519Secret::from_seed(&[0x5c; 32]);
     let member_fp = add_member(&conn, account, &member_x);
