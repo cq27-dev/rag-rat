@@ -608,15 +608,35 @@ async fn an_empty_discovery_result_leaves_the_configured_peers_untouched() {
 
 // ---------------------------------------------------------------- the serving host's advertisement
 
-/// A serving host advertises itself from startup, not half a TTL later.
+/// A serving host advertises itself from startup, and KEEPS renewing.
 ///
 /// `sync serve` is the node a machine behind NAT is trying to reach, and it is the one node the
 /// maintenance-hook cadence can never announce — it has no maintenance hook. Delete the advertise
 /// loop and the always-on host is invisible to every device that does not already have it in
 /// `server_peers`.
+///
+/// The renewal half is asserted separately from the first announcement, because it is a different
+/// mechanism and the obvious test misses it entirely: waiting only for the FIRST announcement stays
+/// green with the `loop` reduced to a single iteration, with the tick period set to something
+/// absurd (an `interval`'s first tick is immediate whatever its period), and with `is_live` stubbed
+/// to return true forever. Requiring a SECOND announcement kills all three.
+///
+/// Real clocks on both sides, unlike the frozen-instant tests above: renewal is a question about
+/// elapsed time, and a frozen clock can only ever answer it one way — which is exactly how a
+/// zero-margin renewal went unnoticed.
 #[tokio::test]
-async fn a_serving_host_advertises_itself_immediately_and_keeps_doing_so() {
-    let service = StubService::start(NOW_MS, Behaviour::Serve).await;
+async fn a_serving_host_advertises_itself_immediately_and_keeps_renewing() {
+    fn wall_clock_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_millis() as i64
+    }
+
+    // A four-second TTL ticks once a second and renews once under three seconds remain, so the
+    // whole publish-then-renew cycle fits inside a test.
+    const TTL: u32 = 4;
+    let service = StubService::start(wall_clock_ms(), Behaviour::Serve).await;
     let tag = account_tag(&[16; 32]);
     let host = client().await;
     let node = local_node(&host);
@@ -626,14 +646,25 @@ async fn a_serving_host_advertises_itself_immediately_and_keeps_doing_so() {
         service: service.addr(),
         tag,
         node,
-        ttl_seconds: 60,
-        now_ms: || NOW_MS,
+        ttl_seconds: TTL,
+        now_ms: wall_clock_ms,
     }));
 
-    // Nothing here waits out a tick interval: the FIRST tick is immediate, so an announcement must
-    // appear promptly. Poll rather than sleep a fixed amount, so the test is neither flaky nor
-    // slower than it needs to be.
-    let appeared = wait_for(|| service.stored(&tag) == vec![node.to_vec()]).await;
+    let announced = wait_for(|| !service.stored(&tag).is_empty()).await;
+    assert!(announced, "the host did not advertise itself at startup");
+
+    // A second announcement can only come from a further pass through the loop that judged the
+    // first no longer fresh enough.
+    let renewed = wait_for(|| service.stored(&tag).len() >= 2).await;
+    let stored = service.stored(&tag);
     advertiser.abort();
-    assert!(appeared, "the host did not advertise itself: {:?}", service.stored(&tag));
+    assert!(
+        renewed,
+        "the host advertised once and then stopped renewing ({} stored)",
+        stored.len()
+    );
+    assert!(
+        stored.iter().all(|payload| payload.as_slice() == node.as_slice()),
+        "every announcement under this tag is this host's own node id"
+    );
 }

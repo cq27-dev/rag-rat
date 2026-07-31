@@ -1,8 +1,10 @@
 # Peer sync (`[sync]`)
 
 Sync replicates one account's signed memory op-log between that account's devices over an iroh QUIC
-transport. Every device holds the whole log; there is no server that owns the data, and the relay
-and discovery service both handle opaque bytes they cannot interpret.
+transport. Every device holds the whole log and there is no server that owns the data: the relay
+forwards encrypted traffic it cannot read, and the discovery service holds only addressing hints
+under a pseudonym it cannot tie to you. Neither is trusted — see
+[What each service learns](#what-each-service-learns).
 
 This page is about **how to arrange your devices** — which of them listens, which dial, and how they
 find each other — plus the `[sync]` table that expresses it. For minting an account and enrolling
@@ -150,9 +152,10 @@ use — including any you add later.
 - **The discovery service** is a blind key-value store keyed on a tag it cannot link to an account.
   The tag comes from account-scoped key material only enrolled devices hold — not from the account
   id, which every host you have ever dialed knows — so an outsider cannot compute it or find your
-  hosts. What the service itself *can* see under that pseudonym is how many nodes advertise beneath
-  a tag and when they stop renewing. Unlinkability is the guarantee; hiding host count and liveness
-  from the service is not.
+  hosts. What the service itself *can* see under that pseudonym is the advertised node ids
+  themselves — in the clear, and dialable — along with how many there are and when they stop
+  renewing. Unlinkability is the guarantee; hiding which hosts advertise, how many, and when, is
+  not.
 - **Neither is trusted.** A discovered address is routing advice only: every peer, discovered or
   configured, passes full mutual roster authorization before a single log entry is exchanged. A
   forged announcement costs a failed dial and nothing else.

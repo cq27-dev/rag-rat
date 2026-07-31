@@ -111,35 +111,38 @@ pub fn discovery_secret(conn: &rusqlite::Connection) -> anyhow::Result<Option<[u
     rag_rat_oplog::read_local_account_genesis(conn)
 }
 
-/// The TTL to publish under, given the device-sync cadence.
+/// How long an announcement should live.
 ///
-/// The service APPENDS and never replaces, reaping only on expiry, and caps a tag at 8 live
-/// announcements — so a device holds `ceil(ttl / cadence)` simultaneous copies of ITSELF.
-/// Publishing at the service maximum (900s) on the default 300s cadence would be 3 copies per
-/// device, and a perfectly ordinary 3-device account would exhaust the cap and start having its
-/// publishes REJECTED — leaving the tag holding zero real peers rather than a stale few.
+/// **The only publisher is a serving host** ([`advertise`]); the device-side pass fetches and never
+/// publishes. So this is a policy knob, not a cadence: it is scaled off `push_interval_secs` purely
+/// because that is the one interval an operator has already tuned, and a host renews on its own
+/// schedule ([`TICKS_PER_TTL`]) regardless of it.
 ///
-/// Two cadences' worth bounds that at 2 copies per device, which is the steady state at the default
-/// cadence — the skip in [`exchange`] does NOT reduce it further there, because an entry published
-/// one cadence ago has exactly half its life left and republishing is the safe call at that
-/// boundary. The skip earns its place in the opposite regime: `push_interval_secs = 0` runs a pass
-/// per trigger and several git hooks fire per action, so without it a device stacks copies of
-/// itself seconds apart until the tag is full.
+/// The number that matters for the service's per-tag limit is `ttl / renewal_interval` — how many
+/// live copies of ITSELF one host holds, since the service appends rather than replacing and reaps
+/// only on expiry. A host renews at half-life, so that is **2 copies per host, whatever the TTL**;
+/// the limit is therefore a limit on hosts (roughly four) and no TTL choice moves it.
 ///
-/// Two known residuals, neither papered over:
-/// - `push_interval_secs > 450` clamps to the service maximum and the announcement then expires
-///   between passes, so such a device is intermittently discoverable. The alternative is publishing
-///   under a TTL the service would reject outright.
-/// - At ~2 slots per advertiser the cap allows roughly four before publishes start being REFUSED
-///   (the service rejects rather than evicting). Only nodes that ACCEPT connections advertise, so
-///   this bounds serving hosts, not devices — a device fetches and costs nothing. A refused host
-///   keeps serving and is still reachable through `server_peers`, so it degrades rather than
-///   breaking; lifting the ceiling needs an evict-oldest policy on the SERVICE, not a change here.
+/// What the TTL does change is how long a host that has died lingers in the tag, costing whoever
+/// discovers it one failed dial. Shorter is fresher; the floor and ceiling are the service's.
 pub fn publish_ttl_seconds(push_interval_secs: u64) -> u32 {
     const MIN_TTL: u64 = 60;
     const MAX_TTL: u64 = 900;
     push_interval_secs.saturating_mul(2).clamp(MIN_TTL, MAX_TTL) as u32
 }
+
+/// How often [`advertise`] wakes, as a divisor of the TTL.
+///
+/// Must be strictly finer than one minus [`RENEWAL_THRESHOLD`]: renewal becomes due once
+/// `1 - threshold` of the TTL has elapsed, and the number of ticks between that moment and expiry
+/// is how many attempts a host gets. At a quarter-TTL tick and a three-quarter threshold that is
+/// three attempts.
+const TICKS_PER_TTL: u64 = 4;
+
+/// Renew once less than three quarters of the TTL remains — see [`is_live`] for why this is
+/// deliberately not the tick period.
+const RENEWAL_THRESHOLD_NUM: i64 = 3;
+const RENEWAL_THRESHOLD_DEN: i64 = 4;
 
 /// What became of this node's own announcement during a pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -324,19 +327,20 @@ pub struct Advertise {
 /// maintenance-hook cadence can never announce, because a serving host has no maintenance hook.
 /// Without this the only publishers would be the only fetchers.
 ///
-/// Ticks at half the TTL: the service reaps only on expiry, so a slower timer would let the
-/// announcement lapse between ticks and leave an always-on host intermittently findable, which is
-/// the exact failure this exists to prevent. The first tick fires immediately, so a host is
-/// discoverable from startup rather than half a TTL later. Each tick is a full [`exchange`], so the
+/// Ticks at a QUARTER of the TTL and renews once less than [`RENEWAL_THRESHOLD`] of it remains, so
+/// a renewal lands at roughly half-life with the other half still in hand — see those constants for
+/// why the margin is the whole point. The first tick fires immediately, so a host is discoverable
+/// from startup rather than a fraction of a TTL later. Each tick is a full [`exchange`], so the
 /// fetch-before-publish skip applies and a long-running host does not stack copies of itself.
 ///
 /// Publish-only in effect: the fetched peers are discarded, because peers dial a serving host
 /// rather than the other way round.
 pub async fn advertise(params: Advertise) {
     let Advertise { endpoint, service, tag, node, ttl_seconds, now_ms } = params;
-    // `.max(2)` keeps the interval positive even if a future TTL floor drops below 2s; a zero
+    // `.max(4)` keeps the interval positive even if a future TTL floor drops below 4s; a zero
     // period would make `interval` panic.
-    let mut ticks = tokio::time::interval(Duration::from_secs(u64::from(ttl_seconds).max(2) / 2));
+    let mut ticks =
+        tokio::time::interval(Duration::from_secs(u64::from(ttl_seconds).max(4) / TICKS_PER_TTL));
     loop {
         ticks.tick().await;
         let outcome = exchange(DiscoveryExchange {
@@ -357,18 +361,28 @@ pub async fn advertise(params: Advertise) {
     }
 }
 
-/// Whether `node` already has an announcement with more than half its TTL left.
+/// Whether `node` already has an announcement with comfortably more than [`RENEWAL_THRESHOLD`] of
+/// its TTL left — i.e. one that does not need renewing yet.
 ///
-/// Half a TTL is one full cadence of headroom (the TTL is two cadences), so a node that skips here
-/// is guaranteed another pass before the entry expires. Requiring merely "present" would let an
-/// announcement lapse in the gap between passes; requiring "freshly written" would defeat the skip.
+/// **The margin is the point, and getting it wrong is silent.** `expires_at_ms` is stamped by the
+/// SERVICE when it receives the publish, not by this client when it sends one, so an entry written
+/// at tick `t` expires at `t + round_trip + ttl`. If the threshold equalled the tick period, every
+/// tick at which renewal was due would find `round_trip` MORE than the threshold remaining, skip,
+/// and defer renewal to the following tick — by which point only `round_trip` milliseconds of life
+/// are left. A single failed renewal there (a timeout, or the `RateLimited` code the service has)
+/// would then leave the host unadvertised for a whole tick period. With a threshold of three
+/// quarters against a quarter-TTL tick, renewal happens at half-life and two further ticks remain
+/// before expiry, so one failure costs nothing.
+///
+/// The comparison also mixes clocks — client `now_ms` against service `expires_at_ms` — which is
+/// tolerable only because the margin dwarfs any plausible skew. It would not be at zero margin.
 fn is_live(
     announcements: &[wire::WireAnnouncement],
     node: &[u8; 32],
     ttl_seconds: u32,
     now_ms: i64,
 ) -> bool {
-    let headroom_ms = i64::from(ttl_seconds) * 1000 / 2;
+    let headroom_ms = i64::from(ttl_seconds) * 1000 * RENEWAL_THRESHOLD_NUM / RENEWAL_THRESHOLD_DEN;
     announcements.iter().any(|announcement| {
         announcement.payload.as_slice() == node.as_slice()
             && announcement.expires_at_ms.saturating_sub(now_ms) > headroom_ms

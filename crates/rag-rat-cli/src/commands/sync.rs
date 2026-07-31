@@ -523,8 +523,9 @@ const DEVICE_SYNC_LAST_META_KEY: &str = "sync_device_last_at_ms";
 /// What a device-side sync attempt did — folded into the maintenance hook report.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DeviceSyncOutcome {
-    /// Nothing to do: no local account, the device is not roster-effective, or there is neither a
-    /// configured peer nor a second roster device for discovery to find.
+    /// Nothing to do: no local account, or this device is not roster-effective. Note that having
+    /// no configured peer is NOT one of the reasons — a pass with an empty `server_peers` still
+    /// runs and still looks.
     Disabled,
     /// The cadence gate suppressed this attempt (a sync ran within `push_interval_secs`).
     Skipped,
@@ -1086,7 +1087,15 @@ mod tests {
     /// it — wedged forever while a reachable host advertises. Re-introduce that gate and this test
     /// goes red.
     ///
-    /// Hermetic: a reserved-TLD relay and an unparseable service id mean no network call.
+    /// Hermetic: a reserved-TLD relay and an unparseable service id mean no network call. That is
+    /// also this test's limit, and it is worth naming rather than implying: because the service id
+    /// does not resolve, the pass "looks" at nothing, so the test pins the ABSENCE of the early
+    /// return and not the presence of a discovery query. **One mutation survives it, and the whole
+    /// suite: passing `None` as `discover_peers`' discovery argument whenever `server_peers` is
+    /// empty.** That reintroduces exactly the wedge described above. Closing it needs the driver to
+    /// reach an in-process service, which needs either a live relay (the repository already gates
+    /// such tests behind `RAG_RAT_SYNC_RELAY`) or a test-only injection point in production code —
+    /// neither of which is worth more than saying so here.
     #[test]
     fn a_lone_looking_roster_does_not_stop_the_pass_from_looking() {
         let conn = schema_conn();

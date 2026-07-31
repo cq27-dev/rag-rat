@@ -246,7 +246,17 @@ impl DiscoveryResponse {
                     return Err(WireError("error code envelope is not a 2-item array".into()));
                 }
                 let index = dec.u32()?;
-                let _empty = dec.array()?;
+                // SKIP the code's field array rather than assuming it is empty. Every code the
+                // counterpart defines today is unit-shaped, so this reads zero elements — but the
+                // counterpart is in another repository and a code that carries a payload would
+                // otherwise leave the decoder pointing at that payload, failing the whole response
+                // and turning "the service told me why" into "the service is broken" for every
+                // older client. That is the failure this forward-compatibility exists to prevent,
+                // so it must not depend on the shape of a variant nobody has written yet.
+                let code_fields = dec.array()?.unwrap_or(0);
+                for _ in 0..code_fields {
+                    dec.skip()?;
+                }
                 Self::Error {
                     code: DiscoveryErrorCode::from_index(index)
                         .map_or(DecodedErrorCode::Unknown(index), DecodedErrorCode::Known),
@@ -521,6 +531,22 @@ mod tests {
         ] {
             assert_eq!(DiscoveryRequest::decode(&request.encode()).unwrap(), request);
         }
+    }
+
+    /// A future code that carries a PAYLOAD must decode too, not just a unit-shaped one.
+    ///
+    /// The counterpart is in another repository and every code it defines today is unit-shaped, so
+    /// the empty-array case is the only one exercised in practice — which is exactly why this is
+    /// pinned: assuming the array is empty leaves the decoder pointing at the payload, and the
+    /// message field then fails the whole response. Every refusal would read as a broken service to
+    /// every older client. Vector: variant 3 (Error), code index 8 carrying `[42]`, message "no".
+    #[test]
+    fn a_future_error_code_carrying_a_payload_still_decodes() {
+        let decoded = DiscoveryResponse::decode(&unhex("820382820881182a626e6f")).unwrap();
+        assert_eq!(decoded, DiscoveryResponse::Error {
+            code: DecodedErrorCode::Unknown(8),
+            message: "no".into(),
+        });
     }
 
     /// A code a NEWER service adds must decode, not fail. Otherwise "the service told me why it
