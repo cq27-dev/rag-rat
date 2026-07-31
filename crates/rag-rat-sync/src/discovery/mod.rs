@@ -204,11 +204,14 @@ pub enum PublishState {
     NotAttempted,
     /// The service acknowledged storing the announcement.
     Published,
-    /// The service RESPONDED and declined — rate-limited, or any non-`Published` answer. The
-    /// announcement is definitely not stored, so a caller renewing on a cadence should try again.
+    /// The announcement is definitely NOT stored, so a caller renewing on a cadence should try
+    /// again at once. Two ways to reach here: the service responded and declined (rate-limited, or
+    /// any non-`Published` answer), or the request stream never opened, so the frame never left
+    /// this host. Both mean nothing landed — distinct from [`Uncertain`], where it might have.
     Refused,
-    /// No acknowledgement arrived: the publish stream errored or timed out. The announcement **may
-    /// or may not** be stored — the service stamps expiry and stores on RECEIPT, before it answers,
+    /// No acknowledgement arrived: the publish frame may have been sent but the stream errored, or
+    /// the deadline passed. The announcement **may or may not** be stored — the service stamps
+    /// expiry and stores on RECEIPT, before it answers,
     /// so a lost or late response says nothing about whether the write landed. A renewing caller
     /// must treat this as possibly-live and NOT re-append every tick, or a service that stores but
     /// cannot answer would drive one host to fill the whole tag. Non-fatal: the fetch half still
@@ -347,13 +350,23 @@ async fn exchange_inner(
                     degraded.push(format!("publish refused: {other:?}"));
                     PublishState::Refused
                 },
-                // No response: the stream errored or the deadline passed. The service stores on
-                // receipt before answering, so the write may already have landed — see
+                // The bi-stream never opened, so the frame never left this host: nothing is stored,
+                // exactly like a refusal, so the next tick should retry rather than assume
+                // liveness.
+                Ok(Err(RequestError::NotSent(error))) => {
+                    degraded.push(format!("publish not sent: {error}"));
+                    PublishState::Refused
+                },
+                // The frame may have reached the service before the stream errored. The service
+                // stores on receipt before answering, so the write may already have landed — see
                 // [`PublishState::Uncertain`].
-                Ok(Err(error)) => {
+                Ok(Err(RequestError::MaybeSent(error))) => {
                     degraded.push(format!("publish failed: {error}"));
                     PublishState::Uncertain
                 },
+                // The deadline passed. `open_bi` on an established connection resolves without a
+                // round trip, so a timeout falls in the write or the wait for a reply — the frame
+                // may already have reached the service, so treat it as possibly live.
                 Err(_elapsed) => {
                     degraded.push(format!("publish timed out after {DISCOVERY_TIMEOUT:?}"));
                     PublishState::Uncertain
@@ -391,7 +404,8 @@ async fn exchange_inner(
 /// one: the service stores on receipt before it answers, so a lost or timed-out ack does not mean
 /// the write failed, and re-appending because it went unacknowledged is how a host whose responses
 /// are dropped fills the whole tag (the service appends, never replaces). A `Refused` is the
-/// opposite — the service answered and declined, nothing is stored, so the next tick should retry.
+/// opposite — either the service answered and declined or the frame never left this host, so
+/// nothing is stored and the next tick should retry.
 ///
 /// The cost of treating a genuinely-failed `Uncertain` as live is one renewal interval of
 /// undiscoverability before the next republish; the cost of the other error is unbounded slot
@@ -512,15 +526,42 @@ pub async fn advertise(params: Advertise) {
     }
 }
 
+/// Where a discovery request failed, so a publish can tell "definitely not stored" from "maybe
+/// stored". A fetch does not care and treats both the same.
+enum RequestError {
+    /// The bi-stream never opened, so nothing reached the service — the write is definitively not
+    /// stored and the caller should retry at once rather than assume it might be live.
+    NotSent(anyhow::Error),
+    /// The request frame may have reached the service before the failure. Since the service stores
+    /// on receipt before it answers, the write may already have landed.
+    MaybeSent(anyhow::Error),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSent(error) | Self::MaybeSent(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 /// One request on its own bi-stream. The service reads a single frame, answers, and closes, so a
 /// second request on the same stream would block until the timeout.
+///
+/// The error distinguishes a failure BEFORE any bytes were sent (`open_bi`) from one after the
+/// frame may have reached the service, so a publish can classify the two differently — see
+/// [`PublishState`].
 async fn request(
     conn: &iroh::endpoint::Connection,
     req: &DiscoveryRequest,
-) -> anyhow::Result<DiscoveryResponse> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    wire::write_frame(&mut send, &req.encode()).await?;
-    send.finish()?;
-    let body = wire::read_frame(&mut recv).await?;
-    Ok(DiscoveryResponse::decode(&body)?)
+) -> Result<DiscoveryResponse, RequestError> {
+    let (mut send, mut recv) =
+        conn.open_bi().await.map_err(|error| RequestError::NotSent(error.into()))?;
+    wire::write_frame(&mut send, &req.encode())
+        .await
+        .map_err(|error| RequestError::MaybeSent(error.into()))?;
+    send.finish().map_err(|error| RequestError::MaybeSent(error.into()))?;
+    let body =
+        wire::read_frame(&mut recv).await.map_err(|error| RequestError::MaybeSent(error.into()))?;
+    DiscoveryResponse::decode(&body).map_err(|error| RequestError::MaybeSent(error.into()))
 }
