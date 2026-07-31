@@ -124,7 +124,7 @@ async fn a_published_node_id_is_fetched_back_by_another_device() {
         tag,
         publish: Some(&published),
         ttl_seconds: 600,
-        now_ms: NOW_MS,
+        fetch: true,
     })
     .await;
     assert_eq!(out.publish, PublishState::Published, "degraded: {:?}", out.degraded);
@@ -136,7 +136,7 @@ async fn a_published_node_id_is_fetched_back_by_another_device() {
         tag,
         publish: None,
         ttl_seconds: 600,
-        now_ms: NOW_MS,
+        fetch: true,
     })
     .await;
     assert_eq!(opened(&out), vec![published], "the fetcher sees the publisher");
@@ -164,7 +164,7 @@ async fn a_device_that_does_not_advertise_itself_still_learns_its_peers() {
         tag,
         publish: None,
         ttl_seconds: 600,
-        now_ms: NOW_MS,
+        fetch: true,
     })
     .await;
     assert_eq!(opened(&out), vec![peer]);
@@ -187,7 +187,7 @@ async fn a_refused_publish_does_not_suppress_the_fetch() {
         tag,
         publish: Some(&local_node(&endpoint)),
         ttl_seconds: 600,
-        now_ms: NOW_MS,
+        fetch: true,
     })
     .await;
     assert_eq!(out.publish, PublishState::Failed);
@@ -217,7 +217,7 @@ async fn a_stalled_publish_does_not_discard_the_peers_already_fetched() {
         tag,
         publish: Some(&local_node(&endpoint)),
         ttl_seconds: 600,
-        now_ms: NOW_MS,
+        fetch: true,
     })
     .await;
 
@@ -250,7 +250,7 @@ async fn a_malformed_announcement_is_dropped_individually() {
         tag,
         publish: None,
         ttl_seconds: 600,
-        now_ms: NOW_MS,
+        fetch: true,
     })
     .await;
     assert_eq!(opened(&out), vec![good], "the well-formed peer survives its malformed neighbour");
@@ -275,7 +275,7 @@ async fn a_service_that_accepts_and_never_answers_does_not_stall_the_pass() {
         tag: account_tag(&[7; 32]),
         publish: Some(&local_node(&endpoint)),
         ttl_seconds: 600,
-        now_ms: NOW_MS,
+        fetch: true,
     })
     .await;
     let elapsed = started.elapsed();
@@ -314,7 +314,7 @@ async fn an_unreachable_service_fails_open() {
         tag: account_tag(&[8; 32]),
         publish: None,
         ttl_seconds: 600,
-        now_ms: NOW_MS,
+        fetch: true,
     })
     .await;
     assert!(opened(&out).is_empty());
@@ -327,53 +327,6 @@ async fn an_unreachable_service_fails_open() {
 
 // ---------------------------------------------------------------- cap exhaustion
 
-/// A live announcement with room to spare means this pass spends no slot on another copy.
-#[tokio::test]
-async fn a_still_fresh_announcement_is_not_republished() {
-    let service = StubService::start(NOW_MS, Behaviour::Serve).await;
-    let tag = account_tag(&[9; 32]);
-    let endpoint = client().await;
-    let node = local_node(&endpoint);
-    // Published a moment ago under a 600s TTL: well over half its life remains.
-    service.seed(tag, node.to_vec(), NOW_MS + 590_000);
-
-    let out = exchange(DiscoveryExchange {
-        endpoint: &endpoint,
-        service: service.addr(),
-        tag,
-        publish: Some(&node),
-        ttl_seconds: 600,
-        now_ms: NOW_MS,
-    })
-    .await;
-    assert_eq!(out.publish, PublishState::AlreadyLive);
-    assert_eq!(service.stored(&tag).len(), 1, "no second copy of ourselves was added");
-}
-
-/// Close to expiry it IS republished — skipping here would let the entry lapse between passes and
-/// silently stop advertising this device.
-#[tokio::test]
-async fn an_announcement_near_expiry_is_republished() {
-    let service = StubService::start(NOW_MS, Behaviour::Serve).await;
-    let tag = account_tag(&[10; 32]);
-    let endpoint = client().await;
-    let node = local_node(&endpoint);
-    // Under half of a 600s TTL remains, i.e. less than one cadence of headroom.
-    service.seed(tag, node.to_vec(), NOW_MS + 200_000);
-
-    let out = exchange(DiscoveryExchange {
-        endpoint: &endpoint,
-        service: service.addr(),
-        tag,
-        publish: Some(&node),
-        ttl_seconds: 600,
-        now_ms: NOW_MS,
-    })
-    .await;
-    assert_eq!(out.publish, PublishState::Published);
-    assert_eq!(service.stored(&tag).len(), 2, "the fresh copy joins the one about to lapse");
-}
-
 /// Steady state on the default cadence: three devices, six passes, no publish ever refused.
 ///
 /// The original design — publish at the service maximum every pass, never skipping — gives each
@@ -381,12 +334,11 @@ async fn an_announcement_near_expiry_is_republished() {
 /// ninth publish is REJECTED (the service never evicts to make room), and an ordinary three-device
 /// account breaks its own discovery on default configuration.
 ///
-/// Honest about what this test can and cannot kill: at this cadence the TTL clamp and the
-/// fetch-before-publish skip are REDUNDANT — either alone keeps three devices inside the cap, so
-/// reverting one of them does not turn this red. It is a regression test on the combination. The
-/// skip has its own killing case in
-/// `rapid_passes_do_not_fill_the_tag_with_copies_of_one_device`, and the clamp's arithmetic is
-/// pinned by `the_published_ttl_is_two_cadences_clamped_to_what_the_service_accepts`.
+/// Honest about what this test can and cannot kill. It exercises the TTL clamp and the eviction
+/// policy; it cannot exercise the renewal skip, which is no longer part of an exchange at all —
+/// `advertise` owns it, and its killing case is
+/// `a_running_host_publishes_once_per_renewal_interval_however_often_it_ticks`. The clamp's
+/// arithmetic is pinned by `the_published_ttl_is_two_cadences_clamped_to_what_the_service_accepts`.
 #[tokio::test]
 async fn a_three_device_account_on_the_default_cadence_stays_under_the_per_tag_cap() {
     let service = StubService::start(NOW_MS, Behaviour::Serve).await;
@@ -396,7 +348,8 @@ async fn a_three_device_account_on_the_default_cadence_stays_under_the_per_tag_c
     let devices = [client().await, client().await, client().await];
     let ids: Vec<[u8; 32]> = devices.iter().map(local_node).collect();
 
-    // Six passes at the default cadence: long enough for entries to accumulate and for the first
+    // Six passes at the default cadence, each device publishing once — the cadence a host on the
+    // half-life renewal actually produces. Long enough for entries to accumulate and for the first
     // ones to age out, which is where a leak would show.
     for pass in 0..6i64 {
         let pass_now_ms = NOW_MS + pass * 300_000;
@@ -409,9 +362,9 @@ async fn a_three_device_account_on_the_default_cadence_stays_under_the_per_tag_c
                 endpoint,
                 service: service.addr(),
                 tag,
+                fetch: true,
                 publish: Some(&local_node(endpoint)),
                 ttl_seconds: ttl,
-                now_ms: pass_now_ms,
             })
             .await;
             assert_ne!(
@@ -438,9 +391,9 @@ async fn a_three_device_account_on_the_default_cadence_stays_under_the_per_tag_c
         endpoint: &observer,
         service: service.addr(),
         tag,
+        fetch: true,
         publish: None,
         ttl_seconds: ttl,
-        now_ms: NOW_MS + 1_500_000,
     })
     .await;
     for id in &ids {
@@ -448,48 +401,62 @@ async fn a_three_device_account_on_the_default_cadence_stays_under_the_per_tag_c
     }
 }
 
-/// The fetch-before-publish skip's killing case.
+/// A caller that asks for a publish gets one — the exchange does not second-guess it by fetching.
 ///
-/// `push_interval_secs = 0` runs a pass on every trigger, and several git hooks fire per action —
-/// so passes land seconds apart while the TTL floor is 60s. Publishing blind each time stacks a
-/// device's own announcements until the tag is full and EVERY device's publishes start failing.
-/// The skip is the only thing standing between that and a self-inflicted outage; delete it and this
-/// test goes red.
+/// The removed design decided liveness here, from the fetch, and that is the bug this pins shut:
+/// the service answers with a size-bounded random SAMPLE, so a host's own live announcement is
+/// often missing from a response, and reading that absence as "not live" republishes. Because the
+/// service appends rather than replaces, every spurious copy evicts another host — the tag degrades
+/// fastest exactly when it is busy enough to be sampled.
 #[tokio::test]
-async fn rapid_passes_do_not_fill_the_tag_with_copies_of_one_device() {
+async fn a_publish_is_not_conditioned_on_finding_ourselves_in_the_fetch() {
     let service = StubService::start(NOW_MS, Behaviour::Serve).await;
-    let tag = account_tag(&[12; 32]);
-    let ttl = publish_ttl_seconds(0);
-    assert_eq!(ttl, 60, "the floor is what makes rapid passes dangerous");
+    let tag = account_tag(&[9; 32]);
+    let endpoint = client().await;
+    let node = local_node(&endpoint);
+    // Already live with almost all of a 600s TTL left. Under the removed rule this was the
+    // canonical "skip it" case; the decision is no longer the exchange's to make.
+    service.seed(tag, node.to_vec(), NOW_MS + 590_000);
 
-    let devices = [client().await, client().await, client().await];
-    // Twelve passes one second apart: well inside a single TTL, so nothing expires to make room.
-    for pass in 0..12i64 {
-        let pass_now_ms = NOW_MS + pass * 1_000;
-        service.advance_to(pass_now_ms);
-        for endpoint in &devices {
-            let out = exchange(DiscoveryExchange {
-                endpoint,
-                service: service.addr(),
-                tag,
-                publish: Some(&local_node(endpoint)),
-                ttl_seconds: ttl,
-                now_ms: pass_now_ms,
-            })
-            .await;
-            assert_ne!(
-                out.publish,
-                PublishState::Failed,
-                "pass {pass}: a publish was refused — the tag filled with our own copies ({:?})",
-                out.degraded
-            );
-        }
-    }
-    assert_eq!(
-        service.stored(&tag).len(),
-        devices.len(),
-        "one live announcement per device, however many passes ran"
-    );
+    let out = exchange(DiscoveryExchange {
+        endpoint: &endpoint,
+        service: service.addr(),
+        tag,
+        fetch: true,
+        publish: Some(&node),
+        ttl_seconds: 600,
+    })
+    .await;
+    assert_eq!(out.publish, PublishState::Published);
+    assert_eq!(service.stored(&tag).len(), 2, "the publish the caller asked for was made");
+}
+
+/// `fetch: false` means no fetch request reaches the service at all.
+///
+/// Not a micro-optimisation. A serving host publishes so that peers dial IT and has no use for the
+/// list, and paying for a response frame per renewal is the smaller half; the larger half is that
+/// a fetch here invites exactly the inference the test above forbids. Asserted on the REQUEST
+/// COUNT, because an ignored response is indistinguishable from an unsent request in every
+/// assertion about stored announcements.
+#[tokio::test]
+async fn a_publish_only_exchange_never_asks_the_service_for_peers() {
+    let service = StubService::start(NOW_MS, Behaviour::Serve).await;
+    let tag = account_tag(&[10; 32]);
+    let endpoint = client().await;
+    let node = local_node(&endpoint);
+
+    let out = exchange(DiscoveryExchange {
+        endpoint: &endpoint,
+        service: service.addr(),
+        tag,
+        fetch: false,
+        publish: Some(&node),
+        ttl_seconds: 600,
+    })
+    .await;
+    assert_eq!(out.publish, PublishState::Published);
+    assert!(out.announcements.is_empty(), "nothing was asked for, so nothing came back");
+    assert_eq!(service.fetches(), 0, "a publish-only exchange fetched anyway");
 }
 
 /// A large account is never refused, and its fetches still fit a frame.
@@ -518,7 +485,7 @@ async fn a_large_account_is_never_refused_and_its_fetches_fit_one_frame() {
             tag,
             publish: Some(&realistic_envelope(seed)),
             ttl_seconds: 600,
-            now_ms: NOW_MS,
+            fetch: true,
         })
         .await;
         assert_eq!(
@@ -535,7 +502,7 @@ async fn a_large_account_is_never_refused_and_its_fetches_fit_one_frame() {
         tag,
         publish: None,
         ttl_seconds: 600,
-        now_ms: NOW_MS,
+        fetch: true,
     })
     .await;
     assert!(!out.announcements.is_empty(), "an over-full tag must still answer");
@@ -590,7 +557,7 @@ async fn discovered_peers_join_the_configured_ones_without_this_node_or_duplicat
             tag,
             publish: Some(&me),
             ttl_seconds: 600,
-            now_ms: NOW_MS,
+            fetch: true,
         }),
         &as_node_id,
     )
@@ -629,13 +596,88 @@ async fn an_empty_discovery_result_leaves_the_configured_peers_untouched() {
             tag: account_tag(&[15; 32]),
             publish: None,
             ttl_seconds: 600,
-            now_ms: NOW_MS,
+            fetch: true,
         }),
         &as_node_id,
     )
     .await;
     assert_eq!(resolved.peers.len(), 1);
     assert_eq!(resolved.peers[0].0, configured[0]);
+}
+
+/// The peer cap counts announcements this device could OPEN, not payloads the service returned.
+///
+/// The killing case for a suppression attack that costs an attacker almost nothing. Anyone who can
+/// compute the tag may publish under it, and a removed device can compute it forever. If the cap
+/// were applied to raw payloads, `MAX_ANNOUNCEMENTS` pieces of garbage would discard every real
+/// advertiser BEFORE anything tried to open them — cheaper than filling the service's slots, and
+/// undetectable, because the good entries are dropped by the client's own bookkeeping.
+///
+/// So: a full cap's worth of unopenable payloads, then one real peer behind them.
+#[tokio::test]
+async fn unopenable_announcements_do_not_consume_the_peer_cap() {
+    let service = StubService::start(NOW_MS, Behaviour::Serve).await;
+    let tag = account_tag(&[21; 32]);
+    let endpoint = client().await;
+
+    // Not 32 bytes, so the opener rejects them — the shape of an envelope sealed to a roster this
+    // device is not on, or simply of junk.
+    for i in 0..crate::discovery::MAX_ANNOUNCEMENTS {
+        service.seed(tag, vec![i as u8; 7], NOW_MS + 600_000);
+    }
+    let real_peer = crate::node_id_from_secret([0x44; 32]);
+    service.seed(tag, real_peer.to_vec(), NOW_MS + 600_000);
+
+    let resolved = crate::discover_peers(
+        &[],
+        "https://relay.example",
+        Some(DiscoveryExchange {
+            endpoint: &endpoint,
+            service: service.addr(),
+            tag,
+            fetch: true,
+            publish: None,
+            ttl_seconds: 600,
+        }),
+        &as_node_id,
+    )
+    .await;
+    let ids: Vec<[u8; 32]> = resolved.peers.iter().map(|(_, addr)| *addr.id.as_bytes()).collect();
+    assert_eq!(
+        ids,
+        vec![real_peer],
+        "a real advertiser was hidden behind a cap's worth of garbage"
+    );
+}
+
+/// The cap still binds — on peers that resolved.
+#[tokio::test]
+async fn the_peer_cap_bounds_how_many_discovered_peers_one_pass_admits() {
+    let service = StubService::start(NOW_MS, Behaviour::Serve).await;
+    let tag = account_tag(&[22; 32]);
+    let endpoint = client().await;
+
+    let over = crate::discovery::MAX_ANNOUNCEMENTS + 4;
+    for i in 0..over {
+        let peer = crate::node_id_from_secret([i as u8; 32]);
+        service.seed(tag, peer.to_vec(), NOW_MS + 600_000);
+    }
+
+    let resolved = crate::discover_peers(
+        &[],
+        "https://relay.example",
+        Some(DiscoveryExchange {
+            endpoint: &endpoint,
+            service: service.addr(),
+            tag,
+            fetch: true,
+            publish: None,
+            ttl_seconds: 600,
+        }),
+        &as_node_id,
+    )
+    .await;
+    assert_eq!(resolved.peers.len(), crate::discovery::MAX_ANNOUNCEMENTS);
 }
 
 // ---------------------------------------------------------------- the serving host's advertisement
@@ -650,12 +692,12 @@ async fn an_empty_discovery_result_leaves_the_configured_peers_untouched() {
 /// The renewal half is asserted separately from the first announcement, because it is a different
 /// mechanism and the obvious test misses it entirely: waiting only for the FIRST announcement stays
 /// green with the `loop` reduced to a single iteration, with the tick period set to something
-/// absurd (an `interval`'s first tick is immediate whatever its period), and with `is_live` stubbed
-/// to return true forever. Requiring a SECOND announcement kills all three.
+/// absurd (an `interval`'s first tick is immediate whatever its period), and with the renewal
+/// check stubbed to "still live" forever. Requiring a SECOND announcement kills all three.
 ///
-/// Real clocks on both sides, unlike the frozen-instant tests above: renewal is a question about
-/// elapsed time, and a frozen clock can only ever answer it one way — which is exactly how a
-/// zero-margin renewal went unnoticed.
+/// Real elapsed time, unlike the frozen-clock tests above: renewal is a question about elapsed
+/// time, and a frozen clock can only ever answer it one way — which is exactly how a zero-margin
+/// renewal went unnoticed.
 #[tokio::test]
 async fn a_serving_host_advertises_itself_immediately_and_keeps_renewing() {
     fn wall_clock_ms() -> i64 {
@@ -665,8 +707,8 @@ async fn a_serving_host_advertises_itself_immediately_and_keeps_renewing() {
             .as_millis() as i64
     }
 
-    // A four-second TTL ticks once a second and renews once under three seconds remain, so the
-    // whole publish-then-renew cycle fits inside a test.
+    // A four-second TTL ticks twice a second and renews at two seconds, so the whole
+    // publish-then-renew cycle fits inside a test.
     const TTL: u32 = 4;
     let service = StubService::start(wall_clock_ms(), Behaviour::Serve).await;
     let tag = account_tag(&[16; 32]);
@@ -680,7 +722,6 @@ async fn a_serving_host_advertises_itself_immediately_and_keeps_renewing() {
         tag,
         announcement,
         ttl_seconds: TTL,
-        now_ms: wall_clock_ms,
     }));
 
     let announced = wait_for(|| !service.stored(&tag).is_empty()).await;
@@ -732,7 +773,6 @@ async fn a_new_envelope_reaches_a_running_advertiser_at_the_next_tick() {
         tag,
         announcement,
         ttl_seconds: TTL,
-        now_ms: wall_clock_ms,
     }));
 
     assert!(
@@ -748,4 +788,48 @@ async fn a_new_envelope_reaches_a_running_advertiser_at_the_next_tick() {
         switched,
         "the replacement was never published; the watch is being read once, not per tick"
     );
+}
+
+/// A host publishes once per renewal interval however many times it ticks — and never asks the
+/// service whether it is still live.
+///
+/// The killing case for renewal being LOCAL state. `ForgetfulFetch` answers every fetch with an
+/// empty list, which is the real service's size-bounded random sample at its most adversarial: a
+/// host's own live announcement is routinely missing from a response. Any implementation that
+/// decides "am I live?" from a fetch sees "no" on every tick here, republishes on every tick, and
+/// — because the service appends rather than replaces — evicts a real peer each time. That is a
+/// feedback loop, not a wasted request: it is worst exactly when the tag is busy enough to sample.
+///
+/// Three assertions, because they fail for different reasons. The stored count kills republishing;
+/// the fetch count kills a fetch whose answer is merely ignored, which no assertion about stored
+/// announcements can see; and requiring at least one publish kills a loop that does nothing at all.
+#[tokio::test]
+async fn a_running_host_publishes_once_per_renewal_interval_however_often_it_ticks() {
+    // Eight seconds ticks every second and renews at four, so the window below spans several ticks
+    // and stops short of the first renewal.
+    const TTL: u32 = 8;
+    let service = StubService::start(0, Behaviour::ForgetfulFetch).await;
+    let tag = account_tag(&[23; 32]);
+    let host = client().await;
+    let node = local_node(&host);
+
+    let (envelopes, announcement) = tokio::sync::watch::channel(Some(node.to_vec()));
+    let advertiser = tokio::spawn(super::advertise(super::Advertise {
+        endpoint: host.clone(),
+        service: service.addr(),
+        tag,
+        announcement,
+        ttl_seconds: TTL,
+    }));
+
+    assert!(wait_for(|| !service.stored(&tag).is_empty()).await, "the host never advertised");
+    // Well past three further ticks, still inside the four-second renewal interval.
+    tokio::time::sleep(Duration::from_millis(3_200)).await;
+    let stored = service.stored(&tag).len();
+    let fetches = service.fetches();
+    advertiser.abort();
+    drop(envelopes);
+
+    assert_eq!(stored, 1, "the host republished on ticks where its announcement was still live");
+    assert_eq!(fetches, 0, "the advertiser asked the service about its own liveness");
 }

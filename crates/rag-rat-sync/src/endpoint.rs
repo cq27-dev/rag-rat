@@ -204,16 +204,32 @@ pub async fn discover_peers(
     // needs a database connection, which is not `Sync` and so cannot cross the await inside the
     // spawned advertise loop that shares that code.
     //
-    // One that will not open is dropped INDIVIDUALLY — it is sealed to a roster this device has
-    // left, malformed, or from a newer version. Failing the batch would let one bad entry, which
-    // anyone able to compute the tag may publish, hide every good one.
-    for node in outcome.announcements.iter().filter_map(|payload| open_announcement(payload)) {
+    // Failures are INDIVIDUAL throughout the loop below. Failing the batch would let one bad
+    // entry, which anyone able to compute the tag may publish, hide every good one.
+    // The peer cap is applied HERE, to announcements that actually resolved, and not in the
+    // exchange to raw payloads. Capping payloads would let anyone able to compute the tag suppress
+    // every real advertiser with a handful of unopenable entries — see `MAX_ANNOUNCEMENTS`.
+    let mut admitted = 0usize;
+    for payload in &outcome.announcements {
+        if admitted >= crate::discovery::MAX_ANNOUNCEMENTS {
+            tracing::debug!(
+                cap = crate::discovery::MAX_ANNOUNCEMENTS,
+                "discovered the most peers one pass admits; ignoring the rest"
+            );
+            break;
+        }
+        // One that will not open is skipped without spending cap budget: it is sealed to a roster
+        // this device has left, malformed, or from a newer version.
+        let Some(node) = open_announcement(payload) else { continue };
         if node == local_node || !seen.insert(node) {
             continue;
         }
         match peer_addr_from_bytes(&node, relay_url) {
             // The label comes off the parsed id rather than a second fallible conversion.
-            Ok(addr) => peers.push((addr.id.to_string(), addr)),
+            Ok(addr) => {
+                peers.push((addr.id.to_string(), addr));
+                admitted += 1;
+            },
             // `from_bytes` rejects a non-canonical point. Dropped individually: anyone who can
             // compute the tag can publish garbage, and one bad entry must not hide the good ones.
             Err(error) =>

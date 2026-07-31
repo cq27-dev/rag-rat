@@ -12,7 +12,7 @@
 //! discovery is safe to run inside the sync session lock.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iroh::endpoint::presets;
@@ -76,6 +76,14 @@ pub(crate) enum Behaviour {
     StallPublish,
     /// Answer fetches with one unusable payload alongside the real ones.
     GarbageAmongTheGood,
+    /// Store publishes normally, but answer every fetch with an EMPTY list.
+    ///
+    /// The real service returns a size-bounded random SAMPLE of a tag, so a live announcement —
+    /// including the fetcher's own — is routinely missing from a response. This is that sample at
+    /// its most adversarial, and it exists to catch anything that infers "not present in this
+    /// response" means "not published": the inference is false, and acting on it makes a host
+    /// republish endlessly and evict the peers it was trying to join.
+    ForgetfulFetch,
 }
 
 pub(crate) struct StubService {
@@ -84,6 +92,10 @@ pub(crate) struct StubService {
     /// The stub's own clock, advanced by the test. Owned per-instance rather than read from the
     /// system so expiry and reaping are exact, and so nothing is shared between tests.
     now_ms: Arc<AtomicI64>,
+    /// Fetch requests served, so a test can assert on requests NOT made. A publish-only caller
+    /// that quietly starts fetching is invisible to every assertion about stored
+    /// announcements.
+    fetches: Arc<AtomicUsize>,
 }
 
 impl StubService {
@@ -99,12 +111,18 @@ impl StubService {
             .expect("bind the stub discovery service");
         let tags = Arc::new(Mutex::new(HashMap::new()));
         let now = Arc::new(AtomicI64::new(now_ms));
-        let service =
-            Self { endpoint: endpoint.clone(), tags: Arc::clone(&tags), now_ms: Arc::clone(&now) };
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let service = Self {
+            endpoint: endpoint.clone(),
+            tags: Arc::clone(&tags),
+            now_ms: Arc::clone(&now),
+            fetches: Arc::clone(&fetches),
+        };
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let tags = Arc::clone(&tags);
                 let now = Arc::clone(&now);
+                let fetches = Arc::clone(&fetches);
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else { return };
                     // Swallowed streams are PARKED, not dropped: dropping a send stream closes it,
@@ -124,6 +142,9 @@ impl StubService {
                             // Accepted, never answered, held open.
                             parked.push((send, recv));
                             continue;
+                        }
+                        if matches!(request, DiscoveryRequest::Fetch { .. }) {
+                            fetches.fetch_add(1, Ordering::Relaxed);
                         }
                         let response =
                             answer(&tags, &request, behaviour, now.load(Ordering::Relaxed));
@@ -166,6 +187,11 @@ impl StubService {
             .unwrap_or_default()
     }
 
+    /// How many fetches this stub has answered.
+    pub(crate) fn fetches(&self) -> usize {
+        self.fetches.load(Ordering::Relaxed)
+    }
+
     /// Seed an announcement directly, bypassing the wire — for setting up a tag's prior state.
     pub(crate) fn seed(&self, tag: [u8; TAG_LEN], payload: Vec<u8>, expires_at_ms: i64) {
         self.tags
@@ -205,6 +231,9 @@ fn answer(
             DiscoveryResponse::Published { withdraw_token: vec![0xaa; 8] }
         },
         DiscoveryRequest::Fetch { tag } => {
+            if behaviour == Behaviour::ForgetfulFetch {
+                return DiscoveryResponse::Fetched { announcements: Vec::new() };
+            }
             let live = tags
                 .get(tag)
                 .map(|entries| {

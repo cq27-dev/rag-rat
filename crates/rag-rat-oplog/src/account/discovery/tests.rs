@@ -265,6 +265,12 @@ fn the_wrap_context_carries_account_tag_epoch_and_recipient() {
 
 // ---------------------------------------------------------------- envelope shape
 
+/// The size law an envelope obeys — and the reason the publish side has a recipient ceiling at all.
+///
+/// `1 + 80n` is what makes roster size a WIRE constraint: the discovery service caps one publish,
+/// so this growth rate decides how many devices an account can have before its host can no longer
+/// seal an announcement it is able to send. The caller pins the resulting ceiling against its own
+/// limit; this pins the law that ceiling is computed from, so the two cannot drift apart silently.
 #[test]
 fn the_envelope_is_a_version_byte_then_eighty_bytes_per_recipient() {
     let conn = db();

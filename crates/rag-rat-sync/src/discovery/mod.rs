@@ -63,13 +63,45 @@ pub const DISCOVERY_TAG_DOMAIN: &[u8] = b"rag-rat/discovery-tag/1";
 /// trade.
 pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Most announcements accepted from one fetch.
+/// Most discovered peers one fetch may contribute.
 ///
-/// The service caps this too, but its cap is an environment-overridable deployment default that
-/// this client cannot observe — so it is not something to trust. Each accepted announcement costs a
-/// full dial with two ALPN sessions, which is what makes an unbounded list expensive rather than
-/// merely untidy.
+/// **Counts announcements this device could OPEN, not payloads the service returned** — the
+/// distinction is the whole safety property, and applying this to raw payloads instead is a
+/// silent hole. Anyone who can compute the tag may publish under it, and a device removed from the
+/// roster can compute it forever (that is #1081's business, not this constant's). Capping raw
+/// payloads would let such a device hide every real advertiser behind sixteen pieces of garbage —
+/// far cheaper than filling the service's slots, and invisible, because the cap discards the good
+/// entries before anything tries to open them. Bounding what actually resolves means garbage costs
+/// an attacker one slot per suppressed peer instead of one payload.
+///
+/// The service caps its own per-tag storage too, but that cap is an environment-overridable
+/// deployment default this client cannot observe, so it is not something to trust. Each admitted
+/// peer costs a full dial with two ALPN sessions, which is what makes an unbounded list expensive
+/// rather than merely untidy.
 pub const MAX_ANNOUNCEMENTS: usize = 16;
+
+/// Most raw payloads carried out of one fetch, before anything is opened.
+///
+/// Purely resource control — the bound that keeps a hostile response from costing unbounded work —
+/// and deliberately looser than [`MAX_ANNOUNCEMENTS`], which is the security-relevant one. Set to
+/// the wire decoder's own per-response ceiling so this never silently truncates a well-formed
+/// answer; opening a payload is one X25519 operation per roster device, cheap enough that the real
+/// protection is the frame cap the decoder already enforces.
+pub const MAX_SEALED_ANNOUNCEMENTS: usize = 64;
+
+/// Bytes of sealed announcement the service will accept in one publish.
+///
+/// A MIRROR of the service's `ANNOUNCEMENT_PAYLOAD_MAX_BYTES`, which this client cannot query, so
+/// it can drift: the service is the authority and a publish above its real limit is refused
+/// outright. Mirroring it anyway is what turns "this host quietly stopped being discoverable" into
+/// a diagnosable message, because the alternative failure is genuinely silent — the refusal looks
+/// like every other transient publish error and the host retries it forever.
+///
+/// It binds at a smaller roster than it looks. An envelope is one version byte plus 80 bytes per
+/// roster-effective device, so this permits about **25 recipients**; the service's own frame budget
+/// would not bite until several hundred. An account past that ceiling cannot advertise until the
+/// envelope is split across announcements — see [`crate::discovery`] docs.
+pub const MAX_ANNOUNCEMENT_BYTES: usize = 2048;
 
 /// The tag an account publishes and fetches under.
 ///
@@ -120,8 +152,9 @@ pub fn discovery_secret(conn: &rusqlite::Connection) -> anyhow::Result<Option<[u
 ///
 /// The number that matters for the service's per-tag limit is `ttl / renewal_interval` — how many
 /// live copies of ITSELF one host holds, since the service appends rather than replacing and reaps
-/// only on expiry. A host renews at half-life, so that is **2 copies per host, whatever the TTL**;
-/// the limit is therefore a limit on hosts (roughly four) and no TTL choice moves it.
+/// only on expiry. A host renews at half-life ([`RENEW_AFTER_NUM`]), so that is **2 copies per
+/// host, whatever the TTL**; against a 32-slot cap the limit is therefore a limit on hosts (roughly
+/// sixteen) and no TTL choice moves it.
 ///
 /// What the TTL does change is how long a host that has died lingers in the tag, costing whoever
 /// discovers it one failed dial. Shorter is fresher; the floor and ceiling are the service's.
@@ -133,16 +166,25 @@ pub fn publish_ttl_seconds(push_interval_secs: u64) -> u32 {
 
 /// How often [`advertise`] wakes, as a divisor of the TTL.
 ///
-/// Must be strictly finer than one minus [`RENEWAL_THRESHOLD`]: renewal becomes due once
-/// `1 - threshold` of the TTL has elapsed, and the number of ticks between that moment and expiry
-/// is how many attempts a host gets. At a quarter-TTL tick and a three-quarter threshold that is
-/// three attempts.
-const TICKS_PER_TTL: u64 = 4;
+/// Only ticks where a renewal is actually due cost anything — the rest compare two local values and
+/// go back to sleep — so this is free to be fine, and being fine is what buys retry attempts. The
+/// number of ticks between renewal falling due and the announcement expiring is how many chances a
+/// host gets to recover from a timeout or the service's `RateLimited`; at an eighth-TTL tick and a
+/// half-TTL renewal that is four.
+///
+/// It was NOT free while liveness came from a fetch, when every tick was a full round trip. That
+/// coupling is gone.
+const TICKS_PER_TTL: u64 = 8;
 
-/// Renew once less than three quarters of the TTL remains — see [`is_live`] for why this is
-/// deliberately not the tick period.
-const RENEWAL_THRESHOLD_NUM: i64 = 3;
-const RENEWAL_THRESHOLD_DEN: i64 = 4;
+/// Renew once half the TTL has elapsed.
+///
+/// This fraction is a slot budget, not a comfort margin. The service APPENDS and reaps only on
+/// expiry, so a host holds `ttl / renewal_interval` live copies of itself at any moment — two here,
+/// whatever the TTL. Against a 32-slot per-tag cap that is roughly sixteen advertisers before hosts
+/// start evicting each other. Renewing at a quarter-TTL instead would double the copies and halve
+/// the accounts that fit, for one extra retry attempt that a finer tick supplies for free.
+const RENEW_AFTER_NUM: u32 = 1;
+const RENEW_AFTER_DEN: u32 = 2;
 
 /// What became of this node's own announcement during a pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -151,9 +193,6 @@ pub enum PublishState {
     /// far enough to try.
     #[default]
     NotAttempted,
-    /// A live announcement for this node was already present with comfortable time left, so the
-    /// pass did not spend a slot on another copy.
-    AlreadyLive,
     /// This pass wrote a fresh announcement.
     Published,
     /// The service refused or the write failed. Non-fatal: the fetch half still ran.
@@ -185,6 +224,9 @@ pub struct DiscoveryExchange<'a> {
     /// testable against the real code path.
     pub service: EndpointAddr,
     pub tag: [u8; TAG_LEN],
+    /// Ask the service who else is advertising. A serving host sets this `false`: it publishes so
+    /// that peers dial IT, and has no use for the list it would pay a response frame to receive.
+    pub fetch: bool,
     /// The sealed announcement to publish, or `None` to fetch only — which is what lets a machine
     /// behind NAT find a host without becoming discoverable itself.
     ///
@@ -193,17 +235,17 @@ pub struct DiscoveryExchange<'a> {
     /// ingredients.
     pub publish: Option<&'a [u8]>,
     pub ttl_seconds: u32,
-    /// "Now" as a VALUE, not a clock: the exchange reads it exactly once, to judge whether this
-    /// node's existing announcement has enough life left to skip republishing.
-    pub now_ms: i64,
 }
 
-/// Fetch the account's current advertisers and, when asked, make sure this node is among them.
+/// Fetch the account's current advertisers, publish this node's announcement, or both.
 ///
-/// **Fetch first, then publish.** The service APPENDS and never replaces, so publishing blind every
-/// pass accumulates copies of this node until the per-tag cap rejects everyone — see
-/// [`publish_ttl_seconds`]. Fetching first lets the pass skip a publish it does not need, and the
-/// fetch was going to happen anyway.
+/// **Whether to publish is the CALLER's decision, made from its own records** — this function does
+/// what it is told. It is deliberately not inferred from the fetch, which was the obvious design
+/// and is wrong: the service returns a size-bounded, randomly sampled SUBSET of a tag, so a host's
+/// own live announcement is frequently absent from a response. Reading that absence as "not live"
+/// makes the host republish, and because the service appends rather than replaces, each spurious
+/// copy evicts some other host — a feedback loop that removes real peers from discovery precisely
+/// when the tag is busy enough to sample. [`advertise`] keeps the record instead.
 ///
 /// The two halves stay INDEPENDENT in the failure direction: a publish that fails does not discard
 /// the peers already fetched, or one device's rate-limiting would blind it to peers it can reach.
@@ -227,7 +269,7 @@ async fn exchange_inner(
     params: &DiscoveryExchange<'_>,
     deadline: tokio::time::Instant,
 ) -> DiscoveryOutcome {
-    let DiscoveryExchange { endpoint, service, tag, publish, ttl_seconds, now_ms } = params;
+    let DiscoveryExchange { endpoint, service, tag, fetch, publish, ttl_seconds } = params;
     let connecting = endpoint.connect(service.clone(), PEER_DISCOVERY_ALPN);
     let conn = match tokio::time::timeout_at(deadline, connecting).await {
         Ok(Ok(conn)) => conn,
@@ -248,30 +290,31 @@ async fn exchange_inner(
     };
 
     let mut degraded = Vec::new();
-    let fetch = DiscoveryRequest::Fetch { tag: *tag };
-    let announcements = match tokio::time::timeout_at(deadline, request(&conn, &fetch)).await {
-        Ok(Ok(DiscoveryResponse::Fetched { announcements })) => announcements,
-        Ok(Ok(other)) => {
-            degraded.push(format!("fetch refused: {other:?}"));
-            Vec::new()
-        },
-        Ok(Err(error)) => {
-            degraded.push(format!("fetch failed: {error}"));
-            Vec::new()
-        },
-        Err(_elapsed) => {
-            degraded.push(format!("fetch timed out after {DISCOVERY_TIMEOUT:?}"));
-            Vec::new()
-        },
+    let announcements = if *fetch {
+        let request = DiscoveryRequest::Fetch { tag: *tag };
+        match tokio::time::timeout_at(deadline, self::request(&conn, &request)).await {
+            Ok(Ok(DiscoveryResponse::Fetched { announcements })) => announcements,
+            Ok(Ok(other)) => {
+                degraded.push(format!("fetch refused: {other:?}"));
+                Vec::new()
+            },
+            Ok(Err(error)) => {
+                degraded.push(format!("fetch failed: {error}"));
+                Vec::new()
+            },
+            Err(_elapsed) => {
+                degraded.push(format!("fetch timed out after {DISCOVERY_TIMEOUT:?}"));
+                Vec::new()
+            },
+        }
+    } else {
+        Vec::new()
     };
 
-    // Reached even when the fetch failed above — an empty announcement list then reads as "this
-    // node is not live", which republishes. Publishing a copy we did not need is far cheaper than
-    // silently ceasing to advertise.
+    // Reached whatever the fetch did — the two halves are independent, and a publish the caller
+    // asked for is owed regardless of whether anyone answered the other question.
     let publish_state = match publish {
         None => PublishState::NotAttempted,
-        Some(envelope) if is_live(&announcements, envelope, *ttl_seconds, *now_ms) =>
-            PublishState::AlreadyLive,
         Some(envelope) => {
             let publish = DiscoveryRequest::Publish {
                 tag: *tag,
@@ -297,19 +340,19 @@ async fn exchange_inner(
         },
     };
 
-    // DEDUPLICATE, then cap — in that order. Capping first would spend the budget on duplicates: a
-    // publisher holds about two live copies of itself at any moment, so a cap applied to raw
-    // announcements admits roughly half the peers it promises.
-    //
     // De-duplicating by BYTES works, and only because a publisher seals once per roster change and
     // republishes the result verbatim: its copies are byte-identical. Were the envelope re-sealed
     // per publish, each copy would carry a fresh ephemeral and none of this would collapse.
+    //
+    // Bounded at [`MAX_SEALED_ANNOUNCEMENTS`], NOT at the peer cap. The peer cap belongs to the
+    // caller, after opening — see [`MAX_ANNOUNCEMENTS`] for why applying it to unopened payloads
+    // hands a suppression primitive to anyone who can compute the tag.
     let mut seen = std::collections::HashSet::new();
     let announcements = announcements
         .into_iter()
         .map(|announcement| announcement.payload)
         .filter(|payload| seen.insert(payload.clone()))
-        .take(MAX_ANNOUNCEMENTS)
+        .take(MAX_SEALED_ANNOUNCEMENTS)
         .collect();
 
     DiscoveryOutcome {
@@ -335,9 +378,6 @@ pub struct Advertise {
     /// device, which has no one to be discovered by.
     pub announcement: tokio::sync::watch::Receiver<Option<Vec<u8>>>,
     pub ttl_seconds: u32,
-    /// A clock, not an instant: unlike a single [`exchange`], this loop runs for the host's
-    /// lifetime and must read the time afresh on every tick.
-    pub now_ms: fn() -> i64,
 }
 
 /// Keep `node` advertised under `tag` for as long as this future is polled. Never returns.
@@ -347,20 +387,38 @@ pub struct Advertise {
 /// maintenance-hook cadence can never announce, because a serving host has no maintenance hook.
 /// Without this the only publishers would be the only fetchers.
 ///
-/// Ticks at a QUARTER of the TTL and renews once less than [`RENEWAL_THRESHOLD`] of it remains, so
-/// a renewal lands at roughly half-life with the other half still in hand — see those constants for
-/// why the margin is the whole point. The first tick fires immediately, so a host is discoverable
-/// from startup rather than a fraction of a TTL later. Each tick is a full [`exchange`], so the
-/// fetch-before-publish skip applies and a long-running host does not stack copies of itself.
+/// Ticks at an eighth of the TTL and republishes once half of it has elapsed, so a renewal lands at
+/// half-life with four ticks in hand before expiry — see [`TICKS_PER_TTL`] and [`RENEW_AFTER_NUM`],
+/// where the fractions are a slot budget rather than a comfort margin. The first tick fires
+/// immediately, so a host is discoverable from startup rather than a fraction of a TTL later.
 ///
-/// Publish-only in effect: the fetched peers are discarded, because peers dial a serving host
-/// rather than the other way round.
+/// **Liveness is this loop's own record, not something read back from the service.** It keeps the
+/// envelope it last got accepted and the monotonic instant of that acceptance, and republishes when
+/// either the envelope changed (a roster move, which must take effect at the next tick) or half the
+/// TTL has passed. Asking the service instead is the trap [`exchange`] documents: fetch responses
+/// are a sampled subset, so a live announcement is often missing from one, and believing that
+/// stacks copies until hosts evict each other. Keeping the record locally also makes a
+/// not-yet-due tick completely free — no dial at all — which is what lets the tick be fine enough
+/// to give renewal four attempts.
+///
+/// A publish that FAILS deliberately leaves the record untouched, so the very next tick retries;
+/// only the service accepting one moves it forward.
+///
+/// Publish-only: [`DiscoveryExchange::fetch`] is off, because peers dial a serving host rather than
+/// the other way round.
 pub async fn advertise(params: Advertise) {
-    let Advertise { endpoint, service, tag, mut announcement, ttl_seconds, now_ms } = params;
-    // `.max(4)` keeps the interval positive even if a future TTL floor drops below 4s; a zero
-    // period would make `interval` panic.
-    let mut ticks =
-        tokio::time::interval(Duration::from_secs(u64::from(ttl_seconds).max(4) / TICKS_PER_TTL));
+    let Advertise { endpoint, service, tag, mut announcement, ttl_seconds } = params;
+    // Milliseconds, and `.max(1)`, so the period stays positive for any TTL the service's floor
+    // could ever permit — `interval` panics on a zero period.
+    let period = Duration::from_millis((u64::from(ttl_seconds) * 1000 / TICKS_PER_TTL).max(1));
+    let renew_after =
+        Duration::from_millis(u64::from(ttl_seconds * RENEW_AFTER_NUM / RENEW_AFTER_DEN) * 1000);
+    let mut ticks = tokio::time::interval(period);
+    // What the service last accepted from this host, and when. A MONOTONIC instant, not the wall
+    // clock and not the service's `expires_at_ms`: this is a pure "how long since we published"
+    // question, so it needs neither a clock that can step backwards nor a comparison across two
+    // machines' clocks.
+    let mut published: Option<(Vec<u8>, tokio::time::Instant)> = None;
     loop {
         ticks.tick().await;
         // Re-read per tick, not once at spawn: this is what makes a roster change take effect.
@@ -376,15 +434,25 @@ pub async fn advertise(params: Advertise) {
             tracing::debug!("nothing to advertise yet; skipping this tick");
             continue;
         };
+        if let Some((last, accepted_at)) = &published
+            && *last == envelope
+            && accepted_at.elapsed() < renew_after
+        {
+            tracing::trace!("this host's announcement is still live; not renewing yet");
+            continue;
+        }
         let outcome = exchange(DiscoveryExchange {
             endpoint: &endpoint,
             service: service.clone(),
             tag,
+            fetch: false,
             publish: Some(&envelope),
             ttl_seconds,
-            now_ms: now_ms(),
         })
         .await;
+        if outcome.publish == PublishState::Published {
+            published = Some((envelope, tokio::time::Instant::now()));
+        }
         match outcome.degraded {
             // Never fatal: a host that cannot advertise itself still serves every peer that
             // reaches it through a configured `server_peers` entry.
@@ -392,42 +460,6 @@ pub async fn advertise(params: Advertise) {
             None => tracing::debug!(state = ?outcome.publish, "advertised this host"),
         }
     }
-}
-
-/// Whether this host's own announcement is already live with comfortably more than
-/// [`RENEWAL_THRESHOLD`] of its TTL left — i.e. does not need renewing yet.
-///
-/// Compares the announcement BYTES against the envelope this host is currently publishing. That
-/// works because the envelope is sealed once per roster change and republished verbatim, not
-/// re-sealed per tick — a fresh ephemeral per publish would make every copy differ, the host would
-/// never recognise itself, and it would republish on every tick until the tag was full of its own
-/// announcements. It also earns a property: when the roster moves the envelope changes, so the old
-/// announcement stops matching and the host republishes at the NEXT tick instead of waiting out a
-/// renewal.
-///
-/// **The margin is the point, and getting it wrong is silent.** `expires_at_ms` is stamped by the
-/// SERVICE when it receives the publish, not by this client when it sends one, so an entry written
-/// at tick `t` expires at `t + round_trip + ttl`. If the threshold equalled the tick period, every
-/// tick at which renewal was due would find `round_trip` MORE than the threshold remaining, skip,
-/// and defer renewal to the following tick — by which point only `round_trip` milliseconds of life
-/// are left. A single failed renewal there (a timeout, or the `RateLimited` code the service has)
-/// would then leave the host unadvertised for a whole tick period. With a threshold of three
-/// quarters against a quarter-TTL tick, renewal happens at half-life and two further ticks remain
-/// before expiry, so one failure costs nothing.
-///
-/// The comparison also mixes clocks — client `now_ms` against service `expires_at_ms` — which is
-/// tolerable only because the margin dwarfs any plausible skew. It would not be at zero margin.
-fn is_live(
-    announcements: &[wire::WireAnnouncement],
-    envelope: &[u8],
-    ttl_seconds: u32,
-    now_ms: i64,
-) -> bool {
-    let headroom_ms = i64::from(ttl_seconds) * 1000 * RENEWAL_THRESHOLD_NUM / RENEWAL_THRESHOLD_DEN;
-    announcements.iter().any(|announcement| {
-        announcement.payload.as_slice() == envelope
-            && announcement.expires_at_ms.saturating_sub(now_ms) > headroom_ms
-    })
 }
 
 /// One request on its own bi-stream. The service reads a single frame, answers, and closes, so a

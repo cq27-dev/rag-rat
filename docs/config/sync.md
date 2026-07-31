@@ -73,27 +73,36 @@ becomes meaningful on any device, because a device that advertises itself will b
 ### Scale
 
 Dials grow linearly with the number of devices — each device dials the host, not every other device
-— and only the hosts advertise, so the per-tag announcement limit is a limit on **hosts**, not on
-devices. One or two hosts stay well inside it no matter how many devices sync through them.
+— and only the hosts advertise, so the per-tag *slot* limit counts **hosts**, not devices. One or
+two hosts stay well inside it no matter how many devices sync through them. Device count reaches
+discovery by a different route: it sets the size of each announcement, which is the 25-device
+ceiling above.
 
 Adding hosts is how you spread load or place one nearer a group of devices; devices that dial more
 than one host also propagate changes between those hosts.
 
-## The limit on advertised hosts
+## The limits on discovery
 
-The discovery service holds at most 8 live announcements per account and refuses further publishes
-rather than evicting. A host keeps about two live announcements of itself, so **roughly four hosts
-can advertise at once**. Devices cost nothing here — they only fetch.
+Two separate ceilings, with different symptoms. Neither binds for an ordinary account, and both
+degrade rather than breaking: discovery is routing advice, so anything it fails to find is still
+reachable through `server_peers`.
 
-Four hosts is far more than most accounts want, so this is unlikely to bind. If it does, it degrades
-rather than breaking:
+**How many hosts can advertise.** The service holds at most 32 live announcements per account and
+evicts the oldest to make room rather than refusing a newcomer. A host renews at half the TTL, so it
+keeps about two live announcements of itself — **roughly sixteen hosts advertising at once**.
+Devices cost nothing here; they only fetch. Past that, hosts evict each other and discoverability
+**flaps**: a host findable this hour may not be next hour. Pin those hosts in `server_peers` instead.
 
-- A host whose publish is refused **stops being discoverable**. It keeps serving normally, and any
-  device that reaches it through `server_peers` is unaffected.
-- Which hosts hold the free slots shifts as announcements expire, so **discoverability flaps** — a
-  host findable this hour may not be next hour.
+**How many devices an account can have.** An announcement is sealed once per recipient, so it grows
+by 80 bytes per roster-effective device against a publish limit of 2048 bytes — a ceiling of about
+**25 devices**. Past it a host logs `roster is too large to seal into one announcement` and does not
+advertise; it serves normally, and every device that reaches it through `server_peers` is
+unaffected. The announcement is never truncated to fit, because which recipients got dropped would
+silently decide who can find that host.
 
-The fix is to pin the hosts in `server_peers` rather than relying on discovery for all of them.
+A fetch is bounded the same way: the service answers with as much as fits one response frame, chosen
+at random, so a busy tag returns a **sample** rather than everything. A device therefore learns some
+of its peers per pass and the rest on later passes.
 
 ## Settings
 

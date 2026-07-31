@@ -262,7 +262,6 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
                         ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
                             config.sync.push_interval_secs,
                         ),
-                        now_ms: time::now_ms,
                     },
                 )))
             });
@@ -677,11 +676,11 @@ pub(crate) fn device_sync_run(
                     // every device that discovers it a dial that can only time out, and occupying
                     // one of the few per-tag slots that a REACHABLE peer needs. Only a node that
                     // accepts connections is worth announcing.
+                    fetch: true,
                     publish: None,
                     ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
                         config.sync.push_interval_secs,
                     ),
-                    now_ms: time::now_ms(),
                 }
             }),
             // Opening happens here, where a connection is available. An announcement sealed to a
@@ -825,16 +824,63 @@ fn seal_announcement(
     local_node: &[u8; 32],
 ) -> Option<(Vec<u8>, rag_rat_oplog::discovery::RosterStamp)> {
     match rag_rat_oplog::discovery::seal_discovery_announcement(conn, tag, local_node) {
-        Ok(Some(sealed)) if sealed.recipients > 1 => Some((sealed.bytes, sealed.roster_stamp)),
-        Ok(Some(_)) => {
-            tracing::debug!("not advertising: this device is the account's only roster member");
-            None
+        Ok(Some(sealed)) => match classify_announcement(sealed.recipients, sealed.bytes.len()) {
+            AnnouncementVerdict::Advertise => Some((sealed.bytes, sealed.roster_stamp)),
+            AnnouncementVerdict::SoleRosterMember => {
+                tracing::debug!("not advertising: this device is the account's only roster member");
+                None
+            },
+            AnnouncementVerdict::TooLargeToPublish => {
+                tracing::warn!(
+                    recipients = sealed.recipients,
+                    bytes = sealed.bytes.len(),
+                    max_bytes = rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES,
+                    "not advertising: this account's roster is too large to seal into one \
+                     announcement"
+                );
+                None
+            },
         },
         Ok(None) => None,
         Err(error) => {
             tracing::warn!(%error, "not advertising: sealing this host's announcement failed");
             None
         },
+    }
+}
+
+/// Why a sealed announcement is, or is not, worth publishing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnouncementVerdict {
+    Advertise,
+    /// No one to be discovered BY, so publishing would spend a slot to tell nobody.
+    SoleRosterMember,
+    /// Past what the service accepts in one publish.
+    TooLargeToPublish,
+}
+
+/// Decide whether a sealed announcement should be published, from its recipient count and size.
+///
+/// **The size rule is the one that fails silently without it.** An envelope grows 80 bytes per
+/// roster-effective device, so an account past roughly 25 of them seals something the service will
+/// refuse — and a refusal looks exactly like a transient one, so the host keeps retrying while
+/// being absent from discovery, with nothing anywhere saying why. Catching it here turns that into
+/// one warning naming the count, the size, and the limit.
+///
+/// It does NOT truncate the recipient list to fit. Which recipients were dropped would decide who
+/// can find this host, and choosing them arbitrarily is a worse failure than not advertising —
+/// splitting the envelope across several announcements is the way past the ceiling.
+///
+/// Named and tested separately for the same reason as [`serve_should_advertise`]: its caller needs
+/// a database with a roster of a given size, and the composition it feeds runs an accept loop until
+/// interrupted.
+fn classify_announcement(recipients: usize, bytes: usize) -> AnnouncementVerdict {
+    if bytes > rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES {
+        AnnouncementVerdict::TooLargeToPublish
+    } else if recipients > 1 {
+        AnnouncementVerdict::Advertise
+    } else {
+        AnnouncementVerdict::SoleRosterMember
     }
 }
 
@@ -1001,10 +1047,10 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, decode_node_secret, device_can_serve,
-        device_can_sync, device_sync_due, device_sync_run, discovery_node_or_configured,
-        discovery_service_addr, fold_peer_outcomes, join, node_secret, record_device_sync,
-        serve_should_advertise,
+        AnnouncementVerdict, DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, classify_announcement,
+        decode_node_secret, device_can_serve, device_can_sync, device_sync_due, device_sync_run,
+        discovery_node_or_configured, discovery_service_addr, fold_peer_outcomes, join,
+        node_secret, record_device_sync, serve_should_advertise,
     };
 
     fn account_of(conn: &Connection) -> rag_rat_oplog::AccountId {
@@ -1138,6 +1184,47 @@ mod tests {
             "--once is a scripted check, not a host; its announcement would outlive the process"
         );
         assert!(!serve_should_advertise(false, false, true));
+    }
+
+    /// The roster size at which a host stops being able to advertise, pinned exactly.
+    ///
+    /// Two properties, and the second is the one that was missing. Sealing to more devices than fit
+    /// one publish is not a hypothetical: an envelope is one version byte plus 80 bytes per
+    /// roster-effective device, so the ceiling arrives at 25 recipients — well inside the roster
+    /// sizes accounts are otherwise built for. Without this branch the oversized publish is refused
+    /// by the service, the refusal is indistinguishable from a transient error, and the host
+    /// retries forever while absent from discovery with nothing explaining why.
+    ///
+    /// Asserted at the boundary on BOTH sides, because an off-by-one here is invisible in
+    /// production — it costs the largest accounts their discovery and nothing else changes.
+    #[test]
+    fn a_roster_too_large_to_seal_into_one_announcement_is_refused_not_truncated() {
+        const VERSION_BYTE: usize = 1;
+        const WRAP_LEN: usize = 32 + 48;
+        let envelope_len = |recipients: usize| VERSION_BYTE + recipients * WRAP_LEN;
+        let max = rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES;
+
+        let fits = (1..).take_while(|n| envelope_len(*n) <= max).last().expect("some roster fits");
+        assert_eq!(fits, 25, "the documented recipient ceiling moved");
+
+        assert_eq!(
+            classify_announcement(fits, envelope_len(fits)),
+            AnnouncementVerdict::Advertise,
+            "the largest roster that fits must still advertise"
+        );
+        assert_eq!(
+            classify_announcement(fits + 1, envelope_len(fits + 1)),
+            AnnouncementVerdict::TooLargeToPublish,
+            "one recipient past the limit must be refused, not truncated to fit"
+        );
+
+        // The sole-member rule still applies, and size is judged first: a lone device is not
+        // advertised whatever its envelope weighs.
+        assert_eq!(
+            classify_announcement(1, envelope_len(1)),
+            AnnouncementVerdict::SoleRosterMember
+        );
+        assert_eq!(classify_announcement(2, envelope_len(2)), AnnouncementVerdict::Advertise);
     }
 
     /// `[sync] discovery = false` silences the service for BOTH callers, because both resolve its
