@@ -197,6 +197,42 @@ test('client authenticates JSON and SSE requests', async (t) => {
   );
 });
 
+test('version changes select only the lanes whose clocks moved', async () => {
+  const { changedVersionLanes } = await loadClientModule();
+  const version = {
+    generation: 7,
+    max_indexed_at_ms: 11,
+    git_dirty: null,
+    content_revision: 'content-1',
+    lanes: { symbols: '1', clones: '2:9', memories: '3', coupling: '4', papertrail: '5' },
+    revision: 'legacy-1',
+  };
+
+  assert.deepEqual(
+    changedVersionLanes(version, {
+      ...version,
+      lanes: { ...version.lanes, memories: '4' },
+      revision: 'legacy-2',
+    }),
+    ['memories'],
+  );
+  assert.deepEqual(
+    changedVersionLanes(version, { ...version, content_revision: 'content-2' }),
+    ['symbols', 'clones', 'memories', 'coupling', 'papertrail'],
+  );
+  assert.deepEqual(
+    changedVersionLanes(version, { ...version, revision: 'unmapped-writer' }),
+    ['symbols', 'clones', 'memories', 'coupling', 'papertrail'],
+    'the legacy aggregate remains a fail-safe for an unmapped writer',
+  );
+  const oldVersion = ({ lanes, content_revision, ...old }) => old;
+  assert.deepEqual(
+    changedVersionLanes(oldVersion(version), oldVersion({ ...version, revision: 'legacy-2' })),
+    ['symbols', 'clones', 'memories', 'coupling', 'papertrail'],
+    'a server without lane clocks keeps the safe legacy behavior',
+  );
+});
+
 test('linked abort signals fire from either side without AbortSignal.any', async () => {
   const { eitherSignal } = await loadClientModule();
 
@@ -991,6 +1027,96 @@ test('a slow clone lane does not discard the lanes that answered', async () => {
   // Worth logging, but the file's signals stay on screen.
   assert.ok(store.failure('src/lib.rs'));
   assert.equal(store.shouldClearSignals('src/lib.rs'), false);
+});
+
+test('invalidating one lane reuses the other four cached answers', async () => {
+  const FileStore = await loadStore();
+  const calls = { symbols: 0, clones: 0, memories: 0, coupling: 0, papertrail: 0 };
+  const client = {
+    fileSymbolGraph: async () => lane([{ name: `symbols-${++calls.symbols}` }]),
+    fileClonesFull: async () => {
+      calls.clones += 1;
+      return lane({ clone_regions: [], clone_graph: { eligible: true } });
+    },
+    fileMemories: async () => lane([{ title: `memory-${++calls.memories}` }]),
+    fileCoupling: async () => {
+      calls.coupling += 1;
+      return lane([]);
+    },
+    filePapertrail: async () => {
+      calls.papertrail += 1;
+      return lane({ refs: [], decisions: [] });
+    },
+  };
+  let identity = 'first server';
+  const store = new FileStore(
+    client,
+    () => 0.9,
+    () => 100,
+    () => 'src/lib.rs',
+    async () => identity,
+    noDigest,
+  );
+  store.setOnline(true);
+  const first = await store.data('src/lib.rs');
+
+  store.invalidate(['memories']);
+  const second = await store.data('src/lib.rs');
+
+  assert.deepEqual(calls, { symbols: 1, clones: 1, memories: 2, coupling: 1, papertrail: 1 });
+  assert.equal(second.symbols[0].name, first.symbols[0].name);
+  assert.equal(second.memories[0].title, 'memory-2');
+
+  identity = 'second server';
+  store.invalidate(['memories']);
+  const repointed = await store.data('src/lib.rs');
+  assert.deepEqual(
+    calls,
+    { symbols: 2, clones: 2, memories: 3, coupling: 2, papertrail: 2 },
+    'a source change widens a selective refresh so no lane is retained from the old server',
+  );
+  assert.equal(repointed.symbols[0].name, 'symbols-2');
+});
+
+test('concurrent selective loads widen after another path notices a source change', async () => {
+  const FileStore = await loadStore();
+  const calls = { symbols: 0, clones: 0, memories: 0, coupling: 0, papertrail: 0 };
+  const client = {
+    fileSymbolGraph: async () => {
+      calls.symbols += 1;
+      return lane([]);
+    },
+    fileClonesFull: async () => {
+      calls.clones += 1;
+      return lane({ clone_regions: [], clone_graph: { eligible: true } });
+    },
+    fileMemories: async () => {
+      calls.memories += 1;
+      return lane([]);
+    },
+    fileCoupling: async () => {
+      calls.coupling += 1;
+      return lane([]);
+    },
+    filePapertrail: async () => {
+      calls.papertrail += 1;
+      return lane({ refs: [], decisions: [] });
+    },
+  };
+  let identity = 'first server';
+  const store = new FileStore(client, () => 0.9, () => 100, () => undefined, async () => identity, noDigest);
+  store.setOnline(true);
+  await Promise.all([store.data('src/a.rs'), store.data('src/b.rs')]);
+
+  identity = 'second server';
+  store.invalidate(['memories']);
+  await Promise.all([store.data('src/a.rs'), store.data('src/b.rs')]);
+
+  assert.deepEqual(
+    calls,
+    { symbols: 4, clones: 4, memories: 4, coupling: 4, papertrail: 4 },
+    'both paths reload wholly from the new source even though only one observes the old identity',
+  );
 });
 
 test('a failed lane keeps its last value instead of reporting an empty one', async () => {

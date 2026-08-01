@@ -5983,72 +5983,62 @@ pub fn apply_lens_enrichment_revision(conn: &Connection) -> rusqlite::Result<()>
         ("clone_refinements", "clone_refinements_lens_revision"),
         ("oracle_runs", "oracle_runs_lens_revision"),
     ] {
-        create_repo_scoped_lens_revision_triggers(conn, table, trigger_prefix)?;
+        create_repo_scoped_lens_revision_triggers(
+            conn,
+            table,
+            trigger_prefix,
+            crate::meta::LENS_ENRICHMENT_REVISION_META,
+        )?;
     }
-
-    let key = crate::meta::LENS_ENRICHMENT_REVISION_META;
-    conn.execute_batch(
-        "DROP TRIGGER IF EXISTS clone_graph_generations_lens_revision_insert;
-         DROP TRIGGER IF EXISTS clone_graph_generations_lens_revision_delete;
-         DROP TRIGGER IF EXISTS clone_graph_generations_lens_revision_update;",
+    create_live_clone_graph_revision_triggers(
+        conn,
+        "clone_graph_generations_lens_revision",
+        crate::meta::LENS_ENRICHMENT_REVISION_META,
     )?;
-    if column_exists(conn, "clone_graph_generations", "repo_id")? {
-        conn.execute_batch(&format!(
-            "CREATE TRIGGER clone_graph_generations_lens_revision_insert
-             AFTER INSERT ON clone_graph_generations
-             WHEN EXISTS (
-                 SELECT 1 FROM repo_meta
-                 WHERE repo_id = NEW.repo_id AND key = 'clone_graph_live_generation'
-                   AND CAST(value AS INTEGER) = NEW.generation
-             )
-             BEGIN
-                 INSERT INTO repo_meta(repo_id, key, value) VALUES (NEW.repo_id, '{key}', '1')
-                 ON CONFLICT(repo_id, key) DO UPDATE SET
-                     value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
-             END;
-         CREATE TRIGGER clone_graph_generations_lens_revision_delete
-             AFTER DELETE ON clone_graph_generations
-             WHEN EXISTS (
-                 SELECT 1 FROM repo_meta
-                 WHERE repo_id = OLD.repo_id AND key = 'clone_graph_live_generation'
-                   AND CAST(value AS INTEGER) = OLD.generation
-             )
-             BEGIN
-                 INSERT INTO repo_meta(repo_id, key, value) VALUES (OLD.repo_id, '{key}', '1')
-                 ON CONFLICT(repo_id, key) DO UPDATE SET
-                     value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
-             END;
-         CREATE TRIGGER clone_graph_generations_lens_revision_update
-             AFTER UPDATE ON clone_graph_generations
-             BEGIN
-                 INSERT INTO repo_meta(repo_id, key, value)
-                 SELECT NEW.repo_id, '{key}', '1'
-                 WHERE EXISTS (
-                     SELECT 1 FROM repo_meta
-                     WHERE repo_id = NEW.repo_id AND key = 'clone_graph_live_generation'
-                       AND CAST(value AS INTEGER) = NEW.generation
-                 )
-                 ON CONFLICT(repo_id, key) DO UPDATE SET
-                     value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
-                 INSERT INTO repo_meta(repo_id, key, value)
-                 SELECT OLD.repo_id, '{key}', '1'
-                 WHERE (OLD.repo_id != NEW.repo_id OR OLD.generation != NEW.generation)
-                   AND EXISTS (
-                       SELECT 1 FROM repo_meta
-                       WHERE repo_id = OLD.repo_id AND key = 'clone_graph_live_generation'
-                         AND CAST(value AS INTEGER) = OLD.generation
-                   )
-                  ON CONFLICT(repo_id, key) DO UPDATE SET
-                      value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
-             END;"
-        ))?;
-    }
     conn.execute_batch(
         "DROP TRIGGER IF EXISTS clone_graph_pointer_lens_revision_insert;
          DROP TRIGGER IF EXISTS clone_graph_pointer_lens_revision_delete;
          DROP TRIGGER IF EXISTS clone_graph_pointer_lens_revision_update;",
     )?;
     Ok(())
+}
+
+/// V102: split the aggregate Lens enrichment clock into the five editor data lanes.
+pub fn apply_lens_lane_revisions(conn: &Connection) -> rusqlite::Result<()> {
+    use crate::meta;
+
+    for (table, trigger_prefix, key) in [
+        ("repo_memories", "memories_lane_revision", meta::LENS_MEMORIES_REVISION_META),
+        (
+            "repo_memory_bindings",
+            "memory_bindings_lane_revision",
+            meta::LENS_MEMORIES_REVISION_META,
+        ),
+        ("memory_reality", "memory_reality_lane_revision", meta::LENS_MEMORIES_REVISION_META),
+        ("memory_summaries", "memory_summaries_lane_revision", meta::LENS_MEMORIES_REVISION_META),
+        ("papertrail_items", "papertrail_items_lane_revision", meta::LENS_PAPERTRAIL_REVISION_META),
+        ("papertrail_refs", "papertrail_refs_lane_revision", meta::LENS_PAPERTRAIL_REVISION_META),
+        (
+            "papertrail_distill",
+            "papertrail_distill_lane_revision",
+            meta::LENS_PAPERTRAIL_REVISION_META,
+        ),
+        (
+            "papertrail_distill_anchors",
+            "papertrail_distill_anchors_lane_revision",
+            meta::LENS_PAPERTRAIL_REVISION_META,
+        ),
+        ("clone_refinements", "clone_refinements_lane_revision", meta::LENS_CLONES_REVISION_META),
+        ("oracle_runs", "oracle_symbols_lane_revision", meta::LENS_SYMBOLS_REVISION_META),
+        ("oracle_runs", "oracle_clones_lane_revision", meta::LENS_CLONES_REVISION_META),
+    ] {
+        create_repo_scoped_lens_revision_triggers(conn, table, trigger_prefix, key)?;
+    }
+    create_live_clone_graph_revision_triggers(
+        conn,
+        "clone_graph_generations_lane_revision",
+        meta::LENS_CLONES_REVISION_META,
+    )
 }
 
 /// V092 (#949): stop duplicating every enrollment receipt in the invite row.
@@ -6198,8 +6188,8 @@ fn create_repo_scoped_lens_revision_triggers(
     conn: &Connection,
     table: &str,
     trigger_prefix: &str,
+    key: &str,
 ) -> rusqlite::Result<()> {
-    let key = crate::meta::LENS_ENRICHMENT_REVISION_META;
     conn.execute_batch(&format!(
         "DROP TRIGGER IF EXISTS {trigger_prefix}_insert;
          DROP TRIGGER IF EXISTS {trigger_prefix}_delete;
@@ -6244,6 +6234,122 @@ fn create_repo_scoped_lens_revision_triggers(
                   END;"
     ))?;
     Ok(())
+}
+
+fn create_live_clone_graph_revision_triggers(
+    conn: &Connection,
+    trigger_prefix: &str,
+    key: &str,
+) -> rusqlite::Result<()> {
+    conn.execute_batch(&format!(
+        "DROP TRIGGER IF EXISTS {trigger_prefix}_insert;
+         DROP TRIGGER IF EXISTS {trigger_prefix}_delete;
+         DROP TRIGGER IF EXISTS {trigger_prefix}_update;"
+    ))?;
+    if !column_exists(conn, "clone_graph_generations", "repo_id")? {
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER {trigger_prefix}_insert
+         AFTER INSERT ON clone_graph_generations
+         WHEN EXISTS (
+             SELECT 1 FROM repo_meta
+             WHERE repo_id = NEW.repo_id AND key = 'clone_graph_live_generation'
+               AND CAST(value AS INTEGER) = NEW.generation
+         )
+         BEGIN
+             INSERT INTO repo_meta(repo_id, key, value) VALUES (NEW.repo_id, '{key}', '1')
+             ON CONFLICT(repo_id, key) DO UPDATE SET
+                 value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+         END;
+         CREATE TRIGGER {trigger_prefix}_delete
+         AFTER DELETE ON clone_graph_generations
+         WHEN EXISTS (
+             SELECT 1 FROM repo_meta
+             WHERE repo_id = OLD.repo_id AND key = 'clone_graph_live_generation'
+               AND CAST(value AS INTEGER) = OLD.generation
+         )
+         BEGIN
+             INSERT INTO repo_meta(repo_id, key, value) VALUES (OLD.repo_id, '{key}', '1')
+             ON CONFLICT(repo_id, key) DO UPDATE SET
+                 value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+         END;
+         CREATE TRIGGER {trigger_prefix}_update
+         AFTER UPDATE ON clone_graph_generations
+         BEGIN
+             INSERT INTO repo_meta(repo_id, key, value)
+             SELECT NEW.repo_id, '{key}', '1'
+             WHERE EXISTS (
+                 SELECT 1 FROM repo_meta
+                 WHERE repo_id = NEW.repo_id AND key = 'clone_graph_live_generation'
+                   AND CAST(value AS INTEGER) = NEW.generation
+             )
+             ON CONFLICT(repo_id, key) DO UPDATE SET
+                 value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+             INSERT INTO repo_meta(repo_id, key, value)
+             SELECT OLD.repo_id, '{key}', '1'
+             WHERE (OLD.repo_id != NEW.repo_id OR OLD.generation != NEW.generation)
+               AND EXISTS (
+                 SELECT 1 FROM repo_meta
+                 WHERE repo_id = OLD.repo_id AND key = 'clone_graph_live_generation'
+                   AND CAST(value AS INTEGER) = OLD.generation
+             )
+             ON CONFLICT(repo_id, key) DO UPDATE SET
+                 value = CAST(COALESCE(value, '0') AS INTEGER) + 1;
+         END;"
+    ))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod lens_lane_revision_migration_tests {
+    use super::*;
+
+    #[test]
+    fn lane_triggers_are_idempotent_and_repo_scoped() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE repos(repo_id TEXT PRIMARY KEY);
+             CREATE TABLE repo_meta(
+                 repo_id TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT,
+                 PRIMARY KEY(repo_id, key)
+             );
+             CREATE TABLE repo_memories(repo_id TEXT NOT NULL);
+             CREATE TABLE papertrail_items(repo_id TEXT NOT NULL);
+             CREATE TABLE clone_refinements(repo_id TEXT NOT NULL);
+             CREATE TABLE oracle_runs(repo_id TEXT NOT NULL);
+             CREATE TABLE clone_graph_generations(repo_id TEXT NOT NULL, generation INTEGER);
+             INSERT INTO repos VALUES ('active'), ('sibling');",
+        )
+        .unwrap();
+
+        apply_lens_lane_revisions(&conn).unwrap();
+        apply_lens_lane_revisions(&conn).expect("trigger replay is a no-op");
+        conn.execute("INSERT INTO repo_memories VALUES ('active')", []).unwrap();
+        conn.execute("INSERT INTO papertrail_items VALUES ('sibling')", []).unwrap();
+        conn.execute("INSERT INTO oracle_runs VALUES ('active')", []).unwrap();
+        conn.execute(
+            "INSERT INTO repo_meta VALUES ('active', 'clone_graph_live_generation', '7')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO clone_graph_generations VALUES ('active', 7)", []).unwrap();
+
+        let revision = |repo_id, key| {
+            crate::meta::repo_meta(&conn, repo_id, key)
+                .unwrap()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0)
+        };
+        assert_eq!(revision("active", crate::meta::LENS_MEMORIES_REVISION_META), 1);
+        assert_eq!(revision("sibling", crate::meta::LENS_MEMORIES_REVISION_META), 0);
+        assert_eq!(revision("sibling", crate::meta::LENS_PAPERTRAIL_REVISION_META), 1);
+        assert_eq!(revision("active", crate::meta::LENS_PAPERTRAIL_REVISION_META), 0);
+        assert_eq!(revision("active", crate::meta::LENS_SYMBOLS_REVISION_META), 1);
+        assert_eq!(revision("active", crate::meta::LENS_CLONES_REVISION_META), 2);
+    }
 }
 
 /// V095 (#1002): per-TABLE spec versioning, plus a direct pointer from a row to its winning entry.

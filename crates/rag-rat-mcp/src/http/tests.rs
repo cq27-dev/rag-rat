@@ -563,7 +563,12 @@ async fn clones_uses_the_native_lens_composition() {
         .await
         .unwrap();
     assert_eq!(version.status(), StatusCode::OK);
-    assert!(json_body(version).await["max_indexed_at_ms"].as_i64().unwrap() > 0);
+    let version = json_body(version).await;
+    assert!(version["max_indexed_at_ms"].as_i64().unwrap() > 0);
+    assert!(version["content_revision"].as_str().is_some());
+    for lane in ["symbols", "clones", "memories", "coupling", "papertrail"] {
+        assert!(version["lanes"][lane].as_str().is_some(), "missing lane version {lane}");
+    }
 
     let treemap = get_json(&app, "/api/treemap").await;
     assert_eq!(treemap["files"].as_array().unwrap().len(), 2);

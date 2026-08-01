@@ -55,8 +55,8 @@ pub use lens::{
     LensCallees, LensCallers, LensChunkText, LensCloneGraphCache, LensCouplingPartner,
     LensDecisionRecord, LensDispatchDetail, LensFileAnswer, LensFileCoupling, LensFileGraph,
     LensFileMemories, LensFileMemory, LensFilePapertrail, LensFileSymbolGraph, LensFileSymbols,
-    LensGraphCallerCounts, LensHopResolvedBy, LensHopSelector, LensPapertrailRef, LensStatus,
-    LensSymbol, LensSymbolHop, LensTreemap, LensTreemapFile, LensVersion,
+    LensGraphCallerCounts, LensHopResolvedBy, LensHopSelector, LensLaneVersions, LensPapertrailRef,
+    LensStatus, LensSymbol, LensSymbolHop, LensTreemap, LensTreemapFile, LensVersion,
 };
 pub use memory::SyncCatchUpReport;
 pub use oracle_runs::OracleShaSnapshots;

@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 101;
+pub const LATEST_SCHEMA_VERSION: u32 = 102;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -769,6 +769,12 @@ const MIGRATION_101_DESCRIPTION: &str = "Add per-file graph and scope derivation
                                          active checkout can refresh only rows whose bytes it can \
                                          verify, while linked worktrees retain and later complete \
                                          their own upgrade";
+const MIGRATION_102_ID: &str = "102_lens_lane_revisions";
+const MIGRATION_102_CHECKSUM: &str = "sha256:rag-rat-lens-lane-revisions-v102";
+const MIGRATION_102_DESCRIPTION: &str = "Add independent O(1), per-repo Lens revision clocks for \
+                                         symbols, clones, memories, coupling, and papertrail so \
+                                         editor clients refetch only lanes whose backing data \
+                                         changed while the aggregate legacy clock remains intact";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1602,6 +1608,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_101_CHECKSUM,
         description: MIGRATION_101_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_file_graph_version_provenance),
+    },
+    Migration {
+        id: MIGRATION_102_ID,
+        checksum: MIGRATION_102_CHECKSUM,
+        description: MIGRATION_102_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_lens_lane_revisions),
     },
 ];
 

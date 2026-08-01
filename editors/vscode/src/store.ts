@@ -2,13 +2,14 @@
 // CodeLens providers, sidebar views, hover, overlays, and diagnostics —
 // instead of each lane fetching its own copy of the same payload.
 import type * as vscode from 'vscode';
-import { UNKNOWN_CONTENT } from './client';
+import { FILE_LANES, UNKNOWN_CONTENT } from './client';
 import type {
   CloneRegion,
   CouplingPartner,
   DecisionRecord,
   FileAnswer,
   FileMemory,
+  FileLane,
   LaneContent,
   LensClient,
   PapertrailRef,
@@ -110,13 +111,13 @@ const MAX_TRACKED_PATHS = 256;
  */
 const FALLBACK_MAX_AGE_MS = 60_000;
 
-type Lane = 'symbols' | 'clones' | 'memories' | 'coupling' | 'papertrail';
+type Lane = FileLane;
 
-const LANES: readonly Lane[] = ['symbols', 'clones', 'memories', 'coupling', 'papertrail'];
+const LANES = FILE_LANES;
 
 /** Everything known about one file. Kept in ONE entry so the parts cannot drift apart. */
 interface PathState {
-  /** The most recent load's payload, served until `TTL_MS` elapses or the epoch moves. */
+  /** The most recent composite payload, served while each constituent lane remains fresh. */
   fresh?: FileData;
   /**
    * The last payload seen for this file, kept across `invalidate` so a lane that fails on the next
@@ -126,6 +127,10 @@ interface PathState {
   lastGood?: FileData;
   /** When each lane of `lastGood` last ARRIVED, bounding how long it may be carried forward. */
   laneAt?: Partial<Record<Lane, number>>;
+  /** When each lane was last attempted, successful or not, so failures retain the ordinary TTL. */
+  checkedAt?: Partial<Record<Lane, number>>;
+  /** Lanes explicitly invalidated before their TTL elapsed. */
+  stale?: Set<Lane>;
   /** The last load's representative error, whether it failed wholly or in a single lane. */
   failure?: unknown;
   /** The last load produced NOTHING — the only case whose signals must be cleared. */
@@ -209,12 +214,18 @@ export class FileStore {
     ) => Promise<DocumentDigest | undefined>,
   ) {}
 
-  /** The index moved: refetch everything, but keep each file's last payload as a fallback. */
-  invalidate(): void {
+  /** Refetch the affected lanes, keeping each file's last payload as a bounded fallback. */
+  invalidate(lanes: readonly Lane[] = LANES): void {
+    if (lanes.length === 0) {
+      return;
+    }
     this.epoch += 1;
     this.pending.clear();
     for (const state of this.paths.values()) {
-      state.fresh = undefined;
+      state.stale ??= new Set();
+      for (const lane of lanes) {
+        state.stale.add(lane);
+      }
       state.failure = undefined;
       state.unusable = undefined;
     }
@@ -431,8 +442,13 @@ export class FileStore {
     if (!this.online) {
       return undefined;
     }
-    const hit = this.state(path).fresh;
-    if (hit && Date.now() - hit.at < TTL_MS) {
+    const state = this.state(path);
+    const now = Date.now();
+    const lanes = LANES.filter(
+      (lane) => state.stale?.has(lane) || now - (state.checkedAt?.[lane] ?? 0) >= TTL_MS,
+    );
+    const hit = state.fresh;
+    if (hit && lanes.length === 0) {
       return hit;
     }
     const pending = this.pending.get(path);
@@ -440,7 +456,7 @@ export class FileStore {
       return await pending;
     }
     const epoch = this.epoch;
-    const request = this.load(path, epoch, 0);
+    const request = this.load(path, epoch, 0, new Set(lanes));
     this.pending.set(path, request);
     try {
       return await request;
@@ -451,22 +467,54 @@ export class FileStore {
     }
   }
 
-  private async load(path: string, epoch: number, attempt: number): Promise<FileData | undefined> {
+  private async load(
+    path: string,
+    epoch: number,
+    attempt: number,
+    requested: ReadonlySet<Lane>,
+  ): Promise<FileData | undefined> {
     const attemptControl = new AbortController();
     this.inflight.add(attemptControl);
     try {
       const endpoint = await this.endpoint();
+      let active = requested;
+      if (this.lastGoodEndpoint !== undefined && endpoint !== this.lastGoodEndpoint) {
+        this.forgetServedState();
+        active = new Set(LANES);
+      }
       const signal = attemptControl.signal;
+      const previous = this.state(path).lastGood;
+      if (previous === undefined && active.size < LANES.length) {
+        active = new Set(LANES);
+      }
+      const held = <T>(lane: Lane, value: T): Promise<FileAnswer<T>> =>
+        Promise.resolve({ content: previous?.laneContent[lane] ?? UNKNOWN_CONTENT, value });
       // The lanes settle independently. `/api/file/clones` is the slow one — it can fall back to a
       // repository-wide scan on a linked worktree — and its timeout must not discard the graph,
       // memory, coupling, and papertrail answers that already arrived, which would clear the
       // file's signals and report the server as offline over a single slow lane.
       const lanes = await Promise.allSettled([
-        this.client.fileSymbolGraph(path, signal),
-        this.client.fileClonesFull(path, this.theta(), this.minTokens(), signal),
-        this.client.fileMemories(path, signal),
-        this.client.fileCoupling(path, signal),
-        this.client.filePapertrail(path, signal),
+        active.has('symbols')
+          ? this.client.fileSymbolGraph(path, signal)
+          : held('symbols', previous?.symbols ?? []),
+        active.has('clones')
+          ? this.client.fileClonesFull(path, this.theta(), this.minTokens(), signal)
+          : held('clones', {
+              clone_regions: previous?.clones ?? [],
+              clone_graph: previous?.cloneGraph ? { ...previous.cloneGraph } : undefined,
+            }),
+        active.has('memories')
+          ? this.client.fileMemories(path, signal)
+          : held('memories', previous?.memories ?? []),
+        active.has('coupling')
+          ? this.client.fileCoupling(path, signal)
+          : held('coupling', previous?.coupling ?? []),
+        active.has('papertrail')
+          ? this.client.filePapertrail(path, signal)
+          : held('papertrail', {
+              refs: previous?.refs ?? [],
+              decisions: previous?.decisions ?? [],
+            }),
       ]);
       if (!this.online || this.epoch !== epoch) {
         return undefined;
@@ -493,13 +541,16 @@ export class FileStore {
         // Drop everything the previous server answered and load again, wholly against the settled
         // one. A second re-point is left to the next refresh rather than looping here.
         this.forgetServedState();
-        return attempt === 0 ? await this.load(path, epoch, attempt + 1) : undefined;
+        return attempt === 0
+          ? await this.load(path, epoch, attempt + 1, new Set(LANES))
+          : undefined;
       }
       const [symbols, clones, memories, coupling, papertrail] = lanes;
       const rejected = lanes.filter(
-        (lane): lane is PromiseRejectedResult => lane.status === 'rejected',
+        (lane, index): lane is PromiseRejectedResult =>
+          active.has(LANES[index]) && lane.status === 'rejected',
       );
-      if (rejected.length === lanes.length) {
+      if (rejected.length === LANES.length) {
         // Nothing arrived at all: that is a file-level failure, and the caller clears its signals.
         return this.recordFailure(path, rejected[0].reason);
       }
@@ -513,14 +564,19 @@ export class FileStore {
       // is nothing left to carry, the clone lane at least has somewhere to say so; the sidebar
       // renders that as unavailable rather than as an empty result.
       const now = Date.now();
-      const previous = entry.lastGood;
       const arrivedAt = entry.laneAt ?? {};
       const canCarry = (lane: Lane): boolean =>
         previous !== undefined && now - (arrivedAt[lane] ?? 0) < FALLBACK_MAX_AGE_MS;
       const carried = <T>(lane: Lane, pick: (data: FileData) => T, empty: T): T =>
         previous && canCarry(lane) ? pick(previous) : empty;
       const origin = (lane: Lane, answered: boolean): LaneOrigin =>
-        answered ? 'current' : canCarry(lane) ? 'carried' : 'empty';
+        !active.has(lane)
+          ? previous?.lanes[lane] ?? 'empty'
+          : answered
+            ? 'current'
+            : canCarry(lane)
+              ? 'carried'
+              : 'empty';
       const cloneLane = clones.status === 'fulfilled' ? clones.value.value : undefined;
       const papertrailLane =
         papertrail.status === 'fulfilled' ? papertrail.value.value : undefined;
@@ -567,12 +623,20 @@ export class FileStore {
       entry.lastGood = data;
       entry.laneAt = {
         ...arrivedAt,
-        ...(symbols.status === 'fulfilled' ? { symbols: now } : {}),
-        ...(cloneLane ? { clones: now } : {}),
-        ...(memories.status === 'fulfilled' ? { memories: now } : {}),
-        ...(coupling.status === 'fulfilled' ? { coupling: now } : {}),
-        ...(papertrailLane ? { papertrail: now } : {}),
+        ...(active.has('symbols') && symbols.status === 'fulfilled' ? { symbols: now } : {}),
+        ...(active.has('clones') && cloneLane ? { clones: now } : {}),
+        ...(active.has('memories') && memories.status === 'fulfilled' ? { memories: now } : {}),
+        ...(active.has('coupling') && coupling.status === 'fulfilled' ? { coupling: now } : {}),
+        ...(active.has('papertrail') && papertrailLane ? { papertrail: now } : {}),
       };
+      entry.checkedAt = {
+        ...entry.checkedAt,
+        ...Object.fromEntries([...active].map((lane) => [lane, now])),
+      };
+      entry.stale ??= new Set();
+      for (const lane of active) {
+        entry.stale.delete(lane);
+      }
       entry.failure = rejected.length ? rejected[0].reason : undefined;
       entry.unusable = undefined;
       return data;
@@ -616,6 +680,8 @@ export class FileStore {
       state.fresh = undefined;
       state.lastGood = undefined;
       state.laneAt = undefined;
+      state.checkedAt = undefined;
+      state.stale = undefined;
     }
     this.lastGoodEndpoint = undefined;
     this.source += 1;
@@ -639,6 +705,8 @@ export class FileStore {
     for (const state of this.paths.values()) {
       state.lastGood = undefined;
       state.laneAt = undefined;
+      state.checkedAt = undefined;
+      state.stale = undefined;
     }
     this.lastGoodEndpoint = endpoint;
     this.source += 1;

@@ -23,6 +23,18 @@ pub const BASE_SCOPE_DISCOVERED_META: &str = "files_base_scope_discovered";
 /// Monotonic per-repo clock maintained by schema triggers and transactional bulk writers for
 /// Lens-visible enrichment rows.
 pub const LENS_ENRICHMENT_REVISION_META: &str = "lens_enrichment_revision";
+pub const LENS_SYMBOLS_REVISION_META: &str = "lens_symbols_revision";
+pub const LENS_CLONES_REVISION_META: &str = "lens_clones_revision";
+pub const LENS_MEMORIES_REVISION_META: &str = "lens_memories_revision";
+pub const LENS_COUPLING_REVISION_META: &str = "lens_coupling_revision";
+pub const LENS_PAPERTRAIL_REVISION_META: &str = "lens_papertrail_revision";
+pub const LENS_LANE_REVISION_METAS: &[&str] = &[
+    LENS_SYMBOLS_REVISION_META,
+    LENS_CLONES_REVISION_META,
+    LENS_MEMORIES_REVISION_META,
+    LENS_COUPLING_REVISION_META,
+    LENS_PAPERTRAIL_REVISION_META,
+];
 /// Prefix of the per-worktree overlay refresh-basis key; the SUFFIX is a `worktree_id`, so the key
 /// carries a checkout path.
 ///
@@ -45,12 +57,23 @@ pub fn bump_lens_enrichment_revision(
     conn: &rusqlite::Connection,
     repo_id: &str,
 ) -> rusqlite::Result<()> {
-    conn.execute(
+    bump_lens_revisions(conn, repo_id, &[LENS_ENRICHMENT_REVISION_META])
+}
+
+/// Advance one or more per-repo Lens lane clocks once for one logical transaction.
+pub fn bump_lens_revisions(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    keys: &[&str],
+) -> rusqlite::Result<()> {
+    let mut statement = conn.prepare_cached(
         "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, '1')
          ON CONFLICT(repo_id, key) DO UPDATE SET
              value = CAST(COALESCE(value, '0') AS INTEGER) + 1",
-        params![repo_id, LENS_ENRICHMENT_REVISION_META],
     )?;
+    for key in keys {
+        statement.execute(params![repo_id, key])?;
+    }
     Ok(())
 }
 

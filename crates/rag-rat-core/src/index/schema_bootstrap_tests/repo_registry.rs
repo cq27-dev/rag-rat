@@ -150,12 +150,21 @@ fn migration_038_forward_migrates_a_v037_index() {
         "DROP TRIGGER memory_bindings_lens_revision_insert;
          DROP TRIGGER memory_bindings_lens_revision_delete;
          DROP TRIGGER memory_bindings_lens_revision_update;
+         DROP TRIGGER memory_bindings_lane_revision_insert;
+         DROP TRIGGER memory_bindings_lane_revision_delete;
+         DROP TRIGGER memory_bindings_lane_revision_update;
          DROP TRIGGER papertrail_items_lens_revision_insert;
          DROP TRIGGER papertrail_items_lens_revision_delete;
          DROP TRIGGER papertrail_items_lens_revision_update;
+         DROP TRIGGER papertrail_items_lane_revision_insert;
+         DROP TRIGGER papertrail_items_lane_revision_delete;
+         DROP TRIGGER papertrail_items_lane_revision_update;
          DROP TRIGGER papertrail_refs_lens_revision_insert;
          DROP TRIGGER papertrail_refs_lens_revision_delete;
          DROP TRIGGER papertrail_refs_lens_revision_update;
+         DROP TRIGGER papertrail_refs_lane_revision_insert;
+         DROP TRIGGER papertrail_refs_lane_revision_delete;
+         DROP TRIGGER papertrail_refs_lane_revision_update;
          DROP TABLE repo_meta;
          DROP TABLE repo_roots;
          DROP TABLE repos;",

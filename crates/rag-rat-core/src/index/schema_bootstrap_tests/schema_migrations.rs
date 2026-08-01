@@ -1794,7 +1794,7 @@ fn migration_100_receiver_type_hint_interning() {
 /// V101 (#1014) makes graph and scope healing resumable per file row.
 #[test]
 fn migration_101_file_graph_version_provenance() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 101, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 102, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(
@@ -1839,7 +1839,7 @@ fn migration_101_file_graph_version_provenance() {
 
     let latest = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&latest, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&latest).unwrap().current_version, 101);
+    assert_eq!(schema::status(&latest).unwrap().current_version, 102);
 }
 
 /// V091 (#949) tracks the live key-target count each invite reservation covers, so fold-time

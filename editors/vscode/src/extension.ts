@@ -1,7 +1,8 @@
 // Shared entry point for BOTH extension hosts (Node desktop + web worker).
 // Everything here must stay runtime-neutral: vscode API + fetch only.
 import * as vscode from 'vscode';
-import { LensClient } from './client';
+import { changedVersionLanes, LensClient } from './client';
+import type { FileLane, VersionToken } from './client';
 import { DocumentDigests } from './content';
 import {
   associateHostedWorkspace,
@@ -185,11 +186,11 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   /** Drop cached index data. Fires no requests — refetching is the pipeline's job, after the gate. */
-  function discardIndexData(endpointChanged: boolean): void {
+  function discardIndexData(endpointChanged: boolean, lanes?: readonly FileLane[]): void {
     if (endpointChanged) {
       store.reset();
     } else {
-      store.invalidate();
+      store.invalidate(lanes);
     }
   }
 
@@ -230,9 +231,11 @@ export function activate(context: vscode.ExtensionContext): void {
    * take a reachable server offline and clear what the newer one just loaded, with no further
    * event coming to undo it.
    */
-  async function reloadIndexData(options: { endpointChanged?: boolean } = {}): Promise<boolean> {
+  async function reloadIndexData(
+    options: { endpointChanged?: boolean; lanes?: readonly FileLane[] } = {},
+  ): Promise<boolean> {
     const generation = ++reloadGeneration;
-    discardIndexData(options.endpointChanged === true);
+    discardIndexData(options.endpointChanged === true, options.lanes);
     // Repaint the now-empty views immediately so a slow probe does not leave stale content on
     // screen; the real refetch happens below, once reachability is published.
     refreshViews();
@@ -282,7 +285,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   let streamController = new AbortController();
-  let lastVersion = '';
+  let lastVersion: VersionToken | undefined;
   let eventsOnline = false;
   let eventFailureLogged = false;
   let reloadGeneration = 0;
@@ -298,11 +301,13 @@ export function activate(context: vscode.ExtensionContext): void {
             eventFailureLogged = false;
             void reloadIndexData();
           }
-          const token = JSON.stringify(version);
-          if (!reconnected && lastVersion && token !== lastVersion) {
-            void reloadIndexData();
+          if (!reconnected && lastVersion) {
+            const lanes = changedVersionLanes(lastVersion, version);
+            if (lanes.length > 0) {
+              void reloadIndexData({ lanes });
+            }
           }
-          lastVersion = token;
+          lastVersion = version;
         });
       } catch (error) {
         if (!signal.aborted) {
@@ -332,7 +337,7 @@ export function activate(context: vscode.ExtensionContext): void {
   function restartEvents(): void {
     streamController.abort();
     streamController = new AbortController();
-    lastVersion = '';
+    lastVersion = undefined;
     eventsOnline = false;
     clearSignals();
     void watchVersions(streamController.signal);

@@ -40,7 +40,10 @@ pub(crate) fn record_history_cursors(
     // Coupling's stamp includes the complete cursor snapshot, so materialize only after all four
     // cursor keys are published. Production callers own the surrounding history transaction.
     crate::index::change_coupling::ensure_coupling_fresh(conn, rag_rat_base::time::now_ms())?;
-    bump_lens_enrichment_revision(conn, &repo_id)?;
+    bump_lens_revisions(conn, &repo_id, &[
+        LENS_ENRICHMENT_REVISION_META,
+        LENS_COUPLING_REVISION_META,
+    ])?;
     Ok(())
 }
 
@@ -372,6 +375,9 @@ fn clear(conn: &Connection) -> anyhow::Result<()> {
         delete_repo_meta(conn, &repo_id, key)?;
     }
     crate::index::change_coupling::ensure_coupling_fresh(conn, rag_rat_base::time::now_ms())?;
-    bump_lens_enrichment_revision(conn, &repo_id)?;
+    bump_lens_revisions(conn, &repo_id, &[
+        LENS_ENRICHMENT_REVISION_META,
+        LENS_COUPLING_REVISION_META,
+    ])?;
     Ok(())
 }

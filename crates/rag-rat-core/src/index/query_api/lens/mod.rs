@@ -25,7 +25,7 @@ pub use files::{
     LensGraphCallerCounts, LensSymbol,
 };
 pub use hops::{LensCallees, LensCallers, LensHopResolvedBy, LensHopSelector, LensSymbolHop};
-pub use status::{LensStatus, LensVersion};
+pub use status::{LensLaneVersions, LensStatus, LensVersion};
 pub use treemap::{LensTreemap, LensTreemapFile};
 
 #[cfg(test)]

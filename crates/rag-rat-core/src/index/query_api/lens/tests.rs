@@ -217,6 +217,11 @@ fn lens_version_tracks_in_place_enrichment_updates() {
     .unwrap();
     let after_binding_update = db.lens_version().unwrap();
     assert_ne!(before_binding_update.revision, after_binding_update.revision);
+    assert_ne!(before_binding_update.lanes.memories, after_binding_update.lanes.memories);
+    assert_eq!(before_binding_update.lanes.symbols, after_binding_update.lanes.symbols);
+    assert_eq!(before_binding_update.lanes.clones, after_binding_update.lanes.clones);
+    assert_eq!(before_binding_update.lanes.coupling, after_binding_update.lanes.coupling);
+    assert_eq!(before_binding_update.lanes.papertrail, after_binding_update.lanes.papertrail);
 
     let before_memory_update = db.lens_version().unwrap();
     conn.execute(
@@ -292,6 +297,8 @@ fn lens_version_tracks_in_place_enrichment_updates() {
         before_distill_update.revision, after_distill_update.revision,
         "distill changes must invalidate even when distilled_at_ms is unchanged"
     );
+    assert_ne!(before_distill_update.lanes.papertrail, after_distill_update.lanes.papertrail);
+    assert_eq!(before_distill_update.lanes.memories, after_distill_update.lanes.memories);
 
     conn.execute(
         "INSERT INTO clone_graph_generations(
@@ -308,6 +315,8 @@ fn lens_version_tracks_in_place_enrichment_updates() {
         before_clone_publish.revision, after_clone_publish.revision,
         "publishing an already-created clone generation must invalidate Lens"
     );
+    assert_ne!(before_clone_publish.lanes.clones, after_clone_publish.lanes.clones);
+    assert_eq!(before_clone_publish.lanes.memories, after_clone_publish.lanes.memories);
     conn.execute(
         "UPDATE clone_graph_generations SET delta_files_applied = delta_files_applied + 1
          WHERE generation = 999",
@@ -319,6 +328,7 @@ fn lens_version_tracks_in_place_enrichment_updates() {
         after_clone_publish.revision, after_clone_delta.revision,
         "an in-place live clone-graph delta must invalidate Lens"
     );
+    assert_ne!(after_clone_publish.lanes.clones, after_clone_delta.lanes.clones);
 
     // Oracle results change graph scores and clone refinement mode, so Lens must see the pass —
     // but a pass writes one verdict per resolved edge, so the clock is advanced by the run row
@@ -351,6 +361,9 @@ fn lens_version_tracks_in_place_enrichment_updates() {
         after_oracle_result.revision, after_oracle_run.revision,
         "the run row that publishes a pass's verdicts must invalidate Lens"
     );
+    assert_ne!(after_oracle_result.lanes.symbols, after_oracle_run.lanes.symbols);
+    assert_ne!(after_oracle_result.lanes.clones, after_oracle_run.lanes.clones);
+    assert_eq!(after_oracle_result.lanes.memories, after_oracle_run.lanes.memories);
 
     conn.execute(
         "INSERT INTO papertrail_items(
@@ -372,6 +385,8 @@ fn lens_version_tracks_in_place_enrichment_updates() {
     .unwrap();
     let after_item_update = db.lens_version().unwrap();
     assert_ne!(before_item_update.revision, after_item_update.revision);
+    assert_ne!(before_item_update.lanes.papertrail, after_item_update.lanes.papertrail);
+    assert_eq!(before_item_update.lanes.memories, after_item_update.lanes.memories);
 
     conn.execute(
         "DELETE FROM papertrail_items
@@ -441,6 +456,9 @@ fn lens_version_tracks_swept_oracle_verdicts() {
         before_sweep.revision, after_sweep.revision,
         "retiring a verdict must invalidate Lens even though the sweep writes no run row"
     );
+    assert_ne!(before_sweep.lanes.symbols, after_sweep.lanes.symbols);
+    assert_ne!(before_sweep.lanes.clones, after_sweep.lanes.clones);
+    assert_eq!(before_sweep.lanes.memories, after_sweep.lanes.memories);
 
     // Idempotence: a sweep that retires nothing must not churn every connected editor.
     let after_empty_sweep = db.lens_version().unwrap();

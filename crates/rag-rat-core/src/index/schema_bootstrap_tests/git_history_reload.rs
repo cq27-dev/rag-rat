@@ -148,6 +148,14 @@ fn history_import_materializes_coupling_and_bumps_lens_once() {
         .unwrap()
         .parse::<i64>()
         .unwrap();
+    let before_coupling_revision = db
+        .repo_meta(rag_rat_db::meta::LENS_COUPLING_REVISION_META)
+        .unwrap()
+        .unwrap_or_else(|| "0".to_string())
+        .parse::<i64>()
+        .unwrap();
+    let before_symbols_revision =
+        db.repo_meta(rag_rat_db::meta::LENS_SYMBOLS_REVISION_META).unwrap();
     let plan = crate::index::git_history::prepare_plan(conn, &root);
     let prepared = crate::index::git_history::prepare_with_plan(&root, plan).unwrap();
     conn.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -175,6 +183,19 @@ fn history_import_materializes_coupling_and_bumps_lens_once() {
         .parse::<i64>()
         .unwrap();
     assert_eq!(after_revision, before_revision + 1, "one bulk import advances Lens once");
+    assert_eq!(
+        db.repo_meta(rag_rat_db::meta::LENS_COUPLING_REVISION_META)
+            .unwrap()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap(),
+        before_coupling_revision + 1,
+        "history publication advances only the coupling lane once",
+    );
+    assert_eq!(
+        db.repo_meta(rag_rat_db::meta::LENS_SYMBOLS_REVISION_META).unwrap(),
+        before_symbols_revision,
+    );
     conn.execute_batch("COMMIT").unwrap();
 
     let (co_changes, computed_at_ms): (i64, i64) = conn

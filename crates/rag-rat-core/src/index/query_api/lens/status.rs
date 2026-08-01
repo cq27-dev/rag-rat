@@ -33,7 +33,19 @@ pub struct LensVersion {
     pub generation: i64,
     pub max_indexed_at_ms: i64,
     pub git_dirty: Option<String>,
+    pub content_revision: String,
+    pub lanes: LensLaneVersions,
+    /// Aggregate compatibility token for clients predating per-lane revisions.
     pub revision: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LensLaneVersions {
+    pub symbols: String,
+    pub clones: String,
+    pub memories: String,
+    pub coupling: String,
+    pub papertrail: String,
 }
 
 impl IndexDatabase {
@@ -85,11 +97,15 @@ impl IndexDatabase {
 
     /// Cheap freshness token in the stable editor-shim shape.
     pub fn lens_version(&self) -> anyhow::Result<LensVersion> {
-        let enrichment_revision = self
-            .repo_meta(rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META)?
-            .unwrap_or_else(|| "0".to_string());
+        use rag_rat_db::meta;
+
+        let enrichment_revision =
+            self.repo_meta(meta::LENS_ENRICHMENT_REVISION_META)?.unwrap_or_else(|| "0".to_string());
         let clone_graph_generation =
             self.repo_meta("clone_graph_live_generation")?.unwrap_or_else(|| "none".to_string());
+        let revision = |key| -> anyhow::Result<String> {
+            Ok(self.repo_meta(key)?.unwrap_or_else(|| "0".to_string()))
+        };
         Ok(LensVersion {
             generation: self.active_generation,
             max_indexed_at_ms: self
@@ -97,6 +113,17 @@ impl IndexDatabase {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
             git_dirty: self.repo_meta("git_dirty")?,
+            content_revision: self.content_revision()?,
+            lanes: LensLaneVersions {
+                symbols: revision(meta::LENS_SYMBOLS_REVISION_META)?,
+                clones: format!(
+                    "{}:{clone_graph_generation}",
+                    revision(meta::LENS_CLONES_REVISION_META)?
+                ),
+                memories: revision(meta::LENS_MEMORIES_REVISION_META)?,
+                coupling: revision(meta::LENS_COUPLING_REVISION_META)?,
+                papertrail: revision(meta::LENS_PAPERTRAIL_REVISION_META)?,
+            },
             revision: format!("{enrichment_revision}:{clone_graph_generation}"),
         })
     }

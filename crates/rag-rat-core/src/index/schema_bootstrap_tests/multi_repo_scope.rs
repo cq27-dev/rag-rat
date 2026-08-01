@@ -396,20 +396,28 @@ fn read_only_open_binds_the_config_repo_over_a_smaller_sibling() {
 
 /// All semantic `repo_meta` rows as a sorted `(repo_id, key, value)` list — the snapshot the
 /// full-ladder replay must leave byte-identical (V039/V040 relocate meta, so a no-op replay must
-/// move nothing). The Lens enrichment counter is a write clock, not semantic metadata: replayed
-/// poison-sibling fixture writes may advance it without moving or resurrecting any source row.
+/// move nothing). The Lens revision counters are write clocks, not semantic metadata: replayed
+/// poison-sibling fixture writes may advance them without moving or resurrecting any source row.
 fn dump_repo_meta(conn: &rusqlite::Connection) -> Vec<(String, String, Option<String>)> {
     let mut stmt = conn
         .prepare(
             "SELECT repo_id, key, value FROM repo_meta
-             WHERE key != ?1
+             WHERE key NOT IN (?1, ?2, ?3, ?4, ?5, ?6)
              ORDER BY repo_id, key",
         )
         .unwrap();
     let mut rows: Vec<(String, String, Option<String>)> = stmt
-        .query_map([rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+        .query_map(
+            rusqlite::params![
+                rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+                rag_rat_db::meta::LENS_SYMBOLS_REVISION_META,
+                rag_rat_db::meta::LENS_CLONES_REVISION_META,
+                rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+                rag_rat_db::meta::LENS_COUPLING_REVISION_META,
+                rag_rat_db::meta::LENS_PAPERTRAIL_REVISION_META,
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
         .unwrap()
         .map(Result::unwrap)
         .collect();

@@ -5,8 +5,8 @@ use gix::object::tree::diff::{Action, Change};
 use gix::revision::walk::Sorting;
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_db::meta::{
-    bump_lens_enrichment_revision, delete_repo_meta, repo_meta, scoped_table_row_count,
-    set_repo_meta,
+    LENS_COUPLING_REVISION_META, LENS_ENRICHMENT_REVISION_META, bump_lens_revisions,
+    delete_repo_meta, repo_meta, scoped_table_row_count, set_repo_meta,
 };
 use rag_rat_db::schema;
 use rusqlite::{Connection, OptionalExtension, params};

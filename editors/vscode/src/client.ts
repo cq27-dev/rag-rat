@@ -207,11 +207,45 @@ export interface FileAnswer<T> {
   value: T;
 }
 
+export type FileLane = 'symbols' | 'clones' | 'memories' | 'coupling' | 'papertrail';
+
+export const FILE_LANES: readonly FileLane[] = [
+  'symbols',
+  'clones',
+  'memories',
+  'coupling',
+  'papertrail',
+];
+
 export interface VersionToken {
   generation: number;
   max_indexed_at_ms: number;
   git_dirty: string | null;
+  /** Optional while an updated extension can still connect to a pre-lane-version server. */
+  content_revision?: string;
+  lanes?: Record<FileLane, string>;
   revision: string;
+}
+
+/** Lanes whose backing state moved; older servers safely fall back to invalidating everything. */
+export function changedVersionLanes(
+  previous: VersionToken,
+  current: VersionToken,
+): readonly FileLane[] {
+  if (
+    previous.generation !== current.generation
+    || previous.max_indexed_at_ms !== current.max_indexed_at_ms
+    || previous.git_dirty !== current.git_dirty
+    || previous.content_revision !== current.content_revision
+  ) {
+    return FILE_LANES;
+  }
+  if (!previous.lanes || !current.lanes) {
+    return previous.revision === current.revision ? [] : FILE_LANES;
+  }
+  const changed = FILE_LANES.filter((lane) => previous.lanes?.[lane] !== current.lanes?.[lane]);
+  // Keep the aggregate token as a fail-safe for a writer not yet assigned to a lane clock.
+  return changed.length === 0 && previous.revision !== current.revision ? FILE_LANES : changed;
 }
 
 /**

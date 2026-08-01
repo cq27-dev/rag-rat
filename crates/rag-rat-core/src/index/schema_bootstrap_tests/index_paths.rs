@@ -1037,6 +1037,7 @@ fn reindex_paths_refreshes_linked_overlay_packages_for_a_dirty_manifest() {
     let config = source_config(main.clone(), Language::Rust);
     let _ = IndexDatabase::rebuild(&config).unwrap();
     let base_packages = package_count(&config);
+    let before_version = IndexDatabase::open_config(&config).unwrap().lens_version().unwrap();
     assert!(base_packages >= 1, "base rebuild wrote the widget package row");
 
     // Linked worktree; dirty its Cargo.toml with NO source change (so only the manifest signal can
@@ -1052,6 +1053,12 @@ fn reindex_paths_refreshes_linked_overlay_packages_for_a_dirty_manifest() {
         base_packages + 1,
         "the manifest-only linked edit refreshes the overlay scope's package map (a new row)",
     );
+    let after_version = IndexDatabase::open_config(&config).unwrap().lens_version().unwrap();
+    assert_ne!(before_version.lanes.symbols, after_version.lanes.symbols);
+    assert_eq!(before_version.lanes.clones, after_version.lanes.clones);
+    assert_eq!(before_version.lanes.memories, after_version.lanes.memories);
+    assert_eq!(before_version.lanes.coupling, after_version.lanes.coupling);
+    assert_eq!(before_version.lanes.papertrail, after_version.lanes.papertrail);
 
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);

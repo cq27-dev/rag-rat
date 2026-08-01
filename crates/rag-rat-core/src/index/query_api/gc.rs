@@ -186,7 +186,11 @@ impl IndexDatabase {
         // it advances the clock itself — once, and only when it actually retired a verdict a
         // connected editor could still be showing.
         if rag_rat_oracle::prune_edge_oracle_without_live_edge(conn)? > 0 {
-            rag_rat_db::meta::bump_lens_enrichment_revision(conn, &self.active_repo_id)?;
+            rag_rat_db::meta::bump_lens_revisions(conn, &self.active_repo_id, &[
+                rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+                rag_rat_db::meta::LENS_SYMBOLS_REVISION_META,
+                rag_rat_db::meta::LENS_CLONES_REVISION_META,
+            ])?;
         }
         // Per-repo (A5): `prune_oracle_runs_outside_scope` now filters `oracle_runs.repo_id` (its
         // own column since V042), so it deletes only THIS repo's run rows that fall outside THIS
