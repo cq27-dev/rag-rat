@@ -56,6 +56,8 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
     assert_eq!(table_count(&db, "reconcile_meta"), 1);
     assert_eq!(table_count(&db, "reconcile_attempts"), 1);
     assert!(file_columns(&db).contains(&"indexed_revision".to_string()));
+    assert!(file_columns(&db).contains(&"graph_version".to_string()));
+    assert!(file_columns(&db).contains(&"scope_version".to_string()));
     assert_eq!(indexed_revision_count(&db), 0);
     assert!(chunk_columns(&db).contains(&"anchor_version".to_string()));
     assert!(chunk_columns(&db).contains(&"normalized_hash".to_string()));

@@ -204,8 +204,9 @@ impl IndexDatabase {
             .prepare_cached(
                 "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
                  indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code, \
-                 repo_id, generation)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 repo_id, generation, graph_version, scope_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, CAST(?14 AS \
+                 INTEGER), CAST(?15 AS INTEGER))
                  RETURNING id",
             )?
             .query_row(
@@ -226,6 +227,8 @@ impl IndexDatabase {
                     // alongside the live generation, made live by the flip), the live generation
                     // for incremental (written in place).
                     self.active_generation,
+                    GRAPH_INDEX_VERSION,
+                    LOGICAL_KEY_VERSION,
                 ],
                 |row| row.get::<_, i64>(0),
             )?;

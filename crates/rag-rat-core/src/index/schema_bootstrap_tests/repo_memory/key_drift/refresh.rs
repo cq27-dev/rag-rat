@@ -1654,6 +1654,7 @@ fn a_legacy_row_in_any_language_has_its_scope_re_derived() {
         let conn = rusqlite::Connection::open(&config.database).unwrap();
         conn.execute("UPDATE symbols SET scope_path = NULL WHERE name = 'inner'", []).unwrap();
         conn.execute("DELETE FROM repo_meta WHERE key = 'logical_key_version'", []).unwrap();
+        conn.execute("UPDATE files SET scope_version = 0", []).unwrap();
         conn.execute("UPDATE repo_meta SET value = '0' WHERE key = 'graph_index_version'", [])
             .unwrap();
     }

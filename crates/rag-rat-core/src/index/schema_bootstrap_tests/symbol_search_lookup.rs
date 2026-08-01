@@ -987,6 +987,10 @@ fn execute_one() {
         .unwrap();
     db.storage
         .connection()
+        .execute("UPDATE main.files SET graph_version = 0 WHERE kind != 'deleted'", [])
+        .unwrap();
+    db.storage
+        .connection()
         .execute(
             "
                 UPDATE edges

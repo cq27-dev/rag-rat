@@ -259,6 +259,12 @@ fn nfc_ident(token: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+pub(super) fn identifiers_equal(left: &str, right: &str) -> bool {
+    let left = left.strip_prefix("r#").unwrap_or(left);
+    let right = right.strip_prefix("r#").unwrap_or(right);
+    nfc_ident(left) == nfc_ident(right)
+}
+
 /// Types the std prelude brings into every module without a `use`. A const parameter named after
 /// one of these is shadowed by the type in argument position, exactly as a locally declared or
 /// imported type shadows it — so the same coexisting impls (`impl<const Vec: usize> Tr<{ Vec }> for

@@ -383,7 +383,9 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // Same reasoning as 13: an index stamped 13 by an interim build would never re-resolve.
 // 15: Generic Rust method calls retain receiver inference through the turbofish wrapper; re-extract
 // `receiver_type_hint_id` so deployed indexes do not keep those calls untyped.
-const GRAPH_INDEX_VERSION: &str = "15";
+// 16: Rust receiver type naming reads AST structure instead of reparsing rendered strings; raw
+// identifiers and constructor paths now share the canonical owner printer, so re-extract hints.
+const GRAPH_INDEX_VERSION: &str = "16";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
 // on next open. Incremental discovery only rewrites a file row when its sha/language/kind changes —
@@ -436,6 +438,8 @@ struct GraphReindexFile {
     /// Digest of the text that produced this row — the graph heal's proof that the bytes it read
     /// from the active checkout are this row's own (rows span every commit/worktree scope).
     sha256: String,
+    graph_owed: bool,
+    scope_owed: bool,
 }
 
 #[derive(Debug)]

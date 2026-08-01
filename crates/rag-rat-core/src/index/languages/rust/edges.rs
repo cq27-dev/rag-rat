@@ -321,8 +321,7 @@ fn infer_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
         if ancestor.kind() == "impl_item"
             && let Some(type_node) = ancestor.child_by_field_name("type")
         {
-            let cleaned =
-                clean_rust_type_name(&super::render_owner(type_node, text, &[]), type_node, text)?;
+            let cleaned = clean_rust_type_name(type_node, type_node, text)?;
             // Canonical against the IMPL's own module — `mod inner { impl Worker { … } }`
             // yields `inner::Worker`, matching the method's container-based scope path.
             return module_qualified_type_path(ancestor, &cleaned, text);
@@ -350,11 +349,7 @@ fn infer_explicit_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
                     continue;
                 }
                 let type_node = parameter.child_by_field_name("type")?;
-                let type_name = clean_rust_type_name(
-                    &super::render_owner(type_node, text, &[]),
-                    type_node,
-                    text,
-                )?;
+                let type_name = clean_rust_type_name(type_node, type_node, text)?;
                 return canonical_receiver_type(type_name, type_node, text);
             }
             return infer_self_type_hint(node, text);
@@ -395,130 +390,161 @@ enum WrapperSpelling {
 /// type with its own methods, so peeling it would send `value.run()` to `Worker::run` when rustc
 /// sends it to `custom::Box::run`. A qualified spelling names the standard pointer only when it is
 /// rooted where the standard pointers live.
-fn wrapper_spelling(head: &str) -> WrapperSpelling {
-    let path: Vec<&str> = head.trim().trim_start_matches("::").split("::").map(str::trim).collect();
-    let Some(tail) = path.last() else { return WrapperSpelling::NotAWrapper };
-    if !DEREF_WRAPPERS.contains(tail) {
+fn wrapper_spelling(head: Node<'_>, text: &str) -> WrapperSpelling {
+    let Some(tail) = path_tail_node(head) else { return WrapperSpelling::NotAWrapper };
+    let tail = canonical_identifier(tail, text);
+    if !DEREF_WRAPPERS.contains(&tail) {
         return WrapperSpelling::NotAWrapper;
     }
-    match path.as_slice() {
-        [_] => WrapperSpelling::Bare,
-        [root, ..] if matches!(*root, "std" | "core" | "alloc") => WrapperSpelling::Rooted,
+    match head.kind() {
+        "identifier" | "type_identifier" => WrapperSpelling::Bare,
+        "scoped_identifier" | "scoped_type_identifier" => {
+            let Some(path) = head.child_by_field_name("path") else {
+                // Preserve the prior treatment of a leading `::Box`: the spelling has one named
+                // segment even though tree-sitter represents it as a scoped path with no `path`.
+                return WrapperSpelling::Bare;
+            };
+            let Some(root) = path_root_node(path) else { return WrapperSpelling::NotAWrapper };
+            match canonical_identifier(root, text) {
+                "std" | "core" | "alloc" => WrapperSpelling::Rooted,
+                _ => WrapperSpelling::NotAWrapper,
+            }
+        },
         _ => WrapperSpelling::NotAWrapper,
     }
 }
 
-/// Return the deref target solely to detect a standard wrapper. The single-string receiver model
-/// cannot preserve Rust's ordered `Box<Worker> -> Worker` lookup, so callers decline inference when
-/// this changes the type rather than confidently naming the inner owner.
-fn peel_deref_wrapper<'a>(type_str: &'a str, context: Node<'_>, text: &str) -> &'a str {
-    let mut current = type_str.trim();
-    loop {
-        let Some(open) = current.find('<') else { return current };
-        let head = current[..open].trim_end();
-        if !current.trim_end().ends_with('>') {
-            return current;
-        }
-        match wrapper_spelling(head) {
-            // A bare name is the standard pointer only while nothing nearer declares it. A crate
-            // with its own `struct Box<T>` gets its methods on the WRAPPER, so peeling would name
-            // the wrong owner. Only a local DECLARATION blocks it: an import does not, because
-            // `use std::sync::Arc;` is how the real one usually arrives.
-            WrapperSpelling::Bare if declares_type_item(context, qn_tail(head), text) => {
-                return current;
-            },
-            WrapperSpelling::NotAWrapper => return current,
-            WrapperSpelling::Bare | WrapperSpelling::Rooted => {},
-        }
-        let inner = current.trim_end();
-        let inner = inner[open + 1..inner.len() - 1].trim();
-        // `Cow<'a, T>` leads with a lifetime, so the LAST argument is the type. A wrapper with more
-        // than one type argument is not one of these by construction.
-        let last = match top_level_arguments(inner).pop() {
-            Some(argument) if !argument.is_empty() => argument,
-            _ => return current,
-        };
-        current = last;
+/// Whether the written type starts at a standard deref wrapper. The single-string receiver model
+/// cannot preserve Rust's ordered `Box<Worker> -> Worker` lookup, so inference declines the whole
+/// receiver rather than choosing either owner.
+fn is_deref_wrapper(type_node: Node<'_>, context: Node<'_>, text: &str) -> bool {
+    if type_node.kind() != "generic_type" {
+        return false;
+    }
+    let Some(head) = type_node.child_by_field_name("type") else { return false };
+    match wrapper_spelling(head, text) {
+        // A bare name is the standard pointer only while nothing nearer declares it. A crate with
+        // its own `struct Box<T>` gets its methods on the WRAPPER. An import does not block this:
+        // `use std::sync::Arc;` is how the standard pointer usually arrives.
+        WrapperSpelling::Bare => {
+            let Some(tail) = path_tail_node(head) else { return false };
+            let written_tail = text.get(tail.byte_range()).unwrap_or_default().trim();
+            !declares_type_item(context, written_tail, text)
+        },
+        WrapperSpelling::Rooted => true,
+        WrapperSpelling::NotAWrapper => false,
     }
 }
 
-/// Split a generic argument list on its own top-level commas.
-fn top_level_arguments(inner: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    crate::index::edges::scope_grammar::scan(inner, |at, ch, depth, span| {
-        if span.is_code() && depth.is_top() && ch == ',' {
-            out.push(inner[start..at].trim());
-            start = at + 1;
+/// Peel only syntax that does not change the receiver owner: references and redundant parentheses.
+fn nameable_type_node(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "reference_type" => node = node.child_by_field_name("type")?,
+            "tuple_type" if redundant_parenthesized_type(node) => {
+                let mut cursor = node.walk();
+                node = node.named_children(&mut cursor).next()?;
+            },
+            "identifier"
+            | "type_identifier"
+            | "scoped_identifier"
+            | "scoped_type_identifier"
+            | "generic_type" => return Some(node),
+            _ => return None,
         }
-    });
-    out.push(inner[start..].trim());
-    out
+    }
 }
 
-/// Drop the whitespace around a path separator, which Rust allows and which changes nothing about
-/// the type: `Self ::Assoc` and `Self::Assoc` name one associated item.
-///
-/// Literals stay untouched — the scanner already knows where they are, and a `::` inside one is
-/// text, not a separator.
-fn normalize_separators(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut skip = 0usize;
-    crate::index::edges::scope_grammar::scan(raw, |at, ch, _, span| {
-        if at < skip {
-            return;
-        }
-        if span.is_code() && ch == ':' && raw[at..].starts_with("::") {
-            while out.ends_with(char::is_whitespace) {
-                out.pop();
+fn redundant_parenthesized_type(node: Node<'_>) -> bool {
+    let mut named = node.walk();
+    if node.named_children(&mut named).count() != 1 {
+        return false;
+    }
+    let mut all = node.walk();
+    !node.children(&mut all).any(|child| child.kind() == ",")
+}
+
+fn canonical_identifier<'a>(node: Node<'_>, text: &'a str) -> &'a str {
+    let written = text.get(node.byte_range()).unwrap_or_default().trim();
+    written.strip_prefix("r#").unwrap_or(written)
+}
+
+/// Preserve the prior receiver-hint boundary without reparsing a rendered string. Parentheses,
+/// arrays, bounds, pointers and function arrows inside a generic argument made the old canonical
+/// output decline; inspect their syntax tokens directly so this refactor does not silently widen
+/// persisted hints.
+fn has_unsupported_receiver_token(node: Node<'_>, text: &str) -> bool {
+    let source = text.get(node.byte_range()).unwrap_or_default();
+    if crate::index::edges::scope_grammar::strip_comments(source).contains("for<") {
+        return true;
+    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            if matches!(child.kind(), "block_comment" | "line_comment") {
+                continue;
             }
-            out.push_str("::");
-            skip = at + 2;
-            // Whitespace AFTER the separator is dropped by the same rule on the next token, so
-            // consume it here rather than leaving `Self:: Assoc`.
-            let rest = &raw[skip..];
-            skip += rest.len() - rest.trim_start().len();
-            return;
+            if matches!(child.kind(), "(" | ")" | "[" | "]" | "+" | "*" | "->" | "as") {
+                return true;
+            }
+            if child.child_count() == 0 {
+                let token = text.get(child.byte_range()).unwrap_or_default();
+                if token.contains(['(', ')', '[', ']', '+', '*'])
+                    || token.contains("->")
+                    || token.contains(" as ")
+                {
+                    return true;
+                }
+            }
+            stack.push(child);
         }
-        out.push(ch);
-    });
-    out
+    }
+    false
+}
+
+fn path_root_node(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "generic_type" => node = node.child_by_field_name("type")?,
+            "scoped_identifier" | "scoped_type_identifier" => {
+                node = node
+                    .child_by_field_name("path")
+                    .or_else(|| node.child_by_field_name("name"))?;
+            },
+            _ => return Some(node),
+        }
+    }
+}
+
+fn path_tail_node(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "generic_type" => node = node.child_by_field_name("type")?,
+            "scoped_identifier" | "scoped_type_identifier" => {
+                node = node.child_by_field_name("name")?;
+            },
+            _ => return Some(node),
+        }
+    }
 }
 
 /// The receiver type a declaration names, or `None` when this pass cannot name it.
 ///
-/// Callers hand in a string the canonical printer produced, not raw source. Rust lets whitespace
-/// sit anywhere a token boundary is legal, so `Self ::Assoc` and `Self::Assoc` are one type spelled
-/// two ways — and the checks below are string predicates. Reading raw text made every one of them
-/// sensitive to spelling: the `Self::` check missed the spaced form and handed back a qualified
-/// hint whose tail could bind an unrelated concrete type. Canonicalizing once, here, is what keeps
-/// each predicate from having to re-derive it.
-fn clean_rust_type_name(raw: &str, at: Node<'_>, text: &str) -> Option<String> {
-    let normalized = normalize_separators(raw);
-    let s = normalized.trim();
-    // A raw-pointer TYPE is not a dereferenced expression: `*mut Worker` must decline here,
-    // before the expression cleaner strips the `*` and the pointer masquerades as `Worker`.
-    if s.starts_with('*') {
+/// `type_node` supplies the type's structure; `context` supplies lexical binders and declarations.
+/// Keeping those roles separate makes unsupported syntax decline by node kind instead of letting a
+/// spelling accidentally pass a string predicate.
+fn clean_rust_type_name(type_node: Node<'_>, context: Node<'_>, text: &str) -> Option<String> {
+    let type_node = nameable_type_node(type_node)?;
+    if is_deref_wrapper(type_node, context, text) {
         return None;
     }
-    let cleaned = clean_receiver_expr(s).unwrap_or(s);
-    if cleaned.starts_with('<') || cleaned.contains(" as ") {
+    if has_unsupported_receiver_token(type_node, text) {
         return None;
     }
-    if peel_deref_wrapper(cleaned, at, text) != cleaned {
-        return None;
-    }
-    let type_str = cleaned.trim();
+    let rendered = super::render_owner(type_node, text, &[]);
+    let type_str = rendered.trim();
     if type_str.is_empty() {
-        return None;
-    }
-    if type_str.starts_with("dyn ") || type_str.starts_with("impl ") {
-        return None;
-    }
-    if type_str.contains(['(', ')', '[', ']', '+', '*'])
-        || type_str.contains("for<")
-        || type_str.contains("->")
-    {
         return None;
     }
     let identity_path = degeneric_path(type_str);
@@ -533,12 +559,12 @@ fn clean_rust_type_name(raw: &str, at: Node<'_>, text: &str) -> Option<String> {
     // The binder question is asked of the POSITION, never of a list the caller assembled: an
     // enclosing `impl`/`trait` binder is invisible from the node a caller happens to hold, and
     // every list-passing caller guessed too narrowly.
-    if binders::binds_name(at, tail, text) {
+    if binders::binds_name(context, tail, text) {
         return None;
     }
     if let Some((prefix, _)) = identity_path.rsplit_once("::") {
         let root = prefix.split("::").next().unwrap_or(prefix);
-        if binders::binds_name(at, root, text) {
+        if binders::binds_name(context, root, text) {
             return None;
         }
     }
@@ -605,8 +631,7 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
                 return None;
             }
             let type_node = param.child_by_field_name("type")?;
-            let type_name =
-                clean_rust_type_name(&super::render_owner(type_node, text, &[]), type_node, text)?;
+            let type_name = clean_rust_type_name(type_node, type_node, text)?;
             let type_name = canonical_receiver_type(type_name, type_node, text)?;
             return Some(type_name);
         }
@@ -681,7 +706,7 @@ fn visible_let_binding(
             return VisibleBinding::Shadowed;
         }
         let type_name = if let Some(type_node) = child.child_by_field_name("type") {
-            clean_rust_type_name(&super::render_owner(type_node, text, &[]), type_node, text)
+            clean_rust_type_name(type_node, type_node, text)
                 .and_then(|type_name| canonical_receiver_type(type_name, type_node, text))
         } else {
             constructor_owner(child.child_by_field_name("value"), text)
@@ -739,7 +764,9 @@ fn scope_declares_item(
 ) -> bool {
     let mut cursor = scope.walk();
     scope.named_children(&mut cursor).any(|item| {
-        occupies(item) && child_name_text(item, text).is_some_and(|declared| declared == name)
+        occupies(item)
+            && child_name_text(item, text)
+                .is_some_and(|declared| super::identifiers_equal(&declared, name))
     })
 }
 
@@ -752,9 +779,8 @@ fn constructor_owner(value: Option<Node<'_>>, text: &str) -> Option<String> {
     if function.kind() != "scoped_identifier" {
         return None;
     }
-    let function_text = node_text(function, text);
-    let (type_part, method_part) = function_text.rsplit_once("::")?;
-    let method_name = method_part.trim();
+    let owner_node = function.child_by_field_name("path")?;
+    let method_name = text.get(function.child_by_field_name("name")?.byte_range())?.trim();
     // Only the two strongest conventions survive: Rust does not force ANY method to return
     // `Self`, so `from`/`with_*` (routinely builder- or conversion-shaped) are declined
     // outright, and `new`/`default` are verified against the constructor's DECLARED return type
@@ -765,7 +791,7 @@ fn constructor_owner(value: Option<Node<'_>>, text: &str) -> Option<String> {
     if !matches!(method_name, "new" | "default") {
         return None;
     }
-    let owner = clean_rust_type_name(type_part, function, text)?;
+    let owner = clean_rust_type_name(owner_node, function, text)?;
     let owner_canonical = canonical_receiver_type(owner.clone(), value, text)?;
     match same_file_constructor_return(value, text, &owner_canonical, method_name) {
         CtorReturn::SelfLike => Some(owner_canonical),
@@ -810,7 +836,7 @@ fn same_file_constructor_return(node: Node<'_>, text: &str, owner: &str, ctor: &
             match child.kind() {
                 "impl_item" => {
                     let Some(type_node) = child.child_by_field_name("type") else { continue };
-                    let impl_type = node_text(type_node, text);
+                    let impl_type = super::render_owner(type_node, text, &[]);
                     let impl_tail = qn_tail(degeneric_path(&impl_type).trim()).to_string();
                     if impl_tail != owner_tail {
                         continue;
@@ -867,19 +893,17 @@ fn classify_constructor_return(
             // A "constructor" declared to return `()` constructs nothing.
             return Some(CtorReturn::Opaque);
         };
-        let declared = node_text(return_node, text);
-        let trimmed = declared.trim();
-        if trimmed == "Self" {
-            return Some(CtorReturn::SelfLike);
-        }
         // Anchored at the RETURN node, so the binders in force are the constructor's own impl
         // and fn — `impl<T> Factory<T> { fn new<U>() -> U }` returns whatever the call site
         // instantiates. The caller's binders are not in scope here and are not consulted, so
         // `fn test<Worker>(..)` calling a constructor that genuinely returns the concrete
         // `Worker` still gets its hint.
-        let Some(declared) = clean_rust_type_name(trimmed, return_node, text) else {
+        let Some(declared) = clean_rust_type_name(return_node, return_node, text) else {
             return Some(CtorReturn::Opaque);
         };
+        if declared == "Self" {
+            return Some(CtorReturn::SelfLike);
+        }
         let Some(declared_canonical) = module_qualified_type_path(item, &declared, text) else {
             return Some(CtorReturn::Opaque);
         };
@@ -1014,10 +1038,12 @@ fn scope_binds_name(scope: Node<'_>, name: &str, text: &str) -> bool {
         if crate::index::edges::use_has_glob(declaration) {
             return true;
         }
+        let declaration = rag_rat_base::canonical::nfc(&declaration.replace("r#", ""));
+        let name = rag_rat_base::canonical::nfc(name);
         // Most scopes have no relevant import. Avoid the full use-tree walk unless the
         // declaration can contain this exact identifier.
         declaration.split(|ch: char| !ch.is_alphanumeric() && ch != '_').any(|part| part == name)
-            && crate::index::edges::use_binds_name(declaration, name)
+            && crate::index::edges::use_binds_name(&declaration, &name)
     })
 }
 
@@ -1138,6 +1164,41 @@ mod receiver_type_hint_tests {
             );
         }
     }
+
+    #[test]
+    fn receiver_type_nameability_follows_the_ast_shape() {
+        assert_eq!(extract_call_hints("fn f(w: &mut (((Worker)))) { w.run(); }"), vec![Some(
+            "Worker".to_string()
+        )]);
+        for type_name in [
+            "*mut Worker",
+            "(Worker, Other)",
+            "[Worker; 2]",
+            "dyn Service",
+            "impl Service",
+            "fn() -> Worker",
+            "<Worker as Service>::Assoc",
+            "Receiver!()",
+        ] {
+            let code = format!("fn f(w: {type_name}) {{ w.run(); }}");
+            assert_eq!(extract_call_hints(&code), vec![None], "{type_name} is not one owner path");
+        }
+    }
+
+    #[test]
+    fn constructor_owner_comes_from_the_scoped_path_node() {
+        let code = r#"
+            mod factory {
+                impl Factory { fn new() -> Worker { Worker } }
+            }
+            fn f() {
+                let worker = factory :: Factory :: new();
+                worker.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None, Some("factory::Worker".to_string())]);
+    }
+
     fn extract_call_hints(code: &str) -> Vec<Option<String>> {
         let mut parser = Parser::new();
         let language = tree_sitter_rust::LANGUAGE;
@@ -1712,6 +1773,17 @@ mod receiver_type_hint_tests {
             fn test(w: Arc<Worker>) { w.run(); }
         "#;
         assert_eq!(extract_call_hints(imported), vec![None]);
+        for (declaration, receiver) in [("Box", "r#Box"), ("r#Box", "Box")] {
+            let code = format!(
+                "struct {declaration}<T>(T); impl<T> {declaration}<T> {{ fn run(&self) {{}} }} fn \
+                 test(w: {receiver}<Worker>) {{ w.run(); }}"
+            );
+            assert_eq!(
+                extract_call_hints(&code),
+                vec![Some("Box<Worker>".to_string())],
+                "raw and ordinary spellings name the same local wrapper"
+            );
+        }
     }
 
     /// A QUALIFIED head is judged by its whole path, not its tail. `custom::Box<Worker>` ends in a
@@ -1732,6 +1804,10 @@ mod receiver_type_hint_tests {
                 vec![None],
                 "{rooted} has more than one possible receiver layer"
             );
+        }
+        for raw in ["r#Box<Worker>", "r#std::boxed::Box<Worker>"] {
+            let code = format!("fn test(w: {raw}) {{ w.run(); }}");
+            assert_eq!(extract_call_hints(&code), vec![None], "raw spelling is the same wrapper");
         }
     }
 
@@ -2145,6 +2221,77 @@ mod receiver_type_hint_tests {
             Some("Foo<u8>".to_string()),
             Some("Foo<u16>".to_string()),
         ]);
+    }
+
+    #[test]
+    fn generic_arguments_keep_the_existing_nameability_boundary() {
+        for type_name in [
+            "Envelope<(Worker, Other)>",
+            "Matrix<[u8; 4]>",
+            "Callback<fn() -> Worker>",
+            "Marker<'*'>",
+            "Envelope<Ty!{\"for<\"}>",
+            "Envelope<Ty!{for<}>",
+        ] {
+            let code = format!("fn f(value: {type_name}) {{ value.run(); }}");
+            assert_eq!(
+                extract_call_hints(&code),
+                vec![None],
+                "the structural refactor must not widen persisted hints"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_constructor_returns_still_decline_aliases_and_binders() {
+        let raw_alias = r#"
+            struct Worker;
+            type r#Alias = Worker;
+            struct Factory;
+            impl Factory { fn new() -> r#Alias { Worker } }
+            fn f() { let worker = Factory::new(); worker.run(); }
+        "#;
+        assert_eq!(extract_call_hints(raw_alias), vec![None, None]);
+
+        let decomposed = "Cafe\u{301}";
+        let generic = format!(
+            "struct Worker; struct Factory; impl Factory {{ fn new<{decomposed}>(value: \
+             {decomposed}) -> {decomposed} {{ value }} }} fn f() {{ let worker = \
+             Factory::new(Worker); worker.run(); }}"
+        );
+        assert_eq!(extract_call_hints(&generic), vec![None, None]);
+    }
+
+    #[test]
+    fn canonical_constructor_returns_recognize_raw_and_nfc_imports() {
+        let raw = r#"
+            mod dep { pub struct Worker; }
+            mod inner {
+                use crate::dep::r#Worker;
+                struct Factory;
+                impl Factory { fn new() -> r#Worker { todo!() } }
+                fn f() { let worker = Factory::new(); worker.run(); }
+            }
+        "#;
+        assert_eq!(extract_call_hints(raw), vec![None, Some("Worker".to_string())]);
+
+        let decomposed = "Cafe\u{301}";
+        let imported = format!(
+            "mod dep {{ pub struct Café; }} mod inner {{ use crate::dep::{decomposed}; struct \
+             Factory; impl Factory {{ fn new() -> {decomposed} {{ todo!() }} }} fn f() {{ let \
+             value = Factory::new(); value.run(); }} }}"
+        );
+        assert_eq!(extract_call_hints(&imported), vec![None, Some("Café".to_string())]);
+    }
+
+    #[test]
+    fn comments_do_not_make_a_receiver_type_unnameable() {
+        assert_eq!(extract_call_hints("fn f(w: Foo</* note */ Worker>) { w.run(); }"), vec![Some(
+            "Foo<Worker>".to_string()
+        )]);
+        assert_eq!(extract_call_hints("fn f(w: &/* note */ Worker) { w.run(); }"), vec![Some(
+            "Worker".to_string()
+        )]);
     }
 
     #[test]

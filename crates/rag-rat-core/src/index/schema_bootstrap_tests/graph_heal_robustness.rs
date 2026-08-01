@@ -14,6 +14,14 @@ fn owe_both_heals(db: &IndexDatabase) {
     db.set_repo_meta("graph_index_version", "0").unwrap();
     db.storage
         .connection()
+        .execute(
+            "UPDATE main.files SET graph_version = 0, scope_version = 0
+             WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'",
+            params![&db.active_repo_id, db.active_generation],
+        )
+        .unwrap();
+    db.storage
+        .connection()
         .execute("DELETE FROM repo_meta WHERE key = 'logical_key_version'", [])
         .unwrap();
     // These tests rewind the version meta behind a connection that has already run passes, so a
@@ -164,6 +172,87 @@ fn edge_target_names(db: &IndexDatabase, file_id: i64) -> Vec<String> {
     names.map(Result::unwrap).collect()
 }
 
+fn edge_ids(db: &IndexDatabase, file_id: i64) -> Vec<i64> {
+    let mut stmt = db
+        .storage
+        .connection()
+        .prepare("SELECT id FROM main.edges_data WHERE source_file_id = ?1 ORDER BY id")
+        .unwrap();
+    let ids = stmt.query_map([file_id], |row| row.get::<_, i64>(0)).unwrap();
+    ids.map(Result::unwrap).collect()
+}
+
+fn file_graph_version(db: &IndexDatabase, file_id: i64) -> i64 {
+    db.storage
+        .connection()
+        .query_row("SELECT graph_version FROM main.files WHERE id = ?1", [file_id], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn file_scope_version(db: &IndexDatabase, file_id: i64) -> i64 {
+    db.storage
+        .connection()
+        .query_row("SELECT scope_version FROM main.files WHERE id = ?1", [file_id], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+#[test]
+fn an_older_binary_does_not_downgrade_future_row_provenance() {
+    let (root, config) = indexed_root(&[
+        ("future.rs", "pub fn future_helper() {}\npub fn future_entry() { future_helper(); }\n"),
+        ("owed.rs", "pub fn owed_helper() {}\npub fn owed_entry() { owed_helper(); }\n"),
+    ]);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let future_id = scoped_file_id(&db, "src/future.rs", &db.active_worktree_id);
+    let owed_id = scoped_file_id(&db, "src/owed.rs", &db.active_worktree_id);
+    let future_resolution =
+        edges::intern_edge_string(db.storage.connection(), "future_resolution").unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE main.edges_data SET resolution_id = ?1 WHERE source_file_id = ?2",
+            params![future_resolution, future_id],
+        )
+        .unwrap();
+    let future_edges = edge_targets_with_resolution(&db, future_id);
+    db.storage
+        .connection()
+        .execute("UPDATE main.files SET graph_version = 17, scope_version = 4 WHERE id = ?1", [
+            future_id,
+        ])
+        .unwrap();
+    db.storage
+        .connection()
+        .execute("UPDATE main.files SET graph_version = 0, scope_version = 0 WHERE id = ?1", [
+            owed_id,
+        ])
+        .unwrap();
+    db.set_repo_meta("graph_index_version", "0").unwrap();
+    db.set_repo_meta(LOGICAL_KEY_VERSION_KEY, "4").unwrap();
+
+    db.ensure_graph_index_current().unwrap();
+
+    assert_eq!(file_graph_version(&db, future_id), 17);
+    assert_eq!(file_scope_version(&db, future_id), 4);
+    assert_eq!(
+        edge_targets_with_resolution(&db, future_id),
+        future_edges,
+        "resolving an owed sibling must not rewrite future-derived edges"
+    );
+    assert_eq!(file_graph_version(&db, owed_id), GRAPH_INDEX_VERSION.parse::<i64>().unwrap());
+    assert_eq!(file_scope_version(&db, owed_id), 0, "scope healing waits for the newer binary");
+    assert_eq!(
+        db.repo_meta(LOGICAL_KEY_VERSION_KEY).unwrap().as_deref(),
+        Some("4"),
+        "the older binary preserves the future global grouping stamp"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// The `main.files` row id for `path` in the scope identified by `worktree_id` (`''` = base).
 fn scoped_file_id(db: &IndexDatabase, path: &str, worktree_id: &str) -> i64 {
     db.storage
@@ -219,6 +308,8 @@ fn a_graph_heal_does_not_rewrite_a_sibling_worktrees_edges() {
     assert_ne!(base_id, overlay_id, "base and overlay must hold separate rows for the path");
     let overlay_before = edge_target_names(&db, overlay_id);
     let overlay_resolved_before = edge_targets_with_resolution(&db, overlay_id);
+    let base_edge_ids_before = edge_ids(&db, base_id);
+    let overlay_edge_ids_before = edge_ids(&db, overlay_id);
     assert!(
         overlay_before.iter().any(|name| name == "overlay_helper"),
         "the overlay row's graph is derived from the BRANCH body: {overlay_before:?}"
@@ -226,6 +317,14 @@ fn a_graph_heal_does_not_rewrite_a_sibling_worktrees_edges() {
 
     owe_both_heals(&db);
     db.ensure_graph_index_current().expect("the heal runs from the base checkout");
+
+    assert_eq!(file_graph_version(&db, base_id), GRAPH_INDEX_VERSION.parse::<i64>().unwrap());
+    assert_eq!(file_scope_version(&db, base_id), LOGICAL_KEY_VERSION.parse::<i64>().unwrap());
+    assert_eq!(file_graph_version(&db, overlay_id), 0);
+    assert_eq!(file_scope_version(&db, overlay_id), 0);
+    let base_edge_ids_after = edge_ids(&db, base_id);
+    assert_ne!(base_edge_ids_after, base_edge_ids_before, "the active row was re-extracted");
+    assert_eq!(edge_ids(&db, overlay_id), overlay_edge_ids_before, "the sibling row was untouched");
 
     assert_eq!(
         edge_target_names(&db, overlay_id),
@@ -242,6 +341,54 @@ fn a_graph_heal_does_not_rewrite_a_sibling_worktrees_edges() {
     assert!(
         base_after.iter().any(|name| name == "base_helper"),
         "the active checkout's own row IS re-derived: {base_after:?}"
+    );
+
+    assert_ne!(
+        db.repo_meta("graph_index_version").unwrap().as_deref(),
+        Some(GRAPH_INDEX_VERSION),
+        "the repo summary stays pending while a sibling row is owed"
+    );
+
+    let mut linked_config = source_config(linked.to_path_buf(), Language::Rust);
+    linked_config.database = config.database.clone();
+    drop(db);
+    assert!(
+        IndexDatabase::try_open_config_read_only(&linked_config).unwrap().is_none(),
+        "a read-only sibling open must notice its visible lagging row"
+    );
+    let linked_db = IndexDatabase::open_config(&linked_config).unwrap();
+    assert_eq!(
+        edge_ids(&linked_db, base_id),
+        base_edge_ids_after,
+        "the sibling open leaves the base graph untouched"
+    );
+    assert_ne!(
+        edge_ids(&linked_db, overlay_id),
+        overlay_edge_ids_before,
+        "the sibling later re-extracts its own unchanged row"
+    );
+    assert_eq!(
+        edge_targets_with_resolution(&linked_db, overlay_id),
+        overlay_resolved_before,
+        "the refreshed sibling graph still describes the branch body"
+    );
+    assert_eq!(
+        file_graph_version(&linked_db, overlay_id),
+        GRAPH_INDEX_VERSION.parse::<i64>().unwrap()
+    );
+    assert_eq!(
+        file_scope_version(&linked_db, overlay_id),
+        LOGICAL_KEY_VERSION.parse::<i64>().unwrap()
+    );
+    assert_eq!(
+        linked_db.repo_meta("graph_index_version").unwrap().as_deref(),
+        Some(GRAPH_INDEX_VERSION),
+        "the repo summary converges after every live row is current"
+    );
+    assert_eq!(
+        linked_db.repo_meta(LOGICAL_KEY_VERSION_KEY).unwrap().as_deref(),
+        Some(LOGICAL_KEY_VERSION),
+        "the logical-key summary converges after every scope row is current"
     );
 
     let _ = fs::remove_dir_all(&main);
@@ -287,10 +434,10 @@ fn partial_coverage_defers_the_logical_key_stamp() {
     owe_both_heals(&db);
     db.ensure_graph_index_current().unwrap();
 
-    assert_eq!(
+    assert_ne!(
         db.repo_meta("graph_index_version").unwrap().as_deref(),
         Some(GRAPH_INDEX_VERSION),
-        "the graph pass itself ran to completion"
+        "an unrefreshed sibling row keeps the graph summary pending"
     );
     assert_ne!(
         db.repo_meta("logical_key_version").unwrap().as_deref(),
@@ -423,6 +570,14 @@ fn a_symbol_row_the_parser_cannot_match_does_not_wedge_the_graph_heal() {
     assert!(
         !edge_target_names(&db, file_id).is_empty(),
         "the file's edges are still re-derived — the shortfall is reported, not fatal"
+    );
+    assert_eq!(file_scope_version(&db, file_id), 0, "the failed scope refresh remains owed");
+    drop(db);
+    let reopened = IndexDatabase::open_config(&config).unwrap();
+    assert_eq!(
+        file_scope_version(&reopened, file_id),
+        0,
+        "a later open retries rather than certifying the failed refresh"
     );
 
     let _ = fs::remove_dir_all(&root);

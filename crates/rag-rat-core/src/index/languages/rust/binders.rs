@@ -22,9 +22,8 @@ use crate::index::edges::{child_name_text, node_text};
 ///
 /// Walks outward to the file root: every item that can carry `type_parameters` contributes —
 /// `impl`, `fn`, `trait`, and the type items — so a binder introduced two levels up is still in
-/// force. Lifetimes and const parameters are collected too; neither survives
-/// [`super::edges::clean_rust_type_name`] as a type name today, so they are here for honesty
-/// rather than reach.
+/// force. Lifetimes and const parameters are collected too; neither is a nameable receiver type,
+/// so they are here for honesty rather than reach.
 pub(super) fn binds_name(at: Node<'_>, name: &str, text: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -53,7 +52,7 @@ fn parameter_list_binds(parameters: Node<'_>, name: &str, text: &str) -> bool {
         // matching — so this has to strip it too, or a raw-spelled binder is substituted by the
         // owner renderer and missed by this membership test.
         "type_parameter" | "const_parameter" => child_name_text(parameter, text)
-            .is_some_and(|declared| declared.strip_prefix("r#").unwrap_or(&declared) == name),
+            .is_some_and(|declared| super::identifiers_equal(&declared, name)),
         "lifetime_parameter" | "lifetime" => {
             let lifetime = node_text(parameter, text);
             lifetime.split(':').next().unwrap_or_default().trim() == name

@@ -1668,12 +1668,17 @@ impl IndexDatabase {
     pub(super) fn ensure_graph_index_current(&self) -> anyhow::Result<()> {
         let graph_current =
             self.repo_meta("graph_index_version")?.as_deref() == Some(GRAPH_INDEX_VERSION);
-        let logical_current =
-            self.repo_meta(LOGICAL_KEY_VERSION_KEY)?.as_deref() == Some(LOGICAL_KEY_VERSION);
-        // A logical-key mismatch by itself is handled by the normal full-rederive gate. This
-        // on-open path owns the graph-version migration only; when both versions lag together it
-        // must refresh symbol extraction before that full regroup.
-        if graph_current {
+        let active_derivation_owed = self.active_derivation_rows_owed()?;
+        let scope_rows_newer = self.scope_rows_newer()?;
+        if scope_rows_newer && !self.active_graph_rows_owed()? {
+            return Ok(());
+        }
+        if !active_derivation_owed {
+            // A sibling checkout may still owe rows this scope cannot read. The active graph is
+            // safe to serve; once the final sibling heals, that opener advances the repo summary.
+            if !graph_current && !self.graph_rows_owed()? {
+                self.mark_graph_index_current()?;
+            }
             return Ok(());
         }
         let Some(root) = self.storage.source_root().map(Path::to_path_buf) else {
@@ -1681,6 +1686,15 @@ impl IndexDatabase {
         };
         self.storage.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| -> anyhow::Result<()> {
+            self.begin_scoped_edge_rewrite()?;
+            self.storage.connection().execute(
+                "INSERT OR IGNORE INTO temp.edge_rewrite_files(file_id)
+                 SELECT id FROM main.files
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                   AND graph_version <= CAST(?3 AS INTEGER)
+                   AND id IN (SELECT id FROM files)",
+                params![self.active_repo_id, self.active_generation, GRAPH_INDEX_VERSION],
+            )?;
             // Repopulate the per-package import scope BEFORE re-resolving (#61). A bare
             // version-bump re-resolve would re-derive `import_scope_*` on the new edges
             // but read an empty `packages` table (V022 only ADDED the column; it did not
@@ -1702,15 +1716,8 @@ impl IndexDatabase {
             // would stamp this checkout's graph onto another scope's rows; failing the open over
             // them would brick every later open, since this runs ON the open path.
             //
-            // A skipped row is then STALE, and stays stale: `graph_index_version` is per-repo and
-            // is stamped below regardless, so this heal never revisits it, and no later pass
-            // re-extracts a file whose content did not change. For a sibling worktree row that
-            // diverges from the active checkout, that can be indefinite. Accepted here because
-            // the alternative on this code path is worse — pre-digest-gate, such a row was wiped
-            // and rebuilt from the WRONG checkout's bytes — and because a lagging row degrades
-            // (it carries the older extractor's facts) rather than answering wrongly. Making the
-            // heal resumable per row, so a later pass can finish what this one could not vouch
-            // for, is #1014.
+            // A skipped row keeps its old per-file versions, so the checkout that owns those bytes
+            // can resume both derivations later without forcing this scope to parse them again.
             // Rows the row reader could not name are uncovered exactly like an unreadable file.
             let mut unverified = unreadable;
             let mut unrefreshed = 0usize;
@@ -1733,26 +1740,34 @@ impl IndexDatabase {
                 // fresh index hashes a real enclosing scope. Left alone, those rows would take the
                 // new stamp holding a key no fresh index produces, and nested same-named symbols
                 // would stay collapsed with no later pass owing them a re-derivation.
-                let scope_is_owed = !logical_current
+                let scope_needs_refresh = file.scope_owed
                     && file.kind != TargetKind::Generated
                     && file.language != Language::Markdown
                     && text.len() <= edges::MAX_GRAPH_PARSE_BYTES
                     && (file.language == Language::Rust
                         || self.file_has_unscoped_symbols(file.id)?);
-                if scope_is_owed
-                    && !self.refresh_symbol_scopes(
-                        file.id,
-                        Path::new(&file.path),
-                        &text,
-                        file.language,
-                    )?
-                {
-                    unrefreshed += 1;
+                if file.scope_owed && !scope_rows_newer {
+                    if !scope_needs_refresh
+                        || self.refresh_symbol_scopes(
+                            file.id,
+                            Path::new(&file.path),
+                            &text,
+                            file.language,
+                        )?
+                    {
+                        self.mark_file_scope_current(file.id)?;
+                    } else {
+                        unrefreshed += 1;
+                    }
+                }
+                if !file.graph_owed {
+                    continue;
                 }
                 if file.kind == TargetKind::Generated
                     || file.language == Language::Markdown
                     || text.len() > edges::MAX_GRAPH_PARSE_BYTES
                 {
+                    self.mark_file_graph_current(file.id)?;
                     continue;
                 }
                 // Wipe exactly the row being re-derived, immediately before re-deriving it.
@@ -1773,83 +1788,37 @@ impl IndexDatabase {
                     file.language,
                     &text,
                 )?;
+                self.mark_file_graph_current(file.id)?;
             }
-            // Rows this connection's view does not admit are never walked above, so their scope
-            // shape is untouched — and `regroup_logical_symbols` reads raw `main.files` across
-            // EVERY scope, so one stale row is enough to change logical identity. Count them for
-            // the stamp decision even though the edge pass deliberately leaves them alone.
-            let out_of_scope: i64 = self.storage.connection().query_row(
-                "SELECT COUNT(*) FROM main.files
-                  WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
-                    AND id NOT IN (SELECT id FROM files)",
-                params![self.active_repo_id, self.active_generation],
-                |row| row.get(0),
-            )?;
-            if unverified > 0 || unrefreshed > 0 || out_of_scope > 0 {
+            if unverified > 0 || unrefreshed > 0 {
                 tracing::warn!(
                     unverified,
                     unrefreshed,
-                    out_of_scope,
-                    "graph heal skipped file rows this checkout could not vouch for; their graph \
-                     stays on the previous extraction, and the logical-key stamp is deferred so \
-                     later passes keep trying (#1014)"
+                    "graph heal skipped file rows this checkout could not vouch for; their \
+                     per-file provenance remains owed for a later checkout (#1014)"
                 );
             }
             // `resolve_edges` and `rebuild_logical_symbols` are SIBLINGS, not a chain: both
             // consume `symbols.scope_path`, and neither consumes the other's output
             // (`same_logical_symbol` compares in-memory `IndexedSymbol` fields, not
             // `logical_symbols` rows — edge resolution never reads that table). What is
-            // load-bearing is that the refresh loop above completed for the whole corpus first;
-            // their relative order here is free.
-            self.resolve_edges()?;
-            // A lagging `logical_key_version` must not survive an on-open graph heal: without
-            // this, an index upgraded across a key-derivation change (e.g. scope_path joining
-            // the key) keeps its OLD merged/split logical ids until some unrelated source
-            // mutation triggers a rebuilding pass — memory bindings and symbol surfaces keep
-            // leaking across owners indefinitely on an otherwise idle repo.
-            //
-            // Stamp the new key version only when this pass actually refreshed EVERY row. The
-            // regroup reads raw `main.files` across every scope, so a row whose scope stayed on
-            // the old shape does not merely lag — it changes IDENTITY: a cross-scope group that
-            // was one logical symbol splits, the stale row keeps the original `stable_id`, and
-            // the refreshed row gets a new one. Stamping that as current would also disarm the
-            // two mechanisms built to recover from it — `logical_key_drift_snapshot` goes quiet
-            // and `can_scope_logical_rederive` starts allowing the scoped re-derive, which by
-            // construction never revisits the untouched rows. Deferring keeps both armed, at the
-            // cost of a whole-corpus regroup on later passes until coverage completes (#1014).
-            if self.repo_meta(LOGICAL_KEY_VERSION_KEY)?.as_deref() != Some(LOGICAL_KEY_VERSION) {
-                let stamp = if unverified == 0 && unrefreshed == 0 && out_of_scope == 0 {
-                    KeyVersionStamp::FullRederive
-                } else {
+            // load-bearing is that the refresh loop above completed for every row this checkout
+            // can advance first; their relative order here is free.
+            self.resolve_changed_edges()?;
+            if !scope_rows_newer
+                && self.repo_meta(LOGICAL_KEY_VERSION_KEY)?.as_deref() != Some(LOGICAL_KEY_VERSION)
+            {
+                let stamp = if self.scope_rows_owed()? {
                     KeyVersionStamp::Defer
+                } else {
+                    KeyVersionStamp::FullRederive
                 };
                 self.rebuild_logical_symbols(stamp)?;
             }
-            // The GRAPH stamp advances even when rows were skipped, unlike the key stamp above.
-            // That is deliberate, and the symmetry is tempting enough to be worth writing down.
-            //
-            // `out_of_scope` counts rows this connection's view does not admit — it is blind to
-            // whether those rows are FRESH. In a repo with two checkouts, each one always sees the
-            // other's rows as out of scope, however recently the other re-derived them. So gating
-            // this stamp on full coverage would not defer it until coverage completed; it would
-            // defer it forever, and every open of a multi-checkout repo would re-read and
-            // re-extract the entire corpus. That trades a bounded staleness for an unbounded cost.
-            //
-            // The key stamp can afford the same gate because deferring it only repeats a regroup,
-            // and because leaving it deferred keeps the drift-recovery mechanisms armed.
-            //
-            // The deferred KEY stamp is not free either, and the cost is worth naming: because
-            // `out_of_scope` is permanent in a multi-checkout repo, that stamp never becomes
-            // current there, so `can_scope_logical_rederive` stays false and every mutating pass
-            // takes the full rebuild instead of the scoped re-derive. Correct, but it gives up the
-            // write-amplification win indefinitely rather than for one pass.
-            //
-            // The real fix for both is per-row provenance — a version on the row, so the repo
-            // stamp can advance while individual rows stay owed and a checkout that CAN read those
-            // bytes finishes them later. That needs a migration and its own review (#1082).
             self.mark_graph_index_current()?;
             Ok(())
         })();
+        self.finish_scoped_edge_rewrite();
         if result.is_err() {
             let _ = self.storage.execute_batch("ROLLBACK");
         }
@@ -1859,7 +1828,101 @@ impl IndexDatabase {
     }
 
     pub(super) fn mark_graph_index_current(&self) -> anyhow::Result<()> {
-        self.set_repo_meta("graph_index_version", GRAPH_INDEX_VERSION)
+        if self.graph_rows_owed()? {
+            self.storage.connection().execute(
+                "DELETE FROM repo_meta WHERE repo_id = ?1 AND key = 'graph_index_version'",
+                [&self.active_repo_id],
+            )?;
+            Ok(())
+        } else {
+            self.set_repo_meta("graph_index_version", GRAPH_INDEX_VERSION)
+        }
+    }
+
+    pub(super) fn active_derivation_rows_owed(&self) -> anyhow::Result<bool> {
+        Ok(self.storage.connection().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM main.files
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                   AND (graph_version < CAST(?3 AS INTEGER)
+                        OR scope_version < CAST(?4 AS INTEGER))
+                   AND id IN (SELECT id FROM files)
+             )",
+            params![
+                self.active_repo_id,
+                self.active_generation,
+                GRAPH_INDEX_VERSION,
+                LOGICAL_KEY_VERSION
+            ],
+            |row| row.get::<_, i64>(0),
+        )? == 1)
+    }
+
+    fn active_graph_rows_owed(&self) -> anyhow::Result<bool> {
+        Ok(self.storage.connection().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM main.files
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                   AND graph_version < CAST(?3 AS INTEGER)
+                   AND id IN (SELECT id FROM files)
+             )",
+            params![self.active_repo_id, self.active_generation, GRAPH_INDEX_VERSION],
+            |row| row.get::<_, i64>(0),
+        )? == 1)
+    }
+
+    fn graph_rows_owed(&self) -> anyhow::Result<bool> {
+        Ok(self.storage.connection().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM main.files
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                   AND graph_version < CAST(?3 AS INTEGER)
+             )",
+            params![self.active_repo_id, self.active_generation, GRAPH_INDEX_VERSION],
+            |row| row.get::<_, i64>(0),
+        )? == 1)
+    }
+
+    fn scope_rows_owed(&self) -> anyhow::Result<bool> {
+        Ok(self.storage.connection().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM main.files
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                   AND scope_version < CAST(?3 AS INTEGER)
+             )",
+            params![self.active_repo_id, self.active_generation, LOGICAL_KEY_VERSION],
+            |row| row.get::<_, i64>(0),
+        )? == 1)
+    }
+
+    fn scope_rows_newer(&self) -> anyhow::Result<bool> {
+        Ok(self.storage.connection().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM main.files
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                   AND scope_version > CAST(?3 AS INTEGER)
+             )",
+            params![self.active_repo_id, self.active_generation, LOGICAL_KEY_VERSION],
+            |row| row.get::<_, i64>(0),
+        )? == 1)
+    }
+
+    fn mark_file_graph_current(&self, file_id: i64) -> anyhow::Result<()> {
+        self.storage.connection().execute(
+            "UPDATE main.files SET graph_version = MAX(graph_version, CAST(?1 AS INTEGER))
+             WHERE id = ?2",
+            params![GRAPH_INDEX_VERSION, file_id],
+        )?;
+        Ok(())
+    }
+
+    fn mark_file_scope_current(&self, file_id: i64) -> anyhow::Result<()> {
+        self.storage.connection().execute(
+            "UPDATE main.files SET scope_version = MAX(scope_version, CAST(?1 AS INTEGER))
+             WHERE id = ?2",
+            params![LOGICAL_KEY_VERSION, file_id],
+        )?;
+        Ok(())
     }
 
     /// Refresh symbol fields whose extraction semantics changed without rewriting chunks or
@@ -1996,30 +2059,44 @@ impl IndexDatabase {
         // `mark_file_deleted` leaves `language='unknown', kind='deleted'`, and neither parses, so
         // letting one through would turn every open into a hard error.
         let mut stmt = self.storage.connection().prepare(
-            "SELECT id, path, language, kind, sha256
+            "SELECT id, path, language, kind, sha256,
+                    graph_version < CAST(?3 AS INTEGER),
+                    scope_version < CAST(?4 AS INTEGER)
                  FROM main.files
                  WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
                    AND id IN (SELECT id FROM files)
+                   AND (graph_version < CAST(?3 AS INTEGER)
+                        OR scope_version < CAST(?4 AS INTEGER))
                  ORDER BY path",
         )?;
-        let rows = stmt.query_map(params![self.active_repo_id, self.active_generation], |row| {
-            let language: String = row.get(2)?;
-            let kind: String = row.get(3)?;
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                language,
-                kind,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![
+                self.active_repo_id,
+                self.active_generation,
+                GRAPH_INDEX_VERSION,
+                LOGICAL_KEY_VERSION
+            ],
+            |row| {
+                let language: String = row.get(2)?;
+                let kind: String = row.get(3)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    language,
+                    kind,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, bool>(6)?,
+                ))
+            },
+        )?;
         let mut files = Vec::new();
         // A row this build cannot name is still a row the heal did not cover, so the caller has to
         // hear about it: with the count lost, a repo whose every OTHER row refreshed would take the
         // new key stamp, and once the stamp matches nothing ever owes this row a re-derivation.
         let mut unreadable = 0usize;
         for row in rows {
-            let (id, path, language, kind, sha256) = row?;
+            let (id, path, language, kind, sha256, graph_owed, scope_owed) = row?;
             // A marker row this build cannot name is a row to LEAVE ALONE, not a reason to fail
             // the open. `ensure_graph_index_current` is on the open path, so an unparseable
             // language/kind here would wedge the database for every later open too.
@@ -2030,7 +2107,15 @@ impl IndexDatabase {
                 unreadable += 1;
                 continue;
             };
-            files.push(GraphReindexFile { id, path, language, kind, sha256 });
+            files.push(GraphReindexFile {
+                id,
+                path,
+                language,
+                kind,
+                sha256,
+                graph_owed,
+                scope_owed,
+            });
         }
         Ok((files, unreadable))
     }

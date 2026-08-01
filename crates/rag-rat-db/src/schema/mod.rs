@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 100;
+pub const LATEST_SCHEMA_VERSION: u32 = 101;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -763,6 +763,12 @@ const MIGRATION_100_CHECKSUM: &str =
 const MIGRATION_100_DESCRIPTION: &str = "Add edges_data.receiver_type_hint_id for conservative \
                                          Rust receiver-type resolution and persist stable callee \
                                          identity for call-path validation";
+const MIGRATION_101_ID: &str = "101_file_graph_version_provenance";
+const MIGRATION_101_CHECKSUM: &str = "sha256:rag-rat-file-graph-version-provenance-v101";
+const MIGRATION_101_DESCRIPTION: &str = "Add per-file graph and scope derivation provenance so an \
+                                         active checkout can refresh only rows whose bytes it can \
+                                         verify, while linked worktrees retain and later complete \
+                                         their own upgrade";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1590,6 +1596,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_100_CHECKSUM,
         description: MIGRATION_100_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_receiver_type_hint_interning),
+    },
+    Migration {
+        id: MIGRATION_101_ID,
+        checksum: MIGRATION_101_CHECKSUM,
+        description: MIGRATION_101_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_file_graph_version_provenance),
     },
 ];
 

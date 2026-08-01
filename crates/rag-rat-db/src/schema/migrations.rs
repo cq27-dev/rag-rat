@@ -7139,6 +7139,54 @@ pub fn apply_receiver_type_hint_interning(conn: &Connection) -> rusqlite::Result
     Ok(())
 }
 
+/// V101 (#1014): record which graph extractor version produced each file row.
+///
+/// Existing rows inherit the repository stamp they previously relied on. A later extractor bump
+/// can then mark only rows whose exact bytes are readable from the active checkout, leaving a
+/// divergent linked-worktree row owed until that checkout opens the shared database itself.
+pub fn apply_file_graph_version_provenance(conn: &Connection) -> rusqlite::Result<()> {
+    let had_graph_version = column_exists(conn, "files", "graph_version")?;
+    let had_scope_version = column_exists(conn, "files", "scope_version")?;
+    add_column_if_missing(conn, "files", "graph_version", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "files", "scope_version", "INTEGER NOT NULL DEFAULT 0")?;
+    let has_repo_meta = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'repo_meta')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !had_graph_version && column_exists(conn, "files", "repo_id")? && has_repo_meta {
+        conn.execute(
+            "UPDATE files
+             SET graph_version = COALESCE((
+                 SELECT CAST(value AS INTEGER)
+                 FROM repo_meta
+                 WHERE repo_meta.repo_id = files.repo_id
+                   AND repo_meta.key = 'graph_index_version'
+             ), 0)",
+            [],
+        )?;
+    }
+    if !had_scope_version && column_exists(conn, "files", "repo_id")? && has_repo_meta {
+        conn.execute(
+            "UPDATE files
+             SET scope_version = COALESCE((
+                 SELECT CAST(value AS INTEGER)
+                 FROM repo_meta
+                 WHERE repo_meta.repo_id = files.repo_id
+                   AND repo_meta.key = 'logical_key_version'
+             ), 0)",
+            [],
+        )?;
+    }
+    if column_exists(conn, "files", "repo_id")? && column_exists(conn, "files", "generation")? {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_files_repo_generation_graph_version
+             ON files(repo_id, generation, graph_version, scope_version);",
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod memory_model_failure_migration_tests {
     use super::*;

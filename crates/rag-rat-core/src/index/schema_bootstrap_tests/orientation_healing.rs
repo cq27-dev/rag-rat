@@ -626,10 +626,13 @@ fn read_only_open_serves_current_index_and_declines_when_heal_is_owed() {
     );
     drop(ro);
 
-    // Mark the graph index stale (a heal write is now owed). open() already ran and left it
-    // current, so set it afterward; the read-only path does not heal, so it must decline.
+    // Mark a file's graph derivation stale (a heal write is now owed). The read-only path does not
+    // heal, so it must decline even if the derived repo summary has not changed yet.
     let db = IndexDatabase::open(&config.database).unwrap();
-    db.set_repo_meta("graph_index_version", "0").unwrap();
+    db.storage
+        .connection()
+        .execute("UPDATE main.files SET graph_version = 0 WHERE kind != 'deleted'", [])
+        .unwrap();
     drop(db);
     assert!(
         IndexDatabase::try_open_config_read_only(&config).unwrap().is_none(),

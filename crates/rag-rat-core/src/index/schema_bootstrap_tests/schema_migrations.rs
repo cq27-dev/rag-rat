@@ -1765,8 +1765,6 @@ fn migration_093_adds_table_sync_projection_state() {
 /// V100 (#976) adds receiver_type_hint_id to edges_data and updates the edges view.
 #[test]
 fn migration_100_receiver_type_hint_interning() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 100, "move this pin with the next schema migration");
-
     let bare = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&bare, &crate::index::migration_hooks()).unwrap();
     schema::migrations::apply_receiver_type_hint_interning(&bare).unwrap();
@@ -1781,7 +1779,7 @@ fn migration_100_receiver_type_hint_interning() {
             .unwrap()
     );
 
-    assert_eq!(schema::status(&bare).unwrap().current_version, 100);
+    assert_eq!(schema::status(&bare).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = bare
         .query_row(
             "SELECT COUNT(*) FROM schema_version
@@ -1790,7 +1788,56 @@ fn migration_100_receiver_type_hint_interning() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(recorded, 1, "the forward migration records V099");
+    assert_eq!(recorded, 1, "the forward migration records V100");
+}
+
+/// V101 (#1014) makes graph and scope healing resumable per file row.
+#[test]
+fn migration_101_file_graph_version_provenance() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 101, "move this pin with the next schema migration");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE files(path TEXT, repo_id TEXT, generation INTEGER);
+         CREATE TABLE repo_meta(repo_id TEXT, key TEXT, value TEXT);
+         INSERT INTO repo_meta VALUES ('repo', 'graph_index_version', '15');
+         INSERT INTO repo_meta VALUES ('repo', 'logical_key_version', '2');
+         INSERT INTO files VALUES ('src/lib.rs', 'repo', 1);",
+    )
+    .unwrap();
+
+    schema::migrations::apply_file_graph_version_provenance(&conn).unwrap();
+    let versions: (i64, i64) = conn
+        .query_row(
+            "SELECT graph_version, scope_version FROM files WHERE path = 'src/lib.rs'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(versions, (15, 2), "existing rows inherit both prior repo stamps");
+
+    conn.execute("UPDATE files SET graph_version = 16, scope_version = 3", []).unwrap();
+    schema::migrations::apply_file_graph_version_provenance(&conn).expect("replay is a no-op");
+    let versions: (i64, i64) = conn
+        .query_row("SELECT graph_version, scope_version FROM files", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(versions, (16, 3), "replay preserves per-row progress");
+    let index_exists: i64 = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                            WHERE type = 'index'
+                              AND name = 'idx_files_repo_generation_graph_version')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_exists, 1);
+
+    let latest = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&latest, &crate::index::migration_hooks()).unwrap();
+    assert_eq!(schema::status(&latest).unwrap().current_version, 101);
 }
 
 /// V091 (#949) tracks the live key-target count each invite reservation covers, so fold-time
@@ -2018,7 +2065,6 @@ fn migration_094_tracks_lens_enrichment_changes_in_constant_time() {
 /// binary that did not do the work.
 #[test]
 fn migration_097_records_the_same_ladder_entry_on_every_platform() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 100, "move this pin with the next schema migration");
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     let status = schema::status(&conn).unwrap();

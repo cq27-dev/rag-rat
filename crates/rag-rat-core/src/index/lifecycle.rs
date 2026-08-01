@@ -434,9 +434,7 @@ impl IndexDatabase {
         // empty scope. The graph / generated-flags gates read `repo_id` explicitly.
         db.set_context(&commit_sha, &worktree_id)?;
         let conn = db.storage.connection();
-        if repo_meta(conn, &db.active_repo_id, "graph_index_version")?.as_deref()
-            != Some(GRAPH_INDEX_VERSION)
-        {
+        if db.active_derivation_rows_owed()? {
             return Ok(None);
         }
         // A stale generated-flags version owes a re-derive (a write); fall back to read-write so it
@@ -879,7 +877,7 @@ fn write_scope_view_inner(conn: &rusqlite::Connection, ctx: &ScopeContext) -> ru
             DROP VIEW IF EXISTS temp.files;
             CREATE TEMP VIEW temp.files AS
             SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-         indexed_revision, commit_sha, worktree_id, has_test_code
+         indexed_revision, commit_sha, worktree_id, has_test_code, graph_version, scope_version
             FROM main.files
             WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
               AND generation = (SELECT value FROM temp.connection_context WHERE key = \
@@ -888,7 +886,7 @@ fn write_scope_view_inner(conn: &rusqlite::Connection, ctx: &ScopeContext) -> ru
          'worktree_id') AND worktree_id != '' AND kind != 'deleted'
             UNION ALL
             SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-         indexed_revision, commit_sha, worktree_id, has_test_code
+         indexed_revision, commit_sha, worktree_id, has_test_code, graph_version, scope_version
             FROM main.files
             WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
               AND generation = (SELECT value FROM temp.connection_context WHERE key = \
@@ -940,7 +938,7 @@ fn write_repo_generation_view(
             DROP VIEW IF EXISTS temp.files;
             CREATE TEMP VIEW temp.files AS
             SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-         indexed_revision, commit_sha, worktree_id, has_test_code
+         indexed_revision, commit_sha, worktree_id, has_test_code, graph_version, scope_version
             FROM main.files
             WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
               AND generation = (SELECT value FROM temp.connection_context WHERE key = \
