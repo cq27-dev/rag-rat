@@ -1384,6 +1384,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_096_ID => Some(96),
             MIGRATION_097_ID => Some(97),
             MIGRATION_098_ID => Some(98),
+            MIGRATION_099_ID => Some(99),
             _ => None,
         })
         .max()
@@ -1491,6 +1492,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_096_ID
             | MIGRATION_097_ID
             | MIGRATION_098_ID
+            | MIGRATION_099_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1595,6 +1597,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_096_ID => migration.checksum != MIGRATION_096_CHECKSUM,
         MIGRATION_097_ID => migration.checksum != MIGRATION_097_CHECKSUM,
         MIGRATION_098_ID => migration.checksum != MIGRATION_098_CHECKSUM,
+        MIGRATION_099_ID => migration.checksum != MIGRATION_099_CHECKSUM,
         _ => false,
     }
 }
@@ -6631,6 +6634,203 @@ pub fn apply_table_sync_gapped_entries(conn: &Connection) -> rusqlite::Result<()
                  stream_id, prev_hash, device_fingerprint, entry_hash);",
     )?;
     tx.commit()
+}
+
+/// V099 (#1049): account-authorized repository incarnations and incarnation-safe table streams.
+///
+/// The table-sync engine is still unreachable in production (`SYNCABLE_TABLES` is empty and no
+/// transport exists), so legacy `/4` projection state has no peer-visible authority and cannot be
+/// assigned an incarnation honestly. The migration retains only chain-tip witnesses, then clears
+/// that unreachable state and rebuilds row bookkeeping with `stream_id` in every key.
+pub fn apply_table_sync_repo_incarnations(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account_repo_incarnations(
+             account_id       BLOB NOT NULL CHECK(length(account_id) = 32),
+             repository_id    TEXT NOT NULL,
+             incarnation_ref  BLOB NOT NULL CHECK(length(incarnation_ref) = 32),
+             predecessor_ref  BLOB CHECK(predecessor_ref IS NULL OR length(predecessor_ref) = 32),
+             PRIMARY KEY(account_id, incarnation_ref)
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS account_repo_incarnations_repo
+             ON account_repo_incarnations(account_id, repository_id, predecessor_ref);
+         CREATE TABLE IF NOT EXISTS account_repo_incarnation_current(
+             account_id       BLOB NOT NULL CHECK(length(account_id) = 32),
+             repository_id    TEXT NOT NULL,
+             state            TEXT NOT NULL CHECK(state IN ('current', 'contested')),
+             incarnation_ref  BLOB CHECK(
+                 (state = 'current' AND length(incarnation_ref) = 32)
+                 OR (state = 'contested' AND incarnation_ref IS NULL)
+             ),
+             PRIMARY KEY(account_id, repository_id)
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS table_sync_chain_tips(
+             stream_id          BLOB    NOT NULL CHECK(length(stream_id) = 32),
+             device_fingerprint BLOB    NOT NULL CHECK(length(device_fingerprint) = 32),
+             lamport            INTEGER NOT NULL,
+             entry_hash         BLOB    NOT NULL CHECK(length(entry_hash) = 32),
+             PRIMARY KEY(stream_id, device_fingerprint)
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS table_sync_chain_tips_stream_lamport
+             ON table_sync_chain_tips(stream_id, lamport);",
+    )?;
+
+    // Rebuild accepted-chain high-water independently of the directory shape. A sanctioned full
+    // schema replay may be repairing a dropped/incomplete witness table on an already-V099 store,
+    // where `table_sync_streams.incarnation_ref` is present and the shape conversion below skips.
+    conn.execute_batch(
+        "INSERT INTO table_sync_chain_tips(stream_id, device_fingerprint, lamport, entry_hash)
+         SELECT e.stream_id, e.device_fingerprint, e.lamport, e.entry_hash
+           FROM table_sync_entries e
+          WHERE NOT EXISTS (
+                SELECT 1 FROM table_sync_entries newer
+                 WHERE newer.stream_id = e.stream_id
+                   AND newer.device_fingerprint = e.device_fingerprint
+                   AND newer.lamport > e.lamport
+          )
+         ON CONFLICT(stream_id, device_fingerprint) DO UPDATE SET
+             lamport = excluded.lamport, entry_hash = excluded.entry_hash
+         WHERE excluded.lamport > table_sync_chain_tips.lamport;",
+    )?;
+
+    if !column_exists(conn, "table_sync_streams", "incarnation_ref")? {
+        conn.execute_batch(
+            "DELETE FROM table_sync_gapped_entries;
+             DELETE FROM table_sync_entries;
+             DROP TABLE table_sync_streams;
+             CREATE TABLE table_sync_streams(
+                 stream_id       BLOB NOT NULL PRIMARY KEY CHECK(length(stream_id) = 32),
+                 repo_id         TEXT NOT NULL,
+                 account_id      BLOB NOT NULL CHECK(length(account_id) = 32),
+                 incarnation_ref BLOB NOT NULL CHECK(length(incarnation_ref) = 32),
+                 scope_id        TEXT NOT NULL,
+                 UNIQUE(repo_id, account_id, incarnation_ref, scope_id)
+             ) STRICT;",
+        )?;
+    }
+    if !column_exists(conn, "sync_published_rows", "stream_id")? {
+        conn.execute_batch(
+            "DROP TABLE sync_published_rows;
+             CREATE TABLE sync_published_rows(
+                 stream_id BLOB NOT NULL CHECK(length(stream_id) = 32), repo_id TEXT NOT NULL,
+                 table_name TEXT NOT NULL, row_pk TEXT NOT NULL, synced_hash TEXT NOT NULL,
+                 spec_version INTEGER NOT NULL,
+                 PRIMARY KEY(stream_id, table_name, row_pk)
+             ) STRICT;",
+        )?;
+    }
+    if !column_exists(conn, "sync_row_clocks", "stream_id")? {
+        conn.execute_batch(
+            "DROP TABLE sync_row_clocks;
+             CREATE TABLE sync_row_clocks(
+                 stream_id BLOB NOT NULL CHECK(length(stream_id) = 32), repo_id TEXT NOT NULL,
+                 table_name TEXT NOT NULL, row_pk TEXT NOT NULL, lamport INTEGER NOT NULL,
+                 device_fingerprint TEXT NOT NULL,
+                 PRIMARY KEY(stream_id, table_name, row_pk)
+             ) STRICT;",
+        )?;
+    }
+    if !column_exists(conn, "sync_row_tombstones", "stream_id")? {
+        conn.execute_batch(
+            "DROP TABLE sync_row_tombstones;
+             CREATE TABLE sync_row_tombstones(
+                 stream_id BLOB NOT NULL CHECK(length(stream_id) = 32), repo_id TEXT NOT NULL,
+                 table_name TEXT NOT NULL, row_pk TEXT NOT NULL, lamport INTEGER NOT NULL,
+                 device_fingerprint TEXT NOT NULL,
+                 PRIMARY KEY(stream_id, table_name, row_pk)
+             ) STRICT;",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod table_sync_repo_incarnation_migration_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_table_sync_state_becomes_a_retained_witness_and_incarnation_scoped_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE table_sync_entries(
+                 entry_hash BLOB PRIMARY KEY, stream_id BLOB NOT NULL,
+                 device_fingerprint BLOB NOT NULL, lamport INTEGER NOT NULL,
+                 prev_hash BLOB, signed_bytes BLOB NOT NULL, received_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE table_sync_gapped_entries(
+                 entry_hash BLOB PRIMARY KEY, stream_id BLOB NOT NULL,
+                 device_fingerprint BLOB NOT NULL, lamport INTEGER NOT NULL,
+                 prev_hash BLOB NOT NULL, signed_bytes BLOB NOT NULL, gapped_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE table_sync_streams(
+                 stream_id BLOB PRIMARY KEY, repo_id TEXT NOT NULL,
+                 account_id BLOB NOT NULL, scope_id TEXT NOT NULL
+             );
+             CREATE TABLE sync_published_rows(
+                 repo_id TEXT, table_name TEXT, row_pk TEXT, synced_hash TEXT, spec_version INTEGER
+             );
+             CREATE TABLE sync_row_clocks(
+                 repo_id TEXT, table_name TEXT, row_pk TEXT, lamport INTEGER,
+                 device_fingerprint TEXT
+             );
+             CREATE TABLE sync_row_tombstones(
+                 repo_id TEXT, table_name TEXT, row_pk TEXT, lamport INTEGER,
+                 device_fingerprint TEXT
+             );
+             INSERT INTO table_sync_streams VALUES(zeroblob(32), 'repo', zeroblob(32), 'demo/1');
+             INSERT INTO table_sync_entries VALUES(
+                 randomblob(32), zeroblob(32), zeroblob(32), 7, NULL, X'00', 0
+             );",
+        )
+        .unwrap();
+
+        apply_table_sync_repo_incarnations(&conn).unwrap();
+        assert!(column_exists(&conn, "table_sync_streams", "incarnation_ref").unwrap());
+        for table in ["sync_published_rows", "sync_row_clocks", "sync_row_tombstones"] {
+            assert!(column_exists(&conn, table, "stream_id").unwrap(), "{table}");
+        }
+        let witnesses: i64 = conn
+            .query_row("SELECT COUNT(*) FROM table_sync_chain_tips", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(witnesses, 1);
+        let entries: i64 = conn
+            .query_row("SELECT COUNT(*) FROM table_sync_entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(entries, 0, "un-authorized /4 history is not assigned a /5 incarnation");
+        assert!(!column_exists(&conn, "table_sync_chain_tips", "repo_id").unwrap());
+        assert!(!column_exists(&conn, "account_repo_incarnations", "repo_id").unwrap());
+    }
+
+    #[test]
+    fn full_ladder_replay_repairs_a_missing_chain_tip_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        conn.execute(
+            "INSERT INTO table_sync_entries(
+                 entry_hash, stream_id, device_fingerprint, lamport, prev_hash, signed_bytes,
+                 received_at_ms
+             ) VALUES (?1, ?2, ?3, 3, NULL, X'00', 0)",
+            rusqlite::params![[3u8; 32].as_slice(), [1u8; 32].as_slice(), [2u8; 32].as_slice()],
+        )
+        .unwrap();
+        conn.execute_batch("DROP TABLE table_sync_chain_tips").unwrap();
+
+        crate::schema::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        let restored: (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT lamport, entry_hash FROM table_sync_chain_tips
+                  WHERE stream_id = ?1 AND device_fingerprint = ?2",
+                rusqlite::params![[1u8; 32].as_slice(), [2u8; 32].as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(restored, (3, vec![3u8; 32]));
+
+        crate::schema::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM table_sync_chain_tips", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "accepted-tip repair is idempotent");
+    }
 }
 
 /// Every table whose `worktree_id` column holds a CHECKOUT PATH — the scope key `worktree_id_of`

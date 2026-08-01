@@ -100,6 +100,11 @@ pub(crate) enum PendingReason {
     /// permanent. Retrying it on every open would be the one reason that makes every store open pay
     /// forever. It is recorded so the state is diagnosable, and left alone.
     NoStreamContext,
+    /// Account authority does not currently select the stream directory's incarnation. Absence,
+    /// contest, or a different apparent current reference is non-monotone: later account entries
+    /// can establish, disambiguate, or restore this reference, so replay must retain debt and
+    /// retry.
+    DeferredIncarnationAuthority,
     /// A live row whose content differs from what was last published: an edit no peer has seen,
     /// which replaying this entry would silently overwrite.
     DeferredUnsentEdit,
@@ -120,14 +125,14 @@ impl PendingReason {
         self.into()
     }
 
-    /// Whether this entry is waiting on LOCAL ROW STATE rather than on a later binary.
+    /// Whether this entry is waiting on mutable row/account state rather than on a later binary.
     ///
     /// The two families are redeemed by different events and so have different retry triggers. A
     /// version gap clears when this binary understands more, which the projector version records —
-    /// so replaying one before the next bump is pure cost. A deferral clears when the row it is
-    /// blocked behind changes (the edit gets authored, the unreadable cell is repaired), which
-    /// nothing stamps and no version can express; the only way to find out is to look again, so a
-    /// deferral is owed a replay at every open (#1005).
+    /// so replaying one before the next bump is pure cost. A deferral clears when mutable state
+    /// changes (a row edit gets authored, an unreadable cell is repaired, or incarnation authority
+    /// resolves), which nothing stamps in this projection; the only way to find out is to look
+    /// again, so a deferral is owed a replay at every open (#1005).
     ///
     /// Every non-deferral variant is a version gap, INCLUDING `PartialAfterImage` (a broken
     /// producer its own doc says will not clear here) and `NoStreamContext`: as deferrals those
@@ -146,7 +151,7 @@ impl PendingReason {
         match self {
             Self::DeferredUnsentEdit | Self::DeferredUnsentDelete | Self::DeferredUnreadableRow =>
                 true,
-            Self::DeferredUnresolvedWinner => false,
+            Self::DeferredUnresolvedWinner | Self::DeferredIncarnationAuthority => false,
             other => {
                 debug_assert!(!other.is_deferral(), "every deferral must state its confidence");
                 false
@@ -159,7 +164,8 @@ impl PendingReason {
             Self::DeferredUnsentEdit
             | Self::DeferredUnsentDelete
             | Self::DeferredUnreadableRow
-            | Self::DeferredUnresolvedWinner => true,
+            | Self::DeferredUnresolvedWinner
+            | Self::DeferredIncarnationAuthority => true,
             Self::UnknownColumn
             | Self::NewerSpecVersion
             | Self::PartialAfterImage
@@ -246,8 +252,17 @@ pub(crate) fn author_row_entry(
     now_ms: i64,
 ) -> anyhow::Result<SignedEntry> {
     let device = secret.public().fingerprint();
+    let stored_tail = chain_tail(tx, stream, device)?;
+    if let Some(witness) = chain_witness(tx, stream, device)?
+        && stored_tail != Some(witness)
+    {
+        anyhow::bail!(
+            "table-sync chain continuity is not restored through the retained local tip; refusing \
+             to author a second genesis"
+        );
+    }
     let lamport = next_stream_lamport(tx, stream)?;
-    let prev_hash = chain_tail(tx, stream, device)?.map(|(_, entry_hash)| entry_hash);
+    let prev_hash = stored_tail.map(|(_, entry_hash)| entry_hash);
     let signed =
         entry::sign_entry_from_op_bytes(secret, stream, prev_hash, lamport, row_op::encode(op));
     // A locally-authored op is projected by construction: the producer builds it from THIS
@@ -259,15 +274,8 @@ pub(crate) fn author_row_entry(
 /// One past the highest lamport on `stream` across all devices — the next Lamport-clock tick. `0`
 /// for an empty stream.
 fn next_stream_lamport(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result<u64> {
-    let stream_bytes = stream.to_bytes();
-    let highest: Option<i64> = tx.query_row(
-        "SELECT MAX(lamport) FROM table_sync_entries WHERE stream_id = ?1",
-        params![stream_bytes.as_slice()],
-        |row| row.get::<_, Option<i64>>(0),
-    )?;
-    let next = match highest {
-        Some(lamport) =>
-            u64::try_from(lamport)?.checked_add(1).context("stream lamport overflow")?,
+    let next = match stream_max_lamport(tx, stream)? {
+        Some(lamport) => lamport.checked_add(1).context("stream lamport overflow")?,
         None => 0,
     };
     // Cap at the same ceiling `accept_row_entry` enforces, so a locally-authored entry can never
@@ -275,6 +283,21 @@ fn next_stream_lamport(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result
     // legitimate op volume); refusing to author is a bounded halt, never a divergent split.
     anyhow::ensure!(next < MAX_ENTRY_LAMPORT, "stream lamport ceiling reached");
     Ok(next)
+}
+
+/// The accepted or retained high-water for one stream. Both authoring and foreign-entry bounded
+/// advance must use this exact clock basis: a purged accepted log leaves only its retained witness.
+fn stream_max_lamport(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result<Option<u64>> {
+    let highest: Option<i64> = tx.query_row(
+        "SELECT MAX(lamport) FROM (
+             SELECT lamport FROM table_sync_entries WHERE stream_id = ?1
+             UNION ALL
+             SELECT lamport FROM table_sync_chain_tips WHERE stream_id = ?1
+         )",
+        params![stream.to_bytes().as_slice()],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    highest.map(u64::try_from).transpose().map_err(Into::into)
 }
 
 /// Verify + chain-classify + store one foreign signed entry, expected on `expected_stream` under
@@ -308,14 +331,7 @@ pub(crate) fn accept_row_entry(
     // of what is already stored (see `MAX_LAMPORT_ADVANCE`). Without it, a single griefing
     // entry near the ceiling would dominate every row's LWW and halt local authoring once
     // `next_stream_lamport` hits the ceiling. Read the current max BEFORE storing this entry.
-    let stream_max: u64 = {
-        let stored: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(lamport), 0) FROM table_sync_entries WHERE stream_id = ?1",
-            params![expected_stream.to_bytes().as_slice()],
-            |row| row.get(0),
-        )?;
-        u64::try_from(stored).unwrap_or(0)
-    };
+    let stream_max = stream_max_lamport(tx, expected_stream)?.unwrap_or(0);
     if verified.lamport > stream_max.saturating_add(MAX_LAMPORT_ADVANCE) {
         anyhow::bail!(
             "entry lamport {} jumps more than {MAX_LAMPORT_ADVANCE} past the stream clock \
@@ -352,7 +368,7 @@ pub(crate) fn accept_row_entry(
         return Ok(AcceptOutcome::Unauthorized);
     }
     match classify(tx, expected_stream, &verified)? {
-        ChainFit::Ok => {},
+        ChainFit::Ok | ChainFit::Restore => {},
         ChainFit::Gap =>
             return Ok(if retain_gapped_entry(tx, &verified, signed_bytes, now_ms)? {
                 AcceptOutcome::GapRetained
@@ -397,6 +413,7 @@ pub(crate) fn accept_row_entry(
 /// How a verified entry fits its `(stream, device)` chain tail.
 enum ChainFit {
     Ok,
+    Restore,
     Gap,
     Conflict,
 }
@@ -406,7 +423,23 @@ fn classify(
     stream: StreamId,
     verified: &VerifiedEntry,
 ) -> anyhow::Result<ChainFit> {
-    Ok(match (verified.prev_hash, chain_tail(tx, stream, verified.device_fingerprint)?) {
+    let tail = chain_tail(tx, stream, verified.device_fingerprint)?;
+    if tail.is_none()
+        && let Some((witness_lamport, witness_hash)) =
+            chain_witness(tx, stream, verified.device_fingerprint)?
+    {
+        if verified.entry_hash == witness_hash && verified.lamport == witness_lamport {
+            return Ok(ChainFit::Restore);
+        }
+        return Ok(match verified.prev_hash {
+            Some(prev) if prev == witness_hash && verified.lamport > witness_lamport =>
+                ChainFit::Ok,
+            None => ChainFit::Conflict,
+            Some(_) if verified.lamport <= witness_lamport => ChainFit::Conflict,
+            Some(_) => ChainFit::Gap,
+        });
+    }
+    Ok(match (verified.prev_hash, tail) {
         // A genesis (no predecessor) is the valid first entry of this device's chain; a genesis
         // when a chain already exists is a second head — an equivocation.
         (None, None) => ChainFit::Ok,
@@ -454,6 +487,22 @@ fn chain_tail(
             "SELECT lamport, entry_hash FROM table_sync_entries
              WHERE stream_id = ?1 AND device_fingerprint = ?2 ORDER BY lamport DESC LIMIT 1",
             params![stream_bytes.as_slice(), device_bytes.as_slice()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    row.map(|(lamport, hash)| Ok((u64::try_from(lamport)?, fixed32(hash)?))).transpose()
+}
+
+fn chain_witness(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    device: DeviceFingerprint,
+) -> anyhow::Result<Option<(u64, [u8; 32])>> {
+    let row = tx
+        .query_row(
+            "SELECT lamport, entry_hash FROM table_sync_chain_tips
+              WHERE stream_id = ?1 AND device_fingerprint = ?2",
+            params![stream.to_bytes().as_slice(), device.to_bytes().as_slice()],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
@@ -632,8 +681,9 @@ pub(crate) fn discard_gapped_descendants(
 ///
 /// A citation from a different STREAM is deliberately NOT swept, and this is the one residual the
 /// sweep leaves. Reaching it would mean matching on `prev_hash` without the `stream_id` equality,
-/// and a stream id is derived from `(repo_id, account_id, scope_id)` — so that query would delete
-/// rows belonging to OTHER REPOS in a shared database, under a write lock scoped to this one.
+/// and a stream id is derived from `(repo_id, account_id, incarnation_ref, scope_id)` — so that
+/// query would delete rows belonging to OTHER REPOS in a shared database, under a write lock scoped
+/// to this one.
 /// Trading a bounded capacity leak for a cross-repo write outside its lock is the wrong direction.
 /// The leak is charged to the malformed signer's own chain, is capped by `MAX_GAPPED_PER_CHAIN`,
 /// and is reclaimed by the deferred retention/GC horizon over this table. (The reverse arrival
@@ -746,6 +796,22 @@ fn insert_entry(
             now_ms,
             pending.map(PendingReason::as_db_str),
             pending.map(|_| super::refold::TABLE_SYNC_PROJECTOR_VERSION),
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO table_sync_chain_tips(
+             stream_id, device_fingerprint, lamport, entry_hash
+         ) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(stream_id, device_fingerprint) DO UPDATE SET
+             lamport = excluded.lamport, entry_hash = excluded.entry_hash
+         WHERE excluded.lamport > table_sync_chain_tips.lamport
+            OR (excluded.lamport = table_sync_chain_tips.lamport
+                AND excluded.entry_hash = table_sync_chain_tips.entry_hash)",
+        params![
+            stream_bytes.as_slice(),
+            device_bytes.as_slice(),
+            i64::try_from(verified.lamport)?,
+            verified.entry_hash.as_slice(),
         ],
     )?;
     Ok(())
@@ -921,12 +987,35 @@ pub(crate) fn deferral_tokens_sql() -> String {
 }
 
 /// The apply context a stored entry needs to be replayed. `scope_stream_id` is a ONE-WAY sha256 of
-/// `(repo_id, account_id, scope_id)` and entries store only the stream id, so without this
-/// directory a retained entry can never be re-applied: `repo_id` scopes every projected write and
-/// `scope_id` resolves the op's table spec.
+/// `(repo_id, account_id, incarnation_ref, scope_id)` and entries store only the stream id, so
+/// without this directory a retained entry can never be re-applied: `repo_id` scopes every
+/// projected write, `incarnation_ref` validates its authority generation, and `scope_id` resolves
+/// the op's table spec.
 pub(crate) struct StreamContext {
     pub(crate) repo_id: String,
+    pub(crate) incarnation_ref: [u8; 32],
     pub(crate) scope_id: String,
+}
+
+pub(crate) fn assert_current_incarnation(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    repo_id: &str,
+    incarnation_ref: [u8; 32],
+) -> anyhow::Result<()> {
+    match crate::account::repo_incarnation_state(tx, account_id, repo_id)? {
+        crate::account::RepoIncarnationState::Current(current) if current == incarnation_ref =>
+            Ok(()),
+        crate::account::RepoIncarnationState::Current(_) => {
+            anyhow::bail!("table-sync context names a stale repository incarnation")
+        },
+        crate::account::RepoIncarnationState::Absent => {
+            anyhow::bail!("repository incarnation authority is absent")
+        },
+        crate::account::RepoIncarnationState::Contested => {
+            anyhow::bail!("repository incarnation authority is contested")
+        },
+    }
 }
 
 /// Record a stream's apply context, idempotently. Called on every authored and ingested entry, so
@@ -936,14 +1025,35 @@ pub(crate) fn record_stream_context(
     stream: StreamId,
     repo_id: &str,
     account_id: AccountId,
+    incarnation_ref: [u8; 32],
     scope_id: &str,
 ) -> anyhow::Result<()> {
     tx.execute(
-        "INSERT INTO table_sync_streams(stream_id, repo_id, account_id, scope_id)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO table_sync_streams(
+             stream_id, repo_id, account_id, incarnation_ref, scope_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(stream_id) DO NOTHING",
-        params![stream.to_bytes().as_slice(), repo_id, account_id.to_bytes().as_slice(), scope_id],
+        params![
+            stream.to_bytes().as_slice(),
+            repo_id,
+            account_id.to_bytes().as_slice(),
+            incarnation_ref.as_slice(),
+            scope_id,
+        ],
     )?;
+    let recorded: (String, Vec<u8>, Vec<u8>, String) = tx.query_row(
+        "SELECT repo_id, account_id, incarnation_ref, scope_id
+           FROM table_sync_streams WHERE stream_id = ?1",
+        [stream.to_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    anyhow::ensure!(
+        recorded.0 == repo_id
+            && recorded.1 == account_id.to_bytes()
+            && recorded.2 == incarnation_ref
+            && recorded.3 == scope_id,
+        "table-sync stream context conflicts with its existing directory row",
+    );
     Ok(())
 }
 
@@ -953,11 +1063,37 @@ pub(crate) fn stream_context(
 ) -> anyhow::Result<Option<StreamContext>> {
     Ok(tx
         .query_row(
-            "SELECT repo_id, scope_id FROM table_sync_streams WHERE stream_id = ?1",
+            "SELECT repo_id, incarnation_ref, scope_id FROM table_sync_streams WHERE stream_id = \
+             ?1",
             params![stream.to_bytes().as_slice()],
-            |row| Ok(StreamContext { repo_id: row.get(0)?, scope_id: row.get(1)? }),
+            |row| {
+                let incarnation: Vec<u8> = row.get(1)?;
+                Ok(StreamContext {
+                    repo_id: row.get(0)?,
+                    incarnation_ref: incarnation.try_into().map_err(|_| {
+                        rusqlite::Error::InvalidColumnType(
+                            1,
+                            "incarnation_ref".into(),
+                            rusqlite::types::Type::Blob,
+                        )
+                    })?,
+                    scope_id: row.get(2)?,
+                })
+            },
         )
         .optional()?)
+}
+
+pub(crate) fn stream_account_id(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+) -> anyhow::Result<AccountId> {
+    let bytes: Vec<u8> = tx.query_row(
+        "SELECT account_id FROM table_sync_streams WHERE stream_id = ?1",
+        [stream.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    Ok(AccountId::from_bytes(fixed32(bytes)?))
 }
 
 fn fixed32(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
@@ -1054,6 +1190,106 @@ mod tests {
             entry_hash: signed.entry.entry_hash,
             prev_hash: None,
         });
+    }
+
+    #[test]
+    fn retained_local_tip_blocks_second_genesis_until_the_tip_is_restored() {
+        let mut c = conn();
+        let secret = DeviceSecret::from_seed(&[1; 32]);
+        let tx = c.transaction().unwrap();
+        let first = author_row_entry(&tx, stream(), &secret, &op("r1"), 0).unwrap();
+        tx.commit().unwrap();
+
+        // Repository purge removes the accepted log but deliberately leaves the witness.
+        c.execute("DELETE FROM table_sync_entries WHERE stream_id = ?1", [stream()
+            .to_bytes()
+            .as_slice()])
+            .unwrap();
+        let tx = c.transaction().unwrap();
+        let error = author_row_entry(&tx, stream(), &secret, &op("r2"), 1).unwrap_err();
+        assert!(error.to_string().contains("continuity is not restored"));
+        tx.rollback().unwrap();
+
+        // Re-delivering the exact retained tip restores continuity. The next local entry extends it
+        // rather than emitting another genesis.
+        let tx = c.transaction().unwrap();
+        assert!(matches!(
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &first.signed_bytes,
+                &secret.public(),
+                2,
+            )
+            .unwrap(),
+            AcceptOutcome::Stored { .. }
+        ));
+        let second = author_row_entry(&tx, stream(), &secret, &op("r2"), 3).unwrap();
+        assert_eq!(second.entry.prev_hash, Some(first.entry.entry_hash));
+        assert_eq!(second.entry.lamport, 1);
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn retained_high_lamport_tip_allows_exact_and_direct_successor_restoration() {
+        let secret = DeviceSecret::from_seed(&[1; 32]);
+        let high_lamport = MAX_LAMPORT_ADVANCE * 2;
+        let tip = entry::sign_entry_from_op_bytes(
+            &secret,
+            stream(),
+            None,
+            high_lamport,
+            row_op::encode(&op("tip")),
+        );
+        let successor = entry::sign_entry_from_op_bytes(
+            &secret,
+            stream(),
+            Some(tip.entry.entry_hash),
+            high_lamport + 1,
+            row_op::encode(&op("successor")),
+        );
+
+        for candidate in [&tip, &successor] {
+            let mut c = conn();
+            c.execute(
+                "INSERT INTO table_sync_chain_tips(
+                     stream_id, device_fingerprint, lamport, entry_hash
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    stream().to_bytes().as_slice(),
+                    secret.public().fingerprint().to_bytes().as_slice(),
+                    i64::try_from(high_lamport).unwrap(),
+                    tip.entry.entry_hash.as_slice(),
+                ],
+            )
+            .unwrap();
+            let tx = c.transaction().unwrap();
+            assert!(matches!(
+                accept_row_entry(
+                    &tx,
+                    account(),
+                    stream(),
+                    &["t"],
+                    &candidate.signed_bytes,
+                    &secret.public(),
+                    0,
+                )
+                .unwrap(),
+                AcceptOutcome::Stored { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn stream_context_conflicts_fail_closed() {
+        let mut c = conn();
+        let tx = c.transaction().unwrap();
+        record_stream_context(&tx, stream(), "repo", account(), [1; 32], "demo/1").unwrap();
+        let error =
+            record_stream_context(&tx, stream(), "repo", account(), [2; 32], "demo/1").unwrap_err();
+        assert!(error.to_string().contains("conflicts"));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Domain hooks the schema layer calls during migrations and repo adoption.
 //!
 //! Migrations occasionally rebuild DERIVED data whose canonical builder lives in a domain crate
-//! above this one (dream finding ids, the papertrail FTS mirror, the account authority
-//! projection, logical-symbol graph realignment). Those builders are intentionally NOT copied
+//! above this one (dream finding ids, the papertrail FTS mirror, account-derived projections,
+//! logical-symbol graph realignment). Those builders are intentionally NOT copied
 //! into the migration ladder — a derived-data rebuild must run the shipped, current builder so
 //! the rebuilt rows match what the domain writes at runtime. The domain crates can't be
 //! dependencies of this one (they depend on it), so the callers supply the builders through this
@@ -21,7 +21,7 @@ pub struct MigrationHooks {
     /// Rebuild dream finding ids after a schema change to their derivation inputs
     /// (dream's `rederive_finding_ids`).
     pub rederive_dream_finding_ids: fn(&Connection) -> rusqlite::Result<()>,
-    /// Rebuild the account authority projection from the op-log
+    /// Rebuild account-derived projections from the op-log
     /// (oplog's `backfill_authority_projection`).
     pub backfill_authority_projection: fn(&Transaction<'_>) -> rusqlite::Result<()>,
     /// Rebuild the papertrail FTS mirror (papertrail's `rebuild_fts`).

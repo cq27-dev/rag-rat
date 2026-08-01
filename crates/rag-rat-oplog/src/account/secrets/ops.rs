@@ -31,6 +31,16 @@ const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 pub(in crate::account) mod entry_type {
     /// A per-`(stream, key_id)` fan-out of content-key wraps (§15).
     pub(in crate::account) const STREAM_KEY_WRAP: u32 = 0;
+    /// An owner-authorized transition of one repository's table-sync incarnation.
+    pub(in crate::account) const REPO_INCARNATION: u32 = 1;
+}
+
+/// One owner-authorized repository incarnation transition. The accepted account-entry hash is the
+/// new incarnation reference; the payload binds it to its repository and predecessor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoIncarnation {
+    pub repo_id: String,
+    pub predecessor_ref: Option<[u8; 32]>,
 }
 
 /// One recipient's wrap inside a [`StreamKeyWrap`]: the recipient device and the C4.1 sealed key.
@@ -56,7 +66,8 @@ pub(in crate::account) struct StreamKeyWrap {
 /// retained opaque forward-version op (never an error for an unrecognized `entry_type`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::account) enum DecodedSecretsOp {
-    Known(StreamKeyWrap),
+    StreamKeyWrap(StreamKeyWrap),
+    RepoIncarnation(RepoIncarnation),
     Unknown { entry_type: u32, bytes: Vec<u8> },
 }
 
@@ -67,17 +78,27 @@ pub(in crate::account) fn entry_type_of(_op: &StreamKeyWrap) -> u32 {
     entry_type::STREAM_KEY_WRAP
 }
 
+pub(in crate::account) fn repo_incarnation_entry_type() -> u32 {
+    entry_type::REPO_INCARNATION
+}
+
 /// The ingest-time structural-validation twin (the secrets mirror of the control-plaintext arm of
-/// `validate_storable_header_payload`): a KNOWN secrets tag is fully validated (arity,
-/// sorted-unique recipients, `WRAP_RECIPIENTS_MAX`, each `wrapped_key` decodes), an unknown tag is
-/// checked only as one canonical CBOR array (retained opaque). The caller gates this on `log_id ==
-/// SECRETS_LOG && crypto_suite == 0 && op_version == 1`, so it auto-covers the pre-verify promotion
-/// path.
+/// `validate_storable_header_payload`): `StreamKeyWrap` is fully validated (arity, sorted-unique
+/// recipients, `WRAP_RECIPIENTS_MAX`, each `wrapped_key` decodes), while unknown tags and
+/// `RepoIncarnation` are checked only as one canonical CBOR array. Incarnation keeps the old opaque
+/// contract because clients that predate tag 1 already admit and chain any such array; strict
+/// decoding belongs to refold so learning the tag cannot wedge their descendants. The caller gates
+/// this on `log_id == SECRETS_LOG && crypto_suite == 0 && op_version == 1`, so it auto-covers the
+/// pre-verify promotion path.
 pub(in crate::account) fn validate_storable_secrets_payload(
     entry_type: u32,
     payload: &[u8],
 ) -> Result<(), CborError> {
-    decode(entry_type, payload).map(|_| ())
+    if entry_type == entry_type::STREAM_KEY_WRAP {
+        decode(entry_type, payload).map(|_| ())
+    } else {
+        validate_opaque_array(payload)
+    }
 }
 
 /// Encode a secrets op to its canonical-CBOR payload (§15). Sorted wraps are emitted in
@@ -85,6 +106,21 @@ pub(in crate::account) fn validate_storable_secrets_payload(
 /// bytes`).
 pub(in crate::account) fn encode(op: &StreamKeyWrap) -> Result<Vec<u8>, CborError> {
     Ok(encode_canonical(&canonicalize(op)?))
+}
+
+pub fn encode_repo_incarnation(op: &RepoIncarnation) -> Result<Vec<u8>, CborError> {
+    if op.repo_id.is_empty() {
+        return Err(CborError::message("repo_id must not be empty"));
+    }
+    let mut buf = Vec::with_capacity(80);
+    let mut enc = Encoder::new(&mut buf);
+    enc.array(2).expect(INFALLIBLE);
+    enc.str(&op.repo_id).expect(INFALLIBLE);
+    match op.predecessor_ref {
+        Some(predecessor) => enc.bytes(&predecessor).expect(INFALLIBLE),
+        None => enc.null().expect(INFALLIBLE),
+    };
+    Ok(buf)
 }
 
 /// Validate + canonicalize a secrets op so its encoding ALWAYS round-trips through [`decode`] — the
@@ -117,8 +153,25 @@ pub(in crate::account) fn decode(
     entry_type: u32,
     bytes: &[u8],
 ) -> Result<DecodedSecretsOp, CborError> {
-    let op = match entry_type {
-        entry_type::STREAM_KEY_WRAP => decode_stream_key_wrap(bytes)?,
+    match entry_type {
+        entry_type::STREAM_KEY_WRAP => {
+            let op = decode_stream_key_wrap(bytes)?;
+            if encode(&op)? != bytes {
+                return Err(CborError::message(
+                    "secrets op payload is not canonical (re-encode differs)",
+                ));
+            }
+            Ok(DecodedSecretsOp::StreamKeyWrap(op))
+        },
+        entry_type::REPO_INCARNATION => {
+            let op = decode_repo_incarnation(bytes)?;
+            if encode_repo_incarnation(&op)? != bytes {
+                return Err(CborError::message(
+                    "secrets op payload is not canonical (re-encode differs)",
+                ));
+            }
+            Ok(DecodedSecretsOp::RepoIncarnation(op))
+        },
         other => {
             // A forward-version secrets op is RETAINED opaque (we can't re-encode it), but it must
             // STILL be exactly one canonical CBOR array — otherwise a future binary that learns
@@ -127,19 +180,16 @@ pub(in crate::account) fn decode(
             // a signed log. The envelope validates the payload only as an opaque bstr,
             // so this is the ONLY place the interior is checked. (Mirrors the
             // control-op decoder.)
-            cbor::require_canonical_cbor(bytes)?;
-            cbor::expect_definite_len(&mut Decoder::new(bytes))?;
-            return Ok(DecodedSecretsOp::Unknown { entry_type: other, bytes: bytes.to_vec() });
+            validate_opaque_array(bytes)?;
+            Ok(DecodedSecretsOp::Unknown { entry_type: other, bytes: bytes.to_vec() })
         },
-    };
-    // Canonicity guarantee for a KNOWN op: the decoded value must re-encode to the exact wire (this
-    // rejects non-minimal ints, unsorted wraps, trailing bytes, a non-canonical inner wrap, etc. in
-    // one check). A decoded op already satisfies every invariant `canonicalize` checks, so the
-    // re-encode cannot fail.
-    if encode(&op)? != bytes {
-        return Err(CborError::message("secrets op payload is not canonical (re-encode differs)"));
     }
-    Ok(DecodedSecretsOp::Known(op))
+}
+
+fn validate_opaque_array(bytes: &[u8]) -> Result<(), CborError> {
+    cbor::require_canonical_cbor(bytes)?;
+    cbor::expect_definite_len(&mut Decoder::new(bytes))?;
+    Ok(())
 }
 
 fn decode_stream_key_wrap(bytes: &[u8]) -> Result<StreamKeyWrap, CborError> {
@@ -150,6 +200,22 @@ fn decode_stream_key_wrap(bytes: &[u8]) -> Result<StreamKeyWrap, CborError> {
     let key_epoch = d.u64()?;
     let wraps = decode_wraps(&mut d)?;
     Ok(StreamKeyWrap { stream_id, key_id, key_epoch, wraps })
+}
+
+fn decode_repo_incarnation(bytes: &[u8]) -> Result<RepoIncarnation, CborError> {
+    let mut d = Decoder::new(bytes);
+    cbor::expect_array(&mut d, 2)?;
+    let repo_id = d.str()?.to_string();
+    if repo_id.is_empty() {
+        return Err(CborError::message("repo_id must not be empty"));
+    }
+    let predecessor_ref = if d.datatype()? == minicbor::data::Type::Null {
+        d.null()?;
+        None
+    } else {
+        Some(cbor::fixed_bytes::<32>(d.bytes()?, "predecessor_ref")?)
+    };
+    Ok(RepoIncarnation { repo_id, predecessor_ref })
 }
 
 /// Validate + canonicalize the wrap fan-out (mirrors the control cut arrays): sort by recipient
@@ -248,7 +314,8 @@ mod tests {
         // Author out of order; canonical encode sorts by recipient, and decode round-trips.
         let authored = op(vec![wrap_entry(0x30), wrap_entry(0x10), wrap_entry(0x20)]);
         let bytes = encode(&authored).unwrap();
-        let DecodedSecretsOp::Known(decoded) = decode(entry_type::STREAM_KEY_WRAP, &bytes).unwrap()
+        let DecodedSecretsOp::StreamKeyWrap(decoded) =
+            decode(entry_type::STREAM_KEY_WRAP, &bytes).unwrap()
         else {
             panic!("known op");
         };
@@ -259,6 +326,57 @@ mod tests {
         assert_eq!(decoded.key_id, authored.key_id);
         assert_eq!(decoded.key_epoch, authored.key_epoch);
         assert_eq!(entry_type_of(&decoded), entry_type::STREAM_KEY_WRAP);
+    }
+
+    #[test]
+    fn repo_incarnation_round_trips_and_has_a_golden_wire() {
+        let op = RepoIncarnation { repo_id: "repo-a".into(), predecessor_ref: Some([0x11; 32]) };
+        let bytes = encode_repo_incarnation(&op).unwrap();
+        let mut golden = vec![0x82, 0x66, b'r', b'e', b'p', b'o', b'-', b'a', 0x58, 0x20];
+        golden.extend([0x11; 32]);
+        assert_eq!(bytes, golden);
+        assert_eq!(
+            decode(entry_type::REPO_INCARNATION, &bytes).unwrap(),
+            DecodedSecretsOp::RepoIncarnation(op)
+        );
+        let genesis = RepoIncarnation { repo_id: "repo-a".into(), predecessor_ref: None };
+        assert_eq!(
+            decode(entry_type::REPO_INCARNATION, &encode_repo_incarnation(&genesis).unwrap())
+                .unwrap(),
+            DecodedSecretsOp::RepoIncarnation(genesis)
+        );
+    }
+
+    #[test]
+    fn malformed_repo_incarnations_are_rejected() {
+        assert!(
+            encode_repo_incarnation(&RepoIncarnation {
+                repo_id: String::new(),
+                predecessor_ref: None,
+            })
+            .is_err()
+        );
+        for bytes in
+            [vec![0x81, 0x61, b'r'], vec![0x82, 0x60, 0xf6], vec![0x82, 0x61, b'r', 0x41, 0]]
+        {
+            assert!(decode(entry_type::REPO_INCARNATION, &bytes).is_err(), "{bytes:02x?}");
+        }
+    }
+
+    #[test]
+    fn repo_incarnation_admission_preserves_the_old_opaque_array_contract() {
+        let malformed_but_canonical = [0x80];
+        assert!(decode(entry_type::REPO_INCARNATION, &malformed_but_canonical).is_err());
+        validate_storable_secrets_payload(entry_type::REPO_INCARNATION, &malformed_but_canonical)
+            .unwrap();
+        assert!(
+            validate_storable_secrets_payload(
+                entry_type::STREAM_KEY_WRAP,
+                &malformed_but_canonical
+            )
+            .is_err(),
+            "StreamKeyWrap admission remains strict",
+        );
     }
 
     #[test]

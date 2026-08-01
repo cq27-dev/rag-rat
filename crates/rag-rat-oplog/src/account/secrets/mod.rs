@@ -25,10 +25,12 @@ mod storage;
 // refold pass wired into `refold_in_tx`.
 pub(in crate::account) use author::single_recipient_wrap_envelope_bytes;
 pub use author::{
-    CatchUpReport, RotationOutcome, catch_up_stream_keys_for_device_in_tx,
-    enroll_stream_keys_for_device_in_tx, ensure_stream_key_current_in_tx,
-    mint_and_author_stream_key_wrap_in_tx, rotate_stream_key_in_tx,
+    CatchUpReport, RotationOutcome, advance_repo_incarnation_in_tx,
+    catch_up_stream_keys_for_device_in_tx, enroll_stream_keys_for_device_in_tx,
+    ensure_stream_key_current_in_tx, mint_and_author_stream_key_wrap_in_tx,
+    rotate_stream_key_in_tx,
 };
+pub use ops::RepoIncarnation;
 pub(in crate::account) use ops::validate_storable_secrets_payload;
 // The C4.3b READ side: derive-on-read sealing-key selection + the key_id adoption cross-check.
 // `current_sealing_key` is what C5's seal path calls; `select_current_sealing_wrap` is also
@@ -43,3 +45,4 @@ pub(in crate::account) use sealing::{
     accepted_stream_key_wrap_exists_strict, recoverable_live_stream_key_target_count,
 };
 pub(in crate::account) use storage::refold_secrets_log;
+pub use storage::{RepoIncarnationState, repo_incarnation_state};

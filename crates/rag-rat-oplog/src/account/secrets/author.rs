@@ -48,7 +48,8 @@ use super::super::fold::{SECRETS_LOG, SUPPORTED_OP_VERSION};
 use super::super::keywrap::{self, ContentKey, SealedKeyWrap, WrapContext};
 use super::super::storage::{self, CandidateInsert};
 use super::super::{AccountId, authoring, limits};
-use super::ops::{self, StreamKeyWrap, WrapEntry};
+use super::ops::{self, RepoIncarnation, StreamKeyWrap, WrapEntry};
+use super::storage::RepoIncarnationState;
 use crate::identity::LocalDevice;
 use crate::local_device;
 use crate::op::DeviceFingerprint;
@@ -59,6 +60,76 @@ type EntryHash = [u8; 32];
 /// The key epoch a stream's content key first mints at. C4.4 lazy rotation bumps it on device
 /// removal; C4.3a only ever mints the initial epoch.
 const INITIAL_KEY_EPOCH: u64 = 0;
+
+/// Explicitly advance `repo_id` to a fresh owner-authorized incarnation. The accepted signed-entry
+/// hash is the new incarnation reference. Local repository removal never calls this seam.
+pub fn advance_repo_incarnation_in_tx(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    now_ms: i64,
+) -> anyhow::Result<EntryHash> {
+    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?
+        .context("cannot author a repository incarnation before the local account is minted")?;
+    let predecessor_ref = match super::storage::repo_incarnation_state(tx, account_id, repo_id)? {
+        RepoIncarnationState::Absent => None,
+        RepoIncarnationState::Current(reference) => Some(reference),
+        RepoIncarnationState::Contested => anyhow::bail!(
+            "repository incarnation authority is contested; refusing to choose a fork locally"
+        ),
+    };
+    let device = local_device(tx, now_ms)?;
+    let fingerprint = device.fingerprint();
+    let authority_ref =
+        storage::effective_owner_incarnation_for_device(tx, account_id, fingerprint)?.context(
+            "the local device holds no live owner incarnation; cannot advance the repository",
+        )?;
+    let (seq, prev_hash) =
+        match authoring::account_chain_tail(tx, account_id, fingerprint, SECRETS_LOG)? {
+            Some((tail_seq, tail_hash)) =>
+                (tail_seq.checked_add(1).context("secrets chain is at u64::MAX")?, Some(tail_hash)),
+            None => (0, None),
+        };
+    let op = RepoIncarnation { repo_id: repo_id.to_string(), predecessor_ref };
+    let payload = ops::encode_repo_incarnation(&op)
+        .map_err(|error| anyhow::anyhow!("encoding repository incarnation failed: {error}"))?;
+    let header = AccountEntryHeader {
+        account_id,
+        log_id: SECRETS_LOG,
+        device_fingerprint: fingerprint,
+        seq,
+        prev_hash,
+        parent_ref: Some(genesis_hash),
+        entry_type: ops::repo_incarnation_entry_type(),
+        op_version: SUPPORTED_OP_VERSION,
+        crypto_suite: 0,
+        auth_len: storage::account_effective_count(tx, account_id)?,
+        key_id: None,
+        authority_ref: Some(authority_ref),
+    };
+    let signed = sign_account_entry(device.secret(), &header, &payload)?;
+    let verified = VerifiedAccountEntry {
+        header: signed.header,
+        payload: signed.payload,
+        entry_hash: signed.entry_hash,
+    };
+    match storage::insert_candidate(tx, &verified, &signed.signed_bytes, now_ms)? {
+        CandidateInsert::Inserted | CandidateInsert::AlreadyPresent => {},
+        CandidateInsert::AtCapacity(scope) => {
+            anyhow::bail!("account candidate capacity reached at {scope:?}")
+        },
+    }
+    let statuses = storage::refold_in_tx(tx, account_id, now_ms)?;
+    anyhow::ensure!(
+        statuses.get(&verified.entry_hash).map(String::as_str) == Some("accepted"),
+        "authored repository incarnation did not fold accepted",
+    );
+    anyhow::ensure!(
+        super::storage::repo_incarnation_state(tx, account_id, repo_id)?
+            == RepoIncarnationState::Current(verified.entry_hash),
+        "authored repository incarnation did not become the unique current reference",
+    );
+    Ok(verified.entry_hash)
+}
 
 /// Mint a fresh content key for `stream_id` and author a `StreamKeyWrap` sealing it to every
 /// roster-effective device, WITHIN the caller's transaction: verify the wrap folds `accepted` and
@@ -653,7 +724,7 @@ mod tests {
             )
             .unwrap();
         let signed = crate::account::envelope::decode_account_signed(&signed_bytes).unwrap();
-        let DecodedSecretsOp::Known(wrap) =
+        let DecodedSecretsOp::StreamKeyWrap(wrap) =
             decode(secrets_entry_type::STREAM_KEY_WRAP, &signed.payload).unwrap()
         else {
             panic!("stored entry is a known StreamKeyWrap");
@@ -737,7 +808,7 @@ mod tests {
             .unwrap()
             .filter_map(|row| {
                 let signed = crate::account::envelope::decode_account_signed(&row.unwrap()).ok()?;
-                let DecodedSecretsOp::Known(wrap) =
+                let DecodedSecretsOp::StreamKeyWrap(wrap) =
                     decode(secrets_entry_type::STREAM_KEY_WRAP, &signed.payload).ok()?
                 else {
                     return None;
@@ -812,6 +883,43 @@ mod tests {
         assert!(header.authority_ref.is_some(), "cites the founder owner incarnation");
         assert_eq!(pending_content_refolds(&conn), 0, "local key mint finalizes immediately");
         let _ = account;
+    }
+
+    #[test]
+    fn explicit_repository_advance_chains_from_the_current_accepted_reference() {
+        let conn = db();
+        let account = bootstrap::local_account(&conn, NOW).unwrap();
+        let first = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let reference = advance_repo_incarnation_in_tx(&tx, "repo-x", NOW).unwrap();
+            tx.commit().unwrap();
+            reference
+        };
+        let second = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let reference = advance_repo_incarnation_in_tx(&tx, "repo-x", NOW + 1).unwrap();
+            tx.commit().unwrap();
+            reference
+        };
+        assert_ne!(first, second);
+        assert_eq!(
+            super::super::storage::repo_incarnation_state(&conn, account, "repo-x").unwrap(),
+            RepoIncarnationState::Current(second),
+        );
+        let signed_bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT signed_bytes FROM account_entries WHERE entry_hash = ?1",
+                [second.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let signed = crate::account::envelope::decode_account_signed(&signed_bytes).unwrap();
+        let DecodedSecretsOp::RepoIncarnation(op) =
+            ops::decode(signed.header.entry_type, &signed.payload).unwrap()
+        else {
+            panic!("known repository incarnation")
+        };
+        assert_eq!(op.predecessor_ref, Some(first));
     }
 
     #[test]

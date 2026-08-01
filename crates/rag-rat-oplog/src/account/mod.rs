@@ -107,12 +107,13 @@ pub use ops::{DeviceCut, DeviceRole, GrantRole};
 // side (derive-on-read sealing-key selection + the key_id adoption cross-check), and the C4.4
 // lazy rotation-on-removal entry points (#607).
 pub use secrets::{
-    CatchUpReport, ContentKeyring, LiveKeyEpoch, LiveKeyTargets, RotationOutcome,
-    SealingKeyOutcome, SelectedWrap, catch_up_stream_keys_for_device_in_tx, current_sealing_key,
+    CatchUpReport, ContentKeyring, LiveKeyEpoch, LiveKeyTargets, RepoIncarnation,
+    RepoIncarnationState, RotationOutcome, SealingKeyOutcome, SelectedWrap,
+    advance_repo_incarnation_in_tx, catch_up_stream_keys_for_device_in_tx, current_sealing_key,
     enroll_stream_keys_for_device_in_tx, ensure_stream_key_current_in_tx,
     historical_content_keyring, live_stream_key_targets_for_device,
-    mint_and_author_stream_key_wrap_in_tx, rotate_stream_key_in_tx, select_current_sealing_wrap,
-    stream_key_rotation_needed,
+    mint_and_author_stream_key_wrap_in_tx, repo_incarnation_state, rotate_stream_key_in_tx,
+    select_current_sealing_wrap, stream_key_rotation_needed,
 };
 // The C6 snapshot-authoring seam (#609). No caller fires it yet, and that is deliberate rather
 // than an oversight: a snapshot is only worth minting once something reads one. #406 owns both

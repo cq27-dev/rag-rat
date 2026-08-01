@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::super::candidate::{self as account_candidate, Ancestry, HeaderView, UnknownCause};
 use super::super::cut::Cut;
@@ -34,6 +34,35 @@ use super::ops::{self, DecodedSecretsOp};
 
 type EntryHash = [u8; 32];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoIncarnationState {
+    Absent,
+    Current(EntryHash),
+    Contested,
+}
+
+pub fn repo_incarnation_state(
+    conn: &rusqlite::Connection,
+    account_id: AccountId,
+    repo_id: &str,
+) -> anyhow::Result<RepoIncarnationState> {
+    let row: Option<(String, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT state, incarnation_ref FROM account_repo_incarnation_current
+              WHERE account_id = ?1 AND repository_id = ?2",
+            params![account_id.to_bytes().as_slice(), repo_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Ok(RepoIncarnationState::Absent),
+        Some((state, None)) if state == "contested" => Ok(RepoIncarnationState::Contested),
+        Some((state, Some(reference))) if state == "current" =>
+            Ok(RepoIncarnationState::Current(fixed::<32>(&reference)?)),
+        Some((state, _)) => anyhow::bail!("malformed repository incarnation state `{state}`"),
+    }
+}
+
 /// One log-1 candidate resolved against the current fold. A non-evaluable entry carries no facts —
 /// it is slot-eligible but its verdict is fixed at `retained_unfolded`.
 struct ResolvedSecretsEntry {
@@ -41,6 +70,7 @@ struct ResolvedSecretsEntry {
     header: AccountEntryHeader,
     dense_predecessor_reachable: bool,
     facts: Option<WrapFacts>,
+    incarnation: Option<ops::RepoIncarnation>,
 }
 
 impl ResolvedSecretsEntry {
@@ -48,13 +78,20 @@ impl ResolvedSecretsEntry {
     fn is_evaluable(&self) -> bool {
         self.facts.is_some()
     }
+
+    /// Incarnation artifacts must select the same secrets branch as an old client that sees their
+    /// tag as unknown. They therefore remain slot-eligible and never break a later accepted prefix,
+    /// even when their own authority verdict is not accepted.
+    fn is_prefix_transparent(&self) -> bool {
+        self.incarnation.is_some() || !self.is_evaluable()
+    }
 }
 
 /// The authority facts for one evaluable `StreamKeyWrap`, all read from ONE fold snapshot.
 struct WrapFacts {
     authority_ref: Option<EntryHash>,
     owner_authority: AuthorityQuery<OwnerChainAuthority>,
-    ownership: AuthorityQuery<EntryHash>,
+    ownership: Option<AuthorityQuery<EntryHash>>,
     freshness: CitedFreshness,
     /// The owning account's contested state (§12) — identical for every entry this refold.
     contested: bool,
@@ -94,7 +131,8 @@ pub(in crate::account) fn refold_secrets_log(
     // extending the chain for its descendants.
     let mut eligible = HashSet::new();
     for r in &resolved {
-        if !r.is_evaluable() || verdict_for(r, &view, false, Phase::Eligibility)?.is_none() {
+        if r.is_prefix_transparent() || verdict_for(r, &view, false, Phase::Eligibility)?.is_none()
+        {
             eligible.insert(r.entry_hash);
         }
     }
@@ -149,6 +187,7 @@ pub(in crate::account) fn refold_secrets_log(
         };
         write_secrets_verdict(tx, &hash, verdict, statuses)?;
     }
+    rewrite_repo_incarnation_projection(tx, account_id, &resolved, &accepted)?;
     Ok(())
 }
 
@@ -273,12 +312,14 @@ fn resolve_secrets_entries(
     let mut caches = Caches::default();
     let mut resolved = Vec::with_capacity(headers.len());
     for (entry_hash, header, payload) in headers {
-        let facts = wrap_facts(tx, account_id, header, payload, contested, &mut caches)?;
+        let (facts, incarnation) =
+            secrets_facts(tx, account_id, header, payload, contested, &mut caches)?;
         resolved.push(ResolvedSecretsEntry {
             entry_hash: *entry_hash,
             header: header.clone(),
             dense_predecessor_reachable: reachable.contains(entry_hash),
             facts,
+            incarnation,
         });
     }
     Ok(resolved)
@@ -295,22 +336,23 @@ struct Caches {
 
 /// Resolve one entry to its `WrapFacts` — `None` when the entry is NOT an evaluable `StreamKeyWrap`
 /// (unknown tag, future `op_version`, or sealed `crypto_suite != 0`), which makes it slot-eligible.
-fn wrap_facts(
+fn secrets_facts(
     tx: &Transaction<'_>,
     account_id: AccountId,
     header: &AccountEntryHeader,
     payload: &[u8],
     contested: bool,
     caches: &mut Caches,
-) -> anyhow::Result<Option<WrapFacts>> {
+) -> anyhow::Result<(Option<WrapFacts>, Option<ops::RepoIncarnation>)> {
     // Evaluable ⇔ a KNOWN secrets op at the supported version with a plaintext payload — mirrors
     // the control fold's `foldable` gate. Everything else is slot-eligible (B-2).
     if header.op_version != SUPPORTED_OP_VERSION || header.crypto_suite != 0 {
-        return Ok(None);
+        return Ok((None, None));
     }
-    let stream_id = match ops::decode(header.entry_type, payload) {
-        Ok(DecodedSecretsOp::Known(wrap)) => wrap.stream_id,
-        Ok(DecodedSecretsOp::Unknown { .. }) | Err(_) => return Ok(None),
+    let (stream_id, incarnation) = match ops::decode(header.entry_type, payload) {
+        Ok(DecodedSecretsOp::StreamKeyWrap(wrap)) => (Some(wrap.stream_id), None),
+        Ok(DecodedSecretsOp::RepoIncarnation(op)) => (None, Some(op)),
+        Ok(DecodedSecretsOp::Unknown { .. }) | Err(_) => return Ok((None, None)),
     };
     let owner_authority = match header.authority_ref {
         Some(owner_id) => {
@@ -333,13 +375,18 @@ fn wrap_facts(
         // unused, so a placeholder Unknown is correct.
         None => AuthorityQuery::Unknown,
     };
-    let ownership = match caches.ownership.get(&stream_id) {
-        Some(cached) => *cached,
-        None => {
-            let resolved = storage::stream_owner_effective_in_snapshot(tx, account_id, stream_id)?;
-            caches.ownership.insert(stream_id, resolved);
-            resolved
-        },
+    let ownership = if let Some(stream_id) = stream_id {
+        Some(match caches.ownership.get(&stream_id) {
+            Some(cached) => *cached,
+            None => {
+                let resolved =
+                    storage::stream_owner_effective_in_snapshot(tx, account_id, stream_id)?;
+                caches.ownership.insert(stream_id, resolved);
+                resolved
+            },
+        })
+    } else {
+        None
     };
     let state = match caches.freshness.get(&header.auth_len) {
         Some(cached) => *cached,
@@ -349,13 +396,16 @@ fn wrap_facts(
             state
         },
     };
-    Ok(Some(WrapFacts {
-        authority_ref: header.authority_ref,
-        owner_authority,
-        ownership,
-        freshness: CitedFreshness { account_id, asserted_auth_len: header.auth_len, state },
-        contested,
-    }))
+    Ok((
+        Some(WrapFacts {
+            authority_ref: header.authority_ref,
+            owner_authority,
+            ownership,
+            freshness: CitedFreshness { account_id, asserted_auth_len: header.auth_len, state },
+            contested,
+        }),
+        incarnation,
+    ))
 }
 
 /// The register watermarks pinning a branch: BOTH secrets boundaries of each wrap's cited owner
@@ -403,25 +453,110 @@ fn prefix_closed_accepted(
             chains.entry(coordinate).or_default().push((
                 r.header.seq,
                 r.entry_hash,
-                r.is_evaluable(),
+                r.is_prefix_transparent(),
             ));
         }
     }
     let mut accepted = HashSet::new();
     for mut winners in chains.into_values() {
         winners.sort_by_key(|(seq, _, _)| *seq);
-        for (_, hash, evaluable) in winners {
-            if !evaluable {
-                continue; // a slot-eligible winner is transparent — never accepted, never a break
-            }
+        for (_, hash, transparent) in winners {
             if raw.get(&hash) == Some(&SecretsAcceptance::Accepted) {
                 accepted.insert(hash);
-            } else {
+            } else if !transparent {
                 break; // prefix broken: every later winner on this chain is not accepted
             }
         }
     }
     accepted
+}
+
+/// Rebuild the accepted repository-incarnation graph for one account. A current reference exists
+/// only for one complete linear chain. Multiple roots, multiple children, or a predecessor outside
+/// the accepted set is an explicit contested state; no hash-order tie-break may mint authority.
+fn rewrite_repo_incarnation_projection(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    resolved: &[ResolvedSecretsEntry],
+    accepted: &HashSet<EntryHash>,
+) -> anyhow::Result<()> {
+    let account = account_id.to_bytes();
+    tx.execute(
+        "DELETE FROM account_repo_incarnations WHERE account_id = ?1",
+        [account.as_slice()],
+    )?;
+    tx.execute("DELETE FROM account_repo_incarnation_current WHERE account_id = ?1", [
+        account.as_slice()
+    ])?;
+
+    let mut by_repo: HashMap<String, Vec<(EntryHash, Option<EntryHash>)>> = HashMap::new();
+    for entry in resolved {
+        let Some(op) = &entry.incarnation else { continue };
+        if !accepted.contains(&entry.entry_hash) {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO account_repo_incarnations(
+                 account_id, repository_id, incarnation_ref, predecessor_ref
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                account.as_slice(),
+                &op.repo_id,
+                entry.entry_hash.as_slice(),
+                op.predecessor_ref.as_ref().map(<[u8; 32]>::as_slice),
+            ],
+        )?;
+        by_repo.entry(op.repo_id.clone()).or_default().push((entry.entry_hash, op.predecessor_ref));
+    }
+
+    for (repo_id, nodes) in by_repo {
+        let held: HashSet<EntryHash> = nodes.iter().map(|(hash, _)| *hash).collect();
+        let roots: Vec<EntryHash> = nodes
+            .iter()
+            .filter_map(|(hash, predecessor)| predecessor.is_none().then_some(*hash))
+            .collect();
+        let mut children: HashMap<EntryHash, Vec<EntryHash>> = HashMap::new();
+        let mut contested = roots.len() != 1;
+        for (hash, predecessor) in &nodes {
+            if let Some(predecessor) = predecessor {
+                if !held.contains(predecessor) {
+                    contested = true;
+                }
+                children.entry(*predecessor).or_default().push(*hash);
+            }
+        }
+        if children.values().any(|successors| successors.len() != 1) {
+            contested = true;
+        }
+        let mut current = roots.first().copied();
+        let mut visited = 0usize;
+        while let Some(hash) = current {
+            visited += 1;
+            current = children.get(&hash).and_then(|successors| successors.first()).copied();
+            if current.is_none() {
+                current = Some(hash);
+                break;
+            }
+            if visited > nodes.len() {
+                contested = true;
+                break;
+            }
+        }
+        contested |= visited != nodes.len();
+        let (state, current) = if contested { ("contested", None) } else { ("current", current) };
+        tx.execute(
+            "INSERT INTO account_repo_incarnation_current(
+                 account_id, repository_id, state, incarnation_ref
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                account.as_slice(),
+                repo_id,
+                state,
+                current.as_ref().map(<[u8; 32]>::as_slice),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Write one wrap's verdict: the `(status, detail)` pair (§16.3), `accepted = 1` only for
@@ -625,6 +760,31 @@ mod tests {
             prev,
             authority_ref,
             secrets_entry_type::STREAM_KEY_WRAP,
+            &payload,
+        )
+    }
+
+    fn incarnation_entry(
+        account: AccountId,
+        signer: &Dev,
+        seq: u64,
+        prev: Option<[u8; 32]>,
+        authority_ref: Option<[u8; 32]>,
+        repo_id: &str,
+        predecessor_ref: Option<[u8; 32]>,
+    ) -> (Vec<u8>, [u8; 32]) {
+        let payload = super::super::ops::encode_repo_incarnation(&ops::RepoIncarnation {
+            repo_id: repo_id.to_string(),
+            predecessor_ref,
+        })
+        .unwrap();
+        secrets_entry(
+            account,
+            signer,
+            seq,
+            prev,
+            authority_ref,
+            secrets_entry_type::REPO_INCARNATION,
             &payload,
         )
     }
@@ -840,6 +1000,326 @@ mod tests {
             ("accepted".to_string(), None),
             "the wrap chained PAST the unknown tag still accepts (slot-eligible is transparent)",
         );
+    }
+
+    #[test]
+    fn a_known_incarnation_preserves_unknown_tag_branch_and_prefix_parity() {
+        let conn = db();
+        let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
+        let wrap0 = wrap_op(account, stream_id, &founder, 0x20);
+        let (w0_bytes, w0) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap0);
+        ingest(&conn, &w0_bytes);
+        let (inc_bytes, incarnation) =
+            incarnation_entry(account, &founder, 1, Some(w0), Some(genesis_hash), "repo-a", None);
+        // The exact payload is canonical under an unknown tag on an old client and known under the
+        // new tag; either way it occupies the same slot and is prefix-transparent.
+        let signed = crate::account::envelope::decode_account_signed(&inc_bytes).unwrap();
+        assert!(matches!(
+            ops::decode(99, &signed.payload).unwrap(),
+            DecodedSecretsOp::Unknown { .. }
+        ));
+        ingest(&conn, &inc_bytes);
+        let wrap2 = wrap_op(account, stream_id, &founder, 0x21);
+        let (w2_bytes, w2) =
+            wrap_entry(account, &founder, 2, Some(incarnation), Some(genesis_hash), &wrap2);
+        ingest(&conn, &w2_bytes);
+        assert_eq!(status(&conn, &incarnation), ("accepted".into(), None));
+        assert_eq!(status(&conn, &w2), ("accepted".into(), None));
+        assert_eq!(
+            repo_incarnation_state(&conn, account, "repo-a").unwrap(),
+            RepoIncarnationState::Current(incarnation)
+        );
+    }
+
+    #[test]
+    fn malformed_canonical_incarnation_is_transparent_to_a_valid_descendant() {
+        let conn = db();
+        let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
+        let wrap0 = wrap_op(account, stream_id, &founder, 0x20);
+        let (w0_bytes, w0) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap0);
+        ingest(&conn, &w0_bytes);
+
+        // Tag 1 was unknown to old clients, which admit any canonical definite array. This is not a
+        // valid RepoIncarnation, but learning tag 1 must not reject a slot the old client chained.
+        let malformed_payload = [0x80];
+        let (malformed_bytes, malformed) = secrets_entry(
+            account,
+            &founder,
+            1,
+            Some(w0),
+            Some(genesis_hash),
+            secrets_entry_type::REPO_INCARNATION,
+            &malformed_payload,
+        );
+        assert!(matches!(
+            ops::decode(99, &malformed_payload).unwrap(),
+            DecodedSecretsOp::Unknown { .. }
+        ));
+        assert!(ops::decode(secrets_entry_type::REPO_INCARNATION, &malformed_payload).is_err());
+        ingest(&conn, &malformed_bytes);
+
+        let wrap2 = wrap_op(account, stream_id, &founder, 0x21);
+        let (w2_bytes, w2) =
+            wrap_entry(account, &founder, 2, Some(malformed), Some(genesis_hash), &wrap2);
+        ingest(&conn, &w2_bytes);
+        assert_eq!(status(&conn, &malformed), ("retained_unfolded".into(), None));
+        assert_eq!(status(&conn, &w2), ("accepted".into(), None));
+    }
+
+    #[test]
+    fn non_owner_incarnation_is_rejected_and_never_projects() {
+        let conn = db();
+        let (account, founder, founder_id, _stream_id) = account_with_owned_stream(&conn);
+        let member = Dev::new(9);
+        let add = AccountOp::DeviceAdd {
+            device_fingerprint: member.fp,
+            ed25519_pubkey: member.ed,
+            x25519_pubkey: member.x,
+            role: DeviceRole::Member,
+            label: None,
+        };
+        let control_tail: Vec<u8> = conn
+            .query_row(
+                "SELECT entry_hash FROM account_entries
+                  WHERE account_id = ?1 AND log_id = 0 AND device_fingerprint = ?2
+                  ORDER BY seq DESC LIMIT 1",
+                params![account.to_bytes().as_slice(), founder.fp.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (add_bytes, _) = control_op(
+            account,
+            &founder,
+            2,
+            Some(fixed::<32>(&control_tail).unwrap()),
+            Some(founder_id),
+            &add,
+        );
+        ingest(&conn, &add_bytes);
+        let (bytes, hash) =
+            incarnation_entry(account, &member, 0, None, Some(founder_id), "repo-a", None);
+        ingest(&conn, &bytes);
+        assert_eq!(status(&conn, &hash).0, "rejected");
+        assert_eq!(
+            repo_incarnation_state(&conn, account, "repo-a").unwrap(),
+            RepoIncarnationState::Absent
+        );
+    }
+
+    #[test]
+    fn concurrent_owner_advances_make_the_repository_contested() {
+        let conn = db();
+        let (account, founder, owner_b, owner_b_id, _stream, _) = account_with_second_owner(&conn);
+        let founder_id = owner_id_of_founder(&conn, account);
+        let (root_bytes, root) =
+            incarnation_entry(account, &founder, 0, None, Some(founder_id), "repo-a", None);
+        ingest(&conn, &root_bytes);
+        let (a_bytes, _) = incarnation_entry(
+            account,
+            &founder,
+            1,
+            Some(root),
+            Some(founder_id),
+            "repo-a",
+            Some(root),
+        );
+        let (b_bytes, _) =
+            incarnation_entry(account, &owner_b, 0, None, Some(owner_b_id), "repo-a", Some(root));
+        ingest(&conn, &a_bytes);
+        ingest(&conn, &b_bytes);
+        assert_eq!(
+            repo_incarnation_state(&conn, account, "repo-a").unwrap(),
+            RepoIncarnationState::Contested
+        );
+    }
+
+    #[test]
+    fn v099_projects_a_previously_opaque_incarnation_entry() {
+        let conn = db();
+        let (account, founder, founder_id, _stream_id) = account_with_owned_stream(&conn);
+        let (bytes, incarnation) =
+            incarnation_entry(account, &founder, 0, None, Some(founder_id), "repo-a", None);
+        ingest(&conn, &bytes);
+
+        // Recreate the pre-V099 state: the signed tag-1 candidate exists, but an older binary only
+        // knew it as a retained opaque secrets slot and no incarnation projection tables existed.
+        conn.execute("DELETE FROM schema_version WHERE id = '099_table_sync_repo_incarnations'", [
+        ])
+        .unwrap();
+        conn.execute_batch(
+            "DROP TABLE account_repo_incarnation_current;
+             DROP TABLE account_repo_incarnations;",
+        )
+        .unwrap();
+        conn.execute("UPDATE account_entries SET accepted = 0 WHERE entry_hash = ?1", [
+            incarnation.as_slice(),
+        ])
+        .unwrap();
+        conn.execute(
+            "UPDATE account_entry_status SET status = 'retained_unfolded', detail = NULL
+              WHERE entry_hash = ?1",
+            [incarnation.as_slice()],
+        )
+        .unwrap();
+        assert_eq!(status(&conn, &incarnation), ("retained_unfolded".into(), None));
+
+        schema::migrate_forward(&conn, &crate::test_hooks()).unwrap();
+        assert_eq!(
+            repo_incarnation_state(&conn, account, "repo-a").unwrap(),
+            RepoIncarnationState::Current(incarnation),
+        );
+        assert_eq!(status(&conn, &incarnation), ("accepted".into(), None));
+    }
+
+    #[test]
+    fn an_owner_removal_cut_condemns_a_later_incarnation_advance() {
+        let conn = db();
+        let (account, founder, owner_b, owner_b_id, _stream, own_hash) =
+            account_with_second_owner(&conn);
+        let (root_bytes, root) =
+            incarnation_entry(account, &owner_b, 0, None, Some(owner_b_id), "repo-a", None);
+        ingest(&conn, &root_bytes);
+        let demote = AccountOp::OwnerDemote {
+            device_fingerprint: owner_b.fp,
+            owner_id: owner_b_id,
+            control_cut: super::super::super::cut::Cut::Empty,
+            secrets_cut: super::super::super::cut::Cut::At { seq: 0, hash: root },
+            reason: "remove".into(),
+        };
+        let founder_id = owner_id_of_founder(&conn, account);
+        let (demote_bytes, _) =
+            control_op(account, &founder, 3, Some(own_hash), Some(founder_id), &demote);
+        ingest(&conn, &demote_bytes);
+        let (late_bytes, late) = incarnation_entry(
+            account,
+            &owner_b,
+            1,
+            Some(root),
+            Some(owner_b_id),
+            "repo-a",
+            Some(root),
+        );
+        ingest(&conn, &late_bytes);
+        assert_eq!(status(&conn, &late).0, "condemned");
+        assert_eq!(
+            repo_incarnation_state(&conn, account, "repo-a").unwrap(),
+            RepoIncarnationState::Current(root),
+        );
+    }
+
+    #[test]
+    fn late_cut_restores_a_pending_table_streams_incarnation() {
+        use crate::table_sync::{
+            Cell, ColumnSpec, PendingReason, RowOp, TableSpec, TypedValue, ValueType,
+            author_row_entry, mark_entry_pending, record_stream_context,
+            refold_stale_projections_against, scope_stream_id,
+        };
+
+        const TABLE: TableSpec = TableSpec {
+            name: "t_incarnation_replay",
+            scope_id: "incarnation/1",
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("title", ValueType::Text)],
+            local_columns: &[],
+            repo_column: None,
+        };
+
+        let mut conn = db();
+        conn.execute_batch(
+            "CREATE TABLE t_incarnation_replay(
+                 id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL
+             ) STRICT;",
+        )
+        .unwrap();
+        let (account, founder, owner_b, owner_b_id, _stream, own_hash) =
+            account_with_second_owner(&conn);
+        let founder_id = owner_id_of_founder(&conn, account);
+
+        let (a_bytes, incarnation_a) =
+            incarnation_entry(account, &owner_b, 0, None, Some(owner_b_id), "repo-a", None);
+        ingest(&conn, &a_bytes);
+        let stream = scope_stream_id("repo-a", account, incarnation_a, TABLE.scope_id);
+        let tx = conn.transaction().unwrap();
+        record_stream_context(&tx, stream, "repo-a", account, incarnation_a, TABLE.scope_id)
+            .unwrap();
+        let pending = author_row_entry(
+            &tx,
+            stream,
+            &founder.secret,
+            &RowOp::Upsert {
+                table: TABLE.name.into(),
+                spec_version: 1,
+                pk: vec![TypedValue::Text("r1".into())],
+                cells: vec![Cell {
+                    column: "title".into(),
+                    value: TypedValue::Text("from-a".into()),
+                }],
+            },
+            NOW,
+        )
+        .unwrap();
+        mark_entry_pending(&tx, &pending.entry.entry_hash, PendingReason::NewerSpecVersion, 1)
+            .unwrap();
+        tx.commit().unwrap();
+
+        let (b_bytes, incarnation_b) = incarnation_entry(
+            account,
+            &owner_b,
+            1,
+            Some(incarnation_a),
+            Some(owner_b_id),
+            "repo-a",
+            Some(incarnation_a),
+        );
+        ingest(&conn, &b_bytes);
+        assert_eq!(
+            repo_incarnation_state(&conn, account, "repo-a").unwrap(),
+            RepoIncarnationState::Current(incarnation_b),
+        );
+        assert!(refold_stale_projections_against(&conn, &[TABLE]).unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT pending_reason FROM table_sync_entries WHERE entry_hash = ?1",
+                [pending.entry.entry_hash.as_slice()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            PendingReason::DeferredIncarnationAuthority.as_db_str(),
+        );
+
+        let demote = AccountOp::OwnerDemote {
+            device_fingerprint: owner_b.fp,
+            owner_id: owner_b_id,
+            control_cut: super::super::super::cut::Cut::Empty,
+            secrets_cut: super::super::super::cut::Cut::At { seq: 0, hash: incarnation_a },
+            reason: "late cut".into(),
+        };
+        let (demote_bytes, _) =
+            control_op(account, &founder, 3, Some(own_hash), Some(founder_id), &demote);
+        ingest(&conn, &demote_bytes);
+        assert_eq!(status(&conn, &incarnation_b).0, "condemned");
+        assert_eq!(
+            repo_incarnation_state(&conn, account, "repo-a").unwrap(),
+            RepoIncarnationState::Current(incarnation_a),
+        );
+
+        assert!(refold_stale_projections_against(&conn, &[TABLE]).unwrap());
+        assert_eq!(
+            conn.query_row("SELECT title FROM t_incarnation_replay WHERE id = 'r1'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "from-a",
+        );
+        let pending_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM table_sync_entries WHERE pending_reason IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 0);
     }
 
     #[test]

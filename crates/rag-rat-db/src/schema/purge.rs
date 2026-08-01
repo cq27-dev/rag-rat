@@ -41,23 +41,14 @@
 //! consolidate import for the same reason). None of these carry a `repo_id` column, so the
 //! class-level sweep leaves them untouched.
 //!
-//! `table_sync_entries` is the ONE stream-keyed sync table that departs from that posture, and the
-//! reason is that its stream id is DERIVED rather than random (#1004): `scope_stream_id` is a pure
-//! function of `(repo_id, account_id, scope_id)`, so re-registering the same repo recreates the
-//! identical stream mapping and a later projector bump replays the removed repo's parked operations
-//! straight back into it. Retention is only safe where the key cannot be regenerated. The stream
-//! directory `table_sync_streams` carries a `repo_id` and is swept by the class sweep, so the two
-//! halves have to agree — retaining the entries while dropping the directory that places them is
-//! the shape that resurrects history.
-//!
-//! That same determinism leaves the OTHER half of the problem open, and deleting the log does not
-//! settle it: a re-registration derives the same stream id over an empty log, so this device
-//! authors a second genesis at lamport 0 and a peer holding the old chain reads it as a fork (and
-//! an old entry redelivered from that peer is chain-continuous, so it repopulates what was purged).
-//! The resolution is a stream epoch or durable chain high-water state, which has to be agreed with
-//! peers and therefore belongs to the transport milestone — tracked in #1049. Unreachable until a
-//! transport exists; purging is still the better interim, because the resurrection path above needs
-//! no peer at all.
+//! `table_sync_entries` and its gapped rows are purged through the captured stream-directory ids.
+//! The `/5` stream commits an account-authorized repository incarnation, so an explicit advance
+//! derives a fresh stream and old entries cannot repopulate it. Local removal does NOT advance that
+//! authority: a same-incarnation rejoin derives the same stream and must continue its old device
+//! chains. `table_sync_chain_tips` therefore survives this purge as store-global high-water
+//! witnesses (it deliberately has no `repo_id` column or directory FK); local authoring refuses a
+//! second genesis until its witnessed tip is restored. The directory and row projection remain
+//! repo-local and are still swept.
 
 use rusqlite::{Connection, params};
 
@@ -168,7 +159,7 @@ const TRANSITIVE_SCOPED_TABLES: &[TransitiveTable] = &[
     },
     // The table-sync entry log (table_sync_streams.stream_id → stream_id). Captured through the
     // directory because the stream id is a one-way hash and cannot be re-derived once the
-    // directory row is swept — see the module docs for why this log is purged at all.
+    // directory row is swept. Retained chain-tip witnesses are intentionally not listed here.
     TransitiveTable {
         table: "table_sync_entries",
         id_column: "stream_id",
@@ -433,8 +424,9 @@ fn capture_purge_ids(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
         params![repo_id],
     )?;
     // Same aliasing for the sync stream directory. This capture is what makes the entry-log delete
-    // possible at all: `stream_id` is a one-way hash of `(repo_id, account_id, scope_id)`, so once
-    // the class sweep removes the directory row there is no way back from an entry to its repo.
+    // possible at all: `stream_id` is a one-way hash of
+    // `(repo_id, account_id, incarnation_ref, scope_id)`, so once the class sweep removes the
+    // directory row there is no way back from an entry to its repo.
     conn.execute(
         &format!(
             "CREATE TEMP TABLE {} AS SELECT stream_id AS id FROM table_sync_streams WHERE repo_id \

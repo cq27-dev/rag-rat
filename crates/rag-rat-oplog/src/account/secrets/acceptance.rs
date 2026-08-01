@@ -135,7 +135,8 @@ where
     /// boundaries).
     pub(in crate::account) owner_authority: AuthorityQuery<OwnerChainAuthority>,
     /// The account's ownership of the wrap's stream (`stream_owner_effective`).
-    pub(in crate::account) ownership: AuthorityQuery<EntryHash>,
+    /// Required for key wraps; repository-incarnation artifacts carry no content stream.
+    pub(in crate::account) ownership: Option<AuthorityQuery<EntryHash>>,
     /// The header's asserted control-fold length (`auth_len`) — the value `freshness` must have
     /// been computed against (provenance).
     pub(in crate::account) asserted_auth_len: u64,
@@ -220,12 +221,12 @@ where
     // The stream must be OWNED by this account (a prior effective `StreamOwn{stream}`), or the
     // owner-only authorization has no basis. §14 makes the true owner unprovable-absent locally, so
     // a not-yet-folded ownership fact PARKS (recoverable) — never a rejection.
-    match input.ownership {
-        AuthorityQuery::Effective(_) => {},
-        AuthorityQuery::Unknown => return parked(SecretsParkReason::UnknownStreamOwner),
-        // `stream_owner_effective` only ever answers Effective / Unknown; an Invalid is treated as
-        // an unresolved ownership (fail-closed park), never an acceptance.
-        AuthorityQuery::Invalid(_) => return parked(SecretsParkReason::UnknownStreamOwner),
+    if let Some(ownership) = input.ownership {
+        match ownership {
+            AuthorityQuery::Effective(_) => {},
+            AuthorityQuery::Unknown => return parked(SecretsParkReason::UnknownStreamOwner),
+            AuthorityQuery::Invalid(_) => return parked(SecretsParkReason::UnknownStreamOwner),
+        }
     }
 
     // The two secrets boundaries (device register + owner-incarnation register) are the conjunction
@@ -340,7 +341,7 @@ mod tests {
             seq: 0,
             authority_ref: Some(OWNER_ID),
             owner_authority,
-            ownership: AuthorityQuery::Effective([1; 32]),
+            ownership: Some(AuthorityQuery::Effective([1; 32])),
             asserted_auth_len: 3,
             dense_predecessor_reachable: true,
             branch_selected: true,
@@ -414,7 +415,7 @@ mod tests {
             owner_chain(AuthorityBoundary::Open, AuthorityBoundary::Open),
             AncestryRelation::OnBranch,
         );
-        input.ownership = AuthorityQuery::Unknown;
+        input.ownership = Some(AuthorityQuery::Unknown);
         assert_eq!(
             evaluate_secrets_acceptance(&input),
             Ok(SecretsAcceptance::Parked(SecretsParkReason::UnknownStreamOwner))
@@ -443,7 +444,7 @@ mod tests {
                 AuthorityBoundary::Cut { seq: 2, hash: [1; 32] },
                 AuthorityBoundary::Open,
             ),
-            ownership: AuthorityQuery::Effective([1; 32]),
+            ownership: Some(AuthorityQuery::Effective([1; 32])),
             asserted_auth_len: 3,
             dense_predecessor_reachable: true,
             branch_selected: true,

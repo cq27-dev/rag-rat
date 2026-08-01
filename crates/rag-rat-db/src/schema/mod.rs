@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 98;
+pub const LATEST_SCHEMA_VERSION: u32 = 99;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -749,6 +749,14 @@ const MIGRATION_098_DESCRIPTION: &str =
      every host: which spellings a store carries is a property of the store, not of the binary \
      that opens it";
 
+const MIGRATION_099_ID: &str = "099_table_sync_repo_incarnations";
+const MIGRATION_099_CHECKSUM: &str = "sha256:rag-rat-table-sync-repo-incarnations-v99";
+const MIGRATION_099_DESCRIPTION: &str =
+    "Add the owner-authorized repository-incarnation projection and /5 table-sync substrate: \
+     incarnation-bound stream contexts, stream-isolated row clocks/publication/tombstones, and \
+     retained per-device chain-tip witnesses that survive local repository purge. Pre-transport \
+     /4 table-sync state is cleared because it has no account-authorized incarnation identity";
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SchemaState {
@@ -955,7 +963,7 @@ impl MigrationFn {
 /// `BEGIN` inside a transaction fails. `blocking_the_ledger_stamp_rolls_the_body_back` drives every
 /// entry and pins the atomicity behaviorally.
 const LEDGER_ATOMIC_MIGRATIONS: &[&str] =
-    &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID, MIGRATION_098_ID];
+    &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID, MIGRATION_098_ID, MIGRATION_099_ID];
 
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
 /// older binary can still act on (see [`LEDGER_ATOMIC_MIGRATIONS`]).
@@ -971,9 +979,10 @@ fn apply_and_record_migration(
 
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     step.apply.run(&tx, hooks)?;
-    // The authority refold is the account-projection pair's own requirement, not the ledger's: it
-    // rebuilds what V064 creates and V065 bounds, off a domain builder this crate cannot link.
-    if matches!(step.id, MIGRATION_064_ID | MIGRATION_065_ID) {
+    // The account refold is the projection migrations' own requirement, not the ledger's: it
+    // rebuilds what V064 creates/V065 bounds and projects V099's newly-known secrets artifact, off
+    // a domain builder this crate cannot link.
+    if matches!(step.id, MIGRATION_064_ID | MIGRATION_065_ID | MIGRATION_099_ID) {
         (hooks.backfill_authority_projection)(&tx)?;
     }
     migrations::record_migration(&tx, step.id, step.checksum, step.description)?;
@@ -1563,6 +1572,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_098_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_reindex_after_unix_backslash_rendering),
     },
+    Migration {
+        id: MIGRATION_099_ID,
+        checksum: MIGRATION_099_CHECKSUM,
+        description: MIGRATION_099_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_table_sync_repo_incarnations),
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -1783,7 +1798,7 @@ mod ledger_atomicity {
     /// test with it, so the regression that reintroduces the two-commit window would pass. These
     /// tests range over the UNION, so removing an id from production fails here instead.
     const DATA_CONVERTING_MIGRATIONS: &[&str] =
-        &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID, MIGRATION_098_ID];
+        &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID, MIGRATION_098_ID, MIGRATION_099_ID];
 
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.
     fn ledger_atomic_under_test() -> Vec<&'static str> {

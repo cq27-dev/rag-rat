@@ -54,51 +54,58 @@ pub(crate) fn produce_row_ops(
         let row_pk = row_op::row_pk_string(&pk);
         live.insert(row_pk.clone());
         let hash = row_op::cells_hash(&cells);
-        let changed = match apply::published_hash(tx, repo_id, spec.name, &row_pk)? {
-            // Published under THIS binary's column set: a differing hash is a real local change.
-            Some((published, version)) if version == spec.spec_version => published != hash,
-            // Published under a DIFFERENT column set: the two hashes cover different cell lists, so
-            // comparing them says nothing (they differ structurally whether or not the row
-            // changed). Resolve it against the op that actually established the row,
-            // projected under this spec — the only thing that CAN settle it.
-            //
-            // Reading the raw mismatch as a delta instead would re-author EVERY row of the table at
-            // a fresh winning lamport on EVERY upgrading device; ignoring it entirely (the #1001
-            // conservatism this replaces) left the row permanently un-authorable, even when
-            // genuinely edited.
-            Some(_) =>
-                match apply::stale_row_disposition(tx, spec, repo_id, stream, &pk, &cells)? {
-                    // Untouched since it landed: nothing to say, just restamp the bookkeeping so
-                    // the row is comparable again from here on.
-                    apply::StaleRow::Unchanged => {
-                        apply::record_published(
-                            tx,
-                            repo_id,
-                            spec.name,
-                            &row_pk,
-                            &hash,
-                            spec.spec_version,
-                        )?;
-                        false
+        let changed =
+            match apply::published_hash_on_stream(tx, stream, repo_id, spec.name, &row_pk)? {
+                // Published under THIS binary's column set: a differing hash is a real local
+                // change.
+                Some((published, version)) if version == spec.spec_version => published != hash,
+                // Published under a DIFFERENT column set: the two hashes cover different cell
+                // lists, so comparing them says nothing (they differ structurally
+                // whether or not the row changed). Resolve it against the op that
+                // actually established the row, projected under this spec — the
+                // only thing that CAN settle it.
+                //
+                // Reading the raw mismatch as a delta instead would re-author EVERY row of the
+                // table at a fresh winning lamport on EVERY upgrading device;
+                // ignoring it entirely (the #1001 conservatism this replaces) left
+                // the row permanently un-authorable, even when genuinely edited.
+                Some(_) =>
+                    match apply::stale_row_disposition(tx, spec, repo_id, stream, &pk, &cells)? {
+                        // Untouched since it landed: nothing to say, just restamp the bookkeeping
+                        // so the row is comparable again from here on.
+                        apply::StaleRow::Unchanged => {
+                            apply::record_published_on_stream(
+                                tx,
+                                stream,
+                                repo_id,
+                                spec.name,
+                                &row_pk,
+                                &hash,
+                                spec.spec_version,
+                            )?;
+                            false
+                        },
+                        // A proven local change — author it. This is the exit from the frozen
+                        // state.
+                        apply::StaleRow::LocallyChanged => true,
+                        // Unprovable (the winning entry is gone, does not project here, or is not
+                        // this row's op). AUTHOR IT — the two readers of
+                        // this verdict must not both defer.
+                        // `row_has_unsent_local_change` reads `Unknown` as "there may be an unsent
+                        // edit, so refuse to replay over it"; if the producer also
+                        // declined, the row would be permanently unauthorable AND
+                        // would permanently block its own pending entries, silently
+                        // losing a genuine local edit with no way out and nothing to report it.
+                        // Authoring is the safe direction: at worst it re-emits a row that was
+                        // already correct (bounded churn, and the restamp
+                        // makes the next pass cheap), and at
+                        // best it publishes an edit that would otherwise have been lost. Not
+                        // authoring has no such floor.
+                        apply::StaleRow::Unknown => true,
                     },
-                    // A proven local change — author it. This is the exit from the frozen state.
-                    apply::StaleRow::LocallyChanged => true,
-                    // Unprovable (the winning entry is gone, does not project here, or is not this
-                    // row's op). AUTHOR IT — the two readers of this verdict must not both defer.
-                    // `row_has_unsent_local_change` reads `Unknown` as "there may be an unsent
-                    // edit, so refuse to replay over it"; if the producer also
-                    // declined, the row would be permanently unauthorable AND
-                    // would permanently block its own pending entries, silently
-                    // losing a genuine local edit with no way out and nothing to report it.
-                    // Authoring is the safe direction: at worst it re-emits a row that was already
-                    // correct (bounded churn, and the restamp makes the next pass cheap), and at
-                    // best it publishes an edit that would otherwise have been lost. Not authoring
-                    // has no such floor.
-                    apply::StaleRow::Unknown => true,
-                },
-            // Never published: a genuinely new local row.
-            None => true,
-        };
+                // Never published: a genuinely new local row.
+                None => true,
+            };
         if changed {
             ops.push(RowOp::Upsert {
                 table: spec.name.to_string(),
@@ -113,7 +120,7 @@ pub(crate) fn produce_row_ops(
     // `Remove` carries only the pk, so which column set the stored hash covered is irrelevant.
     // Gating this on the version would make a locally-deleted row permanently undeletable across a
     // column change — the delete could never be authored, and peers would keep the row forever.
-    for row_pk in published_row_pks(tx, repo_id, spec.name)? {
+    for row_pk in published_row_pks(tx, stream, repo_id, spec.name)? {
         if !live.contains(&row_pk) {
             ops.push(RowOp::Remove {
                 table: spec.name.to_string(),
@@ -127,13 +134,18 @@ pub(crate) fn produce_row_ops(
 
 fn published_row_pks(
     tx: &Transaction<'_>,
+    stream: StreamId,
     repo_id: &str,
     table: &str,
 ) -> anyhow::Result<Vec<String>> {
-    let mut stmt = tx
-        .prepare("SELECT row_pk FROM sync_published_rows WHERE repo_id = ?1 AND table_name = ?2")?;
+    let mut stmt = tx.prepare(
+        "SELECT row_pk FROM sync_published_rows
+              WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3",
+    )?;
     let rows = stmt
-        .query_map(params![repo_id, table], |row| row.get::<_, String>(0))?
+        .query_map(params![stream.to_bytes().as_slice(), repo_id, table], |row| {
+            row.get::<_, String>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -158,11 +170,7 @@ mod tests {
 
     /// Any stable stream id: these tests never reach the winner lookup (no row is ever stale).
     fn test_stream() -> crate::stream::StreamId {
-        crate::table_sync::scope_stream::scope_stream_id(
-            "repo",
-            crate::AccountId::from_bytes([7; 32]),
-            "demo/1",
-        )
+        crate::stream::StreamId::from_bytes([0; 32])
     }
 
     fn conn() -> rusqlite::Connection {

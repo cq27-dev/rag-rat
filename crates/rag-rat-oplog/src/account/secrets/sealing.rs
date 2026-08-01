@@ -565,7 +565,7 @@ fn list_accepted_stream_key_wraps_with_mode(
             );
         }
         match ops::decode(signed.header.entry_type, &signed.payload) {
-            Ok(DecodedSecretsOp::Known(wrap)) if wrap.stream_id == stream_id => {
+            Ok(DecodedSecretsOp::StreamKeyWrap(wrap)) if wrap.stream_id == stream_id => {
                 out.push(AcceptedStreamWrap { entry_hash, wrap });
             },
             Ok(_) => {},
@@ -1654,7 +1654,7 @@ mod tests {
             .unwrap();
         let signed = crate::account::envelope::decode_account_signed(&signed_bytes).unwrap();
         match decode(signed.header.entry_type, &signed.payload).unwrap() {
-            DecodedSecretsOp::Known(wrap) => wrap,
+            DecodedSecretsOp::StreamKeyWrap(wrap) => wrap,
             _ => panic!("stored entry is a known StreamKeyWrap"),
         }
     }

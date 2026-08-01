@@ -369,9 +369,10 @@ pub fn refold_account(conn: &Connection, account_id: AccountId) -> anyhow::Resul
     Ok(())
 }
 
-/// Populate V064's derived authority tables from every account already present in the V059
-/// candidate DAG. The migration owns `tx`; replaying all accounts and recording V064 therefore
-/// commits as one writer-locked unit, with no source-history gap between the scan and ledger.
+/// Rebuild account-derived projections from every account in the candidate DAG. V064/V065 use this
+/// for authority tables and V099 uses it for repository incarnations learned from formerly opaque
+/// secrets entries. The migration owns `tx`, so the source scan, projection, and ledger stamp
+/// commit as one writer-locked unit.
 pub fn backfill_authority_projection(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     let account_ids = {
         let mut stmt =
@@ -384,7 +385,7 @@ pub fn backfill_authority_projection(tx: &Transaction<'_>) -> rusqlite::Result<(
             .and_then(|account_id| refold_in_tx(tx, account_id, 0));
         if let Err(err) = result {
             return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
-                format!("V064 authority backfill failed: {err:#}"),
+                format!("account projection backfill failed: {err:#}"),
             ))));
         }
     }
@@ -7430,8 +7431,8 @@ mod tests {
         let founder = Dev::new(1);
         let (acct, gbytes, gh) = genesis(&founder);
         account_ingest(&conn, &gbytes, NOW).unwrap();
-        // A log-1 entry carrying the control DEVICE_ADD tag: on the SECRETS log that number is an
-        // unknown secrets tag, so the control DEVICE_ADD schema is never applied. C4.2b's secrets
+        // A log-1 entry carrying the control STREAM_OWN tag: on the SECRETS log that number is an
+        // unknown secrets tag, so the control STREAM_OWN schema is never applied. C4.2b's secrets
         // twin DOES validate log-1 plaintext at ingest, but only as one canonical CBOR item (the
         // same opaque-retention rule as an unknown control tag) — a canonical payload is retained
         // `retained_unfolded`, never decoded against any op schema.
@@ -7442,7 +7443,7 @@ mod tests {
             seq: 1,
             prev_hash: Some(gh),
             parent_ref: None,
-            entry_type: ops::entry_type::DEVICE_ADD,
+            entry_type: ops::entry_type::STREAM_OWN,
             op_version: 1,
             crypto_suite: 0,
             auth_len: 1,

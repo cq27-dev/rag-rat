@@ -40,9 +40,9 @@
 #![allow(dead_code)]
 
 /// Migration hooks for oplog's own tests. The only migration hook oplog's schema uses is its OWN
-/// `backfill_authority_projection` (the V064 forward-migration backfill over populated account
-/// histories); the other domains' hooks are irrelevant here, so they stay noop. Wiring the crate's
-/// own function means the tests need no dev-dependency on rag-rat-core's `migration_hooks()`.
+/// `backfill_authority_projection` (the all-account refold for V064/V065/V099); the other domains'
+/// hooks are irrelevant here, so they stay noop. Wiring the crate's own function means the tests
+/// need no dev-dependency on rag-rat-core's `migration_hooks()`.
 #[cfg(test)]
 pub(crate) fn test_hooks() -> rag_rat_db::MigrationHooks {
     rag_rat_db::MigrationHooks {
@@ -100,16 +100,17 @@ pub use account::{
     ContentStreamSettleFailure, DeviceCut, DeviceRole, ENROLLMENT_HELD_ENTRY_HASHES_MAX,
     EnrollingDevice, EnrollmentBootstrap, EnrollmentBudget, GrantAuthority, GrantDeviceAuthority,
     GrantDeviceBoundary, GrantRole, IngestOutcome, KeyId, LiveKeyEpoch, LiveKeyTargets,
-    NodeAuthError, OwnerAuthority, OwnerChainAuthority, PreparedContentAuthoring,
-    RosterContentAuthority, RotationOutcome, SealPolicy, SealingKeyOutcome, SelectedWrap,
-    SignedContentEntry, SnapshotAuthorOutcome, SyncAccountEntry, SyncContentEntry,
+    NodeAuthError, OwnerAuthority, OwnerChainAuthority, PreparedContentAuthoring, RepoIncarnation,
+    RepoIncarnationState, RosterContentAuthority, RotationOutcome, SealPolicy, SealingKeyOutcome,
+    SelectedWrap, SignedContentEntry, SnapshotAuthorOutcome, SyncAccountEntry, SyncContentEntry,
     VerifiedContentEntry, account_effective_count, account_entries_for_enrollment,
     account_entries_for_sync, account_entry_ref, account_ingest, account_signed_entry_exists,
-    account_signed_hash, adopt_enrollment_bootstrap, adopt_local_account, auth_len_freshness,
-    author_content_batch, author_content_batch_in_tx, author_device_add_in_tx,
-    author_enrollment_device_add_in_tx, author_prepared_content_batch_in_tx, author_snapshot_in_tx,
-    backfill_authority_projection, catch_up_stream_keys_for_device_in_tx, content_entries_for_sync,
-    content_entry_ref, content_ingest, content_op_is_authorable, content_op_is_sealed_authorable,
+    account_signed_hash, adopt_enrollment_bootstrap, adopt_local_account,
+    advance_repo_incarnation_in_tx, auth_len_freshness, author_content_batch,
+    author_content_batch_in_tx, author_device_add_in_tx, author_enrollment_device_add_in_tx,
+    author_prepared_content_batch_in_tx, author_snapshot_in_tx, backfill_authority_projection,
+    catch_up_stream_keys_for_device_in_tx, content_entries_for_sync, content_entry_ref,
+    content_ingest, content_op_is_authorable, content_op_is_sealed_authorable,
     content_signed_entry_exists, content_signed_hash, content_stream_has_pending_refold,
     content_stream_has_sealed_ratchet, content_stream_is_empty, current_sealing_key,
     decode_content_signed, enroll_stream_keys_for_device_in_tx, enrollment_authoring_fits,
@@ -120,10 +121,11 @@ pub use account::{
     owned_streams_for_account, owner_control_authority, owner_control_authority_in_snapshot,
     owner_secrets_authority, prepare_content_authoring, prune_account_candidate_reservations_in_tx,
     read_local_account, read_local_account_genesis, release_account_candidate_reservation_in_tx,
-    retry_enrollment_pre_verify, roster_content_authority, rotate_stream_key_in_tx,
-    select_current_sealing_wrap, settle_pending_content_refold_for_stream_in_tx,
-    settle_pending_content_refolds, sign_local_node_binding, stream_key_rotation_needed,
-    stream_owner_effective, upsert_account_candidate_reservation_in_tx, validate_device_add_label,
+    repo_incarnation_state, retry_enrollment_pre_verify, roster_content_authority,
+    rotate_stream_key_in_tx, select_current_sealing_wrap,
+    settle_pending_content_refold_for_stream_in_tx, settle_pending_content_refolds,
+    sign_local_node_binding, stream_key_rotation_needed, stream_owner_effective,
+    upsert_account_candidate_reservation_in_tx, validate_device_add_label,
     verify_enrollment_device_add, verify_node_binding,
 };
 // The `/3` content projection's store-global upgrade re-fold (#688): wired into the index

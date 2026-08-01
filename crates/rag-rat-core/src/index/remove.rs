@@ -567,9 +567,10 @@ mod tests {
     fn seed_table_sync_stream(conn: &rusqlite::Connection, repo_id: &str, seed: u8) -> Vec<u8> {
         let stream_id = vec![seed; 32];
         conn.execute(
-            "INSERT INTO table_sync_streams(stream_id, repo_id, account_id, scope_id) VALUES (?1, \
-             ?2, ?3, 'demo/1')",
-            params![stream_id, repo_id, vec![seed; 32]],
+            "INSERT INTO table_sync_streams(
+                 stream_id, repo_id, account_id, incarnation_ref, scope_id
+             ) VALUES (?1, ?2, ?3, ?4, 'demo/1')",
+            params![stream_id, repo_id, vec![seed; 32], vec![seed ^ 0x55; 32]],
         )
         .unwrap();
         conn.execute(
@@ -807,8 +808,9 @@ mod tests {
         );
         // The stream-keyed half of #1004 explicitly: the directory row is gone via the class sweep,
         // and the entries that only it could place are gone with it. Retaining them would let a
-        // re-registration of the same repo — whose stream id is a pure function of
-        // `(repo_id, account_id, scope_id)` — replay the removed repo's operations back into it.
+        // same-incarnation re-registration of the repo — whose stream id is a pure function of
+        // `(repo_id, account_id, incarnation_ref, scope_id)` — replay the removed repo's operations
+        // back into it.
         let b_streams_left: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM table_sync_streams WHERE repo_id = ?1",

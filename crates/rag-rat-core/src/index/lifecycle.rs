@@ -135,7 +135,7 @@ impl IndexDatabase {
         // V070-tables guard inside skips cleanly); idempotent and serialized by its own
         // IMMEDIATE txn, so racing openers converge.
         rag_rat_oplog::rebuild_all_content_projections_if_stale(storage.connection())?;
-        // #1001: the same discipline for the `/4` table-sync projection. An entry this binary could
+        // #1001: the same discipline for the `/5` table-sync projection. An entry this binary could
         // not project when it arrived is retained and marked; replaying it HERE — after migrations,
         // before any produce — is what keeps a payload that arrived from being lost, since
         // redelivery short-circuits on the entry already being present. Bounded by the pending set,

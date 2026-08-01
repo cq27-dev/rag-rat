@@ -99,7 +99,7 @@ impl ColumnSpec {
 /// One syncable table. `pk` names the identity columns (encoded as the row op's `pk`); `columns`
 /// are the non-pk synced columns (encoded as the op's cells; the whole row is folded as a unit
 /// under its write clock); `local_columns` are re-derived from the local index and never
-/// replicated. `scope_id` names the `/4` stream this table rides — the routing key that binds it to
+/// replicated. `scope_id` names the `/5` stream this table rides — the routing key that binds it to
 /// an auth tier
 /// + retention class + flood budget.
 #[derive(Debug, Clone, Copy)]

@@ -1,12 +1,13 @@
 //! `rag-rat rm` driven from a LINKED WORKTREE, against a database shared with the main checkout and
 //! with an unrelated sibling repo.
 //!
-//! The table-sync stream directory is keyed by `(repo_id, account_id, scope_id)`, and the entry log
-//! it scopes carries no `repo_id` at all — the purge reaches that log only through the captured
-//! directory rows (#1004). Neither key has a checkout dimension, and this pins that rather than
-//! assuming it: both checkouts of a repo must register under ONE `repo_id`, a removal resolved from
-//! the linked worktree must take the whole repo's log, and a sibling repo in the same database must
-//! keep its own — which no `repo_id` predicate could have protected, since the log has none.
+//! The table-sync stream directory is keyed by `(repo_id, account_id, incarnation_ref, scope_id)`,
+//! and the entry log it scopes carries no `repo_id` at all — the purge reaches that log only
+//! through the captured directory rows (#1004). Neither key has a checkout dimension, and this pins
+//! that rather than assuming it: both checkouts of a repo must register under ONE `repo_id`, a
+//! removal resolved from the linked worktree must take the whole repo's log, and a sibling repo in
+//! the same database must keep its own — which no `repo_id` predicate could have protected, since
+//! the log has none.
 
 use super::*;
 
@@ -35,15 +36,23 @@ fn index_at(root: &Path, database: &Path) -> String {
 fn seed_stream(conn: &rusqlite::Connection, repo_id: &str, seed: u8) -> Vec<u8> {
     let stream_id = vec![seed; 32];
     conn.execute(
-        "INSERT INTO table_sync_streams(stream_id, repo_id, account_id, scope_id) VALUES (?1, ?2, \
-         ?3, 'demo/1')",
-        rusqlite::params![stream_id, repo_id, vec![seed; 32]],
+        "INSERT INTO table_sync_streams(
+             stream_id, repo_id, account_id, incarnation_ref, scope_id
+         ) VALUES (?1, ?2, ?3, ?4, 'demo/1')",
+        rusqlite::params![stream_id, repo_id, vec![seed; 32], vec![seed ^ 0x55; 32]],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO table_sync_entries(entry_hash, stream_id, device_fingerprint, lamport, \
          prev_hash, signed_bytes, received_at_ms) VALUES (?1, ?2, ?3, 1, NULL, ?4, 0)",
         rusqlite::params![vec![seed; 32], stream_id, vec![seed; 32], vec![seed; 8]],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO table_sync_chain_tips(
+             stream_id, device_fingerprint, lamport, entry_hash
+         ) VALUES (?1, ?2, 1, ?3)",
+        rusqlite::params![stream_id, vec![seed; 32], vec![seed; 32]],
     )
     .unwrap();
     conn.execute(
@@ -56,6 +65,15 @@ fn seed_stream(conn: &rusqlite::Connection, repo_id: &str, seed: u8) -> Vec<u8> 
     )
     .unwrap();
     stream_id
+}
+
+fn witnesses_on(conn: &rusqlite::Connection, stream_id: &[u8]) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM table_sync_chain_tips WHERE stream_id = ?1",
+        [stream_id],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 fn entries_on(conn: &rusqlite::Connection, stream_id: &[u8]) -> i64 {
@@ -83,6 +101,25 @@ fn directory_rows(conn: &rusqlite::Connection, repo_id: &str) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM table_sync_streams WHERE repo_id = ?1",
         rusqlite::params![repo_id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn seed_account_incarnation(conn: &rusqlite::Connection, repo_id: &str, seed: u8) {
+    conn.execute(
+        "INSERT INTO account_repo_incarnation_current(
+             account_id, repository_id, state, incarnation_ref
+         ) VALUES (?1, ?2, 'current', ?3)",
+        rusqlite::params![vec![seed; 32], repo_id, vec![seed ^ 0x55; 32]],
+    )
+    .unwrap();
+}
+
+fn account_incarnation(conn: &rusqlite::Connection, repo_id: &str) -> Vec<u8> {
+    conn.query_row(
+        "SELECT incarnation_ref FROM account_repo_incarnation_current WHERE repository_id = ?1",
+        [repo_id],
         |row| row.get(0),
     )
     .unwrap()
@@ -117,6 +154,8 @@ fn rm_from_a_linked_worktree_purges_the_shared_stream_log_and_spares_the_sibling
     let conn = storage.connection();
     let shared_stream = seed_stream(conn, &repo_id, 0xaa);
     let sibling_stream = seed_stream(conn, &sibling_repo_id, 0xbb);
+    seed_account_incarnation(conn, &repo_id, 0xaa);
+    seed_account_incarnation(conn, &sibling_repo_id, 0xbb);
 
     let roots: i64 = conn
         .query_row(
@@ -151,12 +190,24 @@ fn rm_from_a_linked_worktree_purges_the_shared_stream_log_and_spares_the_sibling
         "including the entries still awaiting a predecessor — they are signed operations on the \
          same derived stream id, so retaining them would let a re-registration replay them back",
     );
+    assert_eq!(
+        witnesses_on(conn, &shared_stream),
+        1,
+        "the per-device chain tip survives local removal so same-incarnation rejoin cannot fork",
+    );
+    assert_eq!(
+        account_incarnation(conn, &repo_id),
+        vec![0xff; 32],
+        "local rm does not silently advance or delete account-wide incarnation authority",
+    );
 
     // SIBLING PRESERVATION: the other repo in the shared store keeps both halves. Its entries carry
     // no `repo_id`, so only the captured stream ids could have spared them.
     assert_eq!(directory_rows(conn, &sibling_repo_id), 1, "the sibling's directory row survives");
     assert_eq!(entries_on(conn, &sibling_stream), 1, "and so does its entry log");
     assert_eq!(gapped_on(conn, &sibling_stream), 1, "and its entries awaiting a predecessor");
+    assert_eq!(witnesses_on(conn, &sibling_stream), 1, "and its retained chain witness");
+    assert_eq!(account_incarnation(conn, &sibling_repo_id), vec![0xee; 32]);
 
     let _ = fs::remove_dir_all(&linked);
 }

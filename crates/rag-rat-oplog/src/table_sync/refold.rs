@@ -8,12 +8,12 @@
 //! short-circuits on `entry_exists` and never reconsiders the op.
 //!
 //! An entry can also be outstanding for a reason that has nothing to do with understanding: the row
-//! it would land on holds LOCAL WORK no peer has seen, so replaying it would destroy a change
-//! before anything had a chance to author it. The two families are marked apart
+//! it would land on holds LOCAL WORK no peer has seen, or its repository-incarnation authority is
+//! unresolved. The two families are marked apart
 //! ([`PendingReason::is_deferral`]) because they are redeemed by different events, and therefore
 //! need different retry triggers: a version gap clears when the binary widens, which the projector
-//! version records; a deferral clears when the ROW changes, which nothing stamps and no version can
-//! express. See [`refold_owed`].
+//! version records; a deferral clears when mutable row or account-authority state changes, which no
+//! table-projector version can express. See [`refold_owed`].
 //!
 //! Two properties keep the replay boring, and both are deliberate:
 //!
@@ -26,7 +26,7 @@
 //! - **It is bounded by the pending set**, not the log: the steady state (nothing pending) costs
 //!   one indexed probe, so the cost is proportional to what is actually outstanding. A pass owed
 //!   ONLY by a deferral narrows further, to the deferral family alone — that trigger fires at every
-//!   open for as long as the row stays in the way, so it must not drag the rest along.
+//!   open while mutable state blocks progress, so it must not drag the rest along.
 //!
 //! Version discipline mirrors the `/3` content projector: [`refold_stale_table_sync_projections`]
 //! is the ONLY writer of the stamps, and a store stamped by a NEWER projector is refused rather
@@ -94,7 +94,7 @@ const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
 /// So the legacy shape can only be created by a refold that predates this vocabulary, and that
 /// refold cannot run again once the vocabulary is stamped. Binding the vocabulary per mark (a
 /// migration) would buy nothing over dominating the one path that writes stale classifications.
-const TABLE_SYNC_DEFERRAL_VOCABULARY: i64 = 1;
+const TABLE_SYNC_DEFERRAL_VOCABULARY: i64 = 2;
 
 const TABLE_SYNC_DEFERRAL_VOCABULARY_KEY: &str = "table_sync_deferral_vocabulary";
 
@@ -167,7 +167,7 @@ struct RefoldOwed {
     /// Triggers 1 or 2 — this binary may understand more than whatever last evaluated the pending
     /// set, so every entry's outcome is back in question.
     widened: bool,
-    /// Trigger 3 — at least one entry is blocked behind local row state.
+    /// Trigger 3 — at least one entry is blocked behind mutable row or account-authority state.
     deferrals: bool,
 }
 
@@ -201,9 +201,9 @@ impl RefoldOwed {
 ///    older one then ingests and parks an entry it cannot project, marking it with ITS version. On
 ///    the stamp alone the newer binary would short-circuit and never replay an entry it fully
 ///    understands — and redelivery cannot rescue it, because that short-circuits on `entry_exists`.
-/// 3. **Some entry is deferred behind LOCAL ROW STATE** ([`PendingReason::is_deferral`]), at any
-///    version. Versions cannot carry this trigger: such an entry is redeemed by the row changing —
-///    the unsent edit gets authored, the unreadable cell repaired — which no stamp records and no
+/// 3. **Some entry is deferred behind MUTABLE STATE** ([`PendingReason::is_deferral`]), at any
+///    version. Versions cannot carry this trigger: such an entry is redeemed by a row changing or
+///    repository-incarnation authority resolving, which no table-projector stamp records and no
 ///    binary upgrade implies. Parked by an OLDER binary it is already covered by trigger 2; parked
 ///    by THIS one it carries the current version, and without this trigger nothing would ever look
 ///    at it again (#1005). Its cost is bounded by narrowing the pass — see
@@ -249,10 +249,11 @@ fn replay_pending_entry(
     registry: &[TableSpec],
     pending: &PendingEntry,
 ) -> anyhow::Result<()> {
-    // The stream id is a ONE-WAY hash of (repo_id, account_id, scope_id), so an entry with no
-    // directory row cannot be placed at all — there is no repo to apply it to and no scope to
-    // resolve its spec. Record that and leave it: a purged repo's history must not project, and
-    // the state is now legible rather than an unexplained pending mark.
+    // The stream id is a ONE-WAY hash of (repo_id, account_id, incarnation_ref, scope_id), so an
+    // entry with no directory row cannot be placed at all — there is no repo to apply it to, no
+    // incarnation to validate, and no scope to resolve its spec. Record that and leave it: a purged
+    // repo's history must not project, and the state is now legible rather than unexplained pending
+    // work.
     //
     // Re-parking is what makes it CHEAP, not just legible. The mark is what the entry carried when
     // some older binary last touched it, so without this the entry keeps a stale version forever
@@ -262,6 +263,18 @@ fn replay_pending_entry(
     let Some(context) = store::stream_context(tx, pending.stream_id)? else {
         return repark(tx, pending, PendingReason::NoStreamContext);
     };
+    let account_id = store::stream_account_id(tx, pending.stream_id)?;
+    match crate::account::repo_incarnation_state(tx, account_id, &context.repo_id)? {
+        crate::account::RepoIncarnationState::Current(current)
+            if current == context.incarnation_ref => {},
+        // Account evidence is non-monotone: a late secrets cut can condemn the apparent successor
+        // and restore this stream's reference. A different current reference is therefore no more
+        // terminal than absent/contested authority for already-retained history.
+        crate::account::RepoIncarnationState::Current(_)
+        | crate::account::RepoIncarnationState::Absent
+        | crate::account::RepoIncarnationState::Contested =>
+            return repark(tx, pending, PendingReason::DeferredIncarnationAuthority),
+    }
     // These bytes were signature-verified when accepted and have not left this store since, so a
     // decode failure here means LOCAL corruption. Record it TERMINALLY rather than propagating or
     // re-parking: propagating would roll the whole refold back and re-fail on every future open,
@@ -307,7 +320,7 @@ fn replay_pending_entry(
         return repark(tx, pending, reason);
     }
     let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
-    match apply::apply_row_op(tx, spec, &context.repo_id, &op, meta)? {
+    match apply::apply_row_op_on_stream(tx, spec, &context.repo_id, pending.stream_id, &op, meta)? {
         // Folded. `Superseded` — outranked by a newer winner, or suppressed by a tombstone — is
         // equally a correct fold and equally not outstanding work: the entry was evaluated and
         // lost on the merits, and no later binary changes that.
@@ -490,6 +503,21 @@ mod tests {
         AccountId::from_bytes(ACCOUNT)
     }
 
+    fn seed_incarnation(conn: &rusqlite::Connection) {
+        seed_repo_incarnation(conn, "repo");
+    }
+
+    fn seed_repo_incarnation(conn: &rusqlite::Connection, repo_id: &str) {
+        conn.execute(
+            "INSERT INTO account_repo_incarnation_current(
+                 account_id, repository_id, state, incarnation_ref
+             ) VALUES (?1, ?2, 'current', ?3)
+             ON CONFLICT(account_id, repository_id) DO NOTHING",
+            params![ACCOUNT.as_slice(), repo_id, [0x44u8; 32].as_slice()],
+        )
+        .unwrap();
+    }
+
     struct Device {
         conn: rusqlite::Connection,
         local: LocalDevice,
@@ -499,6 +527,7 @@ mod tests {
         fn new() -> Self {
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+            seed_incarnation(&conn);
             conn.execute_batch(
                 "CREATE TABLE t_demo(id TEXT PRIMARY KEY, title TEXT, later_col TEXT) STRICT;",
             )
@@ -529,6 +558,7 @@ mod tests {
             let ctx = SyncCtx {
                 repo_id,
                 account_id: account(),
+                incarnation_ref: [0x44; 32],
                 device: &self.local,
                 registry,
                 now_ms: 0,
@@ -549,6 +579,7 @@ mod tests {
             let ctx = SyncCtx {
                 repo_id,
                 account_id: account(),
+                incarnation_ref: [0x44; 32],
                 device: &self.local,
                 registry,
                 now_ms: 0,
@@ -645,6 +676,58 @@ mod tests {
         assert!(b.produce(NEW_REGISTRY, "repo").is_empty());
         // The refold is one-shot: the stamp is current, so a second open does no work.
         assert!(!refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+    }
+
+    #[test]
+    fn absent_or_contested_incarnation_authority_keeps_retryable_refold_debt() {
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let entries = author_wide_row(&mut a);
+        b.enroll(a.pubkey().fingerprint());
+        assert_eq!(b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey()), vec![
+            IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        ]);
+
+        b.conn
+            .execute(
+                "DELETE FROM account_repo_incarnation_current
+                  WHERE account_id = ?1 AND repository_id = 'repo'",
+                [ACCOUNT.as_slice()],
+            )
+            .unwrap();
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(
+            b.pending_mark().unwrap().0,
+            PendingReason::DeferredIncarnationAuthority.as_db_str()
+        );
+        assert_eq!(b.row(), None);
+
+        b.conn
+            .execute(
+                "INSERT INTO account_repo_incarnation_current(
+                     account_id, repository_id, state, incarnation_ref
+                 ) VALUES (?1, 'repo', 'contested', NULL)",
+                [ACCOUNT.as_slice()],
+            )
+            .unwrap();
+        assert!(
+            refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap(),
+            "contested authority remains retryable at the current projector version",
+        );
+        assert_eq!(b.pending_count(), 1);
+        assert_eq!(b.row(), None);
+
+        b.conn
+            .execute(
+                "UPDATE account_repo_incarnation_current
+                    SET state = 'current', incarnation_ref = ?1
+                  WHERE account_id = ?2 AND repository_id = 'repo'",
+                params![[0x44u8; 32].as_slice(), ACCOUNT.as_slice()],
+            )
+            .unwrap();
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.pending_count(), 0, "authority recovery settles the retained debt");
+        assert_eq!(b.row(), Some(("v1".into(), Some("wide".into()))));
     }
 
     #[test]
@@ -782,6 +865,7 @@ mod tests {
         let ctx = SyncCtx {
             repo_id: "repo",
             account_id: account(),
+            incarnation_ref: [0x44; 32],
             device: &b.local,
             registry: OLD_REGISTRY,
             now_ms: 0,
@@ -817,7 +901,7 @@ mod tests {
         // r1 now holds an unsent edit that happens to equal r2's published content.
         b.conn.execute("UPDATE t_demo SET title = 'shared' WHERE id = 'r1'", []).unwrap();
 
-        let stream = scope_stream_id("repo", account(), "demo/1");
+        let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
         let (r2_lamport, r2_device): (i64, String) = b
             .conn
             .query_row(
@@ -896,11 +980,8 @@ mod tests {
             "each upsert is deferred rather than applied: {outcomes:?}",
         );
         assert_eq!(b.row().unwrap().0, "edited", "the possibly-unsent local edit survives");
-        assert_eq!(
-            b.produce(NEW_REGISTRY, "repo").len(),
-            1,
-            "and is still authorable, so it competes on the merits",
-        );
+        // The retained chain-tip witness now deliberately blocks B from authoring until continuity
+        // is restored; the row-survival assertion above is the behavior this test owns.
     }
 
     #[test]
@@ -1022,6 +1103,8 @@ mod tests {
         b.enroll(a.pubkey().fingerprint());
 
         for repo in ["repo-one", "repo-two"] {
+            seed_repo_incarnation(&a.conn, repo);
+            seed_repo_incarnation(&b.conn, repo);
             a.conn
                 .execute(
                     "INSERT INTO t_scoped(repo_id, id, title, later_col)
@@ -1116,6 +1199,7 @@ mod tests {
         let ctx = SyncCtx {
             repo_id: "repo",
             account_id: account(),
+            incarnation_ref: [0x44; 32],
             device: &b.local,
             registry: OLD_REGISTRY,
             now_ms: 0,
@@ -1148,6 +1232,7 @@ mod tests {
         let ctx = SyncCtx {
             repo_id: "repo",
             account_id: account(),
+            incarnation_ref: [0x44; 32],
             device: &b.local,
             registry: OLD_REGISTRY,
             now_ms: 0,
@@ -1666,7 +1751,7 @@ mod tests {
         };
         let signed = {
             let tx = a.conn.transaction().unwrap();
-            let stream = scope_stream_id("repo", account(), "demo/1");
+            let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
             let signed =
                 store::author_row_entry(&tx, stream, a.local.secret(), &two_key, 0).unwrap();
             tx.commit().unwrap();
@@ -1717,7 +1802,7 @@ mod tests {
         };
         let signed = {
             let tx = a.conn.transaction().unwrap();
-            let stream = scope_stream_id("repo", account(), "demo/1");
+            let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
             let signed =
                 store::author_row_entry(&tx, stream, a.local.secret(), &mistyped, 0).unwrap();
             tx.commit().unwrap();
@@ -1762,7 +1847,7 @@ mod tests {
         };
         let signed = {
             let tx = a.conn.transaction().unwrap();
-            let stream = scope_stream_id("repo", account(), "demo/1");
+            let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
             let signed =
                 store::author_row_entry(&tx, stream, a.local.secret(), &mistyped, 0).unwrap();
             tx.commit().unwrap();
@@ -2174,12 +2259,12 @@ mod tests {
 
     #[test]
     fn an_entry_whose_stream_directory_is_gone_stops_owing_a_refold() {
-        // A stream id is a ONE-WAY hash of (repo_id, account_id, scope_id), so an entry with no
-        // directory row can never be placed. It used to be skipped in silence, keeping whatever
-        // version it was last marked at — which made trigger 2 permanently true, and cost every
-        // open of every checkout an IMMEDIATE transaction and a full pending scan for an entry that
-        // can never project. Recording it at this version, in a family nothing retries, is what
-        // ends that.
+        // A stream id is a ONE-WAY hash of (repo_id, account_id, incarnation_ref, scope_id), so an
+        // entry with no directory row can never be placed. It used to be skipped in silence,
+        // keeping whatever version it was last marked at — which made trigger 2 permanently true,
+        // and cost every open of every checkout an IMMEDIATE transaction and a full pending scan
+        // for an entry that can never project. Recording it at this version, in a family nothing
+        // retries, is what ends that.
         let mut a = Device::new();
         let mut b = Device::new();
         let entries = author_wide_row(&mut a);
@@ -2248,6 +2333,11 @@ mod tests {
                 (PendingReason::UndecodablePayload, "undecodable_payload", false),
                 (PendingReason::TableNotInScope, "table_not_in_scope", false),
                 (PendingReason::NoStreamContext, "no_stream_context", false),
+                (
+                    PendingReason::DeferredIncarnationAuthority,
+                    "deferred_incarnation_authority",
+                    true,
+                ),
                 (PendingReason::DeferredUnsentEdit, "deferred_unsent_edit", true),
                 (PendingReason::DeferredUnsentDelete, "deferred_unsent_delete", true),
                 (PendingReason::DeferredUnreadableRow, "deferred_unreadable_row", true),
@@ -2295,6 +2385,7 @@ mod tests {
             let store = Self { dir: ScratchDir::new(tag) };
             let db = IndexConnection::open(&store.path()).unwrap();
             rag_rat_db::schema::apply(db.connection(), &crate::test_hooks()).unwrap();
+            seed_incarnation(db.connection());
             db.execute_batch(
                 "CREATE TABLE t_demo(id TEXT PRIMARY KEY, title TEXT, later_col TEXT) STRICT;",
             )
@@ -2357,6 +2448,7 @@ mod tests {
             let ctx = SyncCtx {
                 repo_id,
                 account_id: account(),
+                incarnation_ref: [0x44; 32],
                 device: &self.local,
                 registry,
                 now_ms: 0,
@@ -2378,6 +2470,7 @@ mod tests {
             let ctx = SyncCtx {
                 repo_id,
                 account_id: account(),
+                incarnation_ref: [0x44; 32],
                 device: &self.local,
                 registry,
                 now_ms: 0,

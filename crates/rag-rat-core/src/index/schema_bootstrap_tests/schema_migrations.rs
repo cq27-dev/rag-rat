@@ -1660,8 +1660,9 @@ fn migration_095_records_the_table_spec_version() {
     // one — `produce_row_ops` finds a locally-deleted row by its surviving published record, so a
     // dropped table strands every unsent deletion and leaves peers holding the row forever.
     conn.execute(
-        "INSERT INTO sync_published_rows(repo_id, table_name, row_pk, synced_hash, spec_version)
-         VALUES ('repo', 't', 'live', 'hash', 3)",
+        "INSERT INTO sync_published_rows(
+             stream_id, repo_id, table_name, row_pk, synced_hash, spec_version
+         ) VALUES (zeroblob(32), 'repo', 't', 'live', 'hash', 3)",
         [],
     )
     .unwrap();
@@ -1986,7 +1987,7 @@ fn migration_094_tracks_lens_enrichment_changes_in_constant_time() {
 /// binary that did not do the work.
 #[test]
 fn migration_097_records_the_same_ladder_entry_on_every_platform() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 98, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 99, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();

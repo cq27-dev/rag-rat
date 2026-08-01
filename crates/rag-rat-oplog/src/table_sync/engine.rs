@@ -26,6 +26,7 @@ use crate::{AccountId, LocalDevice};
 pub(crate) struct SyncCtx<'a> {
     pub repo_id: &'a str,
     pub account_id: AccountId,
+    pub incarnation_ref: [u8; 32],
     pub device: &'a LocalDevice,
     pub registry: &'a [TableSpec],
     pub now_ms: i64,
@@ -73,16 +74,25 @@ pub(crate) fn produce_and_author(
     tx: &Transaction<'_>,
     ctx: &SyncCtx<'_>,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
+    store::assert_current_incarnation(tx, ctx.account_id, ctx.repo_id, ctx.incarnation_ref)?;
     // Never author into a store a NEWER projector folded: our narrower column set would record
     // anti-echo hashes and park decisions the newer binary has to distrust.
     refold::assert_projector_not_newer(tx)?;
     let mut authored = Vec::new();
     for spec in ctx.registry {
-        let stream = scope_stream_id(ctx.repo_id, ctx.account_id, spec.scope_id);
+        let stream =
+            scope_stream_id(ctx.repo_id, ctx.account_id, ctx.incarnation_ref, spec.scope_id);
         // Record the apply context for every stream we author on: the stream id hashes
-        // (repo_id, account_id, scope_id) one-way, so without the directory a retained entry could
-        // never be replayed by a later binary (see [`super::refold`]).
-        store::record_stream_context(tx, stream, ctx.repo_id, ctx.account_id, spec.scope_id)?;
+        // (repo_id, account_id, incarnation_ref, scope_id) one-way, so without the directory a
+        // retained entry could never be replayed by a later binary (see [`super::refold`]).
+        store::record_stream_context(
+            tx,
+            stream,
+            ctx.repo_id,
+            ctx.account_id,
+            ctx.incarnation_ref,
+            spec.scope_id,
+        )?;
         for op in produce::produce_row_ops(tx, spec, ctx.repo_id, stream)? {
             let signed = store::author_row_entry(tx, stream, ctx.device.secret(), &op, ctx.now_ms)?;
             let meta =
@@ -95,7 +105,7 @@ pub(crate) fn produce_and_author(
             // published hash is NOT recorded, so the next pass would re-author the same
             // row forever (unbounded signed-log growth) and peers would quarantine each
             // copy: surface it and do NOT transmit the junk op.
-            match apply::apply_row_op(tx, spec, ctx.repo_id, &op, meta)? {
+            match apply::apply_row_op_on_stream(tx, spec, ctx.repo_id, stream, &op, meta)? {
                 apply::ApplyOutcome::Applied => authored.push(signed.signed_bytes),
                 // A locally-authored op CANNOT lose its own self-apply while the row's bookkeeping
                 // belongs to this stream: the entry took `MAX(lamport) + 1` over the whole stream,
@@ -177,8 +187,9 @@ pub(crate) fn ingest(
     signed_bytes: &[u8],
     pubkey: &DevicePublic,
 ) -> anyhow::Result<IngestReport> {
+    store::assert_current_incarnation(tx, ctx.account_id, ctx.repo_id, ctx.incarnation_ref)?;
     let device = pubkey.fingerprint();
-    let stream = scope_stream_id(ctx.repo_id, ctx.account_id, scope_id);
+    let stream = scope_stream_id(ctx.repo_id, ctx.account_id, ctx.incarnation_ref, scope_id);
     let (outcome, mut tail) = ingest_one(tx, ctx, scope_id, signed_bytes, pubkey)?;
     let mut promoted = Vec::new();
     // Each accepted entry settles the held CHILDREN of two hashes, and both sets must be drained
@@ -291,10 +302,17 @@ fn ingest_one(
     // Same refusal as the producer: an older binary must not re-park, under its own version, an
     // entry a newer projector already understood and folded.
     refold::assert_projector_not_newer(tx)?;
-    let stream = scope_stream_id(ctx.repo_id, ctx.account_id, scope_id);
+    let stream = scope_stream_id(ctx.repo_id, ctx.account_id, ctx.incarnation_ref, scope_id);
     // The apply context for anything this stream retains — recorded before the entry is stored, so
     // a pending entry is never left without the mapping its replay needs.
-    store::record_stream_context(tx, stream, ctx.repo_id, ctx.account_id, scope_id)?;
+    store::record_stream_context(
+        tx,
+        stream,
+        ctx.repo_id,
+        ctx.account_id,
+        ctx.incarnation_ref,
+        scope_id,
+    )?;
     let scope_tables: Vec<&str> =
         ctx.registry.iter().filter(|s| s.scope_id == scope_id).map(|s| s.name).collect();
     Ok(
@@ -350,7 +368,14 @@ fn ingest_one(
                     )?;
                     return Ok((IngestOutcome::Retained(deferral.as_db_str()), accepted));
                 }
-                let outcome = match apply::apply_row_op(tx, spec, ctx.repo_id, &op, meta)? {
+                let outcome = match apply::apply_row_op_on_stream(
+                    tx,
+                    spec,
+                    ctx.repo_id,
+                    stream,
+                    &op,
+                    meta,
+                )? {
                     // A received op that lost on the merits still landed: the entry is
                     // stored, nothing is outstanding, and redelivery stays idempotent.
                     ApplyOutcome::Applied | ApplyOutcome::Superseded => IngestOutcome::Applied,
@@ -417,6 +442,7 @@ mod tests {
         fn new() -> Self {
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+            seed_incarnation(&conn);
             conn.execute_batch("CREATE TABLE t_demo(id TEXT PRIMARY KEY, title TEXT) STRICT;")
                 .unwrap();
             let local = crate::local_device(&conn, 0).unwrap();
@@ -444,6 +470,7 @@ mod tests {
             let ctx = SyncCtx {
                 repo_id: "repo",
                 account_id: AccountId::from_bytes([42; 32]),
+                incarnation_ref: [0x44; 32],
                 device: &self.local,
                 registry: REGISTRY,
                 now_ms: 0,
@@ -469,6 +496,7 @@ mod tests {
             let ctx = SyncCtx {
                 repo_id: "repo",
                 account_id: AccountId::from_bytes([42; 32]),
+                incarnation_ref: [0x44; 32],
                 device: &self.local,
                 registry: REGISTRY,
                 now_ms: 0,
@@ -494,6 +522,7 @@ mod tests {
             let ctx = SyncCtx {
                 repo_id: "repo",
                 account_id: AccountId::from_bytes([42; 32]),
+                incarnation_ref: [0x44; 32],
                 device: &self.local,
                 registry: REGISTRY,
                 now_ms: 0,
@@ -523,6 +552,19 @@ mod tests {
                 fp.to_bytes().as_slice(),
                 account.to_bytes().as_slice(),
                 fp.to_bytes().as_slice()
+            ],
+        )
+        .unwrap();
+    }
+
+    fn seed_incarnation(conn: &rusqlite::Connection) {
+        conn.execute(
+            "INSERT INTO account_repo_incarnation_current(
+                 account_id, repository_id, state, incarnation_ref
+             ) VALUES (?1, 'repo', 'current', ?2)",
+            rusqlite::params![
+                AccountId::from_bytes([42; 32]).to_bytes().as_slice(),
+                [0x44u8; 32].as_slice()
             ],
         )
         .unwrap();
@@ -691,7 +733,7 @@ mod tests {
         let second = a.produce();
 
         // A second successor of the genesis, signed by the same device — an equivocation.
-        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), "demo/1");
+        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), [0x44; 32], "demo/1");
         let genesis_hash: [u8; 32] = a
             .conn
             .query_row(
@@ -829,7 +871,7 @@ mod tests {
         a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
         let winner = a.produce();
 
-        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), "demo/1");
+        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), [0x44; 32], "demo/1");
         let genesis_hash: [u8; 32] = a
             .conn
             .query_row(
@@ -906,7 +948,7 @@ mod tests {
         a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
         let successor = a.produce();
 
-        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), "demo/1");
+        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), [0x44; 32], "demo/1");
         let genesis_hash: [u8; 32] = a
             .conn
             .query_row(
@@ -984,7 +1026,7 @@ mod tests {
             .unwrap();
 
         // Device C signs an entry citing A's hash — a cross-chain link.
-        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), "demo/1");
+        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), [0x44; 32], "demo/1");
         let cross = entry::sign_entry_from_op_bytes(
             c.local.secret(),
             stream,
@@ -1042,7 +1084,7 @@ mod tests {
         a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
         let winner = a.produce();
 
-        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), "demo/1");
+        let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), [0x44; 32], "demo/1");
         let genesis_hash: [u8; 32] = a
             .conn
             .query_row(
@@ -1104,6 +1146,42 @@ mod tests {
         assert!(b.produce().is_empty(), "a received row never echoes back");
         // And the author does not re-emit its own already-published row.
         assert!(a.produce().is_empty(), "a published row is not re-authored");
+    }
+
+    #[test]
+    fn old_incarnation_offer_is_rejected_before_any_chain_or_projection_storage() {
+        let mut old = Device::new();
+        let mut current = Device::new();
+        old.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'old')", []).unwrap();
+        let entries = old.produce();
+
+        current
+            .conn
+            .execute(
+                "UPDATE account_repo_incarnation_current SET incarnation_ref = ?1
+                  WHERE repository_id = 'repo'",
+                [[0x55u8; 32].as_slice()],
+            )
+            .unwrap();
+        enroll_writer(&current.conn, AccountId::from_bytes([42; 32]), old.pubkey().fingerprint());
+        let tx = current.conn.transaction().unwrap();
+        let ctx = SyncCtx {
+            repo_id: "repo",
+            account_id: AccountId::from_bytes([42; 32]),
+            incarnation_ref: [0x55; 32],
+            device: &current.local,
+            registry: REGISTRY,
+            now_ms: 0,
+        };
+        let error = ingest(&tx, &ctx, "demo/1", &entries[0], &old.pubkey()).unwrap_err();
+        assert!(error.to_string().contains("different stream"));
+        for table in ["table_sync_entries", "table_sync_gapped_entries", "sync_row_clocks"] {
+            let count: i64 = tx
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "old history must not enter {table}");
+        }
+        tx.rollback().unwrap();
     }
 
     #[test]
@@ -1255,6 +1333,7 @@ mod tests {
         let setup = || {
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+            seed_incarnation(&conn);
             conn.execute_batch(
                 "CREATE TABLE t_a(id TEXT PRIMARY KEY, v TEXT) STRICT;
                  CREATE TABLE t_b(id TEXT PRIMARY KEY, v TEXT) STRICT;",
@@ -1275,6 +1354,7 @@ mod tests {
             let ctx = SyncCtx {
                 repo_id: "repo",
                 account_id: account,
+                incarnation_ref: [0x44; 32],
                 device: &a_dev,
                 registry: MULTI,
                 now_ms: 0,
@@ -1294,6 +1374,7 @@ mod tests {
             let ctx = SyncCtx {
                 repo_id: "repo",
                 account_id: account,
+                incarnation_ref: [0x44; 32],
                 device: &b_dev,
                 registry: MULTI,
                 now_ms: 0,

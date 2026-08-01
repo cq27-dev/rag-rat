@@ -4,7 +4,7 @@
 //!
 //! Transport-independent. The wire form ([`row_op`]) and the fold/produce pipeline are exercised by
 //! driving two DB connections through an in-process loopback; the iroh transport is a later
-//! milestone that plugs a `/4` sibling stream into `rag-rat-sync` (nothing here depends on it).
+//! milestone that plugs a `/5` sibling stream into `rag-rat-sync` (nothing here depends on it).
 //!
 //! This `mod.rs` is the curated index; the machinery lives in job-focused siblings. The re-export
 //! surface widens as the apply/produce siblings land and force each export.
@@ -19,6 +19,18 @@ mod schema_facts;
 mod scope_stream;
 mod store;
 
+#[cfg(test)]
+pub(crate) use refold::refold_stale_projections_against;
 /// The store-open forward-compat seam: replay entries retained but not projected when they
 /// arrived.
 pub use refold::refold_stale_table_sync_projections;
+#[cfg(test)]
+pub(crate) use registry::{ColumnSpec, TableSpec, ValueType};
+#[cfg(test)]
+pub(crate) use row_op::{Cell, RowOp, TypedValue};
+#[cfg(test)]
+pub(crate) use scope_stream::scope_stream_id;
+#[cfg(test)]
+pub(crate) use store::{
+    PendingReason, author_row_entry, mark_entry_pending, record_stream_context,
+};
