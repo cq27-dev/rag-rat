@@ -131,4 +131,4 @@ pub use storage::{
     owner_control_authority, owner_control_authority_in_snapshot, owner_secrets_authority,
     roster_content_authority, stream_owner_effective, verify_enrollment_device_add,
 };
-pub(crate) use storage::{device_is_effective_writer, stream_owner_account};
+pub(crate) use storage::{device_is_effective_writer, stored_device_pubkeys, stream_owner_account};

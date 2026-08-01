@@ -16,6 +16,8 @@ use rusqlite::Connection;
 
 use crate::auth::{LocalAuth, NodeAuth, PeerAuthorization, PeerCapability};
 use crate::session::{Ingested, SyncStore};
+use crate::table_session::TableSyncStore;
+use crate::table_wire::ManifestItem;
 
 /// Mint this account's signed node binding for `local_node`. A store with no local device yet (a
 /// fresh peer being onboarded) has nothing to prove, so it returns an EMPTY binding rather than
@@ -261,6 +263,104 @@ impl NodeAuth for OplogSyncStore<'_> {
 }
 
 impl NodeAuth for OplogContentSyncStore<'_> {
+    fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
+        local_auth(self.conn, self.account_id, local_node, now_ms)
+    }
+
+    fn authorize(
+        &self,
+        binding: &[u8],
+        remote_node: &[u8; 32],
+        now_ms: i64,
+    ) -> anyhow::Result<PeerAuthorization> {
+        authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
+    }
+}
+
+/// Production adapter for current repo-scoped `/5` table streams.
+pub struct OplogTableSyncStore<'a, F = fn() -> i64> {
+    conn: &'a Connection,
+    account_id: AccountId,
+    now_fn: F,
+}
+
+impl<'a, F: Fn() -> i64> OplogTableSyncStore<'a, F> {
+    pub fn new(conn: &'a Connection, account_id: AccountId, now_fn: F) -> Self {
+        Self { conn, account_id, now_fn }
+    }
+
+    /// Whether this binary currently supports any table stream for this account.
+    pub fn has_streams(&self) -> anyhow::Result<bool> {
+        Ok(!rag_rat_oplog::table_sync_supported_streams(self.conn, self.account_id)?.is_empty())
+    }
+}
+
+fn to_manifest_item(stream: rag_rat_oplog::TableSyncStream) -> ManifestItem {
+    ManifestItem {
+        repo_id: stream.repo_id,
+        incarnation_ref: stream.incarnation_ref,
+        scope_id: stream.scope_id,
+        stream_id: stream.stream_id,
+    }
+}
+
+fn to_oplog_stream(item: &ManifestItem) -> rag_rat_oplog::TableSyncStream {
+    rag_rat_oplog::TableSyncStream {
+        repo_id: item.repo_id.clone(),
+        incarnation_ref: item.incarnation_ref,
+        scope_id: item.scope_id.clone(),
+        stream_id: item.stream_id,
+    }
+}
+
+impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
+    fn account_id(&self) -> [u8; 32] {
+        self.account_id.to_bytes()
+    }
+
+    fn supported_streams(&self) -> anyhow::Result<Vec<ManifestItem>> {
+        Ok(rag_rat_oplog::table_sync_supported_streams(self.conn, self.account_id)?
+            .into_iter()
+            .map(to_manifest_item)
+            .collect())
+    }
+
+    fn validates(&self, item: &ManifestItem) -> anyhow::Result<bool> {
+        rag_rat_oplog::table_sync_validate_stream(
+            self.conn,
+            self.account_id,
+            &to_oplog_stream(item),
+        )
+    }
+
+    fn snapshot(&self, item: &ManifestItem) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+        Ok(rag_rat_oplog::table_sync_entries_for_stream(
+            self.conn,
+            self.account_id,
+            &to_oplog_stream(item),
+        )?
+        .into_iter()
+        .map(|bytes| (rag_rat_oplog::table_sync_signed_hash(&bytes), bytes))
+        .collect())
+    }
+
+    fn ingest(&mut self, item: &ManifestItem, signed_bytes: &[u8]) -> anyhow::Result<Ingested> {
+        Ok(
+            match rag_rat_oplog::table_sync_ingest(
+                self.conn,
+                self.account_id,
+                &to_oplog_stream(item),
+                signed_bytes,
+                (self.now_fn)(),
+            )? {
+                rag_rat_oplog::TableSyncIngestOutcome::Stored => Ingested::Stored,
+                rag_rat_oplog::TableSyncIngestOutcome::NoChange => Ingested::NoChange,
+            },
+        )
+    }
+}
+
+impl<F> NodeAuth for OplogTableSyncStore<'_, F> {
     fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
         local_auth(self.conn, self.account_id, local_node, now_ms)
     }

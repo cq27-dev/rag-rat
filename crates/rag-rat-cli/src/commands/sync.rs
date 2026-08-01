@@ -110,10 +110,11 @@ struct InviteMint {
 }
 
 /// Run a headless store-and-forward peer for this account's op log: bind the sync endpoint over the
-/// configured relay and replicate with peers the roster authorizes. Serves BOTH streams a peer may
-/// negotiate — the account log (`SYNC_ALPN`) and `/3` content (`CONTENT_SYNC_ALPN`) — routing
+/// configured relay and replicate with peers the roster authorizes. Serves every stream a peer may
+/// negotiate — the account log (`SYNC_ALPN`), `/3` content (`CONTENT_SYNC_ALPN`), and repo-scoped
+/// `/5` tables (`TABLE_SYNC_ALPN`) — routing
 /// each connection by its ALPN. Runs until interrupted; `once` serves a single connection (one
-/// stream), so a full account+content sync a device drives needs two connections.
+/// stream), so a full sync requires one connection per supported ALPN.
 fn serve(config: &Config, once: bool) -> anyhow::Result<()> {
     serve_with(config, once, None)
 }
@@ -524,11 +525,12 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             Err(error) => return Err(anyhow!("enrollment failed: {error}")),
         }
 
-        // 2) Restore-from-zero — pull the account log then `/3` content from the inviter, now that
-        //    this device is roster-effective. Content rides on the account log's authority, so the
-        //    account log runs first. Each stream reconciles to a fixpoint (#878): a single session
-        //    can report `Done` while the store is still incomplete, so re-run until dry (or the
-        //    round cap). The inviter must still be serving (its `sync init` / `serve`).
+        // 2) Restore-from-zero — pull the account log, `/3` content, then supported `/5` table
+        //    streams from the inviter, now that this device is roster-effective. Content rides on
+        //    the account log's authority, so the account log runs first. Each stream reconciles to
+        //    a fixpoint (#878): a single session can report `Done` while the store is still
+        //    incomplete, so re-run until dry (or the round cap). The inviter must still be serving
+        //    (its `sync init` / `serve`).
         let account_report = {
             let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
             rag_rat_sync::connect_and_reconcile(
@@ -547,7 +549,7 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             let mut store = OplogContentSyncStore::new(conn, account_id, time::now_ms);
             rag_rat_sync::connect_and_reconcile(
                 &endpoint,
-                peer,
+                peer.clone(),
                 rag_rat_sync::CONTENT_SYNC_ALPN,
                 &mut store,
                 AuthPolicy::Closed,
@@ -556,6 +558,23 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             )
             .await
             .map_err(|e| anyhow!("restoring content from the inviter failed: {e}"))?
+        };
+        let tables_converged = {
+            let mut store = rag_rat_sync::OplogTableSyncStore::new(conn, account_id, time::now_ms);
+            if store.has_streams()? {
+                rag_rat_sync::connect_and_table_reconcile(
+                    &endpoint,
+                    peer,
+                    &mut store,
+                    time::now_ms,
+                    rag_rat_sync::MAX_RECONCILE_ROUNDS,
+                )
+                .await
+                .map_err(|e| anyhow!("restoring table streams from the inviter failed: {e}"))?
+                .converged
+            } else {
+                true
+            }
         };
         db.fold_wal();
 
@@ -573,7 +592,9 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             "content_entries_restored": content_report.entries_newly_stored,
             // `converged=false` means the restore hit the reconciliation round cap and a later
             // device-side sync should continue — the account/content stores may not be complete yet.
-            "converged": account_report.converged && content_report.converged,
+            "converged": account_report.converged
+                && content_report.converged
+                && tables_converged,
             "inviter_node_id": inviter,
             "inviter_relay": ticket.relay_url,
             "note": "to keep syncing, add inviter_node_id to [sync] server_peers and set [sync] \
@@ -728,7 +749,8 @@ pub(crate) fn device_sync_run(
         let peers = resolved.peers;
         let mut reached = Vec::with_capacity(peers.len());
         for (peer, addr) in &peers {
-            // Own a copy of the resolved address: it is dialed twice (account log, then content),
+            // Own a copy of the resolved address: it is dialed in dependency order (account log,
+            // content, then any supported table streams),
             // and `addr` is a borrow into `peers`.
             let addr = (*addr).clone();
             // Account log FIRST — it carries the roster + stream ownership that AUTHORIZE content,
@@ -775,7 +797,7 @@ pub(crate) fn device_sync_run(
                 let mut store = OplogContentSyncStore::new(conn, account_id, time::now_ms);
                 match rag_rat_sync::connect_and_reconcile(
                     &endpoint,
-                    addr,
+                    addr.clone(),
                     rag_rat_sync::CONTENT_SYNC_ALPN,
                     &mut store,
                     AuthPolicy::Closed,
@@ -793,6 +815,33 @@ pub(crate) fn device_sync_run(
                         "device sync (content) complete"
                     ),
                     Err(e) => tracing::warn!(peer, error = %e, "device sync (content) failed"),
+                }
+                let mut table_store =
+                    rag_rat_sync::OplogTableSyncStore::new(conn, account_id, time::now_ms);
+                if table_store.has_streams()? {
+                    match rag_rat_sync::connect_and_table_reconcile(
+                        &endpoint,
+                        addr,
+                        &mut table_store,
+                        time::now_ms,
+                        rag_rat_sync::MAX_RECONCILE_ROUNDS,
+                    )
+                    .await
+                    {
+                        Ok(report) => tracing::info!(
+                            peer,
+                            rounds = report.rounds,
+                            converged = report.converged,
+                            sent = report.entries_sent,
+                            stored = report.entries_newly_stored,
+                            "device sync (table streams) complete"
+                        ),
+                        Err(e) => tracing::warn!(
+                            peer,
+                            error = %e,
+                            "device sync (table streams) failed"
+                        ),
+                    }
                 }
             }
             reached.push(account_ok);

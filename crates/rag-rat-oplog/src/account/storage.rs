@@ -2202,7 +2202,7 @@ pub(in crate::account) fn refresh_enrollment_reservations_for_stream_in_tx(
 /// The `(fingerprint → ed25519_pubkey)` map from every stored genesis / DeviceAdd for the account —
 /// the only ops that carry a device's key. Fold-status-independent (§16.2): a key resolves from ANY
 /// stored candidate carrying it, whether or not it is currently accepted.
-pub(super) fn stored_device_pubkeys(
+pub(crate) fn stored_device_pubkeys(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<HashMap<DeviceFingerprint, [u8; 32]>> {

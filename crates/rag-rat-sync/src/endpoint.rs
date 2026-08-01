@@ -41,6 +41,10 @@ use crate::enrollment::{
 };
 use crate::session::{DEFAULT_IDLE_TIMEOUT, SessionError, SessionReport, SyncStore, run_session};
 use crate::store::OplogSyncStore;
+use crate::table_session::{
+    TableSessionError, TableSessionReport, TableSyncStore, run_table_session,
+};
+use crate::table_wire::TABLE_SYNC_ALPN;
 use crate::wire::{CONTENT_SYNC_ALPN, SYNC_ALPN};
 
 /// Endpoint construction or connection setup failed, before a session could run.
@@ -85,7 +89,12 @@ pub async fn build_endpoint(
     let relay_url =
         RelayUrl::from_str(relay_url.trim()).map_err(|e| EndpointError::RelayUrl(e.to_string()))?;
     Endpoint::builder(presets::Minimal)
-        .alpns(vec![SYNC_ALPN.to_vec(), CONTENT_SYNC_ALPN.to_vec(), ENROLL_ALPN.to_vec()])
+        .alpns(vec![
+            SYNC_ALPN.to_vec(),
+            CONTENT_SYNC_ALPN.to_vec(),
+            TABLE_SYNC_ALPN.to_vec(),
+            ENROLL_ALPN.to_vec(),
+        ])
         .relay_mode(RelayMode::custom([relay_url]))
         .secret_key(SecretKey::from_bytes(&secret_key))
         .bind()
@@ -157,7 +166,7 @@ pub struct DiscoveredPeers {
 /// [`iroh::EndpointId::from_str`] accepts 64-char lowercase hex (the `Display` form) OR standard
 /// base32, and uppercases before base32-decoding, so three distinct strings can name one peer —
 /// while the config layer only trims and de-duplicates literally. Comparing strings would dial such
-/// a peer twice per pass (two full two-ALPN reconciles) and double-count it in `ok`/`errors`.
+/// a peer twice per pass (two full multi-ALPN reconciles) and double-count it in `ok`/`errors`.
 pub async fn discover_peers(
     configured_peers: &[String],
     relay_url: &str,
@@ -462,6 +471,48 @@ pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
     Ok(report)
 }
 
+/// Dial the dedicated table-sync ALPN, run the existing mutual account auth under closed-roster
+/// policy, then reconcile the bounded manifest intersection.
+pub async fn connect_and_table_sync<S: TableSyncStore + NodeAuth>(
+    endpoint: &Endpoint,
+    peer: impl Into<EndpointAddr>,
+    store: &mut S,
+    now_ms: i64,
+) -> Result<TableSessionReport, SyncFailure> {
+    let local_node = *endpoint.id().as_bytes();
+    let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, TABLE_SYNC_ALPN))
+        .await
+        .map_err(|_| {
+            SyncFailure::Endpoint(EndpointError::Connect("table-sync dial timed out".into()))
+        })?
+        .map_err(|error| SyncFailure::Endpoint(EndpointError::Connect(error.to_string())))?;
+    let remote_node = *conn.remote_id().as_bytes();
+    let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.open_bi())
+        .await
+        .map_err(|_| {
+            SyncFailure::Endpoint(EndpointError::Connect(
+                "opening a table-sync stream timed out".into(),
+            ))
+        })?
+        .map_err(|error| SyncFailure::Endpoint(EndpointError::Connect(error.to_string())))?;
+    let capabilities = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
+        role: AuthRole::Dialer,
+        account_id: store.account_id(),
+        local_node,
+        remote_node,
+        policy: AuthPolicy::Closed,
+        now_ms,
+        pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+    })
+    .await
+    .map_err(SyncFailure::Auth)?;
+    let report = run_table_session(store, send, recv, AuthRole::Dialer, capabilities)
+        .await
+        .map_err(SyncFailure::TableSession)?;
+    conn.close(0u32.into(), b"done");
+    Ok(report)
+}
+
 /// The most times a dialer re-runs a sync session against ONE peer before giving up on convergence
 /// for this pass. A cooperative account reaches a fixpoint in a handful of rounds; a peer still not
 /// dry after this many re-syncs is withholding an authorizer or is pathologically active, so stop
@@ -548,6 +599,33 @@ pub async fn connect_and_reconcile<S: SyncStore + NodeAuth>(
     }
 }
 
+/// Re-run table sessions until the same fully-quiet fixpoint used by account/content sync.
+pub async fn connect_and_table_reconcile<S: TableSyncStore + NodeAuth>(
+    endpoint: &Endpoint,
+    peer: EndpointAddr,
+    store: &mut S,
+    now_ms: impl Fn() -> i64,
+    max_rounds: usize,
+) -> Result<ReconcileReport, SyncFailure> {
+    let mut entries_newly_stored = 0;
+    let mut entries_sent = 0;
+    let mut rounds = 0;
+    loop {
+        let report = connect_and_table_sync(endpoint, peer.clone(), store, now_ms()).await?;
+        rounds += 1;
+        entries_newly_stored += report.entries_newly_stored;
+        entries_sent += report.entries_sent;
+        let session = SessionReport {
+            entries_sent: report.entries_sent,
+            entries_received: report.entries_received,
+            entries_newly_stored: report.entries_newly_stored,
+        };
+        if let ReconcileStep::Stop { converged } = reconcile_step(&session, rounds, max_rounds) {
+            return Ok(ReconcileReport { rounds, entries_newly_stored, entries_sent, converged });
+        }
+    }
+}
+
 /// Accept ONE inbound connection and run a session against it. D4's `sync serve` loops this;
 /// keeping it single-shot here keeps the store's `!Send` connection on one task (no spawn).
 ///
@@ -618,7 +696,8 @@ pub async fn accept_and_sync<S: SyncStore + NodeAuth>(
 
 /// Accept ONE inbound connection and run the session for the STREAM the peer negotiated: the
 /// account log ([`SYNC_ALPN`] → `account_store`), `/3` content ([`CONTENT_SYNC_ALPN`] →
-/// `content_store`), or owner-side enrollment ([`ENROLL_ALPN`] → the account store's database).
+/// `content_store`), repo-scoped `/5` tables ([`TABLE_SYNC_ALPN`]), or owner-side enrollment
+/// ([`ENROLL_ALPN`] → the account store's database).
 /// The auth phase is account-level for normal sync; enrollment instead authenticates the requested
 /// node by the QUIC transport identity and atomically adds it to the roster before normal auth can
 /// admit it.
@@ -654,11 +733,12 @@ where
     let alpn = conn.alpn().to_vec();
     // Reject an unroutable ALPN BEFORE opening a stream or running auth — there is no reason to
     // complete a mutual handshake for a stream we can't serve. Unreachable today (iroh's TLS
-    // refuses any ALPN `build_endpoint` didn't bind, and it binds exactly the two routed ones),
-    // but keeping the check ahead of auth means adding a third bound ALPN without a route here
+    // refuses any ALPN `build_endpoint` didn't bind, and it binds exactly the routed ones), but
+    // keeping the check ahead of auth means adding another bound ALPN without a route here
     // fails cleanly here instead of after the peer has completed authorization.
     if alpn.as_slice() != SYNC_ALPN
         && alpn.as_slice() != CONTENT_SYNC_ALPN
+        && alpn.as_slice() != TABLE_SYNC_ALPN
         && alpn.as_slice() != ENROLL_ALPN
     {
         conn.close(0u32.into(), b"unknown-alpn");
@@ -697,7 +777,7 @@ where
         };
     }
     // Read the clock only now that a peer has connected (see `accept_and_sync`).
-    let now_ms = now_ms();
+    let auth_now_ms = now_ms();
     // The auth phase is store-agnostic (the binding is account-level), so authorize with the
     // account store BEFORE any inventory — no stream leaves this peer until it passes the policy.
     let capabilities = run_auth_phase(&mut send, &mut recv, &*account_store, AuthConfig {
@@ -705,20 +785,40 @@ where
         account_id: account_store.account_id(),
         local_node,
         remote_node,
-        policy,
-        now_ms,
+        // Table streams are private account data. Open/bootstrap admission is only for restoring
+        // the account log; it can never reveal a table manifest.
+        policy: if alpn.as_slice() == TABLE_SYNC_ALPN { AuthPolicy::Closed } else { policy },
+        now_ms: auth_now_ms,
         pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
     })
     .await
     .map_err(SyncFailure::Auth)?;
-    // Route the session to the store the negotiated ALPN names (validated to be one of the two
-    // routed ALPNs above, so the `else` is the content stream, not an unknown-ALPN fallthrough).
+    // Route the session to the store the negotiated ALPN names (validated above, so the final
+    // `else` is the table stream, not an unknown-ALPN fallthrough).
     let report = if alpn.as_slice() == SYNC_ALPN {
-        run_session(account_store, send, recv, AuthRole::Acceptor, capabilities).await
+        run_session(account_store, send, recv, AuthRole::Acceptor, capabilities)
+            .await
+            .map_err(SyncFailure::Session)?
+    } else if alpn.as_slice() == CONTENT_SYNC_ALPN {
+        run_session(content_store, send, recv, AuthRole::Acceptor, capabilities)
+            .await
+            .map_err(SyncFailure::Session)?
     } else {
-        run_session(content_store, send, recv, AuthRole::Acceptor, capabilities).await
-    }
-    .map_err(SyncFailure::Session)?;
+        let mut table_store = crate::store::OplogTableSyncStore::new(
+            account_store.connection(),
+            AccountId::from_bytes(account_store.account_id()),
+            now_ms,
+        );
+        let table =
+            run_table_session(&mut table_store, send, recv, AuthRole::Acceptor, capabilities)
+                .await
+                .map_err(SyncFailure::TableSession)?;
+        SessionReport {
+            entries_sent: table.entries_sent,
+            entries_received: table.entries_received,
+            entries_newly_stored: table.entries_newly_stored,
+        }
+    };
     // Keep the acceptor alive until the dialer reads its final acknowledgement and closes.
     let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
     conn.close(0u32.into(), b"done");
@@ -746,6 +846,7 @@ pub enum SyncFailure {
     /// The node-authorization handshake refused the peer (or we could not authorize to it).
     Auth(crate::auth::AuthError),
     Session(SessionError),
+    TableSession(TableSessionError),
 }
 
 impl std::fmt::Display for SyncFailure {
@@ -755,6 +856,7 @@ impl std::fmt::Display for SyncFailure {
             SyncFailure::Enrollment(e) => write!(f, "{e}"),
             SyncFailure::Auth(e) => write!(f, "{e}"),
             SyncFailure::Session(e) => write!(f, "{e}"),
+            SyncFailure::TableSession(e) => write!(f, "{e}"),
         }
     }
 }
@@ -851,7 +953,7 @@ mod tests {
     /// `EndpointId::from_str` takes 64-char lowercase hex OR standard base32, and uppercases before
     /// base32-decoding — so three strings name one node, while `[sync] server_peers` only
     /// de-duplicates literally. Comparing display strings would dial this peer three times per pass
-    /// (each a full two-ALPN reconcile) and triple-count it in `ok`/`errors`.
+    /// (each a full multi-ALPN reconcile) and triple-count it in `ok`/`errors`.
     #[tokio::test]
     async fn discover_peers_dedupes_configured_spellings_of_one_node() {
         let bytes = node_id_from_secret([11u8; 32]);
@@ -953,8 +1055,107 @@ mod tests {
         }
     }
 
+    struct TableTestStore {
+        auth: TestStore,
+        supported: Vec<crate::table_wire::ManifestItem>,
+        entries: HashMap<[u8; 32], HashMap<[u8; 32], Vec<u8>>>,
+    }
+
+    impl TableTestStore {
+        fn new(
+            account: [u8; 32],
+            supported: Vec<crate::table_wire::ManifestItem>,
+            entries: impl IntoIterator<Item = ([u8; 32], ([u8; 32], Vec<u8>))>,
+        ) -> Self {
+            let mut by_stream: HashMap<_, HashMap<_, _>> = HashMap::new();
+            for (stream, (hash, bytes)) in entries {
+                by_stream.entry(stream).or_default().insert(hash, bytes);
+            }
+            Self {
+                auth: TestStore::new(
+                    account,
+                    [],
+                    PeerCapability::ReadWrite,
+                    PeerCapability::ReadWrite,
+                ),
+                supported,
+                entries: by_stream,
+            }
+        }
+    }
+
+    impl TableSyncStore for TableTestStore {
+        fn account_id(&self) -> [u8; 32] {
+            self.auth.account
+        }
+
+        fn supported_streams(&self) -> anyhow::Result<Vec<crate::table_wire::ManifestItem>> {
+            Ok(self.supported.clone())
+        }
+
+        fn validates(&self, item: &crate::table_wire::ManifestItem) -> anyhow::Result<bool> {
+            Ok(self.supported.contains(item))
+        }
+
+        fn snapshot(
+            &self,
+            item: &crate::table_wire::ManifestItem,
+        ) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+            Ok(self
+                .entries
+                .get(&item.stream_id)
+                .into_iter()
+                .flatten()
+                .map(|(hash, bytes)| (*hash, bytes.clone()))
+                .collect())
+        }
+
+        fn ingest(
+            &mut self,
+            item: &crate::table_wire::ManifestItem,
+            signed_bytes: &[u8],
+        ) -> anyhow::Result<crate::session::Ingested> {
+            if !self.supported.contains(item) {
+                return Ok(crate::session::Ingested::NoChange);
+            }
+            let hash: [u8; 32] = signed_bytes[..32].try_into()?;
+            Ok(match self.entries.entry(item.stream_id).or_default().entry(hash) {
+                std::collections::hash_map::Entry::Occupied(_) =>
+                    crate::session::Ingested::NoChange,
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(signed_bytes.to_vec());
+                    crate::session::Ingested::Stored
+                },
+            })
+        }
+    }
+
+    impl NodeAuth for TableTestStore {
+        fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
+            self.auth.local_auth(local_node, now_ms)
+        }
+
+        fn authorize(
+            &self,
+            binding: &[u8],
+            remote_node: &[u8; 32],
+            now_ms: i64,
+        ) -> anyhow::Result<PeerAuthorization> {
+            self.auth.authorize(binding, remote_node, now_ms)
+        }
+    }
+
     fn test_entry(seed: u8) -> ([u8; 32], Vec<u8>) {
         ([seed; 32], vec![seed; 40])
+    }
+
+    fn table_item(repo: &str, stream: u8) -> crate::table_wire::ManifestItem {
+        crate::table_wire::ManifestItem {
+            repo_id: repo.into(),
+            incarnation_ref: [1; 32],
+            scope_id: "anchors/1".into(),
+            stream_id: [stream; 32],
+        }
     }
 
     fn local_request(database: &Connection) -> EnrollmentRequest {
@@ -1033,7 +1234,12 @@ mod tests {
     async fn loopback_endpoints() -> (Endpoint, Endpoint) {
         let bind = |seed: [u8; 32]| async move {
             Endpoint::builder(presets::Minimal)
-                .alpns(vec![SYNC_ALPN.to_vec(), CONTENT_SYNC_ALPN.to_vec(), ENROLL_ALPN.to_vec()])
+                .alpns(vec![
+                    SYNC_ALPN.to_vec(),
+                    CONTENT_SYNC_ALPN.to_vec(),
+                    TABLE_SYNC_ALPN.to_vec(),
+                    ENROLL_ALPN.to_vec(),
+                ])
                 .relay_mode(RelayMode::Disabled)
                 .secret_key(SecretKey::from_bytes(&seed))
                 .bind()
@@ -1052,6 +1258,98 @@ mod tests {
             .port();
         EndpointAddr::new(endpoint.id())
             .with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+    }
+
+    async fn accept_test_table_sync(
+        endpoint: &Endpoint,
+        store: &mut TableTestStore,
+    ) -> TableSessionReport {
+        let incoming = endpoint.accept().await.unwrap();
+        let conn = incoming.await.unwrap();
+        assert_eq!(conn.alpn(), TABLE_SYNC_ALPN);
+        let local_node = *endpoint.id().as_bytes();
+        let remote_node = *conn.remote_id().as_bytes();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        let capabilities = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
+            role: AuthRole::Acceptor,
+            account_id: store.account_id(),
+            local_node,
+            remote_node,
+            policy: AuthPolicy::Closed,
+            now_ms: NOW,
+            pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+        })
+        .await
+        .unwrap();
+        let report =
+            run_table_session(store, send, recv, AuthRole::Acceptor, capabilities).await.unwrap();
+        let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
+        conn.close(0u32.into(), b"done");
+        report
+    }
+
+    async fn reconcile_test_tables(
+        listener: &Endpoint,
+        dialer: &Endpoint,
+        source: &mut TableTestStore,
+        destination: &mut TableTestStore,
+    ) -> ReconcileReport {
+        let client = connect_and_table_reconcile(
+            dialer,
+            direct_addr(listener),
+            destination,
+            || NOW,
+            MAX_RECONCILE_ROUNDS,
+        );
+        tokio::pin!(client);
+        loop {
+            tokio::select! {
+                report = &mut client => break report.unwrap(),
+                _ = accept_test_table_sync(listener, source) => {},
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn table_reconcile_transfers_only_the_scoped_intersection_over_iroh() {
+        let account = [0xa3; 32];
+        let shared = table_item("repo-shared", 1);
+        let source_only = table_item("repo-source", 2);
+        let destination_only = table_item("repo-destination", 3);
+        let shared_entry = test_entry(11);
+        let private_entry = test_entry(12);
+        let dialer_entry = test_entry(13);
+        let mut source = TableTestStore::new(account, vec![source_only.clone(), shared.clone()], [
+            (shared.stream_id, shared_entry.clone()),
+            (source_only.stream_id, private_entry),
+        ]);
+        let mut destination = TableTestStore::new(
+            account,
+            vec![shared.clone(), destination_only],
+            [(shared.stream_id, dialer_entry.clone())],
+        );
+        let (listener, dialer) = loopback_endpoints().await;
+
+        let report = reconcile_test_tables(&listener, &dialer, &mut source, &mut destination).await;
+        assert_eq!(report.rounds, 2, "one round transfers, one confirms the fixpoint");
+        assert!(report.converged);
+        assert_eq!(report.entries_newly_stored, 1);
+        assert_eq!(report.entries_sent, 1);
+        assert_eq!(destination.entries[&shared.stream_id][&shared_entry.0], shared_entry.1);
+        assert_eq!(
+            source.entries[&shared.stream_id][&dialer_entry.0], dialer_entry.1,
+            "the acceptor stores the dialer's push before the dialer closes",
+        );
+        assert!(
+            !destination.entries.contains_key(&source_only.stream_id),
+            "a repo outside the manifest intersection never crosses the connection",
+        );
+
+        let again = reconcile_test_tables(&listener, &dialer, &mut source, &mut destination).await;
+        assert_eq!(again.rounds, 1, "an idempotent replay is immediately quiet");
+        assert!(again.converged);
+        assert_eq!(again.entries_newly_stored, 0);
+        assert_eq!(again.entries_sent, 0);
     }
 
     #[tokio::test]

@@ -22,6 +22,9 @@ pub mod endpoint;
 pub mod enrollment;
 pub mod session;
 pub mod store;
+pub mod table_codec;
+pub mod table_session;
+pub mod table_wire;
 pub mod wire;
 
 pub use auth::{
@@ -31,8 +34,9 @@ pub use auth::{
 pub use endpoint::{
     DiscoveredPeers, EndpointError, MAX_RECONCILE_ROUNDS, ReconcileReport, SyncFailure,
     accept_and_dispatch, accept_and_sync, accept_enrollment, build_endpoint, connect_and_enroll,
-    connect_and_reconcile, connect_and_sync, discover_peers, endpoint_addr, node_id_from_secret,
-    node_id_to_string, peer_addr, peer_addr_from_bytes,
+    connect_and_reconcile, connect_and_sync, connect_and_table_reconcile, connect_and_table_sync,
+    discover_peers, endpoint_addr, node_id_from_secret, node_id_to_string, peer_addr,
+    peer_addr_from_bytes,
 };
 pub use enrollment::{
     ENROLL_ALPN, EnrollmentReceipt, EnrollmentRequest, EnrollmentTicket, InviteError, InviteSpec,
@@ -48,5 +52,7 @@ pub use session::{
     DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES, SessionError, SessionReport, SyncStore,
     run_session, run_session_with_idle_timeout,
 };
-pub use store::{OplogContentSyncStore, OplogSyncStore};
+pub use store::{OplogContentSyncStore, OplogSyncStore, OplogTableSyncStore};
+pub use table_session::{TableSessionError, TableSessionReport, TableSyncStore, run_table_session};
+pub use table_wire::{Manifest, ManifestItem, TABLE_SYNC_ALPN, TableFrame, TableWireError};
 pub use wire::{CONTENT_SYNC_ALPN, Frame, SYNC_ALPN, WireError};

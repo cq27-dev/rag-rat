@@ -651,10 +651,15 @@ async fn a_real_iroh_round_trip_restores_content_via_alpn_dispatch() {
 /// 127.0.0.1 socket address — a relay-free transport so the pairing drill runs in CI, unlike the
 /// `#[ignore]` live tests that dial over a real relay.
 async fn loopback_endpoints() -> (iroh::Endpoint, iroh::Endpoint) {
-    use rag_rat_sync::{CONTENT_SYNC_ALPN, ENROLL_ALPN, SYNC_ALPN};
+    use rag_rat_sync::{CONTENT_SYNC_ALPN, ENROLL_ALPN, SYNC_ALPN, TABLE_SYNC_ALPN};
     let bind = |seed: [u8; 32]| async move {
         iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .alpns(vec![SYNC_ALPN.to_vec(), CONTENT_SYNC_ALPN.to_vec(), ENROLL_ALPN.to_vec()])
+            .alpns(vec![
+                SYNC_ALPN.to_vec(),
+                CONTENT_SYNC_ALPN.to_vec(),
+                TABLE_SYNC_ALPN.to_vec(),
+                ENROLL_ALPN.to_vec(),
+            ])
             .relay_mode(iroh::RelayMode::Disabled)
             .secret_key(iroh::SecretKey::from_bytes(&seed))
             .bind()
@@ -674,6 +679,92 @@ fn direct_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
         .port();
     iroh::EndpointAddr::new(endpoint.id())
         .with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+}
+
+#[tokio::test]
+async fn empty_production_table_registry_negotiates_zero_streams_through_dispatch() {
+    use rag_rat_sync::{
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,
+        accept_and_dispatch, connect_and_table_sync,
+    };
+
+    let owner = fresh_db();
+    let account = local_account(&owner, NOW).unwrap();
+    let joiner = fresh_db();
+    let (owner_endpoint, joiner_endpoint) = loopback_endpoints().await;
+    enroll_member_over_endpoint(
+        &owner_endpoint,
+        &joiner_endpoint,
+        &owner,
+        &joiner,
+        account,
+        "https://relay.example",
+    )
+    .await;
+
+    let mut account_store = OplogSyncStore::new(&owner, account, || NOW);
+    let mut content_store = OplogContentSyncStore::new(&owner, account, || NOW);
+    let mut table_store = OplogTableSyncStore::new(&joiner, account, || NOW);
+    assert!(!table_store.has_streams().unwrap(), "the production registry stays empty");
+    let server = accept_and_dispatch(
+        &owner_endpoint,
+        &mut account_store,
+        &mut content_store,
+        AuthPolicy::Closed,
+        || NOW,
+    );
+    let client = connect_and_table_sync(
+        &joiner_endpoint,
+        direct_addr(&owner_endpoint),
+        &mut table_store,
+        NOW,
+    );
+    let (server, client) = tokio::join!(server, client);
+    let (alpn, server_report) = server.unwrap();
+    let client_report = client.unwrap();
+    assert_eq!(alpn, TABLE_SYNC_ALPN);
+    assert_eq!(server_report, rag_rat_sync::SessionReport::default());
+    assert_eq!(client_report, rag_rat_sync::TableSessionReport::default());
+}
+
+#[tokio::test]
+async fn closed_table_auth_refusal_reveals_no_manifest() {
+    use rag_rat_sync::{AuthPolicy, Frame, OplogContentSyncStore, TABLE_SYNC_ALPN};
+    use tokio::io::AsyncReadExt;
+
+    let owner = fresh_db();
+    let account = local_account(&owner, NOW).unwrap();
+    let (owner_endpoint, stranger_endpoint) = loopback_endpoints().await;
+    let mut account_store = OplogSyncStore::new(&owner, account, || NOW);
+    let mut content_store = OplogContentSyncStore::new(&owner, account, || NOW);
+
+    let server = rag_rat_sync::accept_and_dispatch(
+        &owner_endpoint,
+        &mut account_store,
+        &mut content_store,
+        // Even an Open account-log endpoint must force Closed semantics for table streams.
+        AuthPolicy::Open,
+        || NOW,
+    );
+    let client = async {
+        let conn =
+            stranger_endpoint.connect(direct_addr(&owner_endpoint), TABLE_SYNC_ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        rag_rat_sync::codec::write_frame(&mut send, &Frame::Auth {
+            account_id: account.to_bytes(),
+            binding: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let revealed =
+            tokio::time::timeout(std::time::Duration::from_secs(1), recv.read_u8()).await;
+        assert!(
+            !matches!(revealed, Ok(Ok(_))),
+            "an unauthorized peer must receive no application bytes"
+        );
+    };
+    let (server, ()) = tokio::join!(server, client);
+    assert!(matches!(server, Err(rag_rat_sync::SyncFailure::Auth(_))));
 }
 
 /// Multi-round reconciliation (#878): `connect_and_reconcile` re-dials until a round is dry, so a
