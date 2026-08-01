@@ -381,7 +381,9 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // 14: #567 — the scope surfaces split in two, so a source-written path keeps the owner's pointer
 // wrapper while an inferred receiver still peels it; which definition a call resolves to changes.
 // Same reasoning as 13: an index stamped 13 by an interim build would never re-resolve.
-const GRAPH_INDEX_VERSION: &str = "14";
+// 15: Generic Rust method calls retain receiver inference through the turbofish wrapper; re-extract
+// `receiver_type_hint_id` so deployed indexes do not keep those calls untyped.
+const GRAPH_INDEX_VERSION: &str = "15";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
 // on next open. Incremental discovery only rewrites a file row when its sha/language/kind changes —

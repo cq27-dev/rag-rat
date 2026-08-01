@@ -1400,6 +1400,35 @@ fn rust_receiver_fallback_rejects_unjustified_owners() {
 }
 
 #[test]
+fn an_untyped_rust_value_receiver_never_uses_bare_name_fallback() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "src/free.rs::run".to_string();
+    run.scope_path = "run".to_string();
+    let symbols = [run];
+    let index = SymbolIndex::build(&symbols);
+    let request = |target_qualified_name, receiver_hint| ResolveSymbolRequest {
+        name: "run",
+        target_qualified_name,
+        edge_kind: EdgeKind::CallsName,
+        evidence: Some("factory().run()"),
+        receiver_hint,
+        receiver_type: None,
+        source_file_id: 1,
+        source_language: Some(Language::Rust.as_str()),
+        imported_external: false,
+        receiver_package: None,
+        file_package: no_packages(),
+    };
+
+    assert!(resolve_symbol(request(Some("factory()::run"), Some("factory()")), &index).is_none());
+    assert!(
+        resolve_symbol(request(None, None), &index).is_some(),
+        "a genuinely bare call keeps the existing fallback"
+    );
+}
+
+#[test]
 fn projected_self_path_never_falls_back_to_the_impl_owner() {
     let mut run = preferred_candidate(1, Language::Rust, "function");
     run.name = "run".to_string();

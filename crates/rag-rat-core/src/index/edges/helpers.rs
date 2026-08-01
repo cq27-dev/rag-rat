@@ -160,7 +160,7 @@ fn containing_symbol(symbols: &[IndexedSymbol], byte: usize) -> Option<&IndexedS
 }
 /// A trailing turbofish (`f::<T>`) wraps the callee path in a `generic_function`; unwrap it so the
 /// type arguments' identifiers / byte ranges aren't mistaken for the callee.
-fn unwrap_generic_function(function: Node<'_>) -> Node<'_> {
+pub(crate) fn unwrap_generic_function(function: Node<'_>) -> Node<'_> {
     if function.kind() == "generic_function" {
         function.child_by_field_name("function").unwrap_or(function)
     } else {

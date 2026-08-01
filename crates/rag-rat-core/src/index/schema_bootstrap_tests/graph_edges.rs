@@ -370,8 +370,9 @@ fn a_linked_worktree_keeps_its_own_receiver_hint_and_target() {
     let main = unique_temp_root();
     let _ = fs::remove_dir_all(&main);
     fs::create_dir_all(main.join("src")).unwrap();
-    let base_source = "struct Alpha;\nstruct Beta;\nimpl Alpha { fn run(&self) {} }\nimpl Beta { \
-                       fn run(&self) {} }\nfn call(receiver: Alpha) { receiver.run(); }\n";
+    let base_source = "struct Alpha;\nstruct Beta;\nimpl Alpha { fn run<T>(&self) {} }\nimpl Beta \
+                       { fn run<T>(&self) {} }\nfn call(receiver: Alpha) { receiver.run::<u8>(); \
+                       }\n";
     fs::write(main.join("src/lib.rs"), base_source).unwrap();
     init_git_repo(&main);
     run_git(&main, &["add", "."]);

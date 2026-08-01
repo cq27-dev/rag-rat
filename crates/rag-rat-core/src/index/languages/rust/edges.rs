@@ -249,7 +249,7 @@ pub(super) fn rust_impl_edges(
 }
 
 pub(crate) fn infer_rust_receiver_type_hint(node: Node<'_>, text: &str) -> Option<String> {
-    let function = node.child_by_field_name("function")?;
+    let function = unwrap_generic_function(node.child_by_field_name("function")?);
     match function.kind() {
         // `value.method()` — the receiver is a VALUE, so a local binding of that name is what it
         // names.
@@ -2137,14 +2137,40 @@ mod receiver_type_hint_tests {
     fn concrete_generic_receiver_arguments_are_preserved() {
         let code = r#"
             fn test(first: Foo<u8>, second: Foo<u16>) {
-                first.run();
-                second.run();
+                first.run::<u8>();
+                second.run::<u16>();
             }
         "#;
         assert_eq!(extract_call_hints(code), vec![
             Some("Foo<u8>".to_string()),
             Some("Foo<u16>".to_string()),
         ]);
+    }
+
+    #[test]
+    fn turbofish_dot_calls_keep_receiver_context() {
+        let code = "fn test(worker: Worker) { worker.run::<u8>(); factory().run(); }";
+        let calls = edge_candidates(
+            std::path::Path::new("lib.rs"),
+            rag_rat_base::language::Language::Rust,
+            code,
+            &[],
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|edge| edge.edge_kind == EdgeKind::CallsName && edge.to_name == "run")
+        .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+
+        let typed =
+            calls.iter().find(|edge| edge.receiver_hint.as_deref() == Some("worker")).unwrap();
+        assert_eq!(typed.receiver_type_hint.as_deref(), Some("Worker"));
+        assert_eq!(typed.target_qualified_name.as_deref(), Some("worker::run"));
+
+        let unknown =
+            calls.iter().find(|edge| edge.receiver_hint.as_deref() == Some("factory()")).unwrap();
+        assert_eq!(unknown.receiver_type_hint, None);
+        assert_eq!(unknown.target_qualified_name.as_deref(), Some("factory()::run"));
     }
 
     #[test]
