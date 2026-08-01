@@ -464,9 +464,11 @@ fn remove_quarantined_synced_node(
              SELECT id FROM repo_memories WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced')",
         params![node_id, repo_id],
     )?;
-    tx.execute("DELETE FROM repo_memory_bindings WHERE memory_id = ?1 AND repo_id = ?2", params![
-        node_id, repo_id
-    ])?;
+    tx.execute(
+        "DELETE FROM repo_memory_bindings WHERE repo_id = ?2 AND memory_id IN (
+             SELECT id FROM repo_memories WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced')",
+        params![node_id, repo_id],
+    )?;
     let removed = tx.execute(
         "DELETE FROM repo_memories WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced'",
         params![node_id, repo_id],
@@ -1568,6 +1570,13 @@ mod tests {
         // A locally-authored row (origin='local'), and a projection that would converge it but is
         // invalid.
         insert_local_memory(&conn, "mem_local", "mine", "b", "active");
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, anchor_status, created_at_ms)
+             VALUES (?1, 'mem_local', 'path', 'src/lib.rs', 'src/lib.rs', 'current', 0)",
+            [REPO],
+        )
+        .unwrap();
         seed_projected_node(&conn, stream, "mem_local", "NotAValidKind", "peer", "b", "active", &[
         ]);
 
@@ -1580,6 +1589,16 @@ mod tests {
             memory_by_id(&conn, "mem_local").unwrap().is_some(),
             "the user's local content survives an invalid projected edit",
         );
+        let binding_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM repo_memory_bindings
+                     WHERE repo_id = ?1 AND memory_id = 'mem_local')",
+                [REPO],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(binding_exists, "the local memory's anchors survive with its content");
     }
 
     /// A projected node whose tag exceeds the local 64-byte cap must be quarantined here, not left

@@ -7304,6 +7304,14 @@ pub fn apply_file_graph_version_provenance(conn: &Connection) -> rusqlite::Resul
 /// one non-null local column a deterministic default. Parent cleanup is explicit in the memory
 /// drain after this migration.
 pub fn apply_syncable_memory_bindings(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS memory_bindings_lens_revision_insert;
+         DROP TRIGGER IF EXISTS memory_bindings_lens_revision_delete;
+         DROP TRIGGER IF EXISTS memory_bindings_lens_revision_update;
+         DROP TRIGGER IF EXISTS memory_bindings_lane_revision_insert;
+         DROP TRIGGER IF EXISTS memory_bindings_lane_revision_delete;
+         DROP TRIGGER IF EXISTS memory_bindings_lane_revision_update;",
+    )?;
     if table_is_strict(conn, "repo_memory_bindings")?
         && primary_key_columns(conn, "repo_memory_bindings")?
             == ["repo_id", "memory_id", "binding_kind", "binding_id"]
@@ -7312,14 +7320,8 @@ pub fn apply_syncable_memory_bindings(conn: &Connection) -> rusqlite::Result<()>
     }
 
     conn.execute_batch(
-        "DROP TRIGGER IF EXISTS memory_bindings_lens_revision_insert;
-          DROP TRIGGER IF EXISTS memory_bindings_lens_revision_delete;
-          DROP TRIGGER IF EXISTS memory_bindings_lens_revision_update;
-          DROP TRIGGER IF EXISTS memory_bindings_lane_revision_insert;
-          DROP TRIGGER IF EXISTS memory_bindings_lane_revision_delete;
-          DROP TRIGGER IF EXISTS memory_bindings_lane_revision_update;
-          DROP TABLE IF EXISTS repo_memory_bindings_v103;
-          CREATE TABLE repo_memory_bindings_v103(
+        "DROP TABLE IF EXISTS repo_memory_bindings_v103;
+         CREATE TABLE repo_memory_bindings_v103(
              repo_id TEXT NOT NULL DEFAULT '__unassigned__',
              memory_id TEXT NOT NULL,
              binding_kind TEXT NOT NULL,
@@ -7345,7 +7347,7 @@ pub fn apply_syncable_memory_bindings(conn: &Connection) -> rusqlite::Result<()>
              downgrade_pending_at_ms INTEGER,
              PRIMARY KEY(repo_id, memory_id, binding_kind, binding_id)
          ) STRICT;
-          INSERT INTO repo_memory_bindings_v103(
+         INSERT INTO repo_memory_bindings_v103(
              repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
              logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, tracker, project,
              item_key, anchor_status, created_at_ms, symbol_kind, signature_hash, moniker_tool,
@@ -7355,9 +7357,9 @@ pub fn apply_syncable_memory_bindings(conn: &Connection) -> rusqlite::Result<()>
              logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, tracker, project,
              item_key, anchor_status, created_at_ms, symbol_kind, signature_hash, moniker_tool,
              moniker_tool_version, relocation_reason, downgrade_pending_at_ms
-          FROM repo_memory_bindings;
-          DROP TABLE repo_memory_bindings;
-          ALTER TABLE repo_memory_bindings_v103 RENAME TO repo_memory_bindings;
+         FROM repo_memory_bindings;
+         DROP TABLE repo_memory_bindings;
+         ALTER TABLE repo_memory_bindings_v103 RENAME TO repo_memory_bindings;
          CREATE INDEX idx_repo_memory_bindings_logical_symbol
              ON repo_memory_bindings(logical_symbol_id);
          CREATE INDEX idx_repo_memory_bindings_symbol ON repo_memory_bindings(symbol_id);

@@ -1932,6 +1932,19 @@ fn migration_103_syncable_memory_bindings() {
         )
         .unwrap();
     assert_eq!(triggers, 0);
+    schema::apply(&conn, &crate::index::migration_hooks()).expect("the full ladder replays");
+    let replayed_triggers: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'trigger' AND tbl_name = 'repo_memory_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        replayed_triggers, 0,
+        "V103 removes binding triggers recreated by earlier replayed migrations"
+    );
     let preserved: (String, i64, i64, i64, String, i64) = conn
         .query_row(
             "SELECT path, logical_symbol_id, symbol_id, chunk_id, anchor_status,
