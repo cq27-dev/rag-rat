@@ -1687,14 +1687,6 @@ impl IndexDatabase {
         self.storage.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| -> anyhow::Result<()> {
             self.begin_scoped_edge_rewrite()?;
-            self.storage.connection().execute(
-                "INSERT OR IGNORE INTO temp.edge_rewrite_files(file_id)
-                 SELECT id FROM main.files
-                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
-                   AND graph_version <= CAST(?3 AS INTEGER)
-                   AND id IN (SELECT id FROM files)",
-                params![self.active_repo_id, self.active_generation, GRAPH_INDEX_VERSION],
-            )?;
             // Repopulate the per-package import scope BEFORE re-resolving (#61). A bare
             // version-bump re-resolve would re-derive `import_scope_*` on the new edges
             // but read an empty `packages` table (V022 only ADDED the column; it did not
@@ -1721,6 +1713,7 @@ impl IndexDatabase {
             // Rows the row reader could not name are uncovered exactly like an unreadable file.
             let mut unverified = unreadable;
             let mut unrefreshed = 0usize;
+            let mut edge_rewrite_staged = false;
             for file in files {
                 let full_path = root.join(&file.path);
                 let Ok(text) = fs::read_to_string(full_path) else {
@@ -1747,14 +1740,21 @@ impl IndexDatabase {
                     && (file.language == Language::Rust
                         || self.file_has_unscoped_symbols(file.id)?);
                 if file.scope_owed && !scope_rows_newer {
-                    if !scope_needs_refresh
-                        || self.refresh_symbol_scopes(
-                            file.id,
-                            Path::new(&file.path),
-                            &text,
-                            file.language,
-                        )?
-                    {
+                    if !scope_needs_refresh {
+                        self.mark_file_scope_current(file.id)?;
+                    } else if self.refresh_symbol_scopes(
+                        file.id,
+                        Path::new(&file.path),
+                        &text,
+                        file.language,
+                    )? {
+                        self.stage_edge_rewrite_inedge_sources(
+                            &file.path,
+                            &self.active_repo_id,
+                            self.active_generation,
+                        )?;
+                        self.stage_edge_rewrite_file(file.id)?;
+                        edge_rewrite_staged = true;
                         self.mark_file_scope_current(file.id)?;
                     } else {
                         unrefreshed += 1;
@@ -1788,6 +1788,8 @@ impl IndexDatabase {
                     file.language,
                     &text,
                 )?;
+                self.stage_edge_rewrite_file(file.id)?;
+                edge_rewrite_staged = true;
                 self.mark_file_graph_current(file.id)?;
             }
             if unverified > 0 || unrefreshed > 0 {
@@ -1804,7 +1806,9 @@ impl IndexDatabase {
             // `logical_symbols` rows — edge resolution never reads that table). What is
             // load-bearing is that the refresh loop above completed for every row this checkout
             // can advance first; their relative order here is free.
-            self.resolve_changed_edges()?;
+            if edge_rewrite_staged {
+                self.resolve_changed_edges()?;
+            }
             if !scope_rows_newer
                 && self.repo_meta(LOGICAL_KEY_VERSION_KEY)?.as_deref() != Some(LOGICAL_KEY_VERSION)
             {
@@ -1844,8 +1848,12 @@ impl IndexDatabase {
             "SELECT EXISTS(
                  SELECT 1 FROM main.files
                  WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
-                   AND (graph_version < CAST(?3 AS INTEGER)
-                        OR scope_version < CAST(?4 AS INTEGER))
+                   AND graph_version < CAST(?3 AS INTEGER)
+                   AND id IN (SELECT id FROM files)
+             ) OR EXISTS(
+                 SELECT 1 FROM main.files
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                   AND scope_version < CAST(?4 AS INTEGER)
                    AND id IN (SELECT id FROM files)
              )",
             params![

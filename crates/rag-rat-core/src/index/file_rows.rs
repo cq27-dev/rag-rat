@@ -83,16 +83,16 @@ impl IndexDatabase {
     }
 
     /// #827: stage the SOURCE FILES of the in-edges pointing at the changed PATH's symbols (set (b)).
-    /// Called from [`Self::remove_file_in_scope`] BEFORE the NULLing UPDATE, so the in-edges are
-    /// still bound. Keyed on `path` (+ repo + generation), NOT the removed `(commit_sha,
-    /// worktree_id)` scope: a FIRST dirty edit of a committed file removes only the (empty)
-    /// overlay scope, yet the in-edge `caller → committed target` must still be re-pointed onto
-    /// the new overlay target that now WINS the active view (a full re-resolve does exactly
-    /// this). Path-keying captures the in-edge whichever scope of the path it currently binds.
+    /// Called before a removal NULLs in-edges and after a graph heal refreshes symbol scopes.
+    /// Keyed on `path` (+ repo + generation), NOT one `(commit_sha, worktree_id)` scope: a FIRST
+    /// dirty edit of a committed file removes only the (empty) overlay scope, yet the in-edge
+    /// `caller → committed target` must still be re-pointed onto the new overlay target that now
+    /// WINS the active view (a full re-resolve does exactly this). Path-keying captures the in-edge
+    /// whichever scope of the path it currently binds.
     /// Over-capturing an in-edge from a sibling worktree is harmless — the scoped resolve's
     /// `files` view excludes non-active rows, so only the active checkout's captured sources
     /// are actually rewritten. No-op unless capture is armed.
-    fn stage_edge_rewrite_inedge_sources(
+    pub(super) fn stage_edge_rewrite_inedge_sources(
         &self,
         path: &str,
         repo_id: &str,

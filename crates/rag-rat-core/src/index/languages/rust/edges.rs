@@ -1055,7 +1055,7 @@ fn enclosing_module_path(node: Node<'_>, text: &str) -> Vec<String> {
         if ancestor.kind() == "mod_item"
             && let Some(name) = child_name_text(ancestor, text)
         {
-            modules.push(name);
+            modules.push(super::canonical_identifier(&name).into_owned());
         }
         current = ancestor.parent();
     }
@@ -2282,6 +2282,27 @@ mod receiver_type_hint_tests {
              value = Factory::new(); value.run(); }} }}"
         );
         assert_eq!(extract_call_hints(&imported), vec![None, Some("Café".to_string())]);
+    }
+
+    #[test]
+    fn qualified_constructor_modules_use_canonical_identifiers() {
+        let raw = r#"
+            mod r#type {
+                pub struct Worker;
+                pub struct Factory;
+                impl Factory { pub fn new() -> Worker { Worker } }
+            }
+            fn f() { let worker = r#type::Factory::new(); worker.run(); }
+        "#;
+        assert_eq!(extract_call_hints(raw), vec![None, Some("type::Worker".to_string())]);
+
+        let decomposed = "Cafe\u{301}";
+        let unicode = format!(
+            "mod {decomposed} {{ pub struct Worker; pub struct Factory; impl Factory {{ pub fn \
+             new() -> Worker {{ Worker }} }} }} fn f() {{ let worker = \
+             {decomposed}::Factory::new(); worker.run(); }}"
+        );
+        assert_eq!(extract_call_hints(&unicode), vec![None, Some("Café::Worker".to_string())]);
     }
 
     #[test]

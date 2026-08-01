@@ -1824,16 +1824,18 @@ fn migration_101_file_graph_version_provenance() {
         })
         .unwrap();
     assert_eq!(versions, (16, 3), "replay preserves per-row progress");
-    let index_exists: i64 = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master
-                            WHERE type = 'index'
-                              AND name = 'idx_files_repo_generation_graph_version')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(index_exists, 1);
+    for index in
+        ["idx_files_repo_generation_graph_version", "idx_files_repo_generation_scope_version"]
+    {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "{index} exists");
+    }
 
     let latest = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&latest, &crate::index::migration_hooks()).unwrap();

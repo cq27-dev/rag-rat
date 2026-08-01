@@ -7181,7 +7181,9 @@ pub fn apply_file_graph_version_provenance(conn: &Connection) -> rusqlite::Resul
     if column_exists(conn, "files", "repo_id")? && column_exists(conn, "files", "generation")? {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_files_repo_generation_graph_version
-             ON files(repo_id, generation, graph_version, scope_version);",
+                 ON files(repo_id, generation, graph_version);
+             CREATE INDEX IF NOT EXISTS idx_files_repo_generation_scope_version
+                 ON files(repo_id, generation, scope_version);",
         )?;
     }
     Ok(())

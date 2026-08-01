@@ -259,10 +259,12 @@ fn nfc_ident(token: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+pub(super) fn canonical_identifier(token: &str) -> std::borrow::Cow<'_, str> {
+    nfc_ident(token.strip_prefix("r#").unwrap_or(token))
+}
+
 pub(super) fn identifiers_equal(left: &str, right: &str) -> bool {
-    let left = left.strip_prefix("r#").unwrap_or(left);
-    let right = right.strip_prefix("r#").unwrap_or(right);
-    nfc_ident(left) == nfc_ident(right)
+    canonical_identifier(left) == canonical_identifier(right)
 }
 
 /// Types the std prelude brings into every module without a `use`. A const parameter named after

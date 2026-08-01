@@ -532,6 +532,47 @@ fn a_file_edited_since_indexing_does_not_wedge_the_graph_heal() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[test]
+fn retrying_an_unverified_row_does_not_reresolve_current_rows() {
+    let (root, config) = indexed_root(&[
+        ("edited.rs", "pub fn edited_helper() {}\npub fn edited_entry() { edited_helper(); }\n"),
+        ("stable.rs", "pub fn stable_helper() {}\npub fn stable_entry() { stable_helper(); }\n"),
+    ]);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let edited_id = scoped_file_id(&db, "src/edited.rs", &db.active_worktree_id);
+    let stable_id = scoped_file_id(&db, "src/stable.rs", &db.active_worktree_id);
+    fs::write(
+        root.join("src/edited.rs"),
+        "pub fn unindexed() {}\npub fn edited_helper() {}\npub fn edited_entry() { \
+         edited_helper(); }\n",
+    )
+    .unwrap();
+
+    owe_both_heals(&db);
+    db.ensure_graph_index_current().unwrap();
+    assert_eq!(file_graph_version(&db, edited_id), 0);
+    assert_eq!(file_graph_version(&db, stable_id), GRAPH_INDEX_VERSION.parse::<i64>().unwrap());
+
+    let sentinel = edges::intern_edge_string(db.storage.connection(), "sentinel").unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE main.edges_data SET resolution_id = ?1 WHERE source_file_id = ?2",
+            params![sentinel, stable_id],
+        )
+        .unwrap();
+    let stable_before_retry = edge_targets_with_resolution(&db, stable_id);
+
+    db.ensure_graph_index_current().unwrap();
+
+    assert_eq!(
+        edge_targets_with_resolution(&db, stable_id),
+        stable_before_retry,
+        "retrying the unverified row must not rewrite an already-current sibling"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// `refresh_symbol_scopes` reports a shortfall when it cannot reach every persisted symbol of a
 /// file — the `unrefreshed` half of the heal's bookkeeping. The digest gate now short-circuits the
 /// obvious way in (an edited file), so this reaches it the only remaining way: a persisted symbol
