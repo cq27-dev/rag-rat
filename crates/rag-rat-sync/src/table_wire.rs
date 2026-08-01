@@ -13,7 +13,7 @@ pub const MAX_REPO_ID_BYTES: usize = 1024;
 pub const MAX_SCOPE_ID_BYTES: usize = 128;
 pub const MAX_TABLE_INVENTORY_HASHES: usize = 65_536;
 pub const MAX_TABLE_ENTRIES_PER_PAGE: usize = 32;
-pub const MAX_TABLE_ENTRY_BYTES: usize = 64 * 1024;
+pub const MAX_TABLE_ENTRY_BYTES: usize = rag_rat_oplog::TABLE_SYNC_ENTRY_MAX_BYTES;
 
 type Hash = [u8; 32];
 

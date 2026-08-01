@@ -20,6 +20,9 @@ mod scope_stream;
 mod store;
 mod transport;
 
+/// Largest signed table-entry envelope accepted by storage and the `/5` transport.
+pub const TABLE_SYNC_ENTRY_MAX_BYTES: usize = 64 * 1024;
+
 #[cfg(test)]
 pub(crate) use refold::refold_stale_projections_against;
 /// The store-open forward-compat seam: replay entries retained but not projected when they

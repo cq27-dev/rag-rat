@@ -265,6 +265,12 @@ pub(crate) fn author_row_entry(
     let prev_hash = stored_tail.map(|(_, entry_hash)| entry_hash);
     let signed =
         entry::sign_entry_from_op_bytes(secret, stream, prev_hash, lamport, row_op::encode(op));
+    anyhow::ensure!(
+        signed.signed_bytes.len() <= super::TABLE_SYNC_ENTRY_MAX_BYTES,
+        "table-sync signed entry is {} bytes, over the {}-byte transport limit",
+        signed.signed_bytes.len(),
+        super::TABLE_SYNC_ENTRY_MAX_BYTES,
+    );
     // A locally-authored op is projected by construction: the producer builds it from THIS
     // registry, so it can never carry a column or op-kind this binary does not understand.
     insert_entry(tx, &signed.entry, &signed.signed_bytes, now_ms, None)?;
@@ -315,6 +321,12 @@ pub(crate) fn accept_row_entry(
     pubkey: &DevicePublic,
     now_ms: i64,
 ) -> anyhow::Result<AcceptOutcome> {
+    anyhow::ensure!(
+        signed_bytes.len() <= super::TABLE_SYNC_ENTRY_MAX_BYTES,
+        "table-sync signed entry is {} bytes, over the {}-byte transport limit",
+        signed_bytes.len(),
+        super::TABLE_SYNC_ENTRY_MAX_BYTES,
+    );
     let verified = entry::verify_signed(signed_bytes, pubkey)?;
     if verified.stream_id != expected_stream {
         anyhow::bail!("entry names a different stream than the one being synced");
@@ -1190,6 +1202,45 @@ mod tests {
             entry_hash: signed.entry.entry_hash,
             prev_hash: None,
         });
+    }
+
+    #[test]
+    fn oversized_entries_are_refused_before_storage_and_authoring_recovers() {
+        let secret = DeviceSecret::from_seed(&[1; 32]);
+        let mut local = conn();
+        let tx = local.transaction().unwrap();
+        let oversized = op(&"x".repeat(crate::table_sync::TABLE_SYNC_ENTRY_MAX_BYTES));
+        let error = author_row_entry(&tx, stream(), &secret, &oversized, 0).unwrap_err();
+        assert!(error.to_string().contains("over the 65536-byte transport limit"));
+        let accepted: i64 =
+            tx.query_row("SELECT COUNT(*) FROM table_sync_entries", [], |row| row.get(0)).unwrap();
+        assert_eq!(accepted, 0, "an oversized local entry never reaches accepted history");
+        author_row_entry(&tx, stream(), &secret, &op("repaired"), 1).unwrap();
+        tx.commit().unwrap();
+
+        let forged = entry::sign_entry_from_op_bytes(
+            &secret,
+            stream(),
+            None,
+            0,
+            vec![0; crate::table_sync::TABLE_SYNC_ENTRY_MAX_BYTES],
+        );
+        let mut remote = conn();
+        let tx = remote.transaction().unwrap();
+        let error = accept_row_entry(
+            &tx,
+            account(),
+            stream(),
+            &["t"],
+            &forged.signed_bytes,
+            &secret.public(),
+            0,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("over the 65536-byte transport limit"));
+        let accepted: i64 =
+            tx.query_row("SELECT COUNT(*) FROM table_sync_entries", [], |row| row.get(0)).unwrap();
+        assert_eq!(accepted, 0, "an oversized received entry never reaches accepted history");
     }
 
     #[test]

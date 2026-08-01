@@ -86,8 +86,25 @@ where
         Manifest::new(store.supported_streams().map_err(TableSessionError::Store)?)
             .map_err(|error| TableSessionError::Store(error.into()))?;
     let local_routes: HashSet<ManifestItem> = local_manifest.items().iter().cloned().collect();
-    let mut snapshots = HashMap::with_capacity(local_manifest.items().len());
-    for item in local_manifest.items() {
+    let manifest_frame = TableFrame::Manifest(local_manifest);
+    let send_manifest = write_before(&mut send, &manifest_frame, idle_timeout);
+    let receive_manifest = async {
+        let TableFrame::Manifest(manifest) = read_before(&mut recv, idle_timeout).await? else {
+            return Err(TableSessionError::Protocol("peer did not open with a manifest".into()));
+        };
+        Ok::<_, TableSessionError>(manifest)
+    };
+    let ((), peer_manifest) = tokio::try_join!(send_manifest, receive_manifest)?;
+
+    let mut intersection = Vec::new();
+    for item in peer_manifest.items() {
+        if local_routes.contains(item) && store.validates(item).map_err(TableSessionError::Store)? {
+            intersection.push(item.clone());
+        }
+    }
+    let streams = intersection.len();
+    let mut snapshots = HashMap::with_capacity(streams);
+    for item in &intersection {
         let snapshot = store.snapshot(item).map_err(TableSessionError::Store)?;
         if snapshot.iter().any(|(_, bytes)| bytes.len() > MAX_TABLE_ENTRY_BYTES) {
             return Err(TableSessionError::Store(anyhow::anyhow!(
@@ -97,16 +114,12 @@ where
         snapshots.insert(item.stream_id, snapshot);
     }
 
-    let (intersection_tx, intersection_rx) = tokio::sync::oneshot::channel::<Vec<ManifestItem>>();
     let (inventory_tx, mut inventory_rx) =
-        tokio::sync::mpsc::channel::<(Hash, HashSet<Hash>)>(local_manifest.items().len().max(1));
+        tokio::sync::mpsc::channel::<(Hash, HashSet<Hash>)>(streams.max(1));
+    let send_intersection = intersection.clone();
 
     let sender = async move {
-        write_before(&mut send, &TableFrame::Manifest(local_manifest), idle_timeout).await?;
-        let Ok(intersection) = intersection_rx.await else {
-            return Ok((send, 0usize));
-        };
-        for item in &intersection {
+        for item in &send_intersection {
             let snapshot = snapshots.get(&item.stream_id).ok_or_else(|| {
                 TableSessionError::Protocol("intersection names an unsupported local stream".into())
             })?;
@@ -121,7 +134,7 @@ where
         }
 
         let mut sent = 0;
-        for item in &intersection {
+        for item in &send_intersection {
             let Some((stream_id, peer_have)) = inventory_rx.recv().await else {
                 return Ok((send, sent));
             };
@@ -165,23 +178,6 @@ where
     };
 
     let receiver = async {
-        let TableFrame::Manifest(peer_manifest) = read_before(&mut recv, idle_timeout).await?
-        else {
-            return Err(TableSessionError::Protocol("peer did not open with a manifest".into()));
-        };
-        let mut intersection = Vec::new();
-        for item in peer_manifest.items() {
-            if local_routes.contains(item)
-                && store.validates(item).map_err(TableSessionError::Store)?
-            {
-                intersection.push(item.clone());
-            }
-        }
-        let streams = intersection.len();
-        intersection_tx.send(intersection.clone()).map_err(|_| {
-            TableSessionError::Protocol("local sender stopped before manifest exchange".into())
-        })?;
-
         for item in &intersection {
             let TableFrame::Inventory { stream_id, have } =
                 read_before(&mut recv, idle_timeout).await?
@@ -343,17 +339,27 @@ mod tests {
         account: Hash,
         supported: Vec<ManifestItem>,
         entries: HashMap<Hash, HashMap<Hash, Vec<u8>>>,
+        forbidden_snapshots: HashSet<Hash>,
     }
 
     impl MemStore {
         fn new(items: Vec<ManifestItem>) -> Self {
-            Self { account: [7; 32], supported: items, entries: HashMap::new() }
+            Self {
+                account: [7; 32],
+                supported: items,
+                entries: HashMap::new(),
+                forbidden_snapshots: HashSet::new(),
+            }
         }
 
         fn insert(&mut self, stream: Hash, seed: u8) {
             let mut bytes = vec![seed; 40];
             bytes[..32].copy_from_slice(&[seed; 32]);
             self.entries.entry(stream).or_default().insert([seed; 32], bytes);
+        }
+
+        fn forbid_snapshot(&mut self, stream: Hash) {
+            self.forbidden_snapshots.insert(stream);
         }
     }
 
@@ -371,6 +377,10 @@ mod tests {
         }
 
         fn snapshot(&self, item: &ManifestItem) -> anyhow::Result<Vec<(Hash, Vec<u8>)>> {
+            anyhow::ensure!(
+                !self.forbidden_snapshots.contains(&item.stream_id),
+                "non-intersecting stream was snapshotted"
+            );
             Ok(self
                 .entries
                 .get(&item.stream_id)
@@ -434,6 +444,8 @@ mod tests {
         a.insert([1; 32], 10);
         a.insert(shared.stream_id, 20);
         b.insert([3; 32], 30);
+        a.forbid_snapshot([1; 32]);
+        b.forbid_snapshot([3; 32]);
 
         let (a_report, b_report) = pair(&mut a, &mut b).await;
         assert_eq!(a_report.streams, 1);

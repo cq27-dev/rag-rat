@@ -168,7 +168,7 @@ pub use stream::StreamId;
 // The table-sync forward-compat seam (#1001): replay entries retained but not projected when
 // they arrived. Belongs at store open, before producing — see the module docs.
 pub use table_sync::{
-    TableSyncIngestOutcome, TableSyncStream, refold_stale_table_sync_projections,
-    table_sync_entries_for_stream, table_sync_ingest, table_sync_signed_hash,
-    table_sync_supported_streams, table_sync_validate_stream,
+    TABLE_SYNC_ENTRY_MAX_BYTES, TableSyncIngestOutcome, TableSyncStream,
+    refold_stale_table_sync_projections, table_sync_entries_for_stream, table_sync_ingest,
+    table_sync_signed_hash, table_sync_supported_streams, table_sync_validate_stream,
 };
