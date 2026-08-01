@@ -78,10 +78,6 @@ pub(in crate::account) fn entry_type_of(_op: &StreamKeyWrap) -> u32 {
     entry_type::STREAM_KEY_WRAP
 }
 
-pub(in crate::account) fn repo_incarnation_entry_type() -> u32 {
-    entry_type::REPO_INCARNATION
-}
-
 /// The ingest-time structural-validation twin (the secrets mirror of the control-plaintext arm of
 /// `validate_storable_header_payload`): `StreamKeyWrap` is fully validated (arity, sorted-unique
 /// recipients, `WRAP_RECIPIENTS_MAX`, each `wrapped_key` decodes), while unknown tags and

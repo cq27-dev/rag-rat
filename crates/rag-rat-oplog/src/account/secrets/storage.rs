@@ -46,20 +46,18 @@ pub fn repo_incarnation_state(
     account_id: AccountId,
     repo_id: &str,
 ) -> anyhow::Result<RepoIncarnationState> {
-    let row: Option<(String, Option<Vec<u8>>)> = conn
+    let row: Option<Option<Vec<u8>>> = conn
         .query_row(
-            "SELECT state, incarnation_ref FROM account_repo_incarnation_current
+            "SELECT incarnation_ref FROM account_repo_incarnation_current
               WHERE account_id = ?1 AND repository_id = ?2",
             params![account_id.to_bytes().as_slice(), repo_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .optional()?;
     match row {
         None => Ok(RepoIncarnationState::Absent),
-        Some((state, None)) if state == "contested" => Ok(RepoIncarnationState::Contested),
-        Some((state, Some(reference))) if state == "current" =>
-            Ok(RepoIncarnationState::Current(fixed::<32>(&reference)?)),
-        Some((state, _)) => anyhow::bail!("malformed repository incarnation state `{state}`"),
+        Some(None) => Ok(RepoIncarnationState::Contested),
+        Some(Some(reference)) => Ok(RepoIncarnationState::Current(fixed::<32>(&reference)?)),
     }
 }
 
@@ -481,10 +479,6 @@ fn rewrite_repo_incarnation_projection(
     accepted: &HashSet<EntryHash>,
 ) -> anyhow::Result<()> {
     let account = account_id.to_bytes();
-    tx.execute(
-        "DELETE FROM account_repo_incarnations WHERE account_id = ?1",
-        [account.as_slice()],
-    )?;
     tx.execute("DELETE FROM account_repo_incarnation_current WHERE account_id = ?1", [
         account.as_slice()
     ])?;
@@ -495,17 +489,6 @@ fn rewrite_repo_incarnation_projection(
         if !accepted.contains(&entry.entry_hash) {
             continue;
         }
-        tx.execute(
-            "INSERT INTO account_repo_incarnations(
-                 account_id, repository_id, incarnation_ref, predecessor_ref
-             ) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                account.as_slice(),
-                &op.repo_id,
-                entry.entry_hash.as_slice(),
-                op.predecessor_ref.as_ref().map(<[u8; 32]>::as_slice),
-            ],
-        )?;
         by_repo.entry(op.repo_id.clone()).or_default().push((entry.entry_hash, op.predecessor_ref));
     }
 
@@ -543,17 +526,12 @@ fn rewrite_repo_incarnation_projection(
             }
         }
         contested |= visited != nodes.len();
-        let (state, current) = if contested { ("contested", None) } else { ("current", current) };
+        let current = if contested { None } else { current };
         tx.execute(
             "INSERT INTO account_repo_incarnation_current(
-                 account_id, repository_id, state, incarnation_ref
-             ) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                account.as_slice(),
-                repo_id,
-                state,
-                current.as_ref().map(<[u8; 32]>::as_slice),
-            ],
+                 account_id, repository_id, incarnation_ref
+             ) VALUES (?1, ?2, ?3)",
+            params![account.as_slice(), repo_id, current.as_ref().map(<[u8; 32]>::as_slice),],
         )?;
     }
     Ok(())
@@ -1146,11 +1124,7 @@ mod tests {
         conn.execute("DELETE FROM schema_version WHERE id = '099_table_sync_repo_incarnations'", [
         ])
         .unwrap();
-        conn.execute_batch(
-            "DROP TABLE account_repo_incarnation_current;
-             DROP TABLE account_repo_incarnations;",
-        )
-        .unwrap();
+        conn.execute_batch("DROP TABLE account_repo_incarnation_current;").unwrap();
         conn.execute("UPDATE account_entries SET accepted = 0 WHERE entry_hash = ?1", [
             incarnation.as_slice(),
         ])

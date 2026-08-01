@@ -560,8 +560,8 @@ mod tests {
     fn seed_incarnation(conn: &rusqlite::Connection) {
         conn.execute(
             "INSERT INTO account_repo_incarnation_current(
-                 account_id, repository_id, state, incarnation_ref
-             ) VALUES (?1, 'repo', 'current', ?2)",
+                 account_id, repository_id, incarnation_ref
+             ) VALUES (?1, 'repo', ?2)",
             rusqlite::params![
                 AccountId::from_bytes([42; 32]).to_bytes().as_slice(),
                 [0x44u8; 32].as_slice()

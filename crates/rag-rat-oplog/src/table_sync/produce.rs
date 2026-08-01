@@ -74,7 +74,7 @@ pub(crate) fn produce_row_ops(
                         // Untouched since it landed: nothing to say, just restamp the bookkeeping
                         // so the row is comparable again from here on.
                         apply::StaleRow::Unchanged => {
-                            apply::record_published_on_stream(
+                            apply::record_published(
                                 tx,
                                 stream,
                                 repo_id,

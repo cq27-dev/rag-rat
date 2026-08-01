@@ -99,7 +99,7 @@ pub fn advance_repo_incarnation_in_tx(
         seq,
         prev_hash,
         parent_ref: Some(genesis_hash),
-        entry_type: ops::repo_incarnation_entry_type(),
+        entry_type: ops::entry_type::REPO_INCARNATION,
         op_version: SUPPORTED_OP_VERSION,
         crypto_suite: 0,
         auth_len: storage::account_effective_count(tx, account_id)?,

@@ -510,8 +510,8 @@ mod tests {
     fn seed_repo_incarnation(conn: &rusqlite::Connection, repo_id: &str) {
         conn.execute(
             "INSERT INTO account_repo_incarnation_current(
-                 account_id, repository_id, state, incarnation_ref
-             ) VALUES (?1, ?2, 'current', ?3)
+                 account_id, repository_id, incarnation_ref
+             ) VALUES (?1, ?2, ?3)
              ON CONFLICT(account_id, repository_id) DO NOTHING",
             params![ACCOUNT.as_slice(), repo_id, [0x44u8; 32].as_slice()],
         )
@@ -705,8 +705,8 @@ mod tests {
         b.conn
             .execute(
                 "INSERT INTO account_repo_incarnation_current(
-                     account_id, repository_id, state, incarnation_ref
-                 ) VALUES (?1, 'repo', 'contested', NULL)",
+                     account_id, repository_id, incarnation_ref
+                 ) VALUES (?1, 'repo', NULL)",
                 [ACCOUNT.as_slice()],
             )
             .unwrap();
@@ -720,7 +720,7 @@ mod tests {
         b.conn
             .execute(
                 "UPDATE account_repo_incarnation_current
-                    SET state = 'current', incarnation_ref = ?1
+                    SET incarnation_ref = ?1
                   WHERE account_id = ?2 AND repository_id = 'repo'",
                 params![[0x44u8; 32].as_slice(), ACCOUNT.as_slice()],
             )

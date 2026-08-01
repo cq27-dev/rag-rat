@@ -6644,23 +6644,10 @@ pub fn apply_table_sync_gapped_entries(conn: &Connection) -> rusqlite::Result<()
 /// that unreachable state and rebuilds row bookkeeping with `stream_id` in every key.
 pub fn apply_table_sync_repo_incarnations(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS account_repo_incarnations(
+        "CREATE TABLE IF NOT EXISTS account_repo_incarnation_current(
              account_id       BLOB NOT NULL CHECK(length(account_id) = 32),
              repository_id    TEXT NOT NULL,
-             incarnation_ref  BLOB NOT NULL CHECK(length(incarnation_ref) = 32),
-             predecessor_ref  BLOB CHECK(predecessor_ref IS NULL OR length(predecessor_ref) = 32),
-             PRIMARY KEY(account_id, incarnation_ref)
-         ) STRICT;
-         CREATE INDEX IF NOT EXISTS account_repo_incarnations_repo
-             ON account_repo_incarnations(account_id, repository_id, predecessor_ref);
-         CREATE TABLE IF NOT EXISTS account_repo_incarnation_current(
-             account_id       BLOB NOT NULL CHECK(length(account_id) = 32),
-             repository_id    TEXT NOT NULL,
-             state            TEXT NOT NULL CHECK(state IN ('current', 'contested')),
-             incarnation_ref  BLOB CHECK(
-                 (state = 'current' AND length(incarnation_ref) = 32)
-                 OR (state = 'contested' AND incarnation_ref IS NULL)
-             ),
+             incarnation_ref  BLOB CHECK(incarnation_ref IS NULL OR length(incarnation_ref) = 32),
              PRIMARY KEY(account_id, repository_id)
          ) STRICT;
          CREATE TABLE IF NOT EXISTS table_sync_chain_tips(
@@ -6797,7 +6784,6 @@ mod table_sync_repo_incarnation_migration_tests {
             .unwrap();
         assert_eq!(entries, 0, "un-authorized /4 history is not assigned a /5 incarnation");
         assert!(!column_exists(&conn, "table_sync_chain_tips", "repo_id").unwrap());
-        assert!(!column_exists(&conn, "account_repo_incarnations", "repo_id").unwrap());
     }
 
     #[test]

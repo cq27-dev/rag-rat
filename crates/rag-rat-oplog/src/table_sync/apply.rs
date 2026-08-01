@@ -374,15 +374,7 @@ fn apply_upsert(
     // Anti-echo: the winning op now owns the whole current row state, so record its synced hash.
     // (A losing op returned above without touching the published hash.)
     if let Some(hash) = synced_row_hash(tx, spec, pk_vals)? {
-        record_published_on_stream(
-            tx,
-            stream,
-            repo_id,
-            spec.name,
-            row_pk,
-            &hash,
-            spec.spec_version,
-        )?;
+        record_published(tx, stream, repo_id, spec.name, row_pk, &hash, spec.spec_version)?;
     }
     Ok(ApplyOutcome::Applied)
 }
@@ -1003,7 +995,7 @@ pub(crate) enum PreApply {
 /// stamped with the TABLE's spec version, which is what defines that column set. Deliberately not
 /// the store-global projector version — that would make an unrelated table's registration mark this
 /// row incomparable.
-pub(crate) fn record_published_on_stream(
+pub(crate) fn record_published(
     tx: &Transaction<'_>,
     stream: StreamId,
     repo_id: &str,
@@ -1028,26 +1020,6 @@ pub(crate) fn record_published_on_stream(
         ],
     )?;
     Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn record_published(
-    tx: &Transaction<'_>,
-    repo_id: &str,
-    table: &str,
-    row_pk: &str,
-    hash: &str,
-    spec_version: u32,
-) -> anyhow::Result<()> {
-    record_published_on_stream(
-        tx,
-        StreamId::from_bytes([0; 32]),
-        repo_id,
-        table,
-        row_pk,
-        hash,
-        spec_version,
-    )
 }
 
 fn clear_published(

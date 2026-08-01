@@ -109,8 +109,8 @@ fn directory_rows(conn: &rusqlite::Connection, repo_id: &str) -> i64 {
 fn seed_account_incarnation(conn: &rusqlite::Connection, repo_id: &str, seed: u8) {
     conn.execute(
         "INSERT INTO account_repo_incarnation_current(
-             account_id, repository_id, state, incarnation_ref
-         ) VALUES (?1, ?2, 'current', ?3)",
+             account_id, repository_id, incarnation_ref
+         ) VALUES (?1, ?2, ?3)",
         rusqlite::params![vec![seed; 32], repo_id, vec![seed ^ 0x55; 32]],
     )
     .unwrap();
