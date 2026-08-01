@@ -1,0 +1,214 @@
+services:
+  # One-shot: hand the fresh lens_runtime volume to the coder user (uid 1000). Fresh
+  # named volumes are root-owned, and the serve-side discovery publish chmods the
+  # directory owner-only — as coder — so a root-owned volume fails startup.
+  init-runtime:
+    image: alpine:3
+    user: root
+    volumes:
+      - lens_runtime:/rt
+    command: ["sh", "-c", "chown 1000:1000 /rt && install -d -o 1000 -g 1000 /rt/sockets"]
+    restart: "no"
+    networks: [internal]
+
+  # The Lens backend — the ONLY container with the DB mount. A visitor who spawns a
+  # task/debug process in the workbench container has no DB to reach: this, not the
+  # settings pins, is the execution boundary for the public demo. Docker's restart
+  # policy supervises it (a backend failure is a container exit, not a silent zombie
+  # beside a "healthy" workbench).
+  serve:
+    build: .
+    entrypoint: ["/usr/local/bin/lens-serve-entrypoint"]
+    restart: unless-stopped
+    depends_on:
+      init-runtime:
+        condition: service_completed_successfully
+    # The DB dir is host-owned by the operator's uid and shared group-write+setgid;
+    # this container's coder user joins that group so serve can write locks and WAL
+    # sidecars. The GID is the HOST operator group — set LENS_DB_GID=$(id -g ragrat) in
+    # .env (default 1002 matches the documented provisioning). The workbench does NOT
+    # get this group.
+    group_add: ["${LENS_DB_GID:-1002}"]
+    networks:
+      internal:
+        # Fixed IP: under gVisor (runsc) Docker's embedded DNS does not resolve service
+        # names inside the workbench, so the loopback proxy targets this address
+        # instead of the `serve` name.
+        ipv4_address: 172.31.255.20
+    environment:
+      # The extension's fetch Origin (a web worker in the visitor's browser), allowed
+      # exactly by the backend's CORS gate.
+      LENS_PUBLIC_ORIGIN: https://rag-rat-demo.cq27.dev
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 1.0
+    pids_limit: 128
+    ulimits:
+      nofile: { soft: 4096, hard: 8192 }
+      core: 0
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3", compress: "true" }
+    init: true
+    user: "1000:1000"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+    volumes:
+      # Host-owned clone of the rag-rat repo itself, strictly read-only.
+      - /srv/rag-rat/repo:/srv/workspace:ro
+      # Writable overlay for `.rag-rat/sockets/lens.json` — the discovery credential the
+      # workbench reads back from the same volume (mounted ro there).
+      - lens_runtime:/srv/workspace/.rag-rat
+      # Host-managed DB DIRECTORY (not the file): serve needs sibling writes — the locks
+      # dir, and SQLite's -wal/-shm sidecars — so mounting the bare file breaks both.
+      # Read-write deliberately: serve migrates on open and self-heals. Host perms are
+      # 2770/0660: group-shared, world-nothing.
+      # TRANSITIONAL: retired when memory/op-log sync lands — the appliance will consume
+      # the synced store and both bind mounts go away. See README "Retirement".
+      - /srv/rag-rat/db:/srv/db
+
+  # The workbench — the container public visitors drive. It has NO DB mount and no
+  # outbound network, so nothing a visitor spawns (a task or debug config with its own
+  # shell, which settings cannot pin) can reach or corrupt the index.
+  code-server:
+    build: .
+    restart: unless-stopped
+    # gVisor (runsc): the public workbench is the untrusted boundary — a visitor who
+    # lands code execution here (task/debug) must not share the host kernel. serve
+    # stays on runc: SQLite's fsync-heavy I/O pays gofer overhead under gVisor, and it
+    # runs no visitor code.
+    runtime: runsc
+    depends_on:
+      init-runtime:
+        condition: service_completed_successfully
+      serve:
+        condition: service_started
+    # Docker does NOT program port publishes attached to an `internal` network (it
+    # silently no-ops — NetworkSettings.Ports stays null). The documented local flow's
+    # host listener therefore lives on the tiny `edge` forwarder below; this container
+    # itself only exposes to the internal network.
+    expose: ["8080"]
+    environment:
+      # The loopback proxy's upstream — the serve container's fixed internal IP
+      # (embedded DNS is unavailable inside runsc).
+      LENS_BACKEND_HOST: 172.31.255.20
+    networks:
+      internal:
+        # Fixed IP: the `edge` forwarder dials this address (embedded DNS is similarly
+        # unavailable to it, and static addresses keep the whole internal topology
+        # explicit).
+        ipv4_address: 172.31.255.10
+    init: true
+    user: "1000:1000"
+    mem_limit: 2g
+    # memswap == mem: Docker's default would silently allow another 2g of swap on top.
+    memswap_limit: 2g
+    cpus: 1.5
+    pids_limit: 256
+    # Docker inherits dockerd's limits (systemd: ~1M fds) when unset — a visitor's fd
+    # exhaustion would otherwise hit the host's other services.
+    ulimits:
+      nofile: { soft: 4096, hard: 8192 }
+      core: 0
+    # json-file's default is unbounded: `yes` in a spawned process would fill the host
+    # disk and burn dockerd CPU. Rotate.
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3", compress: "true" }
+    # OS-level containment (stronger than a chroot inside the container — same kernel,
+    # fewer privileges): no privilege escalation, no capabilities, read-only rootfs.
+    # Writable paths are exactly the tmpfs mounts (the lens_runtime mount is ro here).
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,size=64m"
+      # code-server user data is ephemeral: a bounded tmpfs, wiped on every restart.
+      # The pinned settings.json is bind-mounted over a path inside it (entrypoint
+      # recreates the User dir first).
+      - "/home/coder/.local/share/code-server:rw,noexec,nosuid,size=128m"
+    volumes:
+      # Host-owned clone of the rag-rat repo itself (the appliance dogfoods rag-rat's own
+      # index), strictly read-only to the container.
+      - /srv/rag-rat/repo:/srv/workspace:ro
+      # The discovery credential, read-only here: written by the serve container.
+      - lens_runtime:/srv/workspace/.rag-rat:ro
+      # The hardening settings are pinned OUTSIDE visitor control: a read-only bind
+      # mount of the repo's settings.json over the writable user-data tmpfs. A public
+      # session can still write UI state to the tmpfs, but editing User settings via
+      # the Settings UI fails at the filesystem — the /bin/false terminal/task/debug
+      # profiles cannot be flipped back to a real shell by a visitor.
+      - ./settings.json:/home/coder/.local/share/code-server/User/settings.json:ro
+      # Preinstalled Lens extension, read-only so a public session cannot install or
+      # update extensions (extension code runs with the container's privileges).
+      - lens_ext:/opt/lens-ext:ro
+
+  # Loopback host listener for the local (no-tunnel) flow: forwards 127.0.0.1:8080 on
+  # the host to code-server:8080 over the internal network. Needed because Docker does
+  # not program port publishes on an `internal` network; `hostpublish` is the
+  # non-internal bridge the publish can attach to. The workbench stays off it.
+  edge:
+    build: .
+    entrypoint: ["/usr/lib/code-server/lib/node", "/usr/local/bin/lens-loopback-proxy.js"]
+    restart: unless-stopped
+    depends_on:
+      code-server:
+        condition: service_started
+    environment:
+      LENS_BACKEND_HOST: 172.31.255.10
+      LENS_BACKEND_PORT: "8080"
+      LENS_LOOPBACK_PORT: "8080"
+      # docker-proxy forwards the host publish to this container's eth IP, not its
+      # loopback — the forwarder must listen on all interfaces here.
+      LENS_LISTEN_HOST: 0.0.0.0
+    networks: [internal, hostpublish]
+    ports: ["127.0.0.1:8080:8080"]
+    init: true
+    user: "1000:1000"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    pids_limit: 64
+    mem_limit: 128m
+    memswap_limit: 128m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3", compress: "true" }
+
+  tunnel:
+    # Pinned by digest — the sole public ingress must not float on a mutable tag.
+    image: cloudflare/cloudflared:latest@sha256:e39ee8da81ad5e05d77f38d2f51c60ca51bf2a8450ac3abab50c17fdb91d91bf
+    restart: unless-stopped
+    # Profile-gated: the local-only flow (`docker compose up -d --build`) must not
+    # require a Cloudflare token; the shared flow opts in explicitly
+    # (`docker compose --profile tunnel up -d`).
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run
+    # Only the tunnel talks to the outside world: it reaches code-server over the
+    # internal network and Cloudflare's edge over egress.
+    networks: [internal, egress]
+    environment:
+      # Empty by default so the no-profile (local) flow parses and starts without one;
+      # starting the tunnel with an empty token fails loudly in the cloudflared logs.
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+
+volumes:
+  lens_runtime:
+  lens_ext:
+
+networks:
+  internal:
+    internal: true
+    # Explicit, stable subnet: the host firewall drops INPUT from it (the documented
+    # `internal` isolation covers FORWARD but leaves host daemons — sshd on 0.0.0.0 —
+    # reachable via the gateway IP). Stability matters so the host rule survives
+    # network recreations.
+    ipam:
+      config:
+        - subnet: 172.31.255.0/24
+  egress:
+  # The non-internal bridge the loopback host publish attaches to. Only the `edge`
+  # forwarder sits on it; the workbench and serve never do.
+  hostpublish:

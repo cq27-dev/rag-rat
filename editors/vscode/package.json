@@ -179,6 +179,12 @@
           "default": 100,
           "minimum": 0,
           "description": "Hide clone classes whose medoid body is smaller than this many tokens. ~100 keeps only actionable (refactor-worthy) duplication; enum matchers and trivial accessors sit at 28-86. 0 shows everything."
+        },
+        "rag-rat-lens.demoFile": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "description": "Optional repo-relative file opened once per browser session on startup (public demo onboarding: land visitors on memory-dense code). Empty disables."
         }
       }
     }

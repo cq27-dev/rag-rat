@@ -526,6 +526,24 @@ export function activate(context: vscode.ExtensionContext): void {
     logInfo(ok ? 'lens server connected' : 'lens server offline at startup')
   );
   void watchVersions(streamController.signal);
+
+  // Public-demo onboarding: open a configured showcase file once per browser session, so
+  // a first-time visitor lands on memory-dense code with the overlays already drawn.
+  // Empty default keeps ordinary installs inert. workspaceState is per-browser-session
+  // (the appliance's user data is ephemeral), so it fires once per session, not per boot.
+  const demoFile = config.get<string>('demoFile', '').trim();
+  if (demoFile && isSafeRepoPath(demoFile) && !context.workspaceState.get('demoFileShown')) {
+    void context.workspaceState.update('demoFileShown', true);
+    const uri = resolver.uriOf(demoFile);
+    if (uri) {
+      void vscode.workspace
+        .openTextDocument(uri)
+        .then((doc) => vscode.window.showTextDocument(doc, { preview: true, preserveFocus: true }));
+      // Land with the Lens view open, not just the file: reveal the sidebar's Memories
+      // view (the onboarding's whole point is the bound-memory overlays).
+      void vscode.commands.executeCommand('rag-rat-lens.memories.focus');
+    }
+  }
 }
 
 export function deactivate(): void {}

@@ -1,0 +1,18 @@
+# Container-side rag-rat config. The workspace IS the rag-rat repo itself (dogfooding):
+# the host clones cq27-dev/rag-rat to /srv/rag-rat/repo and indexes + writes the DB
+# MANUALLY (`rag-rat index` on the host against this same file); the appliance only
+# serves it. Both paths are bind mounts defined in docker-compose.yml — keep them in
+# sync with it.
+#
+# Schema compatibility: the host and container rag-rat binaries must be the same release.
+# `rag-rat serve` migrates on open; if the container is newer it rewrites the DB to a
+# schema the host binary can no longer read.
+[index]
+root = "/srv/workspace"
+database = "/srv/db/rag-rat.sqlite"
+
+# Mirror the repo's own rag-rat.toml targets so the served scope matches what the host
+# indexed.
+[target_bindings]
+rust = ["crates"]
+markdown = ["docs"]

@@ -1,0 +1,9 @@
+# Static code-server config for the appliance. No credentials: code-server's default
+# bootstrap writes a config.yaml with a GENERATED PASSWORD the first time it runs
+# (including at image-build extension install), and that file is browsable by any
+# visitor of this public instance. All security posture lives in the entrypoint flags,
+# which take precedence over this file.
+bind-addr: 0.0.0.0:8080
+auth: none
+cert: false
+disable-telemetry: true

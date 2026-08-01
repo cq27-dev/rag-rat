@@ -1,0 +1,106 @@
+name: deploy-appliance
+
+# Deploys the Lens web appliance (editors/appliance, #1106) to the production host over
+# SSH. The host's IP/hostname lives ONLY in the `appliance-prod` environment's secrets —
+# never in this file — and the public URL is a CNAME to the Cloudflare named tunnel, so
+# no DNS record ever points at the box.
+on:
+  push:
+    branches: [main]
+    paths:
+      - editors/appliance/**
+      - editors/vscode/**
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+
+env:
+  DEPLOY_DIR: /opt/rag-rat-appliance
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Holds DEPLOY_HOST, DEPLOY_HOST_KEY, DEPLOY_SSH_KEY (and can require reviewers).
+    environment: appliance-prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the rag-rat binary (dist profile)
+        run: cargo build --profile dist -p rag-rat
+
+      - name: Package the Lens extension (identical to the published artifact)
+        working-directory: editors/vscode
+        run: |
+          npm ci
+          npm run package
+          npx --yes @vscode/vsce package --no-dependencies --out rag-rat-lens.vsix
+
+      - name: Stage artifacts into the build context
+        run: editors/appliance/stage-artifacts.sh
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Pin the host key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' '${{ secrets.DEPLOY_HOST_KEY }}' > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Sync the appliance to the host
+        run: |
+          ssh ragrat@${{ secrets.DEPLOY_HOST }} "mkdir -p '$DEPLOY_DIR'"
+          rsync -az --delete --exclude artifacts --exclude '.env*' editors/appliance/ \
+            ragrat@${{ secrets.DEPLOY_HOST }}:$DEPLOY_DIR/
+          rsync -az editors/appliance/artifacts/ \
+            ragrat@${{ secrets.DEPLOY_HOST }}:$DEPLOY_DIR/artifacts/
+
+      # The served index is commit-scoped: the clone must sit at the deployed SHA and the
+      # DB must be reindexed against it, or commit-scoped views (callers/callees) serve
+      # nothing while repo-scoped memories still work. `git checkout -f` keeps the clone
+      # pristine across deploys; the host-side database path override is then re-applied
+      # idempotently (config has no env override). Incremental `index` self-heals what
+      # the new binary owes (schema/graph migrations run on open).
+      - name: Pin the clone to the deployed SHA and reindex the DB
+        timeout-minutes: 45
+        run: |
+          ssh ragrat@${{ secrets.DEPLOY_HOST }} 'bash -se' <<'DEPLOY'
+            set -e
+            DEPLOY_DIR=/opt/rag-rat-appliance
+            install -m 755 "$DEPLOY_DIR/artifacts/rag-rat" "$HOME/.local/bin/rag-rat"
+            cd /srv/rag-rat/repo
+            git fetch -q origin
+            git checkout -qf "${{ github.sha }}"
+            grep -q '^database = ' rag-rat.toml || \
+              sed -i 's|^root = "\."|root = "."\ndatabase = "/srv/rag-rat/db/rag-rat.sqlite"|' rag-rat.toml
+            # Stop BOTH container writers before the checkout + reindex: the old serve's
+            # watcher stays live on the shared DB otherwise, and the newly installed
+            # binary would index/migrate alongside a different version's writer.
+            cd "$DEPLOY_DIR" && docker compose stop code-server serve
+            # Index from the HOST checkout: its rag-rat.toml resolves root + database to
+            # the host paths. Running from $DEPLOY_DIR would load the appliance config
+            # with the container-only /srv/workspace and /srv/db instead.
+            cd /srv/rag-rat/repo
+            "$HOME/.local/bin/rag-rat" index
+          DEPLOY
+
+      - name: Rebuild and restart
+        run: |
+          ssh ragrat@${{ secrets.DEPLOY_HOST }} \
+            "cd '$DEPLOY_DIR' && docker compose build --pull \
+              && docker compose rm -sf code-server serve \
+              && (docker volume rm rag-rat-appliance_lens_ext || true) \
+              && docker compose --profile tunnel up -d"
+        # lens_ext is a named volume: it initializes from the image ONCE and then shadows
+        # every newer extension bundle (a stale vsix kept serving long after rebuilds —
+        # the demoFile onboarding was invisible until the volume was dropped). Removing
+        # it on every deploy re-initializes from the fresh image. The parens keep
+        # `|| true` scoped to the volume removal alone: a build or compose failure must
+        # fail the deploy, not quietly serve the previous image.

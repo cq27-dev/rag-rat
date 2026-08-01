@@ -75,8 +75,9 @@ export async function showMemoriesQuickPick(
     void vscode.window.showInformationMessage(MEMORY_PICK_MESSAGES[outcome.kind]);
     return;
   }
-  const doc = await vscode.workspace.openTextDocument(outcome.uri);
-  await vscode.window.showTextDocument(doc, vscode.ViewColumn.Beside, true);
+  // Rendered markdown, not the raw source: the doc is markdown-shaped (`.md` suffix on
+  // the custom scheme), so the built-in preview resolves it through the same provider.
+  await vscode.commands.executeCommand('markdown.showPreviewToSide', outcome.uri);
 }
 
 function renderMemoryDoc(m: FileMemory): string {

@@ -25,7 +25,9 @@ export class GraphHoverProvider implements vscode.HoverProvider {
     const md = new vscode.MarkdownString('', true);
     md.isTrusted = { enabledCommands: ['rag-rat-lens.showCallers'] };
     const parts = [
-      `**${escapeMarkdown(s.kind)}** \`${escapeMarkdown(s.name)}\``,
+      // The name goes in a code span UNESCAPED: backslash escapes are not processed inside
+      // code spans, so escaping here renders literal `\_` before every underscore.
+      `**${escapeMarkdown(s.kind)}** ${codeSpan(s.name)}`,
       s.fan_in_bucket !== 'low' ? `**⚑ ${s.fan_in_bucket} load** (fan-in ${s.fan_in_score})` : null,
       total > 0
         ? `⤴ ${total} callers — ${[
@@ -66,4 +68,10 @@ export class GraphHoverProvider implements vscode.HoverProvider {
 
 function escapeMarkdown(value: string): string {
   return value.replace(/[\\`*_{}[\]()<>#+\-.!|]/g, '\\$&');
+}
+
+/// Raw code span for identifier text: no escaping (code spans render literally); a name
+/// containing a backtick gets a double-backtick fence instead.
+function codeSpan(value: string): string {
+  return value.includes('`') ? `\`\` ${value} \`\`` : `\`${value}\``;
 }

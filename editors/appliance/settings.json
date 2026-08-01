@@ -1,0 +1,64 @@
+{
+  // The pinned settings.json itself is read-only (compose ro-bind). A visitor (or a
+  // stale browser backup from before the pin) can still open it in an editor and get a
+  // dirty buffer; with autosave on, VS Code then retries the doomed write on a schedule
+  // and toasts EROFS every startup. Autosave off: the write only fails if someone
+  // explicitly saves — the honest signal, without the loop.
+  "files.autoSave": "off",
+  // Hot exit is what restores a dirty settings.json buffer (and reopens the file) on
+  // every reload even with autosave off. Off: dirty buffers are discarded on close,
+  // nothing is restored, no doomed write is retried.
+  "files.hotExit": "off",
+  // Public read-only demo hardening. The workspace is mounted read-only; these make the
+  // integrated terminal and task runner dead ends too (a public code-server otherwise
+  // hands out code execution to anyone). A defaultProfile pointing at /bin/false does
+  // NOT work (it names a profile, not a shell) — the profiles themselves must die.
+  "terminal.integrated.profiles.linux": {
+    // VS Code AUTODETECTS installed shells (bash, sh, zsh, dash, fish…) and lists them
+    // in the new-terminal dropdown — pinning only the default leaves them selectable.
+    // Null every autodetected profile and keep only the dead one.
+    "sh-false": { "path": "/bin/false" },
+    "bash": null,
+    "sh": null,
+    "zsh": null,
+    "dash": null,
+    "fish": null,
+    "pwsh": null,
+    "rbash": null
+  },
+  "terminal.integrated.defaultProfile.linux": "sh-false",
+  "terminal.integrated.automationProfile.linux": { "path": "/bin/false" },
+  "terminal.integrated.hideOnStartup": "always",
+  // Manual Run Task stays possible regardless (there is no tasks.enabled upstream), but
+  // auto-detection of npm/grunt/gulp/jake scripts is pure surface with no demo value.
+  "task.autoDetect": "off",
+  "npm.autoDetect": "off",
+  "grunt.autoDetect": "off",
+  "gulp.autoDetect": "off",
+  "jake.autoDetect": "off",
+  // No port forwarding: the Ports panel must not auto-forward, and code-server itself
+  // is started with --disable-proxy — a public session must not reach container-local
+  // services (the Lens backend) through the workbench's proxy routes.
+  "remote.autoForwardPorts": false,
+  "remote.autoForwardPortsSource": "process",
+  "task.allowAutomaticTasks": "off",
+  "task.verboseLogging": false,
+  "debug.openDebug": "neverOpen",
+  // String enum in current VS Code — a deprecated boolean here makes VS Code's settings
+  // migration rewrite the file on startup, which both fails (the file is a read-only
+  // bind) and auto-opens it. This value is what the migration would write anyway.
+  "extensions.autoUpdate": "off",
+  "extensions.autoCheckUpdates": false,
+  "update.mode": "none",
+  // No AI provider exists here (no egress, no marketplace): hide the chat/agent
+  // sidebar, inline chat, and "sign in to use AI" prompts instead of teasing a
+  // feature that cannot work.
+  "chat.disableAIFeatures": true,
+  // Single-pane demo layout: no secondary (right) sidebar — the Lens views live in the
+  // primary activity-bar sidebar.
+  "workbench.secondarySideBar.defaultVisibility": "hidden",
+  "telemetry.telemetryLevel": "off",
+  "workbench.startupEditor": "none",
+  "workbench.welcomePage.walkthroughs.openOnInstall": false,
+  "security.workspace.trust.enabled": false
+}

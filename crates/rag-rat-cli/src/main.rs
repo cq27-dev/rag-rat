@@ -458,7 +458,9 @@ fn run_mcp(explicit: Option<&str>, json: bool) -> anyhow::Result<()> {
 }
 
 fn serve_http(config: Config, args: &ServeArgs) -> anyhow::Result<()> {
-    if !args.bind.is_loopback() && (args.token_env.is_none() || args.allow_origin.is_empty()) {
+    if (!args.bind.is_loopback() || args.advertise_url.is_some())
+        && (args.token_env.is_none() || args.allow_origin.is_empty())
+    {
         anyhow::bail!(
             "non-loopback `rag-rat serve` requires --token-env and at least one --allow-origin"
         );
@@ -482,6 +484,7 @@ fn serve_http(config: Config, args: &ServeArgs) -> anyhow::Result<()> {
     let _watcher = rag_rat_core::watch::Watcher::spawn(config.clone());
     let address = std::net::SocketAddr::new(args.bind, args.port);
     let allowed_origins = args.allow_origin.clone();
+    let advertise_url = args.advertise_url.clone();
     let runtime =
         tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     runtime.block_on(async move {
@@ -489,8 +492,11 @@ fn serve_http(config: Config, args: &ServeArgs) -> anyhow::Result<()> {
             config,
             workspace_root,
             address,
-            token,
-            allowed_origins,
+            rag_rat_mcp::lens_server::StandaloneServeOptions {
+                auth_token: token,
+                allowed_origins,
+                advertise_url,
+            },
             election_lock,
             shutdown_signal(),
         )

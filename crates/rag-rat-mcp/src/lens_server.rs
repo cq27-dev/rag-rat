@@ -353,15 +353,26 @@ async fn run_on_ports(
     .context("serving lens HTTP API")
 }
 
+/// Options for [`serve_standalone`] beyond the bind address: the bearer credential, the
+/// CORS allowlist, and the optional advertised discovery URL.
+#[derive(Debug, Default)]
+pub struct StandaloneServeOptions {
+    pub auth_token: String,
+    pub allowed_origins: Vec<String>,
+    /// Publish discovery advertising this URL instead of the bind address (the
+    /// container-split shape: the extension dials this, not the bind IP).
+    pub advertise_url: Option<String>,
+}
+
 pub async fn serve_standalone(
     config: Config,
     workspace_root: PathBuf,
     address: SocketAddr,
-    auth_token: String,
-    allowed_origins: Vec<String>,
+    options: StandaloneServeOptions,
     election_lock: FileLock,
     shutdown: impl Future<Output = std::io::Result<()>> + Send + 'static,
 ) -> anyhow::Result<()> {
+    let StandaloneServeOptions { auth_token, allowed_origins, advertise_url } = options;
     // The caller acquires the election lock before any side effects (index heal, watcher) so a
     // contended worktree fails fast.
     let _election_lock = election_lock;
@@ -376,22 +387,45 @@ pub async fn serve_standalone(
     .ok()
     .map(|identity| identity.repo_id);
     let indexed_root = indexed_root_relative(&config, &workspace_root)?;
-    let discovery = LensDiscovery::new(
+    let mut discovery = LensDiscovery::new(
         listener.local_addr()?,
         repo_id,
         indexed_root,
         path_case_insensitive(&workspace_root),
         auth_token.clone(),
     );
-    // Only loopback standalone serving publishes discovery: a non-loopback bind advertises an
-    // address the extension refuses to dial, and the file would carry the hosted bearer token
-    // into a workspace file it could be committed from.
-    let _discovery = if listener.local_addr()?.ip().is_loopback() {
+    if let Some(advertise) = advertise_url.as_deref() {
+        // The advertised URL replaces the bind address in the published discovery: the
+        // extension dials it, so it must parse and carry a usable host + port (a
+        // sibling-container bind like 0.0.0.0 or 172.x is exactly the case this exists
+        // for). The bind address still decides where the listener lives.
+        let parsed = url::Url::parse(advertise)
+            .with_context(|| format!("invalid --advertise-url `{advertise}`"))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("--advertise-url `{advertise}` has no host"))?
+            .to_string();
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| anyhow::anyhow!("--advertise-url `{advertise}` has no port"))?;
+        discovery.url = format!("{}://{host}:{port}", parsed.scheme());
+        discovery.host = host;
+        discovery.port = port;
+    }
+    // Discovery publishes on loopback (the extension shares the host) or when an
+    // explicit --advertise-url names a reachable address. A bare non-loopback bind
+    // publishes nothing: the file would carry the hosted bearer token into a workspace
+    // file while advertising an address the extension refuses to dial.
+    let _discovery = if listener.local_addr()?.ip().is_loopback() || advertise_url.is_some() {
+        if !listener.local_addr()?.ip().is_loopback() {
+            eprintln!(
+                "non-loopback serve is plain HTTP — terminate TLS in a trusted reverse proxy"
+            );
+        }
         Some(DiscoveryGuard::publish(lens_discovery_path(&workspace_root), &discovery)?)
     } else {
         eprintln!(
-            "non-loopback serve is plain HTTP — terminate TLS in a trusted reverse proxy; no \
-             workspace discovery file published"
+            "non-loopback serve without --advertise-url: no workspace discovery file published"
         );
         None
     };
@@ -1370,8 +1404,11 @@ mod tests {
                 config.clone(),
                 root.clone(),
                 SocketAddr::new(bind_ip, port),
-                "standalone-token".to_string(),
-                Vec::new(),
+                StandaloneServeOptions {
+                    auth_token: "standalone-token".to_string(),
+                    allowed_origins: Vec::new(),
+                    advertise_url: None,
+                },
                 election,
                 async move {
                     let _ = wait_for_stop.await;
@@ -1413,6 +1450,64 @@ mod tests {
                 .expect("a clean shutdown is not an error");
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    /// `--advertise-url` publishes discovery on a non-loopback bind with the ADVERTISED
+    /// address — the container-split shape: the listener binds the docker-network IP,
+    /// and the extension dials the URL it is told to.
+    #[tokio::test]
+    async fn standalone_serving_publishes_the_advertise_url_when_given() {
+        let root = temp_dir();
+        let mut config = test_config(root.clone());
+        config.allow_empty = true;
+        drop(rag_rat_core::IndexDatabase::rebuild(&config).unwrap());
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let election = FileLock::try_acquire(&root.join("election.lock"))
+            .unwrap()
+            .expect("an uncontended election lock");
+        let (stop, wait_for_stop) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(serve_standalone(
+            config.clone(),
+            root.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+            StandaloneServeOptions {
+                auth_token: "standalone-token".to_string(),
+                allowed_origins: Vec::new(),
+                advertise_url: Some("http://lens.internal:18120".to_string()),
+            },
+            election,
+            async move {
+                let _ = wait_for_stop.await;
+                Ok(())
+            },
+        ));
+
+        let discovery_path = lens_discovery_path(&root);
+        for _ in 0..200 {
+            if discovery_path.is_file() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let published: LensDiscovery = serde_json::from_slice(
+            &fs::read(&discovery_path).expect("an advertise-url serve must publish discovery"),
+        )
+        .unwrap();
+        assert_eq!(published.url, "http://lens.internal:18120");
+        assert_eq!(published.host, "lens.internal");
+        assert_eq!(published.port, 18120);
+        assert_eq!(published.ownership_token, "standalone-token");
+
+        let _ = stop.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(10), served)
+            .await
+            .expect("standalone serve must return once its shutdown future resolves")
+            .expect("the serve task must not panic")
+            .expect("a clean shutdown is not an error");
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_config(root: PathBuf) -> Config {

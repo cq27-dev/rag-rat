@@ -206,6 +206,13 @@ pub(crate) struct ServeArgs {
     /// for multiple trusted origins.
     #[arg(long, value_name = "ORIGIN", value_parser = parse_lens_origin)]
     pub allow_origin: Vec<String>,
+    /// Publish the Lens discovery file advertising this URL instead of the bind address. Needed
+    /// when the server runs in a sibling container/VM whose bind address the extension cannot
+    /// dial (the extension refuses `0.0.0.0`); without it, non-loopback serving publishes no
+    /// discovery file. Plain HTTP is only acceptable on a trusted network — terminate TLS in a
+    /// reverse proxy for public serving.
+    #[arg(long, value_name = "URL")]
+    pub advertise_url: Option<String>,
 }
 
 /// clap `value_parser` for `--allow-origin`: an Origin header is `scheme://host[:port]` with no

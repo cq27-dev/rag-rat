@@ -2346,6 +2346,9 @@ test('the memory picker routes through the revalidating open, not the captured o
     Range: class {},
     CodeLens: class {},
     ViewColumn: { Beside: 2 },
+    commands: {
+      executeCommand: async (name, uri) => shown.push([name, uri]),
+    },
     window: {
       showQuickPick: async (items) => items[0],
       showTextDocument: async (doc) => shown.push(doc),
@@ -2371,7 +2374,8 @@ test('the memory picker routes through the revalidating open, not the captured o
   await showMemoriesQuickPick([captured], 'src/lib.rs', documents);
   assert.deepEqual(calls.openPicked, [['mem-1', 'src/lib.rs']], 'the pick must be re-read by id');
   assert.deepEqual(calls.update, [], 'the captured object must never be rendered directly');
-  assert.equal(shown.length, 1);
+  assert.deepEqual(shown, [['markdown.showPreviewToSide', 'rag-rat-memory:/mem-1.md']],
+    'the memory opens as a rendered markdown preview, not the raw source');
 
   // A memory deleted while the picker was open is reported, not opened — and now sayable as a
   // removal, because only a lane that answered can produce this outcome.
