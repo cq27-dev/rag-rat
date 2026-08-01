@@ -318,6 +318,11 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
         self.account_id.to_bytes()
     }
 
+    fn prepare(&mut self) -> anyhow::Result<()> {
+        rag_rat_oplog::table_sync_author_pending(self.conn, self.account_id, (self.now_fn)())?;
+        Ok(())
+    }
+
     fn supported_streams(&self) -> anyhow::Result<Vec<ManifestItem>> {
         Ok(rag_rat_oplog::table_sync_supported_streams(self.conn, self.account_id)?
             .into_iter()
@@ -452,8 +457,9 @@ mod tests {
     }
 
     #[test]
-    fn table_store_maps_routes_and_skips_them_while_the_registry_is_empty() {
+    fn table_store_maps_routes_and_skips_them_without_current_incarnations() {
         let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::hooks::MigrationHooks::noop()).unwrap();
         let account_id = AccountId::from_bytes([1; 32]);
         let stream = rag_rat_oplog::TableSyncStream {
             repo_id: "repo-a".into(),

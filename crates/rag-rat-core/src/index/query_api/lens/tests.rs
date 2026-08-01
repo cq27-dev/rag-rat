@@ -185,7 +185,7 @@ fn chunk_text_rejects_stale_source_without_healing_the_read_only_index() {
 }
 
 #[test]
-fn lens_version_tracks_in_place_enrichment_updates() {
+fn lens_version_tracks_binding_validation_and_in_place_enrichment_updates() {
     let (_temp, config) = indexed_config();
     let db = IndexDatabase::open_config(&config).unwrap();
     let conn = db.storage.connection();
@@ -215,6 +215,8 @@ fn lens_version_tracks_in_place_enrichment_updates() {
         params![db.active_repo_id, memory.memory_id],
     )
     .unwrap();
+    // Synced binding tables stay trigger-free; the validation writer advances the Lens clock.
+    rag_rat_query::memory::validate_memories(conn, Some(&config.root)).unwrap();
     let after_binding_update = db.lens_version().unwrap();
     assert_ne!(before_binding_update.revision, after_binding_update.revision);
     assert_ne!(before_binding_update.lanes.memories, after_binding_update.lanes.memories);

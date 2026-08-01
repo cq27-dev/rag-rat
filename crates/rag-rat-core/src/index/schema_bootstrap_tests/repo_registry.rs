@@ -147,12 +147,12 @@ fn migration_038_forward_migrates_a_v037_index() {
     // Revert to the V037 shape: remove future triggers before their repo_meta target, drop
     // children before the parent (FK), then drop the ledger rows.
     conn.execute_batch(
-        "DROP TRIGGER memory_bindings_lens_revision_insert;
-         DROP TRIGGER memory_bindings_lens_revision_delete;
-         DROP TRIGGER memory_bindings_lens_revision_update;
-         DROP TRIGGER memory_bindings_lane_revision_insert;
-         DROP TRIGGER memory_bindings_lane_revision_delete;
-         DROP TRIGGER memory_bindings_lane_revision_update;
+        "DROP TRIGGER IF EXISTS memory_bindings_lens_revision_insert;
+         DROP TRIGGER IF EXISTS memory_bindings_lens_revision_delete;
+         DROP TRIGGER IF EXISTS memory_bindings_lens_revision_update;
+         DROP TRIGGER IF EXISTS memory_bindings_lane_revision_insert;
+         DROP TRIGGER IF EXISTS memory_bindings_lane_revision_delete;
+         DROP TRIGGER IF EXISTS memory_bindings_lane_revision_update;
          DROP TRIGGER papertrail_items_lens_revision_insert;
          DROP TRIGGER papertrail_items_lens_revision_delete;
          DROP TRIGGER papertrail_items_lens_revision_update;

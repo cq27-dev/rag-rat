@@ -3,8 +3,7 @@
 //! A [`TableSpec`] declares, for one physical table, which columns replicate (the `pk` identity
 //! plus the synced `columns`) and which are re-derived locally and must NEVER travel
 //! (`local_columns`). The engine is generic over `&[TableSpec]`, so the mechanism is exercised
-//! against a synthetic spec in tests; [`SYNCABLE_TABLES`] stays empty until the per-scope
-//! milestones register real tables (anchors, overlay, distill).
+//! against synthetic specs in tests and the production registry starts with durable memory anchors.
 //!
 //! [`assert_spec_covers_schema`] is the load-bearing invariant: every physical column must be
 //! classified exactly once — as pk, synced, or local. A newly-added physical column can never be
@@ -157,10 +156,51 @@ impl TableSpec {
     }
 }
 
-/// The registry of tables the engine replicates. Empty until the per-scope milestones (anchors,
-/// overlay, distill) register their tables; the engine's apply/produce take a `&[TableSpec]`, so
-/// nothing here is load-bearing yet — the mechanism is proven against a synthetic spec in tests.
-pub(crate) const SYNCABLE_TABLES: &[TableSpec] = &[];
+const MEMORY_BINDING_PK: &[ColumnSpec] = &[
+    ColumnSpec::required("repo_id", ValueType::Text),
+    ColumnSpec::required("memory_id", ValueType::Text),
+    ColumnSpec::required("binding_kind", ValueType::Text),
+    ColumnSpec::required("binding_id", ValueType::Text),
+];
+
+const MEMORY_BINDING_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec::required("path", ValueType::Text),
+    ColumnSpec::required("start_line", ValueType::I64),
+    ColumnSpec::required("end_line", ValueType::I64),
+    ColumnSpec::required("commit_hash", ValueType::Text),
+    ColumnSpec::required("tracker", ValueType::Text),
+    ColumnSpec::required("project", ValueType::Text),
+    ColumnSpec::required("item_key", ValueType::Text),
+    ColumnSpec::required("created_at_ms", ValueType::I64),
+    ColumnSpec::required("symbol_kind", ValueType::Text),
+    ColumnSpec::required("signature_hash", ValueType::Text),
+    ColumnSpec::required("moniker_tool", ValueType::Text),
+    ColumnSpec::required("moniker_tool_version", ValueType::Text),
+];
+
+const MEMORY_BINDING_LOCAL_COLUMNS: &[&str] = &[
+    "logical_symbol_id",
+    "symbol_id",
+    "chunk_id",
+    "edge_id",
+    "anchor_status",
+    "relocation_reason",
+    "downgrade_pending_at_ms",
+];
+
+const MEMORY_BINDINGS: TableSpec = TableSpec {
+    name: "repo_memory_bindings",
+    scope_id: "anchors/1",
+    spec_version: 1,
+    pk: MEMORY_BINDING_PK,
+    columns: MEMORY_BINDING_COLUMNS,
+    local_columns: MEMORY_BINDING_LOCAL_COLUMNS,
+    repo_column: Some("repo_id"),
+};
+
+/// The production table registry. `anchors/1` retains durable memory-binding history in full;
+/// higher-churn overlay and distill tables remain unregistered until their retention milestones.
+pub(crate) const SYNCABLE_TABLES: &[TableSpec] = &[MEMORY_BINDINGS];
 
 /// One table's REPLICATED CONTRACT within a projector generation — everything that decides what
 /// this binary can project from the wire, and nothing that does not.
@@ -210,6 +250,33 @@ pub(crate) struct TableGeneration {
 pub(crate) const PROJECTOR_GENERATIONS: &[&[TableGeneration]] = &[
     // v1: the engine exists; no table is registered yet.
     &[],
+    // v2: durable memory anchors replicate on the retained anchors/1 stream.
+    &[TableGeneration {
+        table: "repo_memory_bindings",
+        scope_id: "anchors/1",
+        spec_version: 1,
+        repo_column: Some("repo_id"),
+        pk: &[
+            ("repo_id", ValueType::Text),
+            ("memory_id", ValueType::Text),
+            ("binding_kind", ValueType::Text),
+            ("binding_id", ValueType::Text),
+        ],
+        columns: &[
+            ("path", ValueType::Text, None),
+            ("start_line", ValueType::I64, None),
+            ("end_line", ValueType::I64, None),
+            ("commit_hash", ValueType::Text, None),
+            ("tracker", ValueType::Text, None),
+            ("project", ValueType::Text, None),
+            ("item_key", ValueType::Text, None),
+            ("created_at_ms", ValueType::I64, None),
+            ("symbol_kind", ValueType::Text, None),
+            ("signature_hash", ValueType::Text, None),
+            ("moniker_tool", ValueType::Text, None),
+            ("moniker_tool_version", ValueType::Text, None),
+        ],
+    }],
 ];
 
 /// Assert a spec classifies EVERY physical column of its table exactly once — as pk, a synced

@@ -80,6 +80,41 @@ pub fn table_sync_supported_streams(
     supported_streams_against(conn, account_id, SYNCABLE_TABLES)
 }
 
+/// Author every unpublished local row in the production registry before a table manifest is built.
+pub fn table_sync_author_pending(
+    conn: &Connection,
+    account_id: AccountId,
+    now_ms: i64,
+) -> anyhow::Result<usize> {
+    let streams = supported_streams_against(conn, account_id, SYNCABLE_TABLES)?;
+    let repos: BTreeSet<(String, [u8; 32])> =
+        streams.into_iter().map(|stream| (stream.repo_id, stream.incarnation_ref)).collect();
+    if repos.is_empty() {
+        return Ok(0);
+    }
+
+    let device = crate::local_device(conn, now_ms)?;
+    if !account::device_is_effective_writer(conn, account_id, device.fingerprint())? {
+        return Ok(0);
+    }
+    let _durability = crate::AuthoredDurability::begin(conn)?;
+    let mut authored = 0;
+    for (repo_id, incarnation_ref) in repos {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        authored += engine::produce_and_author(&tx, &SyncCtx {
+            repo_id: &repo_id,
+            account_id,
+            incarnation_ref,
+            device: &device,
+            registry: SYNCABLE_TABLES,
+            now_ms,
+        })?
+        .len();
+        tx.commit()?;
+    }
+    Ok(authored)
+}
+
 /// Recompute an advertised route from local current-incarnation authority and the production
 /// registry. The advertised stream id is routing advice only; it never creates authority.
 pub fn table_sync_validate_stream(
@@ -464,6 +499,17 @@ fn ingest_against(
         now_ms,
     };
     let report = engine::ingest(&tx, &ctx, &stream.scope_id, signed_bytes, &pubkey)?;
+    if registry.iter().any(|spec| spec.name == "repo_memory_bindings")
+        && std::iter::once(&report.outcome)
+            .chain(report.promoted.iter())
+            .any(|outcome| matches!(outcome, IngestOutcome::Applied))
+        && rag_rat_db::schema::repo_id_is_registered(&tx, &stream.repo_id)?
+    {
+        rag_rat_db::meta::bump_lens_revisions(&tx, &stream.repo_id, &[
+            rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+            rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+        ])?;
+    }
     tx.commit()?;
     Ok(match report.outcome {
         IngestOutcome::Applied
@@ -772,9 +818,206 @@ mod tests {
     }
 
     #[test]
-    fn empty_production_registry_has_no_streams() {
+    fn production_registry_advertises_one_anchors_stream_per_current_repo() {
         let conn = database();
-        assert!(table_sync_supported_streams(&conn, account()).unwrap().is_empty());
+        let streams = table_sync_supported_streams(&conn, account()).unwrap();
+        assert_eq!(streams.len(), 2);
+        assert!(streams.iter().all(|stream| stream.scope_id == "anchors/1"));
+        assert_eq!(streams.iter().map(|stream| stream.repo_id.as_str()).collect::<Vec<_>>(), [
+            "repo-a", "repo-b"
+        ]);
+    }
+
+    #[test]
+    fn production_anchors_create_rebind_and_delete_preserve_local_resolution() {
+        let source = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&source, &crate::test_hooks()).unwrap();
+        source
+            .execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+                 VALUES ('repo-a', 'repo-a', 0)",
+                [],
+            )
+            .unwrap();
+        let account = crate::local_account(&source, 0).unwrap();
+        crate::ensure_repo_incarnation(&source, "repo-a", 1).unwrap().unwrap();
+        source
+            .execute(
+                "INSERT INTO repo_memory_bindings(
+                     repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                     logical_symbol_id, symbol_id, chunk_id, edge_id, anchor_status, created_at_ms)
+                 VALUES ('repo-a', 'memory-a', 'path', 'src/lib.rs', 'src/lib.rs', 4, 5,
+                         11, 12, 13, 14, 'current', 2)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(table_sync_author_pending(&source, account, 2).unwrap(), 1);
+        let route = table_sync_supported_streams(&source, account).unwrap().remove(0);
+
+        let destination = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&destination, &crate::test_hooks()).unwrap();
+        crate::local_device(&destination, 0).unwrap();
+        for entry in crate::account_entries_for_sync(&source, account).unwrap() {
+            crate::account_ingest(&destination, &entry.signed_bytes, 0).unwrap();
+        }
+        let lens_revisions = |conn: &Connection| {
+            (
+                rag_rat_db::meta::repo_meta(
+                    conn,
+                    "repo-a",
+                    rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+                )
+                .unwrap(),
+                rag_rat_db::meta::repo_meta(
+                    conn,
+                    "repo-a",
+                    rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+                )
+                .unwrap(),
+            )
+        };
+        let before_create = lens_revisions(&destination);
+        let sync_all = |destination: &Connection| {
+            let heads = table_sync_chain_page_after(&source, account, &route, None, 10).unwrap();
+            assert_eq!(heads.len(), 1);
+            for entry in table_sync_chain_entries(
+                &source,
+                account,
+                &route,
+                heads[0].device_fingerprint,
+                TableSyncEntryStart::Beginning,
+                20,
+            )
+            .unwrap()
+            {
+                table_sync_ingest(
+                    destination,
+                    account,
+                    &route,
+                    heads[0].device_fingerprint,
+                    &entry.signed_bytes,
+                    3,
+                )
+                .unwrap();
+            }
+        };
+        sync_all(&destination);
+        assert_eq!(lens_revisions(&destination), before_create);
+        let replicated_before_registration: bool = destination
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM repo_memory_bindings
+                     WHERE repo_id = 'repo-a' AND memory_id = 'memory-a')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(replicated_before_registration);
+        destination
+            .execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+                 VALUES ('repo-a', 'repo-a', 0)",
+                [],
+            )
+            .unwrap();
+        destination
+            .execute(
+                "UPDATE repo_memory_bindings
+                 SET logical_symbol_id = 71, symbol_id = 72, chunk_id = 73, edge_id = 74,
+                     anchor_status = 'relocated'
+                 WHERE repo_id = 'repo-a' AND memory_id = 'memory-a'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            table_sync_author_pending(&destination, account, 3).unwrap(),
+            0,
+            "checkout-local resolution does not become a replicated edit",
+        );
+        source
+            .execute(
+                "UPDATE repo_memory_bindings SET path = 'src/renamed.rs', start_line = 6
+                 WHERE repo_id = 'repo-a' AND memory_id = 'memory-a'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(table_sync_author_pending(&source, account, 3).unwrap(), 1);
+        let before_update = lens_revisions(&destination);
+        sync_all(&destination);
+        let after_update = lens_revisions(&destination);
+        assert_ne!(after_update.0, before_update.0);
+        assert_ne!(after_update.1, before_update.1);
+        let row: (String, i64, i64, i64, i64, String) = destination
+            .query_row(
+                "SELECT path, logical_symbol_id, symbol_id, chunk_id, edge_id, anchor_status
+                 FROM repo_memory_bindings
+                 WHERE repo_id = 'repo-a' AND memory_id = 'memory-a'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, ("src/renamed.rs".into(), 71, 72, 73, 74, "relocated".into()));
+
+        source
+            .execute_batch(
+                "DELETE FROM repo_memory_bindings
+                 WHERE repo_id = 'repo-a' AND memory_id = 'memory-a';
+                 INSERT INTO repo_memory_bindings(
+                     repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                     anchor_status, created_at_ms)
+                 VALUES ('repo-a', 'memory-a', 'path', 'src/moved.rs', 'src/moved.rs', 8, 9,
+                         'current', 4)",
+            )
+            .unwrap();
+        assert_eq!(table_sync_author_pending(&source, account, 4).unwrap(), 2);
+        let before_rebind = lens_revisions(&destination);
+        sync_all(&destination);
+        let after_rebind = lens_revisions(&destination);
+        assert_ne!(after_rebind.0, before_rebind.0);
+        assert_ne!(after_rebind.1, before_rebind.1);
+        let rebound: (String, String) = destination
+            .query_row(
+                "SELECT path, anchor_status FROM repo_memory_bindings
+                 WHERE repo_id = 'repo-a' AND memory_id = 'memory-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rebound, ("src/moved.rs".into(), "unverified".into()));
+
+        source
+            .execute(
+                "DELETE FROM repo_memory_bindings
+                 WHERE repo_id = 'repo-a' AND memory_id = 'memory-a'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(table_sync_author_pending(&source, account, 5).unwrap(), 1);
+        let before_delete = lens_revisions(&destination);
+        sync_all(&destination);
+        let after_delete = lens_revisions(&destination);
+        assert_ne!(after_delete.0, before_delete.0);
+        assert_ne!(after_delete.1, before_delete.1);
+        let exists: bool = destination
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM repo_memory_bindings
+                     WHERE repo_id = 'repo-a' AND memory_id = 'memory-a')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists);
+        assert_eq!(table_sync_author_pending(&source, account, 6).unwrap(), 0);
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub fn duplicate_memory_id(
         SELECT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
+         AND repo_memory_bindings.repo_id = repo_memories.repo_id
         WHERE repo_memories.kind = ?6
           AND lower(repo_memories.title) = lower(?1)
           AND lower(repo_memories.body) = lower(?2)
@@ -57,10 +58,11 @@ pub fn duplicate_memory_id(
           AND lower(repo_memories.body) = lower(?2)
           AND repo_memories.payload_json IS ?3
           AND repo_memories.status != 'obsolete'{repo_clause}
-          AND NOT EXISTS (
-              SELECT 1 FROM repo_memory_bindings WHERE repo_memory_bindings.memory_id = \
-                 repo_memories.id
-          )
+           AND NOT EXISTS (
+              SELECT 1 FROM repo_memory_bindings
+              WHERE repo_memory_bindings.memory_id = repo_memories.id
+                AND repo_memory_bindings.repo_id = repo_memories.repo_id
+           )
         LIMIT 1
         "
             ),
@@ -209,6 +211,7 @@ pub(crate) fn attach_memory_children(
                relocation_reason, anchor_status, created_at_ms
         FROM repo_memory_bindings
         WHERE memory_id = ?1
+          AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
         ORDER BY binding_kind, binding_id
         ",
     )?;

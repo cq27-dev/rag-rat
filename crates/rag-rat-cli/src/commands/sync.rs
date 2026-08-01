@@ -169,6 +169,7 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
         let conn = db.connection();
         (existing_account_or_hint(conn)?, node_secret(conn)?)
     };
+    ensure_founder_table_repo_incarnations(db.connection())?;
     drop(repo_lock);
 
     let runtime =
@@ -332,13 +333,24 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
                     tracing::info!("interrupted; shutting down");
                     break;
                 },
-                Some(Ok((alpn, report))) => tracing::info!(
-                    stream = %String::from_utf8_lossy(&alpn),
-                    sent = report.entries_sent,
-                    received = report.entries_received,
-                    stored = report.entries_newly_stored,
-                    "sync session complete"
-                ),
+                Some(Ok((alpn, report))) => {
+                    if alpn.as_slice() == rag_rat_sync::SYNC_ALPN
+                        && report.entries_sent == 0
+                        && report.entries_received == 0
+                        && report.entries_newly_stored == 0
+                    {
+                        ensure_founder_table_repo_incarnations(conn)?;
+                    } else if alpn.as_slice() == rag_rat_sync::CONTENT_SYNC_ALPN {
+                        rag_rat_core::drain_synced_memory(conn)?;
+                    }
+                    tracing::info!(
+                        stream = %String::from_utf8_lossy(&alpn),
+                        sent = report.entries_sent,
+                        received = report.entries_received,
+                        stored = report.entries_newly_stored,
+                        "sync session complete"
+                    );
+                },
                 // In one-shot mode the session IS the command's result, so a failed session is a
                 // failed command (scripted checks must see the non-zero exit). The long-running
                 // server logs and moves on to the next peer instead.
@@ -531,9 +543,15 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
         //    a fixpoint (#878): a single session can report `Done` while the store is still
         //    incomplete, so re-run until dry (or the round cap). The inviter must still be serving
         //    (its `sync init` / `serve`).
-        let account_report = {
+        let mut account_report = rag_rat_sync::ReconcileReport {
+            rounds: 0,
+            entries_newly_stored: 0,
+            entries_sent: 0,
+            converged: false,
+        };
+        for pass in 0..3 {
             let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
-            rag_rat_sync::connect_and_reconcile(
+            let report = rag_rat_sync::connect_and_reconcile(
                 &endpoint,
                 peer.clone(),
                 rag_rat_sync::SYNC_ALPN,
@@ -543,8 +561,15 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
                 rag_rat_sync::MAX_RECONCILE_ROUNDS,
             )
             .await
-            .map_err(|e| anyhow!("restoring the account log from the inviter failed: {e}"))?
-        };
+            .map_err(|e| anyhow!("restoring the account log from the inviter failed: {e}"))?;
+            if !report.converged {
+                bail!("restoring the account log did not converge before the round limit");
+            }
+            accumulate_reconcile_report(&mut account_report, report);
+            if pass == 1 {
+                ensure_founder_table_repo_incarnations(conn)?;
+            }
+        }
         let content_report = {
             let mut store = OplogContentSyncStore::new(conn, account_id, time::now_ms);
             rag_rat_sync::connect_and_reconcile(
@@ -559,6 +584,7 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow!("restoring content from the inviter failed: {e}"))?
         };
+        rag_rat_core::drain_synced_memory(conn)?;
         let tables_converged = {
             let mut store = rag_rat_sync::OplogTableSyncStore::new(conn, account_id, time::now_ms);
             if store.has_streams()? {
@@ -746,28 +772,55 @@ pub(crate) fn device_sync_run(
             },
         )
         .await;
+        let unresolved_configured = resolved.unresolved_configured;
         let peers = resolved.peers;
-        let mut reached = Vec::with_capacity(peers.len());
-        for (peer, addr) in &peers {
-            // Own a copy of the resolved address: it is dialed in dependency order (account log,
-            // content, then any supported table streams),
-            // and `addr` is a borrow into `peers`.
-            let addr = (*addr).clone();
-            // Account log FIRST — it carries the roster + stream ownership that AUTHORIZE content,
-            // so leading with it minimizes parking on the peer. The account-log result IS the
-            // peer's outcome — exactly one entry in `reached` per peer. `/3` content rides on top:
-            // best-effort, attempted only once the account log reached the peer, and a
-            // content hiccup is logged — never a peer failure.
-            // Reconcile each stream to a fixpoint (#878): a single session can report `Done` while
-            // the store is still incomplete (adversarial dependent-before-authorizer ordering, or a
-            // large active account), so re-run until a round is dry or the round cap is hit. A
-            // capped (non-converged) pass just defers the remainder to the next
-            // cadence.
-            let account_ok = {
+        let mut reached = vec![false; peers.len()];
+        let mut account_reports = vec![
+            rag_rat_sync::ReconcileReport {
+                rounds: 0,
+                entries_newly_stored: 0,
+                entries_sent: 0,
+                converged: false,
+            };
+            peers.len()
+        ];
+
+        // Reconcile authority with EVERY reachable peer before choosing a missing incarnation.
+        // A per-peer ensure can fork against a valid root held by a later peer.
+        for (index, (peer, addr)) in peers.iter().enumerate() {
+            let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
+            match rag_rat_sync::connect_and_reconcile(
+                &endpoint,
+                (*addr).clone(),
+                rag_rat_sync::SYNC_ALPN,
+                &mut store,
+                AuthPolicy::Closed,
+                time::now_ms,
+                rag_rat_sync::MAX_RECONCILE_ROUNDS,
+            )
+            .await
+            {
+                Ok(report) if report.converged => {
+                    account_reports[index] = report;
+                    reached[index] = true;
+                },
+                Ok(_) => tracing::warn!(
+                    peer,
+                    "device sync (account log) did not converge before the round limit"
+                ),
+                Err(e) => tracing::warn!(peer, error = %e, "device sync (account log) failed"),
+            }
+        }
+
+        // Automatic bootstrap is founder-only, so it cannot depend on a mutable local owner view.
+        // Propagate any newly-authored root through one more account pass before `/5` manifests.
+        ensure_founder_table_repo_incarnations(conn)?;
+        for (index, (peer, addr)) in peers.iter().enumerate() {
+            if reached[index] {
                 let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
                 match rag_rat_sync::connect_and_reconcile(
                     &endpoint,
-                    addr.clone(),
+                    (*addr).clone(),
                     rag_rat_sync::SYNC_ALPN,
                     &mut store,
                     AuthPolicy::Closed,
@@ -776,28 +829,40 @@ pub(crate) fn device_sync_run(
                 )
                 .await
                 {
-                    Ok(report) => {
-                        tracing::info!(
+                    Ok(report) if report.converged => {
+                        accumulate_reconcile_report(&mut account_reports[index], report);
+                    },
+                    Ok(_) => {
+                        tracing::warn!(
                             peer,
-                            rounds = report.rounds,
-                            converged = report.converged,
-                            sent = report.entries_sent,
-                            stored = report.entries_newly_stored,
-                            "device sync (account log) complete"
+                            "device sync (incarnation propagation) did not converge before the \
+                             round limit"
                         );
-                        true
+                        reached[index] = false;
                     },
                     Err(e) => {
-                        tracing::warn!(peer, error = %e, "device sync (account log) failed");
-                        false
+                        tracing::warn!(peer, error = %e, "device sync (incarnation propagation) failed");
+                        reached[index] = false;
                     },
                 }
-            };
-            if account_ok {
+            }
+        }
+
+        for (index, (peer, addr)) in peers.iter().enumerate() {
+            if reached[index] {
+                let account_report = account_reports[index];
+                tracing::info!(
+                    peer,
+                    rounds = account_report.rounds,
+                    converged = account_report.converged,
+                    sent = account_report.entries_sent,
+                    stored = account_report.entries_newly_stored,
+                    "device sync (account log) complete"
+                );
                 let mut store = OplogContentSyncStore::new(conn, account_id, time::now_ms);
                 match rag_rat_sync::connect_and_reconcile(
                     &endpoint,
-                    addr.clone(),
+                    (*addr).clone(),
                     rag_rat_sync::CONTENT_SYNC_ALPN,
                     &mut store,
                     AuthPolicy::Closed,
@@ -816,12 +881,13 @@ pub(crate) fn device_sync_run(
                     ),
                     Err(e) => tracing::warn!(peer, error = %e, "device sync (content) failed"),
                 }
+                rag_rat_core::drain_synced_memory(conn)?;
                 let mut table_store =
                     rag_rat_sync::OplogTableSyncStore::new(conn, account_id, time::now_ms);
                 if table_store.has_streams()? {
                     match rag_rat_sync::connect_and_table_reconcile(
                         &endpoint,
-                        addr,
+                        (*addr).clone(),
                         &mut table_store,
                         time::now_ms,
                         rag_rat_sync::MAX_RECONCILE_ROUNDS,
@@ -844,9 +910,8 @@ pub(crate) fn device_sync_run(
                     }
                 }
             }
-            reached.push(account_ok);
         }
-        anyhow::Ok(fold_peer_outcomes(resolved.unresolved_configured, &reached))
+        anyhow::Ok(fold_peer_outcomes(unresolved_configured, &reached))
     });
 
     // Stamp the cadence watermark on ANY completed attempt — a per-peer failure OR an endpoint-bind
@@ -857,6 +922,23 @@ pub(crate) fn device_sync_run(
     record_device_sync(conn)?;
     let (peers, ok, errors) = result?;
     Ok(DeviceSyncOutcome::Ran { peers, ok, errors })
+}
+
+fn ensure_founder_table_repo_incarnations(conn: &Connection) -> anyhow::Result<()> {
+    for repo_id in rag_rat_db::schema::real_repo_ids(conn)? {
+        rag_rat_oplog::ensure_repo_incarnation(conn, &repo_id, time::now_ms())?;
+    }
+    Ok(())
+}
+
+fn accumulate_reconcile_report(
+    total: &mut rag_rat_sync::ReconcileReport,
+    report: rag_rat_sync::ReconcileReport,
+) {
+    total.rounds += report.rounds;
+    total.entries_newly_stored += report.entries_newly_stored;
+    total.entries_sent += report.entries_sent;
+    total.converged = report.converged;
 }
 
 /// The discovery service's dialable address, or `None` (logged) when the configured id is unusable.

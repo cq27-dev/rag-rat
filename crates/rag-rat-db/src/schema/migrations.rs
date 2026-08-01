@@ -7295,6 +7295,92 @@ pub fn apply_file_graph_version_provenance(conn: &Connection) -> rusqlite::Resul
     Ok(())
 }
 
+/// V103 (#1109): make memory bindings a deterministic whole-row table for `anchors/1`.
+///
+/// The old shape was non-STRICT, keyed without `repo_id`, and cascaded from `repo_memories`.
+/// Those properties are incompatible with table sync: repository identity must be enforced by the
+/// row key, cross-row constraints make LWW arrival-order-dependent, and remote inserts omit
+/// checkout-local resolution state. The rebuilt table therefore has no FK or triggers and gives the
+/// one non-null local column a deterministic default. Parent cleanup is explicit in the memory
+/// drain after this migration.
+pub fn apply_syncable_memory_bindings(conn: &Connection) -> rusqlite::Result<()> {
+    if table_is_strict(conn, "repo_memory_bindings")?
+        && primary_key_columns(conn, "repo_memory_bindings")?
+            == ["repo_id", "memory_id", "binding_kind", "binding_id"]
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS memory_bindings_lens_revision_insert;
+          DROP TRIGGER IF EXISTS memory_bindings_lens_revision_delete;
+          DROP TRIGGER IF EXISTS memory_bindings_lens_revision_update;
+          DROP TRIGGER IF EXISTS memory_bindings_lane_revision_insert;
+          DROP TRIGGER IF EXISTS memory_bindings_lane_revision_delete;
+          DROP TRIGGER IF EXISTS memory_bindings_lane_revision_update;
+          DROP TABLE IF EXISTS repo_memory_bindings_v103;
+          CREATE TABLE repo_memory_bindings_v103(
+             repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+             memory_id TEXT NOT NULL,
+             binding_kind TEXT NOT NULL,
+             binding_id TEXT NOT NULL,
+             path TEXT,
+             start_line INTEGER,
+             end_line INTEGER,
+             logical_symbol_id INTEGER,
+             symbol_id INTEGER,
+             chunk_id INTEGER,
+             edge_id INTEGER,
+             commit_hash TEXT,
+             tracker TEXT,
+             project TEXT,
+             item_key TEXT,
+             anchor_status TEXT NOT NULL DEFAULT 'unverified',
+             created_at_ms INTEGER NOT NULL,
+             symbol_kind TEXT,
+             signature_hash TEXT,
+             moniker_tool TEXT,
+             moniker_tool_version TEXT,
+             relocation_reason TEXT,
+             downgrade_pending_at_ms INTEGER,
+             PRIMARY KEY(repo_id, memory_id, binding_kind, binding_id)
+         ) STRICT;
+          INSERT INTO repo_memory_bindings_v103(
+             repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+             logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, tracker, project,
+             item_key, anchor_status, created_at_ms, symbol_kind, signature_hash, moniker_tool,
+             moniker_tool_version, relocation_reason, downgrade_pending_at_ms
+         )
+         SELECT repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+             logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, tracker, project,
+             item_key, anchor_status, created_at_ms, symbol_kind, signature_hash, moniker_tool,
+             moniker_tool_version, relocation_reason, downgrade_pending_at_ms
+          FROM repo_memory_bindings;
+          DROP TABLE repo_memory_bindings;
+          ALTER TABLE repo_memory_bindings_v103 RENAME TO repo_memory_bindings;
+         CREATE INDEX idx_repo_memory_bindings_logical_symbol
+             ON repo_memory_bindings(logical_symbol_id);
+         CREATE INDEX idx_repo_memory_bindings_symbol ON repo_memory_bindings(symbol_id);
+         CREATE INDEX idx_repo_memory_bindings_chunk ON repo_memory_bindings(chunk_id);
+         CREATE INDEX idx_repo_memory_bindings_edge ON repo_memory_bindings(edge_id);
+         CREATE INDEX idx_repo_memory_bindings_path ON repo_memory_bindings(path);",
+    )
+}
+
+fn table_is_strict(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT strict FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+        [table],
+        |row| row.get(0),
+    )
+}
+
+fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?;
+    stmt.query_map([table], |row| row.get(0))?.collect()
+}
+
 #[cfg(test)]
 mod memory_model_failure_migration_tests {
     use super::*;

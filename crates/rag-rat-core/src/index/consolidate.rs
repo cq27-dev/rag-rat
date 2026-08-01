@@ -606,7 +606,7 @@ fn import_from_source(
     // Mirror invariant: children of EVERY mapped id are replaced, not unioned. Digest the target's
     // child slices before and after — identical slice ⇒ that table reports 0 (an honest no-op).
     let pre = child_slice_digests(&tx, &id_map)?;
-    refresh_children(&tx, &id_map)?;
+    refresh_children(&tx, repo_id, &id_map)?;
     let callee_remap = consolidation_callee_remap(source, repo_id)?;
     let raw = ImportCounts {
         memories,
@@ -923,16 +923,19 @@ struct CopiedMemories {
 /// legacy is the live store until the rename lands, so its child sets REPLACE the stale global
 /// ones (a tag removed legacy-side must not survive by union). Table presence is not probed:
 /// these are TARGET tables, always at current schema.
-fn refresh_children(tx: &Connection, id_map: &BTreeMap<String, String>) -> anyhow::Result<()> {
+fn refresh_children(
+    tx: &Connection,
+    repo_id: &str,
+    id_map: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
     for id in id_map.values() {
-        for table in [
-            "repo_memory_tags",
-            "repo_memory_bindings",
-            "repo_memory_call_paths",
-            "repo_memory_call_path_edges",
-        ] {
+        for table in ["repo_memory_tags", "repo_memory_call_paths", "repo_memory_call_path_edges"] {
             tx.execute(&format!("DELETE FROM {table} WHERE memory_id = ?1"), [id])?;
         }
+        tx.execute(
+            "DELETE FROM repo_memory_bindings WHERE memory_id = ?1 AND repo_id = ?2",
+            params![id, repo_id],
+        )?;
         // Node edges (#464) key on `source_node_id`, not `memory_id` — delete them here too so the
         // subsequent `copy_node_edges` REPLACES the source's edge set (the mirror invariant).
         tx.execute("DELETE FROM repo_node_edges WHERE source_node_id = ?1", [id])?;

@@ -2,9 +2,8 @@
 //! self-describing typed-CBOR row ops on a signed per-scope stream, folded by WHOLE-ROW
 //! last-writer-wins.
 //!
-//! Transport-independent. The wire form ([`row_op`]) and the fold/produce pipeline are exercised by
-//! driving two DB connections through an in-process loopback; the iroh transport is a later
-//! milestone that plugs a `/5` sibling stream into `rag-rat-sync` (nothing here depends on it).
+//! Transport-independent. The wire form ([`row_op`]) and fold/produce pipeline plug into
+//! `rag-rat-sync` through the production [`transport`] seams.
 //!
 //! This `mod.rs` is the curated index; the machinery lives in job-focused siblings. The re-export
 //! surface widens as the apply/produce siblings land and force each export.
@@ -40,7 +39,7 @@ pub(crate) use store::{
 };
 pub use transport::{
     TableSyncChainEntry, TableSyncChainHead, TableSyncEntryStart, TableSyncFrontier,
-    TableSyncIngestOutcome, TableSyncStream, table_sync_chain_entries, table_sync_chain_frontier,
-    table_sync_chain_page_after, table_sync_ingest, table_sync_supported_streams,
-    table_sync_validate_stream,
+    TableSyncIngestOutcome, TableSyncStream, table_sync_author_pending, table_sync_chain_entries,
+    table_sync_chain_frontier, table_sync_chain_page_after, table_sync_ingest,
+    table_sync_supported_streams, table_sync_validate_stream,
 };

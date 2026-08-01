@@ -38,7 +38,7 @@
 //!   invisible at epoch 0.
 
 use anyhow::Context;
-use rusqlite::Transaction;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use super::super::bootstrap::{self, LocalAccountRef};
 use super::super::envelope::{
@@ -60,6 +60,57 @@ type EntryHash = [u8; 32];
 /// The key epoch a stream's content key first mints at. C4.4 lazy rotation bumps it on device
 /// removal; C4.3a only ever mints the initial epoch.
 const INITIAL_KEY_EPOCH: u64 = 0;
+
+/// Return the current owner-authorized repository incarnation, authoring the first one only on the
+/// founder while it remains an owner. Restricting automatic bootstrap to one immutable device keeps
+/// disconnected owner projections from choosing competing predecessor-less roots.
+pub fn ensure_repo_incarnation(
+    conn: &Connection,
+    repo_id: &str,
+    now_ms: i64,
+) -> anyhow::Result<Option<EntryHash>> {
+    let _durability = bootstrap::AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let Some(LocalAccountRef { account_id, genesis_hash }) = bootstrap::local_account_ref(&tx)?
+    else {
+        return Ok(None);
+    };
+    match super::storage::repo_incarnation_state(&tx, account_id, repo_id)? {
+        RepoIncarnationState::Current(reference) => return Ok(Some(reference)),
+        RepoIncarnationState::Contested => anyhow::bail!(
+            "repository incarnation authority is contested; refusing to choose a fork locally"
+        ),
+        RepoIncarnationState::Absent => {},
+    }
+    let device = local_device(&tx, now_ms)?;
+    let founder: Vec<u8> = tx.query_row(
+        "SELECT device_fingerprint FROM account_entries
+         WHERE entry_hash = ?1 AND account_id = ?2 AND accepted = 1",
+        rusqlite::params![genesis_hash.as_slice(), account_id.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    let founder_is_owner: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM account_owner_incarnations
+             WHERE account_id = ?1 AND device_fingerprint = ?2 AND closed_at IS NULL)",
+        rusqlite::params![account_id.to_bytes().as_slice(), founder.as_slice()],
+        |row| row.get(0),
+    )?;
+    if !founder_is_owner {
+        return Ok(None);
+    }
+    if founder.as_slice() != device.fingerprint().to_bytes().as_slice() {
+        return Ok(None);
+    }
+    if storage::effective_owner_incarnation_for_device(&tx, account_id, device.fingerprint())?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let reference = advance_repo_incarnation_in_tx(&tx, repo_id, now_ms)?;
+    tx.commit()?;
+    Ok(Some(reference))
+}
 
 /// Explicitly advance `repo_id` to a fresh owner-authorized incarnation. The accepted signed-entry
 /// hash is the new incarnation reference. Local repository removal never calls this seam.

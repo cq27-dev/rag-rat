@@ -81,6 +81,7 @@ pub fn memories_for_chunk(
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
+         AND repo_memory_bindings.repo_id = repo_memories.repo_id
         LEFT JOIN chunks ON chunks.id = ?1
         LEFT JOIN files ON files.id = chunks.file_id
         WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
@@ -111,6 +112,7 @@ pub fn memories_for_path(
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
+         AND repo_memory_bindings.repo_id = repo_memories.repo_id
         WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
           AND repo_memory_bindings.path = ?1
         ORDER BY repo_memories.updated_at_ms DESC
@@ -136,6 +138,7 @@ pub fn memories_for_symbol(
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
+         AND repo_memory_bindings.repo_id = repo_memories.repo_id
         WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
           AND (
               repo_memory_bindings.logical_symbol_id = ?1
@@ -170,6 +173,7 @@ pub fn memories_for_symbol(
             SELECT DISTINCT repo_memories.id AS memory_id
             FROM repo_memories
             JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
+             AND repo_memory_bindings.repo_id = repo_memories.repo_id
             WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
               AND repo_memory_bindings.chunk_id IN ({placeholders})
             ORDER BY repo_memories.updated_at_ms DESC
@@ -318,6 +322,7 @@ pub fn memories_for_edges(
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
+         AND repo_memory_bindings.repo_id = repo_memories.repo_id
         WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
           AND repo_memory_bindings.edge_id IN ({placeholders})
         ORDER BY repo_memories.updated_at_ms DESC
@@ -419,12 +424,12 @@ pub fn list_memories(conn: &Connection, kind: Option<&str>) -> anyhow::Result<Ve
             SELECT m.id AS memory_id, m.kind, m.title, m.status,
                    b.binding_kind, b.binding_id
             FROM repo_memories AS m
-            JOIN repo_memory_bindings AS b ON b.memory_id = m.id
+            JOIN repo_memory_bindings AS b ON b.memory_id = m.id AND b.repo_id = m.repo_id
             WHERE m.status IN ('active', 'stale'){repo_clause}
               AND b.binding_kind = ?1
               AND b.rowid = (
                   SELECT b2.rowid FROM repo_memory_bindings AS b2
-                  WHERE b2.memory_id = m.id
+                  WHERE b2.memory_id = m.id AND b2.repo_id = m.repo_id
                   ORDER BY b2.binding_kind, b2.binding_id
                   LIMIT 1
               )
@@ -444,10 +449,10 @@ pub fn list_memories(conn: &Connection, kind: Option<&str>) -> anyhow::Result<Ve
                    b.binding_kind, b.binding_id
             FROM repo_memories AS m
             LEFT JOIN repo_memory_bindings AS b
-              ON b.memory_id = m.id
+                   ON b.memory_id = m.id AND b.repo_id = m.repo_id
               AND b.rowid = (
                   SELECT b2.rowid FROM repo_memory_bindings AS b2
-                  WHERE b2.memory_id = m.id
+                  WHERE b2.memory_id = m.id AND b2.repo_id = m.repo_id
                   ORDER BY b2.binding_kind, b2.binding_id
                   LIMIT 1
               )
@@ -501,7 +506,7 @@ pub fn doctor_attention_count(conn: &Connection) -> anyhow::Result<u64> {
             "
         SELECT COUNT(*)
         FROM repo_memory_bindings AS b
-        JOIN repo_memories AS m ON m.id = b.memory_id
+        JOIN repo_memories AS m ON m.id = b.memory_id AND m.repo_id = b.repo_id
         WHERE m.status = 'active'
           AND b.anchor_status IN ('gone', 'stale')
           AND b.binding_kind != 'scip_moniker'{repo_clause}
@@ -524,7 +529,7 @@ pub(crate) fn memory_ids_with_broken_anchors(conn: &Connection) -> rusqlite::Res
     conn.prepare(&format!(
         "SELECT DISTINCT b.memory_id
          FROM repo_memory_bindings AS b
-         JOIN repo_memories AS m ON m.id = b.memory_id
+         JOIN repo_memories AS m ON m.id = b.memory_id AND m.repo_id = b.repo_id
          WHERE m.status = 'active'
            AND b.anchor_status IN ('gone', 'stale')
            AND b.binding_kind != 'scip_moniker'{repo_clause}
@@ -545,7 +550,7 @@ pub fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>
                b.symbol_kind, b.signature_hash, b.anchor_status,
                m.title
         FROM repo_memory_bindings AS b
-        JOIN repo_memories AS m ON m.id = b.memory_id
+        JOIN repo_memories AS m ON m.id = b.memory_id AND m.repo_id = b.repo_id
         WHERE m.status = 'active'
           -- `pending` is LISTED (informational: alive on an in-flight branch, #492) but is
           -- deliberately absent from `doctor_attention_count` and the dream queue — it is not
@@ -716,7 +721,7 @@ pub fn anchor_health_counts(conn: &Connection) -> anyhow::Result<crate::memory::
         "
         SELECT b.anchor_status, COUNT(*) AS cnt
         FROM repo_memory_bindings AS b
-        JOIN repo_memories AS m ON m.id = b.memory_id
+        JOIN repo_memories AS m ON m.id = b.memory_id AND m.repo_id = b.repo_id
         WHERE m.status = 'active'
           -- Auxiliary `scip_moniker` anchors are excluded exactly as in `doctor_report`: these
           -- counts drive the 'run memory doctor' warnings, so counting rows doctor then hides
@@ -772,6 +777,8 @@ pub fn validate_memories(
                downgrade_pending_at_ms
         FROM repo_memory_bindings
         WHERE 1=1{repo_clause}
+        ORDER BY CASE WHEN binding_kind = 'scip_moniker' THEN 1 ELSE 0 END,
+                 memory_id, binding_kind, binding_id
         "
     ))?;
     let rows = stmt.query_map([], |row| {
@@ -830,8 +837,14 @@ pub fn validate_memories(
         {
             conn.execute(
                 "UPDATE repo_memory_bindings SET edge_id = NULL
-                 WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3",
-                params![binding.memory_id, binding.binding_kind, original_binding_id],
+                 WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3
+                   AND (?4 IS NULL OR repo_id = ?4)",
+                params![
+                    binding.memory_id,
+                    binding.binding_kind,
+                    original_binding_id,
+                    scope.as_deref()
+                ],
             )?;
         }
         // Downgrade hysteresis (#492): a single `gone` observation of a not-yet-gone binding is
@@ -851,14 +864,33 @@ pub fn validate_memories(
             } else if downgrade_pending_at_ms.is_none() {
                 conn.execute(
                     "UPDATE repo_memory_bindings SET downgrade_pending_at_ms = ?4
-                     WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3",
-                    params![binding.memory_id, binding.binding_kind, original_binding_id, now_ms()],
+                     WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3
+                       AND (?5 IS NULL OR repo_id = ?5)",
+                    params![
+                        binding.memory_id,
+                        binding.binding_kind,
+                        original_binding_id,
+                        now_ms(),
+                        scope.as_deref()
+                    ],
                 )?;
             } else {
-                stamp_validated_binding(conn, &binding, &original_binding_id, &status)?;
+                stamp_validated_binding(
+                    conn,
+                    scope.as_deref(),
+                    &binding,
+                    &original_binding_id,
+                    &status,
+                )?;
             }
         } else {
-            stamp_validated_binding(conn, &binding, &original_binding_id, &status)?;
+            stamp_validated_binding(
+                conn,
+                scope.as_deref(),
+                &binding,
+                &original_binding_id,
+                &status,
+            )?;
         }
         match status.as_str() {
             "current" => report.current += 1,
@@ -868,6 +900,19 @@ pub fn validate_memories(
             "pending" => report.pending += 1,
             _ => report.unverified += 1,
         }
+    }
+    if report.checked > 0
+        && let Some(repo_id) = scope.as_deref()
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM repos WHERE repo_id = ?1)",
+            [repo_id],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        rag_rat_db::meta::bump_lens_revisions(conn, repo_id, &[
+            rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+            rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+        ])?;
     }
     tx.commit()?;
     Ok(report)
@@ -879,6 +924,7 @@ pub fn validate_memories(
 /// downgrade itself (the marker's job is done).
 fn stamp_validated_binding(
     conn: &Connection,
+    repo_id: Option<&str>,
     binding: &RepoMemoryBinding,
     original_binding_id: &str,
     status: &str,
@@ -891,7 +937,8 @@ fn stamp_validated_binding(
             binding_id = ?11, symbol_kind = ?12, signature_hash = ?13,
             moniker_tool_version = ?15, relocation_reason = ?16,
             downgrade_pending_at_ms = NULL
-        WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?14
+         WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?14
+           AND (?17 IS NULL OR repo_id = ?17)
         ",
         params![
             binding.memory_id,
@@ -909,7 +956,8 @@ fn stamp_validated_binding(
             binding.signature_hash,
             original_binding_id,
             binding.moniker_tool_version,
-            binding.relocation_reason
+            binding.relocation_reason,
+            repo_id
         ],
     )?;
     // UPDATE OR IGNORE: if a sibling binding already holds the new (memory_id, kind,
@@ -918,8 +966,9 @@ fn stamp_validated_binding(
     if updated == 0 && binding.binding_id != original_binding_id {
         conn.execute(
             "DELETE FROM repo_memory_bindings
-             WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3",
-            params![binding.memory_id, binding.binding_kind, original_binding_id],
+             WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3
+               AND (?4 IS NULL OR repo_id = ?4)",
+            params![binding.memory_id, binding.binding_kind, original_binding_id, repo_id],
         )?;
     }
     Ok(())

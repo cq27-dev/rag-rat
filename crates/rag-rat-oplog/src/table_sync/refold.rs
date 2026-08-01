@@ -57,7 +57,7 @@ use crate::op::OpMeta;
 /// registering a table or widening a spec forces an append, and an append is the bump. A widening
 /// that is not a registry change (a new row-op kind) still has to append a generation by hand,
 /// repeating the previous snapshot.
-pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 1;
+pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 2;
 
 const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
 
@@ -108,8 +108,8 @@ pub fn refold_stale_table_sync_projections(conn: &Connection) -> anyhow::Result<
     refold_stale_projections_against(conn, super::registry::SYNCABLE_TABLES)
 }
 
-/// [`refold_stale_table_sync_projections`] against an explicit registry — the seam the engine tests
-/// drive with a synthetic spec, since `SYNCABLE_TABLES` is empty until the scope milestones land.
+/// [`refold_stale_table_sync_projections`] against an explicit registry — the seam engine tests use
+/// to exercise synthetic specs without changing the production registry.
 pub(crate) fn refold_stale_projections_against(
     conn: &Connection,
     registry: &[TableSpec],

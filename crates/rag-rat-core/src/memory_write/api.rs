@@ -288,7 +288,12 @@ pub(crate) fn rebind_memory(
              edge_id, call path, path/span, commit_hash, or tracker ref"
         )
     })?;
-    conn.execute("DELETE FROM repo_memory_bindings WHERE memory_id = ?1", [memory_id])?;
+    conn.execute(
+        "DELETE FROM repo_memory_bindings
+         WHERE memory_id = ?1
+           AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)",
+        [memory_id],
+    )?;
     conn.execute("DELETE FROM repo_memory_call_paths WHERE memory_id = ?1", [memory_id])?;
     let now = now_ms();
     insert_binding(conn, memory_id, &binding, now)?;

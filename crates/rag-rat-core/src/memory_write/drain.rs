@@ -411,10 +411,8 @@ fn write_node_children(tx: &Transaction<'_>, node_id: &str, tags: &[String]) -> 
 /// (a retro-condemn / revocation vacated it). The `origin='synced'` gate leaves a genuine local
 /// ghost of the same id untouched. Returns the removal count.
 ///
-/// The tag / binding / call-path / edge children cascade via their `ON DELETE CASCADE` FK, but the
-/// contentless `repo_memory_fts` shadow has NO foreign key, so its rows must be deleted EXPLICITLY
-/// (in this same txn, before the parent rows go) or a revoked memory leaks permanent FTS index
-/// data.
+/// Bindings and the contentless FTS shadow have no parent FK, so both are deleted explicitly before
+/// the parent. The remaining tag / call-path / edge children still cascade.
 fn remove_vanished_synced_nodes(
     tx: &Transaction<'_>,
     repo_id: &str,
@@ -429,6 +427,12 @@ fn remove_vanished_synced_nodes(
         repo_id,
         stream.to_bytes().as_slice()
     ])?;
+    tx.execute(
+        &format!(
+            "DELETE FROM repo_memory_bindings WHERE repo_id = ?1 AND memory_id IN ({CONDEMNED})"
+        ),
+        params![repo_id, stream.to_bytes().as_slice()],
+    )?;
     let removed = tx.execute(
         "DELETE FROM repo_memories
          WHERE repo_id = ?1 AND origin = 'synced'
@@ -439,7 +443,8 @@ fn remove_vanished_synced_nodes(
 }
 
 /// Drop an existing `origin='synced'` mirror of `node_id` under `repo_id` (FTS shadow first — it
-/// has no FK to cascade; the tag / binding / call-path / edge children cascade via their FK). Used
+/// has no FK to cascade; bindings are also deleted explicitly, while the other children cascade).
+/// Used
 /// when a projected UPDATE to an already-materialized synced row fails the local validity gates:
 /// the accepted value cannot be persisted, but the STALE prior value must not stay searchable
 /// either (it is no longer the projection, so [`remove_vanished_synced_nodes`] — which only fires
@@ -459,6 +464,9 @@ fn remove_quarantined_synced_node(
              SELECT id FROM repo_memories WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced')",
         params![node_id, repo_id],
     )?;
+    tx.execute("DELETE FROM repo_memory_bindings WHERE memory_id = ?1 AND repo_id = ?2", params![
+        node_id, repo_id
+    ])?;
     let removed = tx.execute(
         "DELETE FROM repo_memories WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced'",
         params![node_id, repo_id],
@@ -1731,6 +1739,80 @@ mod tests {
         assert_eq!(origin_of(&conn, "mem_peer"), "synced");
         assert!(memory_by_id(&conn, "mem_peer").unwrap().is_some(), "readable as a local row");
         assert_eq!(origin_of(&conn, &local_id), "local", "the local row is left untouched");
+    }
+
+    #[test]
+    fn content_then_production_anchors_surface_a_synced_memory_by_path() {
+        let source = scoped_conn();
+        let memory_id = create_concept(&source, "portable anchor");
+        source
+            .execute(
+                "INSERT INTO repo_memory_bindings(
+                     repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                     anchor_status, created_at_ms)
+                 VALUES (?1, ?2, 'path', 'src/lib.rs', 'src/lib.rs', 3, 4, 'current', 1)",
+                params![REPO, memory_id],
+            )
+            .unwrap();
+        let account = rag_rat_oplog::local_account(&source, 1).unwrap();
+        rag_rat_oplog::ensure_repo_incarnation(&source, REPO, 1).unwrap().unwrap();
+        assert_eq!(rag_rat_oplog::table_sync_author_pending(&source, account, 2).unwrap(), 1);
+        let route =
+            rag_rat_oplog::table_sync_supported_streams(&source, account).unwrap().remove(0);
+
+        let destination = scoped_conn();
+        rag_rat_oplog::local_device(&destination, 0).unwrap();
+        for entry in rag_rat_oplog::account_entries_for_sync(&source, account).unwrap() {
+            rag_rat_oplog::account_ingest(&destination, &entry.signed_bytes, 0).unwrap();
+        }
+        rag_rat_oplog::adopt_local_account(
+            &destination,
+            account,
+            rag_rat_oplog::read_local_account_genesis(&source).unwrap().unwrap(),
+            0,
+        )
+        .unwrap();
+        for entry in rag_rat_oplog::content_entries_for_sync(&source, account).unwrap() {
+            rag_rat_oplog::content_ingest(&destination, &entry.signed_bytes, 1).unwrap();
+        }
+        let source_stream = rag_rat_oplog::owned_stream_v2_id(&source, REPO).unwrap().unwrap();
+        let destination_stream = rag_rat_oplog::owned_stream_v2_id(&destination, REPO)
+            .unwrap()
+            .expect("account restore derives the repository's content stream");
+        assert_eq!(destination_stream, source_stream);
+        crate::drain_synced_memory(&destination).unwrap();
+        assert!(memory_by_id(&destination, &memory_id).unwrap().is_some());
+        assert!(
+            memory::memories_for_path(&destination, "src/lib.rs", 10).unwrap().is_empty(),
+            "content alone has no checkout-independent anchor",
+        );
+
+        let head = rag_rat_oplog::table_sync_chain_page_after(&source, account, &route, None, 10)
+            .unwrap()
+            .remove(0);
+        for entry in rag_rat_oplog::table_sync_chain_entries(
+            &source,
+            account,
+            &route,
+            head.device_fingerprint,
+            rag_rat_oplog::TableSyncEntryStart::Beginning,
+            10,
+        )
+        .unwrap()
+        {
+            rag_rat_oplog::table_sync_ingest(
+                &destination,
+                account,
+                &route,
+                head.device_fingerprint,
+                &entry.signed_bytes,
+                3,
+            )
+            .unwrap();
+        }
+        let surfaced = memory::memories_for_path(&destination, "src/lib.rs", 10).unwrap();
+        assert_eq!(surfaced.len(), 1);
+        assert_eq!(surfaced[0].memory_id, memory_id);
     }
 
     /// Advance a stream's projection epoch WITHOUT rewriting the projection — the way to simulate

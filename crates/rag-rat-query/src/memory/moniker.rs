@@ -249,6 +249,7 @@ pub(crate) fn moniker_binding_for_memory(
         SELECT binding_id, moniker_tool, moniker_tool_version
         FROM repo_memory_bindings
         WHERE memory_id = ?1 AND binding_kind = ?2
+          AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
         LIMIT 1
         ",
         params![memory_id, SCIP_MONIKER_BINDING_KIND],

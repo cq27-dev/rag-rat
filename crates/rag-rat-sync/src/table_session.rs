@@ -19,6 +19,9 @@ type Hash = [u8; 32];
 /// Store operations needed by the stream-qualified table session.
 pub trait TableSyncStore {
     fn account_id(&self) -> Hash;
+    fn prepare(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn supported_streams(&self) -> anyhow::Result<Vec<ManifestItem>>;
     fn validates(&self, item: &ManifestItem) -> anyhow::Result<bool>;
     fn chain_page(
@@ -165,6 +168,9 @@ where
     debug_assert!(limits.chains_per_page <= limits.chains_per_session);
     debug_assert!(limits.entries_per_page > 0);
     debug_assert!(limits.entries_per_page <= MAX_TABLE_ENTRIES_PER_PAGE);
+    if capabilities.local.can_push() {
+        store.prepare().map_err(TableSessionError::Store)?;
+    }
     let local_manifest =
         Manifest::new(store.supported_streams().map_err(TableSessionError::Store)?)
             .map_err(|error| TableSessionError::Store(error.into()))?;
@@ -638,6 +644,7 @@ mod tests {
         supported: Vec<ManifestItem>,
         entries: HashMap<Hash, HashMap<Hash, TestEntry>>,
         forbidden_snapshots: HashSet<Hash>,
+        prepare_count: usize,
     }
 
     impl MemStore {
@@ -647,6 +654,7 @@ mod tests {
                 supported: items,
                 entries: HashMap::new(),
                 forbidden_snapshots: HashSet::new(),
+                prepare_count: 0,
             }
         }
 
@@ -674,6 +682,11 @@ mod tests {
     impl TableSyncStore for MemStore {
         fn account_id(&self) -> Hash {
             self.account
+        }
+
+        fn prepare(&mut self) -> anyhow::Result<()> {
+            self.prepare_count += 1;
+            Ok(())
         }
 
         fn supported_streams(&self) -> anyhow::Result<Vec<ManifestItem>> {
@@ -889,6 +902,42 @@ mod tests {
         let (a, b) = pair(&mut a, &mut b).await;
         assert_eq!(a, TableSessionReport::default());
         assert_eq!(b, TableSessionReport::default());
+    }
+
+    #[tokio::test]
+    async fn read_only_sessions_do_not_prepare_local_table_authorship() {
+        use crate::auth::PeerCapability;
+
+        let mut a = MemStore::new(Vec::new());
+        let mut b = MemStore::new(Vec::new());
+        let (a_send, b_recv) = tokio::io::duplex(1024);
+        let (b_send, a_recv) = tokio::io::duplex(1024);
+        let capabilities =
+            SessionCapabilities::new(PeerCapability::ReadOnly, PeerCapability::ReadOnly);
+        let (a_result, b_result) = tokio::join!(
+            run_table_session_with_limits(
+                &mut a,
+                a_send,
+                a_recv,
+                AuthRole::Dialer,
+                capabilities,
+                DEFAULT_IDLE_TIMEOUT,
+                TableSessionLimits::default(),
+            ),
+            run_table_session_with_limits(
+                &mut b,
+                b_send,
+                b_recv,
+                AuthRole::Acceptor,
+                capabilities,
+                DEFAULT_IDLE_TIMEOUT,
+                TableSessionLimits::default(),
+            ),
+        );
+        a_result.unwrap();
+        b_result.unwrap();
+        assert_eq!(a.prepare_count, 0);
+        assert_eq!(b.prepare_count, 0);
     }
 
     #[tokio::test]

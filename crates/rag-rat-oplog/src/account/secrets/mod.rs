@@ -27,8 +27,8 @@ pub(in crate::account) use author::single_recipient_wrap_envelope_bytes;
 pub use author::{
     CatchUpReport, RotationOutcome, advance_repo_incarnation_in_tx,
     catch_up_stream_keys_for_device_in_tx, enroll_stream_keys_for_device_in_tx,
-    ensure_stream_key_current_in_tx, mint_and_author_stream_key_wrap_in_tx,
-    rotate_stream_key_in_tx,
+    ensure_repo_incarnation, ensure_stream_key_current_in_tx,
+    mint_and_author_stream_key_wrap_in_tx, rotate_stream_key_in_tx,
 };
 pub use ops::RepoIncarnation;
 pub(in crate::account) use ops::validate_storable_secrets_payload;

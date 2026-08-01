@@ -206,9 +206,8 @@ fn recently_changed_source_files(conn: &Connection, limit: usize) -> anyhow::Res
 /// `root_memory_title`), so we exclude them here to avoid duplication.
 fn active_non_dir_memory_titles(conn: &Connection, limit: usize) -> anyhow::Result<Vec<String>> {
     // Scoped to the active repo (V042): a sibling repo's active memory must not appear in this
-    // repo's orientation. Scoping the outer `m` on `repo_memories.repo_id` is sufficient — the
-    // inner `dir`-exclusion subquery only removes ids, and a sibling id can never equal an
-    // active memory's. `{repo_clause}` empty pre-A5.
+    // repo's orientation. The inner exclusion is correlated by repo because `/5` anchors may arrive
+    // before their parent content and can therefore temporarily reuse a sibling memory id.
     let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
     let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
     let mut stmt = conn.prepare(&format!(
@@ -218,9 +217,9 @@ fn active_non_dir_memory_titles(conn: &Connection, limit: usize) -> anyhow::Resu
          FROM repo_memories AS m
          WHERE m.status = 'active'{repo_clause}
            AND m.id NOT IN (
-               SELECT b.memory_id
-               FROM repo_memory_bindings AS b
-               WHERE b.binding_kind = 'dir'
+                SELECT b.memory_id
+                FROM repo_memory_bindings AS b
+                WHERE b.binding_kind = 'dir' AND b.repo_id = m.repo_id
            )
          ORDER BY m.updated_at_ms DESC
          LIMIT ?1"
@@ -252,9 +251,9 @@ fn active_non_dir_memory_count(conn: &Connection) -> anyhow::Result<u32> {
          FROM repo_memories AS m
          WHERE m.status = 'active'{repo_clause}
            AND m.id NOT IN (
-               SELECT b.memory_id
-               FROM repo_memory_bindings AS b
-               WHERE b.binding_kind = 'dir'
+                SELECT b.memory_id
+                FROM repo_memory_bindings AS b
+                WHERE b.binding_kind = 'dir' AND b.repo_id = m.repo_id
            )"
         ),
         [],

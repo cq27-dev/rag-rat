@@ -247,6 +247,7 @@ fn rewrite_logical_symbol_references(
     from: i64,
     to: i64,
 ) -> rusqlite::Result<()> {
+    let lens_repos = binding_lens_repos_for_logical_symbol(conn, from)?;
     // `logical_symbol_monikers` has no FK, so a DANGLING row (its logical row died in some
     // earlier wholesale rebuild; the next oracle run sweeps it) can already occupy `to` for the
     // same tool — and the plain UPDATE below would abort the whole rebuild on the PK. The moving
@@ -306,6 +307,7 @@ fn rewrite_logical_symbol_references(
             ],
         )?;
     }
+    bump_binding_lens_revisions(conn, &lens_repos)?;
     Ok(())
 }
 
@@ -337,6 +339,38 @@ fn column_present(
     Ok(false)
 }
 
+fn binding_lens_repos_for_logical_symbol(
+    conn: &rusqlite::Connection,
+    logical_symbol_id: i64,
+) -> rusqlite::Result<Vec<String>> {
+    if !column_present(conn, "repo_memory_bindings", "repo_id")?
+        || !table_present(conn, "repos")?
+        || !table_present(conn, "repo_meta")?
+    {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT b.repo_id
+         FROM repo_memory_bindings AS b
+         JOIN repos AS r ON r.repo_id = b.repo_id
+         WHERE b.logical_symbol_id = ?1",
+    )?;
+    stmt.query_map([logical_symbol_id], |row| row.get(0))?.collect()
+}
+
+fn bump_binding_lens_revisions(
+    conn: &rusqlite::Connection,
+    repo_ids: &[String],
+) -> rusqlite::Result<()> {
+    for repo_id in repo_ids {
+        rag_rat_db::meta::bump_lens_revisions(conn, repo_id, &[
+            rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+            rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+        ])?;
+    }
+    Ok(())
+}
+
 /// NULL every CALL-PATH reference to a drifted id the heal could not realign (#493 review),
 /// including a persisted edge callee identity after rebuilding its derived hashes when possible.
 /// Call-path references are the exception to the self-healing ladder: `validate_call_path_binding`
@@ -350,6 +384,7 @@ fn column_present(
 /// no-winner id — occupied and vanished alike — unlike the sentinel/delete cleanup below which is
 /// occupied-only.
 fn null_call_path_references(conn: &rusqlite::Connection, from: i64) -> rusqlite::Result<()> {
+    let lens_repos = binding_lens_repos_for_logical_symbol(conn, from)?;
     rag_rat_query::memory::remap_call_path_callee_logical_symbol_ids(conn, conn, &[(from, None)])?;
     conn.execute(
         "UPDATE repo_memory_bindings SET logical_symbol_id = NULL
@@ -386,6 +421,7 @@ fn null_call_path_references(conn: &rusqlite::Connection, from: i64) -> rusqlite
             params![rag_rat_base::serde_big_id::format_sym_handle(from)],
         )?;
     }
+    bump_binding_lens_revisions(conn, &lens_repos)?;
     Ok(())
 }
 
@@ -406,6 +442,7 @@ fn vacate_logical_symbol_references(
     conn: &rusqlite::Connection,
     from: i64,
 ) -> rusqlite::Result<()> {
+    let lens_repos = binding_lens_repos_for_logical_symbol(conn, from)?;
     conn.execute("DELETE FROM logical_symbol_monikers WHERE logical_symbol_id = ?1", params![
         from
     ])?;
@@ -414,6 +451,7 @@ fn vacate_logical_symbol_references(
           WHERE logical_symbol_id = ?2 AND binding_kind != 'call_path'",
         params![VACATED_LOGICAL_SYMBOL_ID, from],
     )?;
+    bump_binding_lens_revisions(conn, &lens_repos)?;
     Ok(())
 }
 
@@ -1518,30 +1556,43 @@ impl IndexDatabase {
             signature.map(|sig| rag_rat_base::hash::hex_sha256(sig.trim().as_bytes()));
         // Snapshot the current binding_ids before mutating, so the rename loop is not walking a
         // live cursor it is also writing to.
-        let stale_binding_ids: Vec<(String, String)> = {
+        let stale_binding_ids: Vec<(String, String, String)> = {
             let mut stmt = conn.prepare(
-                "SELECT memory_id, binding_id FROM repo_memory_bindings
+                "SELECT repo_id, memory_id, binding_id FROM repo_memory_bindings
                   WHERE binding_kind = 'logical_symbol' AND logical_symbol_id = ?1",
             )?;
-            stmt.query_map(params![logical_symbol_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
+            stmt.query_map(params![logical_symbol_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for (memory_id, old_binding_id) in stale_binding_ids {
+        let mut changed = false;
+        for (repo_id, memory_id, old_binding_id) in stale_binding_ids {
             let updated = conn.execute(
                 "UPDATE OR IGNORE repo_memory_bindings
                     SET binding_id = ?3, symbol_kind = ?4, signature_hash = ?5
-                  WHERE memory_id = ?1 AND binding_kind = 'logical_symbol' AND binding_id = ?2",
-                params![memory_id, old_binding_id, qualified_name, kind, signature_hash],
+                  WHERE repo_id = ?6 AND memory_id = ?1
+                    AND binding_kind = 'logical_symbol' AND binding_id = ?2",
+                params![memory_id, old_binding_id, qualified_name, kind, signature_hash, repo_id],
             )?;
+            changed |= updated > 0;
             // The rename was ignored because a sibling binding of this memory already holds the
             // target qualified name: drop the stale row instead of leaving it mis-labelled.
             if updated == 0 && old_binding_id != qualified_name {
                 conn.execute(
                     "DELETE FROM repo_memory_bindings
-                      WHERE memory_id = ?1 AND binding_kind = 'logical_symbol' AND binding_id = ?2",
-                    params![memory_id, old_binding_id],
+                      WHERE repo_id = ?3 AND memory_id = ?1
+                        AND binding_kind = 'logical_symbol' AND binding_id = ?2",
+                    params![memory_id, old_binding_id, repo_id],
                 )?;
+                changed = true;
             }
+        }
+        if changed {
+            rag_rat_db::meta::bump_lens_revisions(conn, &self.active_repo_id, &[
+                rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+                rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+            ])?;
         }
         Ok(())
     }

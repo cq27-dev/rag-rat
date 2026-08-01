@@ -702,6 +702,45 @@ fn orientation_in_a_linked_worktree_reflects_the_overlay_on_base() {
     run_git(&linked, &["add", "."]);
     run_git(&linked, &["commit", "-q", "-m", "branch"]);
     db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    {
+        let conn = db.storage.connection();
+        conn.execute(
+            "INSERT INTO repo_memories(
+                 id, kind, title, body, confidence, status, created_at_ms, updated_at_ms, source,
+                 input_hash, memory_version, repo_id)
+             VALUES ('linked-anchor', 'Invariant', 'linked anchor', 'body', 'high', 'active', 0, 0,
+                     'agent', 'hash', 'v1', ?1)",
+            [&db.active_repo_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, anchor_status, created_at_ms)
+             VALUES (?1, 'linked-anchor', 'path', 'src/added.rs', 'src/added.rs', 'current', 0)",
+            [&db.active_repo_id],
+        )
+        .unwrap();
+    }
+    db.use_worktree_scope(&main, None).unwrap();
+    rag_rat_query::memory::validate_memories(db.storage.connection(), Some(&main)).unwrap();
+    let status: String = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT anchor_status FROM repo_memory_bindings
+             WHERE repo_id = ?1 AND memory_id = 'linked-anchor'",
+            [&db.active_repo_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "pending", "main must preserve an anchor live in the linked checkout");
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    let surfaced =
+        rag_rat_query::memory::memories_for_path(db.storage.connection(), "src/added.rs", 10)
+            .unwrap();
+    assert_eq!(surfaced.len(), 1, "the linked checkout still surfaces its shared anchor");
     drop(db);
 
     let conn = IndexConnection::open_read_only(&db_path).unwrap();

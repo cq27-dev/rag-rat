@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 102;
+pub const LATEST_SCHEMA_VERSION: u32 = 103;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -775,6 +775,11 @@ const MIGRATION_102_DESCRIPTION: &str = "Add independent O(1), per-repo Lens rev
                                          symbols, clones, memories, coupling, and papertrail so \
                                          editor clients refetch only lanes whose backing data \
                                          changed while the aggregate legacy clock remains intact";
+const MIGRATION_103_ID: &str = "103_syncable_memory_bindings";
+const MIGRATION_103_CHECKSUM: &str = "sha256:rag-rat-syncable-memory-bindings-v103";
+const MIGRATION_103_DESCRIPTION: &str = "Rebuild memory bindings as a strict, repository-keyed, \
+                                         dependency-free table suitable for deterministic \
+                                         anchors/1 whole-row replication";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -981,8 +986,14 @@ impl MigrationFn {
 /// A listed migration's body must NOT open a transaction of its own — the ladder owns one here, and
 /// `BEGIN` inside a transaction fails. `blocking_the_ledger_stamp_rolls_the_body_back` drives every
 /// entry and pins the atomicity behaviorally.
-const LEDGER_ATOMIC_MIGRATIONS: &[&str] =
-    &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID, MIGRATION_098_ID, MIGRATION_099_ID];
+const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[
+    MIGRATION_064_ID,
+    MIGRATION_065_ID,
+    MIGRATION_097_ID,
+    MIGRATION_098_ID,
+    MIGRATION_099_ID,
+    MIGRATION_103_ID,
+];
 
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
 /// older binary can still act on (see [`LEDGER_ATOMIC_MIGRATIONS`]).
@@ -1615,6 +1626,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_102_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_lens_lane_revisions),
     },
+    Migration {
+        id: MIGRATION_103_ID,
+        checksum: MIGRATION_103_CHECKSUM,
+        description: MIGRATION_103_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_syncable_memory_bindings),
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -1834,8 +1851,14 @@ mod ledger_atomicity {
     /// off the production list alone would let a migration dropped from that list drop out of the
     /// test with it, so the regression that reintroduces the two-commit window would pass. These
     /// tests range over the UNION, so removing an id from production fails here instead.
-    const DATA_CONVERTING_MIGRATIONS: &[&str] =
-        &[MIGRATION_064_ID, MIGRATION_065_ID, MIGRATION_097_ID, MIGRATION_098_ID, MIGRATION_099_ID];
+    const DATA_CONVERTING_MIGRATIONS: &[&str] = &[
+        MIGRATION_064_ID,
+        MIGRATION_065_ID,
+        MIGRATION_097_ID,
+        MIGRATION_098_ID,
+        MIGRATION_099_ID,
+        MIGRATION_103_ID,
+    ];
 
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.
     fn ledger_atomic_under_test() -> Vec<&'static str> {

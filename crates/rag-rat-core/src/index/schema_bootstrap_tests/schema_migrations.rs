@@ -1794,8 +1794,6 @@ fn migration_100_receiver_type_hint_interning() {
 /// V101 (#1014) makes graph and scope healing resumable per file row.
 #[test]
 fn migration_101_file_graph_version_provenance() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 102, "move this pin with the next schema migration");
-
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE files(path TEXT, repo_id TEXT, generation INTEGER);
@@ -1836,10 +1834,117 @@ fn migration_101_file_graph_version_provenance() {
             .unwrap();
         assert_eq!(exists, 1, "{index} exists");
     }
+}
 
-    let latest = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&latest, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&latest).unwrap().current_version, 102);
+/// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
+#[test]
+fn migration_103_syncable_memory_bindings() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 103, "move this pin with the next schema migration");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    conn.execute_batch(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-a', 'repo-a', 0);
+         INSERT INTO repo_memories(
+             id, kind, title, body, confidence, status, created_at_ms, updated_at_ms, source,
+             input_hash, memory_version, repo_id)
+             VALUES ('memory-a', 'Invariant', 'title', 'body', 'high', 'active', 0, 0,
+                     'agent', 'hash', 'v1', 'repo-a');
+         INSERT INTO repo_memory_bindings(
+             repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+             logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, tracker, project,
+             item_key, anchor_status, created_at_ms, symbol_kind, signature_hash, moniker_tool,
+             moniker_tool_version, relocation_reason, downgrade_pending_at_ms)
+             VALUES ('repo-a', 'memory-a', 'path', 'src/lib.rs', 'src/lib.rs', 1, 2,
+                     3, 4, 5, 6, 'commit', 'github', 'owner/repo', '7', 'relocated', 8,
+                     'function', 'signature', 'scip-rust', '1', 'moniker-match', 9);
+         ALTER TABLE repo_memory_bindings RENAME TO repo_memory_bindings_v103_shape;
+         CREATE TABLE repo_memory_bindings(
+             repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+             memory_id TEXT NOT NULL,
+             binding_kind TEXT NOT NULL,
+             binding_id TEXT NOT NULL,
+             path TEXT,
+             start_line INTEGER,
+             end_line INTEGER,
+             logical_symbol_id INTEGER,
+             symbol_id INTEGER,
+             chunk_id INTEGER,
+             edge_id INTEGER,
+             commit_hash TEXT,
+             tracker TEXT,
+             project TEXT,
+             item_key TEXT,
+             anchor_status TEXT NOT NULL DEFAULT 'unverified',
+             created_at_ms INTEGER NOT NULL,
+             symbol_kind TEXT,
+             signature_hash TEXT,
+             moniker_tool TEXT,
+             moniker_tool_version TEXT,
+             relocation_reason TEXT,
+             downgrade_pending_at_ms INTEGER,
+             PRIMARY KEY(memory_id, binding_kind, binding_id),
+             FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
+         );
+         INSERT INTO repo_memory_bindings SELECT * FROM repo_memory_bindings_v103_shape;
+         DROP TABLE repo_memory_bindings_v103_shape;
+         CREATE TRIGGER memory_bindings_lens_revision_insert
+             AFTER INSERT ON repo_memory_bindings BEGIN SELECT 1; END;",
+    )
+    .unwrap();
+
+    schema::migrations::apply_syncable_memory_bindings(&conn).unwrap();
+    schema::migrations::apply_syncable_memory_bindings(&conn).expect("replay is a no-op");
+
+    let strict: i64 = conn
+        .query_row(
+            "SELECT strict FROM pragma_table_list
+             WHERE schema = 'main' AND name = 'repo_memory_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(strict, 1);
+    let mut pk = conn
+        .prepare(
+            "SELECT name FROM pragma_table_info('repo_memory_bindings')
+             WHERE pk > 0 ORDER BY pk",
+        )
+        .unwrap();
+    let pk: Vec<String> =
+        pk.query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(pk, ["repo_id", "memory_id", "binding_kind", "binding_id"]);
+    let foreign_keys: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('repo_memory_bindings')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(foreign_keys, 0);
+    let triggers: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'trigger' AND tbl_name = 'repo_memory_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(triggers, 0);
+    let preserved: (String, i64, i64, i64, String, i64) = conn
+        .query_row(
+            "SELECT path, logical_symbol_id, symbol_id, chunk_id, anchor_status,
+                    downgrade_pending_at_ms
+             FROM repo_memory_bindings
+             WHERE repo_id = 'repo-a' AND memory_id = 'memory-a'",
+            [],
+            |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+            },
+        )
+        .unwrap();
+    assert_eq!(preserved, ("src/lib.rs".into(), 3, 4, 5, "relocated".into(), 9));
 }
 
 /// V091 (#949) tracks the live key-target count each invite reservation covers, so fold-time

@@ -682,7 +682,7 @@ fn direct_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
 }
 
 #[tokio::test]
-async fn empty_production_table_registry_negotiates_zero_streams_through_dispatch() {
+async fn production_anchors_replicate_through_dispatch_before_local_repo_registration() {
     use rag_rat_sync::{
         AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,
         accept_and_dispatch, connect_and_table_sync,
@@ -702,10 +702,32 @@ async fn empty_production_table_registry_negotiates_zero_streams_through_dispatc
     )
     .await;
 
+    owner
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-a', 'repo-a', 0)",
+            [],
+        )
+        .unwrap();
+    rag_rat_oplog::ensure_repo_incarnation(&owner, "repo-a", NOW + 1).unwrap().unwrap();
+    owner
+        .execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                 anchor_status, created_at_ms)
+             VALUES ('repo-a', 'memory-a', 'path', 'src/lib.rs', 'src/lib.rs', 4, 5,
+                     'current', ?1)",
+            [NOW + 2],
+        )
+        .unwrap();
+    for entry in account_entries_for_sync(&owner, account).unwrap() {
+        rag_rat_oplog::account_ingest(&joiner, &entry.signed_bytes, NOW + 2).unwrap();
+    }
+
     let mut account_store = OplogSyncStore::new(&owner, account, || NOW);
     let mut content_store = OplogContentSyncStore::new(&owner, account, || NOW);
     let mut table_store = OplogTableSyncStore::new(&joiner, account, || NOW);
-    assert!(!table_store.has_streams().unwrap(), "the production registry stays empty");
+    assert!(table_store.has_streams().unwrap());
     let server = accept_and_dispatch(
         &owner_endpoint,
         &mut account_store,
@@ -723,8 +745,19 @@ async fn empty_production_table_registry_negotiates_zero_streams_through_dispatc
     let (alpn, server_report) = server.unwrap();
     let client_report = client.unwrap();
     assert_eq!(alpn, TABLE_SYNC_ALPN);
-    assert_eq!(server_report, rag_rat_sync::SessionReport::default());
-    assert_eq!(client_report, rag_rat_sync::TableSessionReport::default());
+    assert_eq!(server_report.entries_sent, 1);
+    assert_eq!(client_report.entries_newly_stored, 1);
+    let replicated: bool = joiner
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM repo_memory_bindings
+                 WHERE repo_id = 'repo-a' AND memory_id = 'memory-a'
+                   AND path = 'src/lib.rs')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(replicated);
 }
 
 #[tokio::test]

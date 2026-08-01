@@ -1287,10 +1287,24 @@ fn memory_by_id_read_and_mutations_refuse_a_sibling_repos_memory() {
 /// the binding-scoped sweeps while the parent memory stays in its repo.
 #[test]
 fn rebind_keeps_bindings_on_the_parent_memorys_repo() {
+    use rag_rat_query::memory::memory_by_id;
+
     use crate::memory_write::rebind_memory;
     let conn = a5_scoped_two_repo_conn();
     a5_set_active_repo(&conn, A5_REPO_A);
     let a = a5_create_memory(&conn, "rebind me", "body", "c-old");
+    conn.execute(
+        "INSERT INTO repo_memory_bindings(
+             repo_id, memory_id, binding_kind, binding_id, anchor_status, created_at_ms)
+         VALUES (?1, ?2, 'path', 'sibling-only.rs', 'gone', 0)",
+        rusqlite::params![A5_REPO_B, a.memory.memory_id],
+    )
+    .unwrap();
+    let hydrated = memory_by_id(&conn, &a.memory.memory_id).unwrap().unwrap();
+    assert!(
+        hydrated.bindings.iter().all(|binding| binding.binding_id != "sibling-only.rs"),
+        "an orphan anchor from a sibling repo must not hydrate onto repo A's memory",
+    );
 
     rebind_memory(&conn, &a.memory.memory_id, RepoMemoryBindTarget {
         commit_hash: Some("c-new".to_string()),
@@ -1300,8 +1314,9 @@ fn rebind_keeps_bindings_on_the_parent_memorys_repo() {
 
     let stranded: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM repo_memory_bindings WHERE memory_id = ?1 AND repo_id != ?2",
-            rusqlite::params![a.memory.memory_id, A5_REPO_A],
+            "SELECT COUNT(*) FROM repo_memory_bindings
+             WHERE memory_id = ?1 AND repo_id = '__unassigned__'",
+            [&a.memory.memory_id],
             |r| r.get(0),
         )
         .unwrap();
@@ -1314,6 +1329,49 @@ fn rebind_keeps_bindings_on_the_parent_memorys_repo() {
         )
         .unwrap();
     assert!(owned >= 1, "the rebound commit binding is stamped under repo A");
+    let sibling: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM repo_memory_bindings
+             WHERE memory_id = ?1 AND repo_id = ?2 AND binding_id = 'sibling-only.rs'",
+            rusqlite::params![a.memory.memory_id, A5_REPO_B],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(sibling, 1, "rebind must preserve a sibling repo's orphan anchor");
+}
+
+#[test]
+fn binding_validation_preserves_a_sibling_repos_duplicate_anchor_identity() {
+    let conn = a5_scoped_two_repo_conn();
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let a = a5_create_memory(&conn, "validate me", "body", "shared-commit");
+    let (kind, binding_id): (String, String) = conn
+        .query_row(
+            "SELECT binding_kind, binding_id FROM repo_memory_bindings
+             WHERE repo_id = ?1 AND memory_id = ?2 LIMIT 1",
+            rusqlite::params![A5_REPO_A, a.memory.memory_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO repo_memory_bindings(
+             repo_id, memory_id, binding_kind, binding_id, anchor_status, created_at_ms,
+             downgrade_pending_at_ms)
+         VALUES (?1, ?2, ?3, ?4, 'gone', 0, 99)",
+        rusqlite::params![A5_REPO_B, a.memory.memory_id, kind, binding_id],
+    )
+    .unwrap();
+
+    rag_rat_query::memory::validate_memories(&conn, None).unwrap();
+    let sibling: (String, i64) = conn
+        .query_row(
+            "SELECT anchor_status, downgrade_pending_at_ms FROM repo_memory_bindings
+             WHERE repo_id = ?1 AND memory_id = ?2 AND binding_kind = ?3 AND binding_id = ?4",
+            rusqlite::params![A5_REPO_B, a.memory.memory_id, kind, binding_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(sibling, ("gone".into(), 99));
 }
 
 /// A5 finding: `resolve_moniker` scans `logical_symbol_monikers` and joins `logical_symbols`. BOTH

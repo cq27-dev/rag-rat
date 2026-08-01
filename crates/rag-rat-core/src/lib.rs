@@ -14,6 +14,19 @@ pub mod watch;
 pub use index::{IndexDatabase, IndexStatus};
 pub use output::{OutputFormat, render};
 
+/// Settle and materialize accepted `/3` memory content before dependent `/5` anchor rows are
+/// reconciled.
+pub fn drain_synced_memory(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    let now = rag_rat_base::time::now_ms();
+    rag_rat_oplog::settle_pending_content_refolds(
+        conn,
+        &rag_rat_oplog::ContentRefoldBudget::unbounded(),
+        now,
+    )?;
+    memory_write::drain_synced_streams_for_all_repos(conn, now)?;
+    Ok(())
+}
+
 /// Lightweight, lock-free count of active repo memories whose anchor is `gone`/`stale` — the same
 /// population `memory_doctor` lists. Opens a BARE read-only connection (no git resolution, scope
 /// view, or schema migration), so it is cheap enough to call on every MCP tool result to nudge the

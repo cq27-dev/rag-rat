@@ -237,7 +237,7 @@ fn dir_memory_titles(conn: &Connection) -> anyhow::Result<HashMap<String, String
         // Only active dir memories; binding_id is the normalized dir path (or "" for repo root).
         "SELECT b.binding_id, m.title
          FROM repo_memory_bindings b
-         JOIN repo_memories m ON m.id = b.memory_id
+         JOIN repo_memories m ON m.id = b.memory_id AND m.repo_id = b.repo_id
          WHERE b.binding_kind = 'dir' AND m.status = 'active'{repo_clause}"
     ))?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;

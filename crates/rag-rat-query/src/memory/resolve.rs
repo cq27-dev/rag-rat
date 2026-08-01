@@ -1123,8 +1123,9 @@ fn call_path_key_exists(conn: &Connection, memory_id: &str, hash: &str) -> rusql
              SELECT 1 FROM repo_memory_call_paths
               WHERE memory_id = ?1 AND edge_sequence_hash = ?2
              UNION ALL
-             SELECT 1 FROM repo_memory_bindings
-              WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
+              SELECT 1 FROM repo_memory_bindings
+               WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
+                 AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
          )",
         params![memory_id, hash],
         |row| row.get::<_, i64>(0).map(|value| value != 0),
@@ -1149,7 +1150,8 @@ fn move_call_path_key(
     )?;
     conn.execute(
         "UPDATE repo_memory_bindings SET binding_id = ?1
-          WHERE memory_id = ?2 AND binding_kind = 'call_path' AND binding_id = ?3",
+          WHERE memory_id = ?2 AND binding_kind = 'call_path' AND binding_id = ?3
+            AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)",
         params![to, memory_id, from],
     )?;
     Ok(())
@@ -1183,7 +1185,8 @@ fn load_call_path_binding(
 ) -> rusqlite::Result<Option<PersistedCallPathBinding>> {
     conn.query_row(
         "SELECT logical_symbol_id, created_at_ms FROM repo_memory_bindings
-          WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2",
+          WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
+            AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)",
         params![memory_id, hash],
         |row| {
             Ok(PersistedCallPathBinding {
@@ -1320,13 +1323,15 @@ fn finalize_call_path_binding(
         for path in paths {
             conn.execute(
                 "DELETE FROM repo_memory_bindings
-                  WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2",
+                  WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
+                    AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)",
                 params![memory_id, path.working_hash],
             )?;
         }
         conn.execute(
             "UPDATE repo_memory_bindings SET logical_symbol_id = ?1, created_at_ms = ?2
-              WHERE memory_id = ?3 AND binding_kind = 'call_path' AND binding_id = ?4",
+              WHERE memory_id = ?3 AND binding_kind = 'call_path' AND binding_id = ?4
+                AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?3)",
             params![logical_symbol_id, created_at_ms, memory_id, new_hash],
         )?;
         return Ok(());
@@ -1337,7 +1342,8 @@ fn finalize_call_path_binding(
         if path.working_hash != winner.working_hash {
             conn.execute(
                 "DELETE FROM repo_memory_bindings
-                  WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2",
+                  WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
+                    AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)",
                 params![memory_id, path.working_hash],
             )?;
         }
@@ -1345,7 +1351,8 @@ fn finalize_call_path_binding(
     conn.execute(
         "UPDATE repo_memory_bindings
             SET binding_id = ?1, logical_symbol_id = ?2, created_at_ms = ?3
-          WHERE memory_id = ?4 AND binding_kind = 'call_path' AND binding_id = ?5",
+          WHERE memory_id = ?4 AND binding_kind = 'call_path' AND binding_id = ?5
+            AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?4)",
         params![new_hash, logical_symbol_id, created_at_ms, memory_id, winner.working_hash],
     )?;
     Ok(())
@@ -1728,8 +1735,8 @@ pub fn stamp_bindings_from_parent_repo(conn: &Connection, memory_id: &str) -> an
     if rag_rat_db::schema::periphery_repo_scope(conn, "repo_memory_bindings")?.is_some() {
         conn.execute(
             "UPDATE repo_memory_bindings
-             SET repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
-             WHERE memory_id = ?1",
+              SET repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
+              WHERE memory_id = ?1 AND repo_id = '__unassigned__'",
             [memory_id],
         )?;
     }
