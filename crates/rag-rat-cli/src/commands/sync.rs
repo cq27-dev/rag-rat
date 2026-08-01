@@ -1227,9 +1227,10 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        AnnouncementVerdict, DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, classify_announcement,
-        decode_node_secret, device_can_serve, device_can_sync, device_sync_due, device_sync_run,
-        discovery_node_or_configured, discovery_service_addr, fold_peer_outcomes, join,
+        AnnouncementVerdict, DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome,
+        accumulate_reconcile_report, classify_announcement, decode_node_secret, device_can_serve,
+        device_can_sync, device_sync_due, device_sync_run, discovery_node_or_configured,
+        discovery_service_addr, ensure_founder_table_repo_incarnations, fold_peer_outcomes, join,
         node_secret, record_device_sync, serve_should_advertise, stamp_after_seal,
     };
 
@@ -1525,6 +1526,52 @@ mod tests {
             DeviceSyncOutcome::Skipped,
             "a recent sync suppresses the next attempt before any dial"
         );
+    }
+
+    #[test]
+    fn founder_bootstrap_creates_each_registered_repo_incarnation_once() {
+        let conn = schema_conn();
+        rag_rat_oplog::local_account(&conn, 1_700_000_000_000).unwrap();
+        ensure_founder_table_repo_incarnations(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-a', 'repo-a', 0)",
+            [],
+        )
+        .unwrap();
+        ensure_founder_table_repo_incarnations(&conn).unwrap();
+        let account = account_of(&conn);
+        let first = rag_rat_oplog::repo_incarnation_state(&conn, account, "repo-a").unwrap();
+
+        ensure_founder_table_repo_incarnations(&conn).unwrap();
+        assert_eq!(
+            rag_rat_oplog::repo_incarnation_state(&conn, account, "repo-a").unwrap(),
+            first,
+            "a current repository incarnation is never advanced by bootstrap"
+        );
+    }
+
+    #[test]
+    fn reconcile_report_aggregation_preserves_all_counts_and_latest_convergence() {
+        let mut total = rag_rat_sync::ReconcileReport {
+            rounds: 2,
+            entries_newly_stored: 3,
+            entries_sent: 5,
+            converged: false,
+        };
+        accumulate_reconcile_report(&mut total, rag_rat_sync::ReconcileReport {
+            rounds: 7,
+            entries_newly_stored: 11,
+            entries_sent: 13,
+            converged: true,
+        });
+        assert_eq!(total, rag_rat_sync::ReconcileReport {
+            rounds: 9,
+            entries_newly_stored: 14,
+            entries_sent: 18,
+            converged: true,
+        });
     }
 
     #[test]

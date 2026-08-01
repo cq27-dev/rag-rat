@@ -974,6 +974,23 @@ mod tests {
     }
 
     #[test]
+    fn founder_bootstraps_a_repository_incarnation_once() {
+        let conn = db();
+        let account = bootstrap::local_account(&conn, NOW).unwrap();
+
+        let first = ensure_repo_incarnation(&conn, "repo-x", NOW).unwrap().unwrap();
+        assert_eq!(
+            super::super::storage::repo_incarnation_state(&conn, account, "repo-x").unwrap(),
+            RepoIncarnationState::Current(first),
+        );
+        assert_eq!(
+            ensure_repo_incarnation(&conn, "repo-x", NOW + 1).unwrap(),
+            Some(first),
+            "automatic bootstrap observes the current root instead of advancing it"
+        );
+    }
+
+    #[test]
     fn the_founder_can_unwrap_its_own_wrap_back_to_the_op_key_id() {
         // Round-trip through the REAL authored op: the recipient unwraps under the WrapContext the
         // adoption seam will reconstruct, and the recovered key's key_id matches the op's key_id.
