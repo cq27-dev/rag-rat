@@ -59,6 +59,11 @@ fn receiver_root_origin(
 /// Classify the receiver under the spelling's ORIGINAL import provenance while resolving through
 /// the alias-rewritten owner path. `use dep::Worker as Alias` stores methods under `Worker`, but
 /// `Alias` is the root whose import says whether that owner is local or external.
+enum ReceiverTypeHintResolution<'a> {
+    Original(Option<&'a str>),
+    Alias(Option<&'a str>),
+}
+
 fn receiver_type_identity<'a>(
     import_scope: &ImportScope,
     index: &SymbolIndex<'_>,
@@ -66,13 +71,20 @@ fn receiver_type_identity<'a>(
     language: Option<&str>,
     ref_byte: usize,
     original_hint: Option<&str>,
-    resolved_hint: Option<&'a str>,
+    resolved: ReceiverTypeHintResolution<'a>,
 ) -> Option<ReceiverTypeIdentity<'a>> {
+    let (resolved_hint, alias_bound) = match resolved {
+        ReceiverTypeHintResolution::Original(hint) => (hint, false),
+        ReceiverTypeHintResolution::Alias(hint) => (hint, true),
+    };
     let original_root = original_hint
         .map(str::trim)
         .filter(|hint| !hint.is_empty())
         .map(|hint| hint.split_once("::").map_or(hint, |(root, _)| root));
-    ReceiverTypeIdentity::classify(resolved_hint, |resolved_root| {
+    if alias_bound && resolved_hint.is_none() {
+        return Some(ReceiverTypeIdentity::Ambiguous);
+    }
+    let identity = ReceiverTypeIdentity::classify(resolved_hint, |resolved_root| {
         receiver_root_origin(
             import_scope,
             index,
@@ -82,7 +94,12 @@ fn receiver_type_identity<'a>(
             original_root.unwrap_or(resolved_root),
             resolved_hint.unwrap_or_default(),
         )
-    })
+    });
+    match identity {
+        Some(ReceiverTypeIdentity::LocalQualified(path)) if alias_bound =>
+            Some(ReceiverTypeIdentity::LocalQualifiedExact(path)),
+        _ => identity,
+    }
 }
 
 /// The package a receiver hint is confined to, or `None` when it may name a type from anywhere.
@@ -122,12 +139,11 @@ struct ImportAliasResolveRequest<'a> {
 /// `use crate::Worker as Alias;` makes `Alias` the only spelling the source has, but the method is
 /// stored under `Worker::run` — so the written hint probes a scope that cannot exist, and because a
 /// present receiver type also closes the bare-name fallback it takes the call's last chance with
-/// it. Only the ROOT segment can be an import binding, so only that is rewritten. Deferred, like
-/// the sibling name rebind, when the file itself defines the target name: two candidates for one
-/// spelling is not something this layer may choose between.
+/// it. Only the ROOT segment can be an import binding, so only that is rewritten. Unlike a bare
+/// name rebind, the complete imported owner remains unambiguous when its leaf is defined in this
+/// file — that is the normal shape of an alias for an inline module.
 fn alias_resolved_receiver_hint(
     import_scope: &imports::ImportScope,
-    index: &SymbolIndex<'_>,
     file_id: i64,
     hint: Option<&str>,
     ref_byte: usize,
@@ -138,12 +154,14 @@ fn alias_resolved_receiver_hint(
         None => (hint, None),
     };
     let target = import_scope.import_alias_target(file_id, root, ref_byte)?;
-    if target == root || index.file_defines(file_id, short_name(target)) {
+    if target == root {
         return None;
     }
-    Some(match rest {
-        Some(rest) => format!("{target}::{rest}"),
-        None => target.to_string(),
+    Some(match (target.is_empty(), rest) {
+        (true, Some(rest)) => rest.to_string(),
+        (true, None) => String::new(),
+        (false, Some(rest)) => format!("{target}::{rest}"),
+        (false, None) => target.to_string(),
     })
 }
 
@@ -438,7 +456,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                     import_scope.add_import_alias(file_id, alias, target, scope);
                 }
             } else if let Some(evidence) = evidence {
-                import_scope.add_use(file_id, &evidence, scope);
+                import_scope.add_rust_import_edge(file_id, to_name.as_deref(), &evidence, scope);
             }
         }
     }
@@ -536,13 +554,14 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         let resolve_receiver = rebind.receiver_hint.as_deref().or(receiver_hint.as_deref());
         let aliased_receiver_type = alias_resolved_receiver_hint(
             &import_scope,
-            &index,
             source_file_id,
             receiver_type_hint.as_deref(),
             ref_byte,
         );
-        let resolve_receiver_type =
-            aliased_receiver_type.as_deref().or(receiver_type_hint.as_deref());
+        let receiver_alias_bound = receiver_type_hint.as_deref().is_some_and(|hint| {
+            let root = hint.trim().split_once("::").map_or(hint.trim(), |(root, _)| root);
+            import_scope.has_import_alias(source_file_id, root, ref_byte)
+        });
         let resolution = resolve_symbol(
             ResolveSymbolRequest {
                 name: resolve_name,
@@ -557,7 +576,11 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                     Some(source_language.as_str()),
                     ref_byte,
                     receiver_type_hint.as_deref(),
-                    resolve_receiver_type,
+                    if receiver_alias_bound {
+                        ReceiverTypeHintResolution::Alias(aliased_receiver_type.as_deref())
+                    } else {
+                        ReceiverTypeHintResolution::Original(receiver_type_hint.as_deref())
+                    },
                 ),
                 source_file_id,
                 source_language: Some(source_language.as_str()),
@@ -724,7 +747,12 @@ pub(crate) fn resolve_and_insert_edges(
                     );
                 }
             } else {
-                import_scope.add_use(*file_id, evidence, candidate.import_scope_range());
+                import_scope.add_rust_import_edge(
+                    *file_id,
+                    Some(arena.get(candidate.to_name).trim()),
+                    evidence,
+                    candidate.import_scope_range(),
+                );
             }
         }
     }
@@ -782,14 +810,12 @@ pub(crate) fn resolve_and_insert_edges(
         let resolve_name = rebind.name.as_deref().unwrap_or(to_name);
         let resolve_qualified = rebind.target_qualified_name.as_deref().or(target_qualified_name);
         let resolve_receiver = rebind.receiver_hint.as_deref().or(receiver_hint);
-        let aliased_receiver_type = alias_resolved_receiver_hint(
-            &import_scope,
-            &index,
-            *file_id,
-            receiver_type_hint,
-            ref_byte,
-        );
-        let resolve_receiver_type = aliased_receiver_type.as_deref().or(receiver_type_hint);
+        let aliased_receiver_type =
+            alias_resolved_receiver_hint(&import_scope, *file_id, receiver_type_hint, ref_byte);
+        let receiver_alias_bound = receiver_type_hint.is_some_and(|hint| {
+            let root = hint.trim().split_once("::").map_or(hint.trim(), |(root, _)| root);
+            import_scope.has_import_alias(*file_id, root, ref_byte)
+        });
         // #200: a `dispatch_construct` fact's `to_name` is a synthetic `Enum::Variant` key, not a
         // real target — never resolve it (synthesis reads only its `from_symbol_id`). Mirrors the
         // incremental driver's skip; `dispatch_handle` DOES resolve (synthesis needs its handler
@@ -811,7 +837,11 @@ pub(crate) fn resolve_and_insert_edges(
                         file_language.get(file_id).map(String::as_str),
                         ref_byte,
                         receiver_type_hint,
-                        resolve_receiver_type,
+                        if receiver_alias_bound {
+                            ReceiverTypeHintResolution::Alias(aliased_receiver_type.as_deref())
+                        } else {
+                            ReceiverTypeHintResolution::Original(receiver_type_hint)
+                        },
                     ),
                     source_file_id: *file_id,
                     source_language: file_language.get(file_id).map(String::as_str),
@@ -983,15 +1013,20 @@ pub(crate) fn resolve_symbol<'a>(
     // tail fallback below; a bare one IS its own tail.
     let has_local_receiver_type = matches!(
         request.receiver_type,
-        Some(ReceiverTypeIdentity::LocalQualified(_) | ReceiverTypeIdentity::LocalUnqualified(_))
+        Some(
+            ReceiverTypeIdentity::LocalQualified(_)
+                | ReceiverTypeIdentity::LocalQualifiedExact(_)
+                | ReceiverTypeIdentity::LocalUnqualified(_)
+        )
     );
     let receiver_type = match request.receiver_type {
-        Some(ReceiverTypeIdentity::LocalQualified(path)) => Some((path, true)),
-        Some(ReceiverTypeIdentity::LocalUnqualified(name)) => Some((name, false)),
+        Some(ReceiverTypeIdentity::LocalQualified(path)) => Some((path, true, true, false)),
+        Some(ReceiverTypeIdentity::LocalQualifiedExact(path)) => Some((path, true, false, true)),
+        Some(ReceiverTypeIdentity::LocalUnqualified(name)) => Some((name, false, false, false)),
         Some(ReceiverTypeIdentity::ExternalQualified(_) | ReceiverTypeIdentity::Ambiguous)
         | None => None,
     };
-    if let Some((type_hint, qualified)) = receiver_type {
+    if let Some((type_hint, qualified, allow_tail, alias_exact)) = receiver_type {
         let target = format!("{type_hint}::{}", request.name);
         let target_normalized = receiver_scope_path(&target, request.source_language);
         // A bare, non-import-bound receiver names this package's own type, and `Worker::run` is
@@ -1012,14 +1047,21 @@ pub(crate) fn resolve_symbol<'a>(
         // `impl Tr for W` from `for &W`. Two traits' same-named methods on one type, and one
         // trait's methods on several pointer shapes of one owner, therefore meet on this surface
         // as DISTINCT logical symbols and decline as ambiguous.
-        let try_scope = |target: &str| -> Option<(&'a IndexedSymbol, &'static str)> {
+        let try_scope = |target: &str,
+                         require_alias_file: bool|
+         -> Option<(&'a IndexedSymbol, &'static str)> {
             let scope_exact = index
                 .by_scope_path
                 .get(target)
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|symbol| kind_matches(symbol) && in_receiver_package(symbol))
+                .filter(|symbol| {
+                    kind_matches(symbol)
+                        && in_receiver_package(symbol)
+                        && (!require_alias_file
+                            || alias_owner_matches_symbol_file(type_hint, symbol))
+                })
                 .collect::<Vec<_>>();
             match scope_exact.as_slice() {
                 [symbol] => return Some((*symbol, "receiver_type")),
@@ -1046,7 +1088,12 @@ pub(crate) fn resolve_symbol<'a>(
                         .flatten(),
                 )
                 .copied()
-                .filter(|symbol| kind_matches(symbol) && in_receiver_package(symbol))
+                .filter(|symbol| {
+                    kind_matches(symbol)
+                        && in_receiver_package(symbol)
+                        && (!require_alias_file
+                            || alias_owner_matches_symbol_file(type_hint, symbol))
+                })
                 .collect::<Vec<_>>();
             match scope_normalized.as_slice() {
                 [symbol] => Some((*symbol, "scope_degeneric")),
@@ -1056,7 +1103,7 @@ pub(crate) fn resolve_symbol<'a>(
             }
         };
 
-        if let Some((symbol, reason)) = try_scope(&target) {
+        if let Some((symbol, reason)) = try_scope(&target, false) {
             return Some((symbol, EdgeConfidence::Syntactic, reason));
         }
         // Conservative tail FALLBACK, for a PROVEN-LOCAL qualified hint only (#567 review): a
@@ -1064,9 +1111,9 @@ pub(crate) fn resolve_symbol<'a>(
         // (`Worker::run`) verbatim, so retry with the type's tail — `try_scope` still requires
         // the tail to name exactly one viable target (or one logical symbol's variants), so this
         // never widens into guessing.
-        if qualified {
+        if qualified && (allow_tail || alias_exact) {
             let tail_target = format!("{}::{}", qn_tail(type_hint), request.name);
-            if let Some((symbol, reason)) = try_scope(&tail_target) {
+            if let Some((symbol, reason)) = try_scope(&tail_target, alias_exact) {
                 return Some((symbol, EdgeConfidence::Syntactic, reason));
             }
         }
@@ -1074,7 +1121,7 @@ pub(crate) fn resolve_symbol<'a>(
         // A suffix retry is meaningful only for an already-qualified LOCAL identity. Applying it
         // to a bare root-module `Worker` would let it bind `inner::Worker::run`, undoing the
         // lexical canonicalization that keeps same-tail owners isolated.
-        if qualified {
+        if qualified && allow_tail {
             let scope_suffix = format!("::{target}");
             let scope_normalized_suffix = format!("::{target_normalized}");
             let receiver_suffix_matches = index
@@ -1246,32 +1293,31 @@ pub(crate) fn resolve_symbol<'a>(
     // which preserves `self.default_method()` calls in traits without letting `Worker::run`
     // drift onto an unrelated same-tail owner.
     //
-    // A typed Rust receiver must still reach here: a trait's default method is owned by the trait,
-    // not by the concrete type the receiver hint names, so no scope pass above can find it. That
-    // escape hatch used to re-open the WHOLE bare-name pool, which is how
-    // `self.clone()` in a `#[derive(Clone)]` type — where the derive mints no symbol to find —
-    // bound the single unrelated `clone` body anywhere in the workspace. The receiver type is
-    // still evidence when it fails: it rules out any candidate that a DIFFERENT concrete type
-    // demonstrably owns. `receiver_type_admits_owner` below is that filter.
-    let trait_self_fallback = request.source_language == Some(Language::Rust.as_str())
-        && matches!(request.receiver_hint, Some("self" | "Self"));
-    let typed_trait_fallback =
-        request.source_language == Some(Language::Rust.as_str()) && has_local_receiver_type;
+    // A Rust receiver-bearing call may reach this bare-name stage only with a proven local owner.
+    // The candidate must either belong to that owner or be a trait default backed by an indexed
+    // `impl Trait for Owner`; receiver spelling alone is not evidence. In particular, derives mint
+    // no impl symbol, so `self.clone()` cannot claim an unrelated workspace `clone`.
+    let rust_receiver_fallback = request.source_language == Some(Language::Rust.as_str())
+        && (has_local_receiver_type || matches!(request.receiver_hint, Some("self" | "Self")));
     // ANY receiver-type identity closes this door, not only a local one. An `ExternalQualified`
     // receiver proves the owner is a dependency's, so no local symbol can be the answer — that is
     // the whole point of classifying it — and `Ambiguous` is unusable evidence, which is still not
     // the same as no evidence. Gating on `has_local_receiver_type` let both fall through to
     // repo-wide bare-name matching, where `use dep::Worker; fn f(w: Worker) { w.run(); }` bound
     // whatever unique local `run` existed.
-    if request.receiver_type.is_some() && !trait_self_fallback && !typed_trait_fallback {
+    if request.receiver_type.is_some() && !has_local_receiver_type {
         return None;
     }
-    let receiver_owner_tail = has_local_receiver_type
-        .then(|| match request.receiver_type {
+    if rust_receiver_fallback && !has_local_receiver_type {
+        return None;
+    }
+    let receiver_owner = has_local_receiver_type
+        .then_some(match request.receiver_type {
             Some(
                 ReceiverTypeIdentity::LocalQualified(path)
+                | ReceiverTypeIdentity::LocalQualifiedExact(path)
                 | ReceiverTypeIdentity::LocalUnqualified(path),
-            ) => Some(qn_tail(path)),
+            ) => Some(path),
             _ => None,
         })
         .flatten();
@@ -1303,10 +1349,16 @@ pub(crate) fn resolve_symbol<'a>(
         .filter(|symbol| {
             kind_matches(symbol)
                 && bare_shape_ok(symbol)
-                && if typed_trait_fallback && !trait_self_fallback {
-                    receiver_type_admits_trait_default(symbol, index)
+                && if rust_receiver_fallback {
+                    receiver_type_admits_owner(
+                        receiver_owner,
+                        request.receiver_package,
+                        request.file_package,
+                        symbol,
+                        index,
+                    )
                 } else {
-                    receiver_type_admits_owner(receiver_owner_tail, symbol, index)
+                    true
                 }
         })
         .collect::<Vec<_>>();
@@ -1352,65 +1404,114 @@ pub(crate) fn resolve_symbol<'a>(
 }
 /// Whether a bare-name candidate is compatible with a receiver type that failed the scope passes.
 ///
-/// `None` (no local receiver type) admits everything — the fallback is unchanged for references
-/// that carried no type evidence. With a receiver type, a candidate is admitted only when its
-/// scope does not name a CONFLICTING concrete owner:
-/// - a trait-impl scope (`Type as Trait::method`) is admitted only when `Type` is the receiver's
-///   own type, because `Other as Trait::method` is demonstrably a different type's impl;
-/// - an UNMARKED scope (`WorkerExt::run`) is a trait's own default method or a concrete type's
-///   inherent one, and the string alone cannot tell those apart. So the index is asked what the
-///   owner name IS: a trait admits, since the receiver may implement it, while a struct or enum
-///   that is not the receiver owns its method as demonstrably as a marked impl would. An owner this
-///   index does not know (an external trait) still admits, which is where the fallback started.
-///
-/// This is what keeps the `self`/`Self` escape hatch from re-opening the whole pool. Tails are
-/// compared (not full paths) because the hint is canonicalized per-file while the scope is a
-/// container chain — matching the tolerance the tail retry above already applies.
+/// The receiver's concrete owner must match completely; equal tails in different modules are not
+/// ownership evidence. A trait-owned default is admitted only when an indexed impl symbol proves
+/// that this receiver implements that trait. Ownerless and unknown-owner candidates are rejected.
 fn receiver_type_admits_owner(
-    receiver_owner_tail: Option<&str>,
+    receiver_owner: Option<&str>,
+    receiver_package: Option<i64>,
+    file_package: &HashMap<i64, i64>,
     symbol: &IndexedSymbol,
     index: &SymbolIndex<'_>,
 ) -> bool {
-    let Some(receiver_tail) = receiver_owner_tail else {
-        return true;
-    };
-    let Some((owner, _)) = symbol.scope_path.rsplit_once("::") else {
-        return true;
-    };
-    if let Some((concrete_owner, _)) = owner.split_once(" as ") {
-        return qn_tail(concrete_owner.trim_end()) == receiver_tail;
-    }
-    let owner_tail = qn_tail(owner);
-    if owner_tail == receiver_tail {
-        return true;
-    }
-    let mut names_a_trait = false;
-    let mut names_a_type = false;
-    for owner_symbol in index.by_name.get(owner_tail).into_iter().flatten() {
-        match owner_symbol.kind.as_str() {
-            "trait" => names_a_trait = true,
-            "struct" | "enum" | "union" | "impl" => names_a_type = true,
-            _ => {},
-        }
-    }
-    names_a_trait || !names_a_type
-}
-
-/// A typed value whose concrete-owner lookup failed may still call a default method owned by a
-/// trait. This fallback is deliberately narrower than the `self`/`Self` compatibility path above:
-/// an unknown or concrete owner is not evidence of a trait default, and admitting it would reopen
-/// cross-package, nested-owner, and pointer-shape false matches.
-fn receiver_type_admits_trait_default(symbol: &IndexedSymbol, index: &SymbolIndex<'_>) -> bool {
+    let Some(receiver_owner) = receiver_owner else { return false };
     let Some((owner, _)) = symbol.scope_path.rsplit_once("::") else {
         return false;
     };
     if owner.contains(" as ") {
+        // The receiver-scope pass already considered every applicable trait impl. Reaching the
+        // fallback means that surface was absent or ambiguous, so choosing one impl here would
+        // erase the ambiguity (notably across autoref pointer shapes).
         return false;
     }
+    if receiver_owners_match(receiver_owner, owner) {
+        return receiver_package
+            .is_none_or(|package| file_package.get(&symbol.file_id) == Some(&package));
+    }
+    index.by_scope_path.get(owner).is_some_and(|owners| {
+        owners
+            .iter()
+            .filter(|candidate| candidate.kind == "trait" && candidate.file_id == symbol.file_id)
+            .any(|trait_symbol| {
+                receiver_implements_trait(
+                    receiver_owner,
+                    owner,
+                    trait_symbol.file_id,
+                    receiver_package,
+                    file_package,
+                    index,
+                )
+            })
+    })
+}
+
+fn receiver_owners_match(receiver_owner: &str, candidate_owner: &str) -> bool {
+    receiver_scope_path(receiver_owner.trim(), Some(Language::Rust.as_str()))
+        == receiver_scope_path(candidate_owner.trim(), Some(Language::Rust.as_str()))
+}
+
+/// External module files do not carry their module path in `scope_path`: a method in
+/// `src/worker.rs` is stored as `Worker::run`, not `worker::Worker::run`. An import alias may use
+/// that tail only when the missing owner prefix agrees with the defining file's Rust module path.
+fn alias_owner_matches_symbol_file(alias_owner: &str, symbol: &IndexedSymbol) -> bool {
+    let Some((alias_module, _)) = alias_owner.rsplit_once("::") else {
+        return true;
+    };
+    let file_path = symbol.qualified_name.split("::").next().unwrap_or_default();
+    let crate_relative = file_path
+        .strip_prefix("src/")
+        .or_else(|| file_path.rsplit_once("/src/").map(|(_, relative)| relative))
+        .unwrap_or(file_path);
+    let without_extension = crate_relative.strip_suffix(".rs").unwrap_or(crate_relative);
+    let module_path = match without_extension {
+        "lib" | "main" => "",
+        path => path.strip_suffix("/mod").unwrap_or(path),
+    }
+    .replace('/', "::");
+    alias_module == module_path
+}
+
+fn receiver_implements_trait(
+    receiver_owner: &str,
+    trait_owner: &str,
+    trait_file_id: i64,
+    receiver_package: Option<i64>,
+    file_package: &HashMap<i64, i64>,
+    index: &SymbolIndex<'_>,
+) -> bool {
+    let trait_marker = scope_grammar::segments(trait_owner).join(".");
+    let receiver_key = receiver_scope_path(receiver_owner, Some(Language::Rust.as_str()));
     index
-        .by_scope_path
-        .get(owner)
-        .is_some_and(|owners| owners.iter().any(|owner| owner.kind == "trait"))
+        .by_receiver_scope_path
+        .get(receiver_key.as_ref())
+        .into_iter()
+        .flatten()
+        .filter(|symbol| symbol.kind == "impl")
+        .filter(|symbol| {
+            receiver_package
+                .is_none_or(|package| file_package.get(&symbol.file_id) == Some(&package))
+        })
+        .filter(|symbol| {
+            match (file_package.get(&trait_file_id), file_package.get(&symbol.file_id)) {
+                (Some(trait_package), Some(impl_package)) => trait_package == impl_package,
+                (None, None) => true,
+                _ => false,
+            }
+        })
+        .any(|symbol| {
+            let Some((impl_owner, impl_trait)) = symbol.scope_path.rsplit_once(" as ") else {
+                return false;
+            };
+            receiver_owners_match(receiver_owner, impl_owner)
+                && trait_markers_match(&degeneric_path(impl_trait), &degeneric_path(&trait_marker))
+        })
+}
+
+/// Trait markers preserve source spelling for logical identity. For applicability, an explicit
+/// current-crate path is equivalent to the declaration's container path; imported aliases and
+/// blanket owners require name/type resolution this resolver does not have and therefore decline.
+fn trait_markers_match(impl_trait: &str, declaration_trait: &str) -> bool {
+    impl_trait == declaration_trait || impl_trait.strip_prefix("crate.") == Some(declaration_trait)
 }
 
 /// Whether a set of same-name candidate symbols are all the SAME logical symbol — so the resolver

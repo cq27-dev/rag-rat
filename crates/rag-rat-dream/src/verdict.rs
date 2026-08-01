@@ -1064,8 +1064,9 @@ mod tests {
         .unwrap();
         c.execute(
             "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
-             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name) VALUES \
-             (?1,?2,0,'test-fingerprint','caller',?3,'calls_name',NULL)",
+             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name, \
+             callee_identity_known) VALUES \
+             (?1,?2,0,'test-fingerprint','caller',?3,'calls_name',NULL,1)",
             rusqlite::params![memory_id, hash, target],
         )
         .unwrap();

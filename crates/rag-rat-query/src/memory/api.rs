@@ -795,21 +795,59 @@ pub fn validate_memories(
         let (mut binding, downgrade_pending_at_ms) = row?;
         let original_binding_id = binding.binding_id.clone();
         let stored_status = binding.anchor_status.clone();
+        let stored_edge_id = binding.edge_id;
         report.checked += 1;
-        let status = validate_binding(conn, &mut binding, fs_root)?;
+        let mut status = validate_binding(conn, &mut binding, fs_root)?;
+        // Status hysteresis must not retain a stale row id: SQLite can reuse an invalid edge id,
+        // and edge-based recall reads this field directly without consulting `anchor_status`.
+        // A scoped miss is not enough, however: the same valid id may belong to a linked-worktree
+        // edge hidden from this checkout. Preserve that id so one checkout cannot erase another's
+        // recall mapping before hysteresis has a chance to reconcile their observations.
+        let globally_live_hidden_edge = if status == "gone"
+            && binding.binding_kind == "edge"
+            && stored_edge_id.is_some()
+            && binding.edge_id.is_none()
+        {
+            match (scope.as_deref(), stored_edge_id) {
+                (Some(repo_id), Some(edge_id)) => edge_id_matches_fingerprint_in_linked_worktree(
+                    conn,
+                    edge_id,
+                    repo_id,
+                    &original_binding_id,
+                )?,
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if globally_live_hidden_edge {
+            binding.edge_id = stored_edge_id;
+            status = "pending".to_string();
+        } else if status == "gone"
+            && binding.binding_kind == "edge"
+            && stored_edge_id.is_some()
+            && binding.edge_id.is_none()
+        {
+            conn.execute(
+                "UPDATE repo_memory_bindings SET edge_id = NULL
+                 WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3",
+                params![binding.memory_id, binding.binding_kind, original_binding_id],
+            )?;
+        }
         // Downgrade hysteresis (#492): a single `gone` observation of a not-yet-gone binding is
         // exactly what a torn pass produces (a validate racing a rebuild window, or a sweep from
         // a checkout context that cannot see the anchor another context re-asserts), and a
         // persisted `gone` is what doctor turns into destructive mark-obsolete advice. So a
-        // FIRST gone observation only ARMS `downgrade_pending_at_ms` — the stored row stays as
-        // it was — and only a SECOND consecutive one persists the downgrade. Any non-gone stamp
-        // clears the marker (the ping-pong never lands), and a staged-generation window freezes
-        // the rule entirely (see `staged_window` above). The REPORT keeps counting the computed
-        // observation: what this pass saw is honest; only what doctor reads is hysteresis-
-        // guarded.
+        // FIRST gone observation only ARMS `downgrade_pending_at_ms` — the stored status stays as
+        // it was — and only a SECOND consecutive one persists the downgrade. Invalid edge ids are
+        // detached above because identity safety cannot be deferred with status/remediation. Any
+        // non-gone stamp clears the marker (the ping-pong never lands), and a staged-generation
+        // window freezes the status rule entirely (see `staged_window` above). The REPORT keeps
+        // counting the computed observation: what this pass saw is honest; only what doctor reads
+        // is hysteresis-guarded.
         if status == "gone" && stored_status != "gone" {
             if staged_window {
-                // Untrustworthy observation: leave the row exactly as it was.
+                // Untrustworthy observation: leave status and its marker exactly as they were.
             } else if downgrade_pending_at_ms.is_none() {
                 conn.execute(
                     "UPDATE repo_memory_bindings SET downgrade_pending_at_ms = ?4

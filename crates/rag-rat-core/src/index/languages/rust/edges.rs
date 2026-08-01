@@ -257,7 +257,10 @@ pub(crate) fn infer_rust_receiver_type_hint(node: Node<'_>, text: &str) -> Optio
             let value_node = function.child_by_field_name("value")?;
             let receiver = clean_receiver_expr(&node_text(value_node, text))?.to_string();
             let recv = receiver.as_str();
-            if recv == "self" || recv == "Self" {
+            if recv == "self" {
+                return infer_explicit_self_type_hint(node, text);
+            }
+            if recv == "Self" {
                 return infer_self_type_hint(node, text);
             }
             if !is_simple_identifier(recv) {
@@ -323,6 +326,38 @@ fn infer_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
             // Canonical against the IMPL's own module — `mod inner { impl Worker { … } }`
             // yields `inner::Worker`, matching the method's container-based scope path.
             return module_qualified_type_path(ancestor, &cleaned, text);
+        }
+        current = ancestor.parent();
+    }
+    None
+}
+
+/// An arbitrary self type participates in the same method lookup as an ordinary parameter. In
+/// particular, `self: Box<Self>` can dispatch to a wrapper-level trait method before dereferencing
+/// to the impl owner, so the single-owner inference must decline it.
+fn infer_explicit_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "function_item" {
+            let parameters = ancestor.child_by_field_name("parameters")?;
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                if parameter.kind() != "parameter" {
+                    continue;
+                }
+                let Some(pattern) = parameter.child_by_field_name("pattern") else { continue };
+                if pattern.kind() != "self" {
+                    continue;
+                }
+                let type_node = parameter.child_by_field_name("type")?;
+                let type_name = clean_rust_type_name(
+                    &super::render_owner(type_node, text, &[]),
+                    type_node,
+                    text,
+                )?;
+                return canonical_receiver_type(type_name, type_node, text);
+            }
+            return infer_self_type_hint(node, text);
         }
         current = ancestor.parent();
     }
@@ -511,7 +546,6 @@ fn clean_rust_type_name(raw: &str, at: Node<'_>, text: &str) -> Option<String> {
 }
 
 fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Option<String> {
-    let call_start = call_node.start_byte();
     let mut current = call_node.parent();
     let mut function_node = None;
     while let Some(ancestor) = current {
@@ -540,15 +574,9 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
     while let Some(node) = ancestor {
         if node.kind() == "block" {
             match visible_let_binding(node, child_on_path.start_byte(), recv, text) {
-                VisibleBinding::Typed(type_name, binding_start) => {
-                    // Scan from the BINDING'S block, not the whole function: an assignment can
-                    // only affect this binding while it is in scope, and that scope is exactly
-                    // this block's subtree.
-                    if is_reassigned(node, binding_start, call_start, recv, text) {
-                        return None;
-                    }
-                    return Some(type_name);
-                },
+                // Assignment changes a value, never the binding's static type. Only a lexical
+                // rebind can replace this inference, and the scope walk handles those separately.
+                VisibleBinding::Typed(type_name) => return Some(type_name),
                 VisibleBinding::Shadowed => return None,
                 VisibleBinding::Missing => {},
             }
@@ -580,9 +608,6 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
             let type_name =
                 clean_rust_type_name(&super::render_owner(type_node, text, &[]), type_node, text)?;
             let type_name = canonical_receiver_type(type_name, type_node, text)?;
-            if is_reassigned(function_node, param.start_byte(), call_start, recv, text) {
-                return None;
-            }
             return Some(type_name);
         }
     }
@@ -604,7 +629,7 @@ fn canonical_receiver_type(type_name: String, context: Node<'_>, text: &str) -> 
 
 #[derive(Debug, PartialEq, Eq)]
 enum VisibleBinding {
-    Typed(String, usize),
+    Typed(String),
     Shadowed,
     Missing,
 }
@@ -647,9 +672,7 @@ fn visible_let_binding(
         } else {
             constructor_owner(child.child_by_field_name("value"), text)
         };
-        return type_name
-            .map(|type_name| VisibleBinding::Typed(type_name, child.start_byte()))
-            .unwrap_or(VisibleBinding::Shadowed);
+        return type_name.map(VisibleBinding::Typed).unwrap_or(VisibleBinding::Shadowed);
     }
     VisibleBinding::Missing
 }
@@ -1040,55 +1063,6 @@ fn match_simple_pattern(pattern_node: Node<'_>, text: &str, recv: &str) -> bool 
     name == recv && is_simple_identifier(name)
 }
 
-fn is_reassigned(
-    scope_node: Node<'_>,
-    binding_start: usize,
-    call_start: usize,
-    recv: &str,
-    text: &str,
-) -> bool {
-    let mut found = false;
-    check_assignment(scope_node, binding_start, call_start, recv, text, &mut found);
-    found
-}
-
-fn check_assignment(
-    node: Node<'_>,
-    binding_start: usize,
-    call_start: usize,
-    recv: &str,
-    text: &str,
-    found: &mut bool,
-) {
-    rag_rat_base::stack::grow_stack(|| {
-        if *found || node.start_byte() >= call_start {
-            return;
-        }
-        if node.start_byte() > binding_start
-            && node.kind() == "assignment_expression"
-            && let Some(left) = node.child_by_field_name("left")
-        {
-            let left_text = node_text(left, text);
-            let cleaned = left_text.trim();
-            let name = cleaned.strip_prefix('*').unwrap_or(cleaned).trim();
-            if name == recv {
-                *found = true;
-                return;
-            }
-        }
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            // Only the (binding, call) byte window can hold a relevant assignment — pruning BOTH
-            // bounds keeps this scan proportional to the code between binding and call instead
-            // of the whole enclosing scope. This runs once per candidate hint, the hottest part
-            // of receiver inference on large functions.
-            if child.start_byte() < call_start && child.end_byte() > binding_start {
-                check_assignment(child, binding_start, call_start, recv, text, found);
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod receiver_type_hint_tests {
     use tree_sitter::Parser;
@@ -1169,6 +1143,30 @@ mod receiver_type_hint_tests {
         "#;
         let hints = extract_call_hints(code);
         assert_eq!(hints, vec![Some("Worker".to_string())]);
+    }
+
+    #[test]
+    fn an_explicit_reference_self_type_keeps_the_impl_owner() {
+        let code = r#"
+            impl Worker {
+                fn run(self: &Self) {
+                    self.execute();
+                }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![Some("Worker".to_string())]);
+    }
+
+    #[test]
+    fn an_explicit_deref_wrapper_self_type_declines_single_owner_inference() {
+        for receiver in ["Box<Self>", "Rc<Self>", "Arc<Self>", "Pin<Box<Self>>"] {
+            let code = format!("impl Worker {{ fn run(self: {receiver}) {{ self.execute(); }} }}");
+            assert_eq!(
+                extract_call_hints(&code),
+                vec![None],
+                "{receiver} may dispatch before dereferencing to Worker"
+            );
+        }
     }
 
     #[test]
@@ -1521,16 +1519,29 @@ mod receiver_type_hint_tests {
     }
 
     #[test]
-    fn test_reassignment_declined() {
+    fn reassignment_preserves_the_declared_static_type() {
         let code = r#"
-            fn test() {
-                let mut w = Worker::new();
-                w = OtherWorker::new();
+            fn test(mut w: Worker, replacement: Worker) {
+                w = replacement;
                 w.run();
             }
         "#;
-        let hints = extract_call_hints(code);
-        assert_eq!(hints, vec![None, None, None]);
+        assert_eq!(extract_call_hints(code), vec![Some("Worker".to_string())]);
+    }
+
+    #[test]
+    fn reassignment_preserves_the_inferred_static_type() {
+        let code = r#"
+            impl Worker {
+                fn new() -> Self { Worker }
+            }
+            fn test(replacement: Worker) {
+                let mut w = Worker::new();
+                w = replacement;
+                w.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None, Some("Worker".to_string())]);
     }
 
     #[test]

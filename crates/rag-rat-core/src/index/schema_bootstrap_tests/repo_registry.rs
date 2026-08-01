@@ -2370,7 +2370,11 @@ fn unshallow_upgrades_a_shallow_clone_index_from_local_to_portable_in_place() {
     let _ = fs::remove_dir_all(&base);
     let origin = base.join("origin");
     fs::create_dir_all(origin.join("src")).unwrap();
-    fs::write(origin.join("src/lib.rs"), "pub fn shallow_anchor() {}\n").unwrap();
+    fs::write(
+        origin.join("src/lib.rs"),
+        "pub fn shallow_anchor() {}\npub fn call_anchor() { shallow_anchor(); }\n",
+    )
+    .unwrap();
     run_git(&origin, &["init", "-q", "-b", "main"]);
     run_git(&origin, &["config", "user.email", "t@e"]);
     run_git(&origin, &["config", "user.name", "t"]);
@@ -2430,6 +2434,43 @@ fn unshallow_upgrades_a_shallow_clone_index_from_local_to_portable_in_place() {
             [symbol_id],
         )
         .unwrap();
+    let call_edge_id: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT id FROM edges WHERE to_name = 'shallow_anchor' AND to_symbol_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the caller resolves to shallow_anchor");
+    let call_memory = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Call path survives identity adoption".to_string(),
+            body: "The persisted edge identity follows the logical callee id.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                edge_path: Some(vec![call_edge_id]),
+                ..Default::default()
+            },
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+    let (local_callee, local_fingerprint, local_hash): (i64, String, String) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT callee_logical_symbol_id, edge_fingerprint, edge_sequence_hash
+               FROM repo_memory_call_path_edges WHERE memory_id = ?1",
+            [&call_memory],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
     drop(db);
 
     // Deepen the clone: the real root becomes reachable, so identity is now Portable (the root
@@ -2461,6 +2502,35 @@ fn unshallow_upgrades_a_shallow_clone_index_from_local_to_portable_in_place() {
         )
         .expect("the memory binding still resolves after the in-place upgrade");
     assert_eq!(resolved_name, symbol_name, "the memory resolves to the same symbol post-upgrade");
+    let (portable_callee, portable_fingerprint, edge_hash, path_hash, binding_hash): (
+        i64,
+        String,
+        String,
+        String,
+        String,
+    ) = reopened
+        .storage
+        .connection()
+        .query_row(
+            "SELECT e.callee_logical_symbol_id, e.edge_fingerprint, e.edge_sequence_hash,
+                    p.edge_sequence_hash, b.binding_id
+               FROM repo_memory_call_path_edges e
+               JOIN repo_memory_call_paths p ON p.memory_id = e.memory_id
+               JOIN repo_memory_bindings b ON b.memory_id = e.memory_id
+                  AND b.binding_kind = 'call_path'
+              WHERE e.memory_id = ?1",
+            [&call_memory],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_ne!(portable_callee, local_callee, "the callee id follows the portable repo fold");
+    assert_ne!(portable_fingerprint, local_fingerprint, "the fingerprint includes that callee id");
+    assert_ne!(edge_hash, local_hash, "the ordered fingerprint hash is re-derived");
+    assert_eq!(
+        (edge_hash.as_str(), path_hash.as_str(), binding_hash.as_str()),
+        (path_hash.as_str(), path_hash.as_str(), path_hash.as_str()),
+        "edge rows, call-path parent, and binding stay keyed by one sequence hash",
+    );
     let _ = fs::remove_dir_all(&base);
 }
 

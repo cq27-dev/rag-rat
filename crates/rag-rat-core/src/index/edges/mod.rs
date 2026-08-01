@@ -831,6 +831,9 @@ impl<'a> SymbolIndex<'a> {
 pub(crate) enum ReceiverTypeIdentity<'a> {
     /// Module-qualified (`workers::Worker`) with a workspace-local root.
     LocalQualified(&'a str),
+    /// A canonical owner produced from a concrete Rust import alias. Unlike a lexical qualified
+    /// hint, this must not retry only the type tail when the complete imported owner is absent.
+    LocalQualifiedExact(&'a str),
     /// A bare local type name (`Worker`) — nothing left to qualify.
     LocalUnqualified(&'a str),
     /// The root segment (or the bare name itself) names an external import.

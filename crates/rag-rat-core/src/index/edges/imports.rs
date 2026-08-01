@@ -378,10 +378,10 @@ fn strip_use_visibility(s: &str) -> Option<&str> {
     // path. Requiring a literal space read such a declaration as binding nothing, which makes an
     // imported receiver look like the caller's own type.
     let after = s.strip_prefix("use")?;
-    after.starts_with(char::is_whitespace).then(|| after.trim_start())
+    after.starts_with(char::is_whitespace).then_some(after.trim_start())
 }
 
-/// Every `… as Alias` rename in a use, as `(alias, the name it renames)`.
+/// Every `… as Alias` rename in a use, as `(alias, the owner path it renames)`.
 ///
 /// Only a rename produces a pair: an ordinary leaf already binds the name the index stores.
 fn use_alias_pairs(use_text: &str) -> Vec<(String, String)> {
@@ -400,31 +400,87 @@ fn collect_use_alias_pairs(tree: &str, prefix: &str, out: &mut Vec<(String, Stri
     match tree.find('{') {
         None => {
             let Some(alias) = alias_of(tree).filter(|alias| *alias != "_") else { return };
-            // The target is the renamed path's own leaf: `a::b::Worker as Alias` records `Worker`,
-            // which is the bare name every other reader compares against.
             let renamed = &tree[..tree.len() - alias.len()];
             let renamed = renamed.trim_end().trim_end_matches("as").trim_end();
             // `use a::foo::{self as bar}` renames the MODULE the group hangs off, not a leaf called
             // `self`. Recording the literal `self` rewrote `bar::Worker` to `self::Worker` — a path
             // that names the current module, so the exact lookup missed and the tail fallback was
             // free to pick some other `Worker::run`.
-            let renamed = if renamed.trim() == "self" { prefix } else { renamed };
-            if let Some(target) =
-                renamed.rsplit("::").next().map(str::trim).filter(|target| !target.is_empty())
-            {
+            let target = if renamed.trim() == "self" {
+                prefix.to_string()
+            } else {
+                join_use_path(prefix, renamed)
+            };
+            // Scope paths omit the current-crate pseudo-root. Keep every real owner segment so an
+            // alias for `crate::a::Worker` cannot probe an unrelated root-level `Worker`.
+            let target = target.strip_prefix("crate::").unwrap_or(&target).trim();
+            if !target.is_empty() {
                 out.push((alias.to_string(), target.to_string()));
             }
         },
         Some(open) => {
-            let group_prefix = tree[..open].trim().trim_end_matches(':').trim_end();
+            let group = tree[..open].trim().trim_end_matches(':').trim_end();
+            let group_prefix = join_use_path(prefix, group);
             for entry in split_top_level(brace_inner(&tree[open..])) {
                 let entry = entry.trim();
                 if !entry.is_empty() && entry != "self" {
-                    collect_use_alias_pairs(entry, group_prefix, out);
+                    collect_use_alias_pairs(entry, &group_prefix, out);
                 }
             }
         },
     }
+}
+
+fn join_use_path(prefix: &str, path: &str) -> String {
+    let prefix = prefix.trim().trim_end_matches(':');
+    let path = path.trim().trim_start_matches("::");
+    match (prefix.is_empty(), path.is_empty()) {
+        (true, _) => path.to_string(),
+        (_, true) => prefix.to_string(),
+        (false, false) => format!("{prefix}::{path}"),
+    }
+}
+
+/// Canonicalize a Rust alias target into the container-based scope path stored by the index.
+/// `crate` and local Cargo crate roots disappear from that path; `self`/`super` are resolved from
+/// the module that owns the `use`. An underflowing `super` has no defensible target.
+fn normalize_rust_alias_owner(
+    target: &str,
+    module_path: Option<&str>,
+    local_roots: &HashSet<String>,
+) -> Option<String> {
+    let mut target_segments = target
+        .trim()
+        .trim_start_matches("::")
+        .split("::")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty());
+    let first = target_segments.next()?;
+    let mut suffix = target_segments.collect::<Vec<_>>();
+    let mut modules = module_path
+        .into_iter()
+        .flat_map(|path| path.split("::"))
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    match first {
+        "crate" => modules.clear(),
+        "self" => {},
+        "super" => {
+            modules.pop()?;
+            while suffix.first() == Some(&"super") {
+                suffix.remove(0);
+                modules.pop()?;
+            }
+        },
+        root if local_roots.contains(root) => modules.clear(),
+        root => {
+            modules.clear();
+            modules.push(root);
+        },
+    }
+    modules.extend(suffix);
+    Some(modules.join("::"))
 }
 
 /// The bound leaf names of a use (sub)tree, appended to `out`. A tree is either a single path
@@ -540,6 +596,11 @@ pub(crate) struct ImportScope {
     /// by [`Self::finalize`] — built ONCE per file on ingest so the ref→mod-id lookup stays
     /// off the per-edge hot path.
     module_ranges: HashMap<i64, Vec<(usize, usize, i64)>>,
+    /// Inline-module name by its body-start id. Together with `module_ranges`, this reconstructs
+    /// the lexical module path without retaining the source tree during resolution.
+    module_names: HashMap<i64, HashMap<i64, String>>,
+    /// Canonical module path by body-start id, derived in [`Self::finalize`].
+    module_paths: HashMap<i64, HashMap<i64, String>>,
     file_package: HashMap<i64, i64>,
     package_roots: HashMap<i64, HashSet<String>>,
     global_roots: HashSet<String>,
@@ -550,19 +611,20 @@ pub(crate) struct ImportScope {
     /// `Url`. Only a genuinely non-Cargo corpus (no manifest at all) fails open. Set true by
     /// [`Self::mark_has_manifests`] when any package row is loaded.
     has_manifests: bool,
-    /// Per-file import aliases: `alias name → its bindings` (#174). A `from m import T as
-    /// A` records `A → T` so a later reference to `A` resolves to the IMPORTED symbol `T`, not
-    /// an unrelated local `A`. Distinct from `by_file` (Rust external-import suppression):
-    /// this REBINDS an alias use to its in-corpus target name, rather than just flagging it
-    /// external.
+    /// Per-file import aliases: `alias name → its bindings` (#174). A `from m import T as A`
+    /// records `A → T`; a Rust `use crate::a::T as A` records `A → a::T`. Distinct from `by_file`
+    /// (Rust external-import suppression): this REBINDS an alias use to its in-corpus target
+    /// rather than just flagging it external.
     import_aliases: HashMap<i64, HashMap<String, Vec<ImportAlias>>>,
 }
 
-/// One Python import alias binding: the imported target name the alias stands for, scoped to a byte
-/// range (whole-file today — Python imports are module-global). Mirrors [`ImportBinding`] but
-/// carries the TARGET name (for rebinding) rather than the crate root (for external detection).
+/// One import alias binding: the imported target name/path the alias stands for, scoped to a byte
+/// range. Mirrors [`ImportBinding`] but carries the TARGET (for rebinding) rather than the crate
+/// root (for external detection).
 struct ImportAlias {
-    target: String,
+    target: Option<String>,
+    /// Rust aliases start as source paths and are canonicalized after every module range is known.
+    rust_owner_path: bool,
     scope_start: usize,
     scope_end: usize,
     /// The module the alias is declared in. A `use` is NOT inherited by a nested `mod`, so an
@@ -614,7 +676,8 @@ impl ImportScope {
         let Some(scope) = scope else { return };
         self.import_aliases.entry(file_id).or_default().entry(alias).or_default().push(
             ImportAlias {
-                target,
+                target: Some(target),
+                rust_owner_path: false,
                 scope_start: scope.scope_start,
                 scope_end: scope.scope_end,
                 // Python has no inline-module ranges, so every reference in the file reports the
@@ -622,6 +685,22 @@ impl ImportScope {
                 mod_id: scope.mod_id,
             },
         );
+    }
+
+    /// Record one Rust Imports edge. A `use` contributes bindings; an inline `mod` contributes the
+    /// body/name provenance needed to canonicalize relative alias targets after ingest completes.
+    pub(crate) fn add_rust_import_edge(
+        &mut self,
+        file_id: i64,
+        name: Option<&str>,
+        evidence: &str,
+        scope: Option<ImportScopeRange>,
+    ) {
+        if strip_use_visibility(evidence.trim()).is_some() {
+            self.add_use(file_id, evidence, scope);
+        } else if let (Some(name), Some(scope)) = (name, scope) {
+            self.add_inline_module(file_id, name.to_string(), scope);
+        }
     }
 
     /// The imported target name a Python alias `name` stands for at `ref_byte`, if any (#174). The
@@ -661,10 +740,37 @@ impl ImportScope {
             .into_iter()
             .filter(|alias| alias.scope_end.saturating_sub(alias.scope_start) == narrowest);
         let first = innermost.next()?;
-        if innermost.any(|alias| alias.target != first.target) {
+        let first_target = first.target.as_deref()?;
+        if innermost.any(|alias| alias.target.as_deref() != Some(first_target)) {
             return None;
         }
-        Some(first.target.as_str())
+        Some(first_target)
+    }
+
+    /// Whether an alias binding covers this reference, including an ambiguous or uncanonicalizable
+    /// binding whose target deliberately returns `None` from [`Self::import_alias_target`].
+    pub(crate) fn has_import_alias(&self, file_id: i64, name: &str, ref_byte: usize) -> bool {
+        let ref_mod_id = self.ref_mod_id(file_id, ref_byte);
+        self.import_aliases
+            .get(&file_id)
+            .and_then(|aliases| aliases.get(name))
+            .is_some_and(|aliases| aliases.iter().any(|alias| alias.covers(ref_byte, ref_mod_id)))
+    }
+
+    /// Record one inline module's name and body range. The range is also part of reference-module
+    /// lookup; its name lets [`Self::finalize`] derive paths for `self::` and `super::` imports.
+    pub(crate) fn add_inline_module(
+        &mut self,
+        file_id: i64,
+        name: String,
+        scope: ImportScopeRange,
+    ) {
+        self.module_ranges.entry(file_id).or_default().push((
+            scope.scope_start,
+            scope.scope_end,
+            scope.mod_id,
+        ));
+        self.module_names.entry(file_id).or_default().insert(scope.mod_id, name);
     }
 
     /// Record one Imports edge for `file_id`. An inline-`mod` edge (scope present, but `use_text`
@@ -705,12 +811,15 @@ impl ImportScope {
         // only by languages whose import edges carry the alias directly — a `use`-shaped language
         // reached this branch instead and left the map empty, so the lookup always missed.
         for (alias, target) in use_alias_pairs(use_text) {
-            self.import_aliases
-                .entry(file_id)
-                .or_default()
-                .entry(alias)
-                .or_default()
-                .push(ImportAlias { target, scope_start, scope_end, mod_id });
+            self.import_aliases.entry(file_id).or_default().entry(alias).or_default().push(
+                ImportAlias {
+                    target: Some(target),
+                    rust_owner_path: true,
+                    scope_start,
+                    scope_end,
+                    mod_id,
+                },
+            );
         }
         let file = self.by_file.entry(file_id).or_default();
         for leaf in leaves {
@@ -736,6 +845,61 @@ impl ImportScope {
         for ranges in self.module_ranges.values_mut() {
             ranges.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
             ranges.dedup();
+        }
+        self.module_paths.clear();
+        for (&file_id, names) in &self.module_names {
+            let Some(ranges) = self.module_ranges.get(&file_id) else { continue };
+            let mut modules = names
+                .iter()
+                .filter_map(|(&mod_id, name)| {
+                    ranges
+                        .iter()
+                        .find(|(start, _, id)| *id == mod_id && *start as i64 == mod_id)
+                        .map(|&(start, end, _)| (start, end, mod_id, name.as_str()))
+                })
+                .collect::<Vec<_>>();
+            modules.sort_by_key(|(start, end, _, _)| (*start, std::cmp::Reverse(*end)));
+            let mut paths: HashMap<i64, String> = HashMap::new();
+            for &(start, end, mod_id, name) in &modules {
+                let parent = modules
+                    .iter()
+                    .filter(|(candidate_start, candidate_end, candidate_id, _)| {
+                        *candidate_id != mod_id
+                            && *candidate_start <= start
+                            && *candidate_end >= end
+                    })
+                    .min_by_key(|(candidate_start, candidate_end, _, _)| {
+                        candidate_end.saturating_sub(*candidate_start)
+                    })
+                    .and_then(|(_, _, parent_id, _)| paths.get(parent_id));
+                let path =
+                    parent.map_or_else(|| name.to_string(), |parent| format!("{parent}::{name}"));
+                paths.insert(mod_id, path);
+            }
+            self.module_paths.insert(file_id, paths);
+        }
+
+        let module_paths = &self.module_paths;
+        let file_package = &self.file_package;
+        let package_roots = &self.package_roots;
+        let global_roots = &self.global_roots;
+        for (&file_id, aliases) in &mut self.import_aliases {
+            let local_roots = file_package
+                .get(&file_id)
+                .and_then(|package_id| package_roots.get(package_id))
+                .unwrap_or(global_roots);
+            for bindings in aliases.values_mut() {
+                for alias in bindings.iter_mut().filter(|alias| alias.rust_owner_path) {
+                    let module_path = module_paths
+                        .get(&file_id)
+                        .and_then(|paths| paths.get(&alias.mod_id))
+                        .map(String::as_str);
+                    alias.target = alias.target.as_deref().and_then(|target| {
+                        normalize_rust_alias_owner(target, module_path, local_roots)
+                    });
+                    alias.rust_owner_path = false;
+                }
+            }
         }
     }
 
@@ -882,31 +1046,70 @@ impl ImportScope {
 mod tests {
     use super::{ImportScope, ImportScopeRange, use_alias_pairs};
 
-    /// `use a::foo::{self as bar}` renames the MODULE the group hangs off. Recording the literal
-    /// `self` rewrote `bar::Worker` into `self::Worker` — a path naming the current module — so the
-    /// exact lookup missed and the tail fallback was free to pick a different `Worker`.
+    /// A rename retains the complete owner path. Recording only its tail lets a root-level
+    /// namesake capture a call through the alias.
     #[test]
-    fn an_aliased_self_renames_the_group_prefix() {
+    fn an_alias_retains_the_complete_owner_path() {
         assert_eq!(use_alias_pairs("use crate::foo::{self as bar};"), vec![(
             "bar".to_string(),
             "foo".to_string()
         )]);
         assert_eq!(use_alias_pairs("use a::b::c::{self as z};"), vec![(
             "z".to_string(),
-            "c".to_string()
+            "a::b::c".to_string()
         )]);
-        // A leaf alias beside an aliased `self` keeps naming its own leaf.
+        // A leaf alias beside an aliased `self` includes the group's path too.
         let mut both = use_alias_pairs("use crate::foo::{self as bar, Worker as W};");
         both.sort();
         assert_eq!(both, vec![
-            ("W".to_string(), "Worker".to_string()),
+            ("W".to_string(), "foo::Worker".to_string()),
             ("bar".to_string(), "foo".to_string()),
         ]);
-        // An ordinary rename is unchanged.
+        // An ordinary rename retains all real owner segments and drops only the pseudo-root.
         assert_eq!(use_alias_pairs("use a::b::Worker as Alias;"), vec![(
             "Alias".to_string(),
-            "Worker".to_string()
+            "a::b::Worker".to_string()
         )]);
+        assert_eq!(use_alias_pairs("use crate::a::Worker as Alias;"), vec![(
+            "Alias".to_string(),
+            "a::Worker".to_string()
+        )]);
+    }
+
+    #[test]
+    fn rust_alias_owners_are_canonicalized_from_import_provenance() {
+        let mut scope = ImportScope::new(HashSet::from(["sibling".to_string()]));
+        scope.add_inline_module(1, "outer".to_string(), mod_scope(10, 500));
+        scope.add_inline_module(1, "inner".to_string(), mod_scope(100, 400));
+        let inner = use_in_mod(100, 400, 100);
+        for declaration in [
+            "use crate::a::Worker as Direct;",
+            "use crate::{a::{Worker as Grouped}};",
+            "use crate::{a::{deep::{Worker as Nested}}};",
+            "use sibling::a::Worker as Workspace;",
+        ] {
+            scope.add_use(1, declaration, Some(scope_at_file_root(0, 600)));
+        }
+        scope.add_use(1, "use self::workers::Worker as SelfWorker;", Some(inner));
+        scope.add_use(1, "use super::workers::Worker as SuperWorker;", Some(inner));
+        scope.add_use(1, "use super::workers::{self as Workers};", Some(inner));
+        scope.add_use(1, "use crate::{self as Root};", Some(inner));
+        scope.finalize();
+
+        assert_eq!(scope.import_alias_target(1, "Direct", 550), Some("a::Worker"));
+        assert_eq!(scope.import_alias_target(1, "Grouped", 550), Some("a::Worker"));
+        assert_eq!(scope.import_alias_target(1, "Nested", 550), Some("a::deep::Worker"));
+        assert_eq!(scope.import_alias_target(1, "Workspace", 550), Some("a::Worker"));
+        assert_eq!(
+            scope.import_alias_target(1, "SelfWorker", 150),
+            Some("outer::inner::workers::Worker")
+        );
+        assert_eq!(
+            scope.import_alias_target(1, "SuperWorker", 150),
+            Some("outer::workers::Worker")
+        );
+        assert_eq!(scope.import_alias_target(1, "Workers", 150), Some("outer::workers"));
+        assert_eq!(scope.import_alias_target(1, "Root", 150), Some(""));
     }
 
     /// A `use` is not inherited by a nested `mod`, so an outer alias must not rewrite names inside
@@ -929,7 +1132,7 @@ mod tests {
         // Inside the child module the outer alias does not apply.
         assert_eq!(scope.import_alias_target(1, "W", 200), None);
         // Outside it, it still does.
-        assert_eq!(scope.import_alias_target(1, "W", 50), Some("Worker"));
+        assert_eq!(scope.import_alias_target(1, "W", 50), Some("a::Worker"));
     }
 
     use super::*;

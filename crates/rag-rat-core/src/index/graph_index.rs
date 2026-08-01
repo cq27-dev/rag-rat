@@ -214,13 +214,16 @@ fn remap_logical_symbol_ids(
         let temp_id = -(i as i64 + 1);
         rewrite_logical_symbol_id(conn, temp_id, *new_id)?;
     }
+    let call_path_remap: Vec<(i64, Option<i64>)> =
+        remap.iter().map(|(old_id, new_id)| (*old_id, Some(*new_id))).collect();
+    rag_rat_query::memory::remap_call_path_callee_logical_symbol_ids(conn, conn, &call_path_remap)?;
     Ok(())
 }
 
 /// Move a single logical-symbol id from `from` to `to` across the PK row and every column that
-/// references it — the members join table, the per-tool monikers, and the two durable-memory
-/// reference tables (`repo_memory_bindings`, `repo_memory_call_paths`' start/end). See
-/// [`realign_logical_symbol_ids`] for the FK-off/deferred requirement.
+/// references it — the members join table, per-tool monikers, memory bindings, call-path endpoints,
+/// and call-path edge identities. See [`realign_logical_symbol_ids`] for the FK-off/deferred
+/// requirement.
 fn rewrite_logical_symbol_id(
     conn: &rusqlite::Connection,
     from: i64,
@@ -319,7 +322,23 @@ fn table_present(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<b
         .is_some())
 }
 
-/// NULL every CALL-PATH reference to a drifted id the heal could not realign (#493 review).
+fn column_present(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for result in columns {
+        if result? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// NULL every CALL-PATH reference to a drifted id the heal could not realign (#493 review),
+/// including a persisted edge callee identity after rebuilding its derived hashes when possible.
 /// Call-path references are the exception to the self-healing ladder: `validate_call_path_binding`
 /// re-checks only the stored EDGE fingerprints and NEVER consults or repairs the endpoint ids, so
 /// a stale (occupied-by-another OR vanished) endpoint would be a permanent bogus `sym_8000…`
@@ -331,6 +350,7 @@ fn table_present(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<b
 /// no-winner id — occupied and vanished alike — unlike the sentinel/delete cleanup below which is
 /// occupied-only.
 fn null_call_path_references(conn: &rusqlite::Connection, from: i64) -> rusqlite::Result<()> {
+    rag_rat_query::memory::remap_call_path_callee_logical_symbol_ids(conn, conn, &[(from, None)])?;
     conn.execute(
         "UPDATE repo_memory_bindings SET logical_symbol_id = NULL
           WHERE logical_symbol_id = ?1 AND binding_kind = 'call_path'",
@@ -413,6 +433,9 @@ fn remap_logical_symbol_references(
         let temp_id = -(i as i64 + 1);
         rewrite_logical_symbol_references(conn, temp_id, *new_id)?;
     }
+    let call_path_remap: Vec<(i64, Option<i64>)> =
+        remap.iter().map(|(old_id, new_id)| (*old_id, Some(*new_id))).collect();
+    rag_rat_query::memory::remap_call_path_callee_logical_symbol_ids(conn, conn, &call_path_remap)?;
     Ok(())
 }
 
@@ -1190,11 +1213,11 @@ impl IndexDatabase {
     /// [`Self::capture_drift_snapshot_before_removal`] before a pass's first file removal (the
     /// member-signature evidence lives in the rows being deleted), or fresh at
     /// [`Self::rebuild_logical_symbols`] when nothing was removed. Bounded by the
-    /// DURABLE references (memory bindings, call-path endpoints, oracle monikers) rather than the
-    /// whole table: unreferenced ids need no healing, and the reference set is dozens of rows
-    /// where the table is tens of thousands. The `logical_symbols` join keys the intersection to
-    /// the ACTIVE repo, so a sibling repo's references never enter a heal that queries this
-    /// repo's candidates.
+    /// DURABLE references (memory bindings, call-path endpoints and edge callees, oracle monikers)
+    /// rather than the whole table: unreferenced ids need no healing, and the reference set is
+    /// dozens of rows where the table is tens of thousands. The `logical_symbols` join keys the
+    /// intersection to the ACTIVE repo, so a sibling repo's references never enter a heal that
+    /// queries this repo's candidates.
     pub(super) fn logical_key_drift_snapshot(
         &self,
     ) -> anyhow::Result<Option<Vec<LogicalKeyDriftRow>>> {
@@ -1225,6 +1248,14 @@ impl IndexDatabase {
                   UNION
                   SELECT target_logical_symbol_id FROM repo_node_edges
                    WHERE target_logical_symbol_id IS NOT NULL",
+            );
+        }
+        if column_present(conn, "repo_memory_call_path_edges", "callee_logical_symbol_id")? {
+            reference_sources.push_str(
+                "
+                  UNION
+                  SELECT callee_logical_symbol_id FROM repo_memory_call_path_edges
+                   WHERE callee_logical_symbol_id IS NOT NULL",
             );
         }
         if table_present(conn, "papertrail_distill_anchors")? {

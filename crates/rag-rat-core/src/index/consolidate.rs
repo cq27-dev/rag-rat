@@ -46,7 +46,7 @@ use rag_rat_base::{data_dir, locks};
 use rag_rat_db::storage::IndexConnection;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::index::{IndexDatabase, schema};
+use crate::index::{self, IndexDatabase, schema};
 
 /// The `repo_meta` keys consolidate carries from the legacy DB into the global DB. Carried as a
 /// per-key MIRROR of the source (the import's mirror invariant): a key present in the legacy DB
@@ -607,6 +607,7 @@ fn import_from_source(
     // child slices before and after — identical slice ⇒ that table reports 0 (an honest no-op).
     let pre = child_slice_digests(&tx, &id_map)?;
     refresh_children(&tx, &id_map)?;
+    let callee_remap = consolidation_callee_remap(source, repo_id)?;
     let raw = ImportCounts {
         memories,
         bindings: copy_bindings(source, &tx, repo_id, &id_map)?,
@@ -617,6 +618,7 @@ fn import_from_source(
         embedding_cache_rows: copy_embedding_cache(source, &tx)?,
         meta_keys: copy_model_state(source, &tx, repo_id)?,
     };
+    rag_rat_query::memory::remap_call_path_callee_logical_symbol_ids(&tx, source, &callee_remap)?;
     let post = child_slice_digests(&tx, &id_map)?;
     let counts = ImportCounts {
         bindings: if pre.bindings == post.bindings { 0 } else { raw.bindings },
@@ -633,6 +635,98 @@ fn import_from_source(
     rebuild_memory_fts_for_repo(&tx, repo_id)?;
     tx.commit()?;
     Ok(counts)
+}
+
+/// Re-derive every persisted call-path callee id under the destination repo identity. The source
+/// graph remains the fingerprint evidence during import because derived graph rows are deliberately
+/// not copied into the consolidated store.
+struct ConsolidationLogicalSymbolFields {
+    language: String,
+    path: String,
+    name: String,
+    qualified_name: Option<String>,
+    kind: String,
+}
+
+fn consolidation_callee_remap(
+    source: &Connection,
+    repo_id: &str,
+) -> anyhow::Result<Vec<(i64, Option<i64>)>> {
+    if !schema::column_exists(source, "repo_memory_call_path_edges", "callee_logical_symbol_id")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = source.prepare(
+        "SELECT DISTINCT callee_logical_symbol_id
+           FROM repo_memory_call_path_edges
+          WHERE callee_logical_symbol_id IS NOT NULL",
+    )?;
+    let ids =
+        stmt.query_map([], |row| row.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut remap = Vec::with_capacity(ids.len());
+    for old_id in ids {
+        let fields = source
+            .query_row(
+                "SELECT ls.language, ls.path, ls.logical_name, qn.value, ls.kind
+                   FROM logical_symbols ls
+                   LEFT JOIN name_strings qn ON qn.id = ls.qualified_name_id
+                  WHERE ls.id = ?1",
+                [old_id],
+                |row| {
+                    Ok(ConsolidationLogicalSymbolFields {
+                        language: row.get(0)?,
+                        path: row.get(1)?,
+                        name: row.get(2)?,
+                        qualified_name: row.get(3)?,
+                        kind: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        let key = match fields {
+            Some(fields) => consolidation_logical_symbol_key(source, old_id, fields)?,
+            None => None,
+        };
+        remap.push((old_id, key.map(|key| key.stable_id(repo_id))));
+    }
+    Ok(remap)
+}
+
+/// Recover a portable key only when every member agrees on the member-resident key fields. A
+/// legacy source can hold a pre-scope-aware merged group; choosing one member would silently assign
+/// every persisted callee reference to that arbitrary owner after consolidation.
+fn consolidation_logical_symbol_key(
+    source: &Connection,
+    old_id: i64,
+    fields: ConsolidationLogicalSymbolFields,
+) -> anyhow::Result<Option<index::graph_index::LogicalSymbolKey>> {
+    let Some(qualified_name) = fields.qualified_name else { return Ok(None) };
+    let mut stmt = source.prepare(
+        "SELECT COALESCE(s.scope_path, ''), s.signature
+           FROM logical_symbol_members m
+           JOIN symbols s ON s.id = m.symbol_id
+          WHERE m.logical_symbol_id = ?1
+          ORDER BY s.id",
+    )?;
+    let members = stmt
+        .query_map([old_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let Some((scope_path, signature)) = members.first().cloned() else { return Ok(None) };
+    if members.iter().any(|(member_scope, member_signature)| {
+        member_scope != &scope_path || member_signature != &signature
+    }) {
+        return Ok(None);
+    }
+    Ok(Some(index::graph_index::LogicalSymbolKey {
+        language: fields.language,
+        path: fields.path,
+        name: fields.name,
+        qualified_name,
+        scope_path,
+        kind: fields.kind,
+        signature,
+    }))
 }
 
 /// One SHA-256 digest per child table over the TARGET rows of the mapped ids (order-insensitive:
@@ -1082,8 +1176,9 @@ fn copy_tags(
 }
 
 /// Copy `repo_memory_call_paths`, NULLing the local `start`/`end_logical_symbol_id` (re-resolved
-/// by the validate loop, like the bindings' rowid columns); the portable identity
-/// (`edge_sequence_hash`, `path_summary`, `created_at_ms`) is copied verbatim.
+/// by the validate loop, like the bindings' rowid columns). The path identity is copied first and
+/// then re-keyed by [`rag_rat_query::memory::remap_call_path_callee_logical_symbol_ids`] when a
+/// callee id changes.
 fn copy_call_paths(
     source: &Connection,
     tx: &Connection,
@@ -1118,10 +1213,10 @@ fn copy_call_paths(
     Ok(count)
 }
 
-/// Copy `repo_memory_call_path_edges` verbatim — every column is a row-id-independent portable
-/// identity used to re-find the edge, so nothing is nulled. Pre-V099 sources have no callee
-/// identity columns; copy them as unknown so validation fails closed until an exact compatibility
-/// match converges the row.
+/// Copy `repo_memory_call_path_edges`. Pre-V099 sources have no callee identity columns; copy them
+/// as unknown so validation fails closed until an exact compatibility match converges the row.
+/// Current rows are copied first, then the import transaction re-derives their callee ids,
+/// fingerprints, sequence hashes, and binding ids under the destination repo identity.
 fn copy_call_path_edges(
     source: &Connection,
     tx: &Connection,
@@ -1591,6 +1686,167 @@ mod tests {
             ),
             1,
         );
+    }
+
+    #[test]
+    fn import_rekeys_call_path_identity_for_the_destination_repo() {
+        use rag_rat_base::config::{ResolvedTarget, TargetKind};
+        use rag_rat_base::language::Language;
+        use rag_rat_base::test_scratch::{self, ScratchDir};
+
+        let root = ScratchDir::new("consolidate-call-path");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn callee() {}\npub fn caller() { callee(); }\n")
+            .unwrap();
+        let config_root = test_scratch::canonical_config_root(root.path());
+        let config = Config {
+            trackers: Vec::new(),
+            papertrail: Default::default(),
+            sync: Default::default(),
+            repo_id_override: None,
+            database_key_pinned: true,
+            database: config_root.join(".rag-rat/index.sqlite"),
+            root: config_root,
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            llm: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+            search: Default::default(),
+            memory: Default::default(),
+            log: Default::default(),
+            source_root_reanchored_from: None,
+            allow_empty: false,
+        };
+        let source = IndexDatabase::rebuild(&config).unwrap();
+        let edge_id: i64 = source
+            .storage
+            .connection()
+            .query_row(
+                "SELECT id FROM edges WHERE to_name = 'callee' AND to_symbol_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let memory_id = source
+            .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: "Consolidated call path".to_string(),
+                body: "Its callee identity is repo-derived.".to_string(),
+                confidence: "high".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: Vec::new(),
+                payload_json: None,
+                bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                    edge_path: Some(vec![edge_id]),
+                    ..Default::default()
+                },
+            })
+            .unwrap()
+            .memory
+            .memory_id;
+        let (source_callee, source_fingerprint, source_hash): (i64, String, String) = source
+            .storage
+            .connection()
+            .query_row(
+                "SELECT callee_logical_symbol_id, edge_fingerprint, edge_sequence_hash
+                   FROM repo_memory_call_path_edges WHERE memory_id = ?1",
+                [&memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        let target = fresh_target();
+        import_from_source(source.storage.connection(), &target, "global-repo").unwrap();
+        let (target_callee, target_fingerprint, edge_hash, path_hash, binding_hash): (
+            i64,
+            String,
+            String,
+            String,
+            String,
+        ) = target
+            .query_row(
+                "SELECT e.callee_logical_symbol_id, e.edge_fingerprint, e.edge_sequence_hash,
+                        p.edge_sequence_hash, b.binding_id
+                   FROM repo_memory_call_path_edges e
+                   JOIN repo_memory_call_paths p ON p.memory_id = e.memory_id
+                   JOIN repo_memory_bindings b ON b.memory_id = e.memory_id
+                      AND b.binding_kind = 'call_path'
+                  WHERE e.memory_id = ?1",
+                [&memory_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_ne!(target_callee, source_callee, "the destination repo derives a distinct callee");
+        assert_ne!(
+            target_fingerprint, source_fingerprint,
+            "the imported fingerprint is re-derived"
+        );
+        assert_ne!(edge_hash, source_hash, "the sequence hash follows the new fingerprint");
+        assert_eq!(edge_hash, path_hash);
+        assert_eq!(path_hash, binding_hash);
+    }
+
+    #[test]
+    fn consolidation_declines_a_non_unanimous_legacy_logical_group() {
+        let source = Connection::open_in_memory().unwrap();
+        schema::apply(&source, &crate::index::migration_hooks()).unwrap();
+        source
+            .execute(
+                "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms,
+                        indexed_at_ms, commit_sha, worktree_id, repo_id, generation)
+                 VALUES ('src/lib.rs', 'rust', 'source', 'sha', 0, 0, '', '',
+                         '__unassigned__', 0)",
+                [],
+            )
+            .unwrap();
+        source.execute("INSERT INTO name_strings(value) VALUES ('src/lib.rs::run')", []).unwrap();
+        let qualified_name_id = source.last_insert_rowid();
+        for scope_path in ["Alpha::run", "Beta::run"] {
+            source
+                .execute(
+                    "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind,
+                            start_byte, end_byte, signature, scope_path)
+                     VALUES (1, 'rust', 'run', ?1, 'function', 0, 1, 'fn run()', ?2)",
+                    params![qualified_name_id, scope_path],
+                )
+                .unwrap();
+        }
+        source
+            .execute(
+                "INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name_id,
+                        kind, variant_count, group_reason, repo_id)
+                 VALUES (91, 'rust', 'src/lib.rs', 'run', ?1, 'function', 2, 'legacy',
+                         '__unassigned__')",
+                [qualified_name_id],
+            )
+            .unwrap();
+        source
+            .execute_batch(
+                "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, start_line,
+                        end_line) VALUES (91, 1, 1, 1);
+                 INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, start_line,
+                        end_line) VALUES (91, 2, 1, 1);
+                 INSERT INTO repo_memories(id, kind, title, body, confidence, status,
+                        created_at_ms, updated_at_ms, source, memory_version, repo_id)
+                 VALUES ('m', 'Invariant', 't', 'b', 'high', 'active', 0, 0, 'agent', 'v1',
+                         '__unassigned__');
+                 INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal,
+                        edge_fingerprint, to_name, edge_kind, callee_logical_symbol_id,
+                        callee_identity_known)
+                 VALUES ('m', 'h', 0, 'fp', 'run', 'calls_name', 91, 1);",
+            )
+            .unwrap();
+
+        assert_eq!(consolidation_callee_remap(&source, "destination").unwrap(), vec![(91, None)]);
     }
 
     /// The relocation-provenance columns (`symbol_kind`, `signature_hash`, `moniker_tool`,

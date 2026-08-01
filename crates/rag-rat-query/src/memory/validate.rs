@@ -1456,6 +1456,116 @@ mod call_path_receiver_type_hint_tests {
         );
     }
 
+    #[test]
+    fn first_gone_validation_detaches_the_persisted_edge_before_status_downgrades() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint, \
+             receiver_type_hint, source_file_id, source_start_line, source_end_line) VALUES \
+             ('caller','run','calls_name','exact','recv','Alpha',?1,10,10)",
+            [file_id],
+        )
+        .unwrap();
+        let edge_id = c.last_insert_rowid();
+        let fingerprint = edge_by_id(&c, edge_id).unwrap().unwrap().fingerprint;
+
+        seed_memory(&c, "m1", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             start_line, end_line, edge_id, anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','edge',?1,'src/lib.rs',10,10,?2,'current',0,'r')",
+            rusqlite::params![fingerprint, edge_id],
+        )
+        .unwrap();
+        assert_eq!(memories_for_edges(&c, &[edge_id], 10).unwrap().len(), 1);
+
+        // Reusing the row for a semantically different receiver invalidates the stored fingerprint
+        // while preserving the numeric id that edge recall would otherwise follow.
+        c.execute("UPDATE edges SET receiver_type_hint = 'Beta' WHERE id = ?1", [edge_id]).unwrap();
+
+        let report = validate_memories(&c, None).unwrap();
+        assert_eq!(report.gone, 1);
+        let persisted: (String, Option<i64>, Option<i64>) = c
+            .query_row(
+                "SELECT anchor_status, downgrade_pending_at_ms, edge_id
+                 FROM repo_memory_bindings WHERE memory_id = 'm1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted.0, "current", "the first observation must not downgrade status");
+        assert!(persisted.1.is_some(), "the first observation arms status hysteresis");
+        assert_eq!(persisted.2, None, "the invalid edge identity detaches immediately");
+        assert!(
+            memories_for_edges(&c, &[edge_id], 10).unwrap().is_empty(),
+            "edge recall must not surface the memory on the replacement edge"
+        );
+
+        validate_memories(&c, None).unwrap();
+        let confirmed: (String, Option<i64>, Option<i64>) = c
+            .query_row(
+                "SELECT anchor_status, downgrade_pending_at_ms, edge_id
+                 FROM repo_memory_bindings WHERE memory_id = 'm1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(confirmed, ("gone".to_string(), None, None));
+    }
+
+    #[test]
+    fn active_scope_validation_preserves_a_linked_worktree_edge_id_as_pending() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/branch.rs", "r");
+        c.execute("UPDATE main.files SET worktree_id = 'linked' WHERE id = ?1", [file_id]).unwrap();
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, source_file_id,
+                    source_start_line, source_end_line)
+             VALUES ('caller', 'branch_only', 'calls_name', 'exact', ?1, 10, 10)",
+            [file_id],
+        )
+        .unwrap();
+        let edge_id: i64 =
+            c.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
+        let fingerprint = edge_by_id(&c, edge_id).unwrap().unwrap().fingerprint;
+        seed_memory(&c, "m1", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path,
+                    start_line, end_line, edge_id, anchor_status, created_at_ms, repo_id)
+             VALUES ('m1', 'edge', ?1, 'src/branch.rs', 10, 10, ?2, 'current', 0, 'r')",
+            rusqlite::params![fingerprint, edge_id],
+        )
+        .unwrap();
+
+        // Model a main-checkout connection: the raw store retains the linked row, while the scoped
+        // view used by validation cannot see it.
+        c.execute_batch(
+            "CREATE TEMP VIEW files AS
+                 SELECT * FROM main.files WHERE worktree_id = '';",
+        )
+        .unwrap();
+
+        let report = validate_memories(&c, None).unwrap();
+        assert_eq!((report.pending, report.gone), (1, 0));
+        let persisted: (String, Option<i64>, Option<i64>) = c
+            .query_row(
+                "SELECT anchor_status, downgrade_pending_at_ms, edge_id
+                   FROM repo_memory_bindings WHERE memory_id = 'm1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, ("pending".to_string(), None, Some(edge_id)));
+        assert_eq!(
+            memories_for_edges(&c, &[edge_id], 10).unwrap().len(),
+            1,
+            "the linked checkout retains its direct edge recall mapping"
+        );
+    }
+
     /// Convergence rewrites the binding's identity, so it may only run when the recomputed hash
     /// describes the SAME call path: every edge must have matched a live edge. An edge that
     /// survives only by its loose identity has no live fingerprint to fold in, and re-keying on

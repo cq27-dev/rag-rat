@@ -586,6 +586,54 @@ pub(crate) fn edge_by_id(conn: &Connection, edge_id: i64) -> anyhow::Result<Opti
     .optional()
     .map_err(Into::into)
 }
+
+/// Whether an edge hidden from the active checkout still carries this exact current identity in
+/// another live worktree of the same repo. Scoped validation remains authoritative for status;
+/// this raw-main probe is only the safety check before destructive row-id detachment.
+pub(crate) fn edge_id_matches_fingerprint_in_linked_worktree(
+    conn: &Connection,
+    edge_id: i64,
+    repo_id: &str,
+    fingerprint: &str,
+) -> anyhow::Result<bool> {
+    let active_worktree =
+        rag_rat_db::schema::connection_context_value(conn, "worktree_id").unwrap_or_default();
+    let edge = conn
+        .query_row(
+            "SELECT edges.id AS edge_id,
+                    main.files.path AS path,
+                    COALESCE(NULLIF(edges.source_start_line, 0), 1) AS start_line,
+                    COALESCE(NULLIF(edges.source_end_line, 0),
+                             NULLIF(edges.source_start_line, 0), 1) AS end_line,
+                    main.files.sha256 AS source_hash,
+                    edges.from_name AS from_name,
+                    edges.to_name AS to_name,
+                    edges.edge_kind AS edge_kind,
+                    edges.target_qualified_name AS target_qualified_name,
+                    edges.receiver_hint AS receiver_hint,
+                    edges.receiver_type_hint AS receiver_type_hint,
+                    members.logical_symbol_id AS callee_logical_symbol_id
+               FROM main.edges AS edges
+               JOIN main.files ON main.files.id = edges.source_file_id
+               LEFT JOIN main.logical_symbol_members members
+                      ON members.symbol_id = edges.to_symbol_id
+              WHERE edges.id = ?1
+                AND main.files.repo_id = ?2
+                AND main.files.kind != 'deleted'
+                AND main.files.worktree_id != ''
+                AND main.files.worktree_id != ?3
+                AND main.files.generation = COALESCE(
+                    (SELECT CAST(value AS INTEGER) FROM repo_meta
+                      WHERE repo_id = ?2 AND key = 'live_files_generation'),
+                    0
+                )",
+            params![edge_id, repo_id, active_worktree],
+            |row| read_edge_anchor(row, LegacyShadow::Skip),
+        )
+        .optional()?;
+    Ok(edge.is_some_and(|edge| edge.fingerprint == fingerprint))
+}
+
 pub(crate) fn edge_by_fingerprint(
     conn: &Connection,
     fingerprint: &str,
@@ -858,6 +906,575 @@ pub(crate) fn compute_edge_sequence_hash<'a>(
         buf.push_str(fingerprint);
     }
     hex_sha256(buf.as_bytes())
+}
+
+struct PersistedCalleeReference {
+    ordinal: i64,
+    fingerprint: String,
+    old_callee: i64,
+}
+
+struct EdgeReplacement {
+    fingerprint: String,
+    callee: Option<i64>,
+    identity_known: i64,
+}
+
+struct PersistedCallPathParent {
+    start_logical_symbol_id: Option<i64>,
+    end_logical_symbol_id: Option<i64>,
+    path_summary: String,
+    created_at_ms: i64,
+}
+
+struct PersistedCallPathBinding {
+    logical_symbol_id: Option<i64>,
+    created_at_ms: i64,
+}
+
+struct AffectedCallPath {
+    memory_id: String,
+    old_hash: String,
+    working_hash: String,
+    new_hash: String,
+    replacements: std::collections::BTreeMap<i64, EdgeReplacement>,
+    parent: Option<PersistedCallPathParent>,
+    binding: Option<PersistedCallPathBinding>,
+}
+
+/// Remap persisted call-path callee ids and every identity derived from them.
+///
+/// `evidence_conn` is normally `conn`. Consolidation passes the legacy source instead because the
+/// target intentionally has no derived graph yet. Callers own the transaction: logical-symbol
+/// adoption and drift healing already run inside the transaction that moves the other references,
+/// while consolidation supplies its import transaction.
+pub fn remap_call_path_callee_logical_symbol_ids(
+    conn: &Connection,
+    evidence_conn: &Connection,
+    remap: &[(i64, Option<i64>)],
+) -> rusqlite::Result<usize> {
+    if remap.is_empty()
+        || !column_exists(conn, "repo_memory_call_path_edges", "callee_logical_symbol_id")?
+    {
+        return Ok(0);
+    }
+
+    let remap: std::collections::HashMap<i64, Option<i64>> = remap.iter().copied().collect();
+    let mut stmt = conn.prepare(
+        "SELECT memory_id, edge_sequence_hash, ordinal, edge_fingerprint,
+                callee_logical_symbol_id
+           FROM repo_memory_call_path_edges
+          WHERE callee_logical_symbol_id IS NOT NULL
+          ORDER BY memory_id, edge_sequence_hash, ordinal",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut affected: std::collections::BTreeMap<(String, String), Vec<PersistedCalleeReference>> =
+        std::collections::BTreeMap::new();
+    for (memory_id, sequence_hash, ordinal, fingerprint, old_callee) in rows {
+        if remap.contains_key(&old_callee) {
+            affected
+                .entry((memory_id, sequence_hash))
+                .or_default()
+                .push(PersistedCalleeReference { ordinal, fingerprint, old_callee });
+        }
+    }
+
+    let mut remapped_edges = 0usize;
+    let mut planned = Vec::with_capacity(affected.len());
+    let mut reserved_working_keys = std::collections::HashSet::new();
+    for ((memory_id, old_hash), edges) in affected {
+        let all_fingerprints: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT ordinal, edge_fingerprint
+                   FROM repo_memory_call_path_edges
+                  WHERE memory_id = ?1 AND edge_sequence_hash = ?2
+                  ORDER BY ordinal",
+            )?;
+            stmt.query_map(params![memory_id, old_hash], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut replacements = std::collections::BTreeMap::new();
+        for edge in edges {
+            let PersistedCalleeReference { ordinal, fingerprint, old_callee } = edge;
+            let requested_callee = remap[&old_callee];
+            let replacement = remapped_edge_fingerprint(
+                evidence_conn,
+                &fingerprint,
+                old_callee,
+                requested_callee,
+            )?;
+            let replacement = match replacement {
+                Some(fingerprint) =>
+                    EdgeReplacement { fingerprint, callee: requested_callee, identity_known: 1 },
+                // Never retain a digest containing the old logical id. It could become valid for a
+                // different symbol after an occupied-id swap. The non-digest sentinel cannot match
+                // either current or legacy edge fingerprints, while the remapped callee remains
+                // available to the conservative loose-identity validator.
+                None => EdgeReplacement {
+                    fingerprint: invalidated_remap_fingerprint(&fingerprint, requested_callee),
+                    callee: requested_callee,
+                    identity_known: 1,
+                },
+            };
+            replacements.insert(ordinal, replacement);
+            remapped_edges += 1;
+        }
+        let new_hash =
+            compute_edge_sequence_hash(all_fingerprints.iter().map(|(ordinal, value)| {
+                replacements
+                    .get(ordinal)
+                    .map_or(value.as_str(), |replacement| replacement.fingerprint.as_str())
+            }));
+        let working_hash =
+            unused_working_hash(conn, &memory_id, &old_hash, &mut reserved_working_keys)?;
+        let parent = load_call_path_parent(conn, &memory_id, &old_hash)?;
+        let binding = load_call_path_binding(conn, &memory_id, &old_hash)?;
+        planned.push(AffectedCallPath {
+            memory_id,
+            old_hash,
+            working_hash,
+            new_hash,
+            replacements,
+            parent,
+            binding,
+        });
+    }
+
+    // Vacate EVERY affected key before any final key is occupied. This is the call-path analogue
+    // of logical-symbol temp ids: swaps and cycles cannot collide with an unstaged sibling.
+    for path in &planned {
+        move_call_path_key(conn, &path.memory_id, &path.old_hash, &path.working_hash)?;
+    }
+    for path in &planned {
+        for (ordinal, replacement) in &path.replacements {
+            conn.execute(
+                "UPDATE repo_memory_call_path_edges
+                    SET edge_fingerprint = ?1, callee_logical_symbol_id = ?2,
+                        callee_identity_known = ?3
+                  WHERE memory_id = ?4 AND edge_sequence_hash = ?5 AND ordinal = ?6",
+                params![
+                    replacement.fingerprint,
+                    replacement.callee,
+                    replacement.identity_known,
+                    path.memory_id,
+                    path.working_hash,
+                    ordinal
+                ],
+            )?;
+        }
+    }
+
+    let mut convergence_groups: std::collections::BTreeMap<
+        (String, String),
+        Vec<&AffectedCallPath>,
+    > = std::collections::BTreeMap::new();
+    for path in &planned {
+        convergence_groups
+            .entry((path.memory_id.clone(), path.new_hash.clone()))
+            .or_default()
+            .push(path);
+    }
+    for ((memory_id, new_hash), paths) in convergence_groups {
+        finalize_call_path_group(conn, &memory_id, &new_hash, &paths)?;
+    }
+    Ok(remapped_edges)
+}
+
+fn invalidated_remap_fingerprint(old_fingerprint: &str, callee: Option<i64>) -> String {
+    let callee = callee.map_or_else(|| "none".to_string(), |id| id.to_string());
+    format!("invalidated-call-path-remap:{callee}:{old_fingerprint}")
+}
+
+fn unused_working_hash(
+    conn: &Connection,
+    memory_id: &str,
+    old_hash: &str,
+    reserved: &mut std::collections::HashSet<(String, String)>,
+) -> rusqlite::Result<String> {
+    let mut suffix = 0usize;
+    loop {
+        let candidate = format!("call-path-logical-id-remap:{suffix}:{old_hash}");
+        let key = (memory_id.to_string(), candidate.clone());
+        if !reserved.contains(&key) && !call_path_key_exists(conn, memory_id, &candidate)? {
+            reserved.insert(key);
+            return Ok(candidate);
+        }
+        suffix += 1;
+    }
+}
+
+fn call_path_key_exists(conn: &Connection, memory_id: &str, hash: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM repo_memory_call_path_edges
+              WHERE memory_id = ?1 AND edge_sequence_hash = ?2
+             UNION ALL
+             SELECT 1 FROM repo_memory_call_paths
+              WHERE memory_id = ?1 AND edge_sequence_hash = ?2
+             UNION ALL
+             SELECT 1 FROM repo_memory_bindings
+              WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
+         )",
+        params![memory_id, hash],
+        |row| row.get::<_, i64>(0).map(|value| value != 0),
+    )
+}
+
+fn move_call_path_key(
+    conn: &Connection,
+    memory_id: &str,
+    from: &str,
+    to: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE repo_memory_call_path_edges SET edge_sequence_hash = ?1
+          WHERE memory_id = ?2 AND edge_sequence_hash = ?3",
+        params![to, memory_id, from],
+    )?;
+    conn.execute(
+        "UPDATE repo_memory_call_paths SET edge_sequence_hash = ?1
+          WHERE memory_id = ?2 AND edge_sequence_hash = ?3",
+        params![to, memory_id, from],
+    )?;
+    conn.execute(
+        "UPDATE repo_memory_bindings SET binding_id = ?1
+          WHERE memory_id = ?2 AND binding_kind = 'call_path' AND binding_id = ?3",
+        params![to, memory_id, from],
+    )?;
+    Ok(())
+}
+
+fn load_call_path_parent(
+    conn: &Connection,
+    memory_id: &str,
+    hash: &str,
+) -> rusqlite::Result<Option<PersistedCallPathParent>> {
+    conn.query_row(
+        "SELECT start_logical_symbol_id, end_logical_symbol_id, path_summary, created_at_ms
+           FROM repo_memory_call_paths WHERE memory_id = ?1 AND edge_sequence_hash = ?2",
+        params![memory_id, hash],
+        |row| {
+            Ok(PersistedCallPathParent {
+                start_logical_symbol_id: row.get(0)?,
+                end_logical_symbol_id: row.get(1)?,
+                path_summary: row.get(2)?,
+                created_at_ms: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn load_call_path_binding(
+    conn: &Connection,
+    memory_id: &str,
+    hash: &str,
+) -> rusqlite::Result<Option<PersistedCallPathBinding>> {
+    conn.query_row(
+        "SELECT logical_symbol_id, created_at_ms FROM repo_memory_bindings
+          WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2",
+        params![memory_id, hash],
+        |row| {
+            Ok(PersistedCallPathBinding {
+                logical_symbol_id: row.get(0)?,
+                created_at_ms: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn unanimous_non_null(values: impl IntoIterator<Item = Option<i64>>) -> Option<i64> {
+    let values: std::collections::BTreeSet<i64> = values.into_iter().flatten().collect();
+    (values.len() == 1).then(|| *values.first().expect("one value"))
+}
+
+/// Finalize one `(memory, new hash)` group. An already-present destination wins; otherwise the
+/// lexicographically first old hash wins. Duplicate parents/bindings converge without dropping the
+/// row class, and conflicting endpoint ids are cleared rather than assigned arbitrarily.
+fn finalize_call_path_group(
+    conn: &Connection,
+    memory_id: &str,
+    new_hash: &str,
+    paths: &[&AffectedCallPath],
+) -> rusqlite::Result<()> {
+    finalize_call_path_parent(conn, memory_id, new_hash, paths)?;
+    finalize_call_path_binding(conn, memory_id, new_hash, paths)?;
+    finalize_call_path_edges(conn, memory_id, new_hash, paths)
+}
+
+fn finalize_call_path_parent(
+    conn: &Connection,
+    memory_id: &str,
+    new_hash: &str,
+    paths: &[&AffectedCallPath],
+) -> rusqlite::Result<()> {
+    let existing = load_call_path_parent(conn, memory_id, new_hash)?;
+    let parents = paths.iter().filter_map(|path| path.parent.as_ref()).collect::<Vec<_>>();
+    if existing.is_none() && parents.is_empty() {
+        return Ok(());
+    }
+    let start = unanimous_non_null(
+        existing
+            .as_ref()
+            .map(|parent| parent.start_logical_symbol_id)
+            .into_iter()
+            .chain(parents.iter().map(|parent| parent.start_logical_symbol_id)),
+    );
+    let end = unanimous_non_null(
+        existing
+            .as_ref()
+            .map(|parent| parent.end_logical_symbol_id)
+            .into_iter()
+            .chain(parents.iter().map(|parent| parent.end_logical_symbol_id)),
+    );
+    let summary = existing
+        .as_ref()
+        .map(|parent| parent.path_summary.as_str())
+        .or_else(|| parents.first().map(|parent| parent.path_summary.as_str()))
+        .expect("a parent exists");
+    let created_at_ms = existing
+        .as_ref()
+        .map(|parent| parent.created_at_ms)
+        .into_iter()
+        .chain(parents.iter().map(|parent| parent.created_at_ms))
+        .min()
+        .expect("a parent exists");
+
+    if existing.is_some() {
+        for path in paths {
+            conn.execute(
+                "DELETE FROM repo_memory_call_paths WHERE memory_id = ?1 AND edge_sequence_hash = \
+                 ?2",
+                params![memory_id, path.working_hash],
+            )?;
+        }
+        conn.execute(
+            "UPDATE repo_memory_call_paths
+                SET start_logical_symbol_id = ?1, end_logical_symbol_id = ?2,
+                    path_summary = ?3, created_at_ms = ?4
+              WHERE memory_id = ?5 AND edge_sequence_hash = ?6",
+            params![start, end, summary, created_at_ms, memory_id, new_hash],
+        )?;
+        return Ok(());
+    }
+
+    let winner = paths.iter().find(|path| path.parent.is_some()).expect("a parent exists");
+    for path in paths {
+        if path.working_hash != winner.working_hash {
+            conn.execute(
+                "DELETE FROM repo_memory_call_paths WHERE memory_id = ?1 AND edge_sequence_hash = \
+                 ?2",
+                params![memory_id, path.working_hash],
+            )?;
+        }
+    }
+    conn.execute(
+        "UPDATE repo_memory_call_paths
+            SET edge_sequence_hash = ?1, start_logical_symbol_id = ?2,
+                end_logical_symbol_id = ?3, path_summary = ?4, created_at_ms = ?5
+          WHERE memory_id = ?6 AND edge_sequence_hash = ?7",
+        params![new_hash, start, end, summary, created_at_ms, memory_id, winner.working_hash],
+    )?;
+    Ok(())
+}
+
+fn finalize_call_path_binding(
+    conn: &Connection,
+    memory_id: &str,
+    new_hash: &str,
+    paths: &[&AffectedCallPath],
+) -> rusqlite::Result<()> {
+    let existing = load_call_path_binding(conn, memory_id, new_hash)?;
+    let bindings = paths.iter().filter_map(|path| path.binding.as_ref()).collect::<Vec<_>>();
+    if existing.is_none() && bindings.is_empty() {
+        return Ok(());
+    }
+    let logical_symbol_id = unanimous_non_null(
+        existing
+            .as_ref()
+            .map(|binding| binding.logical_symbol_id)
+            .into_iter()
+            .chain(bindings.iter().map(|binding| binding.logical_symbol_id)),
+    );
+    let created_at_ms = existing
+        .as_ref()
+        .map(|binding| binding.created_at_ms)
+        .into_iter()
+        .chain(bindings.iter().map(|binding| binding.created_at_ms))
+        .min()
+        .expect("a binding exists");
+
+    if existing.is_some() {
+        for path in paths {
+            conn.execute(
+                "DELETE FROM repo_memory_bindings
+                  WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2",
+                params![memory_id, path.working_hash],
+            )?;
+        }
+        conn.execute(
+            "UPDATE repo_memory_bindings SET logical_symbol_id = ?1, created_at_ms = ?2
+              WHERE memory_id = ?3 AND binding_kind = 'call_path' AND binding_id = ?4",
+            params![logical_symbol_id, created_at_ms, memory_id, new_hash],
+        )?;
+        return Ok(());
+    }
+
+    let winner = paths.iter().find(|path| path.binding.is_some()).expect("a binding exists");
+    for path in paths {
+        if path.working_hash != winner.working_hash {
+            conn.execute(
+                "DELETE FROM repo_memory_bindings
+                  WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2",
+                params![memory_id, path.working_hash],
+            )?;
+        }
+    }
+    conn.execute(
+        "UPDATE repo_memory_bindings
+            SET binding_id = ?1, logical_symbol_id = ?2, created_at_ms = ?3
+          WHERE memory_id = ?4 AND binding_kind = 'call_path' AND binding_id = ?5",
+        params![new_hash, logical_symbol_id, created_at_ms, memory_id, winner.working_hash],
+    )?;
+    Ok(())
+}
+
+fn finalize_call_path_edges(
+    conn: &Connection,
+    memory_id: &str,
+    new_hash: &str,
+    paths: &[&AffectedCallPath],
+) -> rusqlite::Result<()> {
+    let existing_fingerprints = load_call_path_fingerprints(conn, memory_id, new_hash)?;
+    let existing_is_valid = !existing_fingerprints.is_empty()
+        && compute_edge_sequence_hash(existing_fingerprints.iter().map(String::as_str)) == new_hash;
+    if existing_is_valid {
+        for path in paths {
+            conn.execute(
+                "DELETE FROM repo_memory_call_path_edges
+                  WHERE memory_id = ?1 AND edge_sequence_hash = ?2",
+                params![memory_id, path.working_hash],
+            )?;
+        }
+        return Ok(());
+    }
+
+    conn.execute(
+        "DELETE FROM repo_memory_call_path_edges WHERE memory_id = ?1 AND edge_sequence_hash = ?2",
+        params![memory_id, new_hash],
+    )?;
+    let winner = paths.first().expect("an affected edge path exists");
+    for path in paths.iter().skip(1) {
+        conn.execute(
+            "DELETE FROM repo_memory_call_path_edges
+              WHERE memory_id = ?1 AND edge_sequence_hash = ?2",
+            params![memory_id, path.working_hash],
+        )?;
+    }
+    conn.execute(
+        "UPDATE repo_memory_call_path_edges SET edge_sequence_hash = ?1
+          WHERE memory_id = ?2 AND edge_sequence_hash = ?3",
+        params![new_hash, memory_id, winner.working_hash],
+    )?;
+    Ok(())
+}
+
+fn load_call_path_fingerprints(
+    conn: &Connection,
+    memory_id: &str,
+    hash: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT edge_fingerprint FROM repo_memory_call_path_edges
+          WHERE memory_id = ?1 AND edge_sequence_hash = ?2 ORDER BY ordinal",
+    )?;
+    stmt.query_map(params![memory_id, hash], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for result in columns {
+        if result? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Rebuild one edge fingerprint with a replacement callee id. The stored fingerprint is matched
+/// against live edge fields with the OLD id substituted, so this works both before derived graph
+/// rows move (consolidation) and after they move (adoption/key drift).
+fn remapped_edge_fingerprint(
+    conn: &Connection,
+    stored_fingerprint: &str,
+    old_callee: i64,
+    new_callee: Option<i64>,
+) -> rusqlite::Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT main.files.path AS path,
+                COALESCE(NULLIF(edges.source_start_line, 0), 1) AS start_line,
+                COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), 1)
+                    AS end_line,
+                edges.from_name AS from_name, edges.to_name AS to_name,
+                edges.edge_kind AS edge_kind,
+                edges.target_qualified_name AS target_qualified_name,
+                edges.receiver_hint AS receiver_hint,
+                edges.receiver_type_hint AS receiver_type_hint
+           FROM edges
+           JOIN main.files ON main.files.id = edges.source_file_id
+           LEFT JOIN main.logical_symbol_members members ON members.symbol_id = edges.to_symbol_id
+          WHERE main.files.kind != 'deleted'
+            AND main.files.generation = COALESCE(
+                (SELECT CAST(value AS INTEGER) FROM repo_meta
+                  WHERE repo_id = main.files.repo_id AND key = 'live_files_generation'),
+                0
+            )
+            AND (members.logical_symbol_id = ?1
+              OR members.logical_symbol_id = ?2
+              OR (?2 IS NULL AND members.logical_symbol_id IS NULL))",
+    )?;
+    let mut rows = stmt.query(params![old_callee, new_callee])?;
+    while let Some(row) = rows.next()? {
+        let path: String = row.get("path")?;
+        let start_line = row.get("start_line")?;
+        let end_line = row.get("end_line")?;
+        let from_name: Option<String> = row.get("from_name")?;
+        let to_name: Option<String> = row.get("to_name")?;
+        let edge_kind: String = row.get("edge_kind")?;
+        let target: Option<String> = row.get("target_qualified_name")?;
+        let receiver_hint: Option<String> = row.get("receiver_hint")?;
+        let receiver_type_hint: Option<String> = row.get("receiver_type_hint")?;
+        let parts = |callee_logical_symbol_id| EdgeFingerprintParts {
+            path: &path,
+            start_line,
+            end_line,
+            from_name: from_name.as_deref(),
+            to_name: to_name.as_deref(),
+            edge_kind: &edge_kind,
+            target_qualified_name: target.as_deref(),
+            receiver_hint: receiver_hint.as_deref(),
+            receiver_type_hint: receiver_type_hint.as_deref().filter(|value| !value.is_empty()),
+            callee_logical_symbol_id,
+        };
+        if edge_fingerprint(parts(Some(old_callee))) == stored_fingerprint {
+            return Ok(Some(edge_fingerprint(parts(new_callee))));
+        }
+    }
+    Ok(None)
 }
 
 /// Read one edge's fingerprint + loose identity by row id. The fingerprint is computed exactly
@@ -1222,6 +1839,244 @@ pub(crate) fn short_symbol_name<'a>(binding_id: &'a str, path: Option<&str>) -> 
         return name;
     }
     binding_id.rsplit("::").next().unwrap_or(binding_id)
+}
+
+#[cfg(test)]
+mod call_path_remap_tests {
+    use super::*;
+
+    fn remap_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms,
+                    commit_sha, worktree_id, repo_id, generation)
+             VALUES ('src/lib.rs', 'rust', 'source', 'sha', 0, 0, '', '', 'r', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms,
+                    updated_at_ms, source, memory_version, repo_id)
+             VALUES ('m', 'Invariant', 't', 'b', 'high', 'active', 0, 0, 'agent', 'v1', 'r')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn seed_callee(conn: &Connection, logical_id: i64, name: &str) -> i64 {
+        let qualified_name = format!("src/lib.rs::{name}");
+        conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", [&qualified_name])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, kind,
+                    start_byte, end_byte, start_line, end_line)
+             VALUES (1, 'rust', ?1, (SELECT id FROM name_strings WHERE value = ?2), ?1,
+                     'function', 0, 1, 1, 1)",
+            params![name, qualified_name],
+        )
+        .unwrap();
+        let symbol_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name_id, \
+             kind,
+                    variant_count, group_reason, repo_id)
+             VALUES (?1, 'rust', 'src/lib.rs', ?2,
+                     (SELECT id FROM name_strings WHERE value = ?3), 'function', 1, 'exact', 'r')",
+            params![logical_id, name, qualified_name],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, start_line, \
+             end_line)
+             VALUES (?1, ?2, 1, 1)",
+            params![logical_id, symbol_id],
+        )
+        .unwrap();
+        symbol_id
+    }
+
+    fn seed_edge(conn: &Connection, target_symbol_id: i64) -> CallPathEdge {
+        conn.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint,
+                    receiver_type_hint, source_file_id, source_start_line, source_end_line,
+                    to_symbol_id)
+             VALUES ('caller', 'run', 'calls_name', 'exact', 'recv', 'Worker', 1, 10, 10, ?1)",
+            [target_symbol_id],
+        )
+        .unwrap();
+        let edge_id: i64 =
+            conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
+        call_path_edge_by_id(conn, edge_id).unwrap().unwrap()
+    }
+
+    fn seed_path(
+        conn: &Connection,
+        edge: &CallPathEdge,
+        summary: &str,
+        endpoint: Option<i64>,
+        created_at_ms: i64,
+    ) -> String {
+        let hash = compute_edge_sequence_hash([edge.fingerprint.as_str()]);
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id,
+                    logical_symbol_id, anchor_status, created_at_ms, repo_id)
+             VALUES ('m', 'call_path', ?1, ?2, 'current', ?3, 'r')",
+            params![hash, endpoint, created_at_ms],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_call_paths(memory_id, start_logical_symbol_id,
+                    edge_sequence_hash, path_summary, created_at_ms)
+             VALUES ('m', ?1, ?2, ?3, ?4)",
+            params![endpoint, hash, summary, created_at_ms],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal,
+                    edge_fingerprint, from_name, to_name, edge_kind, receiver_hint,
+                    callee_logical_symbol_id, callee_identity_known)
+             VALUES ('m', ?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+            params![
+                hash,
+                edge.fingerprint,
+                edge.from_name,
+                edge.to_name,
+                edge.edge_kind,
+                edge.receiver_hint,
+                edge.callee_logical_symbol_id
+            ],
+        )
+        .unwrap();
+        hash
+    }
+
+    #[test]
+    fn call_path_hash_swaps_stage_every_key_before_finalization() {
+        let conn = remap_db();
+        let alpha = seed_callee(&conn, 11, "Alpha");
+        let beta = seed_callee(&conn, 22, "Beta");
+        let alpha_edge = seed_edge(&conn, alpha);
+        let beta_edge = seed_edge(&conn, beta);
+        let alpha_hash = seed_path(&conn, &alpha_edge, "alpha path", Some(11), 2);
+        let beta_hash = seed_path(&conn, &beta_edge, "beta path", Some(22), 3);
+
+        remap_call_path_callee_logical_symbol_ids(&conn, &conn, &[(11, Some(22)), (22, Some(11))])
+            .unwrap();
+
+        let alpha_summary: String = conn
+            .query_row(
+                "SELECT path_summary FROM repo_memory_call_paths
+                  WHERE memory_id = 'm' AND edge_sequence_hash = ?1",
+                [&beta_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let beta_summary: String = conn
+            .query_row(
+                "SELECT path_summary FROM repo_memory_call_paths
+                  WHERE memory_id = 'm' AND edge_sequence_hash = ?1",
+                [&alpha_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alpha_summary, "alpha path");
+        assert_eq!(beta_summary, "beta path");
+        for table in
+            ["repo_memory_bindings", "repo_memory_call_paths", "repo_memory_call_path_edges"]
+        {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE memory_id = 'm'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 2, "both swapped rows survive in {table}");
+        }
+    }
+
+    #[test]
+    fn many_to_one_call_paths_converge_onto_an_existing_destination() {
+        let conn = remap_db();
+        let alpha = seed_callee(&conn, 11, "Alpha");
+        let beta = seed_callee(&conn, 22, "Beta");
+        let target = seed_callee(&conn, 33, "Target");
+        let alpha_edge = seed_edge(&conn, alpha);
+        let beta_edge = seed_edge(&conn, beta);
+        let target_edge = seed_edge(&conn, target);
+        seed_path(&conn, &alpha_edge, "alpha path", Some(11), 2);
+        seed_path(&conn, &beta_edge, "beta path", Some(22), 3);
+        let target_hash = seed_path(&conn, &target_edge, "existing target", Some(33), 4);
+
+        remap_call_path_callee_logical_symbol_ids(&conn, &conn, &[(11, Some(33)), (22, Some(33))])
+            .unwrap();
+
+        let parent: (i64, String, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), path_summary, start_logical_symbol_id
+                   FROM repo_memory_call_paths WHERE memory_id = 'm' AND edge_sequence_hash = ?1",
+                [&target_hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(parent, (1, "existing target".to_string(), None));
+        let binding: (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), logical_symbol_id FROM repo_memory_bindings
+                  WHERE memory_id = 'm' AND binding_kind = 'call_path' AND binding_id = ?1",
+                [&target_hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(binding, (1, None));
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM repo_memory_call_path_edges
+                  WHERE memory_id = 'm' AND edge_sequence_hash = ?1",
+                [&target_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_count, 1, "the existing valid edge sequence wins deterministically");
+    }
+
+    #[test]
+    fn missing_remap_evidence_cannot_revive_through_the_old_fingerprint() {
+        let conn = remap_db();
+        let alpha = seed_callee(&conn, 11, "Alpha");
+        let edge = seed_edge(&conn, alpha);
+        let old_fingerprint = edge.fingerprint.clone();
+        seed_path(&conn, &edge, "missing edge", Some(11), 0);
+        conn.execute("DELETE FROM edges_data", []).unwrap();
+
+        remap_call_path_callee_logical_symbol_ids(&conn, &conn, &[(11, None)]).unwrap();
+        let stored: (String, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT edge_fingerprint, callee_logical_symbol_id, callee_identity_known
+                   FROM repo_memory_call_path_edges WHERE memory_id = 'm'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(stored.0.starts_with("invalidated-call-path-remap:"));
+        assert_ne!(stored.0, old_fingerprint);
+        assert_eq!((stored.1, stored.2), (None, 1));
+
+        let replacement = seed_edge(&conn, alpha);
+        assert_eq!(replacement.fingerprint, old_fingerprint);
+        assert!(edge_by_fingerprint(&conn, &old_fingerprint).unwrap().is_some());
+        assert!(
+            edge_by_fingerprint(&conn, &stored.0).unwrap().is_none(),
+            "the invalidated persisted identity cannot match the replacement edge"
+        );
+    }
 }
 
 #[cfg(test)]
