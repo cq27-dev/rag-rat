@@ -271,8 +271,11 @@ pub(crate) fn infer_rust_receiver_type_hint(node: Node<'_>, text: &str) -> Optio
         // `worker.run()` is the parameter's method; reading the parameter here bound the call to
         // `Alpha::run`. Lowercase `self` is a path too — `self::helper()` names the CURRENT MODULE,
         // not the enclosing impl. `Self` is the one qualifier that does name a type.
-        "scoped_identifier" => (scoped_receiver_name(node, text)? == "Self")
-            .then(|| infer_self_type_hint(node, text))?,
+        "scoped_identifier" => {
+            let qualifier = function.child_by_field_name("path")?;
+            (node_text(qualifier, text).trim() == "Self")
+                .then(|| infer_self_type_hint(node, text))?
+        },
         _ => None,
     }
 }
@@ -326,10 +329,9 @@ fn infer_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
     None
 }
 
-/// Smart pointers that `Deref` to their contents, so a method call on one is found on the INNER
-/// type. `Box<Worker>`, `Rc<Worker>` and `Arc<Worker>` all send `w.run()` to `Worker::run`;
-/// `Cow<'a, T>` likewise, and `Pin<P>` derefs to `P::Target`, so `Pin<Box<Worker>>` reaches
-/// `Worker` through two peels. All checked against rustc.
+/// Smart pointers that `Deref` to their contents. They cannot produce one authoritative receiver
+/// hint: Rust considers methods on the wrapper before dereferencing to the inner type, and a local
+/// trait may implement a method directly for `Box<Worker>` (or any sibling here).
 ///
 /// The list is the deref-transparent wrappers common enough to matter, and it is OPEN, not closed:
 /// `ManuallyDrop<T>`, `MutexGuard<'_, T>` and `Ref<'_, T>` deref to their contents too, and a
@@ -371,11 +373,9 @@ fn wrapper_spelling(head: &str) -> WrapperSpelling {
     }
 }
 
-/// Strip deref-transparent wrappers off a type so the receiver names the type the method is on.
-///
-/// Without this, `fn f(w: Box<Worker>)` yields the hint `Box`, which is worse than no hint at all:
-/// `Box::run` matches nothing AND a present-but-failed local receiver type suppresses the bare-name
-/// fallback, so a call that used to resolve stops resolving.
+/// Return the deref target solely to detect a standard wrapper. The single-string receiver model
+/// cannot preserve Rust's ordered `Box<Worker> -> Worker` lookup, so callers decline inference when
+/// this changes the type rather than confidently naming the inner owner.
 fn peel_deref_wrapper<'a>(type_str: &'a str, context: Node<'_>, text: &str) -> &'a str {
     let mut current = type_str.trim();
     loop {
@@ -470,7 +470,9 @@ fn clean_rust_type_name(raw: &str, at: Node<'_>, text: &str) -> Option<String> {
     if cleaned.starts_with('<') || cleaned.contains(" as ") {
         return None;
     }
-    let cleaned = peel_deref_wrapper(cleaned, at, text);
+    if peel_deref_wrapper(cleaned, at, text) != cleaned {
+        return None;
+    }
     let without_generics = degeneric_path(cleaned);
     let type_str = without_generics.trim();
     if type_str.is_empty() {
@@ -1183,6 +1185,20 @@ mod receiver_type_hint_tests {
     }
 
     #[test]
+    fn projected_self_call_does_not_name_the_impl_owner() {
+        let code = r#"
+            trait Holder { type Assoc; }
+            struct Worker;
+            struct Factory;
+            impl Holder for Factory {
+                type Assoc = Worker;
+                fn run() { Self::Assoc::execute(); }
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None]);
+    }
+
+    #[test]
     fn test_simple_param() {
         let code = r#"
             fn process(worker: &mut Worker) {
@@ -1578,39 +1594,29 @@ mod receiver_type_hint_tests {
         assert_eq!(extract_call_hints(code), vec![None]);
     }
 
-    /// A smart pointer that derefs to its contents is not the receiver — the method is on what it
-    /// holds. Naming the wrapper is worse than declining: `Box::run` matches nothing, and a
-    /// present-but-failed local receiver type also suppresses the bare-name fallback, so the call
-    /// stops resolving at all.
+    /// A smart pointer has an ordered receiver chain that one hint cannot represent. A local trait
+    /// method on `Box<Worker>` wins before deref reaches `Worker::run`, so naming either owner as
+    /// authoritative can produce a false edge.
     #[test]
-    fn a_deref_wrapper_names_the_type_it_holds() {
+    fn a_deref_wrapper_declines_single_owner_inference() {
         for wrapper in ["Box<Worker>", "Rc<Worker>", "Arc<Worker>", "std::sync::Arc<Worker>"] {
             let code = format!("fn test(w: {wrapper}) {{ w.run(); }}");
             assert_eq!(
                 extract_call_hints(&code),
-                vec![Some("Worker".to_string())],
-                "{wrapper} dispatches to Worker"
+                vec![None],
+                "{wrapper} may dispatch before dereferencing to Worker"
             );
         }
-        // A lifetime leads `Cow`'s arguments; the type is the last one. Nesting peels to the type
-        // whose method is actually reached.
-        assert_eq!(extract_call_hints("fn test(w: Cow<'a, Worker>) { w.run(); }"), vec![Some(
-            "Worker".to_string()
-        )]);
-        assert_eq!(extract_call_hints("fn test(w: Arc<Box<Worker>>) { w.run(); }"), vec![Some(
-            "Worker".to_string()
-        )]);
-        // `Arc<Mutex<T>>` stops at `Mutex` — that is where `lock` lives; `Mutex` does not deref.
-        assert_eq!(extract_call_hints("fn test(w: Arc<Mutex<Worker>>) { w.lock(); }"), vec![Some(
-            "Mutex".to_string()
-        )]);
+        assert_eq!(extract_call_hints("fn test(w: Cow<'a, Worker>) { w.run(); }"), vec![None]);
+        assert_eq!(extract_call_hints("fn test(w: Arc<Box<Worker>>) { w.run(); }"), vec![None]);
+        assert_eq!(extract_call_hints("fn test(w: Arc<Mutex<Worker>>) { w.lock(); }"), vec![None]);
     }
 
     /// A wrapper name is only the standard pointer while nothing nearer declares it. A crate with
     /// its own `struct Box<T>` puts `run` on the WRAPPER, so peeling would name the wrong owner —
     /// and since a present-but-failing hint also closes the fallback, it would take the call's last
-    /// chance too. An IMPORT does not block the peel: `use std::sync::Arc;` is how the real one
-    /// usually arrives, and declining there would lose the common case to protect the rare one.
+    /// chance too. An import of a standard wrapper still declines because local traits can add
+    /// wrapper-level methods to it.
     #[test]
     fn a_locally_declared_wrapper_name_is_not_the_standard_pointer() {
         let shadowed = r#"
@@ -1619,12 +1625,11 @@ mod receiver_type_hint_tests {
             fn test(w: Box<Worker>) { w.run(); }
         "#;
         assert_eq!(extract_call_hints(shadowed), vec![Some("Box".to_string())]);
-        // The import spelling still peels, because that is how the real pointer is named.
         let imported = r#"
             use std::sync::Arc;
             fn test(w: Arc<Worker>) { w.run(); }
         "#;
-        assert_eq!(extract_call_hints(imported), vec![Some("Worker".to_string())]);
+        assert_eq!(extract_call_hints(imported), vec![None]);
     }
 
     /// A QUALIFIED head is judged by its whole path, not its tail. `custom::Box<Worker>` ends in a
@@ -1636,14 +1641,14 @@ mod receiver_type_hint_tests {
             fn test(w: custom::Box<Worker>) { w.run(); }
         "#;
         assert_eq!(extract_call_hints(foreign), vec![Some("custom::Box".to_string())]);
-        // The standard crates are the roots that do name the real pointer, and a local `struct Box`
-        // cannot shadow a path that names its own root.
+        // The standard crates are the roots that name the real pointer, but that pointer may carry
+        // a local trait method before deref reaches the inner type.
         for rooted in ["std::boxed::Box", "alloc::sync::Arc", "core::pin::Pin"] {
             let code = format!("struct Box<T>(T);\nfn test(w: {rooted}<Worker>) {{ w.run(); }}");
             assert_eq!(
                 extract_call_hints(&code),
-                vec![Some("Worker".to_string())],
-                "{rooted} names the standard wrapper"
+                vec![None],
+                "{rooted} has more than one possible receiver layer"
             );
         }
     }

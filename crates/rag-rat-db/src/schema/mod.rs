@@ -758,9 +758,11 @@ const MIGRATION_099_DESCRIPTION: &str =
      /4 table-sync state is cleared because it has no account-authorized incarnation identity";
 
 const MIGRATION_100_ID: &str = "100_receiver_type_hint_interning";
-const MIGRATION_100_CHECKSUM: &str = "sha256:rag-rat-receiver-type-hint-interning-v100";
-const MIGRATION_100_DESCRIPTION: &str =
-    "Add edges_data.receiver_type_hint_id for conservative Rust receiver-type resolution";
+const MIGRATION_100_CHECKSUM: &str =
+    "sha256:rag-rat-receiver-type-hint-and-callee-aware-edge-identity-v100";
+const MIGRATION_100_DESCRIPTION: &str = "Add edges_data.receiver_type_hint_id for conservative \
+                                         Rust receiver-type resolution and persist stable callee \
+                                         identity for call-path validation";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

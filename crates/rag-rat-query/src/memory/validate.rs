@@ -354,8 +354,15 @@ pub(crate) fn validate_edge_binding(
         return validate_bound_edge_source_hash(conn, binding, &edge.source_hash);
     }
     let Some(edge) = edge_by_fingerprint(conn, &binding.binding_id)? else {
+        // A row id may survive an in-place re-resolution or be reused after rebuild. Once the
+        // stable fingerprint no longer exists, retaining that id would surface this memory on the
+        // replacement edge through edge-id lookups.
+        binding.edge_id = None;
         return Ok("gone".to_string());
     };
+    // Compatibility matches return the live current fingerprint. Converge the binding identity so
+    // the next validation takes the current fast path instead of reporting `relocated` forever.
+    binding.binding_id = edge.fingerprint.clone();
     binding.edge_id = Some(edge.edge_id);
     binding.path = Some(edge.path);
     binding.start_line = Some(edge.start_line);
@@ -373,7 +380,8 @@ pub(crate) fn validate_call_path_binding(
     // that edge is gone.
     let mut stmt = conn.prepare(
         "
-        SELECT ordinal, edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name
+        SELECT ordinal, edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name,
+               callee_logical_symbol_id, callee_identity_known
         FROM repo_memory_call_path_edges
         WHERE memory_id = ?1 AND edge_sequence_hash = ?2
         ORDER BY ordinal
@@ -388,6 +396,8 @@ pub(crate) fn validate_call_path_binding(
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, i64>(7)? != 0,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -412,7 +422,17 @@ pub(crate) fn validate_call_path_binding(
     // on: an edge that matched only its loose identity has no live fingerprint to converge to.
     let mut live_fingerprints = Vec::with_capacity(total);
     let mut matched_legacy = false;
-    for (ordinal, fingerprint, from_name, to_name, edge_kind, target) in &edges {
+    for (
+        ordinal,
+        fingerprint,
+        from_name,
+        to_name,
+        edge_kind,
+        target,
+        callee_logical_symbol_id,
+        callee_identity_known,
+    ) in &edges
+    {
         if let Some(edge) = edge_by_fingerprint(conn, fingerprint)? {
             if edge.matched_legacy_fingerprint {
                 // The v1 identity has no receiver type. It proves the call site survived, but not
@@ -422,16 +442,17 @@ pub(crate) fn validate_call_path_binding(
                 relocated += 1;
                 matched_legacy = true;
             }
-            live_fingerprints.push((*ordinal, edge.fingerprint));
+            live_fingerprints.push((*ordinal, edge.fingerprint, edge.callee_logical_symbol_id));
             continue;
         }
-        if call_path_edge_relocatable(
-            conn,
-            from_name.as_deref(),
-            to_name.as_deref(),
-            edge_kind,
-            target.as_deref(),
-        )? {
+        let loose_identity = EdgeLooseIdentity {
+            from_name: from_name.clone(),
+            to_name: to_name.clone().unwrap_or_default(),
+            edge_kind: edge_kind.clone(),
+            target_qualified_name: target.clone(),
+            callee_logical_symbol_id: *callee_logical_symbol_id,
+        };
+        if call_path_edge_relocatable(conn, &loose_identity, *callee_identity_known)? {
             relocated += 1;
         } else {
             gone += 1;
@@ -469,10 +490,10 @@ pub(crate) fn validate_call_path_binding(
 fn converge_call_path_identity(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
-    live_fingerprints: &[(i64, String)],
+    live_fingerprints: &[(i64, String, Option<i64>)],
 ) -> anyhow::Result<()> {
     let converged =
-        compute_edge_sequence_hash(live_fingerprints.iter().map(|(_, value)| value.as_str()));
+        compute_edge_sequence_hash(live_fingerprints.iter().map(|(_, value, _)| value.as_str()));
     if converged == binding.binding_id {
         return Ok(());
     }
@@ -489,12 +510,20 @@ fn converge_call_path_identity(
     if taken > 0 {
         return Ok(());
     }
-    for (ordinal, fingerprint) in live_fingerprints {
+    for (ordinal, fingerprint, callee_logical_symbol_id) in live_fingerprints {
         conn.execute(
             "UPDATE repo_memory_call_path_edges
-             SET edge_fingerprint = ?1, edge_sequence_hash = ?2
-             WHERE memory_id = ?3 AND edge_sequence_hash = ?4 AND ordinal = ?5",
-            params![fingerprint, converged, binding.memory_id, binding.binding_id, ordinal],
+             SET edge_fingerprint = ?1, edge_sequence_hash = ?2,
+                 callee_logical_symbol_id = ?3, callee_identity_known = 1
+             WHERE memory_id = ?4 AND edge_sequence_hash = ?5 AND ordinal = ?6",
+            params![
+                fingerprint,
+                converged,
+                callee_logical_symbol_id,
+                binding.memory_id,
+                binding.binding_id,
+                ordinal
+            ],
         )?;
     }
     conn.execute(
@@ -517,11 +546,12 @@ fn converge_call_path_identity(
 /// `call_path_edge_by_id`.
 pub(crate) fn call_path_edge_relocatable(
     conn: &Connection,
-    from_name: Option<&str>,
-    to_name: Option<&str>,
-    edge_kind: &str,
-    target_qualified_name: Option<&str>,
+    identity: &EdgeLooseIdentity,
+    callee_identity_known: bool,
 ) -> anyhow::Result<bool> {
+    if !callee_identity_known {
+        return Ok(false);
+    }
     let count: i64 = conn.query_row(
         "
         SELECT COUNT(*)
@@ -531,8 +561,18 @@ pub(crate) fn call_path_edge_relocatable(
           AND COALESCE(from_name, '') = COALESCE(?1, '')
           AND COALESCE(to_name, '') = COALESCE(?2, '')
           AND COALESCE(target_qualified_name, '') = COALESCE(?4, '')
+          AND ((?5 IS NULL AND to_symbol_id IS NULL) OR EXISTS(
+              SELECT 1 FROM logical_symbol_members members
+              WHERE members.symbol_id = edges.to_symbol_id AND members.logical_symbol_id = ?5
+          ))
         ",
-        params![from_name, to_name, edge_kind, target_qualified_name],
+        params![
+            identity.from_name,
+            identity.to_name,
+            identity.edge_kind,
+            identity.target_qualified_name,
+            identity.callee_logical_symbol_id
+        ],
         |row| row.get(0),
     )?;
     Ok(count > 0)
@@ -1150,6 +1190,33 @@ mod call_path_receiver_type_hint_tests {
         .unwrap();
     }
 
+    fn seed_target(c: &Connection, file_id: i64, name: &str, logical_id: i64) -> i64 {
+        let qualified = format!("src/lib.rs::{name}");
+        c.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", [&qualified]).unwrap();
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, kind, \
+             start_byte, end_byte, start_line, end_line) VALUES (?1, 'rust', ?2, (SELECT id FROM \
+             name_strings WHERE value = ?3), ?2, 'function', 0, 1, 1, 1)",
+            rusqlite::params![file_id, name, qualified],
+        )
+        .unwrap();
+        let symbol_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name_id, \
+             kind, variant_count, group_reason) VALUES (?1, 'rust', 'src/lib.rs', ?2, (SELECT id \
+             FROM name_strings WHERE value = ?3), 'function', 1, 'exact')",
+            rusqlite::params![logical_id, name, qualified],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, start_line, \
+             end_line) VALUES (?1, ?2, 1, 1)",
+            rusqlite::params![logical_id, symbol_id],
+        )
+        .unwrap();
+        symbol_id
+    }
+
     fn call_path_binding(memory_id: &str, edge_sequence_hash: &str) -> RepoMemoryBinding {
         RepoMemoryBinding {
             memory_id: memory_id.to_string(),
@@ -1207,6 +1274,7 @@ mod call_path_receiver_type_hint_tests {
                 target_qualified_name: None,
                 receiver_hint: Some("recv"),
                 receiver_type_hint: None,
+                callee_logical_symbol_id: None,
             });
 
         seed_memory(&c, "m1", "r");
@@ -1250,6 +1318,7 @@ mod call_path_receiver_type_hint_tests {
                 target_qualified_name: None,
                 receiver_hint: Some("recv"),
                 receiver_type_hint: None,
+                callee_logical_symbol_id: None,
             });
 
         seed_memory(&c, "m1", "r");
@@ -1262,6 +1331,12 @@ mod call_path_receiver_type_hint_tests {
 
         assert_eq!(validate_edge_binding(&c, &mut binding).unwrap(), "relocated");
         assert!(binding.edge_id.is_some(), "the relocated binding adopts the live edge row");
+        assert_ne!(binding.binding_id, legacy, "the binding converges to the current fingerprint");
+        assert_eq!(
+            validate_edge_binding(&c, &mut binding).unwrap(),
+            "current",
+            "a compatibility relocation converges instead of repeating forever"
+        );
 
         let mut missing = RepoMemoryBinding {
             binding_kind: "edge".to_string(),
@@ -1293,7 +1368,7 @@ mod call_path_receiver_type_hint_tests {
         // hash OF those fingerprints, so a half-migrated row would no longer re-derive its own id,
         // and `call_path_memories_for_crossed` — which looks memories up by the hash it computes
         // from LIVE fingerprints — would never surface this memory again.
-        assert_ne!(call_path.binding_id, "legacy-path", "the binding id re-points to the v2 hash");
+        assert_ne!(call_path.binding_id, "legacy-path", "the binding id re-points to the v3 hash");
         let (upgraded, key): (String, String) = c
             .query_row(
                 "SELECT edge_fingerprint, edge_sequence_hash FROM repo_memory_call_path_edges
@@ -1302,7 +1377,7 @@ mod call_path_receiver_type_hint_tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_ne!(upgraded, legacy, "validation converges the stored identity to v2");
+        assert_ne!(upgraded, legacy, "validation converges the stored identity to v3");
         assert_eq!(key, call_path.binding_id, "the edge rows follow the binding to its new key");
         assert_eq!(
             compute_edge_sequence_hash([upgraded.as_str()]),
@@ -1321,7 +1396,63 @@ mod call_path_receiver_type_hint_tests {
         assert_eq!(
             validate_call_path_binding(&c, &mut call_path).unwrap(),
             "current",
-            "the converged v2 identity is no longer permanently hint-blind"
+            "the converged v3 identity is no longer permanently hint-blind"
+        );
+    }
+
+    #[test]
+    fn callee_retarget_invalidates_edge_and_call_path_bindings() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        let alpha = seed_target(&c, file_id, "Alpha", 11);
+        let beta = seed_target(&c, file_id, "Beta", 22);
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint, \
+             receiver_type_hint, source_file_id, source_start_line, source_end_line, \
+             to_symbol_id) VALUES \
+             ('caller','run','calls_name','exact','recv','Worker',?1,10,10,?2)",
+            rusqlite::params![file_id, alpha],
+        )
+        .unwrap();
+        let edge_id: i64 =
+            c.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
+        let original = edge_by_id(&c, edge_id).unwrap().unwrap();
+
+        seed_memory(&c, "m1", "r");
+        let mut edge_binding = RepoMemoryBinding {
+            memory_id: "m1".to_string(),
+            binding_kind: "edge".to_string(),
+            binding_id: original.fingerprint.clone(),
+            edge_id: Some(edge_id),
+            ..call_path_binding("m1", "unused")
+        };
+        let path_hash = compute_edge_sequence_hash([original.fingerprint.as_str()]);
+        c.execute(
+            "INSERT INTO repo_memory_call_paths(memory_id, edge_sequence_hash, path_summary, \
+             created_at_ms) VALUES ('m1', ?1, 'caller -> run', 0)",
+            [path_hash.as_str()],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, receiver_hint, \
+             callee_logical_symbol_id, callee_identity_known) VALUES ('m1', ?1, 0, ?2, 'caller', \
+             'run', 'calls_name', 'recv', 11, 1)",
+            rusqlite::params![path_hash, original.fingerprint],
+        )
+        .unwrap();
+
+        c.execute("UPDATE edges_data SET to_symbol_id = ?1 WHERE id = ?2", [beta, edge_id])
+            .unwrap();
+
+        assert_eq!(validate_edge_binding(&c, &mut edge_binding).unwrap(), "gone");
+        assert_eq!(edge_binding.edge_id, None, "a retargeted row id must not remain attached");
+        let mut call_path = call_path_binding("m1", &path_hash);
+        assert_eq!(
+            validate_call_path_binding(&c, &mut call_path).unwrap(),
+            "gone",
+            "loose relocation must reject a different stable callee"
         );
     }
 
@@ -1352,6 +1483,7 @@ mod call_path_receiver_type_hint_tests {
                 target_qualified_name: None,
                 receiver_hint: Some("recv"),
                 receiver_type_hint: None,
+                callee_logical_symbol_id: None,
             });
 
         seed_memory(&c, "m1", "r");

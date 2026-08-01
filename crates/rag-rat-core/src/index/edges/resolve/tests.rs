@@ -60,6 +60,23 @@ fn add_edge(
     conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
 }
 
+fn add_receiver_type_edge(
+    conn: &Connection,
+    source_file_id: i64,
+    to_name: &str,
+    target_qualified_name: &str,
+    receiver_type_hint: &str,
+) -> i64 {
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, target_qualified_name, edge_kind, confidence, \
+         resolution, receiver_hint, receiver_type_hint) VALUES (?1, ?2, ?3, 'calls_name', \
+         'NameOnly', 'unresolved', 'w', ?4)",
+        params![source_file_id, to_name, target_qualified_name, receiver_type_hint],
+    )
+    .unwrap();
+    conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
+}
+
 fn edge_state(conn: &Connection, edge_id: i64) -> (Option<i64>, String, String) {
     conn.query_row(
         "SELECT to_symbol_id, confidence, resolution FROM edges WHERE id = ?1",
@@ -734,6 +751,79 @@ fn external_receiver_type_hint_never_binds_locally() {
 }
 
 #[test]
+fn external_receiver_alias_keeps_its_import_origin() {
+    let conn = seeded_conn();
+    set_local_crate_roots(&conn, "mycrate");
+    let caller = add_file(&conn, "a.rs", NEW);
+    let defs = add_file(&conn, "b.rs", NEW);
+    add_symbol_scope_language(
+        &conn,
+        defs,
+        "Worker",
+        "b.rs::Worker",
+        "Worker",
+        "struct",
+        Language::Rust,
+    );
+    add_symbol_scope(&conn, defs, "run", "b.rs::run", "Worker::run");
+    add_import_edge(&conn, caller, "Alias", "use dep::Worker as Alias;");
+    let call = add_receiver_type_edge(&conn, caller, "run", "w::run", "Alias");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, call);
+    assert_eq!(to, None, "the alias's external origin must survive rewriting to Worker");
+    assert_eq!(resolution, "unresolved");
+}
+
+#[test]
+fn unproven_qualified_receiver_cannot_tail_bind_a_local_type() {
+    let conn = seeded_conn();
+    let caller = add_file(&conn, "a.rs", NEW);
+    let defs = add_file(&conn, "b.rs", NEW);
+    add_symbol_scope_language(
+        &conn,
+        defs,
+        "Client",
+        "b.rs::Client",
+        "Client",
+        "struct",
+        Language::Rust,
+    );
+    add_symbol_scope(&conn, defs, "execute", "b.rs::execute", "Client::execute");
+    add_symbol_scope_language(
+        &conn,
+        defs,
+        "Client",
+        "b.rs::local_client",
+        "local_mod::Client",
+        "struct",
+        Language::Rust,
+    );
+    let local_execute = add_symbol_scope(
+        &conn,
+        defs,
+        "execute",
+        "b.rs::local_execute",
+        "local_mod::Client::execute",
+    );
+    let external =
+        add_receiver_type_edge(&conn, caller, "execute", "c::execute", "reqwest::Client");
+    let local = add_receiver_type_edge(&conn, caller, "execute", "c::execute", "local_mod::Client");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    assert_eq!(edge_state(&conn, external).0, None, "an unknown qualified root fails closed");
+    assert_eq!(
+        edge_state(&conn, local).0,
+        Some(local_execute),
+        "a qualified owner proven by a local type definition still resolves"
+    );
+}
+
+#[test]
 fn bare_root_receiver_does_not_suffix_match_nested_owner() {
     let mut run = preferred_candidate(1, Language::Rust, "function");
     run.name = "run".to_string();
@@ -919,6 +1009,76 @@ fn typed_self_receiver_keeps_trait_default_qualified_resolution() {
     .expect("a unique trait default method remains available through self");
     assert_eq!(bare.0.id, symbols[0].id);
     assert_eq!(bare.2, "target_name_fallback");
+}
+
+#[test]
+fn typed_local_receiver_reaches_only_compatible_trait_default() {
+    let mut trait_run = preferred_candidate(1, Language::Rust, "function");
+    trait_run.name = "run".to_string();
+    trait_run.qualified_name = "src/lib.rs::trait_run".to_string();
+    trait_run.scope_path = "Runs::run".to_string();
+    let mut runs = preferred_candidate(1, Language::Rust, "trait");
+    runs.name = "Runs".to_string();
+    runs.qualified_name = "src/lib.rs::Runs".to_string();
+    runs.scope_path = "Runs".to_string();
+    let mut other_run = preferred_candidate(1, Language::Rust, "function");
+    other_run.name = "run".to_string();
+    other_run.qualified_name = "src/lib.rs::other_run".to_string();
+    other_run.scope_path = "Other::run".to_string();
+    let mut other = preferred_candidate(1, Language::Rust, "struct");
+    other.name = "Other".to_string();
+    other.qualified_name = "src/lib.rs::Other".to_string();
+    other.scope_path = "Other".to_string();
+    let symbols = [trait_run, runs, other_run, other];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: Some("w::run"),
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("w.run()"),
+            receiver_hint: Some("w"),
+            receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &index,
+    )
+    .expect("the concrete receiver may use a trait's default method");
+    assert_eq!(resolved.0.scope_path, "Runs::run");
+    assert_eq!(resolved.2, "target_name_fallback");
+}
+
+#[test]
+fn projected_self_path_never_falls_back_to_the_impl_owner() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "src/lib.rs::run".to_string();
+    run.scope_path = "Factory::run".to_string();
+    let symbols = [run];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: Some("Self::Assoc::run"),
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("Self::Assoc::run()"),
+            receiver_hint: Some("Self"),
+            receiver_type: None,
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &index,
+    );
+    assert!(resolved.is_none(), "an unresolved associated type must not become Factory::run");
 }
 
 #[test]

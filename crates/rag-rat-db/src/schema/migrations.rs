@@ -372,9 +372,10 @@ pub(crate) fn apply_repo_memory_call_paths(conn: &Connection) -> rusqlite::Resul
 
 pub(crate) fn apply_repo_memory_call_path_edges(conn: &Connection) -> rusqlite::Result<()> {
     // The ordered edges behind a server-derived call-path hash (#38). `edge_fingerprint` is the
-    // exact, row-id-independent identity (path+lines+names+kind+target); the looser
-    // from/to/kind/target columns let validation re-find an edge that moved lines (relocated)
-    // rather than reporting the whole path gone. One row per edge, ordered by `ordinal`.
+    // exact, row-id-independent identity (path+lines+names+kind+target+resolved callee); the looser
+    // columns let validation re-find an edge that moved lines only when its stable callee identity
+    // still agrees. `callee_identity_known` distinguishes a new unresolved edge (known NULL) from
+    // a pre-V099 row that never recorded callee identity. One row per edge, ordered by `ordinal`.
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS repo_memory_call_path_edges(
@@ -387,6 +388,8 @@ pub(crate) fn apply_repo_memory_call_path_edges(conn: &Connection) -> rusqlite::
             edge_kind TEXT NOT NULL,
             target_qualified_name TEXT,
             receiver_hint TEXT,
+            callee_logical_symbol_id INTEGER,
+            callee_identity_known INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(memory_id, edge_sequence_hash, ordinal),
             FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
         );
@@ -7402,7 +7405,7 @@ mod windows_verbatim_rekey_tests {
     }
 }
 
-/// V098 (#976): intern the Rust receiver-type hint on `edges_data`.
+/// V100 (#976): intern the Rust receiver-type hint and make call-path identity target-aware.
 ///
 /// Conservative receiver-type inference records the type a method call was made ON, so resolution
 /// can bind `worker.run()` to `Worker::run` instead of every `run` in the repo. The value is an
@@ -7411,6 +7414,18 @@ mod windows_verbatim_rekey_tests {
 /// new column without a second migration.
 pub fn apply_receiver_type_hint_interning(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "edges_data", "receiver_type_hint_id", "INTEGER")?;
+    add_column_if_missing(
+        conn,
+        "repo_memory_call_path_edges",
+        "callee_logical_symbol_id",
+        "INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "repo_memory_call_path_edges",
+        "callee_identity_known",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_edges_view(conn)?;
     Ok(())
 }

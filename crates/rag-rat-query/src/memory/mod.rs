@@ -518,6 +518,17 @@ pub(crate) struct CallPathEdge {
     pub(crate) edge_kind: String,
     pub(crate) target_qualified_name: Option<String>,
     pub(crate) receiver_hint: Option<String>,
+    pub(crate) callee_logical_symbol_id: Option<i64>,
+}
+
+/// Row-independent fields that may re-find an edge after its source lines move. Callee identity is
+/// part of this loose match so relocation never changes which symbol the edge reaches.
+pub(crate) struct EdgeLooseIdentity {
+    pub(crate) from_name: Option<String>,
+    pub(crate) to_name: String,
+    pub(crate) edge_kind: String,
+    pub(crate) target_qualified_name: Option<String>,
+    pub(crate) callee_logical_symbol_id: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -545,6 +556,7 @@ pub(crate) struct EdgeAnchor {
     start_line: i64,
     end_line: i64,
     source_hash: String,
+    callee_logical_symbol_id: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -558,14 +570,13 @@ pub(crate) struct EdgeFingerprintParts<'a> {
     target_qualified_name: Option<&'a str>,
     receiver_hint: Option<&'a str>,
     /// Rust-only conservative receiver type inference (`recv.run()` → `Alpha`/`Beta`, #567):
-    /// deliberately excluded from every LOOSE identity (`LiveEdgeMatch`, `CallPathEdge`,
-    /// `live_edges_matching_identities`'s identity tuple) so a receiver-type-driven re-resolution
-    /// still relocates rather than going `gone`, mirroring `receiver_hint`. It DOES participate in
-    /// the stable fingerprint so re-resolution to a different method target (Alpha::run →
-    /// Beta::run) is detected as a change instead of silently validating `current` against a stale
-    /// target. NULL/empty is folded away in `edge_fingerprint` so every pre-existing fingerprint
-    /// (computed before this field existed) is preserved byte-for-byte.
+    /// deliberately excluded from the loose call-site identity. The resolved callee below is the
+    /// authority for whether that loose match may relocate: changing Alpha::run to Beta::run must
+    /// demote the binding even when this hint remains `Worker`.
     receiver_type_hint: Option<&'a str>,
+    /// Stable content-derived identity of the resolved callee. `None` is also identity: an
+    /// unresolved edge must fingerprint differently from the same call once it resolves.
+    callee_logical_symbol_id: Option<i64>,
 }
 
 #[cfg(test)]

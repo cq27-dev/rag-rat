@@ -27,19 +27,62 @@ fn import_scope_from_row(
 /// scope alone cannot see it — the language policy's known-external roots participate too.
 fn receiver_root_origin(
     import_scope: &ImportScope,
+    index: &SymbolIndex<'_>,
     file_id: i64,
     language: Option<&str>,
     ref_byte: usize,
     root: &str,
+    resolved_hint: &str,
 ) -> RootOrigin {
     if import_scope.covering_roots_disagree(file_id, root, ref_byte) {
         return RootOrigin::Ambiguous;
     }
-    let external = import_scope.is_external_import(file_id, root, ref_byte)
-        || crate::index::languages::resolver_policy_for_name(language).is_some_and(|policy| {
-            (policy.qualified_root)(root) == crate::index::languages::QualifiedRoot::External
-        });
-    if external { RootOrigin::External } else { RootOrigin::Local }
+    if import_scope.is_external_import(file_id, root, ref_byte) {
+        return RootOrigin::External;
+    }
+    let qualified_root = crate::index::languages::resolver_policy_for_name(language)
+        .map(|policy| (policy.qualified_root)(root));
+    if qualified_root == Some(crate::index::languages::QualifiedRoot::External) {
+        return RootOrigin::External;
+    }
+    if import_scope.is_import_bound(file_id, root, ref_byte)
+        || qualified_root == Some(crate::index::languages::QualifiedRoot::Local)
+        || !resolved_hint.contains("::")
+        || index.defines_type_scope(resolved_hint)
+    {
+        RootOrigin::Local
+    } else {
+        RootOrigin::Unknown
+    }
+}
+
+/// Classify the receiver under the spelling's ORIGINAL import provenance while resolving through
+/// the alias-rewritten owner path. `use dep::Worker as Alias` stores methods under `Worker`, but
+/// `Alias` is the root whose import says whether that owner is local or external.
+fn receiver_type_identity<'a>(
+    import_scope: &ImportScope,
+    index: &SymbolIndex<'_>,
+    file_id: i64,
+    language: Option<&str>,
+    ref_byte: usize,
+    original_hint: Option<&str>,
+    resolved_hint: Option<&'a str>,
+) -> Option<ReceiverTypeIdentity<'a>> {
+    let original_root = original_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .map(|hint| hint.split_once("::").map_or(hint, |(root, _)| root));
+    ReceiverTypeIdentity::classify(resolved_hint, |resolved_root| {
+        receiver_root_origin(
+            import_scope,
+            index,
+            file_id,
+            language,
+            ref_byte,
+            original_root.unwrap_or(resolved_root),
+            resolved_hint.unwrap_or_default(),
+        )
+    })
 }
 
 /// The package a receiver hint is confined to, or `None` when it may name a type from anywhere.
@@ -507,15 +550,15 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                 edge_kind,
                 evidence: evidence.as_deref(),
                 receiver_hint: resolve_receiver,
-                receiver_type: ReceiverTypeIdentity::classify(resolve_receiver_type, |root| {
-                    receiver_root_origin(
-                        &import_scope,
-                        source_file_id,
-                        Some(source_language.as_str()),
-                        ref_byte,
-                        root,
-                    )
-                }),
+                receiver_type: receiver_type_identity(
+                    &import_scope,
+                    &index,
+                    source_file_id,
+                    Some(source_language.as_str()),
+                    ref_byte,
+                    receiver_type_hint.as_deref(),
+                    resolve_receiver_type,
+                ),
                 source_file_id,
                 source_language: Some(source_language.as_str()),
                 imported_external: import_scope.is_external_import(
@@ -761,15 +804,15 @@ pub(crate) fn resolve_and_insert_edges(
                     edge_kind: candidate.edge_kind,
                     evidence,
                     receiver_hint: resolve_receiver,
-                    receiver_type: ReceiverTypeIdentity::classify(resolve_receiver_type, |root| {
-                        receiver_root_origin(
-                            &import_scope,
-                            *file_id,
-                            file_language.get(file_id).map(String::as_str),
-                            ref_byte,
-                            root,
-                        )
-                    }),
+                    receiver_type: receiver_type_identity(
+                        &import_scope,
+                        &index,
+                        *file_id,
+                        file_language.get(file_id).map(String::as_str),
+                        ref_byte,
+                        receiver_type_hint,
+                        resolve_receiver_type,
+                    ),
                     source_file_id: *file_id,
                     source_language: file_language.get(file_id).map(String::as_str),
                     imported_external: import_scope.is_external_import(
@@ -1173,14 +1216,28 @@ pub(crate) fn resolve_symbol<'a>(
             [_, ..] => return None,
             [] => {},
         }
-        if !allow_unqualified_fallback(
-            request.edge_kind,
-            qualified,
-            request.name,
-            request.evidence,
-            request.receiver_hint,
-            request.source_language,
-        ) {
+        let projected_self = request.source_language == Some(Language::Rust.as_str())
+            && request.receiver_hint == Some("Self")
+            && {
+                let segments = scope_grammar::segments(qualified);
+                segments.first().is_some_and(|segment| *segment == "Self") && segments.len() > 2
+            };
+        if projected_self {
+            // `Self::Assoc::run()` dispatches through the associated type, not the enclosing impl
+            // owner. Until projection resolution can establish that type, a bare `run` match is
+            // less evidence than the written path and must not claim an unrelated method.
+            return None;
+        }
+        if !has_local_receiver_type
+            && !allow_unqualified_fallback(
+                request.edge_kind,
+                qualified,
+                request.name,
+                request.evidence,
+                request.receiver_hint,
+                request.source_language,
+            )
+        {
             return None;
         }
     }
@@ -1189,22 +1246,24 @@ pub(crate) fn resolve_symbol<'a>(
     // which preserves `self.default_method()` calls in traits without letting `Worker::run`
     // drift onto an unrelated same-tail owner.
     //
-    // `self`/`Self` is the ONE case that must still reach here: a trait's default method is
-    // owned by the trait, not by the impl type the receiver hint names, so no scope pass above
-    // can find it. That escape hatch used to re-open the WHOLE bare-name pool, which is how
+    // A typed Rust receiver must still reach here: a trait's default method is owned by the trait,
+    // not by the concrete type the receiver hint names, so no scope pass above can find it. That
+    // escape hatch used to re-open the WHOLE bare-name pool, which is how
     // `self.clone()` in a `#[derive(Clone)]` type — where the derive mints no symbol to find —
     // bound the single unrelated `clone` body anywhere in the workspace. The receiver type is
     // still evidence when it fails: it rules out any candidate that a DIFFERENT concrete type
     // demonstrably owns. `receiver_type_admits_owner` below is that filter.
     let trait_self_fallback = request.source_language == Some(Language::Rust.as_str())
         && matches!(request.receiver_hint, Some("self" | "Self"));
+    let typed_trait_fallback =
+        request.source_language == Some(Language::Rust.as_str()) && has_local_receiver_type;
     // ANY receiver-type identity closes this door, not only a local one. An `ExternalQualified`
     // receiver proves the owner is a dependency's, so no local symbol can be the answer — that is
     // the whole point of classifying it — and `Ambiguous` is unusable evidence, which is still not
     // the same as no evidence. Gating on `has_local_receiver_type` let both fall through to
     // repo-wide bare-name matching, where `use dep::Worker; fn f(w: Worker) { w.run(); }` bound
     // whatever unique local `run` existed.
-    if request.receiver_type.is_some() && !trait_self_fallback {
+    if request.receiver_type.is_some() && !trait_self_fallback && !typed_trait_fallback {
         return None;
     }
     let receiver_owner_tail = has_local_receiver_type
@@ -1244,7 +1303,11 @@ pub(crate) fn resolve_symbol<'a>(
         .filter(|symbol| {
             kind_matches(symbol)
                 && bare_shape_ok(symbol)
-                && receiver_type_admits_owner(receiver_owner_tail, symbol, index)
+                && if typed_trait_fallback && !trait_self_fallback {
+                    receiver_type_admits_trait_default(symbol, index)
+                } else {
+                    receiver_type_admits_owner(receiver_owner_tail, symbol, index)
+                }
         })
         .collect::<Vec<_>>();
     let preferred = preferred_matches(request.edge_kind, request.source_language, &matches);
@@ -1331,6 +1394,23 @@ fn receiver_type_admits_owner(
         }
     }
     names_a_trait || !names_a_type
+}
+
+/// A typed value whose concrete-owner lookup failed may still call a default method owned by a
+/// trait. This fallback is deliberately narrower than the `self`/`Self` compatibility path above:
+/// an unknown or concrete owner is not evidence of a trait default, and admitting it would reopen
+/// cross-package, nested-owner, and pointer-shape false matches.
+fn receiver_type_admits_trait_default(symbol: &IndexedSymbol, index: &SymbolIndex<'_>) -> bool {
+    let Some((owner, _)) = symbol.scope_path.rsplit_once("::") else {
+        return false;
+    };
+    if owner.contains(" as ") {
+        return false;
+    }
+    index
+        .by_scope_path
+        .get(owner)
+        .is_some_and(|owners| owners.iter().any(|owner| owner.kind == "trait"))
 }
 
 /// Whether a set of same-name candidate symbols are all the SAME logical symbol — so the resolver

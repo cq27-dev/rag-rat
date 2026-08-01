@@ -1119,7 +1119,9 @@ fn copy_call_paths(
 }
 
 /// Copy `repo_memory_call_path_edges` verbatim — every column is a row-id-independent portable
-/// identity used to re-find the edge (the full 9-column table shape), so nothing is nulled.
+/// identity used to re-find the edge, so nothing is nulled. Pre-V099 sources have no callee
+/// identity columns; copy them as unknown so validation fails closed until an exact compatibility
+/// match converges the row.
 fn copy_call_path_edges(
     source: &Connection,
     tx: &Connection,
@@ -1128,10 +1130,17 @@ fn copy_call_path_edges(
     if !schema::table_exists(source, "repo_memory_call_path_edges")? {
         return Ok(0);
     }
-    let mut stmt = source.prepare(
+    let callee_columns =
+        if schema::column_exists(source, "repo_memory_call_path_edges", "callee_identity_known")? {
+            "callee_logical_symbol_id, callee_identity_known"
+        } else {
+            "NULL, 0"
+        };
+    let mut stmt = source.prepare(&format!(
         "SELECT memory_id, edge_sequence_hash, ordinal, edge_fingerprint, from_name, to_name, \
-         edge_kind, target_qualified_name, receiver_hint FROM repo_memory_call_path_edges",
-    )?;
+         edge_kind, target_qualified_name, receiver_hint, {callee_columns} FROM \
+         repo_memory_call_path_edges"
+    ))?;
     let mut rows = stmt.query([])?;
     let mut count = 0u64;
     while let Some(row) = rows.next()? {
@@ -1141,8 +1150,8 @@ fn copy_call_path_edges(
         let changed = tx.execute(
             "INSERT OR IGNORE INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, \
              ordinal, edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name, \
-             receiver_hint)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             receiver_hint, callee_logical_symbol_id, callee_identity_known)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 memory_id,
                 row.get::<_, String>(1)?,
@@ -1153,6 +1162,8 @@ fn copy_call_path_edges(
                 row.get::<_, String>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, i64>(10)?,
             ],
         )?;
         count += changed as u64;

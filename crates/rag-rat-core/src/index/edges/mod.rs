@@ -798,6 +798,21 @@ impl<'a> SymbolIndex<'a> {
     pub(crate) fn file_defines(&self, file_id: i64, name: &str) -> bool {
         self.by_name.get(name).is_some_and(|symbols| symbols.iter().any(|s| s.file_id == file_id))
     }
+
+    /// Whether the live symbol set proves that `path` names a local type owner. A qualified
+    /// receiver path with no import binding is local only with this evidence; otherwise a Cargo
+    /// dependency absent from the language's small well-known-root list could tail-bind an
+    /// unrelated local type.
+    pub(crate) fn defines_type_scope(&self, path: &str) -> bool {
+        self.by_scope_path.get(path).is_some_and(|symbols| {
+            symbols.iter().any(|symbol| {
+                matches!(
+                    symbol.kind.as_str(),
+                    "struct" | "enum" | "trait" | "type" | "class" | "interface" | "object"
+                )
+            })
+        })
+    }
 }
 
 /// The ONE explicit classification of a stored receiver-type hint (#567 review): computed once
@@ -833,6 +848,9 @@ pub(crate) enum RootOrigin {
     Local,
     /// A dependency's item; a local same-named symbol is not it.
     External,
+    /// No import, language root, or live type definition proves the root local. A qualified path
+    /// in this state must fail closed rather than tail-match a local owner.
+    Unknown,
     /// The scope holds conflicting answers (mutually exclusive `cfg` imports of one name), so
     /// there is no root to act on.
     Ambiguous,
@@ -852,6 +870,7 @@ impl<'a> ReceiverTypeIdentity<'a> {
         let root = hint.split_once("::").map_or(hint, |(root, _)| root);
         Some(match (root_origin(root), hint.contains("::")) {
             (RootOrigin::Ambiguous, _) => Self::Ambiguous,
+            (RootOrigin::Unknown, _) => Self::Ambiguous,
             (RootOrigin::External, _) => Self::ExternalQualified(hint),
             (RootOrigin::Local, true) => Self::LocalQualified(hint),
             (RootOrigin::Local, false) => Self::LocalUnqualified(hint),

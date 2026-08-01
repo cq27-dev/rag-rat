@@ -24,7 +24,7 @@ use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
-use super::resolve;
+use super::{EdgeLooseIdentity, resolve};
 
 /// The authoritative "resolves nowhere" verdict, emitted only when the note's binding proves the
 /// searched domain is live and covered.
@@ -1288,9 +1288,9 @@ fn call_path_gives_absence_authority(
     edge_sequence_hash: &str,
 ) -> anyhow::Result<bool> {
     let mut stmt = conn.prepare(
-        "SELECT edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name FROM \
-         repo_memory_call_path_edges WHERE memory_id = ?1 AND edge_sequence_hash = ?2 ORDER BY \
-         ordinal",
+        "SELECT edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name, \
+         callee_logical_symbol_id, callee_identity_known FROM repo_memory_call_path_edges WHERE \
+         memory_id = ?1 AND edge_sequence_hash = ?2 ORDER BY ordinal",
     )?;
     let edges = stmt
         .query_map(rusqlite::params![memory_id, edge_sequence_hash], |row| {
@@ -1300,25 +1300,31 @@ fn call_path_gives_absence_authority(
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, i64>(6)? != 0,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if edges.is_empty() {
         return Ok(false);
     }
-    let identities: Vec<(Option<String>, String, String, Option<String>)> = edges
+    // A pre-V099 row cannot prove which callee it named. Validation may converge an exact
+    // compatibility match first, but until then it grants no absence authority.
+    if edges.iter().any(|edge| !edge.6) {
+        return Ok(false);
+    }
+    let identities: Vec<EdgeLooseIdentity> = edges
         .iter()
-        .map(|(_, from_name, to_name, edge_kind, target)| {
-            (
-                from_name.clone(),
-                to_name.clone().unwrap_or_default(),
-                edge_kind.clone(),
-                target.clone(),
-            )
+        .map(|(_, from_name, to_name, edge_kind, target, callee, _)| EdgeLooseIdentity {
+            from_name: from_name.clone(),
+            to_name: to_name.clone().unwrap_or_default(),
+            edge_kind: edge_kind.clone(),
+            target_qualified_name: target.clone(),
+            callee_logical_symbol_id: *callee,
         })
         .collect();
     let mut candidates = resolve::live_edges_matching_identities(conn, &identities)?;
-    for (fingerprint, from_name, to_name, edge_kind, target) in &edges {
+    for (fingerprint, from_name, to_name, edge_kind, target, callee, _) in &edges {
         // Each persisted edge must CONSUME a distinct live candidate: with duplicate loose
         // identities in one path, a single surviving call site cannot vouch for all of them —
         // the sibling that fell out of the index must stay missing.
@@ -1335,11 +1341,13 @@ fn call_path_gives_absence_authority(
                         candidate.to_name.as_str(),
                         candidate.edge_kind.as_str(),
                         candidate.target_qualified_name.as_deref().unwrap_or(""),
+                        candidate.callee_logical_symbol_id,
                     ) == (
                         from_name.as_deref().unwrap_or(""),
                         to_name.as_deref().unwrap_or(""),
                         edge_kind.as_str(),
                         target.as_deref().unwrap_or(""),
+                        *callee,
                     )
                 })
             });
@@ -2908,9 +2916,10 @@ mod tests {
         .unwrap();
         c.execute(
             "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
-             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name) VALUES \
-             ('m1','hash1',0,'fp-a','caller_fn','gone_helper','calls_name',NULL), \
-             ('m1','hash1',1,'fp-b','caller_fn','gone_helper','calls_name',NULL)",
+             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name, \
+             callee_identity_known) VALUES \
+             ('m1','hash1',0,'fp-a','caller_fn','gone_helper','calls_name',NULL,1), \
+             ('m1','hash1',1,'fp-b','caller_fn','gone_helper','calls_name',NULL,1)",
             [],
         )
         .unwrap();
@@ -2950,8 +2959,9 @@ mod tests {
         .unwrap();
         c.execute(
             "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
-             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name) VALUES \
-             ('m1','hash1',0,'fp-unknown','caller_fn','gone_helper','calls_name',NULL)",
+             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name, \
+             callee_identity_known) VALUES \
+             ('m1','hash1',0,'fp-unknown','caller_fn','gone_helper','calls_name',NULL,1)",
             [],
         )
         .unwrap();

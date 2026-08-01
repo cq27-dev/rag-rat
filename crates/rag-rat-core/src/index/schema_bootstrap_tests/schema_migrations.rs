@@ -1772,6 +1772,14 @@ fn migration_100_receiver_type_hint_interning() {
     schema::migrations::apply_receiver_type_hint_interning(&bare).unwrap();
     schema::migrations::apply_receiver_type_hint_interning(&bare).expect("replay is a no-op");
     assert!(schema::column_exists(&bare, "edges_data", "receiver_type_hint_id").unwrap());
+    assert!(
+        schema::column_exists(&bare, "repo_memory_call_path_edges", "callee_logical_symbol_id")
+            .unwrap()
+    );
+    assert!(
+        schema::column_exists(&bare, "repo_memory_call_path_edges", "callee_identity_known")
+            .unwrap()
+    );
 
     assert_eq!(schema::status(&bare).unwrap().current_version, 100);
     let recorded: i64 = bare

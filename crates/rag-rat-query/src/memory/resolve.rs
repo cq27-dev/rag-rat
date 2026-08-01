@@ -573,9 +573,11 @@ pub(crate) fn edge_by_id(conn: &Connection, edge_id: i64) -> anyhow::Result<Opti
                edges.edge_kind AS edge_kind,
                edges.target_qualified_name AS target_qualified_name,
                edges.receiver_hint AS receiver_hint,
-               edges.receiver_type_hint AS receiver_type_hint
+               edges.receiver_type_hint AS receiver_type_hint,
+               members.logical_symbol_id AS callee_logical_symbol_id
         FROM edges
         JOIN files ON files.id = edges.source_file_id
+        LEFT JOIN logical_symbol_members members ON members.symbol_id = edges.to_symbol_id
         WHERE edges.id = ?1
         ",
         [edge_id],
@@ -601,9 +603,11 @@ pub(crate) fn edge_by_fingerprint(
                edges.edge_kind AS edge_kind,
                edges.target_qualified_name AS target_qualified_name,
                edges.receiver_hint AS receiver_hint,
-               edges.receiver_type_hint AS receiver_type_hint
+               edges.receiver_type_hint AS receiver_type_hint,
+               members.logical_symbol_id AS callee_logical_symbol_id
         FROM edges
         JOIN files ON files.id = edges.source_file_id
+        LEFT JOIN logical_symbol_members members ON members.symbol_id = edges.to_symbol_id
         ",
     )?;
     // Current format first. A migrated store finds its binding here and never hashes the legacy
@@ -650,6 +654,7 @@ fn read_edge_anchor(row: &rusqlite::Row<'_>, legacy: LegacyShadow) -> rusqlite::
     let target_qualified_name: Option<String> = row.get("target_qualified_name")?;
     let receiver_hint: Option<String> = row.get("receiver_hint")?;
     let receiver_type_hint: Option<String> = row.get("receiver_type_hint")?;
+    let callee_logical_symbol_id: Option<i64> = row.get("callee_logical_symbol_id")?;
     let parts = EdgeFingerprintParts {
         path: &path,
         start_line,
@@ -660,6 +665,7 @@ fn read_edge_anchor(row: &rusqlite::Row<'_>, legacy: LegacyShadow) -> rusqlite::
         target_qualified_name: target_qualified_name.as_deref(),
         receiver_hint: receiver_hint.as_deref(),
         receiver_type_hint: receiver_type_hint.as_deref().filter(|value| !value.is_empty()),
+        callee_logical_symbol_id,
     };
     Ok(EdgeAnchor {
         edge_id: row.get("edge_id")?,
@@ -676,12 +682,13 @@ fn read_edge_anchor(row: &rusqlite::Row<'_>, legacy: LegacyShadow) -> rusqlite::
         start_line,
         end_line,
         source_hash: row.get("source_hash")?,
+        callee_logical_symbol_id,
     })
 }
 /// The exact, row-id-independent edge identity (#38), VERSIONED (#567 review): the leading
-/// version line plus the always-present `receiver_type_hint` field mean the two formats can
+/// version line plus the receiver type and stable resolved-callee fields mean the formats can
 /// never collide — so a post-upgrade binding on a hintless edge is NOT masked when that edge
-/// later gains a hint (its stored v2 value matches neither the edge's new v2 fingerprint nor
+/// later gains a hint (its stored value matches neither the edge's new fingerprint nor
 /// the legacy form below). `receiver_type_hint` participates (unlike the loose
 /// from/to/kind/target identity) so a receiver-type re-resolution that re-points the same call
 /// site (`Alpha::run` → `Beta::run`) changes the fingerprint. Bindings persisted in the
@@ -689,7 +696,7 @@ fn read_edge_anchor(row: &rusqlite::Row<'_>, legacy: LegacyShadow) -> rusqlite::
 pub(crate) fn edge_fingerprint(parts: EdgeFingerprintParts<'_>) -> String {
     hex_sha256(
         format!(
-            "2\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "3\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             parts.path,
             parts.start_line,
             parts.end_line,
@@ -698,7 +705,8 @@ pub(crate) fn edge_fingerprint(parts: EdgeFingerprintParts<'_>) -> String {
             parts.edge_kind,
             parts.target_qualified_name.unwrap_or(""),
             parts.receiver_hint.unwrap_or(""),
-            parts.receiver_type_hint.unwrap_or("")
+            parts.receiver_type_hint.unwrap_or(""),
+            parts.callee_logical_symbol_id.map_or_else(String::new, |id| id.to_string())
         )
         .as_bytes(),
     )
@@ -734,15 +742,17 @@ pub(crate) struct LiveEdgeMatch {
     pub(crate) to_name: String,
     pub(crate) edge_kind: String,
     pub(crate) target_qualified_name: Option<String>,
+    pub(crate) callee_logical_symbol_id: Option<i64>,
 }
 
 fn live_edge_match_sql(identity_count: usize) -> String {
     let disjunction = (0..identity_count)
         .map(|identity| {
-            let from_name = identity * 4 + 1;
+            let from_name = identity * 5 + 1;
             let to_name = from_name + 1;
             let edge_kind = from_name + 2;
             let target = from_name + 3;
+            let callee = from_name + 4;
             format!(
                 "(edges.to_name_id = (SELECT id FROM name_strings WHERE value = ?{to_name}) AND \
                  edges.edge_kind_id = (SELECT id FROM name_strings WHERE value = ?{edge_kind}) \
@@ -750,7 +760,8 @@ fn live_edge_match_sql(identity_count: usize) -> String {
                  = (SELECT id FROM name_strings WHERE value = ?{from_name})) AND ((?{target} IS \
                  NULL AND edges.target_qualified_name_id IS NULL) OR \
                  edges.target_qualified_name_id = (SELECT id FROM name_strings WHERE value = \
-                 ?{target})))"
+                 ?{target})) AND ((?{callee} IS NULL AND edges.to_symbol_id IS NULL) OR \
+                 members.logical_symbol_id = ?{callee}))"
             )
         })
         .collect::<Vec<_>>()
@@ -761,8 +772,10 @@ fn live_edge_match_sql(identity_count: usize) -> String {
         "SELECT files.path AS path, COALESCE(NULLIF(edges.source_start_line, 0), 1) AS \
          start_line, COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, \
          0), 1) AS end_line, edges.from_name, edges.to_name, edges.edge_kind, \
-         edges.target_qualified_name, edges.receiver_hint, edges.receiver_type_hint FROM edges \
-         JOIN files ON files.id = edges.source_file_id WHERE {disjunction}"
+         edges.target_qualified_name, edges.receiver_hint, edges.receiver_type_hint, \
+         members.logical_symbol_id AS callee_logical_symbol_id FROM edges JOIN files ON files.id \
+         = edges.source_file_id LEFT JOIN logical_symbol_members members ON members.symbol_id = \
+         edges.to_symbol_id WHERE {disjunction}"
     )
 }
 
@@ -773,7 +786,7 @@ fn live_edge_match_sql(identity_count: usize) -> String {
 /// predicates MUST stay on the interned `*_id` columns so the edge indexes remain usable.
 pub(crate) fn live_edges_matching_identities(
     conn: &Connection,
-    identities: &[(Option<String>, String, String, Option<String>)],
+    identities: &[EdgeLooseIdentity],
 ) -> anyhow::Result<Vec<LiveEdgeMatch>> {
     if identities.is_empty() {
         return Ok(Vec::new());
@@ -781,12 +794,13 @@ pub(crate) fn live_edges_matching_identities(
     // The start/end-line expressions MUST match `edge_by_fingerprint`'s SELECT exactly, or the
     // fingerprints computed here disagree with it.
     let mut stmt = conn.prepare(&live_edge_match_sql(identities.len()))?;
-    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(identities.len() * 4);
-    for (from_name, to_name, edge_kind, target) in identities {
-        params.push(from_name);
-        params.push(to_name);
-        params.push(edge_kind);
-        params.push(target);
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(identities.len() * 5);
+    for identity in identities {
+        params.push(&identity.from_name);
+        params.push(&identity.to_name);
+        params.push(&identity.edge_kind);
+        params.push(&identity.target_qualified_name);
+        params.push(&identity.callee_logical_symbol_id);
     }
     let rows = stmt.query_map(params.as_slice(), |row| {
         let path = row.get::<_, String>("path")?;
@@ -798,6 +812,7 @@ pub(crate) fn live_edges_matching_identities(
         let target_qualified_name = row.get::<_, Option<String>>("target_qualified_name")?;
         let receiver_hint = row.get::<_, Option<String>>("receiver_hint")?;
         let receiver_type_hint = row.get::<_, Option<String>>("receiver_type_hint")?;
+        let callee_logical_symbol_id = row.get::<_, Option<i64>>("callee_logical_symbol_id")?;
         let parts = EdgeFingerprintParts {
             path: &path,
             start_line,
@@ -808,6 +823,7 @@ pub(crate) fn live_edges_matching_identities(
             target_qualified_name: target_qualified_name.as_deref(),
             receiver_hint: receiver_hint.as_deref(),
             receiver_type_hint: receiver_type_hint.as_deref().filter(|value| !value.is_empty()),
+            callee_logical_symbol_id,
         };
         Ok(LiveEdgeMatch {
             fingerprint: edge_fingerprint(parts),
@@ -818,6 +834,7 @@ pub(crate) fn live_edges_matching_identities(
             to_name,
             edge_kind,
             target_qualified_name,
+            callee_logical_symbol_id,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -825,7 +842,7 @@ pub(crate) fn live_edges_matching_identities(
 
 /// Hash-algorithm version prefix for server-derived call-path hashes. Bump if the input
 /// composition changes so old hashes never silently collide with a new scheme (#38).
-pub(crate) const CALL_PATH_HASH_VERSION: &str = "cp1";
+pub(crate) const CALL_PATH_HASH_VERSION: &str = "cp2";
 /// Cap on edges in one call path — bounds the bind payload and the validation scan.
 const MAX_CALL_PATH_EDGES: usize = 64;
 
@@ -861,9 +878,11 @@ pub(crate) fn call_path_edge_by_id(
                edges.edge_kind AS edge_kind,
                edges.target_qualified_name AS target_qualified_name,
                edges.receiver_hint AS receiver_hint,
-               edges.receiver_type_hint AS receiver_type_hint
+               edges.receiver_type_hint AS receiver_type_hint,
+               members.logical_symbol_id AS callee_logical_symbol_id
         FROM edges
         JOIN files ON files.id = edges.source_file_id
+        LEFT JOIN logical_symbol_members members ON members.symbol_id = edges.to_symbol_id
         WHERE edges.id = ?1
         ",
         [edge_id],
@@ -877,6 +896,7 @@ pub(crate) fn call_path_edge_by_id(
             let target_qualified_name: Option<String> = row.get("target_qualified_name")?;
             let receiver_hint: Option<String> = row.get("receiver_hint")?;
             let receiver_type_hint: Option<String> = row.get("receiver_type_hint")?;
+            let callee_logical_symbol_id: Option<i64> = row.get("callee_logical_symbol_id")?;
             let fingerprint = edge_fingerprint(EdgeFingerprintParts {
                 path: &path,
                 start_line,
@@ -887,6 +907,7 @@ pub(crate) fn call_path_edge_by_id(
                 target_qualified_name: target_qualified_name.as_deref(),
                 receiver_hint: receiver_hint.as_deref(),
                 receiver_type_hint: receiver_type_hint.as_deref(),
+                callee_logical_symbol_id,
             });
             Ok(CallPathEdge {
                 fingerprint,
@@ -895,6 +916,7 @@ pub(crate) fn call_path_edge_by_id(
                 edge_kind,
                 target_qualified_name,
                 receiver_hint,
+                callee_logical_symbol_id,
             })
         },
     )
@@ -1053,9 +1075,10 @@ pub fn insert_binding(
                 "
                 INSERT INTO repo_memory_call_path_edges(
                     memory_id, edge_sequence_hash, ordinal, edge_fingerprint, from_name, to_name,
-                    edge_kind, target_qualified_name, receiver_hint
+                    edge_kind, target_qualified_name, receiver_hint, callee_logical_symbol_id,
+                    callee_identity_known
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)
                 ",
                 params![
                     memory_id,
@@ -1067,6 +1090,7 @@ pub fn insert_binding(
                     edge.edge_kind,
                     edge.target_qualified_name,
                     edge.receiver_hint,
+                    edge.callee_logical_symbol_id,
                 ],
             )?;
         }
@@ -1217,10 +1241,12 @@ mod live_edge_match_tests {
                     "first_target",
                     "calls_name",
                     Option::<String>::None,
+                    Option::<i64>::None,
                     "source",
                     "second_target",
                     "calls_name",
                     "qualified::target",
+                    Option::<i64>::None,
                 ],
                 |row| row.get::<_, String>(3),
             )
@@ -1248,6 +1274,7 @@ mod receiver_type_hint_fingerprint_tests {
             target_qualified_name: None,
             receiver_hint: Some("recv"),
             receiver_type_hint,
+            callee_logical_symbol_id: None,
         }
     }
 
@@ -1262,6 +1289,21 @@ mod receiver_type_hint_fingerprint_tests {
         let alpha = edge_fingerprint(base_parts(Some("Alpha")));
         let beta = edge_fingerprint(base_parts(Some("Beta")));
         assert_ne!(alpha, beta, "different receiver_type_hint must yield different fingerprints");
+    }
+
+    #[test]
+    fn resolved_callee_repoint_changes_the_stable_fingerprint() {
+        let unresolved = edge_fingerprint(base_parts(Some("Worker")));
+        let alpha = edge_fingerprint(EdgeFingerprintParts {
+            callee_logical_symbol_id: Some(11),
+            ..base_parts(Some("Worker"))
+        });
+        let beta = edge_fingerprint(EdgeFingerprintParts {
+            callee_logical_symbol_id: Some(22),
+            ..base_parts(Some("Worker"))
+        });
+        assert_ne!(unresolved, alpha, "resolution changes edge identity");
+        assert_ne!(alpha, beta, "retargeting with the same receiver hint changes edge identity");
     }
 
     #[test]
