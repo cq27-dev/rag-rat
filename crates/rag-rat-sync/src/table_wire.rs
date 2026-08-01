@@ -449,4 +449,41 @@ mod tests {
         let bytes = TableFrame::Manifest(Manifest(reversed)).encode();
         assert!(matches!(TableFrame::decode(&bytes), Err(TableWireError::Malformed(_))));
     }
+
+    #[test]
+    fn remaining_manifest_and_decoder_bounds_are_rejected() {
+        let items = (0..=MAX_MANIFEST_ITEMS)
+            .map(|index| {
+                let mut stream_id = [0; 32];
+                stream_id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                ManifestItem {
+                    repo_id: format!("repo-{index}"),
+                    incarnation_ref: [1; 32],
+                    scope_id: "anchors/1".into(),
+                    stream_id,
+                }
+            })
+            .collect();
+        let over_cap = Manifest::new(items).unwrap_err();
+        assert!(over_cap.to_string().contains("over cap"));
+        assert!(Manifest::new(vec![item("", 1, "s", 2)]).is_err());
+
+        let malformed = TableFrame::decode(&[0xff]).unwrap_err();
+        assert!(malformed.to_string().contains("malformed"));
+
+        let mut unknown_tag = Vec::new();
+        let mut enc = Encoder::new(&mut unknown_tag);
+        enc.array(2).unwrap();
+        enc.str(FRAME_DOMAIN).unwrap();
+        enc.u8(99).unwrap();
+        assert!(TableFrame::decode(&unknown_tag).is_err());
+
+        let mut short_stream = Vec::new();
+        let mut enc = Encoder::new(&mut short_stream);
+        enc.array(3).unwrap();
+        enc.str(FRAME_DOMAIN).unwrap();
+        enc.u8(tag::STREAM_DONE).unwrap();
+        enc.bytes(&[0]).unwrap();
+        assert!(TableFrame::decode(&short_stream).is_err());
+    }
 }

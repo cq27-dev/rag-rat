@@ -66,10 +66,36 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn codec_errors_render_their_cause() {
+        assert!(TableCodecError::Io(std::io::Error::other("boom")).to_string().contains("boom"));
+        assert!(TableCodecError::FrameTooLarge(7).to_string().contains("7 bytes"));
+        assert!(
+            TableCodecError::Wire(TableWireError::Malformed("bad".into()))
+                .to_string()
+                .contains("bad")
+        );
+        assert!(TableCodecError::Eof.to_string().contains("closed"));
+    }
+
     #[tokio::test]
     async fn total_frame_bound_is_checked_before_allocation() {
         let (mut sender, mut receiver) = tokio::io::duplex(16);
         sender.write_all(&(MAX_TABLE_FRAME_BYTES + 1).to_be_bytes()).await.unwrap();
         assert!(matches!(read_frame(&mut receiver).await, Err(TableCodecError::FrameTooLarge(_))));
+
+        let mut empty = tokio::io::empty();
+        assert!(matches!(read_frame(&mut empty).await, Err(TableCodecError::Eof)));
+
+        let mut sink = tokio::io::sink();
+        let oversized = TableFrame::Entries {
+            stream_id: [0; 32],
+            entries: vec![vec![0; MAX_TABLE_FRAME_BYTES as usize]],
+            more: false,
+        };
+        assert!(matches!(
+            write_frame(&mut sink, &oversized).await,
+            Err(TableCodecError::FrameTooLarge(_))
+        ));
     }
 }

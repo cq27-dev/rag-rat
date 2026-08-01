@@ -385,4 +385,26 @@ mod tests {
         assert_eq!(capability_for_role(DeviceRole::Member), PeerCapability::ReadWrite);
         assert_eq!(capability_for_role(DeviceRole::Owner), PeerCapability::ReadWrite);
     }
+
+    #[test]
+    fn table_store_maps_routes_and_skips_them_while_the_registry_is_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        let account_id = AccountId::from_bytes([1; 32]);
+        let stream = rag_rat_oplog::TableSyncStream {
+            repo_id: "repo-a".into(),
+            incarnation_ref: [2; 32],
+            scope_id: "anchors/1".into(),
+            stream_id: [3; 32],
+        };
+        let item = to_manifest_item(stream.clone());
+        assert_eq!(to_oplog_stream(&item), stream);
+
+        let mut store = OplogTableSyncStore::new(&conn, account_id, || 7);
+        assert_eq!(store.account_id(), account_id.to_bytes());
+        assert!(!store.has_streams().unwrap());
+        assert!(store.supported_streams().unwrap().is_empty());
+        assert!(!store.validates(&item).unwrap());
+        assert!(store.snapshot(&item).unwrap().is_empty());
+        assert_eq!(store.ingest(&item, &[0]).unwrap(), Ingested::NoChange);
+    }
 }
