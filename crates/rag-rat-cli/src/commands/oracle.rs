@@ -118,7 +118,7 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
     // run covering fresh state isn't falsely judged stale even after a long lock wait) yet before
     // any mid-run reindex (so a run that misses one IS judged stale). (#145 + #146 review)
     let (started_at_ms, pre_spawn_sha) = with_oracle_write_lock(config, |db| {
-        Ok((crate::now_epoch_ms(), db.oracle_pre_spawn_snapshot()?))
+        Ok((rag_rat_base::time::now_ms(), db.oracle_pre_spawn_snapshot()?))
     })?;
     let scip_output = config
         .database
@@ -300,7 +300,7 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
                 tool,
                 &scip_bytes,
                 rag_rat_core::index::OracleShaSnapshots::default(),
-                crate::now_epoch_ms(),
+                rag_rat_base::time::now_ms(),
             )
         })?
     } else {
@@ -313,7 +313,7 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
             anyhow::bail!("oracle tool for corpus `{}` unavailable: {hint}", profile.corpus_id);
         }
         let (started_at_ms, pre_spawn_sha) = with_oracle_write_lock(config, |db| {
-            Ok((crate::now_epoch_ms(), db.oracle_pre_spawn_snapshot()?))
+            Ok((rag_rat_base::time::now_ms(), db.oracle_pre_spawn_snapshot()?))
         })?;
         let scip_output = config
             .database

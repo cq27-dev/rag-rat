@@ -333,22 +333,13 @@ pub(crate) fn cells_hash(cells: &[Cell]) -> String {
 /// producer can reconstruct a deleted row's identity (present in the published-rows table, absent
 /// from the table) to emit a `Remove`.
 pub(crate) fn row_pk_values(row_pk: &str) -> anyhow::Result<Vec<TypedValue>> {
-    let bytes = hex_decode(row_pk)?;
+    let bytes = rag_rat_base::hash::hex_decode(row_pk)
+        .ok_or_else(|| anyhow::anyhow!("bad hex in row_pk"))?;
     let mut d = Decoder::new(&bytes);
     let values =
         decode_values(&mut d).map_err(|err| anyhow::anyhow!("row_pk decode failed: {err}"))?;
     anyhow::ensure!(d.position() == bytes.len(), "trailing bytes in row_pk");
     Ok(values)
-}
-
-fn hex_decode(text: &str) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(text.len().is_multiple_of(2), "hex string has an odd length");
-    (0..text.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&text[i..i + 2], 16).map_err(|err| anyhow::anyhow!("bad hex: {err}"))
-        })
-        .collect()
 }
 
 #[cfg(test)]

@@ -138,10 +138,7 @@ pub(crate) fn cheap_skip_policy(
     if is_test_fixture_path(&path_text) {
         return Some(policy("SkipTestFixture", 9, false));
     }
-    let Ok(language_kind) = language.parse::<Language>() else {
-        return Some(policy("SkipLanguageUnsupported", 9, false));
-    };
-    if !language_kind.supports_embeddings() {
+    if language.parse::<Language>().is_err() {
         return Some(policy("SkipLanguageUnsupported", 9, false));
     }
     if trimmed.chars().count() < MIN_EMBEDDING_CHARS {

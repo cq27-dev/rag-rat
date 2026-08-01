@@ -435,7 +435,7 @@ fn cluster_for(cluster: ClusterBuild) -> RepoCluster {
     let category = cluster_category(&metrics).to_string();
     let confidence = confidence_for(&metrics, cluster.avg_edge_score).to_string();
     let why = why_for(&metrics, cluster.avg_edge_score, &name);
-    let next_tools = next_tools_for(representative_paths.first());
+    let next_tools = next_tools_for(representative_paths.first().map(String::as_str));
 
     RepoCluster {
         cluster_id: String::new(),
@@ -520,7 +520,7 @@ fn why_for(metrics: &RepoClusterMetrics, avg_edge_score: f64, name: &str) -> Vec
     why
 }
 
-fn next_tools_for(path: Option<&String>) -> Vec<RepoClusterNextTool> {
+fn next_tools_for(path: Option<&str>) -> Vec<RepoClusterNextTool> {
     let Some(path) = path else {
         return Vec::new();
     };
@@ -533,11 +533,11 @@ fn next_tools_for(path: Option<&String>) -> Vec<RepoClusterNextTool> {
         next_tool(
             "impact_surface",
             "inspect graph, git, papertrail, and memories for the representative path",
-            [("query", path.clone())],
+            [("query", path.to_string())],
         ),
         next_tool("git_history_for_path", "inspect co-touch and churn history", [(
             "path",
-            path.clone(),
+            path.to_string(),
         )]),
     ]
 }

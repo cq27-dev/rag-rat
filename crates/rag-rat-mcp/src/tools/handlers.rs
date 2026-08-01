@@ -270,7 +270,7 @@ pub(crate) fn call_tool_with_db(
             // model-derived findings a prior `--verify` run persisted (dream_run's resolve sweep is
             // kind-scoped), so `memory_divergence` etc. still surface in this worklist.
             json!(db.dream_run(rag_rat_dream::DreamOptions {
-                now_ms: now_ms(),
+                now_ms: rag_rat_base::time::now_ms(),
                 limit: args.limit as usize,
                 verify: false,
                 include_reviewed: args.all,
@@ -278,7 +278,11 @@ pub(crate) fn call_tool_with_db(
         },
         "dream_review" => {
             let args: DreamReviewArgs = serde_json::from_value(arguments)?;
-            json!(db.review_dream_finding(&args.finding, args.verdict.core(), now_ms())?)
+            json!(db.review_dream_finding(
+                &args.finding,
+                args.verdict.core(),
+                rag_rat_base::time::now_ms(),
+            )?)
         },
         "find_clones" => {
             let args: FindClonesArgs = serde_json::from_value(arguments)?;
@@ -740,16 +744,6 @@ pub(crate) fn graph_symbol_selector(args: &SymbolGraphArgs) -> anyhow::Result<Sy
         allow_ambiguous: args.allow_ambiguous,
         limit: args.limit,
     })
-}
-
-/// Wall-clock milliseconds for the dream write tools (finding first/last-seen + review stamps).
-/// Mirrors the CLI `dream` command's inline clock — the core `now_ms` helpers are crate-private, so
-/// the MCP surface computes its own; the dream lifecycle only needs a monotonic-enough stamp.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 pub(crate) fn find_clones_tool(db: &IndexDatabase, args: FindClonesArgs) -> anyhow::Result<Value> {

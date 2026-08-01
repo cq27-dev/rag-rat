@@ -152,7 +152,8 @@ fn dedup_in_place<T: std::hash::Hash + Eq + Copy>(items: &mut Vec<T>) {
 }
 
 /// Stable output-ladder tokens. The names map directly to the `rung_*` run-counter columns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum OutputRung {
     /// A guided model call was attempted.
     Guided,
@@ -168,23 +169,12 @@ impl OutputRung {
     pub(crate) const VARIANTS: [Self; 4] =
         [Self::Guided, Self::Serde, Self::Unguided, Self::Tolerant];
 
-    pub(crate) const fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Guided => "guided",
-            Self::Serde => "serde",
-            Self::Unguided => "unguided",
-            Self::Tolerant => "tolerant",
-        }
+    pub(crate) fn as_db_str(self) -> &'static str {
+        self.into()
     }
 
     pub(crate) fn from_db_str(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "guided" => Ok(Self::Guided),
-            "serde" => Ok(Self::Serde),
-            "unguided" => Ok(Self::Unguided),
-            "tolerant" => Ok(Self::Tolerant),
-            _ => Err(anyhow::anyhow!("unknown output-rung token `{value}`")),
-        }
+        value.parse().map_err(|_| anyhow::anyhow!("unknown output-rung token `{value}`"))
     }
 }
 

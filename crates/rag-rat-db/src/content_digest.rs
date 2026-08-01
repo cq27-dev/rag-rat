@@ -106,15 +106,6 @@ pub fn encode_state(state: &DigestState) -> String {
     out
 }
 
-fn hex_digit(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
 /// Decode a 64-hex `state` back to four LE `u64` lanes. Errs (fail-closed) on any length other than
 /// 64 or any non-hex byte — the malformed-state case the scalar fold raises.
 pub fn decode_state(hex: &str) -> Result<DigestState, MalformedDigestState> {
@@ -124,9 +115,9 @@ pub fn decode_state(hex: &str) -> Result<DigestState, MalformedDigestState> {
     }
     let mut raw = [0u8; 32];
     for (out, chunk) in raw.iter_mut().zip(bytes.chunks_exact(2)) {
-        let hi = hex_digit(chunk[0])
+        let hi = rag_rat_base::hash::hex_nibble(chunk[0])
             .ok_or_else(|| MalformedDigestState(format!("non-hex byte {:#04x}", chunk[0])))?;
-        let lo = hex_digit(chunk[1])
+        let lo = rag_rat_base::hash::hex_nibble(chunk[1])
             .ok_or_else(|| MalformedDigestState(format!("non-hex byte {:#04x}", chunk[1])))?;
         *out = (hi << 4) | lo;
     }

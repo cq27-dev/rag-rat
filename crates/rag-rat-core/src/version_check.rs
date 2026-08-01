@@ -120,14 +120,12 @@ fn parse_latest_response(body: &str) -> Option<String> {
 /// server's background, an explicit `version-check` command) — never on the session-start read
 /// path.
 pub fn refresh(database: &Path) -> Option<CachedVersion> {
-    let cached = CachedVersion { latest_version: fetch_latest()?, checked_at_ms: now_ms() };
+    let cached = CachedVersion {
+        latest_version: fetch_latest()?,
+        checked_at_ms: rag_rat_base::time::now_ms(),
+    };
     write_cache(database, &cached);
     Some(cached)
-}
-
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 /// `(major, minor, patch)`, pre-release/build metadata stripped. `None` if it doesn't parse.

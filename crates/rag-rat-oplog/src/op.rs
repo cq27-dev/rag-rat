@@ -134,9 +134,9 @@ impl FromStr for DeviceFingerprint {
         }
         let mut bytes = [0u8; 32];
         for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-            let high = hex_nibble(pair[0])
+            let high = rag_rat_base::hash::hex_nibble(pair[0])
                 .ok_or(ParseDeviceFingerprintError::InvalidHex { index: index * 2 })?;
-            let low = hex_nibble(pair[1])
+            let low = rag_rat_base::hash::hex_nibble(pair[1])
                 .ok_or(ParseDeviceFingerprintError::InvalidHex { index: index * 2 + 1 })?;
             bytes[index] = high << 4 | low;
         }
@@ -150,15 +150,6 @@ impl fmt::Display for DeviceFingerprint {
             write!(f, "{byte:02x}")?;
         }
         Ok(())
-    }
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
     }
 }
 

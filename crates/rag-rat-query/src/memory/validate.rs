@@ -987,16 +987,6 @@ fn payload_cbor_element(payload_json: Option<&str>) -> (u64, Vec<u8>) {
     (0, buf)
 }
 
-pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
-    let hash = Sha256::digest(bytes);
-    hash.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-pub(crate) fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
-}
 pub(crate) fn fts_query(query: &str) -> String {
     let terms = query
         .split(|ch: char| !ch.is_alphanumeric() && ch != '_')

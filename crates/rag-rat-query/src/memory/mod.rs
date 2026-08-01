@@ -18,10 +18,11 @@ pub use edges::{
 pub use edges::{EdgeRelation, EdgeTarget, NodeEdge};
 pub use hydrate::*;
 pub use moniker::*;
+use rag_rat_base::hash::hex_sha256;
+use rag_rat_base::time::now_ms;
 pub use resolve::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 pub use validate::*;
 
 /// The active `repo_id` scope for the memory tables, or `None` on the pre-A5 schema (the memory

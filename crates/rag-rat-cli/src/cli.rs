@@ -212,24 +212,7 @@ pub(crate) struct ServeArgs {
 /// path, query, or fragment. A trailing slash is normalized away; anything else that would
 /// silently never match the header is rejected at parse time.
 fn parse_lens_origin(raw: &str) -> Result<String, String> {
-    let trimmed = raw.trim();
-    let parsed = url::Url::parse(trimmed)
-        .map_err(|_| format!("origin `{raw}` must look like scheme://host[:port]"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(format!("origin scheme must be http or https: `{raw}`"));
-    }
-    if parsed.host().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.path() != "/"
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(format!(
-            "origin must not contain credentials, a path, query, or fragment: `{raw}`"
-        ));
-    }
-    Ok(parsed.origin().ascii_serialization())
+    rag_rat_mcp::lens_server::canonical_lens_origin(raw.trim()).map_err(|err| err.to_string())
 }
 
 #[derive(Debug, Args)]

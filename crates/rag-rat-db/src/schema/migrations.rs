@@ -1296,326 +1296,35 @@ pub(crate) fn apply_logical_group_reason_by_evidence(conn: &Connection) -> rusql
 }
 
 pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
-    migrations
-        .iter()
-        .filter_map(|migration| match migration.id.as_str() {
-            MIGRATION_001_ID => Some(1),
-            MIGRATION_002_ID => Some(2),
-            MIGRATION_003_ID => Some(3),
-            MIGRATION_004_ID => Some(4),
-            MIGRATION_005_ID => Some(5),
-            MIGRATION_006_ID => Some(6),
-            MIGRATION_007_ID => Some(7),
-            MIGRATION_008_ID => Some(8),
-            MIGRATION_009_ID => Some(9),
-            MIGRATION_010_ID => Some(10),
-            MIGRATION_011_ID => Some(11),
-            MIGRATION_012_ID => Some(12),
-            MIGRATION_013_ID => Some(13),
-            MIGRATION_014_ID => Some(14),
-            MIGRATION_015_ID => Some(15),
-            MIGRATION_016_ID => Some(16),
-            MIGRATION_017_ID => Some(17),
-            MIGRATION_018_ID => Some(18),
-            MIGRATION_019_ID => Some(19),
-            MIGRATION_020_ID => Some(20),
-            MIGRATION_021_ID => Some(21),
-            MIGRATION_022_ID => Some(22),
-            MIGRATION_023_ID => Some(23),
-            MIGRATION_024_ID => Some(24),
-            MIGRATION_025_ID => Some(25),
-            MIGRATION_026_ID => Some(26),
-            MIGRATION_027_ID => Some(27),
-            MIGRATION_028_ID => Some(28),
-            MIGRATION_029_ID => Some(29),
-            MIGRATION_030_ID => Some(30),
-            MIGRATION_031_ID => Some(31),
-            MIGRATION_032_ID => Some(32),
-            MIGRATION_033_ID => Some(33),
-            MIGRATION_034_ID => Some(34),
-            MIGRATION_035_ID => Some(35),
-            MIGRATION_036_ID => Some(36),
-            MIGRATION_037_ID => Some(37),
-            MIGRATION_038_ID => Some(38),
-            MIGRATION_039_ID => Some(39),
-            MIGRATION_040_ID => Some(40),
-            MIGRATION_041_ID => Some(41),
-            MIGRATION_042_ID => Some(42),
-            MIGRATION_043_ID => Some(43),
-            MIGRATION_044_ID => Some(44),
-            MIGRATION_045_ID => Some(45),
-            MIGRATION_046_ID => Some(46),
-            MIGRATION_047_ID => Some(47),
-            MIGRATION_048_ID => Some(48),
-            MIGRATION_049_ID => Some(49),
-            MIGRATION_050_ID => Some(50),
-            MIGRATION_051_ID => Some(51),
-            MIGRATION_052_ID => Some(52),
-            MIGRATION_053_ID => Some(53),
-            MIGRATION_054_ID => Some(54),
-            MIGRATION_055_ID => Some(55),
-            MIGRATION_056_ID => Some(56),
-            MIGRATION_057_ID => Some(57),
-            MIGRATION_058_ID => Some(58),
-            MIGRATION_059_ID => Some(59),
-            MIGRATION_060_ID => Some(60),
-            MIGRATION_061_ID => Some(61),
-            MIGRATION_062_ID => Some(62),
-            MIGRATION_063_ID => Some(63),
-            MIGRATION_064_ID => Some(64),
-            MIGRATION_065_ID => Some(65),
-            MIGRATION_066_ID => Some(66),
-            MIGRATION_067_ID => Some(67),
-            MIGRATION_068_ID => Some(68),
-            MIGRATION_069_ID => Some(69),
-            MIGRATION_070_ID => Some(70),
-            MIGRATION_071_ID => Some(71),
-            MIGRATION_072_ID => Some(72),
-            MIGRATION_073_ID => Some(73),
-            MIGRATION_074_ID => Some(74),
-            MIGRATION_075_ID => Some(75),
-            MIGRATION_076_ID => Some(76),
-            MIGRATION_077_ID => Some(77),
-            MIGRATION_078_ID => Some(78),
-            MIGRATION_079_ID => Some(79),
-            MIGRATION_080_ID => Some(80),
-            MIGRATION_081_ID => Some(81),
-            MIGRATION_082_ID => Some(82),
-            MIGRATION_083_ID => Some(83),
-            MIGRATION_084_ID => Some(84),
-            MIGRATION_085_ID => Some(85),
-            MIGRATION_086_ID => Some(86),
-            MIGRATION_087_ID => Some(87),
-            MIGRATION_088_ID => Some(88),
-            MIGRATION_089_ID => Some(89),
-            MIGRATION_090_ID => Some(90),
-            MIGRATION_091_ID => Some(91),
-            MIGRATION_092_ID => Some(92),
-            MIGRATION_093_ID => Some(93),
-            MIGRATION_094_ID => Some(94),
-            MIGRATION_095_ID => Some(95),
-            MIGRATION_096_ID => Some(96),
-            MIGRATION_097_ID => Some(97),
-            MIGRATION_098_ID => Some(98),
-            MIGRATION_099_ID => Some(99),
-            MIGRATION_100_ID => Some(100),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0)
+    migrations.iter().filter_map(|migration| shipped_version(&migration.id)).max().unwrap_or(0)
 }
 
 pub(crate) fn known_migration(id: &str) -> bool {
-    matches!(
-        id,
-        MIGRATION_001_ID
-            | MIGRATION_002_ID
-            | MIGRATION_003_ID
-            | MIGRATION_004_ID
-            | MIGRATION_005_ID
-            | MIGRATION_006_ID
-            | MIGRATION_007_ID
-            | MIGRATION_008_ID
-            | MIGRATION_009_ID
-            | MIGRATION_010_ID
-            | MIGRATION_011_ID
-            | MIGRATION_012_ID
-            | MIGRATION_013_ID
-            | MIGRATION_014_ID
-            | MIGRATION_015_ID
-            | MIGRATION_016_ID
-            | MIGRATION_017_ID
-            | MIGRATION_018_ID
-            | MIGRATION_019_ID
-            | MIGRATION_020_ID
-            | MIGRATION_021_ID
-            | MIGRATION_022_ID
-            | MIGRATION_023_ID
-            | MIGRATION_024_ID
-            | MIGRATION_025_ID
-            | MIGRATION_026_ID
-            | MIGRATION_027_ID
-            | MIGRATION_028_ID
-            | MIGRATION_029_ID
-            | MIGRATION_030_ID
-            | MIGRATION_031_ID
-            | MIGRATION_032_ID
-            | MIGRATION_033_ID
-            | MIGRATION_034_ID
-            | MIGRATION_035_ID
-            | MIGRATION_036_ID
-            | MIGRATION_037_ID
-            | MIGRATION_038_ID
-            | MIGRATION_039_ID
-            | MIGRATION_040_ID
-            | MIGRATION_041_ID
-            | MIGRATION_042_ID
-            | MIGRATION_043_ID
-            | MIGRATION_044_ID
-            | MIGRATION_045_ID
-            | MIGRATION_046_ID
-            | MIGRATION_047_ID
-            | MIGRATION_048_ID
-            | MIGRATION_049_ID
-            | MIGRATION_050_ID
-            | MIGRATION_051_ID
-            | MIGRATION_052_ID
-            | MIGRATION_053_ID
-            | MIGRATION_054_ID
-            | MIGRATION_055_ID
-            | MIGRATION_056_ID
-            | MIGRATION_057_ID
-            | MIGRATION_058_ID
-            | MIGRATION_059_ID
-            | MIGRATION_060_ID
-            | MIGRATION_061_ID
-            | MIGRATION_062_ID
-            | MIGRATION_063_ID
-            | MIGRATION_064_ID
-            | MIGRATION_065_ID
-            | MIGRATION_066_ID
-            | MIGRATION_067_ID
-            | MIGRATION_068_ID
-            | MIGRATION_069_ID
-            | MIGRATION_070_ID
-            | MIGRATION_071_ID
-            | MIGRATION_072_ID
-            | MIGRATION_073_ID
-            | MIGRATION_074_ID
-            | MIGRATION_075_ID
-            | MIGRATION_076_ID
-            | MIGRATION_077_ID
-            | MIGRATION_078_ID
-            | MIGRATION_079_ID
-            | MIGRATION_080_ID
-            | MIGRATION_081_ID
-            | MIGRATION_082_ID
-            | MIGRATION_083_ID
-            | MIGRATION_084_ID
-            | MIGRATION_085_ID
-            | MIGRATION_086_ID
-            | MIGRATION_087_ID
-            | MIGRATION_088_ID
-            | MIGRATION_089_ID
-            | MIGRATION_090_ID
-            | MIGRATION_091_ID
-            | MIGRATION_092_ID
-            | MIGRATION_093_ID
-            | MIGRATION_094_ID
-            | MIGRATION_095_ID
-            | MIGRATION_096_ID
-            | MIGRATION_097_ID
-            | MIGRATION_098_ID
-            | MIGRATION_099_ID
-            | MIGRATION_100_ID
-            | DIRTY_MIGRATION_ID
-    )
+    shipped_version(id).is_some() || id == DIRTY_MIGRATION_ID
 }
 
 pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
-    match migration.id.as_str() {
-        MIGRATION_001_ID => migration.checksum != MIGRATION_001_CHECKSUM,
-        MIGRATION_002_ID => migration.checksum != MIGRATION_002_CHECKSUM,
-        MIGRATION_003_ID => migration.checksum != MIGRATION_003_CHECKSUM,
-        MIGRATION_004_ID => migration.checksum != MIGRATION_004_CHECKSUM,
-        MIGRATION_005_ID => migration.checksum != MIGRATION_005_CHECKSUM,
-        MIGRATION_006_ID => migration.checksum != MIGRATION_006_CHECKSUM,
-        MIGRATION_007_ID => migration.checksum != MIGRATION_007_CHECKSUM,
-        MIGRATION_008_ID => migration.checksum != MIGRATION_008_CHECKSUM,
-        MIGRATION_009_ID => migration.checksum != MIGRATION_009_CHECKSUM,
-        MIGRATION_010_ID => migration.checksum != MIGRATION_010_CHECKSUM,
-        MIGRATION_011_ID => migration.checksum != MIGRATION_011_CHECKSUM,
-        MIGRATION_012_ID => migration.checksum != MIGRATION_012_CHECKSUM,
-        MIGRATION_013_ID => migration.checksum != MIGRATION_013_CHECKSUM,
-        MIGRATION_014_ID => migration.checksum != MIGRATION_014_CHECKSUM,
-        MIGRATION_015_ID => migration.checksum != MIGRATION_015_CHECKSUM,
-        MIGRATION_016_ID => migration.checksum != MIGRATION_016_CHECKSUM,
-        MIGRATION_017_ID => migration.checksum != MIGRATION_017_CHECKSUM,
-        MIGRATION_018_ID => migration.checksum != MIGRATION_018_CHECKSUM,
-        MIGRATION_019_ID => migration.checksum != MIGRATION_019_CHECKSUM,
-        MIGRATION_020_ID => migration.checksum != MIGRATION_020_CHECKSUM,
-        MIGRATION_021_ID => migration.checksum != MIGRATION_021_CHECKSUM,
-        MIGRATION_022_ID => migration.checksum != MIGRATION_022_CHECKSUM,
-        MIGRATION_023_ID => migration.checksum != MIGRATION_023_CHECKSUM,
-        MIGRATION_024_ID => migration.checksum != MIGRATION_024_CHECKSUM,
-        MIGRATION_025_ID => migration.checksum != MIGRATION_025_CHECKSUM,
-        MIGRATION_026_ID => migration.checksum != MIGRATION_026_CHECKSUM,
-        MIGRATION_027_ID => migration.checksum != MIGRATION_027_CHECKSUM,
-        MIGRATION_028_ID => migration.checksum != MIGRATION_028_CHECKSUM,
-        MIGRATION_029_ID => migration.checksum != MIGRATION_029_CHECKSUM,
-        MIGRATION_030_ID => migration.checksum != MIGRATION_030_CHECKSUM,
-        MIGRATION_031_ID => migration.checksum != MIGRATION_031_CHECKSUM,
-        MIGRATION_032_ID => migration.checksum != MIGRATION_032_CHECKSUM,
-        MIGRATION_033_ID => migration.checksum != MIGRATION_033_CHECKSUM,
-        MIGRATION_034_ID => migration.checksum != MIGRATION_034_CHECKSUM,
-        MIGRATION_035_ID => migration.checksum != MIGRATION_035_CHECKSUM,
-        MIGRATION_036_ID => migration.checksum != MIGRATION_036_CHECKSUM,
-        MIGRATION_037_ID => migration.checksum != MIGRATION_037_CHECKSUM,
-        MIGRATION_038_ID => migration.checksum != MIGRATION_038_CHECKSUM,
-        MIGRATION_039_ID => migration.checksum != MIGRATION_039_CHECKSUM,
-        MIGRATION_040_ID => migration.checksum != MIGRATION_040_CHECKSUM,
-        MIGRATION_041_ID => migration.checksum != MIGRATION_041_CHECKSUM,
-        MIGRATION_042_ID => migration.checksum != MIGRATION_042_CHECKSUM,
-        MIGRATION_043_ID => migration.checksum != MIGRATION_043_CHECKSUM,
-        MIGRATION_044_ID => migration.checksum != MIGRATION_044_CHECKSUM,
-        MIGRATION_045_ID => migration.checksum != MIGRATION_045_CHECKSUM,
-        MIGRATION_046_ID => migration.checksum != MIGRATION_046_CHECKSUM,
-        MIGRATION_047_ID => migration.checksum != MIGRATION_047_CHECKSUM,
-        MIGRATION_048_ID => migration.checksum != MIGRATION_048_CHECKSUM,
-        MIGRATION_049_ID => migration.checksum != MIGRATION_049_CHECKSUM,
-        MIGRATION_050_ID => migration.checksum != MIGRATION_050_CHECKSUM,
-        MIGRATION_051_ID => migration.checksum != MIGRATION_051_CHECKSUM,
-        MIGRATION_052_ID => migration.checksum != MIGRATION_052_CHECKSUM,
-        MIGRATION_053_ID => migration.checksum != MIGRATION_053_CHECKSUM,
-        MIGRATION_054_ID => migration.checksum != MIGRATION_054_CHECKSUM,
-        MIGRATION_055_ID => migration.checksum != MIGRATION_055_CHECKSUM,
-        MIGRATION_056_ID => migration.checksum != MIGRATION_056_CHECKSUM,
-        MIGRATION_057_ID => migration.checksum != MIGRATION_057_CHECKSUM,
-        MIGRATION_058_ID => migration.checksum != MIGRATION_058_CHECKSUM,
-        MIGRATION_059_ID => migration.checksum != MIGRATION_059_CHECKSUM,
-        MIGRATION_060_ID => migration.checksum != MIGRATION_060_CHECKSUM,
-        MIGRATION_061_ID => migration.checksum != MIGRATION_061_CHECKSUM,
-        MIGRATION_062_ID => migration.checksum != MIGRATION_062_CHECKSUM,
-        MIGRATION_063_ID => migration.checksum != MIGRATION_063_CHECKSUM,
-        MIGRATION_064_ID => migration.checksum != MIGRATION_064_CHECKSUM,
-        MIGRATION_065_ID => migration.checksum != MIGRATION_065_CHECKSUM,
-        MIGRATION_066_ID => migration.checksum != MIGRATION_066_CHECKSUM,
-        MIGRATION_067_ID => migration.checksum != MIGRATION_067_CHECKSUM,
-        MIGRATION_068_ID => migration.checksum != MIGRATION_068_CHECKSUM,
-        MIGRATION_069_ID => migration.checksum != MIGRATION_069_CHECKSUM,
-        MIGRATION_070_ID => migration.checksum != MIGRATION_070_CHECKSUM,
-        MIGRATION_071_ID => migration.checksum != MIGRATION_071_CHECKSUM,
-        MIGRATION_072_ID => migration.checksum != MIGRATION_072_CHECKSUM,
-        MIGRATION_073_ID => migration.checksum != MIGRATION_073_CHECKSUM,
-        MIGRATION_074_ID => migration.checksum != MIGRATION_074_CHECKSUM,
-        MIGRATION_075_ID => migration.checksum != MIGRATION_075_CHECKSUM,
-        MIGRATION_076_ID => migration.checksum != MIGRATION_076_CHECKSUM,
-        MIGRATION_077_ID => migration.checksum != MIGRATION_077_CHECKSUM,
-        MIGRATION_078_ID => migration.checksum != MIGRATION_078_CHECKSUM,
-        MIGRATION_079_ID => migration.checksum != MIGRATION_079_CHECKSUM,
-        MIGRATION_080_ID => migration.checksum != MIGRATION_080_CHECKSUM,
-        MIGRATION_081_ID => migration.checksum != MIGRATION_081_CHECKSUM,
-        MIGRATION_082_ID => migration.checksum != MIGRATION_082_CHECKSUM,
-        MIGRATION_083_ID => migration.checksum != MIGRATION_083_CHECKSUM,
-        MIGRATION_084_ID => migration.checksum != MIGRATION_084_CHECKSUM,
-        MIGRATION_085_ID => migration.checksum != MIGRATION_085_CHECKSUM,
-        MIGRATION_086_ID => migration.checksum != MIGRATION_086_CHECKSUM,
-        MIGRATION_087_ID => migration.checksum != MIGRATION_087_CHECKSUM,
-        MIGRATION_088_ID => migration.checksum != MIGRATION_088_CHECKSUM,
-        MIGRATION_089_ID => migration.checksum != MIGRATION_089_CHECKSUM,
-        MIGRATION_090_ID => migration.checksum != MIGRATION_090_CHECKSUM,
-        MIGRATION_091_ID => migration.checksum != MIGRATION_091_CHECKSUM,
-        MIGRATION_092_ID => migration.checksum != MIGRATION_092_CHECKSUM,
-        MIGRATION_093_ID => migration.checksum != MIGRATION_093_CHECKSUM,
-        MIGRATION_094_ID => migration.checksum != MIGRATION_094_CHECKSUM,
-        MIGRATION_095_ID => migration.checksum != MIGRATION_095_CHECKSUM,
-        MIGRATION_096_ID => migration.checksum != MIGRATION_096_CHECKSUM,
-        MIGRATION_097_ID => migration.checksum != MIGRATION_097_CHECKSUM,
-        MIGRATION_098_ID => migration.checksum != MIGRATION_098_CHECKSUM,
-        MIGRATION_099_ID => migration.checksum != MIGRATION_099_CHECKSUM,
-        MIGRATION_100_ID => migration.checksum != MIGRATION_100_CHECKSUM,
-        _ => false,
+    shipped_checksum(&migration.id).is_some_and(|checksum| migration.checksum != checksum)
+}
+
+/// The ladder position a shipped migration id maps to: the baseline (001) is 1, and each
+/// [`ADDITIVE_MIGRATIONS`] entry is its 1-based position after it. `None` for a row written by a
+/// future binary (or the dirty marker, which has no version).
+fn shipped_version(id: &str) -> Option<u32> {
+    if id == MIGRATION_001_ID {
+        return Some(1);
     }
+    ADDITIVE_MIGRATIONS
+        .iter()
+        .position(|step| step.id == id)
+        .and_then(|index| u32::try_from(index + 2).ok())
+}
+
+fn shipped_checksum(id: &str) -> Option<&'static str> {
+    if id == MIGRATION_001_ID {
+        return Some(MIGRATION_001_CHECKSUM);
+    }
+    ADDITIVE_MIGRATIONS.iter().find(|step| step.id == id).map(|step| step.checksum)
 }
 
 pub(crate) fn record_migration(

@@ -570,7 +570,10 @@ fn parse_lens_origins(value: &str) -> anyhow::Result<Vec<String>> {
         .collect()
 }
 
-fn canonical_lens_origin(raw: &str) -> anyhow::Result<String> {
+/// Canonicalize one browser Origin (`scheme://host[:port]`, no path/query/fragment/credentials).
+/// Shared by the server-side `RAG_RAT_LENS_ORIGINS` env allowlist and the CLI's
+/// `--allow-origin` clap parser so both surfaces accept exactly the same spellings.
+pub fn canonical_lens_origin(raw: &str) -> anyhow::Result<String> {
     let parsed = url::Url::parse(raw)
         .with_context(|| format!("invalid origin in RAG_RAT_LENS_ORIGINS: `{raw}`"))?;
     if !matches!(parsed.scheme(), "http" | "https")

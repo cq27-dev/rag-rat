@@ -262,7 +262,7 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_base::config::Config) {
         quiet_period_ms: i64,
         min_interval_ms: i64,
     ) -> anyhow::Result<()> {
-        let now_ms = now_epoch_ms();
+        let now_ms = rag_rat_base::time::now_ms();
         // `indexed_at_ms` is the active checkout's last index-change clock; without it we can't
         // judge staleness, so skip this tick.
         let last_index_change_ms = {
@@ -330,7 +330,7 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_base::config::Config) {
         // reindex can interleave between reading the indexed state and recording the start; under
         // the lock, started_at matches the indexed state this run covers (#145 + #146 review).
         let (started_at_ms, pre_spawn_sha) = with_oracle_write_lock(config, |db| {
-            Ok((now_epoch_ms(), db.oracle_pre_spawn_snapshot()?))
+            Ok((rag_rat_base::time::now_ms(), db.oracle_pre_spawn_snapshot()?))
         })?;
         let scip_output = config
             .database
@@ -364,13 +364,6 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_base::config::Config) {
     fn saturating_secs_to_ms(secs: u64) -> i64 {
         i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1000)
     }
-}
-
-fn now_epoch_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Load the config, mapping a missing file to a friendly hint instead of a raw IO error.

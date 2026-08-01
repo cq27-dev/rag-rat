@@ -4961,7 +4961,6 @@ dependencies = [
  "toon-format",
  "tracing",
  "tui-tree-widget",
- "url",
  "zeroize",
 ]
 

@@ -26,7 +26,6 @@ struct LanguageSpec {
     aliases: &'static [&'static str],
     simple_extensions: &'static [&'static str],
     target_extensions: &'static [&'static str],
-    supports_embeddings: bool,
 }
 
 const LANGUAGE_SPECS: [LanguageSpec; 9] = [
@@ -36,7 +35,6 @@ const LANGUAGE_SPECS: [LanguageSpec; 9] = [
         aliases: &["rs"],
         simple_extensions: &["rs"],
         target_extensions: &["rs"],
-        supports_embeddings: true,
     },
     LanguageSpec {
         language: Language::TypeScript,
@@ -44,7 +42,6 @@ const LANGUAGE_SPECS: [LanguageSpec; 9] = [
         aliases: &["ts", "tsx"],
         simple_extensions: &["ts", "tsx"],
         target_extensions: &["ts", "tsx"],
-        supports_embeddings: true,
     },
     LanguageSpec {
         language: Language::Kotlin,
@@ -52,7 +49,6 @@ const LANGUAGE_SPECS: [LanguageSpec; 9] = [
         aliases: &["kt"],
         simple_extensions: &["kt", "kts"],
         target_extensions: &["kt", "kts"],
-        supports_embeddings: true,
     },
     LanguageSpec {
         language: Language::C,
@@ -60,7 +56,6 @@ const LANGUAGE_SPECS: [LanguageSpec; 9] = [
         aliases: &[],
         simple_extensions: &["c", "h"],
         target_extensions: &["c", "h"],
-        supports_embeddings: true,
     },
     LanguageSpec {
         language: Language::Cpp,
@@ -68,7 +63,6 @@ const LANGUAGE_SPECS: [LanguageSpec; 9] = [
         aliases: &["c++", "cc", "cxx"],
         simple_extensions: &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++"],
         target_extensions: &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++", "h"],
-        supports_embeddings: true,
     },
     LanguageSpec {
         language: Language::Python,
@@ -76,7 +70,6 @@ const LANGUAGE_SPECS: [LanguageSpec; 9] = [
         aliases: &["py"],
         simple_extensions: &["py", "pyi"],
         target_extensions: &["py", "pyi"],
-        supports_embeddings: true,
     },
     LanguageSpec {
         language: Language::Swift,
@@ -84,7 +77,6 @@ const LANGUAGE_SPECS: [LanguageSpec; 9] = [
         aliases: &[],
         simple_extensions: &["swift"],
         target_extensions: &["swift"],
-        supports_embeddings: true,
     },
     LanguageSpec {
         language: Language::Go,
@@ -92,7 +84,6 @@ const LANGUAGE_SPECS: [LanguageSpec; 9] = [
         aliases: &["golang"],
         simple_extensions: &["go"],
         target_extensions: &["go"],
-        supports_embeddings: true,
     },
     LanguageSpec {
         language: Language::Markdown,
@@ -100,7 +91,6 @@ const LANGUAGE_SPECS: [LanguageSpec; 9] = [
         aliases: &["md"],
         simple_extensions: &["md", "markdown"],
         target_extensions: &["md", "markdown"],
-        supports_embeddings: true,
     },
 ];
 
@@ -171,10 +161,6 @@ impl Language {
     /// drift.
     pub fn default_include_globs(self) -> Vec<String> {
         self.target_extensions().iter().map(|ext| format!("**/*.{ext}")).collect()
-    }
-
-    pub fn supports_embeddings(self) -> bool {
-        self.spec().supports_embeddings
     }
 
     pub fn from_path(path: &std::path::Path) -> Option<Self> {

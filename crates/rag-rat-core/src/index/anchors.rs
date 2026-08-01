@@ -1,4 +1,4 @@
-use sha2::{Digest, Sha256};
+use rag_rat_base::hash::hex_sha256;
 
 #[derive(Debug, Clone)]
 pub struct ChunkAnchor {
@@ -148,14 +148,4 @@ fn context_hash(lines: &[&str], line: usize, radius: usize) -> String {
     let normalized =
         lines[start..end].iter().map(|line| line.trim()).collect::<Vec<_>>().join("\n");
     hex_sha256(normalized.as_bytes())
-}
-
-fn hex_sha256(bytes: &[u8]) -> String {
-    let hash = Sha256::digest(bytes);
-    let mut out = String::with_capacity(hash.len() * 2);
-    for byte in hash {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
