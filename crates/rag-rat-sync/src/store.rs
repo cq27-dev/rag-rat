@@ -403,12 +403,18 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
         .collect())
     }
 
-    fn ingest(&mut self, item: &ManifestItem, signed_bytes: &[u8]) -> anyhow::Result<Ingested> {
+    fn ingest(
+        &mut self,
+        item: &ManifestItem,
+        expected_device: [u8; 32],
+        signed_bytes: &[u8],
+    ) -> anyhow::Result<Ingested> {
         Ok(
             match rag_rat_oplog::table_sync_ingest(
                 self.conn,
                 self.account_id,
                 &to_oplog_stream(item),
+                expected_device,
                 signed_bytes,
                 (self.now_fn)(),
             )? {
@@ -466,6 +472,6 @@ mod tests {
         assert!(store.chain_page(&item, None, 1).unwrap().is_empty());
         assert_eq!(store.frontier(&item, [4; 32]).unwrap(), FrontierState::Empty);
         assert!(store.entries(&item, [4; 32], ChainStart::Beginning, 1).unwrap().is_empty());
-        assert_eq!(store.ingest(&item, &[0]).unwrap(), Ingested::NoChange);
+        assert_eq!(store.ingest(&item, [4; 32], &[0]).unwrap(), Ingested::NoChange);
     }
 }

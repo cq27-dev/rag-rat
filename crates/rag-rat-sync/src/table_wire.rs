@@ -95,7 +95,7 @@ pub enum TableFrame {
     Manifest(Manifest),
     ChainInventory { stream_id: Hash, chains: Vec<ChainHead> },
     ChainFrontiers { stream_id: Hash, frontiers: Vec<ChainFrontier> },
-    Entries { stream_id: Hash, entries: Vec<Vec<u8>> },
+    Entries { stream_id: Hash, device_fingerprint: Hash, entries: Vec<Vec<u8>> },
     InventoryDone { stream_id: Hash },
     StreamDone { stream_id: Hash, continuation_pending: bool },
     Done,
@@ -189,11 +189,12 @@ impl TableFrame {
                     }
                 }
             },
-            Self::Entries { stream_id, entries } => {
-                enc.array(4).expect(INFALLIBLE);
+            Self::Entries { stream_id, device_fingerprint, entries } => {
+                enc.array(5).expect(INFALLIBLE);
                 enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
                 enc.u8(tag::ENTRIES).expect(INFALLIBLE);
                 enc.bytes(stream_id).expect(INFALLIBLE);
+                enc.bytes(device_fingerprint).expect(INFALLIBLE);
                 enc.array(entries.len() as u64).expect(INFALLIBLE);
                 for entry in entries {
                     enc.bytes(entry).expect(INFALLIBLE);
@@ -236,7 +237,8 @@ impl TableFrame {
         let tag = dec.u8().map_err(m)?;
         let expected = match tag {
             tag::MANIFEST => 3,
-            tag::CHAIN_INVENTORY | tag::CHAIN_FRONTIERS | tag::ENTRIES | tag::STREAM_DONE => 4,
+            tag::CHAIN_INVENTORY | tag::CHAIN_FRONTIERS | tag::STREAM_DONE => 4,
+            tag::ENTRIES => 5,
             tag::INVENTORY_DONE => 3,
             tag::DONE | tag::ACK => 2,
             other => return Err(TableWireError::Malformed(format!("unknown frame tag {other}"))),
@@ -317,6 +319,7 @@ impl TableFrame {
             },
             tag::ENTRIES => {
                 let stream_id = fixed32(dec.bytes().map_err(m)?, "stream_id")?;
+                let device_fingerprint = fixed32(dec.bytes().map_err(m)?, "device_fingerprint")?;
                 let count =
                     bounded_count(dec.array().map_err(m)?, "entries", MAX_TABLE_ENTRIES_PER_PAGE)?;
                 if count == 0 {
@@ -333,7 +336,7 @@ impl TableFrame {
                     }
                     entries.push(entry.to_vec());
                 }
-                Self::Entries { stream_id, entries }
+                Self::Entries { stream_id, device_fingerprint, entries }
             },
             tag::INVENTORY_DONE =>
                 Self::InventoryDone { stream_id: fixed32(dec.bytes().map_err(m)?, "stream_id")? },
@@ -470,7 +473,11 @@ mod tests {
                     state: FrontierState::Restore { lamport: 4, entry_hash: [5; 32] },
                 }],
             },
-            TableFrame::Entries { stream_id: [2; 32], entries: vec![vec![4, 5]] },
+            TableFrame::Entries {
+                stream_id: [2; 32],
+                device_fingerprint: [3; 32],
+                entries: vec![vec![4, 5]],
+            },
             TableFrame::InventoryDone { stream_id: [2; 32] },
             TableFrame::StreamDone { stream_id: [2; 32], continuation_pending: true },
             TableFrame::Done,
@@ -501,7 +508,11 @@ mod tests {
                     state: FrontierState::Accepted { lamport: 4, entry_hash: [5; 32] },
                 }],
             },
-            TableFrame::Entries { stream_id: [2; 32], entries: vec![vec![4, 5]] },
+            TableFrame::Entries {
+                stream_id: [2; 32],
+                device_fingerprint: [3; 32],
+                entries: vec![vec![4, 5]],
+            },
             TableFrame::InventoryDone { stream_id: [2; 32] },
             TableFrame::StreamDone { stream_id: [2; 32], continuation_pending: false },
             TableFrame::Done,
@@ -514,8 +525,8 @@ mod tests {
             golden.extend_from_slice(&bytes);
         }
         assert_eq!(Sha256::digest(golden).as_slice(), &[
-            179, 118, 122, 4, 77, 8, 88, 205, 193, 56, 51, 53, 77, 23, 6, 51, 102, 205, 50, 183,
-            175, 163, 252, 103, 196, 7, 156, 70, 198, 195, 198, 251,
+            207, 130, 172, 222, 118, 237, 28, 115, 145, 245, 148, 105, 68, 107, 217, 78, 66, 164,
+            248, 205, 81, 83, 160, 84, 91, 124, 119, 163, 184, 98, 21, 236,
         ]);
     }
 
@@ -567,15 +578,17 @@ mod tests {
 
         let mut entries = Vec::new();
         let mut enc = Encoder::new(&mut entries);
-        enc.array(4).unwrap();
+        enc.array(5).unwrap();
         enc.str(FRAME_DOMAIN).unwrap();
         enc.u8(tag::ENTRIES).unwrap();
         enc.bytes(&[1; 32]).unwrap();
+        enc.bytes(&[2; 32]).unwrap();
         enc.array((MAX_TABLE_ENTRIES_PER_PAGE + 1) as u64).unwrap();
         assert!(matches!(TableFrame::decode(&entries), Err(TableWireError::OverCap(_))));
 
         let oversized = TableFrame::Entries {
             stream_id: [1; 32],
+            device_fingerprint: [2; 32],
             entries: vec![vec![0; MAX_TABLE_ENTRY_BYTES + 1]],
         }
         .encode();

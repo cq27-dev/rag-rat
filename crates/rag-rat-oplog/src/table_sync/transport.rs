@@ -138,10 +138,11 @@ pub fn table_sync_ingest(
     conn: &Connection,
     account_id: AccountId,
     stream: &TableSyncStream,
+    expected_device: [u8; 32],
     signed_bytes: &[u8],
     now_ms: i64,
 ) -> anyhow::Result<TableSyncIngestOutcome> {
-    ingest_against(conn, account_id, stream, signed_bytes, now_ms, SYNCABLE_TABLES)
+    ingest_against(conn, account_id, stream, expected_device, signed_bytes, now_ms, SYNCABLE_TABLES)
 }
 
 fn repo_registry(registry: &[TableSpec]) -> Vec<TableSpec> {
@@ -421,6 +422,7 @@ fn ingest_against(
     conn: &Connection,
     account_id: AccountId,
     stream: &TableSyncStream,
+    expected_device: [u8; 32],
     signed_bytes: &[u8],
     now_ms: i64,
     registry: &[TableSpec],
@@ -435,6 +437,9 @@ fn ingest_against(
         return Ok(TableSyncIngestOutcome::NoChange);
     }
     let signer = signed.entry.device_fingerprint;
+    if signer.to_bytes() != expected_device {
+        return Ok(TableSyncIngestOutcome::NoChange);
+    }
     let Some(pubkey_bytes) =
         account::stored_device_pubkeys(conn, account_id)?.get(&signer).copied()
     else {
@@ -551,7 +556,7 @@ mod tests {
         for route in [&stale, &unknown, &forged] {
             assert!(!validate_stream_against(&conn, account(), route, &[REPO_SPEC]).unwrap());
             assert_eq!(
-                ingest_against(&conn, account(), route, &[0], 0, &[REPO_SPEC]).unwrap(),
+                ingest_against(&conn, account(), route, [0; 32], &[0], 0, &[REPO_SPEC]).unwrap(),
                 TableSyncIngestOutcome::NoChange,
             );
         }
@@ -804,6 +809,7 @@ mod tests {
             )
             .unwrap();
         let local = crate::load_local_device(&source).unwrap().unwrap();
+        let author = local.public().fingerprint().to_bytes();
         let tx = source.transaction().unwrap();
         let ctx = SyncCtx {
             repo_id: "repo-a",
@@ -838,11 +844,18 @@ mod tests {
 
         let destination = restore(false);
         assert_eq!(
-            ingest_against(&destination, account, &route, &authored[0], 1, &[REPO_SPEC]).unwrap(),
+            ingest_against(&destination, account, &route, [0; 32], &authored[0], 1, &[REPO_SPEC],)
+                .unwrap(),
+            TableSyncIngestOutcome::NoChange,
+        );
+        assert_eq!(
+            ingest_against(&destination, account, &route, author, &authored[0], 1, &[REPO_SPEC],)
+                .unwrap(),
             TableSyncIngestOutcome::Stored,
         );
         assert_eq!(
-            ingest_against(&destination, account, &route, &authored[0], 2, &[REPO_SPEC]).unwrap(),
+            ingest_against(&destination, account, &route, author, &authored[0], 2, &[REPO_SPEC],)
+                .unwrap(),
             TableSyncIngestOutcome::NoChange,
         );
         let title: String = destination
@@ -856,7 +869,8 @@ mod tests {
 
         let removed = restore(true);
         assert_eq!(
-            ingest_against(&removed, account, &route, &authored[0], 1, &[REPO_SPEC]).unwrap(),
+            ingest_against(&removed, account, &route, author, &authored[0], 1, &[REPO_SPEC],)
+                .unwrap(),
             TableSyncIngestOutcome::NoChange,
         );
         let accepted: i64 = removed

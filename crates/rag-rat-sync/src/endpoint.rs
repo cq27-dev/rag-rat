@@ -1189,12 +1189,16 @@ mod tests {
         fn ingest(
             &mut self,
             item: &crate::table_wire::ManifestItem,
+            expected_device: [u8; 32],
             signed_bytes: &[u8],
         ) -> anyhow::Result<crate::session::Ingested> {
             if !self.supported.contains(item) {
                 return Ok(crate::session::Ingested::NoChange);
             }
             let hash: [u8; 32] = signed_bytes[..32].try_into()?;
+            if hash != expected_device {
+                return Ok(crate::session::Ingested::NoChange);
+            }
             Ok(match self.entries.entry(item.stream_id).or_default().entry(hash) {
                 std::collections::hash_map::Entry::Occupied(_) =>
                     crate::session::Ingested::NoChange,

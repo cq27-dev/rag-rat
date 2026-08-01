@@ -35,7 +35,12 @@ pub trait TableSyncStore {
         start: ChainStart,
         limit: usize,
     ) -> anyhow::Result<Vec<ChainEntry>>;
-    fn ingest(&mut self, item: &ManifestItem, signed_bytes: &[u8]) -> anyhow::Result<Ingested>;
+    fn ingest(
+        &mut self,
+        item: &ManifestItem,
+        expected_device: Hash,
+        signed_bytes: &[u8],
+    ) -> anyhow::Result<Ingested>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +362,7 @@ where
                         send,
                         &TableFrame::Entries {
                             stream_id: item.stream_id,
+                            device_fingerprint: chain.device_fingerprint,
                             entries: entries.into_iter().map(|entry| entry.signed_bytes).collect(),
                         },
                         idle_timeout,
@@ -456,8 +462,11 @@ where
                     .await?;
                     loop {
                         match read_before(recv, idle_timeout).await? {
-                            TableFrame::Entries { stream_id, entries }
-                                if stream_id == item.stream_id =>
+                            TableFrame::Entries { stream_id, device_fingerprint, entries }
+                                if stream_id == item.stream_id
+                                    && chains.iter().any(|chain| {
+                                        chain.device_fingerprint == device_fingerprint
+                                    }) =>
                             {
                                 received += entries.len();
                                 if received > limits.entries_per_session {
@@ -468,7 +477,7 @@ where
                                 }
                                 for bytes in entries {
                                     if store
-                                        .ingest(item, &bytes)
+                                        .ingest(item, device_fingerprint, &bytes)
                                         .map_err(TableSessionError::Store)?
                                         == Ingested::Stored
                                     {
@@ -771,13 +780,21 @@ mod tests {
                 .collect())
         }
 
-        fn ingest(&mut self, item: &ManifestItem, bytes: &[u8]) -> anyhow::Result<Ingested> {
+        fn ingest(
+            &mut self,
+            item: &ManifestItem,
+            expected_device: Hash,
+            bytes: &[u8],
+        ) -> anyhow::Result<Ingested> {
             if !self.supported.contains(item) {
                 return Ok(Ingested::NoChange);
             }
             let hash: Hash = bytes[..32].try_into()?;
             let device = [bytes[32]; 32];
             let lamport = u64::from_be_bytes(bytes[33..41].try_into()?);
+            if device != expected_device {
+                return Ok(Ingested::NoChange);
+            }
             Ok(match self.entries.entry(item.stream_id).or_default().entry(hash) {
                 std::collections::hash_map::Entry::Occupied(_) => Ingested::NoChange,
                 std::collections::hash_map::Entry::Vacant(slot) => {
@@ -1055,6 +1072,50 @@ mod tests {
                 matches!(result, Err(TableSessionError::Protocol(message)) if message.contains("cap"))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn entry_pages_must_name_a_chain_in_the_current_inventory() {
+        let shared = item("repo-a", 1);
+        let streams = vec![shared.clone()];
+        let mut store = MemStore::new(streams.clone());
+        let (mut receiver_send, mut peer_recv) = tokio::io::duplex(4096);
+        let (mut peer_send, mut receiver_recv) = tokio::io::duplex(4096);
+        let peer = async move {
+            table_codec::write_frame(&mut peer_send, &TableFrame::ChainInventory {
+                stream_id: shared.stream_id,
+                chains: vec![ChainHead {
+                    device_fingerprint: [1; 32],
+                    lamport: 0,
+                    entry_hash: [1; 32],
+                }],
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                table_codec::read_frame(&mut peer_recv).await.unwrap(),
+                TableFrame::ChainFrontiers { .. }
+            ));
+            table_codec::write_frame(&mut peer_send, &TableFrame::Entries {
+                stream_id: shared.stream_id,
+                device_fingerprint: [2; 32],
+                entries: vec![vec![0; 41]],
+            })
+            .await
+            .unwrap();
+        };
+        let receiver = receive_direction(
+            &mut store,
+            &streams,
+            &mut receiver_send,
+            &mut receiver_recv,
+            true,
+            DEFAULT_IDLE_TIMEOUT,
+            TableSessionLimits::default(),
+        );
+        let (result, ()) = tokio::join!(receiver, peer);
+        assert!(matches!(result, Err(TableSessionError::Protocol(_))));
+        assert!(store.entries.is_empty());
     }
 
     #[tokio::test]

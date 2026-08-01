@@ -90,6 +90,7 @@ mod tests {
         let mut sink = tokio::io::sink();
         let oversized = TableFrame::Entries {
             stream_id: [0; 32],
+            device_fingerprint: [1; 32],
             entries: vec![vec![0; MAX_TABLE_FRAME_BYTES as usize]],
         };
         assert!(matches!(
