@@ -508,8 +508,7 @@ fn clean_rust_type_name(raw: &str, at: Node<'_>, text: &str) -> Option<String> {
     if peel_deref_wrapper(cleaned, at, text) != cleaned {
         return None;
     }
-    let without_generics = degeneric_path(cleaned);
-    let type_str = without_generics.trim();
+    let type_str = cleaned.trim();
     if type_str.is_empty() {
         return None;
     }
@@ -522,7 +521,8 @@ fn clean_rust_type_name(raw: &str, at: Node<'_>, text: &str) -> Option<String> {
     {
         return None;
     }
-    let tail = qn_tail(type_str);
+    let identity_path = degeneric_path(type_str);
+    let tail = qn_tail(identity_path.trim());
     if tail.is_empty() {
         return None;
     }
@@ -536,7 +536,7 @@ fn clean_rust_type_name(raw: &str, at: Node<'_>, text: &str) -> Option<String> {
     if binders::binds_name(at, tail, text) {
         return None;
     }
-    if let Some((prefix, _)) = type_str.rsplit_once("::") {
+    if let Some((prefix, _)) = identity_path.rsplit_once("::") {
         let root = prefix.split("::").next().unwrap_or(prefix);
         if binders::binds_name(at, root, text) {
             return None;
@@ -573,7 +573,7 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
     let mut ancestor = call_node.parent();
     while let Some(node) = ancestor {
         if node.kind() == "block" {
-            match visible_let_binding(node, child_on_path.start_byte(), recv, text) {
+            match visible_let_binding(node, child_on_path, recv, text) {
                 // Assignment changes a value, never the binding's static type. Only a lexical
                 // rebind can replace this inference, and the scope walk handles those separately.
                 VisibleBinding::Typed(type_name) => return Some(type_name),
@@ -636,7 +636,7 @@ enum VisibleBinding {
 
 fn visible_let_binding(
     block: Node<'_>,
-    before_byte: usize,
+    before: Node<'_>,
     recv: &str,
     text: &str,
 ) -> VisibleBinding {
@@ -645,15 +645,17 @@ fn visible_let_binding(
     // call — rustc reports the parameter unused and resolves the call against the item. The scan
     // below is position-ordered because a `let` is; an item is not, and there is no expression to
     // read a type from, so the only sound answer is to decline.
-    if block_item_binds_value(block, recv, text) {
-        return VisibleBinding::Shadowed;
-    }
-    let mut cursor = block.walk();
-    let children = block
-        .named_children(&mut cursor)
-        .filter(|child| child.end_byte() <= before_byte)
-        .collect::<Vec<_>>();
-    for child in children.into_iter().rev() {
+    let mut sibling = before.prev_named_sibling();
+    while let Some(child) = sibling {
+        sibling = child.prev_named_sibling();
+        if child.kind() == "macro_invocation"
+            || child.named_child(0).is_some_and(|node| node.kind() == "macro_invocation")
+        {
+            // A statement macro can introduce a `let` for any identifier passed to it. A later
+            // explicit declaration would have stopped this reverse walk first; without one, the
+            // outer binding is not authoritative.
+            return VisibleBinding::Shadowed;
+        }
         if child.kind() != "let_declaration" {
             continue;
         }
@@ -666,6 +668,18 @@ fn visible_let_binding(
         if !match_simple_pattern(pattern, text, recv) {
             return VisibleBinding::Shadowed;
         }
+        if super::attribute_items(text, child).iter().any(|attribute| {
+            let name = attribute
+                .trim_start_matches(['#', '['])
+                .trim_start()
+                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .next();
+            matches!(name, Some("cfg" | "cfg_attr"))
+        }) {
+            // The index does not evaluate cfg. A conditional declaration may disappear and expose
+            // an earlier binding with a different type, so neither candidate is authoritative.
+            return VisibleBinding::Shadowed;
+        }
         let type_name = if let Some(type_node) = child.child_by_field_name("type") {
             clean_rust_type_name(&super::render_owner(type_node, text, &[]), type_node, text)
                 .and_then(|type_name| canonical_receiver_type(type_name, type_node, text))
@@ -674,7 +688,11 @@ fn visible_let_binding(
         };
         return type_name.map(VisibleBinding::Typed).unwrap_or(VisibleBinding::Shadowed);
     }
-    VisibleBinding::Missing
+    if block_item_binds_value(block, recv, text) {
+        VisibleBinding::Shadowed
+    } else {
+        VisibleBinding::Missing
+    }
 }
 
 /// Whether `scope` declares an item that occupies `name` in the VALUE namespace — the namespace a
@@ -894,14 +912,15 @@ fn declares_type_alias(context: Node<'_>, name: &str, text: &str) -> bool {
 }
 
 fn module_qualified_type_path(context: Node<'_>, raw_type: &str, text: &str) -> Option<String> {
-    let degeneric = degeneric_path(raw_type.trim());
-    let cleaned = degeneric.trim();
-    if cleaned.is_empty() || cleaned.starts_with('<') || cleaned.contains(" as ") {
+    let cleaned = raw_type.trim();
+    let structural = degeneric_path(cleaned);
+    let structural = structural.trim();
+    if structural.is_empty() || structural.starts_with('<') || structural.contains(" as ") {
         return None;
     }
     // `Self::Assoc` names an associated item of the enclosing impl, not a type this canonicalizer
     // can place. (Bare `Self` is the impl's own type and routes through `infer_self_type_hint`.)
-    if cleaned.strip_prefix("Self::").is_some() {
+    if structural.strip_prefix("Self::").is_some() {
         return None;
     }
     // A type ALIAS is a second name for something else, and the impl blocks are on the underlying
@@ -910,7 +929,7 @@ fn module_qualified_type_path(context: Node<'_>, raw_type: &str, text: &str) -> 
     // closes the bare-name fallback — the call would stop resolving at all. Expanding the alias
     // needs the right-hand side resolved in ITS own scope, which is more than this lexical pass
     // knows, so it declines and leaves the fallback open.
-    if declares_type_alias(context, cleaned, text) {
+    if declares_type_alias(context, structural, text) {
         return None;
     }
     // An import re-roots a path at the USE's target — somewhere the lexical module chain below
@@ -930,7 +949,7 @@ fn module_qualified_type_path(context: Node<'_>, raw_type: &str, text: &str) -> 
     // layer decline it is what keeps the two layers from disagreeing.
     //
     // `crate`/`self`/`super` are path keywords, never import bindings, and are resolved below.
-    let root = cleaned.split("::").next().unwrap_or(cleaned);
+    let root = structural.split("::").next().unwrap_or(structural);
     if !matches!(root, "crate" | "self" | "super") && lexical_scope_binds_name(context, root, text)
     {
         return Some(cleaned.to_string());
@@ -952,8 +971,11 @@ fn module_qualified_type_path(context: Node<'_>, raw_type: &str, text: &str) -> 
     if relative.is_empty() {
         return None;
     }
-    modules.extend(relative.split("::").map(str::to_string));
-    Some(modules.join("::"))
+    if modules.is_empty() {
+        Some(relative.to_string())
+    } else {
+        Some(format!("{}::{relative}", modules.join("::")))
+    }
 }
 
 /// Whether a `use` visible at `context` introduces `name`, scanning outward through block scopes
@@ -989,6 +1011,9 @@ fn scope_binds_name(scope: Node<'_>, name: &str, text: &str) -> bool {
             return false;
         }
         let declaration = &text[item.byte_range()];
+        if crate::index::edges::use_has_glob(declaration) {
+            return true;
+        }
         // Most scopes have no relevant import. Avoid the full use-tree walk unless the
         // declaration can contain this exact identifier.
         declaration.split(|ch: char| !ch.is_alphanumeric() && ch != '_').any(|part| part == name)
@@ -1080,10 +1105,13 @@ mod receiver_type_hint_tests {
         // An import of some OTHER name says nothing about this receiver.
         let unrelated = "fn f(worker: A) { use crate::items::other; worker.run(); }";
         assert_eq!(extract_call_hints(unrelated), vec![Some("A".to_string())]);
-        // A GLOB does not count. It cannot be resolved here, and declining on one would silence
-        // every receiver in the ordinary files that open with `use super::*;`.
+        // A glob may import a same-named item, so the outer parameter is no longer proven.
         let globbed = "fn f(worker: A) { use crate::items::*; worker.run(); }";
-        assert_eq!(extract_call_hints(globbed), vec![Some("A".to_string())]);
+        assert_eq!(extract_call_hints(globbed), vec![None]);
+        // A closer explicit declaration proves the binding despite an earlier glob.
+        let explicit =
+            "fn f(worker: A) { use crate::items::*; let worker: B = value; worker.run(); }";
+        assert_eq!(extract_call_hints(explicit), vec![Some("B".to_string())]);
         // An aliased import binds the ALIAS, not the original name.
         let aliased = "fn f(worker: A) { use crate::items::thing as worker; worker.run(); }";
         assert_eq!(extract_call_hints(aliased), vec![None]);
@@ -1194,6 +1222,15 @@ mod receiver_type_hint_tests {
             }
         "#;
         assert_eq!(extract_call_hints(code), vec![None]);
+
+        let unconditional = r#"
+            fn test() {
+                #[allow(unused)]
+                let worker: Alpha = alpha;
+                worker.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(unconditional), vec![Some("Alpha".to_string())]);
     }
 
     #[test]
@@ -1571,6 +1608,40 @@ mod receiver_type_hint_tests {
     }
 
     #[test]
+    fn conditional_bindings_decline_the_hint() {
+        let code = r#"
+            fn test() {
+                #[cfg(unix)]
+                let worker: Alpha = alpha;
+                #[cfg(windows)]
+                let worker: Beta = beta;
+                worker.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None]);
+    }
+
+    #[test]
+    fn a_preceding_macro_may_introduce_the_receiver_binding() {
+        let code = r#"
+            fn test(worker: Alpha) {
+                bind_worker!(worker);
+                worker.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None]);
+
+        let explicit = r#"
+            fn test(worker: Alpha) {
+                bind_worker!(worker);
+                let worker: Beta = beta;
+                worker.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(explicit), vec![Some("Beta".to_string())]);
+    }
+
+    #[test]
     fn test_destructuring_shadow_declined() {
         let code = r#"
             fn test(worker: &Alpha) {
@@ -1635,7 +1706,7 @@ mod receiver_type_hint_tests {
             impl<T> Box<T> { fn run(&self) {} }
             fn test(w: Box<Worker>) { w.run(); }
         "#;
-        assert_eq!(extract_call_hints(shadowed), vec![Some("Box".to_string())]);
+        assert_eq!(extract_call_hints(shadowed), vec![Some("Box<Worker>".to_string())]);
         let imported = r#"
             use std::sync::Arc;
             fn test(w: Arc<Worker>) { w.run(); }
@@ -1651,7 +1722,7 @@ mod receiver_type_hint_tests {
         let foreign = r#"
             fn test(w: custom::Box<Worker>) { w.run(); }
         "#;
-        assert_eq!(extract_call_hints(foreign), vec![Some("custom::Box".to_string())]);
+        assert_eq!(extract_call_hints(foreign), vec![Some("custom::Box<Worker>".to_string())]);
         // The standard crates are the roots that name the real pointer, but that pointer may carry
         // a local trait method before deref reaches the inner type.
         for rooted in ["std::boxed::Box", "alloc::sync::Arc", "core::pin::Pin"] {
@@ -1670,8 +1741,11 @@ mod receiver_type_hint_tests {
     fn a_container_that_does_not_deref_keeps_its_own_name() {
         for container in ["Option<Worker>", "Vec<Worker>", "Result<Worker, E>"] {
             let code = format!("fn test(w: {container}) {{ w.run(); }}");
-            let head = container.split('<').next().unwrap().to_string();
-            assert_eq!(extract_call_hints(&code), vec![Some(head)], "{container} does not deref");
+            assert_eq!(
+                extract_call_hints(&code),
+                vec![Some(container.replace(", ", ","))],
+                "{container} does not deref"
+            );
         }
     }
 
@@ -2057,5 +2131,32 @@ mod receiver_type_hint_tests {
         "#;
         assert_eq!(extract_call_hints(generic), vec![None]);
         assert_eq!(extract_call_hints(trait_object), vec![None]);
+    }
+
+    #[test]
+    fn concrete_generic_receiver_arguments_are_preserved() {
+        let code = r#"
+            fn test(first: Foo<u8>, second: Foo<u16>) {
+                first.run();
+                second.run();
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![
+            Some("Foo<u8>".to_string()),
+            Some("Foo<u16>".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn receiver_hint_scan_handles_twenty_thousand_nearby_bindings() {
+        let mut code = String::from("fn test() {");
+        for _ in 0..20_000 {
+            code.push_str("let worker = value; worker.run();");
+        }
+        code.push('}');
+
+        let hints = extract_call_hints(&code);
+        assert_eq!(hints.len(), 20_000);
+        assert!(hints.into_iter().all(|hint| hint.is_none()));
     }
 }

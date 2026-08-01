@@ -257,8 +257,8 @@ fn path_dependency_is_in_corpus(manifest_dir: &Path, path: &str, root: &Path) ->
 /// Handles restricted visibility (`pub(crate) use …`, `pub(in path) use …`), brace groups
 /// (including nesting), `as` aliases (the alias is the bound name), and `self` in a group (binds
 /// the parent segment). Returns `None` for a non-`use`/unparseable form; a glob (`*`) contributes
-/// no specific binding (the names it brings in are unknowable, so it fails open — suppresses
-/// nothing).
+/// no specific leaf binding; its wildcard scope is recorded separately because every imported name
+/// is potentially shadowed.
 pub(crate) fn parse_use(use_text: &str) -> Option<(String, Vec<String>)> {
     // Comments are lexer trivia, so nothing downstream of the tokens may see them; a leaf compared
     // as raw text otherwise reads `/* kept */ Worker` and reports `Worker` unbound.
@@ -288,6 +288,22 @@ pub(crate) fn use_binds_name(use_text: &str, name: &str) -> bool {
     let tree = rest.strip_suffix(';').unwrap_or(rest).trim();
     let tree = tree.strip_prefix("::").unwrap_or(tree);
     use_tree_binds_name(tree, name)
+}
+
+pub(crate) fn use_has_glob(use_text: &str) -> bool {
+    let use_text = super::scope_grammar::strip_comments(use_text);
+    let Some(rest) = strip_use_visibility(use_text.trim()) else { return false };
+    let tree = rest.strip_suffix(';').unwrap_or(rest).trim();
+    use_tree_has_glob(tree.strip_prefix("::").unwrap_or(tree))
+}
+
+fn use_tree_has_glob(tree: &str) -> bool {
+    let tree = tree.trim();
+    match tree.find('{') {
+        None => tree.rsplit("::").next().is_some_and(|leaf| leaf.trim() == "*"),
+        Some(open) =>
+            split_top_level(brace_inner(&tree[open..])).into_iter().any(use_tree_has_glob),
+    }
 }
 
 fn use_tree_binds_name(tree: &str, name: &str) -> bool {
@@ -799,6 +815,7 @@ impl ImportScope {
             ));
         }
         let Some((root, leaves)) = parse_use(use_text) else { return };
+        let has_glob = use_has_glob(use_text);
         let (scope_start, scope_end, mod_id) = match scope {
             Some(scope) => (scope.scope_start, scope.scope_end, scope.mod_id),
             // A pre-#61 import edge (or a test) with no scope columns: fall open to whole-file,
@@ -822,7 +839,7 @@ impl ImportScope {
             );
         }
         let file = self.by_file.entry(file_id).or_default();
-        for leaf in leaves {
+        for leaf in leaves.into_iter().chain(has_glob.then(|| "*".to_string())) {
             let binding = ImportBinding { root: root.clone(), scope_start, scope_end, mod_id };
             let bindings = file.entry(leaf).or_default();
             // Dedup exact repeats (the same leaf re-emitted under the truncated-evidence edges of
@@ -995,6 +1012,23 @@ impl ImportScope {
     /// lexically, which for a bare type means its own crate declares it.
     pub(crate) fn is_import_bound(&self, file_id: i64, name: &str, ref_byte: usize) -> bool {
         self.covering_root(file_id, name, ref_byte).is_some()
+    }
+
+    /// Whether the effective import evidence for `name` is a wildcard rather than a closer named
+    /// import. A wildcard can introduce any type, so receiver ownership is ambiguous.
+    pub(crate) fn is_glob_import_bound(&self, file_id: i64, name: &str, ref_byte: usize) -> bool {
+        let Some(names) = self.by_file.get(&file_id) else { return false };
+        let ref_mod_id = self.ref_mod_id(file_id, ref_byte);
+        let narrowest = |key: &str| {
+            names
+                .get(key)
+                .into_iter()
+                .flatten()
+                .filter(|binding| binding.covers(ref_byte, ref_mod_id))
+                .map(ImportBinding::span)
+                .min()
+        };
+        narrowest("*").is_some_and(|glob| narrowest(name).is_none_or(|named| glob < named))
     }
 
     /// Whether `name` at `ref_byte` in `file_id` was imported from an EXTERNAL dependency crate —
@@ -1273,6 +1307,18 @@ mod tests {
         agreed.add_use(2, "use local_crate::Worker;", span);
         agreed.finalize();
         assert!(!agreed.covering_roots_disagree(2, "Worker", 10));
+    }
+
+    #[test]
+    fn a_covering_glob_is_ambiguous_unless_a_closer_named_import_wins() {
+        let mut scope = ImportScope::default();
+        scope.add_use(1, "use crate::outer::*;", Some(scope_at_file_root(0, 500)));
+        scope.add_use(1, "use crate::inner::Worker;", Some(use_in_mod(100, 400, 100)));
+        scope.finalize();
+
+        assert!(scope.is_glob_import_bound(1, "Worker", 50));
+        assert!(!scope.is_import_bound(1, "Worker", 50));
+        assert!(!scope.is_glob_import_bound(1, "Worker", 200));
     }
 
     #[test]

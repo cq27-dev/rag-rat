@@ -47,7 +47,7 @@ fn receiver_root_origin(
     }
     if import_scope.is_import_bound(file_id, root, ref_byte)
         || qualified_root == Some(crate::index::languages::QualifiedRoot::Local)
-        || !resolved_hint.contains("::")
+        || scope_grammar::segments(resolved_hint).len() == 1
         || index.defines_type_scope(resolved_hint)
     {
         RootOrigin::Local
@@ -77,14 +77,24 @@ fn receiver_type_identity<'a>(
         ReceiverTypeHintResolution::Original(hint) => (hint, false),
         ReceiverTypeHintResolution::Alias(hint) => (hint, true),
     };
-    let original_root = original_hint
-        .map(str::trim)
-        .filter(|hint| !hint.is_empty())
-        .map(|hint| hint.split_once("::").map_or(hint, |(root, _)| root));
+    let original_path =
+        original_hint.map(str::trim).filter(|hint| !hint.is_empty()).map(degeneric_path);
+    let original_root =
+        original_path.as_deref().map(|hint| hint.split_once("::").map_or(hint, |(root, _)| root));
+    let resolved_path = resolved_hint.map(degeneric_path);
+    if original_root.is_some_and(|root| {
+        import_scope.is_glob_import_bound(file_id, root, ref_byte)
+            && !index.file_defines(file_id, qn_tail(resolved_path.as_deref().unwrap_or(root)))
+    }) {
+        return Some(ReceiverTypeIdentity::Ambiguous);
+    }
     if alias_bound && resolved_hint.is_none() {
         return Some(ReceiverTypeIdentity::Ambiguous);
     }
     let identity = ReceiverTypeIdentity::classify(resolved_hint, |resolved_root| {
+        let resolved_path = degeneric_path(resolved_root);
+        let resolved_root =
+            resolved_path.split_once("::").map_or(resolved_path.as_str(), |(root, _)| root);
         receiver_root_origin(
             import_scope,
             index,
@@ -114,13 +124,17 @@ fn receiver_package(
     hint: Option<&str>,
     ref_byte: usize,
 ) -> Option<i64> {
-    hint.map(str::trim)
-        .filter(|hint| !hint.is_empty())
-        .filter(|hint| {
-            let root = hint.split_once("::").map_or(*hint, |(root, _)| root);
-            !import_scope.is_import_bound(file_id, root, ref_byte)
-        })
-        .and_then(|_| import_scope.package_of(file_id))
+    let hint = hint?.trim();
+    if hint.is_empty() {
+        return None;
+    }
+    let structural = degeneric_path(hint);
+    let root = structural.split_once("::").map_or(structural.as_str(), |(root, _)| root);
+    if import_scope.is_import_bound(file_id, root, ref_byte) {
+        None
+    } else {
+        import_scope.package_of(file_id)
+    }
 }
 
 /// Apply a language package's import-alias rewrite. The shared resolver owns scope lookup and the
@@ -1091,6 +1105,7 @@ pub(crate) fn resolve_symbol<'a>(
                 .filter(|symbol| {
                     kind_matches(symbol)
                         && in_receiver_package(symbol)
+                        && scope_grammar::generic_arguments_compatible(target, &symbol.scope_path)
                         && (!require_alias_file
                             || alias_owner_matches_symbol_file(type_hint, symbol))
                 })

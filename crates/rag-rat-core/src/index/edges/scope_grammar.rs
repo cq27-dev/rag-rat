@@ -38,6 +38,10 @@ impl Depth {
     fn in_angle(self) -> bool {
         self.angle > 0
     }
+
+    fn is_outer_angle(self) -> bool {
+        self.angle == 1 && self.group == 0
+    }
 }
 
 /// What one char of a path IS, for consumers that treat the three differently: structure is only
@@ -284,6 +288,61 @@ pub(crate) fn degeneric(path: &str) -> String {
     out
 }
 
+/// Whether corresponding generic arguments can name the same receiver owner. Missing arguments
+/// and `_` are intentionally non-concrete; two different concrete arguments are not.
+pub(crate) fn generic_arguments_compatible(left: &str, right: &str) -> bool {
+    segments(left).into_iter().zip(segments(right)).all(|(left, right)| {
+        let left = strip_receiver_wrappers(strip_trait_marker(left));
+        let right = strip_receiver_wrappers(strip_trait_marker(right));
+        match (generic_arguments(left), generic_arguments(right)) {
+            (Some(left), Some(right)) => {
+                let mut left = split_arguments(left);
+                let mut right = split_arguments(right);
+                loop {
+                    match (left.next(), right.next()) {
+                        (Some(left), Some(right))
+                            if left == "_" || right == "_" || left == right => {},
+                        (None, None) => break true,
+                        _ => break false,
+                    }
+                }
+            },
+            _ => true,
+        }
+    })
+}
+
+fn generic_arguments(segment: &str) -> Option<&str> {
+    let mut start = None;
+    let mut end = None;
+    scan(segment, |at, ch, depth, span| {
+        if !span.is_code() || !depth.is_outer_angle() {
+            return;
+        }
+        if ch == '<' && start.is_none() {
+            start = Some(at + 1);
+        } else if ch == '>' {
+            end = Some(at);
+        }
+    });
+    Some(&segment[start?..end?])
+}
+
+fn split_arguments(arguments: &str) -> impl Iterator<Item = &str> {
+    let mut commas = Vec::new();
+    scan(arguments, |at, ch, depth, span| {
+        if span.is_code() && depth.is_top() && ch == ',' {
+            commas.push(at);
+        }
+    });
+    let mut start = 0;
+    commas.into_iter().chain(std::iter::once(arguments.len())).map(move |end| {
+        let argument = arguments[start..end].trim();
+        start = end + 1;
+        argument
+    })
+}
+
 /// `text` with every comment replaced by one space, so the tokens either side stay apart.
 ///
 /// A comment is trivia the Rust lexer drops before anything sees the tokens, so any parser reading
@@ -341,6 +400,14 @@ mod tests {
         assert_eq!(segments("Foo<A::B>::run"), vec!["Foo<A::B>", "run"]);
         assert_eq!(segments("[u8; { a::b() }]::run"), vec!["[u8; { a::b() }]", "run"]);
         assert_eq!(segments("W as a.Tr::run"), vec!["W as a.Tr", "run"]);
+    }
+
+    #[test]
+    fn concrete_generic_arguments_must_match() {
+        assert!(generic_arguments_compatible("Foo<u8>::run", "Foo<u8> as Runs::run"));
+        assert!(!generic_arguments_compatible("Foo<u8>::run", "Foo<u16> as Runs::run"));
+        assert!(generic_arguments_compatible("Foo<u8>::run", "Foo<_> as Runs::run"));
+        assert!(generic_arguments_compatible("Foo<u8>::run", "Foo as Runs::run"));
     }
 
     #[test]

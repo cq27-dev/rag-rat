@@ -1193,6 +1193,37 @@ fn typed_local_receiver_reaches_only_compatible_trait_default() {
 }
 
 #[test]
+fn normalized_receiver_fallback_rejects_different_concrete_arguments() {
+    let mut u8_run = preferred_candidate(1, Language::Rust, "function");
+    u8_run.name = "run".to_string();
+    u8_run.scope_path = "Foo<u8> as Runs::run".to_string();
+    let mut u16_run = preferred_candidate(2, Language::Rust, "function");
+    u16_run.name = "run".to_string();
+    u16_run.scope_path = "Foo<u16> as Runs::run".to_string();
+    let request = || ResolveSymbolRequest {
+        name: "run",
+        target_qualified_name: None,
+        edge_kind: EdgeKind::CallsName,
+        evidence: Some("value.run()"),
+        receiver_hint: Some("value"),
+        receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Foo<u8>")),
+        source_file_id: 9,
+        source_language: Some(Language::Rust.as_str()),
+        imported_external: false,
+        receiver_package: None,
+        file_package: no_packages(),
+    };
+
+    let both = [u8_run, u16_run];
+    let index = SymbolIndex::build(&both);
+    let resolved = resolve_symbol(request(), &index).unwrap();
+    assert_eq!(resolved.0.scope_path, "Foo<u8> as Runs::run");
+
+    let wrong_only = [both[1].clone()];
+    assert!(resolve_symbol(request(), &SymbolIndex::build(&wrong_only)).is_none());
+}
+
+#[test]
 fn nested_trait_default_accepts_an_explicit_same_package_impl_identity() {
     let mut run = preferred_candidate(1, Language::Rust, "function");
     run.name = "run".to_string();
@@ -1448,6 +1479,13 @@ fn receiver_type_identity_classification() {
     assert_eq!(
         ReceiverTypeIdentity::classify(Some("Worker"), external),
         Some(ReceiverTypeIdentity::LocalUnqualified("Worker"))
+    );
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("Foo<module::Item>"), |root| {
+            assert_eq!(root, "Foo");
+            RootOrigin::Local
+        }),
+        Some(ReceiverTypeIdentity::LocalUnqualified("Foo<module::Item>"))
     );
     // Present-but-empty evidence is Ambiguous (suppresses bare fallback); absent is None.
     assert_eq!(

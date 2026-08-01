@@ -1,7 +1,7 @@
 pub(in crate::index) mod extract;
 mod helpers;
 mod imports;
-pub(crate) use imports::{ImportScope, use_binds_name};
+pub(crate) use imports::{ImportScope, use_binds_name, use_has_glob};
 mod intern;
 mod resolve;
 pub(crate) mod scope_grammar;
@@ -870,8 +870,9 @@ impl<'a> ReceiverTypeIdentity<'a> {
         if hint.is_empty() {
             return Some(Self::Ambiguous);
         }
-        let root = hint.split_once("::").map_or(hint, |(root, _)| root);
-        Some(match (root_origin(root), hint.contains("::")) {
+        let segments = scope_grammar::segments(hint);
+        let root = degeneric_path(segments[0]);
+        Some(match (root_origin(&root), segments.len() > 1) {
             (RootOrigin::Ambiguous, _) => Self::Ambiguous,
             (RootOrigin::Unknown, _) => Self::Ambiguous,
             (RootOrigin::External, _) => Self::ExternalQualified(hint),
