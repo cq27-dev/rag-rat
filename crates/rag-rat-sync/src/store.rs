@@ -16,8 +16,8 @@ use rusqlite::Connection;
 
 use crate::auth::{LocalAuth, NodeAuth, PeerAuthorization, PeerCapability};
 use crate::session::{Ingested, SyncStore};
-use crate::table_session::TableSyncStore;
-use crate::table_wire::ManifestItem;
+use crate::table_session::{ChainEntry, ChainStart, TableSyncStore};
+use crate::table_wire::{ChainHead, FrontierState, ManifestItem};
 
 /// Mint this account's signed node binding for `local_node`. A store with no local device yet (a
 /// fresh peer being onboarded) has nothing to prove, so it returns an EMPTY binding rather than
@@ -333,14 +333,73 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
         )
     }
 
-    fn snapshot(&self, item: &ManifestItem) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
-        Ok(rag_rat_oplog::table_sync_entries_for_stream(
+    fn chain_page(
+        &self,
+        item: &ManifestItem,
+        after_device: Option<[u8; 32]>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ChainHead>> {
+        Ok(rag_rat_oplog::table_sync_chain_page_after(
             self.conn,
             self.account_id,
             &to_oplog_stream(item),
+            after_device,
+            limit,
         )?
         .into_iter()
-        .map(|bytes| (rag_rat_oplog::table_sync_signed_hash(&bytes), bytes))
+        .map(|chain| ChainHead {
+            device_fingerprint: chain.device_fingerprint,
+            lamport: chain.lamport,
+            entry_hash: chain.entry_hash,
+        })
+        .collect())
+    }
+
+    fn frontier(&self, item: &ManifestItem, device: [u8; 32]) -> anyhow::Result<FrontierState> {
+        Ok(
+            match rag_rat_oplog::table_sync_chain_frontier(
+                self.conn,
+                self.account_id,
+                &to_oplog_stream(item),
+                device,
+            )? {
+                rag_rat_oplog::TableSyncFrontier::Empty => FrontierState::Empty,
+                rag_rat_oplog::TableSyncFrontier::Accepted { lamport, entry_hash } =>
+                    FrontierState::Accepted { lamport, entry_hash },
+                rag_rat_oplog::TableSyncFrontier::Restore { lamport, entry_hash } =>
+                    FrontierState::Restore { lamport, entry_hash },
+            },
+        )
+    }
+
+    fn entries(
+        &self,
+        item: &ManifestItem,
+        device: [u8; 32],
+        start: ChainStart,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ChainEntry>> {
+        let start = match start {
+            ChainStart::Beginning => rag_rat_oplog::TableSyncEntryStart::Beginning,
+            ChainStart::After { lamport, entry_hash } =>
+                rag_rat_oplog::TableSyncEntryStart::After { lamport, entry_hash },
+            ChainStart::At { lamport, entry_hash } =>
+                rag_rat_oplog::TableSyncEntryStart::At { lamport, entry_hash },
+        };
+        Ok(rag_rat_oplog::table_sync_chain_entries(
+            self.conn,
+            self.account_id,
+            &to_oplog_stream(item),
+            device,
+            start,
+            limit,
+        )?
+        .into_iter()
+        .map(|entry| ChainEntry {
+            lamport: entry.lamport,
+            entry_hash: entry.entry_hash,
+            signed_bytes: entry.signed_bytes,
+        })
         .collect())
     }
 
@@ -404,7 +463,9 @@ mod tests {
         assert!(!store.has_streams().unwrap());
         assert!(store.supported_streams().unwrap().is_empty());
         assert!(!store.validates(&item).unwrap());
-        assert!(store.snapshot(&item).unwrap().is_empty());
+        assert!(store.chain_page(&item, None, 1).unwrap().is_empty());
+        assert_eq!(store.frontier(&item, [4; 32]).unwrap(), FrontierState::Empty);
+        assert!(store.entries(&item, [4; 32], ChainStart::Beginning, 1).unwrap().is_empty());
         assert_eq!(store.ingest(&item, &[0]).unwrap(), Ingested::NoChange);
     }
 }

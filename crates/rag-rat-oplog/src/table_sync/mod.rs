@@ -39,6 +39,8 @@ pub(crate) use store::{
     PendingReason, author_row_entry, mark_entry_pending, record_stream_context,
 };
 pub use transport::{
-    TableSyncIngestOutcome, TableSyncStream, table_sync_entries_for_stream, table_sync_ingest,
-    table_sync_signed_hash, table_sync_supported_streams, table_sync_validate_stream,
+    TableSyncChainEntry, TableSyncChainHead, TableSyncEntryStart, TableSyncFrontier,
+    TableSyncIngestOutcome, TableSyncStream, table_sync_chain_entries, table_sync_chain_frontier,
+    table_sync_chain_page_after, table_sync_ingest, table_sync_supported_streams,
+    table_sync_validate_stream,
 };

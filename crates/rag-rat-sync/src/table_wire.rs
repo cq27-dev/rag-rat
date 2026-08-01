@@ -5,13 +5,16 @@ use std::collections::BTreeMap;
 use minicbor::{Decoder, Encoder};
 
 /// Dedicated ALPN for table-stream sync. Existing account/content/enrollment ALPNs do not move.
-pub const TABLE_SYNC_ALPN: &[u8] = b"rag-rat/table-sync/1";
+pub const TABLE_SYNC_ALPN: &[u8] = b"rag-rat/table-sync/2";
 
-const FRAME_DOMAIN: &str = "rag-rat/table-sync-frame/1";
+const FRAME_DOMAIN: &str = "rag-rat/table-sync-frame/2";
 pub const MAX_MANIFEST_ITEMS: usize = 1024;
 pub const MAX_REPO_ID_BYTES: usize = 1024;
 pub const MAX_SCOPE_ID_BYTES: usize = 128;
-pub const MAX_TABLE_INVENTORY_HASHES: usize = 65_536;
+pub const MAX_TABLE_CHAINS_PER_PAGE: usize = 1024;
+/// Hard protocol ceiling on historical device chains across one manifest intersection. Entry
+/// history within those chains remains incrementally unbounded.
+pub const MAX_TABLE_CHAINS_PER_SESSION: usize = 65_536;
 pub const MAX_TABLE_ENTRIES_PER_PAGE: usize = 32;
 pub const MAX_TABLE_ENTRY_BYTES: usize = rag_rat_oplog::TABLE_SYNC_ENTRY_MAX_BYTES;
 
@@ -64,24 +67,50 @@ impl Manifest {
     }
 }
 
-/// Table-session frames. Every inventory and entry page is explicitly stream-qualified.
+/// The accepted tip of one device chain offered by a sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainHead {
+    pub device_fingerprint: Hash,
+    pub lamport: u64,
+    pub entry_hash: Hash,
+}
+
+/// Durable receiver progress for one offered device chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontierState {
+    Empty,
+    Accepted { lamport: u64, entry_hash: Hash },
+    Restore { lamport: u64, entry_hash: Hash },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainFrontier {
+    pub device_fingerprint: Hash,
+    pub state: FrontierState,
+}
+
+/// Table-session frames. Every chain and entry page is explicitly stream-qualified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableFrame {
     Manifest(Manifest),
-    Inventory { stream_id: Hash, have: Vec<Hash> },
-    Entries { stream_id: Hash, entries: Vec<Vec<u8>>, more: bool },
-    StreamDone { stream_id: Hash },
+    ChainInventory { stream_id: Hash, chains: Vec<ChainHead> },
+    ChainFrontiers { stream_id: Hash, frontiers: Vec<ChainFrontier> },
+    Entries { stream_id: Hash, entries: Vec<Vec<u8>> },
+    InventoryDone { stream_id: Hash },
+    StreamDone { stream_id: Hash, continuation_pending: bool },
     Done,
     Ack,
 }
 
 mod tag {
     pub const MANIFEST: u8 = 0;
-    pub const INVENTORY: u8 = 1;
-    pub const ENTRIES: u8 = 2;
-    pub const STREAM_DONE: u8 = 3;
-    pub const DONE: u8 = 4;
-    pub const ACK: u8 = 5;
+    pub const CHAIN_INVENTORY: u8 = 1;
+    pub const CHAIN_FRONTIERS: u8 = 2;
+    pub const ENTRIES: u8 = 3;
+    pub const INVENTORY_DONE: u8 = 4;
+    pub const STREAM_DONE: u8 = 5;
+    pub const DONE: u8 = 6;
+    pub const ACK: u8 = 7;
 }
 
 #[derive(Debug)]
@@ -119,18 +148,49 @@ impl TableFrame {
                     enc.bytes(&item.stream_id).expect(INFALLIBLE);
                 }
             },
-            Self::Inventory { stream_id, have } => {
+            Self::ChainInventory { stream_id, chains } => {
                 enc.array(4).expect(INFALLIBLE);
                 enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
-                enc.u8(tag::INVENTORY).expect(INFALLIBLE);
+                enc.u8(tag::CHAIN_INVENTORY).expect(INFALLIBLE);
                 enc.bytes(stream_id).expect(INFALLIBLE);
-                enc.array(have.len() as u64).expect(INFALLIBLE);
-                for hash in have {
-                    enc.bytes(hash).expect(INFALLIBLE);
+                enc.array(chains.len() as u64).expect(INFALLIBLE);
+                for chain in chains {
+                    enc.array(3).expect(INFALLIBLE);
+                    enc.bytes(&chain.device_fingerprint).expect(INFALLIBLE);
+                    enc.u64(chain.lamport).expect(INFALLIBLE);
+                    enc.bytes(&chain.entry_hash).expect(INFALLIBLE);
                 }
             },
-            Self::Entries { stream_id, entries, more } => {
-                enc.array(5).expect(INFALLIBLE);
+            Self::ChainFrontiers { stream_id, frontiers } => {
+                enc.array(4).expect(INFALLIBLE);
+                enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
+                enc.u8(tag::CHAIN_FRONTIERS).expect(INFALLIBLE);
+                enc.bytes(stream_id).expect(INFALLIBLE);
+                enc.array(frontiers.len() as u64).expect(INFALLIBLE);
+                for frontier in frontiers {
+                    enc.array(4).expect(INFALLIBLE);
+                    enc.bytes(&frontier.device_fingerprint).expect(INFALLIBLE);
+                    match frontier.state {
+                        FrontierState::Empty => {
+                            enc.u8(0).expect(INFALLIBLE);
+                            enc.null().expect(INFALLIBLE);
+                            enc.null().expect(INFALLIBLE);
+                        },
+                        FrontierState::Accepted { lamport, entry_hash } => {
+                            enc.u8(1).expect(INFALLIBLE);
+                            enc.u64(lamport).expect(INFALLIBLE);
+                            enc.bytes(&entry_hash).expect(INFALLIBLE);
+                        },
+                        FrontierState::Restore { lamport, entry_hash } => {
+                            enc.u8(2).expect(INFALLIBLE);
+                            enc.u64(lamport).expect(INFALLIBLE);
+                            enc.bytes(&entry_hash).expect(INFALLIBLE);
+                        },
+                    }
+                }
+            },
+            Self::Entries { stream_id, entries } => {
+                enc.array(4).expect(INFALLIBLE);
                 enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
                 enc.u8(tag::ENTRIES).expect(INFALLIBLE);
                 enc.bytes(stream_id).expect(INFALLIBLE);
@@ -138,13 +198,19 @@ impl TableFrame {
                 for entry in entries {
                     enc.bytes(entry).expect(INFALLIBLE);
                 }
-                enc.bool(*more).expect(INFALLIBLE);
             },
-            Self::StreamDone { stream_id } => {
+            Self::InventoryDone { stream_id } => {
                 enc.array(3).expect(INFALLIBLE);
+                enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
+                enc.u8(tag::INVENTORY_DONE).expect(INFALLIBLE);
+                enc.bytes(stream_id).expect(INFALLIBLE);
+            },
+            Self::StreamDone { stream_id, continuation_pending } => {
+                enc.array(4).expect(INFALLIBLE);
                 enc.str(FRAME_DOMAIN).expect(INFALLIBLE);
                 enc.u8(tag::STREAM_DONE).expect(INFALLIBLE);
                 enc.bytes(stream_id).expect(INFALLIBLE);
+                enc.bool(*continuation_pending).expect(INFALLIBLE);
             },
             Self::Done => {
                 enc.array(2).expect(INFALLIBLE);
@@ -170,9 +236,8 @@ impl TableFrame {
         let tag = dec.u8().map_err(m)?;
         let expected = match tag {
             tag::MANIFEST => 3,
-            tag::INVENTORY => 4,
-            tag::ENTRIES => 5,
-            tag::STREAM_DONE => 3,
+            tag::CHAIN_INVENTORY | tag::CHAIN_FRONTIERS | tag::ENTRIES | tag::STREAM_DONE => 4,
+            tag::INVENTORY_DONE => 3,
             tag::DONE | tag::ACK => 2,
             other => return Err(TableWireError::Malformed(format!("unknown frame tag {other}"))),
         };
@@ -183,23 +248,80 @@ impl TableFrame {
         }
         let frame = match tag {
             tag::MANIFEST => Self::Manifest(decode_manifest(&mut dec)?),
-            tag::INVENTORY => {
+            tag::CHAIN_INVENTORY => {
                 let stream_id = fixed32(dec.bytes().map_err(m)?, "stream_id")?;
                 let count = bounded_count(
                     dec.array().map_err(m)?,
-                    "inventory hashes",
-                    MAX_TABLE_INVENTORY_HASHES,
+                    "device chains",
+                    MAX_TABLE_CHAINS_PER_PAGE,
                 )?;
-                let mut have = Vec::with_capacity(count);
-                for _ in 0..count {
-                    have.push(fixed32(dec.bytes().map_err(m)?, "inventory hash")?);
+                if count == 0 {
+                    return Err(TableWireError::Malformed("empty chain inventory page".into()));
                 }
-                Self::Inventory { stream_id, have }
+                let mut chains = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if dec.array().map_err(m)? != Some(3) {
+                        return Err(TableWireError::Malformed("chain head arity".into()));
+                    }
+                    chains.push(ChainHead {
+                        device_fingerprint: fixed32(dec.bytes().map_err(m)?, "device_fingerprint")?,
+                        lamport: dec.u64().map_err(m)?,
+                        entry_hash: fixed32(dec.bytes().map_err(m)?, "entry_hash")?,
+                    });
+                }
+                validate_devices(chains.iter().map(|chain| chain.device_fingerprint))?;
+                Self::ChainInventory { stream_id, chains }
+            },
+            tag::CHAIN_FRONTIERS => {
+                let stream_id = fixed32(dec.bytes().map_err(m)?, "stream_id")?;
+                let count = bounded_count(
+                    dec.array().map_err(m)?,
+                    "chain frontiers",
+                    MAX_TABLE_CHAINS_PER_PAGE,
+                )?;
+                if count == 0 {
+                    return Err(TableWireError::Malformed("empty chain frontier page".into()));
+                }
+                let mut frontiers = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if dec.array().map_err(m)? != Some(4) {
+                        return Err(TableWireError::Malformed("chain frontier arity".into()));
+                    }
+                    let device_fingerprint =
+                        fixed32(dec.bytes().map_err(m)?, "device_fingerprint")?;
+                    let state = match dec.u8().map_err(m)? {
+                        0 => {
+                            dec.null().map_err(m)?;
+                            dec.null().map_err(m)?;
+                            FrontierState::Empty
+                        },
+                        mode @ 1..=2 => {
+                            let lamport = dec.u64().map_err(m)?;
+                            let entry_hash = fixed32(dec.bytes().map_err(m)?, "entry_hash")?;
+                            if mode == 1 {
+                                FrontierState::Accepted { lamport, entry_hash }
+                            } else {
+                                FrontierState::Restore { lamport, entry_hash }
+                            }
+                        },
+                        mode => {
+                            return Err(TableWireError::Malformed(format!(
+                                "unknown chain frontier mode {mode}"
+                            )));
+                        },
+                    };
+                    frontiers.push(ChainFrontier { device_fingerprint, state });
+                }
+                validate_devices(frontiers.iter().map(|frontier| frontier.device_fingerprint))?;
+                Self::ChainFrontiers { stream_id, frontiers }
             },
             tag::ENTRIES => {
                 let stream_id = fixed32(dec.bytes().map_err(m)?, "stream_id")?;
                 let count =
                     bounded_count(dec.array().map_err(m)?, "entries", MAX_TABLE_ENTRIES_PER_PAGE)?;
+                if count == 0 {
+                    return Err(TableWireError::Malformed("empty table entry page".into()));
+                }
                 let mut entries = Vec::with_capacity(count);
                 for _ in 0..count {
                     let entry = dec.bytes().map_err(m)?;
@@ -211,10 +333,14 @@ impl TableFrame {
                     }
                     entries.push(entry.to_vec());
                 }
-                Self::Entries { stream_id, entries, more: dec.bool().map_err(m)? }
+                Self::Entries { stream_id, entries }
             },
-            tag::STREAM_DONE =>
-                Self::StreamDone { stream_id: fixed32(dec.bytes().map_err(m)?, "stream_id")? },
+            tag::INVENTORY_DONE =>
+                Self::InventoryDone { stream_id: fixed32(dec.bytes().map_err(m)?, "stream_id")? },
+            tag::STREAM_DONE => Self::StreamDone {
+                stream_id: fixed32(dec.bytes().map_err(m)?, "stream_id")?,
+                continuation_pending: dec.bool().map_err(m)?,
+            },
             tag::DONE => Self::Done,
             tag::ACK => Self::Ack,
             _ => unreachable!(),
@@ -224,6 +350,19 @@ impl TableFrame {
         }
         Ok(frame)
     }
+}
+
+fn validate_devices(devices: impl IntoIterator<Item = Hash>) -> Result<(), TableWireError> {
+    let mut previous = None;
+    for device in devices {
+        if previous.is_some_and(|previous| previous >= device) {
+            return Err(TableWireError::Malformed(
+                "device chains are not in canonical sorted/deduplicated order".into(),
+            ));
+        }
+        previous = Some(device);
+    }
+    Ok(())
 }
 
 fn decode_manifest(dec: &mut Decoder<'_>) -> Result<Manifest, TableWireError> {
@@ -302,6 +441,10 @@ mod tests {
         }
     }
 
+    fn head(device: u8, lamport: u64, hash: u8) -> ChainHead {
+        ChainHead { device_fingerprint: [device; 32], lamport, entry_hash: [hash; 32] }
+    }
+
     #[test]
     fn manifest_sorts_and_collapses_exact_duplicates_but_rejects_conflicts() {
         let a = item("repo-a", 1, "anchors/1", 2);
@@ -319,9 +462,17 @@ mod tests {
         let manifest = Manifest::new(vec![item("r", 1, "s", 2)]).unwrap();
         let frames = [
             TableFrame::Manifest(manifest.clone()),
-            TableFrame::Inventory { stream_id: [2; 32], have: vec![[3; 32]] },
-            TableFrame::Entries { stream_id: [2; 32], entries: vec![vec![4, 5]], more: false },
-            TableFrame::StreamDone { stream_id: [2; 32] },
+            TableFrame::ChainInventory { stream_id: [2; 32], chains: vec![head(3, 4, 5)] },
+            TableFrame::ChainFrontiers {
+                stream_id: [2; 32],
+                frontiers: vec![ChainFrontier {
+                    device_fingerprint: [3; 32],
+                    state: FrontierState::Restore { lamport: 4, entry_hash: [5; 32] },
+                }],
+            },
+            TableFrame::Entries { stream_id: [2; 32], entries: vec![vec![4, 5]] },
+            TableFrame::InventoryDone { stream_id: [2; 32] },
+            TableFrame::StreamDone { stream_id: [2; 32], continuation_pending: true },
             TableFrame::Done,
             TableFrame::Ack,
         ];
@@ -331,9 +482,9 @@ mod tests {
         assert_eq!(TableFrame::Done.encode(), [
             0x82, 0x78, 0x1a, b'r', b'a', b'g', b'-', b'r', b'a', b't', b'/', b't', b'a', b'b',
             b'l', b'e', b'-', b's', b'y', b'n', b'c', b'-', b'f', b'r', b'a', b'm', b'e', b'/',
-            b'1', 0x04,
+            b'2', 0x06,
         ]);
-        assert_eq!(TABLE_SYNC_ALPN, b"rag-rat/table-sync/1");
+        assert_eq!(TABLE_SYNC_ALPN, b"rag-rat/table-sync/2");
     }
 
     #[test]
@@ -342,9 +493,17 @@ mod tests {
 
         let frames = [
             TableFrame::Manifest(Manifest::new(vec![item("r", 1, "s", 2)]).unwrap()),
-            TableFrame::Inventory { stream_id: [2; 32], have: vec![[3; 32]] },
-            TableFrame::Entries { stream_id: [2; 32], entries: vec![vec![4, 5]], more: false },
-            TableFrame::StreamDone { stream_id: [2; 32] },
+            TableFrame::ChainInventory { stream_id: [2; 32], chains: vec![head(3, 4, 5)] },
+            TableFrame::ChainFrontiers {
+                stream_id: [2; 32],
+                frontiers: vec![ChainFrontier {
+                    device_fingerprint: [3; 32],
+                    state: FrontierState::Accepted { lamport: 4, entry_hash: [5; 32] },
+                }],
+            },
+            TableFrame::Entries { stream_id: [2; 32], entries: vec![vec![4, 5]] },
+            TableFrame::InventoryDone { stream_id: [2; 32] },
+            TableFrame::StreamDone { stream_id: [2; 32], continuation_pending: false },
             TableFrame::Done,
             TableFrame::Ack,
         ];
@@ -355,8 +514,8 @@ mod tests {
             golden.extend_from_slice(&bytes);
         }
         assert_eq!(Sha256::digest(golden).as_slice(), &[
-            127, 65, 177, 170, 94, 248, 249, 42, 4, 84, 175, 14, 138, 115, 103, 182, 228, 64, 61,
-            105, 158, 189, 214, 59, 224, 146, 228, 176, 152, 213, 72, 222,
+            179, 118, 122, 4, 77, 8, 88, 205, 193, 56, 51, 53, 77, 23, 6, 51, 102, 205, 50, 183,
+            175, 163, 252, 103, 196, 7, 156, 70, 198, 195, 198, 251,
         ]);
     }
 
@@ -396,19 +555,19 @@ mod tests {
     }
 
     #[test]
-    fn inventory_entry_count_and_entry_width_are_bounded_from_declared_lengths() {
+    fn chain_entry_counts_and_entry_width_are_bounded_from_declared_lengths() {
         let mut inventory = Vec::new();
         let mut enc = Encoder::new(&mut inventory);
         enc.array(4).unwrap();
         enc.str(FRAME_DOMAIN).unwrap();
-        enc.u8(tag::INVENTORY).unwrap();
+        enc.u8(tag::CHAIN_INVENTORY).unwrap();
         enc.bytes(&[1; 32]).unwrap();
-        enc.array((MAX_TABLE_INVENTORY_HASHES + 1) as u64).unwrap();
+        enc.array((MAX_TABLE_CHAINS_PER_PAGE + 1) as u64).unwrap();
         assert!(matches!(TableFrame::decode(&inventory), Err(TableWireError::OverCap(_))));
 
         let mut entries = Vec::new();
         let mut enc = Encoder::new(&mut entries);
-        enc.array(5).unwrap();
+        enc.array(4).unwrap();
         enc.str(FRAME_DOMAIN).unwrap();
         enc.u8(tag::ENTRIES).unwrap();
         enc.bytes(&[1; 32]).unwrap();
@@ -418,7 +577,6 @@ mod tests {
         let oversized = TableFrame::Entries {
             stream_id: [1; 32],
             entries: vec![vec![0; MAX_TABLE_ENTRY_BYTES + 1]],
-            more: false,
         }
         .encode();
         assert!(matches!(TableFrame::decode(&oversized), Err(TableWireError::OverCap(_))));
@@ -448,6 +606,30 @@ mod tests {
         // Bypass `Manifest::new` only inside this module to handcraft noncanonical wire.
         let bytes = TableFrame::Manifest(Manifest(reversed)).encode();
         assert!(matches!(TableFrame::decode(&bytes), Err(TableWireError::Malformed(_))));
+    }
+
+    #[test]
+    fn chain_pages_reject_empty_duplicate_and_out_of_order_devices() {
+        let empty = TableFrame::ChainInventory { stream_id: [1; 32], chains: Vec::new() }.encode();
+        assert!(matches!(TableFrame::decode(&empty), Err(TableWireError::Malformed(_))));
+
+        for chains in [vec![head(2, 0, 2), head(2, 1, 3)], vec![head(2, 0, 2), head(1, 1, 3)]] {
+            let bytes = TableFrame::ChainInventory { stream_id: [1; 32], chains }.encode();
+            assert!(matches!(TableFrame::decode(&bytes), Err(TableWireError::Malformed(_))));
+        }
+
+        let duplicate_frontiers = TableFrame::ChainFrontiers {
+            stream_id: [1; 32],
+            frontiers: vec![
+                ChainFrontier { device_fingerprint: [2; 32], state: FrontierState::Empty },
+                ChainFrontier { device_fingerprint: [2; 32], state: FrontierState::Empty },
+            ],
+        }
+        .encode();
+        assert!(matches!(
+            TableFrame::decode(&duplicate_frontiers),
+            Err(TableWireError::Malformed(_))
+        ));
     }
 
     #[test]

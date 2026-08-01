@@ -53,6 +53,12 @@ pub use session::{
     run_session, run_session_with_idle_timeout,
 };
 pub use store::{OplogContentSyncStore, OplogSyncStore, OplogTableSyncStore};
-pub use table_session::{TableSessionError, TableSessionReport, TableSyncStore, run_table_session};
-pub use table_wire::{Manifest, ManifestItem, TABLE_SYNC_ALPN, TableFrame, TableWireError};
+pub use table_session::{
+    ChainEntry, ChainStart, TableSessionError, TableSessionReport, TableSyncStore,
+    run_table_session,
+};
+pub use table_wire::{
+    ChainFrontier, ChainHead, FrontierState, Manifest, ManifestItem, TABLE_SYNC_ALPN, TableFrame,
+    TableWireError,
+};
 pub use wire::{CONTENT_SYNC_ALPN, Frame, SYNC_ALPN, WireError};

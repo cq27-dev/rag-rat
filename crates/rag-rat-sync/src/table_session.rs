@@ -1,6 +1,6 @@
 //! Authenticated multi-stream table reconciliation over one bidirectional stream.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -9,7 +9,8 @@ use crate::auth::{AuthRole, SessionCapabilities};
 use crate::session::{DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES};
 use crate::table_codec::{self, TableCodecError};
 use crate::table_wire::{
-    MAX_TABLE_ENTRIES_PER_PAGE, MAX_TABLE_ENTRY_BYTES, MAX_TABLE_INVENTORY_HASHES, Manifest,
+    ChainFrontier, ChainHead, FrontierState, MAX_TABLE_CHAINS_PER_PAGE,
+    MAX_TABLE_CHAINS_PER_SESSION, MAX_TABLE_ENTRIES_PER_PAGE, MAX_TABLE_ENTRY_BYTES, Manifest,
     ManifestItem, TableFrame,
 };
 
@@ -20,8 +21,35 @@ pub trait TableSyncStore {
     fn account_id(&self) -> Hash;
     fn supported_streams(&self) -> anyhow::Result<Vec<ManifestItem>>;
     fn validates(&self, item: &ManifestItem) -> anyhow::Result<bool>;
-    fn snapshot(&self, item: &ManifestItem) -> anyhow::Result<Vec<(Hash, Vec<u8>)>>;
+    fn chain_page(
+        &self,
+        item: &ManifestItem,
+        after_device: Option<Hash>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ChainHead>>;
+    fn frontier(&self, item: &ManifestItem, device: Hash) -> anyhow::Result<FrontierState>;
+    fn entries(
+        &self,
+        item: &ManifestItem,
+        device: Hash,
+        start: ChainStart,
+        limit: usize,
+    ) -> anyhow::Result<Vec<ChainEntry>>;
     fn ingest(&mut self, item: &ManifestItem, signed_bytes: &[u8]) -> anyhow::Result<Ingested>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainStart {
+    Beginning,
+    After { lamport: u64, entry_hash: Hash },
+    At { lamport: u64, entry_hash: Hash },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainEntry {
+    pub lamport: u64,
+    pub entry_hash: Hash,
+    pub signed_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +58,7 @@ pub struct TableSessionReport {
     pub entries_sent: usize,
     pub entries_received: usize,
     pub entries_newly_stored: usize,
+    pub continuation_pending: bool,
 }
 
 #[derive(Debug)]
@@ -71,8 +100,8 @@ where
 
 async fn run_table_session_with_idle_timeout<S, R, W>(
     store: &mut S,
-    mut send: W,
-    mut recv: R,
+    send: W,
+    recv: R,
     role: AuthRole,
     capabilities: SessionCapabilities,
     idle_timeout: Duration,
@@ -82,6 +111,55 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    run_table_session_with_limits(
+        store,
+        send,
+        recv,
+        role,
+        capabilities,
+        idle_timeout,
+        TableSessionLimits::default(),
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct TableSessionLimits {
+    chains_per_page: usize,
+    chains_per_session: usize,
+    entries_per_page: usize,
+    entries_per_session: usize,
+}
+
+impl Default for TableSessionLimits {
+    fn default() -> Self {
+        Self {
+            chains_per_page: MAX_TABLE_CHAINS_PER_PAGE,
+            chains_per_session: MAX_TABLE_CHAINS_PER_SESSION,
+            entries_per_page: MAX_TABLE_ENTRIES_PER_PAGE,
+            entries_per_session: MAX_SESSION_ENTRIES,
+        }
+    }
+}
+
+async fn run_table_session_with_limits<S, R, W>(
+    store: &mut S,
+    mut send: W,
+    mut recv: R,
+    role: AuthRole,
+    capabilities: SessionCapabilities,
+    idle_timeout: Duration,
+    limits: TableSessionLimits,
+) -> Result<TableSessionReport, TableSessionError>
+where
+    S: TableSyncStore,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    debug_assert!(limits.chains_per_page > 0);
+    debug_assert!(limits.chains_per_page <= limits.chains_per_session);
+    debug_assert!(limits.entries_per_page > 0);
+    debug_assert!(limits.entries_per_page <= MAX_TABLE_ENTRIES_PER_PAGE);
     let local_manifest =
         Manifest::new(store.supported_streams().map_err(TableSessionError::Store)?)
             .map_err(|error| TableSessionError::Store(error.into()))?;
@@ -103,164 +181,366 @@ where
         }
     }
     let streams = intersection.len();
-    let mut snapshots = HashMap::with_capacity(streams);
-    for item in &intersection {
-        let snapshot = store.snapshot(item).map_err(TableSessionError::Store)?;
-        if snapshot.iter().any(|(_, bytes)| bytes.len() > MAX_TABLE_ENTRY_BYTES) {
-            return Err(TableSessionError::Store(anyhow::anyhow!(
-                "local table-sync entry exceeds {MAX_TABLE_ENTRY_BYTES} bytes"
-            )));
-        }
-        snapshots.insert(item.stream_id, snapshot);
-    }
-
-    let (inventory_tx, mut inventory_rx) =
-        tokio::sync::mpsc::channel::<(Hash, HashSet<Hash>)>(streams.max(1));
-    let send_intersection = intersection.clone();
-
-    let sender = async move {
-        for item in &send_intersection {
-            let snapshot = snapshots.get(&item.stream_id).ok_or_else(|| {
-                TableSessionError::Protocol("intersection names an unsupported local stream".into())
-            })?;
-            let have =
-                snapshot.iter().map(|(hash, _)| *hash).take(MAX_TABLE_INVENTORY_HASHES).collect();
-            write_before(
+    let (entries_sent, entries_received, entries_newly_stored, continuation_pending) = match role {
+        AuthRole::Dialer => {
+            let (entries_sent, local_pending) = send_direction(
+                store,
+                &intersection,
                 &mut send,
-                &TableFrame::Inventory { stream_id: item.stream_id, have },
+                &mut recv,
+                capabilities.local.can_push(),
                 idle_timeout,
+                limits,
             )
             .await?;
-        }
-
-        let mut sent = 0;
-        for item in &send_intersection {
-            let Some((stream_id, peer_have)) = inventory_rx.recv().await else {
-                return Ok((send, sent));
-            };
-            if stream_id != item.stream_id {
-                return Err(TableSessionError::Protocol(
-                    "peer inventories arrived out of canonical stream order".into(),
-                ));
-            }
-            let remaining = MAX_SESSION_ENTRIES.saturating_sub(sent);
-            let mut entries: Vec<Vec<u8>> = if capabilities.local.can_push() {
-                snapshots[&item.stream_id]
-                    .iter()
-                    .filter(|(hash, _)| !peer_have.contains(hash))
-                    .take(remaining)
-                    .map(|(_, bytes)| bytes.clone())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            sent += entries.len();
-            while !entries.is_empty() {
-                let tail = entries.split_off(entries.len().min(MAX_TABLE_ENTRIES_PER_PAGE));
-                let page = std::mem::replace(&mut entries, tail);
-                let more = !entries.is_empty();
-                write_before(
-                    &mut send,
-                    &TableFrame::Entries { stream_id: item.stream_id, entries: page, more },
-                    idle_timeout,
-                )
-                .await?;
-            }
-            write_before(
+            let (entries_received, entries_newly_stored, peer_pending) = receive_direction(
+                store,
+                &intersection,
                 &mut send,
-                &TableFrame::StreamDone { stream_id: item.stream_id },
+                &mut recv,
+                capabilities.peer.can_push(),
                 idle_timeout,
+                limits,
             )
             .await?;
-        }
-        write_before(&mut send, &TableFrame::Done, idle_timeout).await?;
-        Ok::<_, TableSessionError>((send, sent))
+            (entries_sent, entries_received, entries_newly_stored, local_pending || peer_pending)
+        },
+        AuthRole::Acceptor => {
+            let (entries_received, entries_newly_stored, peer_pending) = receive_direction(
+                store,
+                &intersection,
+                &mut send,
+                &mut recv,
+                capabilities.peer.can_push(),
+                idle_timeout,
+                limits,
+            )
+            .await?;
+            let (entries_sent, local_pending) = send_direction(
+                store,
+                &intersection,
+                &mut send,
+                &mut recv,
+                capabilities.local.can_push(),
+                idle_timeout,
+                limits,
+            )
+            .await?;
+            (entries_sent, entries_received, entries_newly_stored, local_pending || peer_pending)
+        },
     };
+    complete(&mut send, &mut recv, role, idle_timeout).await?;
+    Ok(TableSessionReport {
+        streams,
+        entries_sent,
+        entries_received,
+        entries_newly_stored,
+        continuation_pending,
+    })
+}
 
-    let receiver = async {
-        for item in &intersection {
-            let TableFrame::Inventory { stream_id, have } =
-                read_before(&mut recv, idle_timeout).await?
+async fn send_direction<S, R, W>(
+    store: &S,
+    streams: &[ManifestItem],
+    send: &mut W,
+    recv: &mut R,
+    can_push: bool,
+    idle_timeout: Duration,
+    limits: TableSessionLimits,
+) -> Result<(usize, bool), TableSessionError>
+where
+    S: TableSyncStore,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut sent = 0;
+    let mut offered_chains: usize = 0;
+    let mut continuation_pending = false;
+    for item in streams {
+        let mut after_device = None;
+        let mut stream_pending = false;
+        loop {
+            if !can_push {
+                break;
+            }
+            if sent >= limits.entries_per_session {
+                stream_pending = true;
+                break;
+            }
+            if offered_chains >= limits.chains_per_session {
+                let has_more = !store
+                    .chain_page(item, after_device, 1)
+                    .map_err(TableSessionError::Store)?
+                    .is_empty();
+                if has_more {
+                    return Err(TableSessionError::Store(anyhow::anyhow!(
+                        "table-sync manifest intersection exceeds the {}-device chain ceiling",
+                        limits.chains_per_session
+                    )));
+                }
+                break;
+            }
+            let chain_limit = limits
+                .chains_per_page
+                .min(limits.chains_per_session.saturating_sub(offered_chains));
+            let chains = store
+                .chain_page(item, after_device, chain_limit)
+                .map_err(TableSessionError::Store)?;
+            if chains.is_empty() {
+                break;
+            }
+            if chains.len() > chain_limit {
+                return Err(TableSessionError::Store(anyhow::anyhow!(
+                    "local table-sync chain page exceeds {} chains",
+                    chain_limit
+                )));
+            }
+            offered_chains += chains.len();
+            validate_chain_page(&chains).map_err(TableSessionError::Store)?;
+            write_before(
+                send,
+                &TableFrame::ChainInventory { stream_id: item.stream_id, chains: chains.clone() },
+                idle_timeout,
+            )
+            .await?;
+            let TableFrame::ChainFrontiers { stream_id, frontiers } =
+                read_before(recv, idle_timeout).await?
             else {
                 return Err(TableSessionError::Protocol(
-                    "peer did not send the expected stream inventory".into(),
+                    "peer did not answer a table chain inventory".into(),
                 ));
             };
-            if stream_id != item.stream_id {
+            if stream_id != item.stream_id
+                || frontiers.len() != chains.len()
+                || !frontiers.iter().zip(&chains).all(|(frontier, chain)| {
+                    frontier.device_fingerprint == chain.device_fingerprint
+                })
+            {
                 return Err(TableSessionError::Protocol(
-                    "peer inventory names the wrong stream".into(),
+                    "peer chain frontiers do not match the offered inventory".into(),
                 ));
             }
-            inventory_tx.send((stream_id, have.into_iter().collect())).await.map_err(|_| {
-                TableSessionError::Protocol("local sender stopped during inventory exchange".into())
-            })?;
-        }
 
-        let mut received = 0;
-        let mut newly_stored = 0;
-        for item in &intersection {
-            let mut saw_page = false;
-            let mut saw_final = false;
-            loop {
-                match read_before(&mut recv, idle_timeout).await? {
-                    TableFrame::Entries { stream_id, entries, more } => {
-                        if !capabilities.peer.can_push() {
-                            return Err(TableSessionError::UnauthorizedPush);
-                        }
-                        if stream_id != item.stream_id {
-                            return Err(TableSessionError::Protocol(
-                                "peer entry page names the wrong stream".into(),
-                            ));
-                        }
-                        if entries.is_empty() || saw_final {
-                            return Err(TableSessionError::Protocol(
-                                "peer sent an empty or after-final table entry page".into(),
-                            ));
-                        }
-                        for bytes in entries {
-                            received += 1;
-                            if received > MAX_SESSION_ENTRIES {
-                                return Err(TableSessionError::Protocol(format!(
-                                    "peer streamed more than {MAX_SESSION_ENTRIES} table entries"
-                                )));
-                            }
-                            if store.ingest(item, &bytes).map_err(TableSessionError::Store)?
-                                == Ingested::Stored
-                            {
-                                newly_stored += 1;
-                            }
-                        }
-                        saw_page = true;
-                        saw_final = !more;
+            for (chain, frontier) in chains.iter().zip(frontiers) {
+                let mut start = match chain_plan(chain, frontier.state)? {
+                    ChainPlan::Complete => continue,
+                    ChainPlan::Send(start) => start,
+                    ChainPlan::Pending => {
+                        stream_pending = true;
+                        continue;
                     },
-                    TableFrame::StreamDone { stream_id } => {
-                        if stream_id != item.stream_id || (saw_page && !saw_final) {
-                            return Err(TableSessionError::Protocol(
-                                "peer ended the wrong or incomplete table stream".into(),
-                            ));
-                        }
+                };
+                while sent < limits.entries_per_session {
+                    let page_limit = limits
+                        .entries_per_page
+                        .min(limits.entries_per_session.saturating_sub(sent));
+                    let entries = store
+                        .entries(item, chain.device_fingerprint, start, page_limit)
+                        .map_err(TableSessionError::Store)?;
+                    if entries.is_empty() {
                         break;
-                    },
-                    _ => {
-                        return Err(TableSessionError::Protocol(
-                            "peer sent an out-of-sequence table frame".into(),
-                        ));
-                    },
+                    }
+                    if entries.len() > page_limit
+                        || entries
+                            .iter()
+                            .any(|entry| entry.signed_bytes.len() > MAX_TABLE_ENTRY_BYTES)
+                    {
+                        return Err(TableSessionError::Store(anyhow::anyhow!(
+                            "local table-sync entry page exceeds its transport bound"
+                        )));
+                    }
+                    let last = entries.last().expect("non-empty page checked above");
+                    start =
+                        ChainStart::After { lamport: last.lamport, entry_hash: last.entry_hash };
+                    sent += entries.len();
+                    write_before(
+                        send,
+                        &TableFrame::Entries {
+                            stream_id: item.stream_id,
+                            entries: entries.into_iter().map(|entry| entry.signed_bytes).collect(),
+                        },
+                        idle_timeout,
+                    )
+                    .await?;
+                }
+                if sent >= limits.entries_per_session {
+                    break;
                 }
             }
+            write_before(
+                send,
+                &TableFrame::InventoryDone { stream_id: item.stream_id },
+                idle_timeout,
+            )
+            .await?;
+            if sent >= limits.entries_per_session {
+                stream_pending = true;
+                break;
+            }
+            after_device = chains.last().map(|chain| chain.device_fingerprint);
         }
-        if read_before(&mut recv, idle_timeout).await? != TableFrame::Done {
-            return Err(TableSessionError::Protocol(
-                "peer did not finish after its streams".into(),
-            ));
-        }
-        Ok::<_, TableSessionError>((recv, streams, received, newly_stored))
-    };
+        write_before(
+            send,
+            &TableFrame::StreamDone {
+                stream_id: item.stream_id,
+                continuation_pending: stream_pending,
+            },
+            idle_timeout,
+        )
+        .await?;
+        continuation_pending |= stream_pending;
+    }
+    write_before(send, &TableFrame::Done, idle_timeout).await?;
+    Ok((sent, continuation_pending))
+}
 
-    let ((mut send, entries_sent), (mut recv, streams, entries_received, entries_newly_stored)) =
-        tokio::try_join!(sender, receiver)?;
-    complete(&mut send, &mut recv, role, idle_timeout).await?;
-    Ok(TableSessionReport { streams, entries_sent, entries_received, entries_newly_stored })
+async fn receive_direction<S, R, W>(
+    store: &mut S,
+    streams: &[ManifestItem],
+    send: &mut W,
+    recv: &mut R,
+    peer_can_push: bool,
+    idle_timeout: Duration,
+    limits: TableSessionLimits,
+) -> Result<(usize, usize, bool), TableSessionError>
+where
+    S: TableSyncStore,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut received = 0;
+    let mut newly_stored = 0;
+    let mut offered_chains: usize = 0;
+    let mut continuation_pending = false;
+    for item in streams {
+        let mut last_device = None;
+        loop {
+            match read_before(recv, idle_timeout).await? {
+                TableFrame::ChainInventory { stream_id, chains } => {
+                    if !peer_can_push {
+                        return Err(TableSessionError::UnauthorizedPush);
+                    }
+                    let ordered_after_previous = chains.first().is_some_and(|first| {
+                        last_device.is_none_or(|previous| first.device_fingerprint > previous)
+                    });
+                    if stream_id != item.stream_id
+                        || chains.len() > limits.chains_per_page
+                        || offered_chains.saturating_add(chains.len()) > limits.chains_per_session
+                        || !ordered_after_previous
+                    {
+                        return Err(TableSessionError::Protocol(
+                            "peer chain inventory names the wrong stream or exceeds the session \
+                             cap"
+                            .into(),
+                        ));
+                    }
+                    offered_chains += chains.len();
+                    last_device = chains.last().map(|chain| chain.device_fingerprint);
+                    let frontiers = chains
+                        .iter()
+                        .map(|chain| {
+                            store.frontier(item, chain.device_fingerprint).map(|state| {
+                                ChainFrontier {
+                                    device_fingerprint: chain.device_fingerprint,
+                                    state,
+                                }
+                            })
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()
+                        .map_err(TableSessionError::Store)?;
+                    write_before(
+                        send,
+                        &TableFrame::ChainFrontiers { stream_id, frontiers },
+                        idle_timeout,
+                    )
+                    .await?;
+                    loop {
+                        match read_before(recv, idle_timeout).await? {
+                            TableFrame::Entries { stream_id, entries }
+                                if stream_id == item.stream_id =>
+                            {
+                                received += entries.len();
+                                if received > limits.entries_per_session {
+                                    return Err(TableSessionError::Protocol(format!(
+                                        "peer streamed more than {} table entries",
+                                        limits.entries_per_session
+                                    )));
+                                }
+                                for bytes in entries {
+                                    if store
+                                        .ingest(item, &bytes)
+                                        .map_err(TableSessionError::Store)?
+                                        == Ingested::Stored
+                                    {
+                                        newly_stored += 1;
+                                    }
+                                }
+                            },
+                            TableFrame::InventoryDone { stream_id }
+                                if stream_id == item.stream_id =>
+                                break,
+                            _ => {
+                                return Err(TableSessionError::Protocol(
+                                    "peer sent an out-of-sequence table inventory response".into(),
+                                ));
+                            },
+                        }
+                    }
+                },
+                TableFrame::StreamDone { stream_id, continuation_pending: pending }
+                    if stream_id == item.stream_id =>
+                {
+                    continuation_pending |= pending;
+                    break;
+                },
+                _ => {
+                    return Err(TableSessionError::Protocol(
+                        "peer sent an out-of-sequence table stream frame".into(),
+                    ));
+                },
+            }
+        }
+    }
+    if read_before(recv, idle_timeout).await? != TableFrame::Done {
+        return Err(TableSessionError::Protocol("peer did not finish after its streams".into()));
+    }
+    Ok((received, newly_stored, continuation_pending))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainPlan {
+    Complete,
+    Send(ChainStart),
+    Pending,
+}
+
+fn chain_plan(local: &ChainHead, frontier: FrontierState) -> Result<ChainPlan, TableSessionError> {
+    match frontier {
+        FrontierState::Empty => Ok(ChainPlan::Send(ChainStart::Beginning)),
+        FrontierState::Accepted { lamport, .. } if lamport > local.lamport =>
+            Ok(ChainPlan::Complete),
+        FrontierState::Accepted { lamport, entry_hash } if lamport == local.lamport => {
+            if entry_hash != local.entry_hash {
+                return Err(TableSessionError::Protocol(
+                    "peer chain frontier conflicts with the offered tip".into(),
+                ));
+            }
+            Ok(ChainPlan::Complete)
+        },
+        FrontierState::Accepted { lamport, entry_hash } =>
+            Ok(ChainPlan::Send(ChainStart::After { lamport, entry_hash })),
+        FrontierState::Restore { lamport, .. } if lamport > local.lamport => Ok(ChainPlan::Pending),
+        FrontierState::Restore { lamport, entry_hash } =>
+            Ok(ChainPlan::Send(ChainStart::At { lamport, entry_hash })),
+    }
+}
+
+fn validate_chain_page(chains: &[ChainHead]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        chains.windows(2).all(|pair| pair[0].device_fingerprint < pair[1].device_fingerprint),
+        "local table-sync chain page is not canonical"
+    );
+    Ok(())
 }
 
 async fn complete<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
@@ -332,13 +612,22 @@ async fn read_before<R: AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
     use super::*;
+
+    #[derive(Clone)]
+    struct TestEntry {
+        device: Hash,
+        lamport: u64,
+        bytes: Vec<u8>,
+    }
 
     #[derive(Clone)]
     struct MemStore {
         account: Hash,
         supported: Vec<ManifestItem>,
-        entries: HashMap<Hash, HashMap<Hash, Vec<u8>>>,
+        entries: HashMap<Hash, HashMap<Hash, TestEntry>>,
         forbidden_snapshots: HashSet<Hash>,
     }
 
@@ -353,9 +642,19 @@ mod tests {
         }
 
         fn insert(&mut self, stream: Hash, seed: u8) {
-            let mut bytes = vec![seed; 40];
+            self.insert_chain(stream, seed, 0, seed);
+        }
+
+        fn insert_chain(&mut self, stream: Hash, device: u8, lamport: u64, seed: u8) {
+            let mut bytes = vec![seed; 41];
             bytes[..32].copy_from_slice(&[seed; 32]);
-            self.entries.entry(stream).or_default().insert([seed; 32], bytes);
+            bytes[32] = device;
+            bytes[33..41].copy_from_slice(&lamport.to_be_bytes());
+            self.entries.entry(stream).or_default().insert([seed; 32], TestEntry {
+                device: [device; 32],
+                lamport,
+                bytes,
+            });
         }
 
         fn forbid_snapshot(&mut self, stream: Hash) {
@@ -376,17 +675,99 @@ mod tests {
             Ok(self.supported.contains(item))
         }
 
-        fn snapshot(&self, item: &ManifestItem) -> anyhow::Result<Vec<(Hash, Vec<u8>)>> {
+        fn chain_page(
+            &self,
+            item: &ManifestItem,
+            after_device: Option<Hash>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<ChainHead>> {
             anyhow::ensure!(
                 !self.forbidden_snapshots.contains(&item.stream_id),
                 "non-intersecting stream was snapshotted"
             );
+            let mut chains = BTreeMap::new();
+            for (hash, entry) in self.entries.get(&item.stream_id).into_iter().flatten() {
+                let head = chains.entry(entry.device).or_insert((entry.lamport, *hash));
+                if entry.lamport > head.0 {
+                    *head = (entry.lamport, *hash);
+                }
+            }
+            Ok(chains
+                .into_iter()
+                .filter(|(device, _)| after_device.is_none_or(|after| *device > after))
+                .take(limit)
+                .map(|(device, (lamport, entry_hash))| ChainHead {
+                    device_fingerprint: device,
+                    lamport,
+                    entry_hash,
+                })
+                .collect())
+        }
+
+        fn frontier(&self, item: &ManifestItem, device: Hash) -> anyhow::Result<FrontierState> {
             Ok(self
                 .entries
                 .get(&item.stream_id)
                 .into_iter()
                 .flatten()
-                .map(|(hash, bytes)| (*hash, bytes.clone()))
+                .filter(|(_, entry)| entry.device == device)
+                .max_by_key(|(_, entry)| entry.lamport)
+                .map_or(FrontierState::Empty, |(hash, entry)| FrontierState::Accepted {
+                    lamport: entry.lamport,
+                    entry_hash: *hash,
+                }))
+        }
+
+        fn entries(
+            &self,
+            item: &ManifestItem,
+            device: Hash,
+            start: ChainStart,
+            limit: usize,
+        ) -> anyhow::Result<Vec<ChainEntry>> {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let entries = self.entries.get(&item.stream_id);
+            let (minimum, inclusive) = match start {
+                ChainStart::Beginning => (None, false),
+                ChainStart::After { lamport, entry_hash } => {
+                    if !entries.is_some_and(|entries| {
+                        entries
+                            .get(&entry_hash)
+                            .is_some_and(|entry| entry.device == device && entry.lamport == lamport)
+                    }) {
+                        anyhow::bail!("test cursor is not present")
+                    }
+                    (Some(lamport), false)
+                },
+                ChainStart::At { lamport, entry_hash } => {
+                    if !entries.is_some_and(|entries| {
+                        entries
+                            .get(&entry_hash)
+                            .is_some_and(|entry| entry.device == device && entry.lamport == lamport)
+                    }) {
+                        anyhow::bail!("test restore cursor is not present")
+                    }
+                    (Some(lamport), true)
+                },
+            };
+            let mut chain: Vec<_> =
+                entries.into_iter().flatten().filter(|(_, entry)| entry.device == device).collect();
+            chain.sort_by_key(|(_, entry)| entry.lamport);
+            Ok(chain
+                .into_iter()
+                .filter(|(_, entry)| {
+                    minimum.is_none_or(|minimum| {
+                        entry.lamport > minimum || (inclusive && entry.lamport == minimum)
+                    })
+                })
+                .take(limit)
+                .map(|(hash, entry)| ChainEntry {
+                    lamport: entry.lamport,
+                    entry_hash: *hash,
+                    signed_bytes: entry.bytes.clone(),
+                })
                 .collect())
         }
 
@@ -395,10 +776,12 @@ mod tests {
                 return Ok(Ingested::NoChange);
             }
             let hash: Hash = bytes[..32].try_into()?;
+            let device = [bytes[32]; 32];
+            let lamport = u64::from_be_bytes(bytes[33..41].try_into()?);
             Ok(match self.entries.entry(item.stream_id).or_default().entry(hash) {
                 std::collections::hash_map::Entry::Occupied(_) => Ingested::NoChange,
                 std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(bytes.to_vec());
+                    slot.insert(TestEntry { device, lamport, bytes: bytes.to_vec() });
                     Ingested::Stored
                 },
             })
@@ -415,25 +798,48 @@ mod tests {
     }
 
     async fn pair(a: &mut MemStore, b: &mut MemStore) -> (TableSessionReport, TableSessionReport) {
+        pair_with_limits(a, b, TableSessionLimits::default()).await
+    }
+
+    async fn pair_with_limits(
+        a: &mut MemStore,
+        b: &mut MemStore,
+        limits: TableSessionLimits,
+    ) -> (TableSessionReport, TableSessionReport) {
+        let (a, b) = try_pair_with_limits(a, b, limits).await;
+        (a.unwrap(), b.unwrap())
+    }
+
+    async fn try_pair_with_limits(
+        a: &mut MemStore,
+        b: &mut MemStore,
+        limits: TableSessionLimits,
+    ) -> (
+        Result<TableSessionReport, TableSessionError>,
+        Result<TableSessionReport, TableSessionError>,
+    ) {
         let (a_send, b_recv) = tokio::io::duplex(1 << 20);
         let (b_send, a_recv) = tokio::io::duplex(1 << 20);
-        let (a, b) = tokio::join!(
-            run_table_session(
+        tokio::join!(
+            run_table_session_with_limits(
                 a,
                 a_send,
                 a_recv,
                 AuthRole::Dialer,
                 SessionCapabilities::bidirectional(),
+                DEFAULT_IDLE_TIMEOUT,
+                limits,
             ),
-            run_table_session(
+            run_table_session_with_limits(
                 b,
                 b_send,
                 b_recv,
                 AuthRole::Acceptor,
                 SessionCapabilities::bidirectional(),
+                DEFAULT_IDLE_TIMEOUT,
+                limits,
             ),
-        );
-        (a.unwrap(), b.unwrap())
+        )
     }
 
     #[tokio::test]
@@ -469,6 +875,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capped_sessions_advance_from_durable_frontiers_until_quiet() {
+        let shared = item("repo-a", 1);
+        let mut source = MemStore::new(vec![shared.clone()]);
+        let mut destination = MemStore::new(vec![shared.clone()]);
+        for seed in 1..=5 {
+            source.insert_chain(shared.stream_id, 7, u64::from(seed), seed);
+        }
+        let limits = TableSessionLimits {
+            chains_per_page: 2,
+            chains_per_session: 8,
+            entries_per_page: 1,
+            entries_per_session: 2,
+        };
+
+        let mut moved = Vec::new();
+        let mut pending = Vec::new();
+        for _ in 0..4 {
+            let (source_report, destination_report) =
+                pair_with_limits(&mut source, &mut destination, limits).await;
+            moved.push(source_report.entries_sent);
+            pending.push(source_report.continuation_pending);
+            assert_eq!(source_report.entries_sent, destination_report.entries_newly_stored);
+        }
+        assert_eq!(moved, [2, 2, 1, 0]);
+        assert_eq!(pending, [true, true, false, false]);
+        assert_eq!(destination.entries[&shared.stream_id].len(), 5);
+    }
+
+    #[tokio::test]
+    async fn lost_completion_ack_does_not_consume_or_repeat_progress() {
+        let shared = item("repo-a", 1);
+        let mut source = MemStore::new(vec![shared.clone()]);
+        let mut destination = MemStore::new(vec![shared.clone()]);
+        source.insert(shared.stream_id, 1);
+        let limits = TableSessionLimits::default();
+        let (mut source_send, mut destination_recv) = tokio::io::duplex(4096);
+        let (mut destination_send, mut source_recv) = tokio::io::duplex(4096);
+        let streams = vec![shared];
+        let (sent, received) = tokio::join!(
+            send_direction(
+                &source,
+                &streams,
+                &mut source_send,
+                &mut source_recv,
+                true,
+                DEFAULT_IDLE_TIMEOUT,
+                limits,
+            ),
+            receive_direction(
+                &mut destination,
+                &streams,
+                &mut destination_send,
+                &mut destination_recv,
+                true,
+                DEFAULT_IDLE_TIMEOUT,
+                limits,
+            ),
+        );
+        assert_eq!(sent.unwrap(), (1, false));
+        assert_eq!(received.unwrap(), (1, 1, false));
+
+        let (source_report, destination_report) = pair(&mut source, &mut destination).await;
+        assert_eq!(source_report.entries_sent + destination_report.entries_sent, 0);
+        assert_eq!(source_report.entries_newly_stored + destination_report.entries_newly_stored, 0);
+    }
+
+    #[test]
+    fn peer_frontiers_must_be_provable_prefixes_and_restore_debt_stays_pending() {
+        let local = ChainHead { device_fingerprint: [1; 32], lamport: 3, entry_hash: [3; 32] };
+        assert!(matches!(
+            chain_plan(&local, FrontierState::Accepted { lamport: 3, entry_hash: [4; 32] }),
+            Err(TableSessionError::Protocol(_))
+        ));
+        assert_eq!(
+            chain_plan(&local, FrontierState::Accepted { lamport: 4, entry_hash: [4; 32] })
+                .unwrap(),
+            ChainPlan::Complete
+        );
+        assert_eq!(
+            chain_plan(&local, FrontierState::Accepted { lamport: 2, entry_hash: [2; 32] })
+                .unwrap(),
+            ChainPlan::Send(ChainStart::After { lamport: 2, entry_hash: [2; 32] })
+        );
+        assert_eq!(
+            chain_plan(&local, FrontierState::Restore { lamport: 4, entry_hash: [4; 32] }).unwrap(),
+            ChainPlan::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn local_chain_inventory_enforces_the_exact_session_ceiling() {
+        let shared = item("repo-a", 1);
+        let mut source = MemStore::new(vec![shared.clone()]);
+        let mut destination = MemStore::new(vec![shared.clone()]);
+        source.insert_chain(shared.stream_id, 1, 0, 1);
+        source.insert_chain(shared.stream_id, 2, 0, 2);
+        let limits = TableSessionLimits {
+            chains_per_page: 1,
+            chains_per_session: 2,
+            entries_per_page: 1,
+            entries_per_session: 3,
+        };
+
+        let (source_report, destination_report) =
+            pair_with_limits(&mut source, &mut destination, limits).await;
+        assert_eq!(source_report.entries_sent, 2);
+        assert_eq!(destination_report.entries_newly_stored, 2);
+
+        source.insert_chain(shared.stream_id, 3, 0, 3);
+        let (source_result, peer_result) =
+            try_pair_with_limits(&mut source, &mut destination, limits).await;
+        assert!(matches!(
+            source_result,
+            Err(TableSessionError::Store(error)) if error.to_string().contains("ceiling")
+        ));
+        assert!(peer_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn peer_chain_inventory_must_advance_order_and_respect_the_session_ceiling() {
+        for devices in [vec![2, 2], vec![1, 2, 3]] {
+            let shared = item("repo-a", 1);
+            let streams = vec![shared.clone()];
+            let mut store = MemStore::new(streams.clone());
+            let limits = TableSessionLimits {
+                chains_per_page: 1,
+                chains_per_session: 2,
+                entries_per_page: 1,
+                entries_per_session: 2,
+            };
+            let (mut receiver_send, mut peer_recv) = tokio::io::duplex(4096);
+            let (mut peer_send, mut receiver_recv) = tokio::io::duplex(4096);
+            let peer = async move {
+                for device in &devices[..devices.len() - 1] {
+                    table_codec::write_frame(&mut peer_send, &TableFrame::ChainInventory {
+                        stream_id: shared.stream_id,
+                        chains: vec![ChainHead {
+                            device_fingerprint: [*device; 32],
+                            lamport: 0,
+                            entry_hash: [*device; 32],
+                        }],
+                    })
+                    .await
+                    .unwrap();
+                    assert!(matches!(
+                        table_codec::read_frame(&mut peer_recv).await.unwrap(),
+                        TableFrame::ChainFrontiers { .. }
+                    ));
+                    table_codec::write_frame(&mut peer_send, &TableFrame::InventoryDone {
+                        stream_id: shared.stream_id,
+                    })
+                    .await
+                    .unwrap();
+                }
+                let device = devices[devices.len() - 1];
+                table_codec::write_frame(&mut peer_send, &TableFrame::ChainInventory {
+                    stream_id: shared.stream_id,
+                    chains: vec![ChainHead {
+                        device_fingerprint: [device; 32],
+                        lamport: 0,
+                        entry_hash: [device; 32],
+                    }],
+                })
+                .await
+                .unwrap();
+            };
+            let receiver = receive_direction(
+                &mut store,
+                &streams,
+                &mut receiver_send,
+                &mut receiver_recv,
+                true,
+                DEFAULT_IDLE_TIMEOUT,
+                limits,
+            );
+            let (result, ()) = tokio::join!(receiver, peer);
+            assert!(
+                matches!(result, Err(TableSessionError::Protocol(message)) if message.contains("cap"))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_peer_that_stops_reading_cannot_block_writes_forever() {
         let shared = item("repo-a", 1);
         let mut store = MemStore::new(vec![shared.clone()]);
@@ -480,8 +1069,14 @@ mod tests {
         let peer = async move {
             for frame in [
                 TableFrame::Manifest(Manifest::new(vec![shared.clone()]).unwrap()),
-                TableFrame::Inventory { stream_id: shared.stream_id, have: Vec::new() },
-                TableFrame::StreamDone { stream_id: shared.stream_id },
+                TableFrame::ChainFrontiers {
+                    stream_id: shared.stream_id,
+                    frontiers: vec![ChainFrontier {
+                        device_fingerprint: [1; 32],
+                        state: FrontierState::Empty,
+                    }],
+                },
+                TableFrame::StreamDone { stream_id: shared.stream_id, continuation_pending: false },
                 TableFrame::Done,
             ] {
                 table_codec::write_frame(&mut peer_send, &frame).await.unwrap();

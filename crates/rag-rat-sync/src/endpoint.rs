@@ -620,7 +620,16 @@ pub async fn connect_and_table_reconcile<S: TableSyncStore + NodeAuth>(
             entries_received: report.entries_received,
             entries_newly_stored: report.entries_newly_stored,
         };
-        if let ReconcileStep::Stop { converged } = reconcile_step(&session, rounds, max_rounds) {
+        let step = if report.continuation_pending {
+            if rounds >= max_rounds {
+                ReconcileStep::Stop { converged: false }
+            } else {
+                ReconcileStep::Continue
+            }
+        } else {
+            reconcile_step(&session, rounds, max_rounds)
+        };
+        if let ReconcileStep::Stop { converged } = step {
             return Ok(ReconcileReport { rounds, entries_newly_stored, entries_sent, converged });
         }
     }
@@ -1097,16 +1106,83 @@ mod tests {
             Ok(self.supported.contains(item))
         }
 
-        fn snapshot(
+        fn chain_page(
             &self,
             item: &crate::table_wire::ManifestItem,
-        ) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
-            Ok(self
+            after_device: Option<[u8; 32]>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<crate::table_wire::ChainHead>> {
+            let mut devices: Vec<_> = self
                 .entries
                 .get(&item.stream_id)
                 .into_iter()
                 .flatten()
-                .map(|(hash, bytes)| (*hash, bytes.clone()))
+                .map(|(hash, _)| *hash)
+                .filter(|device| after_device.is_none_or(|after| *device > after))
+                .collect();
+            devices.sort();
+            Ok(devices
+                .into_iter()
+                .take(limit)
+                .map(|device| crate::table_wire::ChainHead {
+                    device_fingerprint: device,
+                    lamport: 0,
+                    entry_hash: device,
+                })
+                .collect())
+        }
+
+        fn frontier(
+            &self,
+            item: &crate::table_wire::ManifestItem,
+            device: [u8; 32],
+        ) -> anyhow::Result<crate::table_wire::FrontierState> {
+            Ok(
+                if self
+                    .entries
+                    .get(&item.stream_id)
+                    .is_some_and(|entries| entries.contains_key(&device))
+                {
+                    crate::table_wire::FrontierState::Accepted { lamport: 0, entry_hash: device }
+                } else {
+                    crate::table_wire::FrontierState::Empty
+                },
+            )
+        }
+
+        fn entries(
+            &self,
+            item: &crate::table_wire::ManifestItem,
+            device: [u8; 32],
+            start: crate::table_session::ChainStart,
+            limit: usize,
+        ) -> anyhow::Result<Vec<crate::table_session::ChainEntry>> {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let Some(bytes) =
+                self.entries.get(&item.stream_id).and_then(|entries| entries.get(&device))
+            else {
+                return Ok(Vec::new());
+            };
+            let include = match start {
+                crate::table_session::ChainStart::Beginning => true,
+                crate::table_session::ChainStart::After { lamport, entry_hash } => {
+                    if lamport != 0 || entry_hash != device {
+                        return Ok(Vec::new());
+                    }
+                    false
+                },
+                crate::table_session::ChainStart::At { lamport, entry_hash } =>
+                    lamport == 0 && entry_hash == device,
+            };
+            Ok(include
+                .then(|| crate::table_session::ChainEntry {
+                    lamport: 0,
+                    entry_hash: device,
+                    signed_bytes: bytes.clone(),
+                })
+                .into_iter()
                 .collect())
         }
 
