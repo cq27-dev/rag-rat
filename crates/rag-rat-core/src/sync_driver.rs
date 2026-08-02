@@ -296,6 +296,25 @@ struct Publication {
     ttl_seconds: u32,
 }
 
+struct RefusedPublication {
+    envelope: Vec<u8>,
+    attempted_at: tokio::time::Instant,
+}
+
+fn refused_publication_is_due(
+    refusal: Option<&RefusedPublication>,
+    envelope: &[u8],
+    now: tokio::time::Instant,
+    retry_after: Duration,
+) -> bool {
+    !matches!(
+        refusal,
+        Some(refusal)
+            if refusal.envelope == envelope
+                && now.duration_since(refusal.attempted_at) < retry_after
+    )
+}
+
 /// Maintain a serving host's discovery announcement independently of its inbound session loop.
 ///
 /// The record in `index_meta` is reused only for the same endpoint identity, account tag, and
@@ -310,8 +329,10 @@ pub async fn advertise_host(config: Config, endpoint: iroh::Endpoint, database: 
         return;
     };
     let ttl_seconds = rag_rat_sync::discovery::publish_ttl_seconds(config.sync.push_interval_secs);
+    let retry_after = rag_rat_sync::discovery::retry_after_refusal(ttl_seconds);
     let node = *endpoint.id().as_bytes();
     let mut refresh = tokio::time::interval(ADVERTISEMENT_REFRESH);
+    let mut last_refused = None;
     loop {
         refresh.tick().await;
         let publication = match prepare_advertisement(&database, &node, time::now_ms(), ttl_seconds)
@@ -323,6 +344,15 @@ pub async fn advertise_host(config: Config, endpoint: iroh::Endpoint, database: 
                 continue;
             },
         };
+        let attempted_at = tokio::time::Instant::now();
+        if !refused_publication_is_due(
+            last_refused.as_ref(),
+            &publication.envelope,
+            attempted_at,
+            retry_after,
+        ) {
+            continue;
+        }
         let attempted_at_ms = time::now_ms();
         let outcome =
             rag_rat_sync::discovery::exchange(rag_rat_sync::discovery::DiscoveryExchange {
@@ -340,6 +370,11 @@ pub async fn advertise_host(config: Config, endpoint: iroh::Endpoint, database: 
         {
             tracing::warn!(%error, "could not persist this host's discovery liveness");
         }
+        last_refused = match outcome.publish {
+            rag_rat_sync::discovery::PublishState::Refused =>
+                Some(RefusedPublication { envelope: publication.envelope, attempted_at }),
+            _ => None,
+        };
         match outcome.degraded {
             Some(reason) => tracing::warn!(reason, "advertising this host degraded"),
             None => tracing::debug!(state = ?outcome.publish, "advertised this host"),
@@ -729,14 +764,15 @@ fn decode_secret(encoded: &str) -> anyhow::Result<Zeroizing<[u8; 32]>> {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use rag_rat_base::config::Config;
     use rusqlite::Connection;
 
     use super::{
         DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PersistedAdvertisement, RESIDENT_NUDGE,
-        can_host, can_sync, device_sync_run, nudge_resident_host, read_advertisement,
-        write_advertisement,
+        RefusedPublication, can_host, can_sync, device_sync_run, nudge_resident_host,
+        read_advertisement, refused_publication_is_due, write_advertisement,
     };
 
     #[test]
@@ -815,6 +851,34 @@ mod tests {
         assert!(
             !record.live(31_000),
             "the first renewal is still due at the established half-life"
+        );
+    }
+
+    #[test]
+    fn a_refused_advertisement_uses_the_ttl_derived_retry_delay() {
+        let retry_after = rag_rat_sync::discovery::retry_after_refusal(60);
+        assert_eq!(retry_after, Duration::from_millis(7_500));
+
+        let attempted_at = tokio::time::Instant::now();
+        let refusal = RefusedPublication { envelope: vec![1, 2, 3], attempted_at };
+        assert!(
+            !refused_publication_is_due(
+                Some(&refusal),
+                &[1, 2, 3],
+                attempted_at + retry_after - Duration::from_millis(1),
+                retry_after,
+            ),
+            "the fine controller timer must not turn a refusal into a request per second"
+        );
+        assert!(refused_publication_is_due(
+            Some(&refusal),
+            &[1, 2, 3],
+            attempted_at + retry_after,
+            retry_after,
+        ));
+        assert!(
+            refused_publication_is_due(Some(&refusal), &[9], attempted_at, retry_after),
+            "a roster reseal is a new envelope and should not wait behind an old refusal"
         );
     }
 }

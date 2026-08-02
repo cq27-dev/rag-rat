@@ -173,7 +173,7 @@ pub fn publish_ttl_seconds(push_interval_secs: u64) -> u32 {
     push_interval_secs.saturating_mul(2).clamp(MIN_TTL, MAX_TTL) as u32
 }
 
-/// How often [`advertise`] wakes, as a divisor of the TTL.
+/// How long a refused publish waits before retrying, as a divisor of the TTL.
 ///
 /// Only ticks where a renewal is actually due cost anything — the rest compare two local values and
 /// go back to sleep — so this is free to be fine, and being fine is what buys retry attempts. The
@@ -184,6 +184,15 @@ pub fn publish_ttl_seconds(push_interval_secs: u64) -> u32 {
 /// It was NOT free while liveness came from a fetch, when every tick was a full round trip. That
 /// coupling is gone.
 const TICKS_PER_TTL: u64 = 8;
+
+/// The retry delay after a publish the service definitely did not store.
+///
+/// Serving-host controllers may check their local state more frequently for roster changes, but
+/// must retain this pacing for repeated network attempts against the same envelope.
+pub fn retry_after_refusal(ttl_seconds: u32) -> Duration {
+    // `.max(1)` keeps the duration positive if a future service permits a sub-second TTL.
+    Duration::from_millis((u64::from(ttl_seconds) * 1000 / TICKS_PER_TTL).max(1))
+}
 
 /// Renew once half the TTL has elapsed.
 ///
@@ -467,9 +476,7 @@ pub struct Advertise {
 /// the other way round.
 pub async fn advertise(params: Advertise) {
     let Advertise { endpoint, service, tag, mut announcement, ttl_seconds } = params;
-    // Milliseconds, and `.max(1)`, so the period stays positive for any TTL the service's floor
-    // could ever permit — `interval` panics on a zero period.
-    let period = Duration::from_millis((u64::from(ttl_seconds) * 1000 / TICKS_PER_TTL).max(1));
+    let period = retry_after_refusal(ttl_seconds);
     let renew_after = renew_after(ttl_seconds);
     let mut ticks = tokio::time::interval(period);
     // What the service last accepted from this host, and when. A MONOTONIC instant, not the wall
