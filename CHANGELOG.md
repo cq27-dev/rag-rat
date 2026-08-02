@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.21.1...rag-rat-base-v0.22.0) - 2026-08-02
+
+### Added
+
+- *(sync)* account-keyed peer discovery ([#1078](https://github.com/cq27-dev/rag-rat/pull/1078))
+- *(oracle)* give each checkout its own live oracle sessions and worklist ([#1054](https://github.com/cq27-dev/rag-rat/pull/1054))
+- *(languages)* add Go language support ([#994](https://github.com/cq27-dev/rag-rat/pull/994))
+- *(lens)* add authenticated VS Code repository lens ([#985](https://github.com/cq27-dev/rag-rat/pull/985))
+- *(oracle)* add a live TypeScript LSP backend ([#536](https://github.com/cq27-dev/rag-rat/pull/536)) ([#992](https://github.com/cq27-dev/rag-rat/pull/992))
+- *(oracle)* live LSP watcher wiring — phase 6 slice 2 ([#534](https://github.com/cq27-dev/rag-rat/pull/534)) ([#972](https://github.com/cq27-dev/rag-rat/pull/972))
+- *(sync)* device-side account-log sync to configured server peers ([#922](https://github.com/cq27-dev/rag-rat/pull/922))
+- *(sync)* [sync] config + `rag-rat sync serve` headless peer ([#909](https://github.com/cq27-dev/rag-rat/pull/909))
+
+### Fixed
+
+- *(index)* treat a literal backslash in a Unix filename as part of the name ([#1052](https://github.com/cq27-dev/rag-rat/pull/1052))
+- *(paths)* resolve filesystem paths off the Windows verbatim spelling ([#1055](https://github.com/cq27-dev/rag-rat/pull/1055))
+- *(index)* canonicalize fixture config roots so the suite matches Config::load ([#1047](https://github.com/cq27-dev/rag-rat/pull/1047))
+- *(oracle)* separate the checkout ceiling, the index root, and the indexed corpus (#1008, #1011) ([#1031](https://github.com/cq27-dev/rag-rat/pull/1031))
+- *(tests)* isolate fixture git invocations from the ambient environment ([#975](https://github.com/cq27-dev/rag-rat/pull/975))
+- *(tests)* retain satellite-crate scratch cleanup guards ([#973](https://github.com/cq27-dev/rag-rat/pull/973))
+- *(tests)* retain core unit-test scratch cleanup guards ([#968](https://github.com/cq27-dev/rag-rat/pull/968))
+- *(tests)* retain config scratch cleanup guards ([#967](https://github.com/cq27-dev/rag-rat/pull/967))
+- *(tests)* clean high-volume scratch fixtures ([#963](https://github.com/cq27-dev/rag-rat/pull/963))
+
+### Other
+
+- derive schema recognizers from the ladder and reuse shared helpers ([#1098](https://github.com/cq27-dev/rag-rat/pull/1098))
+- document Go language support ([#1061](https://github.com/cq27-dev/rag-rat/pull/1061))
+- *(deps)* upgrade Rust dependencies ([#933](https://github.com/cq27-dev/rag-rat/pull/933))
+
 ## [0.21.1](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.21.0...rag-rat-base-v0.21.1) - 2026-07-24
 
 ### Other
