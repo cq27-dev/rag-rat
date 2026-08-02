@@ -263,6 +263,7 @@ async fn resident_loop(
 struct PersistedAdvertisement {
     tag: [u8; 32],
     node: [u8; 32],
+    service: [u8; 32],
     roster_stamp: Option<[u8; 32]>,
     envelope: Option<Vec<u8>>,
     published_at_ms: Option<i64>,
@@ -270,8 +271,17 @@ struct PersistedAdvertisement {
 }
 
 impl PersistedAdvertisement {
-    fn matches(&self, tag: &[u8; 32], node: &[u8; 32], stamp: &Option<[u8; 32]>) -> bool {
-        self.tag == *tag && self.node == *node && self.roster_stamp == *stamp
+    fn matches(
+        &self,
+        tag: &[u8; 32],
+        node: &[u8; 32],
+        service: &[u8; 32],
+        stamp: &Option<[u8; 32]>,
+    ) -> bool {
+        self.tag == *tag
+            && self.node == *node
+            && self.service == *service
+            && self.roster_stamp == *stamp
     }
 
     fn live(&self, now_ms: i64) -> bool {
@@ -292,6 +302,7 @@ impl PersistedAdvertisement {
 struct Publication {
     tag: [u8; 32],
     node: [u8; 32],
+    service: [u8; 32],
     envelope: Vec<u8>,
     ttl_seconds: u32,
 }
@@ -331,12 +342,18 @@ pub async fn advertise_host(config: Config, endpoint: iroh::Endpoint, database: 
     let ttl_seconds = rag_rat_sync::discovery::publish_ttl_seconds(config.sync.push_interval_secs);
     let retry_after = rag_rat_sync::discovery::retry_after_refusal(ttl_seconds);
     let node = *endpoint.id().as_bytes();
+    let service_node = *service.id.as_bytes();
     let mut refresh = tokio::time::interval(ADVERTISEMENT_REFRESH);
     let mut last_refused = None;
     loop {
         refresh.tick().await;
-        let publication = match prepare_advertisement(&database, &node, time::now_ms(), ttl_seconds)
-        {
+        let publication = match prepare_advertisement(
+            &database,
+            &node,
+            &service_node,
+            time::now_ms(),
+            ttl_seconds,
+        ) {
             Ok(Some(publication)) => publication,
             Ok(None) => continue,
             Err(error) => {
@@ -385,6 +402,7 @@ pub async fn advertise_host(config: Config, endpoint: iroh::Endpoint, database: 
 fn prepare_advertisement(
     database: &Path,
     node: &[u8; 32],
+    service: &[u8; 32],
     now_ms: i64,
     ttl_seconds: u32,
 ) -> anyhow::Result<Option<Publication>> {
@@ -396,7 +414,7 @@ fn prepare_advertisement(
     let tag = rag_rat_sync::discovery::account_tag(&secret);
     let stamp = rag_rat_oplog::discovery::roster_stamp(conn)?;
     let persisted = read_advertisement(conn)?;
-    let current = persisted.filter(|record| record.matches(&tag, node, &stamp));
+    let current = persisted.filter(|record| record.matches(&tag, node, service, &stamp));
     let record = match current {
         Some(record) => record,
         None => {
@@ -404,6 +422,7 @@ fn prepare_advertisement(
             let record = PersistedAdvertisement {
                 tag,
                 node: *node,
+                service: *service,
                 roster_stamp: stamp,
                 envelope,
                 published_at_ms: None,
@@ -416,7 +435,13 @@ fn prepare_advertisement(
     if record.live(now_ms) {
         return Ok(None);
     }
-    Ok(record.envelope.map(|envelope| Publication { tag, node: *node, envelope, ttl_seconds }))
+    Ok(record.envelope.map(|envelope| Publication {
+        tag,
+        node: *node,
+        service: *service,
+        envelope,
+        ttl_seconds,
+    }))
 }
 
 fn record_advertisement_liveness(
@@ -431,7 +456,7 @@ fn record_advertisement_liveness(
         return Ok(());
     };
     // Never make a publish from a roster that moved during the network exchange look current.
-    if !record.matches(&publication.tag, &publication.node, &stamp)
+    if !record.matches(&publication.tag, &publication.node, &publication.service, &stamp)
         || record.envelope.as_deref() != Some(publication.envelope.as_slice())
     {
         return Ok(());
@@ -809,12 +834,13 @@ mod tests {
     }
 
     #[test]
-    fn persisted_advertisement_matches_only_the_same_endpoint_tag_and_roster() {
+    fn persisted_advertisement_matches_only_the_same_endpoint_service_tag_and_roster() {
         let conn = Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
         let record = PersistedAdvertisement {
             tag: [1; 32],
             node: [2; 32],
+            service: [3; 32],
             roster_stamp: Some([3; 32]),
             envelope: Some(vec![4, 5, 6]),
             published_at_ms: Some(7),
@@ -824,10 +850,11 @@ mod tests {
         write_advertisement(&conn, &record).unwrap();
         let restored = read_advertisement(&conn).unwrap().expect("the record was persisted");
         assert_eq!(restored, record, "the exact sealed envelope survives a host restart");
-        assert!(restored.matches(&[1; 32], &[2; 32], &Some([3; 32])));
-        assert!(!restored.matches(&[9; 32], &[2; 32], &Some([3; 32])));
-        assert!(!restored.matches(&[1; 32], &[9; 32], &Some([3; 32])));
-        assert!(!restored.matches(&[1; 32], &[2; 32], &Some([9; 32])));
+        assert!(restored.matches(&[1; 32], &[2; 32], &[3; 32], &Some([3; 32])));
+        assert!(!restored.matches(&[9; 32], &[2; 32], &[3; 32], &Some([3; 32])));
+        assert!(!restored.matches(&[1; 32], &[9; 32], &[3; 32], &Some([3; 32])));
+        assert!(!restored.matches(&[1; 32], &[2; 32], &[9; 32], &Some([3; 32])));
+        assert!(!restored.matches(&[1; 32], &[2; 32], &[3; 32], &Some([9; 32])));
         assert!(
             rag_rat_db::meta::read_meta(&conn, DISCOVERY_ADVERTISEMENT).unwrap().is_some(),
             "the controller stores its state in index_meta"
@@ -839,6 +866,7 @@ mod tests {
         let record = PersistedAdvertisement {
             tag: [1; 32],
             node: [2; 32],
+            service: [3; 32],
             roster_stamp: Some([3; 32]),
             envelope: Some(vec![4, 5, 6]),
             published_at_ms: Some(1_000),
