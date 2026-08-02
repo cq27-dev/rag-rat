@@ -136,10 +136,14 @@ GitHub `appliance-prod` environment secrets:
 
 - Upgrade: push to `main` touching the appliance/extension/crates → CI rebuilds and
   restarts. The deploy also **pins the host clone to the deployed SHA** (`git checkout
-  -qf <sha>`), installs the freshly built host binary, stops the workbench, and runs
-  `rag-rat index` before restarting — the served graph is commit-scoped, so the clone,
-  the DB, and the binary must move together. Roll back by re-running the workflow from
-  the previous commit (the same pin+reindex restores that state).
+  -qf <sha>`), installs the freshly built host binary, and reindexes — **hot, without
+  stopping the appliance**: the full rebuild is generation-staged, so readers see the
+  complete old generation until the atomic flip, and the repo write lock serializes the
+  old serve's watcher against the new binary. Only the per-service container recreate
+  (serve → code-server → edge/tunnel) costs seconds of public gap. Caveat: a
+  schema-versioned deploy may crash the old serve early; the recreate follows within
+  minutes and is still strictly better than a stopped window. Roll back by re-running
+  the workflow from the previous commit.
 - code-server user data is a tmpfs (ephemeral per boot); `.rag-rat` runtime is the
   `lens_runtime` volume. The `lens_ext` volume initializes from the image ONCE and then
   shadows newer extension bundles — the deploy drops it before `up` for exactly this

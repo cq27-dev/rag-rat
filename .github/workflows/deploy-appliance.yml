@@ -75,18 +75,36 @@ jobs:
             set -e
             DEPLOY_DIR=/opt/rag-rat-appliance
             install -m 755 "$DEPLOY_DIR/artifacts/rag-rat" "$HOME/.local/bin/rag-rat"
-            cd /srv/rag-rat/repo
-            git fetch -q origin
-            git checkout -qf "${{ github.sha }}"
-            grep -q '^database = ' rag-rat.toml || \
-              sed -i 's|^root = "\."|root = "."\ndatabase = "/srv/rag-rat/db/rag-rat.sqlite"|' rag-rat.toml
-            # Stop BOTH container writers before the checkout + reindex: the old serve's
-            # watcher stays live on the shared DB otherwise, and the newly installed
-            # binary would index/migrate alongside a different version's writer.
-            cd "$DEPLOY_DIR" && docker compose stop code-server serve
+            # Serialize the checkout against the live serve watcher: its event-driven
+            # maintenance pass writes DIRECTLY to the live generation (no staging), and
+            # `rag-rat index` only takes the repo write lock after the tree has been
+            # replaced — so a pass woken by checkout churn could index the transient
+            # half-switched tree into the live scope. Hold the repo's own write flock
+            # across the checkout instead; anything the watcher writes afterwards is
+            # superseded by the staged rebuild's atomic flip.
+            #
+            # The lock file is derived, not globbed: stale per-repo lock files from an
+            # identity transition must not let us hold the WRONG one. rag-rat's lock
+            # discriminator is the first 12 alphanumerics of the repo id, and a portable
+            # repo id is the first-parent root commit hash.
+            ROOT=$(git -C /srv/rag-rat/repo rev-list --max-parents=0 --first-parent HEAD | head -1)
+            DISC=$(printf %s "$ROOT" | tr -cd '[:alnum:]' | cut -c1-12)
+            flock -x "/srv/rag-rat/db/rag-rat-write-$DISC.lock" -c \
+              "git -C /srv/rag-rat/repo fetch -q origin && git -C /srv/rag-rat/repo checkout -qf ${{ github.sha }}"
+            grep -q '^database = ' /srv/rag-rat/repo/rag-rat.toml || \
+              sed -i 's|^root = "\."|root = "."\ndatabase = "/srv/rag-rat/db/rag-rat.sqlite"|' \
+                /srv/rag-rat/repo/rag-rat.toml
             # Index from the HOST checkout: its rag-rat.toml resolves root + database to
             # the host paths. Running from $DEPLOY_DIR would load the appliance config
             # with the container-only /srv/workspace and /srv/db instead.
+            #
+            # HOT deploy, no stopped-writer window: the full rebuild is generation-staged
+            # (readers see the complete old generation until the atomic flip, never a
+            # half-built mix) and the repo write lock serializes the old serve's watcher
+            # against this new binary, so indexing runs while the appliance keeps serving.
+            # Caveat: on a SCHEMA-VERSIONED deploy the old serve may fail its schema
+            # check and exit early — bounded (the recreate below follows within minutes),
+            # and strictly better than a certain 10-minute outage on every deploy.
             cd /srv/rag-rat/repo
             "$HOME/.local/bin/rag-rat" index
             # The clone lane is a separate derived artifact: a plain index leaves the
@@ -99,12 +117,21 @@ jobs:
         run: |
           ssh ragrat@${{ secrets.DEPLOY_HOST }} \
             "cd '$DEPLOY_DIR' && docker compose build --pull \
-              && docker compose rm -sf code-server serve \
+              && docker compose --profile tunnel run --rm init-runtime \
+              && docker compose --profile tunnel up -d --no-deps --force-recreate serve \
+              && docker compose rm -sf code-server \
               && (docker volume rm rag-rat-appliance_lens_ext || true) \
-              && docker compose --profile tunnel up -d"
+              && docker compose --profile tunnel up -d --no-deps --force-recreate code-server edge tunnel"
         # lens_ext is a named volume: it initializes from the image ONCE and then shadows
         # every newer extension bundle (a stale vsix kept serving long after rebuilds —
-        # the demoFile onboarding was invisible until the volume was dropped). Removing
-        # it on every deploy re-initializes from the fresh image. The parens keep
-        # `|| true` scoped to the volume removal alone: a build or compose failure must
-        # fail the deploy, not quietly serve the previous image.
+        # the demoFile onboarding was invisible until the volume was dropped). The rm
+        # must follow `rm -sf code-server`: the running container holds the volume, so
+        # removing first silently fails and the recreate reuses the stale bundle. The
+        # parens keep `|| true` scoped to the volume removal alone: a build or compose
+        # failure must fail the deploy, not quietly serve the previous image.
+        #
+        # Per-service recreate order keeps the public gap to seconds: init-runtime first,
+        # SYNCHRONOUSLY (`run --rm` returns only after the chown completes — `up -d`
+        # would let serve start while the one-shot init is still running, and the
+        # recreate's `--no-deps` bypasses the depends_on guard), then the backend, then
+        # the workbench and its forwarders.
