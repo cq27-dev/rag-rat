@@ -418,6 +418,19 @@ fn current_row_clock(
     current_row_clock_on_stream(tx, StreamId::from_bytes([0; 32]), repo_id, table, row_pk)
 }
 
+/// The row's live whole-row-LWW winner on `stream` as `(lamport, device hex)` — the merge-table
+/// half of the re-adoption verdict (#997). The fingerprint is stored as the lowercase hex the
+/// applier wrote (`OpMeta::device.to_string()`); callers compare the hex strings directly.
+pub(crate) fn row_clock_winner_on_stream(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    repo_id: &str,
+    table: &str,
+    row_pk: &str,
+) -> anyhow::Result<Option<(u64, String)>> {
+    current_row_clock_on_stream(tx, stream, repo_id, table, row_pk)
+}
+
 /// Raise the row's write clock to `(lamport, device_hex)` under LWW — a later-arriving but older
 /// write never lowers it.
 fn raise_row_clock(
@@ -469,6 +482,18 @@ fn current_tombstone(
         )
         .optional()?;
     row.map(|(lamport, device)| Ok((u64::try_from(lamport)?, device))).transpose()
+}
+
+/// The row's current tombstone winner on `stream` as `(lamport, device hex)` — the deletion half
+/// of the re-adoption verdict (#997).
+pub(crate) fn tombstone_winner_on_stream(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    repo_id: &str,
+    table: &str,
+    row_pk: &str,
+) -> anyhow::Result<Option<(u64, String)>> {
+    current_tombstone(tx, stream, repo_id, table, row_pk)
 }
 
 /// Raise the row's tombstone to `(lamport, device_hex)` under LWW — a lower clock never lowers it.
@@ -1035,6 +1060,16 @@ fn clear_published(
         rusqlite::params![stream.to_bytes().as_slice(), repo_id, table, row_pk],
     )?;
     Ok(())
+}
+
+/// Build the re-adoption `Remove` for an orphaned tombstone: just the row pk (a delete carries no
+/// after-image).
+pub(crate) fn readopt_remove(spec: &TableSpec, row_pk: &str) -> anyhow::Result<RowOp> {
+    Ok(RowOp::Remove {
+        table: spec.name.to_string(),
+        spec_version: spec.spec_version,
+        pk: row_op::row_pk_values(row_pk)?,
+    })
 }
 
 // ── value / identifier plumbing ──────────────────────────────────────────────────────────────

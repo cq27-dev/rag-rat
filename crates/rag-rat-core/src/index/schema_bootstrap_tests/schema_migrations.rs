@@ -1839,7 +1839,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 103, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 104, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
@@ -1958,6 +1958,40 @@ fn migration_103_syncable_memory_bindings() {
         )
         .unwrap();
     assert_eq!(preserved, ("src/lib.rs".into(), 3, 4, 5, "relocated".into(), 9));
+}
+
+/// V104 (#997) adds the durable re-adoption worklist and audit provenance.
+#[test]
+fn migration_104_table_sync_readoption() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+
+    let work_strict: i64 = conn
+        .query_row(
+            "SELECT strict FROM pragma_table_list
+             WHERE schema = 'main' AND name = 'table_sync_readoption_work'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(work_strict, 1);
+    let audit_strict: i64 = conn
+        .query_row(
+            "SELECT strict FROM pragma_table_list
+             WHERE schema = 'main' AND name = 'table_sync_readoption_audit'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit_strict, 1);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '104_table_sync_readoption'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
 }
 
 /// V091 (#949) tracks the live key-target count each invite reservation covers, so fold-time

@@ -1489,6 +1489,10 @@ mod repo_id_scope_coverage {
         ),
         ("sync_row_clocks", "per-row last-writer-wins clocks, same keying"),
         ("sync_row_tombstones", "per-row delete clocks, same keying"),
+        (
+            "table_sync_readoption_audit",
+            "re-adoption provenance, keyed to its stream like the directory's other children",
+        ),
     ];
 
     /// `(table, what is unresolved)` — the dream-v2 verification siblings on the LATE-MERGE path

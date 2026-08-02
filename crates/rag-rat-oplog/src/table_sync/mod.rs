@@ -33,6 +33,7 @@ pub(crate) use registry::{ColumnSpec, TableSpec, ValueType};
 pub(crate) use row_op::{Cell, RowOp, TypedValue};
 #[cfg(test)]
 pub(crate) use scope_stream::scope_stream_id;
+pub(crate) use store::enqueue_readoption_work;
 #[cfg(test)]
 pub(crate) use store::{
     PendingReason, author_row_entry, mark_entry_pending, record_stream_context,

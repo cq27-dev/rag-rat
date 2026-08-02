@@ -11,6 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use super::engine::{self, IngestOutcome, SyncCtx};
 use super::registry::{SYNCABLE_TABLES, TableSpec};
 use super::scope_stream::scope_stream_id;
+use super::store;
 use crate::AccountId;
 use crate::account::{self, RepoIncarnationState};
 use crate::device::DevicePublic;
@@ -81,6 +82,9 @@ pub fn table_sync_supported_streams(
 }
 
 /// Author every unpublished local row in the production registry before a table manifest is built.
+///
+/// The count includes entries authored by re-adoption (#997): a removal drain can be the only
+/// thing this pass authors, and a caller using the return as "did anything change" must see it.
 pub fn table_sync_author_pending(
     conn: &Connection,
     account_id: AccountId,
@@ -101,15 +105,42 @@ pub fn table_sync_author_pending(
     let mut authored = 0;
     for (repo_id, incarnation_ref) in repos {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        authored += engine::produce_and_author(&tx, &SyncCtx {
+        let ctx = SyncCtx {
             repo_id: &repo_id,
             account_id,
             incarnation_ref,
             device: &device,
             registry: SYNCABLE_TABLES,
             now_ms,
-        })?
-        .len();
+        };
+        // INVARIANT: the account fold enqueues re-adoption work for EVERY stream in
+        // table_sync_streams, while this drain only walks repo-scoped specs' streams. The two
+        // sets coincide as long as every registered production table is repo-scoped — registering
+        // an account-scoped table must derive the drain set from the work table instead.
+        let mut streams: Vec<crate::stream::StreamId> = SYNCABLE_TABLES
+            .iter()
+            .filter(|spec| spec.repo_column.is_some())
+            .map(|spec| scope_stream_id(&repo_id, account_id, incarnation_ref, spec.scope_id))
+            .collect();
+        authored += engine::produce_and_author(&tx, &ctx)?.len();
+        streams.sort_unstable();
+        streams.dedup();
+        for stream in streams {
+            // Drain EVERY pending removal, not one: two devices removed on one stream must not
+            // wait a whole sync session for the second repair. Each call completes one removal, so
+            // `has_pending` makes progress — UNLESS the pass cannot drain: a row whose synced
+            // column is unreadable today (retried once the cell is repaired), or a stream with no
+            // recorded apply context. `None` is that case: stop rather than spin on a work item
+            // this pass cannot finish.
+            while store::has_pending_readoption_work(&tx, account_id, stream)? {
+                let Some(reauthored) =
+                    engine::process_readoption_work_for_stream(&tx, &ctx, stream)?
+                else {
+                    break;
+                };
+                authored += reauthored;
+            }
+        }
         tx.commit()?;
     }
     Ok(authored)

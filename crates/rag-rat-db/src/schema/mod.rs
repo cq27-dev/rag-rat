@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 103;
+pub const LATEST_SCHEMA_VERSION: u32 = 104;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -780,6 +780,12 @@ const MIGRATION_103_CHECKSUM: &str = "sha256:rag-rat-syncable-memory-bindings-v1
 const MIGRATION_103_DESCRIPTION: &str = "Rebuild memory bindings as a strict, repository-keyed, \
                                          dependency-free table suitable for deterministic \
                                          anchors/1 whole-row replication";
+const MIGRATION_104_ID: &str = "104_table_sync_readoption";
+const MIGRATION_104_CHECKSUM: &str = "sha256:rag-rat-table-sync-readoption-v104";
+const MIGRATION_104_DESCRIPTION: &str =
+    "Add the durable table-sync re-adoption worklist and audit log (#997): an effective \
+     DeviceRemove enqueues one item per affected stream, which a current writer drains by \
+     re-authoring the removed writer's surviving LWW state under its own chain";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1631,6 +1637,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_103_CHECKSUM,
         description: MIGRATION_103_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_syncable_memory_bindings),
+    },
+    Migration {
+        id: MIGRATION_104_ID,
+        checksum: MIGRATION_104_CHECKSUM,
+        description: MIGRATION_104_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_table_sync_readoption),
     },
 ];
 

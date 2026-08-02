@@ -590,6 +590,31 @@ mod tests {
             ]],
         )
         .unwrap();
+        // The re-adoption tables are swept through the same directory (#997): a pending repair and
+        // its provenance both name the stream, so each needs a seed row for the orphan check to
+        // observe.
+        conn.execute(
+            "INSERT INTO table_sync_readoption_work(account_id, device_fingerprint, stream_id, \
+             roster_ref, removed_at_epoch, enqueued_at_ms) VALUES (?1, ?2, ?3, ?4, 1, 0)",
+            params![vec![seed; 32], vec![seed; 32], stream_id, vec![seed ^ 0x11; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO table_sync_readoption_audit(account_id, removed_fingerprint, \
+             adopter_fingerprint, stream_id, repo_id, scope_id, table_name, row_pk, \
+             original_lamport, original_entry_hash, adopted_entry_hash, adopted_at_ms) VALUES \
+             (?1, ?2, ?3, ?4, ?5, 'demo/1', 't', 'aa', 1, ?6, ?7, 0)",
+            params![
+                vec![seed; 32],
+                vec![seed; 32],
+                vec![seed ^ 0x22; 32],
+                stream_id,
+                repo_id,
+                vec![seed; 32],
+                vec![seed ^ 0x33; 32]
+            ],
+        )
+        .unwrap();
         stream_id
     }
 
@@ -640,6 +665,8 @@ mod tests {
             ("clone_df_epoch", "build_generation", generation_in),
             ("table_sync_entries", "stream_id", blob_literal(stream_id)),
             ("table_sync_gapped_entries", "stream_id", blob_literal(stream_id)),
+            ("table_sync_readoption_work", "stream_id", blob_literal(stream_id)),
+            ("table_sync_readoption_audit", "stream_id", blob_literal(stream_id)),
         ];
         for (table, column, in_body) in checks {
             let count: i64 = conn

@@ -165,6 +165,21 @@ const TRANSITIVE_SCOPED_TABLES: &[TransitiveTable] = &[
         id_column: "stream_id",
         parent_ids: purge_ids::STREAMS,
     },
+    // Re-adoption work for removed writers on this repo's streams. It must not survive the
+    // directory: stream identity is derived, so a re-registered repo must never let an old
+    // removal re-author rows into its fresh stream.
+    TransitiveTable {
+        table: "table_sync_readoption_work",
+        id_column: "stream_id",
+        parent_ids: purge_ids::STREAMS,
+    },
+    // Re-adoption provenance for those same streams, retained only while the repo's accepted
+    // history is retained.
+    TransitiveTable {
+        table: "table_sync_readoption_audit",
+        id_column: "stream_id",
+        parent_ids: purge_ids::STREAMS,
+    },
     // Entries held awaiting a chain predecessor. Same reasoning as the accepted log above, and for
     // the same reason it must not be exempted: these are signed operations on a stream whose id is
     // derived, so retaining them across a re-registration of the repo would replay a removed
@@ -357,6 +372,26 @@ pub fn purge_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
             [],
         )?;
     }
+    // Re-adoption work parked under the all-zero placeholder stream has no directory row to scope
+    // through and would otherwise survive forever. It exists only while its account has no
+    // table-sync streams at all, so there is no authored history it could still repair, and any
+    // removal it records is already folded into every peer's roster. Scoped to the accounts that
+    // hold incarnation authority for THIS repository: a parked row is account-scoped, and an
+    // unrelated account's repair must not be collateral of this purge. Rows already copied into a
+    // real stream were handled above through purge_ids::STREAMS.
+    if crate::schema::table_exists(conn, "table_sync_readoption_work")?
+        && crate::schema::table_exists(conn, "account_repo_incarnation_current")?
+    {
+        conn.execute(
+            "DELETE FROM table_sync_readoption_work
+             WHERE stream_id = zeroblob(32)
+               AND account_id IN (
+                   SELECT account_id FROM account_repo_incarnation_current
+                    WHERE repository_id = ?1
+               )",
+            params![repo_id],
+        )?;
+    }
     // chunk_fts is contentless FTS5 keyed by chunk.id: delete by rowid from the captured chunk set
     // (it carries no repo_id and no FK, so neither the sweep nor a cascade would ever reach it).
     conn.execute(
@@ -477,5 +512,52 @@ mod tests {
         let counts = count_repo_rows(&conn, "some-repo")
             .expect("planning must survive a store whose directory table predates the entry log");
         assert_eq!(counts.total_rows, 0, "nothing is counted for an unknown repo");
+    }
+
+    /// Parked re-adoption work is account-scoped: purging one account's repo must not delete
+    /// another account's repair.
+    #[test]
+    fn purging_parked_readoption_work_leaves_unrelated_accounts_untouched() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_repo_incarnation_current(
+                 account_id, repository_id, incarnation_ref
+             ) VALUES (zeroblob(32), 'repo-x', zeroblob(32)),
+                      (x'1100000000000000000000000000000000000000000000000000000000000000',
+                       'repo-y', zeroblob(32));
+             INSERT INTO table_sync_readoption_work(
+                 account_id, device_fingerprint, stream_id, roster_ref, removed_at_epoch,
+                 enqueued_at_ms
+             ) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(32), 1, 2),
+                      (x'1100000000000000000000000000000000000000000000000000000000000000',
+                       zeroblob(32), zeroblob(32), zeroblob(32), 1, 2);
+             INSERT INTO table_sync_readoption_work(
+                 account_id, device_fingerprint, stream_id, roster_ref, removed_at_epoch,
+                 enqueued_at_ms, processed_at_ms
+             ) VALUES (zeroblob(32), \
+             x'2200000000000000000000000000000000000000000000000000000000000000',
+                       zeroblob(32), \
+             x'2200000000000000000000000000000000000000000000000000000000000000',
+                       1, 2, 3);",
+        )
+        .unwrap();
+
+        purge_repo_rows(&conn, "repo-x").unwrap();
+
+        let remaining: Vec<Vec<u8>> = conn
+            .prepare("SELECT account_id FROM table_sync_readoption_work")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut expected = vec![0x11];
+        expected.extend([0; 31]);
+        assert_eq!(
+            remaining,
+            vec![expected],
+            "repo-y's parked work survives; repo-x's rows are gone, stamped or not"
+        );
     }
 }

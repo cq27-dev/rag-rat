@@ -7377,6 +7377,49 @@ fn table_is_strict(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
     )
 }
 
+/// V104 (#997): the durable re-adoption worklist and audit log.
+///
+/// An effective `DeviceRemove` makes the #935 ingest gate refuse every later copy of that
+/// device's entries, so rows whose whole-row LWW winner is the removed writer never reach a
+/// replica enrolled after the removal. The account fold records each removal here, and a
+/// roster-effective writer drains the worklist by re-authoring the surviving state under its
+/// own chain. `roster_ref` is NOT a foreign key: the projection deletes and rewrites roster
+/// history on every fold, and the worklist must survive that rewrite.
+pub fn apply_table_sync_readoption(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS table_sync_readoption_work(
+              account_id BLOB NOT NULL CHECK(length(account_id) = 32),
+              device_fingerprint BLOB NOT NULL CHECK(length(device_fingerprint) = 32),
+              stream_id BLOB NOT NULL CHECK(length(stream_id) = 32),
+              roster_ref BLOB NOT NULL CHECK(length(roster_ref) = 32),
+              removed_at_epoch INTEGER NOT NULL,
+              enqueued_at_ms INTEGER NOT NULL,
+              processed_at_ms INTEGER,
+              PRIMARY KEY(account_id, device_fingerprint, stream_id)
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS table_sync_readoption_work_pending
+              ON table_sync_readoption_work(account_id, stream_id)
+              WHERE processed_at_ms IS NULL;
+          CREATE TABLE IF NOT EXISTS table_sync_readoption_audit(
+              audit_id INTEGER PRIMARY KEY,
+              account_id BLOB NOT NULL CHECK(length(account_id) = 32),
+              removed_fingerprint BLOB NOT NULL CHECK(length(removed_fingerprint) = 32),
+              adopter_fingerprint BLOB NOT NULL CHECK(length(adopter_fingerprint) = 32),
+              stream_id BLOB NOT NULL CHECK(length(stream_id) = 32),
+              repo_id TEXT NOT NULL,
+              scope_id TEXT NOT NULL,
+              table_name TEXT NOT NULL,
+              row_pk TEXT NOT NULL,
+              original_lamport INTEGER NOT NULL,
+              original_entry_hash BLOB NOT NULL CHECK(length(original_entry_hash) = 32),
+              adopted_entry_hash BLOB NOT NULL CHECK(length(adopted_entry_hash) = 32),
+              adopted_at_ms INTEGER NOT NULL
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS table_sync_readoption_audit_stream
+              ON table_sync_readoption_audit(account_id, stream_id);",
+    )
+}
+
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
     let mut stmt =
         conn.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?;

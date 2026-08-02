@@ -14,6 +14,7 @@ use rusqlite::Transaction;
 
 use super::apply::{self, ApplyOutcome};
 use super::registry::TableSpec;
+use super::row_op::{self, RowOp};
 use super::scope_stream::scope_stream_id;
 use super::store::{self, AcceptOutcome};
 use super::{produce, refold};
@@ -164,6 +165,183 @@ pub(crate) fn produce_and_author(
     // after that edit is authored, and loses on the merits instead of by default.
     refold::replay_deferred_entries(tx, ctx.registry)?;
     Ok(authored)
+}
+
+/// Re-author the removed writer's surviving state on this stream under the local device key, then
+/// mark the removal handled (#997). Runs inside the producer transaction: it sees the just-authored
+/// local rows and is protected by the same current-incarnation and projector gates as authoring.
+///
+/// Returns `None` when the removal CANNOT be fully drained here — the local device is not
+/// currently a roster-effective writer, the stream has no recorded apply context, or a row exists
+/// that cannot be carried in an op today (an unreadable synced column: retried after the cell is
+/// repaired, never written off). `Some(n)` means the work item completed (n re-authored rows,
+/// possibly 0): the caller must not treat "could not drain" and "nothing to re-author" as the
+/// same outcome.
+pub(crate) fn process_readoption_work_for_stream(
+    tx: &Transaction<'_>,
+    ctx: &SyncCtx<'_>,
+    stream: crate::stream::StreamId,
+) -> anyhow::Result<Option<usize>> {
+    let Some(work) = store::readoption_work_for_stream(tx, ctx.account_id, stream)? else {
+        return Ok(Some(0));
+    };
+    if !crate::account::device_is_effective_writer(tx, ctx.account_id, ctx.device.fingerprint())? {
+        return Ok(None);
+    }
+    // Re-verify the removal still stands: a device re-invited before this pass is effective again,
+    // so its entries ingest directly on every replica and re-authoring them here would only steal
+    // clock ownership from an active writer. Completing (not deleting) keeps the row idempotent.
+    if crate::account::device_is_effective_writer(tx, ctx.account_id, work.device_fingerprint)? {
+        store::complete_readoption_work(
+            tx,
+            ctx.account_id,
+            work.device_fingerprint,
+            stream,
+            ctx.now_ms,
+        )?;
+        return Ok(Some(0));
+    }
+    let Some(context) = store::stream_context(tx, stream)? else {
+        return Ok(None);
+    };
+    let removed = work.device_fingerprint;
+    let removed_hex = removed.to_string();
+    let mut authored = 0;
+    let mut unrepairable = 0;
+    for candidate in store::readoption_candidates(tx, stream, work.device_fingerprint)? {
+        let Some(spec) = ctx
+            .registry
+            .iter()
+            .find(|spec| spec.scope_id == context.scope_id && spec.name == candidate.table_name)
+        else {
+            continue;
+        };
+        let op = match readoption_repair_op(tx, ctx, spec, stream, &candidate.row_pk, &removed_hex)?
+        {
+            ReadoptionRepair::Skip => continue,
+            ReadoptionRepair::Unrepairable => {
+                unrepairable += 1;
+                continue;
+            },
+            ReadoptionRepair::Repair(op) => op,
+        };
+        let signed = store::author_row_entry(tx, stream, ctx.device.secret(), &op, ctx.now_ms)?;
+        let meta =
+            OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
+        match apply::apply_row_op_on_stream(tx, spec, ctx.repo_id, stream, &op, meta)? {
+            ApplyOutcome::Applied => {
+                store::record_readoption_audit(tx, store::ReadoptionAudit {
+                    account_id: ctx.account_id,
+                    removed,
+                    adopter: ctx.device.fingerprint(),
+                    stream,
+                    repo_id: context.repo_id.clone(),
+                    scope_id: context.scope_id.clone(),
+                    table_name: spec.name.to_string(),
+                    row_pk: candidate.row_pk.clone(),
+                    original_lamport: candidate.original_lamport,
+                    original_entry_hash: candidate.entry_hash,
+                    adopted_entry_hash: signed.entry.entry_hash,
+                    adopted_at_ms: ctx.now_ms,
+                })?;
+                authored += 1;
+            },
+            ApplyOutcome::Superseded => {
+                // Same diagnosis as the produce path: a locally-authored op takes the stream's
+                // MAX(lamport)+1, so losing its own self-apply means the row's clock carries a
+                // lamport from ANOTHER stream — the shape a scope or account move leaves behind.
+                // Swallowing it would mark the removal complete with the orphan unrepaired and no
+                // retry left. Fail the pass instead: the work item stays pending and the rollback
+                // drops the just-inserted entry.
+                anyhow::bail!(
+                    "table-sync: a re-adoption op lost its own self-apply on `{}` — the row's \
+                     write clock carries a lamport from another stream",
+                    spec.name
+                );
+            },
+            outcome @ (ApplyOutcome::Quarantined(_) | ApplyOutcome::Unprojectable(_)) => {
+                anyhow::bail!(
+                    "table-sync: a re-adoption op did not self-apply on `{}`: {outcome:?}",
+                    spec.name
+                );
+            },
+        }
+    }
+    if unrepairable > 0 {
+        // A row the pass cannot carry today is NOT written off: completing here would abandon it
+        // to anti-echo silence (a later content-identical repair authors nothing, so a fresh
+        // replica never receives the row — the divergence this pass exists to fix). Report
+        // "could not drain" and leave the item pending; a pass after the cell is repaired
+        // completes it. Already re-authored rows above stay committed.
+        return Ok(None);
+    }
+    store::complete_readoption_work(
+        tx,
+        ctx.account_id,
+        work.device_fingerprint,
+        stream,
+        ctx.now_ms,
+    )?;
+    Ok(Some(authored))
+}
+
+/// What the drain can do with one candidate row.
+enum ReadoptionRepair {
+    /// Re-author this op under the local key.
+    Repair(RowOp),
+    /// Nothing owed: the row is settled under another writer, or physically consistent with its
+    /// merge state (an absent row under a live clock is the producer's `Remove` to author, not
+    /// this pass's).
+    Skip,
+    /// The physical row exists but a synced column cannot be read as its declared type. NOT
+    /// abandoned: the work item stays pending so a pass after the cell is repaired still
+    /// converges the fresh replica.
+    Unrepairable,
+}
+
+/// The physical-table repair for one still-orphaned candidate row.
+fn readoption_repair_op(
+    tx: &Transaction<'_>,
+    ctx: &SyncCtx<'_>,
+    spec: &TableSpec,
+    stream: crate::stream::StreamId,
+    row_pk: &str,
+    removed_hex: &str,
+) -> anyhow::Result<ReadoptionRepair> {
+    let clock = apply::row_clock_winner_on_stream(tx, stream, ctx.repo_id, spec.name, row_pk)?;
+    let tombstone = apply::tombstone_winner_on_stream(tx, stream, ctx.repo_id, spec.name, row_pk)?;
+    Ok(match (clock, tombstone) {
+        // A live clock and a tombstone can only coexist with the clock newer: a remove raises the
+        // tombstone at its own lamport, and a remove that BEATS the clock clears the clock. So a
+        // live clock always owns the row; re-adopt it while the removed writer is that winner.
+        // What the PHYSICAL row allows decides the repair: carried (re-author), absent (the
+        // producer's Remove owns it), or unreadable (stay pending until repaired).
+        (Some((_, winner)), _) if winner == removed_hex => {
+            let pk = row_op::row_pk_values(row_pk)?;
+            match apply::read_synced_cells(tx, spec, &pk)? {
+                apply::SyncedRow::Cells(cells) => ReadoptionRepair::Repair(RowOp::Upsert {
+                    table: spec.name.to_string(),
+                    spec_version: spec.spec_version,
+                    pk,
+                    cells,
+                }),
+                apply::SyncedRow::Absent => ReadoptionRepair::Skip,
+                apply::SyncedRow::Unreadable(_) => ReadoptionRepair::Unrepairable,
+            }
+        },
+        // A tombstone with no live clock owns the deletion. Re-adopt it only while no physical
+        // row exists; otherwise a live local row would be destroyed by a stale repair.
+        (None, Some((_, winner))) if winner == removed_hex => {
+            let pk = row_op::row_pk_values(row_pk)?;
+            match apply::read_synced_cells(tx, spec, &pk)? {
+                apply::SyncedRow::Absent =>
+                    ReadoptionRepair::Repair(apply::readopt_remove(spec, row_pk)?),
+                apply::SyncedRow::Cells(_) => ReadoptionRepair::Skip,
+                apply::SyncedRow::Unreadable(_) => ReadoptionRepair::Unrepairable,
+            }
+        },
+        _ => ReadoptionRepair::Skip,
+    })
 }
 
 /// **The caller MUST roll back on `Err`.** Everything here runs in the caller's transaction and
@@ -557,6 +735,39 @@ mod tests {
         .unwrap();
     }
 
+    /// Close `fp`'s roster row — the device is removed from the account, so its entries fail the
+    /// #935 gate and the drain-time effectiveness re-check sees the removal.
+    fn remove_writer(
+        conn: &rusqlite::Connection,
+        account: AccountId,
+        fp: crate::op::DeviceFingerprint,
+    ) {
+        let closed = conn
+            .execute(
+                "UPDATE account_roster_history SET closed_at = 1
+                 WHERE account_id = ?1 AND device_fingerprint = ?2 AND closed_at IS NULL",
+                rusqlite::params![account.to_bytes().as_slice(), fp.to_bytes().as_slice()],
+            )
+            .unwrap();
+        assert_eq!(closed, 1, "the device was on the roster to remove");
+    }
+
+    /// Re-open `fp`'s closed roster row — the device is re-invited and effective again.
+    fn reinvite_writer(
+        conn: &rusqlite::Connection,
+        account: AccountId,
+        fp: crate::op::DeviceFingerprint,
+    ) {
+        let reopened = conn
+            .execute(
+                "UPDATE account_roster_history SET closed_at = NULL
+                 WHERE account_id = ?1 AND device_fingerprint = ?2 AND closed_at IS NOT NULL",
+                rusqlite::params![account.to_bytes().as_slice(), fp.to_bytes().as_slice()],
+            )
+            .unwrap();
+        assert_eq!(reopened, 1, "the device was removed to re-invite");
+    }
+
     fn seed_incarnation(conn: &rusqlite::Connection) {
         conn.execute(
             "INSERT INTO account_repo_incarnation_current(
@@ -568,6 +779,667 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn readoption_re_authors_a_removed_writers_row_and_uses_it_to_converge_a_fresh_replica() {
+        let mut a = Device::new(); // the original author, later removed from the roster
+        let mut c = Device::new(); // a current writer that already holds A's row
+        let mut d = Device::new(); // a replica enrolled only AFTER A had left
+
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'distilled')", []).unwrap();
+        let entry = a.produce();
+        assert_eq!(entry.len(), 1);
+
+        enroll_writer(&c.conn, AccountId::from_bytes([42; 32]), a.pubkey().fingerprint());
+        enroll_writer(&c.conn, AccountId::from_bytes([42; 32]), c.local.fingerprint());
+        assert_eq!(c.ingest_all(&entry, &a.pubkey()), vec![IngestOutcome::Applied]);
+        assert_eq!(c.title().as_deref(), Some("distilled"));
+        let account = AccountId::from_bytes([42; 32]);
+        remove_writer(&c.conn, account, a.pubkey().fingerprint());
+        let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+        let removal_ref = [7; 32];
+        {
+            let tx = c.conn.transaction().unwrap();
+            store::enqueue_readoption_work(
+                &tx,
+                account,
+                a.pubkey().fingerprint(),
+                stream,
+                removal_ref,
+                9,
+                10,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let reauthored = c.produce();
+        assert!(reauthored.is_empty(), "ordinary production does not re-adopt without the driver");
+        {
+            let tx = c.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &c.local,
+                registry: REGISTRY,
+                now_ms: 0,
+            };
+            let processed = process_readoption_work_for_stream(&tx, &ctx, stream).unwrap();
+            tx.commit().unwrap();
+            assert_eq!(processed, Some(1), "the orphaned row is re-authored once");
+        }
+        let audit_count: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM table_sync_readoption_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(audit_count, 1, "the re-authorship carries its provenance");
+
+        let reauthored = {
+            let tail: Vec<u8> = c
+                .conn
+                .query_row(
+                    "SELECT signed_bytes FROM table_sync_entries
+                     WHERE stream_id = ?1 AND device_fingerprint = ?2
+                     ORDER BY lamport DESC LIMIT 1",
+                    rusqlite::params![
+                        stream.to_bytes().as_slice(),
+                        c.local.fingerprint().to_bytes().as_slice()
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            vec![tail]
+        };
+
+        enroll_writer(&d.conn, AccountId::from_bytes([42; 32]), c.local.fingerprint());
+        assert_eq!(d.ingest_all(&reauthored, &c.pubkey()), vec![IngestOutcome::Applied]);
+        assert_eq!(d.title().as_deref(), Some("distilled"));
+    }
+
+    #[test]
+    fn readoption_never_authors_a_remove_while_the_physical_row_is_live() {
+        let mut a = Device::new(); // creates AND deletes r1, then leaves the roster
+        let mut c = Device::new();
+        let account = AccountId::from_bytes([42; 32]);
+        let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'created')", []).unwrap();
+        let create = a.produce();
+        enroll_writer(&c.conn, account, a.pubkey().fingerprint());
+        enroll_writer(&c.conn, account, c.local.fingerprint());
+        c.ingest_all(&create, &a.pubkey());
+        a.delete_row();
+        let delete = a.produce();
+        assert_eq!(delete.len(), 1);
+        c.ingest_all(&delete, &a.pubkey());
+        assert_eq!(c.title(), None, "A's delete landed: r1 is gone, tombstoned under A");
+        remove_writer(&c.conn, account, a.pubkey().fingerprint());
+
+        // Recreate the pk locally without publishing it. This is exactly the state the scan-based
+        // design destroyed: tombstone state says removed-author delete wins, while the physical
+        // table says the row is live again.
+        c.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'recreated')", []).unwrap();
+
+        {
+            let tx = c.conn.transaction().unwrap();
+            store::enqueue_readoption_work(
+                &tx,
+                account,
+                a.pubkey().fingerprint(),
+                stream,
+                [8; 32],
+                11,
+                12,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = c.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &c.local,
+                registry: REGISTRY,
+                now_ms: 0,
+            };
+            assert_eq!(
+                process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(),
+                Some(0),
+                "the physical-liveness guard declines the stale tombstone repair",
+            );
+            tx.commit().unwrap();
+        }
+        let out = c.produce();
+        assert_eq!(out.len(), 1, "only the legitimate local upsert is authored");
+        assert_eq!(c.title().as_deref(), Some("recreated"));
+        let removes: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM table_sync_readoption_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(removes, 0, "no stale tombstone re-adoption can delete a live row");
+    }
+
+    /// A device removed, drained, re-invited, and removed again must have its SECOND removal
+    /// re-arm the worklist — the roster_ref distinguishes the two removals (#997 review).
+    #[test]
+    fn a_second_removal_after_drain_re_adopts_the_devices_new_rows() {
+        let mut a = Device::new(); // invited, removed, re-invited, removed again
+        let mut c = Device::new(); // the current writer that holds every copy
+        let account = AccountId::from_bytes([42; 32]);
+        let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+
+        // Round one: A authors r1, C ingests it, A is removed, and C drains the work.
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'first')", []).unwrap();
+        let first = a.produce();
+        enroll_writer(&c.conn, account, a.pubkey().fingerprint());
+        enroll_writer(&c.conn, account, c.local.fingerprint());
+        c.ingest_all(&first, &a.pubkey());
+        remove_writer(&c.conn, account, a.pubkey().fingerprint());
+        {
+            let tx = c.conn.transaction().unwrap();
+            store::enqueue_readoption_work(
+                &tx,
+                account,
+                a.pubkey().fingerprint(),
+                stream,
+                [7; 32],
+                9,
+                10,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = c.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &c.local,
+                registry: REGISTRY,
+                now_ms: 0,
+            };
+            assert_eq!(process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(), Some(1));
+            tx.commit().unwrap();
+        }
+
+        // Re-invite: A is roster-effective again, authors r2, and C ingests it. A's SECOND
+        // removal carries a new roster_ref.
+        reinvite_writer(&c.conn, account, a.pubkey().fingerprint());
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'second')", []).unwrap();
+        let second = a.produce();
+        c.ingest_all(&second, &a.pubkey());
+        remove_writer(&c.conn, account, a.pubkey().fingerprint());
+        {
+            let tx = c.conn.transaction().unwrap();
+            store::enqueue_readoption_work(
+                &tx,
+                account,
+                a.pubkey().fingerprint(),
+                stream,
+                [9; 32],
+                21,
+                22,
+            )
+            .unwrap();
+            assert!(
+                store::readoption_work_for_stream(&tx, account, stream).unwrap().is_some(),
+                "a different roster_ref resets processed_at_ms",
+            );
+            tx.commit().unwrap();
+        }
+        {
+            let tx = c.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &c.local,
+                registry: REGISTRY,
+                now_ms: 0,
+            };
+            // r1's clock winner is C after round one; only r2 is still orphaned under A.
+            assert_eq!(
+                process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(),
+                Some(1),
+                "the second removal re-adopts only the newly orphaned rows",
+            );
+            tx.commit().unwrap();
+        }
+        let audit_count: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM table_sync_readoption_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(audit_count, 2, "both rounds left their provenance");
+
+        // An idempotent re-fold of the SAME removal does not re-arm the drained row.
+        {
+            let tx = c.conn.transaction().unwrap();
+            store::enqueue_readoption_work(
+                &tx,
+                account,
+                a.pubkey().fingerprint(),
+                stream,
+                [9; 32],
+                21,
+                23,
+            )
+            .unwrap();
+            assert!(
+                store::readoption_work_for_stream(&tx, account, stream).unwrap().is_none(),
+                "the same roster_ref is a re-fold, not a new removal",
+            );
+            tx.commit().unwrap();
+        }
+    }
+
+    /// A row written twice by the removed device must have its audit name the entry the row's
+    /// LWW clock actually points at — the latest one, not the first.
+    #[test]
+    fn the_audit_names_the_winning_entry_for_a_row_written_twice() {
+        let mut a = Device::new();
+        let mut c = Device::new();
+        let account = AccountId::from_bytes([42; 32]);
+        let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'v1')", []).unwrap();
+        let first = a.produce();
+        a.conn.execute("UPDATE t_demo SET title = 'v2' WHERE id = 'r1'", []).unwrap();
+        let second = a.produce();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1, "the edit authors a second entry for the same row");
+
+        enroll_writer(&c.conn, account, a.pubkey().fingerprint());
+        enroll_writer(&c.conn, account, c.local.fingerprint());
+        c.ingest_all(&first, &a.pubkey());
+        c.ingest_all(&second, &a.pubkey());
+        remove_writer(&c.conn, account, a.pubkey().fingerprint());
+        {
+            let tx = c.conn.transaction().unwrap();
+            store::enqueue_readoption_work(
+                &tx,
+                account,
+                a.pubkey().fingerprint(),
+                stream,
+                [7; 32],
+                9,
+                10,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = c.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &c.local,
+                registry: REGISTRY,
+                now_ms: 0,
+            };
+            assert_eq!(process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(), Some(1));
+            tx.commit().unwrap();
+        }
+        let (original_lamport, original_hash): (i64, Vec<u8>) = c
+            .conn
+            .query_row(
+                "SELECT original_lamport, original_entry_hash FROM table_sync_readoption_audit",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let winner_lamport: i64 = c
+            .conn
+            .query_row(
+                "SELECT MAX(lamport) FROM table_sync_entries
+                 WHERE stream_id = ?1 AND device_fingerprint = ?2",
+                rusqlite::params![
+                    stream.to_bytes().as_slice(),
+                    a.pubkey().fingerprint().to_bytes().as_slice()
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            original_lamport, winner_lamport,
+            "original_* names the winning entry, not the first write"
+        );
+        let winner_hash: Vec<u8> = c
+            .conn
+            .query_row(
+                "SELECT entry_hash FROM table_sync_entries
+                 WHERE stream_id = ?1 AND device_fingerprint = ?2 AND lamport = ?3",
+                rusqlite::params![
+                    stream.to_bytes().as_slice(),
+                    a.pubkey().fingerprint().to_bytes().as_slice(),
+                    original_lamport
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(original_hash, winner_hash, "the audit joins back by (lamport, hash)");
+    }
+
+    /// A later write that quarantined never owned the row's clock, so the audit must not name it:
+    /// dedup follows the clock, not the device's latest entry.
+    #[test]
+    fn the_audit_skips_a_quarantined_later_write_that_never_owned_the_clock() {
+        let mut a = Device::new();
+        let mut c = Device::new();
+        let account = AccountId::from_bytes([42; 32]);
+        let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'v1')", []).unwrap();
+        let first = a.produce();
+        enroll_writer(&c.conn, account, a.pubkey().fingerprint());
+        enroll_writer(&c.conn, account, c.local.fingerprint());
+        c.ingest_all(&first, &a.pubkey());
+        let first_hash = crate::entry::decode_signed(&first[0]).unwrap().entry.entry_hash;
+
+        // A's second write carries a wrongly-typed cell: stored and quarantined, never applied,
+        // so the row's clock still points at the FIRST entry.
+        let bad_op = RowOp::Upsert {
+            spec_version: 1,
+            table: "t_demo".to_string(),
+            pk: vec![row_op::TypedValue::Text("r1".to_string())],
+            cells: vec![row_op::Cell {
+                column: "title".to_string(),
+                value: row_op::TypedValue::I64(1),
+            }],
+        };
+        let bad = crate::entry::sign_entry_from_op_bytes(
+            a.local.secret(),
+            stream,
+            Some(first_hash),
+            1,
+            row_op::encode(&bad_op),
+        );
+        let outcomes = c.ingest_all(std::slice::from_ref(&bad.signed_bytes), &a.pubkey());
+        assert!(
+            matches!(outcomes.as_slice(), [IngestOutcome::Quarantined(_)]),
+            "the malformed write quarantines instead of taking the clock: {outcomes:?}",
+        );
+        remove_writer(&c.conn, account, a.pubkey().fingerprint());
+
+        {
+            let tx = c.conn.transaction().unwrap();
+            store::enqueue_readoption_work(
+                &tx,
+                account,
+                a.pubkey().fingerprint(),
+                stream,
+                [7; 32],
+                9,
+                10,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = c.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &c.local,
+                registry: REGISTRY,
+                now_ms: 0,
+            };
+            assert_eq!(process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(), Some(1));
+            tx.commit().unwrap();
+        }
+        let original_lamport: i64 = c
+            .conn
+            .query_row("SELECT original_lamport FROM table_sync_readoption_audit", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(original_lamport, 0, "the audit names the entry the clock points at");
+    }
+
+    /// A device re-invited before the drain is effective again: its entries ingest directly, so
+    /// the pending removal completes WITHOUT re-authoring its rows.
+    #[test]
+    fn a_reinvited_devices_pending_removal_completes_without_reauthoring() {
+        let mut a = Device::new();
+        let mut c = Device::new();
+        let account = AccountId::from_bytes([42; 32]);
+        let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'v')", []).unwrap();
+        let entry = a.produce();
+        enroll_writer(&c.conn, account, a.pubkey().fingerprint());
+        enroll_writer(&c.conn, account, c.local.fingerprint());
+        c.ingest_all(&entry, &a.pubkey());
+        {
+            let tx = c.conn.transaction().unwrap();
+            store::enqueue_readoption_work(
+                &tx,
+                account,
+                a.pubkey().fingerprint(),
+                stream,
+                [7; 32],
+                9,
+                10,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        // A is re-invited (roster-effective again) before any sync pass drains the work.
+        {
+            let tx = c.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &c.local,
+                registry: REGISTRY,
+                now_ms: 0,
+            };
+            assert_eq!(process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(), Some(0));
+            tx.commit().unwrap();
+        }
+        let audit_count: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM table_sync_readoption_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(audit_count, 0, "an effective writer keeps its own clock ownership");
+        {
+            let tx = c.conn.transaction().unwrap();
+            assert!(
+                !store::has_pending_readoption_work(&tx, account, stream).unwrap(),
+                "the stale work item is completed, not left to re-author later",
+            );
+            tx.commit().unwrap();
+        }
+    }
+
+    /// An unreadable synced column must not be written off: the work item stays pending, and a
+    /// pass after the cell is repaired still re-adopts the row.
+    #[test]
+    fn an_unreadable_orphan_stays_pending_until_the_cell_is_repaired() {
+        const BOOL_SPEC: TableSpec = TableSpec {
+            name: "t_typed",
+            scope_id: "demo/1",
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("flag", ValueType::Bool)],
+            local_columns: &[],
+            repo_column: None,
+        };
+        const BOOL_REGISTRY: &[TableSpec] = &[BOOL_SPEC];
+
+        let mut a = Device::new();
+        let mut c = Device::new();
+        let account = AccountId::from_bytes([42; 32]);
+        let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+        for device in [&a, &c] {
+            device
+                .conn
+                .execute_batch("CREATE TABLE t_typed(id TEXT PRIMARY KEY, flag INTEGER) STRICT;")
+                .unwrap();
+        }
+
+        a.conn.execute("INSERT INTO t_typed(id, flag) VALUES ('r1', 1)", []).unwrap();
+        let entry = {
+            let tx = a.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &a.local,
+                registry: BOOL_REGISTRY,
+                now_ms: 0,
+            };
+            let out = produce_and_author(&tx, &ctx).unwrap();
+            tx.commit().unwrap();
+            out
+        };
+        enroll_writer(&c.conn, account, a.pubkey().fingerprint());
+        enroll_writer(&c.conn, account, c.local.fingerprint());
+        {
+            let tx = c.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &c.local,
+                registry: BOOL_REGISTRY,
+                now_ms: 0,
+            };
+            for bytes in &entry {
+                ingest(&tx, &ctx, "demo/1", bytes, &a.pubkey()).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        // A raw write leaves the cell unreadable as its declared type (STRICT stores the integer;
+        // reading it as Bool rejects anything but 0/1).
+        c.conn.execute("UPDATE t_typed SET flag = 2 WHERE id = 'r1'", []).unwrap();
+        remove_writer(&c.conn, account, a.pubkey().fingerprint());
+        {
+            let tx = c.conn.transaction().unwrap();
+            store::enqueue_readoption_work(
+                &tx,
+                account,
+                a.pubkey().fingerprint(),
+                stream,
+                [7; 32],
+                9,
+                10,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = c.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &c.local,
+                registry: BOOL_REGISTRY,
+                now_ms: 0,
+            };
+            assert_eq!(
+                process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(),
+                None,
+                "an unreadable row cannot be drained today",
+            );
+            assert!(
+                store::has_pending_readoption_work(&tx, account, stream).unwrap(),
+                "and the removal is NOT written off",
+            );
+            tx.commit().unwrap();
+        }
+
+        // Repair the cell content-identically: anti-echo means the producer authors nothing, so
+        // only the re-adoption pass can carry the row to a fresh replica.
+        c.conn.execute("UPDATE t_typed SET flag = 1 WHERE id = 'r1'", []).unwrap();
+        {
+            let tx = c.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &c.local,
+                registry: BOOL_REGISTRY,
+                now_ms: 0,
+            };
+            assert_eq!(
+                process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(),
+                Some(1),
+                "the repaired row is re-adopted by the retry",
+            );
+            tx.commit().unwrap();
+        }
+        let audit_count: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM table_sync_readoption_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(audit_count, 1);
+    }
+
+    /// Two devices removed on one stream drain in ONE pass — the second repair does not wait a
+    /// whole sync session.
+    #[test]
+    fn one_pass_drains_every_pending_removal_on_a_stream() {
+        let mut a = Device::new();
+        let mut b = Device::new();
+        let mut c = Device::new();
+        let account = AccountId::from_bytes([42; 32]);
+        let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'from-a')", []).unwrap();
+        b.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'from-b')", []).unwrap();
+        let from_a = a.produce();
+        let from_b = b.produce();
+        enroll_writer(&c.conn, account, a.pubkey().fingerprint());
+        enroll_writer(&c.conn, account, b.pubkey().fingerprint());
+        enroll_writer(&c.conn, account, c.local.fingerprint());
+        c.ingest_all(&from_a, &a.pubkey());
+        c.ingest_all(&from_b, &b.pubkey());
+        remove_writer(&c.conn, account, a.pubkey().fingerprint());
+        remove_writer(&c.conn, account, b.pubkey().fingerprint());
+
+        for (fingerprint, roster_ref) in
+            [(a.pubkey().fingerprint(), [7; 32]), (b.pubkey().fingerprint(), [8; 32])]
+        {
+            let tx = c.conn.transaction().unwrap();
+            store::enqueue_readoption_work(&tx, account, fingerprint, stream, roster_ref, 9, 10)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let tx = c.conn.transaction().unwrap();
+        let ctx = SyncCtx {
+            repo_id: "repo",
+            account_id: account,
+            incarnation_ref: [0x44; 32],
+            device: &c.local,
+            registry: REGISTRY,
+            now_ms: 0,
+        };
+        while store::has_pending_readoption_work(&tx, account, stream).unwrap() {
+            process_readoption_work_for_stream(&tx, &ctx, stream).unwrap();
+        }
+        tx.commit().unwrap();
+
+        let audit_count: i64 = c
+            .conn
+            .query_row("SELECT COUNT(*) FROM table_sync_readoption_audit", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(audit_count, 2, "both removals were repaired in the same pass");
+        assert_eq!(c.title().as_deref(), Some("from-a"));
+        let r2: String = c
+            .conn
+            .query_row("SELECT title FROM t_demo WHERE id = 'r2'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(r2, "from-b");
     }
 
     /// Three rows authored in order on A, then delivered to B in REVERSE. Before entries awaiting

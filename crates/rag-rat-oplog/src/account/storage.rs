@@ -1280,7 +1280,7 @@ fn fold_account_state_in_tx(
         )?;
         statuses.insert(row.entry_hash, status);
     }
-    rewrite_authority_projection(tx, account_id, &projection.history)?;
+    rewrite_authority_projection(tx, account_id, &projection.history, now_ms)?;
     // Re-derive secrets-log (log 1) acceptance from the just-rewritten authority projection, in
     // this SAME txn (§15, C4.2b). The main loop above wrote `retained_unfolded` for every log-1
     // row (the declassify baseline); this pass OVERWRITES that — in both `account_entry_status`
@@ -1332,6 +1332,7 @@ fn rewrite_authority_projection(
     tx: &Transaction<'_>,
     account_id: AccountId,
     history: &fold::AccountAuthHistory,
+    now_ms: i64,
 ) -> anyhow::Result<()> {
     let account = account_id.to_bytes();
     for table in [
@@ -1374,6 +1375,11 @@ fn rewrite_authority_projection(
     for (roster_ref, fact) in history.roster_facts() {
         let (control_kind, control_seq, control_hash) = stored_boundary(fact.control_boundary);
         let (secrets_kind, secrets_seq, secrets_hash) = stored_boundary(fact.secrets_boundary);
+        if let Some(closed_at) = fact.closed_at {
+            enqueue_readoption_for_closed_fact(
+                tx, account_id, roster_ref, fact, closed_at, now_ms,
+            )?;
+        }
         tx.execute(
             "INSERT INTO account_roster_history(
                  roster_ref, account_id, device_fingerprint, role, effective_at, closed_at,
@@ -1481,6 +1487,57 @@ fn rewrite_authority_projection(
                 ],
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Enqueue table-sync re-adoption for one roster fact the fold just closed (#997).
+///
+/// This runs inside the authority projection rewrite, before the roster row itself is inserted,
+/// because the fold is the one place that knows the removal is effective. One durable work item is
+/// recorded per stream that currently has table-sync context for this account; a stream that
+/// first learns of the removal before its directory row exists gets the work attached when the
+/// first entry is authored or ingested. `roster_ref` is intentionally not a FK: this table rewrites
+/// roster history wholesale on every fold, while the worklist must survive that rewrite.
+fn enqueue_readoption_for_closed_fact(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    roster_ref: &[u8; 32],
+    fact: &fold::RosterFact,
+    closed_at: u64,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT stream_id FROM table_sync_streams WHERE account_id = ?1 ORDER BY stream_id",
+    )?;
+    let streams = stmt
+        .query_map([account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if streams.is_empty() {
+        // A stream whose first local contact happens after this removal still owes repair. Park
+        // the removal under the impossible zero stream until the first authored/ingested entry
+        // records the real context.
+        crate::table_sync::enqueue_readoption_work(
+            tx,
+            account_id,
+            fact.authority.device_fingerprint,
+            StreamId::from_bytes([0; 32]),
+            *roster_ref,
+            closed_at,
+            now_ms,
+        )?;
+        return Ok(());
+    }
+    for stream in streams {
+        crate::table_sync::enqueue_readoption_work(
+            tx,
+            account_id,
+            fact.authority.device_fingerprint,
+            StreamId::from_bytes(fixed::<32>(&stream)?),
+            *roster_ref,
+            closed_at,
+            now_ms,
+        )?;
     }
     Ok(())
 }

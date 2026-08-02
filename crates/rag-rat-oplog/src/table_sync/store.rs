@@ -1009,6 +1009,310 @@ pub(crate) struct StreamContext {
     pub(crate) scope_id: String,
 }
 
+/// One roster-effective `DeviceRemove`'s stream-scoped repair obligation (#997).
+pub(crate) struct ReadoptionWork {
+    pub(crate) device_fingerprint: DeviceFingerprint,
+    pub(crate) roster_ref: [u8; 32],
+    pub(crate) removed_at_epoch: u64,
+}
+
+/// One row the removed writer authored on this stream, with the entry hash audit needs.
+#[derive(Clone)]
+pub(crate) struct ReadoptionCandidate {
+    pub(crate) table_name: String,
+    pub(crate) row_pk: String,
+    /// The removed writer's own entry coordinates — what the audit row's `original_*` columns
+    /// name. Carried alongside the hash so the audit joins back by `(lamport, hash)`.
+    pub(crate) original_lamport: u64,
+    pub(crate) entry_hash: [u8; 32],
+}
+
+/// The provenance one re-adopted row carries into the audit log.
+pub(crate) struct ReadoptionAudit {
+    pub(crate) account_id: AccountId,
+    pub(crate) removed: DeviceFingerprint,
+    pub(crate) adopter: DeviceFingerprint,
+    pub(crate) stream: StreamId,
+    pub(crate) repo_id: String,
+    pub(crate) scope_id: String,
+    pub(crate) table_name: String,
+    pub(crate) row_pk: String,
+    pub(crate) original_lamport: u64,
+    pub(crate) original_entry_hash: [u8; 32],
+    pub(crate) adopted_entry_hash: [u8; 32],
+    pub(crate) adopted_at_ms: i64,
+}
+
+/// Record the roster removal re-adoption owes, idempotently. The account fold calls this when it
+/// sees a roster fact close; re-folding the same removal never duplicates work.
+///
+/// The conflict update is MONOTONIC on `removed_at_epoch`: successive removals of one device are
+/// effective entries at strictly increasing epochs, so only a strictly newer removal re-arms a
+/// drained (or pending) row. Without the comparison, a device removed twice has two closed facts
+/// the fold enqueues in arbitrary `HashMap` order — each overwriting the other, re-arming a
+/// drained row on every fold and never letting the item settle. A same-epoch re-fold of the same
+/// removal is equally inert under this rule.
+pub(crate) fn enqueue_readoption_work(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    device_fingerprint: DeviceFingerprint,
+    stream: StreamId,
+    roster_ref: [u8; 32],
+    removed_at_epoch: u64,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "INSERT INTO table_sync_readoption_work(
+             account_id, device_fingerprint, stream_id, roster_ref, removed_at_epoch,
+             enqueued_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(account_id, device_fingerprint, stream_id) DO UPDATE SET
+             roster_ref = excluded.roster_ref,
+             removed_at_epoch = excluded.removed_at_epoch,
+             enqueued_at_ms = excluded.enqueued_at_ms,
+             processed_at_ms = NULL
+         WHERE excluded.removed_at_epoch > table_sync_readoption_work.removed_at_epoch",
+        params![
+            account_id.to_bytes().as_slice(),
+            device_fingerprint.to_bytes().as_slice(),
+            stream.to_bytes().as_slice(),
+            roster_ref.as_slice(),
+            i64::try_from(removed_at_epoch)?,
+            now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Attach removals this account folded while `stream` had no directory row. Stored under a zero
+/// stream id until first contact; the current processor rejects that placeholder because it is
+/// neither current nor registered.
+///
+/// Known limitation: the copy lands only in the FIRST stream to record a context — a stream
+/// created later for a different scope never learns of the removal. Unreachable today: a removal
+/// parked before any stream existed can have orphaned nothing on a stream created afterwards
+/// (the #935 gate drops the removed writer's new entries there), and production registers a
+/// single scope. Revisit if multi-scope registries arrive.
+fn enqueue_precontext_readoption_work(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    account_id: AccountId,
+) -> anyhow::Result<()> {
+    let precontext = StreamId::from_bytes([0; 32]).to_bytes();
+    let mut stmt = tx.prepare(
+        "SELECT device_fingerprint, roster_ref, removed_at_epoch, enqueued_at_ms
+         FROM table_sync_readoption_work
+         WHERE account_id = ?1 AND stream_id = ?2 AND processed_at_ms IS NULL",
+    )?;
+    let rows = stmt
+        .query_map(params![account_id.to_bytes().as_slice(), precontext.as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (device, roster_ref, epoch, enqueued_at_ms) in rows {
+        enqueue_readoption_work(
+            tx,
+            account_id,
+            DeviceFingerprint::from_bytes(fixed32(device)?),
+            stream,
+            fixed32(roster_ref)?,
+            u64::try_from(epoch)?,
+            enqueued_at_ms,
+        )?;
+    }
+    // The parked copy has served its purpose: without this stamp, it would copy itself into every
+    // later stream's first context as well.
+    tx.execute(
+        "UPDATE table_sync_readoption_work SET processed_at_ms = enqueued_at_ms
+         WHERE account_id = ?1 AND stream_id = ?2 AND processed_at_ms IS NULL",
+        params![account_id.to_bytes().as_slice(), precontext.as_slice()],
+    )?;
+    Ok(())
+}
+
+/// The pending repair owed by `stream`, if its remove was folded before this stream's first
+/// locally-known entry recorded the directory context. `None` also covers an already-drained item.
+pub(crate) fn readoption_work_for_stream(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    stream: StreamId,
+) -> anyhow::Result<Option<ReadoptionWork>> {
+    let row = tx
+        .query_row(
+            "SELECT device_fingerprint, roster_ref, removed_at_epoch
+             FROM table_sync_readoption_work
+             WHERE account_id = ?1 AND stream_id = ?2 AND processed_at_ms IS NULL",
+            params![account_id.to_bytes().as_slice(), stream.to_bytes().as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?)),
+        )
+        .optional()?;
+    row.map(|(device, roster_ref, epoch)| -> anyhow::Result<_> {
+        Ok(ReadoptionWork {
+            device_fingerprint: DeviceFingerprint::from_bytes(fixed32(device)?),
+            roster_ref: fixed32(roster_ref)?,
+            removed_at_epoch: u64::try_from(epoch)?,
+        })
+    })
+    .transpose()
+}
+
+/// Whether `stream` owes any unprocessed re-adoption — the drain loop's progress condition.
+pub(crate) fn has_pending_readoption_work(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    stream: StreamId,
+) -> anyhow::Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(
+                 SELECT 1 FROM table_sync_readoption_work
+                 WHERE account_id = ?1 AND stream_id = ?2 AND processed_at_ms IS NULL
+             )",
+        params![account_id.to_bytes().as_slice(), stream.to_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )? == 1)
+}
+
+/// Every row op the removed device authored on this stream, reduced to its row identity and
+/// provenance hash. This is the bounded candidate set the #997 redesign requires: the device's own
+/// accepted history, never a scan of every clock or deletion the merge tables have ever seen.
+pub(crate) fn readoption_candidates(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    device_fingerprint: DeviceFingerprint,
+) -> anyhow::Result<Vec<ReadoptionCandidate>> {
+    let mut stmt = tx.prepare(
+        "SELECT lamport, entry_hash, signed_bytes FROM table_sync_entries
+         WHERE stream_id = ?1 AND device_fingerprint = ?2
+         ORDER BY lamport",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![stream.to_bytes().as_slice(), device_fingerprint.to_bytes().as_slice()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut candidates = Vec::with_capacity(rows.len());
+    for (lamport, hash, signed_bytes) in rows {
+        let Ok(signed) = entry::decode_signed(&signed_bytes) else {
+            continue;
+        };
+        let op = match row_op::decode(&signed.entry.op_bytes) {
+            Ok(DecodedRowOp::Known(op)) => op,
+            // Retained but not understood here; its table/row identity cannot be established.
+            _ => continue,
+        };
+        candidates.push(ReadoptionCandidate {
+            table_name: op.table().to_string(),
+            row_pk: row_op::row_pk_string(op.pk()),
+            original_lamport: u64::try_from(lamport)?,
+            entry_hash: fixed32(hash)?,
+        });
+    }
+    // One candidate per row, and it must be the entry the row's whole-row LWW clock points AT: the
+    // audit's `original_*` columns are provenance for the winning entry, so a later entry that was
+    // quarantined and never owned the clock must not be named. Rows arrive in lamport order, so
+    // the last per row is the fallback when the clock row is gone.
+    let mut by_row: std::collections::HashMap<(String, String), Vec<ReadoptionCandidate>> =
+        std::collections::HashMap::new();
+    for candidate in candidates {
+        by_row
+            .entry((candidate.table_name.clone(), candidate.row_pk.clone()))
+            .or_default()
+            .push(candidate);
+    }
+    let mut out = Vec::with_capacity(by_row.len());
+    for ((table_name, row_pk), entries) in by_row {
+        let winner = winner_lamport_for_row(tx, stream, &table_name, &row_pk)?;
+        let chosen = entries
+            .iter()
+            .find(|candidate| Some(candidate.original_lamport) == winner)
+            .or(entries.last())
+            .expect("one entry per grouped row");
+        out.push(chosen.clone());
+    }
+    out.sort_by_key(|candidate| candidate.original_lamport);
+    Ok(out)
+}
+
+/// The lamport the row's merge state currently crowns — the live clock when present and newer, the
+/// tombstone otherwise. `None` when the row has no merge state at all.
+fn winner_lamport_for_row(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    table_name: &str,
+    row_pk: &str,
+) -> anyhow::Result<Option<u64>> {
+    let mut stmt = tx.prepare(
+        "SELECT MAX(lamport) FROM (
+             SELECT lamport FROM sync_row_clocks
+              WHERE stream_id = ?1 AND table_name = ?2 AND row_pk = ?3
+             UNION ALL
+             SELECT lamport FROM sync_row_tombstones
+              WHERE stream_id = ?1 AND table_name = ?2 AND row_pk = ?3
+         )",
+    )?;
+    let highest: Option<i64> = stmt
+        .query_row(params![stream.to_bytes().as_slice(), table_name, row_pk], |row| row.get(0))?;
+    highest.map(u64::try_from).transpose().map_err(Into::into)
+}
+
+/// Record one re-authored row operation with the removed writer's original entry as provenance.
+pub(crate) fn record_readoption_audit(
+    tx: &Transaction<'_>,
+    audit: ReadoptionAudit,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "INSERT INTO table_sync_readoption_audit(
+             account_id, removed_fingerprint, adopter_fingerprint, stream_id, repo_id, scope_id,
+             table_name, row_pk, original_lamport, original_entry_hash, adopted_entry_hash,
+             adopted_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            audit.account_id.to_bytes().as_slice(),
+            audit.removed.to_bytes().as_slice(),
+            audit.adopter.to_bytes().as_slice(),
+            audit.stream.to_bytes().as_slice(),
+            audit.repo_id,
+            audit.scope_id,
+            audit.table_name,
+            audit.row_pk,
+            i64::try_from(audit.original_lamport)?,
+            audit.original_entry_hash.as_slice(),
+            audit.adopted_entry_hash.as_slice(),
+            audit.adopted_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Mark one removal's stream repair complete. The work row remains as the durable witness that
+/// this removal was handled; re-processing is gated on `processed_at_ms IS NULL`.
+pub(crate) fn complete_readoption_work(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    device_fingerprint: DeviceFingerprint,
+    stream: StreamId,
+    processed_at_ms: i64,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE table_sync_readoption_work SET processed_at_ms = ?4
+         WHERE account_id = ?1 AND device_fingerprint = ?2 AND stream_id = ?3
+           AND processed_at_ms IS NULL",
+        params![
+            account_id.to_bytes().as_slice(),
+            device_fingerprint.to_bytes().as_slice(),
+            stream.to_bytes().as_slice(),
+            processed_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn assert_current_incarnation(
     tx: &Transaction<'_>,
     account_id: AccountId,
@@ -1066,6 +1370,7 @@ pub(crate) fn record_stream_context(
             && recorded.3 == scope_id,
         "table-sync stream context conflicts with its existing directory row",
     );
+    enqueue_precontext_readoption_work(tx, stream, account_id)?;
     Ok(())
 }
 
@@ -1173,6 +1478,115 @@ mod tests {
             table: "t".to_string(),
             pk: vec![TypedValue::Text(id.to_string())],
         }
+    }
+
+    #[test]
+    fn readoption_work_enqueues_reads_rearms_and_completes() {
+        let mut c = conn();
+        let tx = c.transaction().unwrap();
+        let device = DeviceFingerprint::from_bytes([7; 32]);
+
+        assert!(!has_pending_readoption_work(&tx, account(), stream()).unwrap());
+        assert!(readoption_work_for_stream(&tx, account(), stream()).unwrap().is_none());
+
+        enqueue_readoption_work(&tx, account(), device, stream(), [3; 32], 11, 12).unwrap();
+        let work = readoption_work_for_stream(&tx, account(), stream()).unwrap().unwrap();
+        assert_eq!(work.device_fingerprint, device);
+        assert_eq!(work.roster_ref, [3; 32]);
+        assert_eq!(work.removed_at_epoch, 11);
+        assert!(has_pending_readoption_work(&tx, account(), stream()).unwrap());
+
+        // A same-roster_ref re-enqueue (an idempotent re-fold) changes nothing.
+        enqueue_readoption_work(&tx, account(), device, stream(), [3; 32], 11, 99).unwrap();
+        let work = readoption_work_for_stream(&tx, account(), stream()).unwrap().unwrap();
+        assert_eq!(work.removed_at_epoch, 11, "a re-fold of the same removal is inert");
+
+        // A new removal (re-invite, newer epoch) re-arms the row even before completion.
+        enqueue_readoption_work(&tx, account(), device, stream(), [4; 32], 21, 22).unwrap();
+        let work = readoption_work_for_stream(&tx, account(), stream()).unwrap().unwrap();
+        assert_eq!(work.roster_ref, [4; 32]);
+        assert_eq!(work.removed_at_epoch, 21, "the new removal replaces the stale record");
+
+        complete_readoption_work(&tx, account(), device, stream(), 30).unwrap();
+        assert!(readoption_work_for_stream(&tx, account(), stream()).unwrap().is_none());
+        assert!(!has_pending_readoption_work(&tx, account(), stream()).unwrap());
+
+        // A STALE removal (an older closed fact, enqueued late by an arbitrary fold order) must
+        // not re-arm the drained row: the update is monotonic on removed_at_epoch.
+        enqueue_readoption_work(&tx, account(), device, stream(), [3; 32], 11, 40).unwrap();
+        assert!(
+            !has_pending_readoption_work(&tx, account(), stream()).unwrap(),
+            "an older removal never re-arms a settled row",
+        );
+
+        // A genuinely newer removal still re-arms after completion.
+        enqueue_readoption_work(&tx, account(), device, stream(), [5; 32], 31, 41).unwrap();
+        let work = readoption_work_for_stream(&tx, account(), stream()).unwrap().unwrap();
+        assert_eq!(work.roster_ref, [5; 32]);
+        assert_eq!(work.removed_at_epoch, 31);
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn a_first_stream_context_adopts_parked_work_and_stamps_it() {
+        let mut c = conn();
+        let tx = c.transaction().unwrap();
+        let device = DeviceFingerprint::from_bytes([7; 32]);
+        let parked = StreamId::from_bytes([0; 32]);
+
+        // The removal folded while this account had NO streams: the work parks under the
+        // placeholder stream id.
+        enqueue_readoption_work(&tx, account(), device, parked, [3; 32], 11, 12).unwrap();
+        assert!(!has_pending_readoption_work(&tx, account(), stream()).unwrap());
+
+        // The first authored or ingested entry records this stream's context, and the parked
+        // work moves onto it — once, never again.
+        record_stream_context(&tx, stream(), "repo", account(), [0x44; 32], "demo/1").unwrap();
+        let work = readoption_work_for_stream(&tx, account(), stream()).unwrap().unwrap();
+        assert_eq!(work.roster_ref, [3; 32]);
+        assert!(
+            !has_pending_readoption_work(&tx, account(), parked).unwrap(),
+            "the placeholder copy is stamped processed when it is adopted"
+        );
+        // Recording another stream does NOT re-adopt the same removal.
+        let other = StreamId::from_bytes([6; 32]);
+        record_stream_context(&tx, other, "repo", account(), [0x44; 32], "demo/2").unwrap();
+        assert!(
+            readoption_work_for_stream(&tx, account(), other).unwrap().is_none(),
+            "a stamped placeholder does not copy into later streams"
+        );
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn readoption_audit_records_provenance() {
+        let mut c = conn();
+        let tx = c.transaction().unwrap();
+        record_readoption_audit(&tx, ReadoptionAudit {
+            account_id: account(),
+            removed: DeviceFingerprint::from_bytes([7; 32]),
+            adopter: DeviceFingerprint::from_bytes([8; 32]),
+            stream: stream(),
+            repo_id: "repo".to_string(),
+            scope_id: "demo/1".to_string(),
+            table_name: "t".to_string(),
+            row_pk: "aa".to_string(),
+            original_lamport: 7,
+            original_entry_hash: [1; 32],
+            adopted_entry_hash: [2; 32],
+            adopted_at_ms: 42,
+        })
+        .unwrap();
+        let row: (i64, Vec<u8>, Vec<u8>, i64) = tx
+            .query_row(
+                "SELECT original_lamport, original_entry_hash, adopted_entry_hash, adopted_at_ms
+                 FROM table_sync_readoption_audit",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (7, vec![1; 32], vec![2; 32], 42));
+        tx.commit().unwrap();
     }
 
     #[test]
