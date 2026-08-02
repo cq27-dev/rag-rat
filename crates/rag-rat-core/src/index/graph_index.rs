@@ -234,7 +234,7 @@ fn rewrite_logical_symbol_id(
         "UPDATE logical_symbol_members SET logical_symbol_id = ?1 WHERE logical_symbol_id = ?2",
         params![to, from],
     )?;
-    rewrite_logical_symbol_references(conn, from, to)
+    rewrite_logical_symbol_references(conn, from, to, bindings_lens_capable(conn)?)
 }
 
 /// Move ONLY the durable references to a logical-symbol id — monikers, memory bindings,
@@ -246,8 +246,9 @@ fn rewrite_logical_symbol_references(
     conn: &rusqlite::Connection,
     from: i64,
     to: i64,
+    bindings_lens_capable: bool,
 ) -> rusqlite::Result<()> {
-    let lens_repos = binding_lens_repos_for_logical_symbol(conn, from)?;
+    let lens_repos = binding_lens_repos_for_logical_symbol(conn, from, bindings_lens_capable)?;
     // `logical_symbol_monikers` has no FK, so a DANGLING row (its logical row died in some
     // earlier wholesale rebuild; the next oracle run sweeps it) can already occupy `to` for the
     // same tool — and the plain UPDATE below would abort the whole rebuild on the PK. The moving
@@ -339,14 +340,22 @@ fn column_present(
     Ok(false)
 }
 
+/// Whether the memory-bindings lens-bump tables exist in the shape the bump queries need. These
+/// are per-CONNECTION schema facts; the drift-heal/remap passes resolve them ONCE and hand the
+/// answer down — a per-call `PRAGMA table_info` inside a thousands-of-symbols regroup is the
+/// #1112 instruction regression.
+fn bindings_lens_capable(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    Ok(column_present(conn, "repo_memory_bindings", "repo_id")?
+        && table_present(conn, "repos")?
+        && table_present(conn, "repo_meta")?)
+}
+
 fn binding_lens_repos_for_logical_symbol(
     conn: &rusqlite::Connection,
     logical_symbol_id: i64,
+    capable: bool,
 ) -> rusqlite::Result<Vec<String>> {
-    if !column_present(conn, "repo_memory_bindings", "repo_id")?
-        || !table_present(conn, "repos")?
-        || !table_present(conn, "repo_meta")?
-    {
+    if !capable {
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(
@@ -383,8 +392,12 @@ fn bump_binding_lens_revisions(
 /// start-or-end endpoint, equally ignored by the validator) are cleared. Called for EVERY
 /// no-winner id — occupied and vanished alike — unlike the sentinel/delete cleanup below which is
 /// occupied-only.
-fn null_call_path_references(conn: &rusqlite::Connection, from: i64) -> rusqlite::Result<()> {
-    let lens_repos = binding_lens_repos_for_logical_symbol(conn, from)?;
+fn null_call_path_references(
+    conn: &rusqlite::Connection,
+    from: i64,
+    bindings_lens_capable: bool,
+) -> rusqlite::Result<()> {
+    let lens_repos = binding_lens_repos_for_logical_symbol(conn, from, bindings_lens_capable)?;
     rag_rat_query::memory::remap_call_path_callee_logical_symbol_ids(conn, conn, &[(from, None)])?;
     conn.execute(
         "UPDATE repo_memory_bindings SET logical_symbol_id = NULL
@@ -441,8 +454,9 @@ fn null_call_path_references(conn: &rusqlite::Connection, from: i64) -> rusqlite
 fn vacate_logical_symbol_references(
     conn: &rusqlite::Connection,
     from: i64,
+    bindings_lens_capable: bool,
 ) -> rusqlite::Result<()> {
-    let lens_repos = binding_lens_repos_for_logical_symbol(conn, from)?;
+    let lens_repos = binding_lens_repos_for_logical_symbol(conn, from, bindings_lens_capable)?;
     conn.execute("DELETE FROM logical_symbol_monikers WHERE logical_symbol_id = ?1", params![
         from
     ])?;
@@ -463,13 +477,14 @@ fn remap_logical_symbol_references(
     conn: &rusqlite::Connection,
     remap: &[(i64, i64)],
 ) -> rusqlite::Result<()> {
+    let capable = bindings_lens_capable(conn)?;
     for (i, (old_id, _)) in remap.iter().enumerate() {
         let temp_id = -(i as i64 + 1);
-        rewrite_logical_symbol_references(conn, *old_id, temp_id)?;
+        rewrite_logical_symbol_references(conn, *old_id, temp_id, capable)?;
     }
     for (i, (_, new_id)) in remap.iter().enumerate() {
         let temp_id = -(i as i64 + 1);
-        rewrite_logical_symbol_references(conn, temp_id, *new_id)?;
+        rewrite_logical_symbol_references(conn, temp_id, *new_id, capable)?;
     }
     let call_path_remap: Vec<(i64, Option<i64>)> =
         remap.iter().map(|(old_id, new_id)| (*old_id, Some(*new_id))).collect();
@@ -1491,14 +1506,15 @@ impl IndexDatabase {
         // stale ones.
         let remapped: std::collections::HashSet<i64> =
             remap.iter().map(|(old_id, _)| *old_id).collect();
+        let capable = bindings_lens_capable(conn)?;
         for old in snapshot {
             let old_id = old.old_id;
             if remapped.contains(&old_id) || survivor_claims.contains(&old_id) {
                 continue;
             }
-            null_call_path_references(conn, old_id)?;
+            null_call_path_references(conn, old_id, capable)?;
             if occupied_old_ids.contains(&old_id) {
-                vacate_logical_symbol_references(conn, old_id)?;
+                vacate_logical_symbol_references(conn, old_id, capable)?;
             }
         }
         remap_logical_symbol_references(conn, &remap)?;
