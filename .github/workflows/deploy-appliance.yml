@@ -89,6 +89,10 @@ jobs:
             # with the container-only /srv/workspace and /srv/db instead.
             cd /srv/rag-rat/repo
             "$HOME/.local/bin/rag-rat" index
+            # The clone lane is a separate derived artifact: a plain index leaves the
+            # precomputed clone graph stamped against the old source revision, and the
+            # Clone Classes view serves stale data until it is rebuilt.
+            "$HOME/.local/bin/rag-rat" clones --precompute
           DEPLOY
 
       - name: Rebuild and restart
