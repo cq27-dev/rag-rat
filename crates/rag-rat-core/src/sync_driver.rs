@@ -316,6 +316,14 @@ struct RefusedPublication {
     attempted_at: tokio::time::Instant,
 }
 
+fn retry_is_due(
+    last_attempt: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    retry_after: Duration,
+) -> bool {
+    last_attempt.is_none_or(|attempted_at| now.duration_since(attempted_at) >= retry_after)
+}
+
 fn refused_publication_is_due(
     refusal: Option<&RefusedPublication>,
     envelope: &[u8],
@@ -326,7 +334,7 @@ fn refused_publication_is_due(
         refusal,
         Some(refusal)
             if refusal.envelope == envelope
-                && now.duration_since(refusal.attempted_at) < retry_after
+                && !retry_is_due(Some(refusal.attempted_at), now, retry_after)
     )
 }
 
@@ -348,9 +356,14 @@ pub async fn advertise_host(config: Config, endpoint: iroh::Endpoint, database: 
     let node = *endpoint.id().as_bytes();
     let service_node = *service.id.as_bytes();
     let mut refresh = tokio::time::interval(ADVERTISEMENT_REFRESH);
+    let mut last_prepare_failure = None;
     let mut last_refused = None;
     loop {
         refresh.tick().await;
+        let now = tokio::time::Instant::now();
+        if !retry_is_due(last_prepare_failure, now, retry_after) {
+            continue;
+        }
         let publication = match prepare_advertisement(
             &database,
             &node,
@@ -359,9 +372,16 @@ pub async fn advertise_host(config: Config, endpoint: iroh::Endpoint, database: 
             time::now_ms(),
             ttl_seconds,
         ) {
-            Ok(Some(publication)) => publication,
-            Ok(None) => continue,
+            Ok(Some(publication)) => {
+                last_prepare_failure = None;
+                publication
+            },
+            Ok(None) => {
+                last_prepare_failure = None;
+                continue;
+            },
             Err(error) => {
+                last_prepare_failure = Some(now);
                 tracing::warn!(%error, "could not prepare this host's discovery announcement");
                 continue;
             },
@@ -810,7 +830,7 @@ mod tests {
     use super::{
         DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PersistedAdvertisement, RESIDENT_NUDGE,
         RefusedPublication, can_host, can_sync, device_sync_run, nudge_resident_host,
-        read_advertisement, refused_publication_is_due, write_advertisement,
+        read_advertisement, refused_publication_is_due, retry_is_due, write_advertisement,
     };
 
     #[test]
@@ -960,5 +980,17 @@ mod tests {
             refused_publication_is_due(Some(&refusal), &[9], attempted_at, retry_after),
             "a roster reseal is a new envelope and should not wait behind an old refusal"
         );
+    }
+
+    #[test]
+    fn a_preparation_error_uses_the_ttl_derived_retry_delay() {
+        let retry_after = rag_rat_sync::discovery::retry_after_refusal(60);
+        let attempted_at = tokio::time::Instant::now();
+        assert!(!retry_is_due(
+            Some(attempted_at),
+            attempted_at + retry_after - Duration::from_millis(1),
+            retry_after,
+        ));
+        assert!(retry_is_due(Some(attempted_at), attempted_at + retry_after, retry_after,));
     }
 }
