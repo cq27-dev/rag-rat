@@ -8,6 +8,7 @@ pub mod output;
 pub mod query;
 pub mod search;
 pub mod sidecar_state;
+pub mod sync_driver;
 pub mod version_check;
 pub mod watch;
 

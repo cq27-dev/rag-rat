@@ -25,7 +25,7 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use iroh::endpoint::presets;
+use iroh::endpoint::{Connection as IrohConnection, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use rag_rat_oplog::{self, AccountId, DeviceFingerprint};
 use rusqlite::Connection;
@@ -720,6 +720,36 @@ pub async fn accept_and_dispatch<C>(
 where
     C: SyncStore,
 {
+    let local_node = *endpoint.id().as_bytes();
+    let conn = accept_connection(endpoint).await?;
+    dispatch_connection(conn, local_node, account_store, content_store, policy, now_ms).await
+}
+
+/// Accept and complete the transport handshake for one inbound connection. Kept separate from
+/// [`dispatch_connection`] so a resident host can keep accepting while prior sessions reconcile.
+pub async fn accept_connection(endpoint: &Endpoint) -> Result<IrohConnection, SyncFailure> {
+    let incoming = endpoint
+        .accept()
+        .await
+        .ok_or_else(|| SyncFailure::Endpoint(EndpointError::Connect("endpoint closed".into())))?;
+    timeout(DEFAULT_IDLE_TIMEOUT, incoming)
+        .await
+        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("handshake timed out".into())))?
+        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))
+}
+
+/// Run the ALPN-selected sync session for an already-accepted connection.
+pub async fn dispatch_connection<C>(
+    conn: IrohConnection,
+    local_node: [u8; 32],
+    account_store: &mut OplogSyncStore<'_>,
+    content_store: &mut C,
+    policy: AuthPolicy,
+    now_ms: impl Fn() -> i64 + Copy,
+) -> Result<(Vec<u8>, SessionReport), SyncFailure>
+where
+    C: SyncStore,
+{
     // The two stores MUST be for the same account: the auth phase authorizes the peer against the
     // account store's account, and a content connection then runs the content store — which would
     // serve the WRONG account's content if they differed. Our callers always pass same-account
@@ -729,15 +759,6 @@ where
             "account and content stores are for different accounts".into(),
         )));
     }
-    let local_node = *endpoint.id().as_bytes();
-    let incoming = endpoint
-        .accept()
-        .await
-        .ok_or_else(|| SyncFailure::Endpoint(EndpointError::Connect("endpoint closed".into())))?;
-    let conn = timeout(DEFAULT_IDLE_TIMEOUT, incoming)
-        .await
-        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("handshake timed out".into())))?
-        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
     let remote_node = *conn.remote_id().as_bytes();
     let alpn = conn.alpn().to_vec();
     // Reject an unroutable ALPN BEFORE opening a stream or running auth — there is no reason to

@@ -520,6 +520,20 @@ fn sync_hook_trigger(config: &Config) -> serde_json::Value {
         Ok(db) => db,
         Err(error) => return serde_json::json!({"status": "error", "error": error.to_string()}),
     };
+    match rag_rat_core::sync_driver::nudge_resident_host(db.connection()) {
+        Ok(true) => {
+            return serde_json::json!({
+                "status": "nudged",
+                "reason": "the active MCP resident sync host will reconcile this database",
+            });
+        },
+        Ok(false) => {},
+        Err(error) => tracing::warn!(
+            target: "rag_rat_core::sync",
+            %error,
+            "could not nudge a resident sync host; using the short-lived fallback"
+        ),
+    }
     match device_sync_run(config, db.connection()) {
         Ok(DeviceSyncOutcome::Disabled) => serde_json::json!({
             "status": "disabled",

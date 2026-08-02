@@ -11,6 +11,10 @@ for coding agents. It keeps source files read-only, writes only its own SQLite d
 with provenance on every result — current source, the code graph, git/GitHub history, and durable,
 source-anchored repo memories that persist across sessions and agents.
 
+Explore the [live VS Code Lens demo](https://rag-rat-demo.cq27.dev/?folder=/srv/workspace&payload=%5B%5B%22gotoLineMode%22%2C%22true%22%5D%2C%5B%22openFile%22%2C%22vscode-remote%3A//rag-rat-demo.cq27.dev/srv/workspace/crates/rag-rat-oplog/src/account/content/storage.rs%3A1459%3A1%22%5D%5D) — no installation required.
+It surfaces clone classes, repo memories, and issue/decision context alongside the code; press
+`Ctrl+Alt+R` to reveal clone overlays.
+
 Every coding harness already has `grep` and file reads. rag-rat adds the layer they do not provide:
 source-anchored *rationale*. It connects the code an agent is about to touch to its callers, callees,
 tests, git/GitHub history, prior decisions, invariants, risks, and duplicate-code signals — and

@@ -22,6 +22,7 @@ pub async fn run_stdio(
         // Keep the index fresh while a session is connected; dropping the watcher on shutdown
         // runs a final timeout-skip pass. (Hot-upgrade is Unix-only.)
         let _watcher = rag_rat_core::watch::Watcher::spawn(config.clone());
+        let _sync_host = start_sync_host(config.clone());
         let service = RagRatService::new(config.clone(), output_format).serve(stdio()).await?;
         let _lens_server = crate::lens_server::spawn(config);
         service.waiting().await?;
@@ -113,6 +114,8 @@ async fn run_stdio_unix(
     let _watcher =
         rag_rat_core::watch::Watcher::spawn_with_fleet(config.clone(), install_path.clone());
 
+    let _sync_host = start_sync_host(config.clone());
+
     // Grep-augment hook listener: one elected listener per worktree. Spawned after the `running`
     // match so it covers both cold start and hot-upgrade resume. On normal EOF shutdown the guard
     // aborts the task so the socket + election lock release promptly; on a hot-`exec` the process
@@ -174,4 +177,15 @@ async fn run_stdio_unix(
 
     running.waiting().await?;
     Ok(())
+}
+
+/// Sync is an active-repo capability: a dormant MCP server has neither a database nor an endpoint.
+fn start_sync_host(config: Config) -> Option<rag_rat_core::sync_driver::ResidentSyncHost> {
+    match rag_rat_core::sync_driver::ResidentSyncHost::start(config) {
+        Ok(host) => host,
+        Err(error) => {
+            tracing::warn!(%error, "resident sync host did not start");
+            None
+        },
+    }
 }

@@ -29,6 +29,7 @@ getrandom.workspace = true
 futures-util.workspace = true
 gix.workspace = true
 httpdate.workspace = true
+iroh.workspace = true
 ignore = "0.4.31"
 model2vec-rs = { version = "0.2.1", default-features = false, features = ["hf-hub", "fancy-regex"], optional = true }
 notify = "8.2.0"
@@ -41,6 +42,7 @@ protobuf.workspace = true
 rag-rat-oracle.workspace = true
 rag-rat-oplog.workspace = true
 rag-rat-query.workspace = true
+rag-rat-sync.workspace = true
 reqwest.workspace = true
 scip.workspace = true
 serde.workspace = true

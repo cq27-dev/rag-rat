@@ -630,300 +630,9 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
     })
 }
 
-/// How long device-side sync waits for the per-database session lock before deferring to the next
-/// maintenance pass. Kept short: a colocated `serve` peer holds this lock for its whole life, so a
-/// long wait would just burn time on every hook before deferring; a transient overlap with another
-/// device sync resolves on the next trigger anyway (the cadence has already been satisfied).
-const DEVICE_SYNC_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
-/// Meta key: the last device-side sync attempt (ms), the cadence watermark.
-const DEVICE_SYNC_LAST_META_KEY: &str = "sync_device_last_at_ms";
+pub(crate) use rag_rat_core::sync_driver::{DeviceSyncOutcome, device_sync_run};
 
-/// What a device-side sync attempt did — folded into the maintenance hook report.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DeviceSyncOutcome {
-    /// Nothing to do: no local account, or this device is not roster-effective. Note that having
-    /// no configured peer is NOT one of the reasons — a pass with an empty `server_peers` still
-    /// runs and still looks.
-    Disabled,
-    /// The cadence gate suppressed this attempt (a sync ran within `push_interval_secs`).
-    Skipped,
-    /// The per-database session lock is held (a serve peer or another sync); retry next pass.
-    Deferred,
-    /// Ran against the peers this pass resolved — configured plus discovered: `ok` sessions
-    /// succeeded, `errors` failed, and `ok + errors == peers`.
-    ///
-    /// `peers` is what was ATTEMPTED, not what was configured. The two diverge in both directions:
-    /// discovery adds peers no config named, and several configured spellings of one node collapse
-    /// into a single dial. A configured id that failed to resolve is logged and counted as an
-    /// error, so a typo stays visible rather than shrinking the peer set to a healthy-looking zero.
-    Ran { peers: usize, ok: usize, errors: usize },
-}
-
-/// Best-effort device-side account-log sync on the maintenance path: dial each configured server
-/// peer and run one bidirectional session (push the entries the peer lacks, pull the ones we lack).
-/// Reuses the migrated `conn` from the maintenance pass and never holds the repo write lock — each
-/// account ingest is a single SQLite transaction serialized against any watcher write. Every
-/// per-peer failure is counted and logged; the caller folds the outcome into the hook report and a
-/// broken peer never fails the hook.
-pub(crate) fn device_sync_run(
-    config: &Config,
-    conn: &Connection,
-) -> anyhow::Result<DeviceSyncOutcome> {
-    // Device-side sync must NOT mint identity: an unenrolled store simply has nothing to sync.
-    // Read the account FIRST — ahead of the configured-peers check it used to sit behind — because
-    // whether an empty `server_peers` means "nothing to do" is now an account-scoped question.
-    let Some(account_id) = rag_rat_oplog::read_local_account(conn)? else {
-        return Ok(DeviceSyncOutcome::Disabled);
-    };
-    // An enrolled account is reason enough to run: this pass may have nothing configured and know
-    // of no other device, and still need to fetch.
-    //
-    // Deliberately NOT gated on the local roster holding a second device. That count is REPLICATED
-    // state — it is only current if this device has synced recently — so using it to decide whether
-    // to sync is circular, and the circle closes badly: a store restored from a backup taken before
-    // the other devices were enrolled believes it is alone, declines to look, and therefore never
-    // receives the roster entries that would tell it otherwise. It stays wedged forever while a
-    // reachable host sits there advertising. The cost of getting this wrong in the permissive
-    // direction is one fetch per cadence for an account that really is alone; in the strict
-    // direction it is a device that can never recover.
-    if !device_sync_due(conn, config.sync.push_interval_secs)? {
-        return Ok(DeviceSyncOutcome::Skipped);
-    }
-    // The per-database session lock: this device-side ephemeral session must not run while a
-    // colocated serve peer (or another device sync) holds the same node identity. On timeout,
-    // defer to the next maintenance pass rather than block the hook.
-    let Some(_session) =
-        locks::WriteLock::acquire_sync_session_timeout(&config.database, DEVICE_SYNC_LOCK_TIMEOUT)?
-    else {
-        return Ok(DeviceSyncOutcome::Deferred);
-    };
-    // Re-check the cadence UNDER the lock (double-checked locking): several git hooks fire per
-    // action and can all pass the pre-lock check on the same old watermark; without this a
-    // serialized contender would re-dial every peer right after the first run stamps the watermark.
-    if !device_sync_due(conn, config.sync.push_interval_secs)? {
-        return Ok(DeviceSyncOutcome::Skipped);
-    }
-    let node_key = node_secret(conn)?;
-    // Gate on roster-effectiveness BEFORE binding an endpoint: the node id is derivable from the
-    // secret, so this pays no socket or relay traffic. A revoked or unenrolled device could
-    // authorize to no `Closed` peer, so dialing would only fail every session. Stamp the watermark
-    // so this local-broken state is cadence-limited exactly like an unreachable peer — otherwise
-    // every hook would rebind an endpoint and hit the relay for nothing.
-    let local_node = rag_rat_sync::node_id_from_secret(*node_key);
-    if !device_can_sync(device_roster_capability(conn, account_id, &local_node)?) {
-        record_device_sync(conn)?;
-        return Ok(DeviceSyncOutcome::Disabled);
-    }
-    let relay = effective_relay_url(config);
-    // Key material for the account's discovery tag. Absent only when no account is minted, which
-    // the read above already ruled out; treat it as "no discovery" rather than an error either way.
-    let discovery_tag = rag_rat_sync::discovery::discovery_secret(conn)?
-        .map(|secret| rag_rat_sync::discovery::account_tag(&secret));
-    let discovery_service = discovery_service_addr(config, &relay);
-
-    let runtime =
-        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
-    let result: anyhow::Result<(usize, usize, usize)> = runtime.block_on(async {
-        let endpoint = rag_rat_sync::build_endpoint(*node_key, &relay)
-            .await
-            .with_context(|| format!("binding the sync endpoint over relay {relay}"))?;
-        // Resolve which peers to dial: the configured ids plus whatever the account advertises.
-        // INSIDE the runtime and AFTER the bind on purpose — publishing advertises this endpoint's
-        // identity, so there is nothing to announce until it exists. Each entry pairs the peer's
-        // node-id string (for logs) with its dialable address; a configured id that does not parse
-        // is logged and counted there, so it never becomes a dial attempt.
-        let resolved = rag_rat_sync::discover_peers(
-            &config.sync.server_peers,
-            &relay,
-            discovery_tag.zip(discovery_service).map(|(tag, service)| {
-                rag_rat_sync::discovery::DiscoveryExchange {
-                    endpoint: &endpoint,
-                    service,
-                    tag,
-                    // FETCH ONLY, whatever `[sync] discoverable` says — that flag is honoured by
-                    // `serve_with`, which is a different process state.
-                    //
-                    // This pass never calls `accept_and_dispatch`: it dials out and drops the
-                    // endpoint when it finishes, seconds later. Advertising here would publish an
-                    // address that cannot accept a connection and stops existing almost
-                    // immediately, while the announcement lives on for its whole TTL — costing
-                    // every device that discovers it a dial that can only time out, and occupying
-                    // one of the few per-tag slots that a REACHABLE peer needs. Only a node that
-                    // accepts connections is worth announcing.
-                    fetch: true,
-                    publish: None,
-                    ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
-                        config.sync.push_interval_secs,
-                    ),
-                }
-            }),
-            // Opening happens here, where a connection is available. An announcement sealed to a
-            // roster this device is no longer on simply will not open, and is dropped with the
-            // malformed ones — a device that has been removed stops finding its former peers by
-            // discovery, which is the point of sealing them.
-            &|payload| {
-                discovery_tag.and_then(|tag| {
-                    rag_rat_oplog::discovery::open_discovery_announcement(conn, &tag, payload)
-                        .unwrap_or_else(|error| {
-                            tracing::warn!(%error, "could not open a discovered announcement");
-                            None
-                        })
-                })
-            },
-        )
-        .await;
-        let unresolved_configured = resolved.unresolved_configured;
-        let peers = resolved.peers;
-        let mut reached = vec![false; peers.len()];
-        let mut account_reports = vec![
-            rag_rat_sync::ReconcileReport {
-                rounds: 0,
-                entries_newly_stored: 0,
-                entries_sent: 0,
-                converged: false,
-            };
-            peers.len()
-        ];
-
-        // Reconcile authority with EVERY reachable peer before choosing a missing incarnation.
-        // A per-peer ensure can fork against a valid root held by a later peer.
-        for (index, (peer, addr)) in peers.iter().enumerate() {
-            let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
-            match rag_rat_sync::connect_and_reconcile(
-                &endpoint,
-                (*addr).clone(),
-                rag_rat_sync::SYNC_ALPN,
-                &mut store,
-                AuthPolicy::Closed,
-                time::now_ms,
-                rag_rat_sync::MAX_RECONCILE_ROUNDS,
-            )
-            .await
-            {
-                Ok(report) if report.converged => {
-                    account_reports[index] = report;
-                    reached[index] = true;
-                },
-                Ok(_) => tracing::warn!(
-                    peer,
-                    "device sync (account log) did not converge before the round limit"
-                ),
-                Err(e) => tracing::warn!(peer, error = %e, "device sync (account log) failed"),
-            }
-        }
-
-        // Automatic bootstrap is founder-only, so it cannot depend on a mutable local owner view.
-        // Propagate any newly-authored root through one more account pass before `/5` manifests.
-        ensure_founder_table_repo_incarnations(conn)?;
-        for (index, (peer, addr)) in peers.iter().enumerate() {
-            if reached[index] {
-                let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
-                match rag_rat_sync::connect_and_reconcile(
-                    &endpoint,
-                    (*addr).clone(),
-                    rag_rat_sync::SYNC_ALPN,
-                    &mut store,
-                    AuthPolicy::Closed,
-                    time::now_ms,
-                    rag_rat_sync::MAX_RECONCILE_ROUNDS,
-                )
-                .await
-                {
-                    Ok(report) if report.converged => {
-                        accumulate_reconcile_report(&mut account_reports[index], report);
-                    },
-                    Ok(_) => {
-                        tracing::warn!(
-                            peer,
-                            "device sync (incarnation propagation) did not converge before the \
-                             round limit"
-                        );
-                        reached[index] = false;
-                    },
-                    Err(e) => {
-                        tracing::warn!(peer, error = %e, "device sync (incarnation propagation) failed");
-                        reached[index] = false;
-                    },
-                }
-            }
-        }
-
-        for (index, (peer, addr)) in peers.iter().enumerate() {
-            if reached[index] {
-                let account_report = account_reports[index];
-                tracing::info!(
-                    peer,
-                    rounds = account_report.rounds,
-                    converged = account_report.converged,
-                    sent = account_report.entries_sent,
-                    stored = account_report.entries_newly_stored,
-                    "device sync (account log) complete"
-                );
-                let mut store = OplogContentSyncStore::new(conn, account_id, time::now_ms);
-                match rag_rat_sync::connect_and_reconcile(
-                    &endpoint,
-                    (*addr).clone(),
-                    rag_rat_sync::CONTENT_SYNC_ALPN,
-                    &mut store,
-                    AuthPolicy::Closed,
-                    time::now_ms,
-                    rag_rat_sync::MAX_RECONCILE_ROUNDS,
-                )
-                .await
-                {
-                    Ok(report) => tracing::info!(
-                        peer,
-                        rounds = report.rounds,
-                        converged = report.converged,
-                        sent = report.entries_sent,
-                        stored = report.entries_newly_stored,
-                        "device sync (content) complete"
-                    ),
-                    Err(e) => tracing::warn!(peer, error = %e, "device sync (content) failed"),
-                }
-                rag_rat_core::drain_synced_memory(conn)?;
-                let mut table_store =
-                    rag_rat_sync::OplogTableSyncStore::new(conn, account_id, time::now_ms);
-                if table_store.has_streams()? {
-                    match rag_rat_sync::connect_and_table_reconcile(
-                        &endpoint,
-                        (*addr).clone(),
-                        &mut table_store,
-                        time::now_ms,
-                        rag_rat_sync::MAX_RECONCILE_ROUNDS,
-                    )
-                    .await
-                    {
-                        Ok(report) => tracing::info!(
-                            peer,
-                            rounds = report.rounds,
-                            converged = report.converged,
-                            sent = report.entries_sent,
-                            stored = report.entries_newly_stored,
-                            "device sync (table streams) complete"
-                        ),
-                        Err(e) => tracing::warn!(
-                            peer,
-                            error = %e,
-                            "device sync (table streams) failed"
-                        ),
-                    }
-                }
-            }
-        }
-        anyhow::Ok(fold_peer_outcomes(unresolved_configured, &reached))
-    });
-
-    // Stamp the cadence watermark on ANY completed attempt — a per-peer failure OR an endpoint-bind
-    // failure (a bad relay URL, a relay outage). Without stamping before we propagate, the bind
-    // failure would `?`-exit and every subsequent hook would rebind and hit the relay again,
-    // ignoring `push_interval_secs`. A bind failure still surfaces (the caller reports it and never
-    // fails the hook), but it is now cadence-limited exactly like an unreachable peer.
-    record_device_sync(conn)?;
-    let (peers, ok, errors) = result?;
-    Ok(DeviceSyncOutcome::Ran { peers, ok, errors })
-}
-
+// Kept for the CLI's focused cadence tests; production device syncing lives in core.
 fn ensure_founder_table_repo_incarnations(conn: &Connection) -> anyhow::Result<()> {
     for repo_id in rag_rat_db::schema::real_repo_ids(conn)? {
         rag_rat_oplog::ensure_repo_incarnation(conn, &repo_id, time::now_ms())?;
@@ -1088,47 +797,6 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Fold the per-peer session results into the `(peers, ok, errors)` a [`DeviceSyncOutcome::Ran`]
-/// reports. `reached[i]` is whether peer `i`'s account-log session succeeded.
-///
-/// Pure, and separately tested, because this accounting is where the mistake lives when it is made.
-/// The obvious spelling — deriving the unresolvable count as `configured - peers.len()` — is wrong
-/// the moment discovery can add peers or duplicate spellings can collapse, and it under-counts
-/// errors all the way to a healthy-looking zero over an all-typo `server_peers`. A unit test on the
-/// resolver's return value cannot see that, because the subtraction lives HERE, at the caller.
-fn fold_peer_outcomes(unresolved_configured: usize, reached: &[bool]) -> (usize, usize, usize) {
-    let ok = reached.iter().filter(|reached| **reached).count();
-    let errors = reached.len() - ok + unresolved_configured;
-    (reached.len() + unresolved_configured, ok, errors)
-}
-
-/// The cadence gate: whether enough time has passed since the last device-side sync attempt.
-/// `push_interval_secs == 0` always runs; a never-synced store always runs.
-fn device_sync_due(conn: &Connection, push_interval_secs: u64) -> anyhow::Result<bool> {
-    if push_interval_secs == 0 {
-        return Ok(true);
-    }
-    let Some(last) = rag_rat_db::meta::read_meta(conn, DEVICE_SYNC_LAST_META_KEY)?
-        .and_then(|s| s.trim().parse::<i64>().ok())
-    else {
-        return Ok(true);
-    };
-    let now = time::now_ms();
-    // A watermark in the FUTURE means the clock stepped backward (NTP correcting a fast RTC, a VM
-    // resume) after a stamp — never trust it, or device sync would stay silently suppressed for the
-    // whole gap until the wall clock catches up. Treat it as due and let the next run re-stamp.
-    if last > now {
-        return Ok(true);
-    }
-    let interval_ms = i64::try_from(push_interval_secs).unwrap_or(i64::MAX).saturating_mul(1000);
-    Ok(now - last >= interval_ms)
-}
-
-/// Stamp the device-side sync cadence watermark at the current time.
-fn record_device_sync(conn: &Connection) -> anyhow::Result<()> {
-    rag_rat_db::meta::set_meta(conn, DEVICE_SYNC_LAST_META_KEY, &time::now_ms().to_string())
-}
-
 /// Resolve this store's EXISTING local account WITHOUT minting one. A serve peer must already be
 /// enrolled; merely starting the server must never create account or device identity state as a
 /// side effect (that is `sync enable`'s job). The "no account yet" case becomes an actionable
@@ -1162,10 +830,6 @@ fn device_roster_capability(
 
 fn device_can_serve(capability: Option<PeerCapability>) -> bool {
     matches!(capability, Some(PeerCapability::ReadWrite))
-}
-
-fn device_can_sync(capability: Option<PeerCapability>) -> bool {
-    capability.is_some()
 }
 
 /// Meta key for this index's persisted iroh node secret (the transport identity).
@@ -1227,11 +891,10 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        AnnouncementVerdict, DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome,
-        accumulate_reconcile_report, classify_announcement, decode_node_secret, device_can_serve,
-        device_can_sync, device_sync_due, device_sync_run, discovery_node_or_configured,
-        discovery_service_addr, ensure_founder_table_repo_incarnations, fold_peer_outcomes, join,
-        node_secret, record_device_sync, serve_should_advertise, stamp_after_seal,
+        AnnouncementVerdict, DeviceSyncOutcome, accumulate_reconcile_report, classify_announcement,
+        decode_node_secret, device_can_serve, device_sync_run, discovery_node_or_configured,
+        discovery_service_addr, ensure_founder_table_repo_incarnations, join, node_secret,
+        serve_should_advertise, stamp_after_seal,
     };
 
     fn account_of(conn: &Connection) -> rag_rat_oplog::AccountId {
@@ -1273,55 +936,6 @@ mod tests {
         let config =
             Config::minimal_for_database(dir.path().join("db.sqlite"), dir.path().to_path_buf());
         (config, dir)
-    }
-
-    #[test]
-    fn device_sync_due_respects_the_cadence() {
-        let conn = schema_conn();
-        assert!(device_sync_due(&conn, 0).unwrap(), "interval 0 always runs");
-        assert!(device_sync_due(&conn, 300).unwrap(), "a never-synced store is due");
-        record_device_sync(&conn).unwrap();
-        assert!(
-            !device_sync_due(&conn, 300).unwrap(),
-            "a just-synced store waits out the interval"
-        );
-        rag_rat_db::meta::set_meta(&conn, DEVICE_SYNC_LAST_META_KEY, "0").unwrap();
-        assert!(device_sync_due(&conn, 300).unwrap(), "an ancient watermark is due again");
-        // A watermark in the future (backward clock step) must not silently suppress sync.
-        let future = (rag_rat_base::time::now_ms() + 10_000_000).to_string();
-        rag_rat_db::meta::set_meta(&conn, DEVICE_SYNC_LAST_META_KEY, &future).unwrap();
-        assert!(device_sync_due(&conn, 300).unwrap(), "a future watermark is treated as due");
-    }
-
-    /// The accounting the old `configured.saturating_sub(peers.len())` got wrong. Restoring that
-    /// subtraction makes the discovery row report 1 error instead of 3, and the all-typo row report
-    /// 0 instead of 2 — a pass that looks healthy while syncing with nobody.
-    #[test]
-    fn peer_outcomes_count_every_attempt_including_the_ids_that_never_resolved() {
-        assert_eq!(
-            fold_peer_outcomes(0, &[true, true]),
-            (2, 2, 0),
-            "two configured peers, both reached"
-        );
-        assert_eq!(
-            fold_peer_outcomes(2, &[]),
-            (2, 0, 2),
-            "an all-typo server_peers reports errors, never a healthy-looking empty run"
-        );
-        assert_eq!(
-            fold_peer_outcomes(3, &[true, false]),
-            (5, 1, 4),
-            "unresolvable ids are attempts too: they seed errors and count toward peers"
-        );
-        // Discovery adds peers no config named, so `peers` exceeds the configured count. The old
-        // subtraction could not represent this at all.
-        let (peers, ok, errors) = fold_peer_outcomes(1, &[true, true, false, true]);
-        assert_eq!((peers, ok, errors), (5, 3, 2));
-        assert_eq!(
-            ok + errors,
-            peers,
-            "ok + errors == peers is the invariant the hook report reads"
-        );
     }
 
     /// The env override exists for ops and tests; without it, pointing a checkout at a throwaway
@@ -1517,7 +1131,12 @@ mod tests {
     fn device_sync_run_skips_within_the_cadence_window() {
         let conn = schema_conn();
         rag_rat_oplog::local_account(&conn, 1_700_000_000_000).unwrap(); // enroll a local account
-        record_device_sync(&conn).unwrap(); // just synced
+        rag_rat_db::meta::set_meta(
+            &conn,
+            "sync_device_last_at_ms",
+            &rag_rat_base::time::now_ms().to_string(),
+        )
+        .unwrap();
         let mut config = min_config();
         config.sync.server_peers = vec!["some-node-id".to_string()];
         config.sync.push_interval_secs = 300;
@@ -1577,10 +1196,8 @@ mod tests {
     #[test]
     fn read_only_devices_can_sync_but_cannot_serve() {
         let read_only = Some(rag_rat_sync::PeerCapability::ReadOnly);
-        assert!(device_can_sync(read_only));
         assert!(!device_can_serve(read_only));
         assert!(device_can_serve(Some(rag_rat_sync::PeerCapability::ReadWrite)));
-        assert!(!device_can_sync(None));
     }
 
     #[test]
