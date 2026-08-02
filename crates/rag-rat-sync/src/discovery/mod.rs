@@ -410,8 +410,15 @@ async fn exchange_inner(
 /// The cost of treating a genuinely-failed `Uncertain` as live is one renewal interval of
 /// undiscoverability before the next republish; the cost of the other error is unbounded slot
 /// churn. This trades the bounded harm for the unbounded one.
-fn records_liveness(state: PublishState) -> bool {
+pub fn records_liveness(state: PublishState) -> bool {
     matches!(state, PublishState::Published | PublishState::Uncertain)
+}
+
+/// How long a locally recorded publication remains live before it is renewed.
+///
+/// Kept beside [`advertise`] so every host uses the same slot-budget policy.
+pub fn renew_after(ttl_seconds: u32) -> Duration {
+    Duration::from_millis(u64::from(ttl_seconds * RENEW_AFTER_NUM / RENEW_AFTER_DEN) * 1000)
 }
 
 /// A long-running host's standing advertisement — see [`advertise`].
@@ -463,18 +470,15 @@ pub async fn advertise(params: Advertise) {
     // Milliseconds, and `.max(1)`, so the period stays positive for any TTL the service's floor
     // could ever permit — `interval` panics on a zero period.
     let period = Duration::from_millis((u64::from(ttl_seconds) * 1000 / TICKS_PER_TTL).max(1));
-    let renew_after =
-        Duration::from_millis(u64::from(ttl_seconds * RENEW_AFTER_NUM / RENEW_AFTER_DEN) * 1000);
+    let renew_after = renew_after(ttl_seconds);
     let mut ticks = tokio::time::interval(period);
     // What the service last accepted from this host, and when. A MONOTONIC instant, not the wall
     // clock and not the service's `expires_at_ms`: this is a pure "how long since we published"
     // question, so it needs neither a clock that can step backwards nor a comparison across two
     // machines' clocks.
     //
-    // In memory only, so a restart forgets it — and because a fresh seal is byte-distinct, the
-    // restarted host cannot recognise its still-live announcement and appends another. Bounded and
-    // self-healing after one restart; a crash loop or rapid redeploy is the case that bites.
-    // Persisting or reusing the envelope across restart is #1086.
+    // This low-level task deliberately knows only its watch channel. A serving host that survives
+    // restarts persists this same pair through its controller instead.
     let mut published: Option<(Vec<u8>, tokio::time::Instant)> = None;
     loop {
         ticks.tick().await;

@@ -1,6 +1,6 @@
 //! Shared device-sync driver for the CLI fallback and the active MCP resident host.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +12,7 @@ use rag_rat_sync::{
     AuthPolicy, NodeAuth, OplogContentSyncStore, OplogSyncStore, PeerAuthorization, PeerCapability,
 };
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(1);
@@ -21,6 +22,8 @@ const RESIDENT_NUDGE: &str = "sync_resident_nudge_at_ms";
 const HEARTBEAT_MAX_AGE_MS: i64 = 30_000;
 const HEARTBEAT_INTERVAL_MS: i64 = HEARTBEAT_MAX_AGE_MS / 2;
 const NODE_SECRET: &str = "sync_node_secret";
+const DISCOVERY_ADVERTISEMENT: &str = "sync_discovery_advertisement";
+const ADVERTISEMENT_REFRESH: Duration = Duration::from_secs(1);
 /// Bound pre-auth peers as well as authenticated sessions: each task owns a SQLite connection
 /// until the stream-idle timeout expires.
 const RESIDENT_SESSION_MAX: usize = 8;
@@ -208,22 +211,13 @@ async fn resident_loop(
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let accept = tokio::task::spawn_local(accept_loop(endpoint.clone(), account, database.clone()));
-    let mut announcement = resident_announcement(&config, &endpoint, &database);
-    let advertiser = announcement.as_ref().zip(discovery_addr(&config, &relay_url(&config))).map(
-        |((tag, _, _, receiver, _), service)| {
-            tokio::task::spawn_local(rag_rat_sync::discovery::advertise(
-                rag_rat_sync::discovery::Advertise {
-                    endpoint: endpoint.clone(),
-                    service,
-                    tag: *tag,
-                    announcement: receiver.clone(),
-                    ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
-                        config.sync.push_interval_secs,
-                    ),
-                },
-            ))
-        },
-    );
+    // Advertising owns a separate timer and short-lived DB handles. Inbound sessions stay on their
+    // own task, so a seal retry cannot cancel or delay a session already in flight.
+    let advertiser = tokio::task::spawn_local(advertise_host(
+        config.clone(),
+        endpoint.clone(),
+        database.clone(),
+    ));
     let mut poll = tokio::time::interval(Duration::from_secs(1));
     let mut handled_nudge = 0;
     let mut last_heartbeat = 0;
@@ -235,7 +229,6 @@ async fn resident_loop(
         let result = async {
             let storage = IndexConnection::open(&database)?;
             let conn = storage.connection();
-            refresh_announcement(conn, &mut announcement)?;
             let nudge = rag_rat_db::meta::read_meta(conn, RESIDENT_NUDGE)?
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or_default();
@@ -261,86 +254,159 @@ async fn resident_loop(
         }
     }
     accept.abort();
-    if let Some(advertiser) = advertiser {
-        advertiser.abort();
+    advertiser.abort();
+}
+
+/// Persisted local state for one serving endpoint's announcement. The service appends rather than
+/// replaces, so the exact sealed bytes and their possible liveness must survive a restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedAdvertisement {
+    tag: [u8; 32],
+    node: [u8; 32],
+    roster_stamp: Option<[u8; 32]>,
+    envelope: Option<Vec<u8>>,
+    published_at_ms: Option<i64>,
+    ttl_seconds: u32,
+}
+
+impl PersistedAdvertisement {
+    fn matches(&self, tag: &[u8; 32], node: &[u8; 32], stamp: &Option<[u8; 32]>) -> bool {
+        self.tag == *tag && self.node == *node && self.roster_stamp == *stamp
+    }
+
+    fn live(&self, now_ms: i64) -> bool {
+        self.envelope.is_some()
+            && self.published_at_ms.is_some_and(|published_at| {
+                // A backwards wall-clock step must not turn one possibly-live publication into a
+                // burst of appends. The next normal clock reading renews it.
+                published_at > now_ms
+                    || now_ms.saturating_sub(published_at)
+                        < i64::try_from(
+                            rag_rat_sync::discovery::renew_after(self.ttl_seconds).as_millis(),
+                        )
+                        .unwrap_or(i64::MAX)
+            })
     }
 }
 
-type ResidentAnnouncement = (
-    [u8; 32],
-    [u8; 32],
-    tokio::sync::watch::Sender<Option<Vec<u8>>>,
-    tokio::sync::watch::Receiver<Option<Vec<u8>>>,
-    Option<rag_rat_oplog::discovery::RosterStamp>,
-);
+struct Publication {
+    tag: [u8; 32],
+    node: [u8; 32],
+    envelope: Vec<u8>,
+    ttl_seconds: u32,
+}
 
-fn resident_announcement(
-    config: &Config,
-    endpoint: &iroh::Endpoint,
-    database: &std::path::Path,
-) -> Option<ResidentAnnouncement> {
+/// Maintain a serving host's discovery announcement independently of its inbound session loop.
+///
+/// The record in `index_meta` is reused only for the same endpoint identity, account tag, and
+/// roster stamp. This preserves byte identity across a restart while making a roster move reseal
+/// promptly. The timer retries an initial or replacement seal even when no peer ever connects.
+pub async fn advertise_host(config: Config, endpoint: iroh::Endpoint, database: PathBuf) {
     if !config.sync.discovery || !config.sync.discoverable {
-        return None;
+        return;
     }
-    let storage = match IndexConnection::open(database) {
-        Ok(storage) => storage,
-        Err(error) => {
-            tracing::warn!(%error, "could not open the resident sync announcement store");
-            return None;
-        },
+    let relay = relay_url(&config);
+    let Some(service) = discovery_addr(&config, &relay) else {
+        return;
     };
+    let ttl_seconds = rag_rat_sync::discovery::publish_ttl_seconds(config.sync.push_interval_secs);
+    let node = *endpoint.id().as_bytes();
+    let mut refresh = tokio::time::interval(ADVERTISEMENT_REFRESH);
+    loop {
+        refresh.tick().await;
+        let publication = match prepare_advertisement(&database, &node, time::now_ms(), ttl_seconds)
+        {
+            Ok(Some(publication)) => publication,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(%error, "could not prepare this host's discovery announcement");
+                continue;
+            },
+        };
+        let attempted_at_ms = time::now_ms();
+        let outcome =
+            rag_rat_sync::discovery::exchange(rag_rat_sync::discovery::DiscoveryExchange {
+                endpoint: &endpoint,
+                service: service.clone(),
+                tag: publication.tag,
+                fetch: false,
+                publish: Some(&publication.envelope),
+                ttl_seconds,
+            })
+            .await;
+        if rag_rat_sync::discovery::records_liveness(outcome.publish)
+            && let Err(error) =
+                record_advertisement_liveness(&database, &publication, attempted_at_ms)
+        {
+            tracing::warn!(%error, "could not persist this host's discovery liveness");
+        }
+        match outcome.degraded {
+            Some(reason) => tracing::warn!(reason, "advertising this host degraded"),
+            None => tracing::debug!(state = ?outcome.publish, "advertised this host"),
+        }
+    }
+}
+
+fn prepare_advertisement(
+    database: &Path,
+    node: &[u8; 32],
+    now_ms: i64,
+    ttl_seconds: u32,
+) -> anyhow::Result<Option<Publication>> {
+    let storage = IndexConnection::open(database)?;
     let conn = storage.connection();
-    let tag = match rag_rat_sync::discovery::discovery_secret(conn) {
-        Ok(Some(secret)) => rag_rat_sync::discovery::account_tag(&secret),
-        Ok(None) => return None,
-        Err(error) => {
-            tracing::warn!(%error, "could not read the resident sync discovery secret");
-            return None;
+    let Some(secret) = rag_rat_sync::discovery::discovery_secret(conn)? else {
+        return Ok(None);
+    };
+    let tag = rag_rat_sync::discovery::account_tag(&secret);
+    let stamp = rag_rat_oplog::discovery::roster_stamp(conn)?;
+    let persisted = read_advertisement(conn)?;
+    let current = persisted.filter(|record| record.matches(&tag, node, &stamp));
+    let record = match current {
+        Some(record) => record,
+        None => {
+            let envelope = seal_advertisement(conn, &tag, node)?;
+            let record = PersistedAdvertisement {
+                tag,
+                node: *node,
+                roster_stamp: stamp,
+                envelope,
+                published_at_ms: None,
+                ttl_seconds,
+            };
+            write_advertisement(conn, &record)?;
+            record
         },
     };
-    let (bytes, seal_succeeded) = match seal_announcement(conn, &tag, endpoint.id().as_bytes()) {
-        Ok(bytes) => (bytes, true),
-        Err(error) => {
-            tracing::warn!(%error, "could not seal the resident sync announcement");
-            (None, false)
-        },
-    };
-    // A failed initial seal must leave this unset so the periodic refresh retries against the same
-    // roster rather than treating an unpublished announcement as current.
-    let stamp = if seal_succeeded {
-        rag_rat_oplog::discovery::roster_stamp(conn).ok().flatten()
-    } else {
-        None
-    };
-    let (sender, receiver) = tokio::sync::watch::channel(bytes);
-    Some((tag, *endpoint.id().as_bytes(), sender, receiver, stamp))
+    if record.live(now_ms) {
+        return Ok(None);
+    }
+    Ok(record.envelope.map(|envelope| Publication { tag, node: *node, envelope, ttl_seconds }))
 }
 
-fn refresh_announcement(
-    conn: &Connection,
-    announcement: &mut Option<ResidentAnnouncement>,
+fn record_advertisement_liveness(
+    database: &Path,
+    publication: &Publication,
+    attempted_at_ms: i64,
 ) -> anyhow::Result<()> {
-    let Some((tag, node, sender, _, stamp)) = announcement else {
+    let storage = IndexConnection::open(database)?;
+    let conn = storage.connection();
+    let stamp = rag_rat_oplog::discovery::roster_stamp(conn)?;
+    let Some(mut record) = read_advertisement(conn)? else {
         return Ok(());
     };
-    let observed = rag_rat_oplog::discovery::roster_stamp(conn)?;
-    if observed == *stamp {
+    // Never make a publish from a roster that moved during the network exchange look current.
+    if !record.matches(&publication.tag, &publication.node, &stamp)
+        || record.envelope.as_deref() != Some(publication.envelope.as_slice())
+    {
         return Ok(());
     }
-    match seal_announcement(conn, tag, node) {
-        Ok(bytes) => {
-            *stamp = observed;
-            let _ = sender.send(bytes);
-        },
-        Err(error) => {
-            tracing::warn!(%error, "could not refresh the resident sync announcement");
-            let _ = sender.send(None);
-        },
-    }
-    Ok(())
+    record.published_at_ms = Some(attempted_at_ms);
+    record.ttl_seconds = publication.ttl_seconds;
+    write_advertisement(conn, &record)
 }
 
-fn seal_announcement(
+fn seal_advertisement(
     conn: &Connection,
     tag: &[u8; 32],
     node: &[u8; 32],
@@ -349,12 +415,36 @@ fn seal_announcement(
     else {
         return Ok(None);
     };
-    if sealed.recipients <= 1
-        || sealed.bytes.len() > rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES
-    {
+    if sealed.recipients <= 1 {
+        return Ok(None);
+    }
+    if sealed.bytes.len() > rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES {
+        tracing::warn!(
+            recipients = sealed.recipients,
+            bytes = sealed.bytes.len(),
+            max_bytes = rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES,
+            "not advertising: this account's roster is too large to seal into one announcement"
+        );
         return Ok(None);
     }
     Ok(Some(sealed.bytes))
+}
+
+fn read_advertisement(conn: &Connection) -> anyhow::Result<Option<PersistedAdvertisement>> {
+    let Some(encoded) = rag_rat_db::meta::read_meta(conn, DISCOVERY_ADVERTISEMENT)? else {
+        return Ok(None);
+    };
+    match serde_json::from_str(&encoded) {
+        Ok(record) => Ok(Some(record)),
+        Err(error) => {
+            tracing::warn!(%error, "ignoring a malformed persisted discovery advertisement");
+            Ok(None)
+        },
+    }
+}
+
+fn write_advertisement(conn: &Connection, record: &PersistedAdvertisement) -> anyhow::Result<()> {
+    rag_rat_db::meta::set_meta(conn, DISCOVERY_ADVERTISEMENT, &serde_json::to_string(record)?)
 }
 
 async fn accept_loop(
@@ -545,6 +635,7 @@ fn discovery_addr(config: &Config, relay: &str) -> Option<rag_rat_sync::Endpoint
     let node = std::env::var("RAG_RAT_SYNC_DISCOVERY_NODE")
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
         .unwrap_or_else(|| config.sync.discovery_node_id.clone());
     rag_rat_sync::peer_addr(&node, relay).map_err(|error| {
         tracing::warn!(%error, "skipping peer discovery: configured node id is invalid")
@@ -643,7 +734,9 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        DeviceSyncOutcome, RESIDENT_NUDGE, can_host, can_sync, device_sync_run, nudge_resident_host,
+        DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PersistedAdvertisement, RESIDENT_NUDGE,
+        can_host, can_sync, device_sync_run, nudge_resident_host, read_advertisement,
+        write_advertisement,
     };
 
     #[test]
@@ -677,5 +770,51 @@ mod tests {
         assert!(can_host(Some(rag_rat_sync::PeerCapability::ReadWrite)));
         assert!(!can_host(Some(rag_rat_sync::PeerCapability::ReadOnly)));
         assert!(can_sync(Some(rag_rat_sync::PeerCapability::ReadOnly)));
+    }
+
+    #[test]
+    fn persisted_advertisement_matches_only_the_same_endpoint_tag_and_roster() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        let record = PersistedAdvertisement {
+            tag: [1; 32],
+            node: [2; 32],
+            roster_stamp: Some([3; 32]),
+            envelope: Some(vec![4, 5, 6]),
+            published_at_ms: Some(7),
+            ttl_seconds: 60,
+        };
+
+        write_advertisement(&conn, &record).unwrap();
+        let restored = read_advertisement(&conn).unwrap().expect("the record was persisted");
+        assert_eq!(restored, record, "the exact sealed envelope survives a host restart");
+        assert!(restored.matches(&[1; 32], &[2; 32], &Some([3; 32])));
+        assert!(!restored.matches(&[9; 32], &[2; 32], &Some([3; 32])));
+        assert!(!restored.matches(&[1; 32], &[9; 32], &Some([3; 32])));
+        assert!(!restored.matches(&[1; 32], &[2; 32], &Some([9; 32])));
+        assert!(
+            rag_rat_db::meta::read_meta(&conn, DISCOVERY_ADVERTISEMENT).unwrap().is_some(),
+            "the controller stores its state in index_meta"
+        );
+    }
+
+    #[test]
+    fn a_restart_reuses_matching_liveness_until_renewal_is_due() {
+        let record = PersistedAdvertisement {
+            tag: [1; 32],
+            node: [2; 32],
+            roster_stamp: Some([3; 32]),
+            envelope: Some(vec![4, 5, 6]),
+            published_at_ms: Some(1_000),
+            ttl_seconds: 60,
+        };
+        assert!(
+            record.live(30_999),
+            "a restarted host keeps using its still-live byte-identical envelope"
+        );
+        assert!(
+            !record.live(31_000),
+            "the first renewal is still due at the established half-life"
+        );
     }
 }
