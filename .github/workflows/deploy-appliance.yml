@@ -4,15 +4,13 @@ name: deploy-appliance
 # SSH. The host's IP/hostname lives ONLY in the `appliance-prod` environment's secrets —
 # never in this file — and the public URL is a CNAME to the Cloudflare named tunnel, so
 # no DNS record ever points at the box.
+#
+# Runs ONLY on release tags (release-plz cuts vX.Y.Z): every main push deploying to
+# production meant a ~10-minute host reindex per commit and production tracking
+# unreleased code. Manual runs stay available via workflow_dispatch.
 on:
   push:
-    branches: [main]
-    paths:
-      - editors/appliance/**
-      - editors/vscode/**
-      - crates/**
-      - Cargo.toml
-      - Cargo.lock
+    tags: ["v*"]
   workflow_dispatch:
 
 env:
