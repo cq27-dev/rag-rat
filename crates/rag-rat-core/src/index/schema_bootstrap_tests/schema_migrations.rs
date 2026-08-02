@@ -1839,7 +1839,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 104, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 106, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
@@ -1987,6 +1987,66 @@ fn migration_104_table_sync_readoption() {
     let recorded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM schema_version WHERE id = '104_table_sync_readoption'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
+}
+
+/// V105 (#1127) adds the per-chain retained floor for accepted-entry compaction.
+#[test]
+fn migration_105_table_sync_retained_floors() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+
+    let strict: i64 = conn
+        .query_row(
+            "SELECT strict FROM pragma_table_list
+             WHERE schema = 'main' AND name = 'table_sync_retained_floors'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(strict, 1);
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '105_table_sync_retained_floors'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
+}
+
+/// V106 (#1127) makes the re-adoption audit's original entry hash nullable for compacted winners.
+#[test]
+fn migration_106_readoption_audit_nullable_winner() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+
+    let nullable: i64 = conn
+        .query_row(
+            "SELECT NOT \"notnull\" FROM pragma_table_info('table_sync_readoption_audit')
+             WHERE name = 'original_entry_hash'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(nullable, 1);
+    conn.execute(
+        "INSERT INTO table_sync_readoption_audit(
+             account_id, removed_fingerprint, adopter_fingerprint, stream_id, repo_id, scope_id,
+             table_name, row_pk, original_lamport, original_entry_hash, adopted_entry_hash,
+             adopted_at_ms
+         ) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(32), 'r', 's', 't', 'p',
+                   1, NULL, zeroblob(32), 0)",
+        [],
+    )
+    .expect("a compacted winner's audit row has no hash to record");
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '106_readoption_audit_nullable_winner'",
             [],
             |row| row.get(0),
         )

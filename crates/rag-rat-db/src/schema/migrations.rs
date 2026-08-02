@@ -7420,6 +7420,71 @@ pub fn apply_table_sync_readoption(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// V105 (#1127): the per-(stream, device) retained floor.
+///
+/// Accepted-entry compaction drops a chain prefix below the floor; this table is how a peer
+/// (and the local accept path) tells an intentionally reclaimed prefix from a chain gap. It is
+/// swept with the stream directory on repository purge, NOT retained like the chain-tip
+/// witnesses: once the accepted log itself is gone, "the prefix below F was compacted" stops
+/// being true, and a surviving floor would short-circuit the re-offered prefix the restored
+/// chain then waits on forever.
+pub fn apply_table_sync_retained_floors(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS table_sync_retained_floors(
+             stream_id          BLOB    NOT NULL CHECK(length(stream_id) = 32),
+             device_fingerprint BLOB    NOT NULL CHECK(length(device_fingerprint) = 32),
+             lamport            INTEGER NOT NULL,
+             entry_hash         BLOB    NOT NULL CHECK(length(entry_hash) = 32),
+             compacted_at_ms    INTEGER NOT NULL,
+             PRIMARY KEY(stream_id, device_fingerprint)
+         ) STRICT;",
+    )
+}
+
+/// V106 (#1127): re-adoption audit provenance for a compacted winner.
+///
+/// Re-adoption candidates derive from the merge state, which survives compaction; a winning entry
+/// below the retained floor is gone, so the audit records its slot by `(stream, device, lamport)`
+/// and stores NULL for the hash. Rebuilds the just-shipped V104 table — it holds only locally
+/// authored audit rows, copied verbatim.
+pub fn apply_readoption_audit_nullable_winner(conn: &Connection) -> rusqlite::Result<()> {
+    let already_nullable: bool = conn.query_row(
+        "SELECT NOT \"notnull\" FROM pragma_table_info('table_sync_readoption_audit')
+         WHERE name = 'original_entry_hash'",
+        [],
+        |row| row.get(0),
+    )?;
+    if already_nullable {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE table_sync_readoption_audit_v106(
+             audit_id INTEGER PRIMARY KEY,
+             account_id BLOB NOT NULL CHECK(length(account_id) = 32),
+             removed_fingerprint BLOB NOT NULL CHECK(length(removed_fingerprint) = 32),
+             adopter_fingerprint BLOB NOT NULL CHECK(length(adopter_fingerprint) = 32),
+             stream_id BLOB NOT NULL CHECK(length(stream_id) = 32),
+             repo_id TEXT NOT NULL,
+             scope_id TEXT NOT NULL,
+             table_name TEXT NOT NULL,
+             row_pk TEXT NOT NULL,
+             original_lamport INTEGER NOT NULL,
+             original_entry_hash BLOB CHECK(
+                 original_entry_hash IS NULL OR length(original_entry_hash) = 32
+             ),
+             adopted_entry_hash BLOB NOT NULL CHECK(length(adopted_entry_hash) = 32),
+             adopted_at_ms INTEGER NOT NULL
+         ) STRICT;
+         INSERT INTO table_sync_readoption_audit_v106
+         SELECT * FROM table_sync_readoption_audit;
+         DROP TABLE table_sync_readoption_audit;
+         ALTER TABLE table_sync_readoption_audit_v106
+             RENAME TO table_sync_readoption_audit;
+         CREATE INDEX IF NOT EXISTS table_sync_readoption_audit_stream
+             ON table_sync_readoption_audit(account_id, stream_id);",
+    )
+}
+
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
     let mut stmt =
         conn.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?;

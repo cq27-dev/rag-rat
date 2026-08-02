@@ -615,6 +615,13 @@ mod tests {
             ],
         )
         .unwrap();
+        // The retained floor bounds the same accepted log (#1127) and is swept with it.
+        conn.execute(
+            "INSERT INTO table_sync_retained_floors(stream_id, device_fingerprint, lamport, \
+             entry_hash, compacted_at_ms) VALUES (?1, ?2, 1, ?3, 0)",
+            params![stream_id, vec![seed; 32], vec![seed; 32]],
+        )
+        .unwrap();
         stream_id
     }
 
@@ -667,6 +674,7 @@ mod tests {
             ("table_sync_gapped_entries", "stream_id", blob_literal(stream_id)),
             ("table_sync_readoption_work", "stream_id", blob_literal(stream_id)),
             ("table_sync_readoption_audit", "stream_id", blob_literal(stream_id)),
+            ("table_sync_retained_floors", "stream_id", blob_literal(stream_id)),
         ];
         for (table, column, in_body) in checks {
             let count: i64 = conn

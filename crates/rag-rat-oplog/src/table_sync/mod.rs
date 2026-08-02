@@ -13,6 +13,7 @@ mod engine;
 mod produce;
 mod refold;
 mod registry;
+mod retention;
 mod row_op;
 mod schema_facts;
 mod scope_stream;

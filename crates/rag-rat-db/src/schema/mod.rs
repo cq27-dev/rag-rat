@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 104;
+pub const LATEST_SCHEMA_VERSION: u32 = 106;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -786,6 +786,18 @@ const MIGRATION_104_DESCRIPTION: &str =
     "Add the durable table-sync re-adoption worklist and audit log (#997): an effective \
      DeviceRemove enqueues one item per affected stream, which a current writer drains by \
      re-authoring the removed writer's surviving LWW state under its own chain";
+const MIGRATION_105_ID: &str = "105_table_sync_retained_floors";
+const MIGRATION_105_CHECKSUM: &str = "sha256:rag-rat-table-sync-retained-floors-v105";
+const MIGRATION_105_DESCRIPTION: &str = "Add table_sync_retained_floors (#1127): the per-(stream, \
+                                         device) chain prefix floor an accepted-entry compaction \
+                                         has reclaimed below, so peers and the accept path can \
+                                         tell an intentionally pruned prefix from a chain gap";
+const MIGRATION_106_ID: &str = "106_readoption_audit_nullable_winner";
+const MIGRATION_106_CHECKSUM: &str = "sha256:rag-rat-readoption-audit-nullable-winner-v106";
+const MIGRATION_106_DESCRIPTION: &str = "Make table_sync_readoption_audit.original_entry_hash \
+                                         nullable (#1127): a winner reclaimed by accepted-entry \
+                                         compaction before re-adoption ran has no hash to record; \
+                                         the slot stays named by (stream, device, lamport)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -999,6 +1011,7 @@ const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[
     MIGRATION_098_ID,
     MIGRATION_099_ID,
     MIGRATION_103_ID,
+    MIGRATION_106_ID,
 ];
 
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
@@ -1644,6 +1657,18 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_104_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_table_sync_readoption),
     },
+    Migration {
+        id: MIGRATION_105_ID,
+        checksum: MIGRATION_105_CHECKSUM,
+        description: MIGRATION_105_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_table_sync_retained_floors),
+    },
+    Migration {
+        id: MIGRATION_106_ID,
+        checksum: MIGRATION_106_CHECKSUM,
+        description: MIGRATION_106_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_readoption_audit_nullable_winner),
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -1870,6 +1895,7 @@ mod ledger_atomicity {
         MIGRATION_098_ID,
         MIGRATION_099_ID,
         MIGRATION_103_ID,
+        MIGRATION_106_ID,
     ];
 
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.

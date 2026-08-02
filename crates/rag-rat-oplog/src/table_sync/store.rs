@@ -354,6 +354,18 @@ pub(crate) fn accept_row_entry(
     if entry_exists(tx, &verified.entry_hash)? {
         return Ok(AcceptOutcome::AlreadyPresent);
     }
+    // Below the retained floor the prefix is INTENTIONALLY reclaimed (#1127): a redelivery of a
+    // compacted entry is idempotent, not an equivocation against the retained tail. The trade is
+    // explicit: below-floor FORK DETECTION is gone on compacted peers — an equivocation in the
+    // reclaimed region reports AlreadyPresent here while a non-compacted peer still classifies it
+    // as a fork. Accepted, because Fork is non-storing and a below-floor entry can never apply;
+    // the divergence costs evidence, never convergence (see the retention module docs).
+    if let Some(floor) =
+        super::retention::retained_floor(tx, expected_stream, verified.device_fingerprint)?
+        && verified.lamport < floor
+    {
+        return Ok(AcceptOutcome::AlreadyPresent);
+    }
     // Dedupe against the gapped table HERE, beside the accepted-entry check and BEFORE the
     // authority gate, so a redelivered gapped entry reports the same way whether or not its
     // device is still roster-effective — the dedup-precedence-over-authority ordering the
@@ -1021,10 +1033,11 @@ pub(crate) struct ReadoptionWork {
 pub(crate) struct ReadoptionCandidate {
     pub(crate) table_name: String,
     pub(crate) row_pk: String,
-    /// The removed writer's own entry coordinates — what the audit row's `original_*` columns
-    /// name. Carried alongside the hash so the audit joins back by `(lamport, hash)`.
+    /// The lamport the row's merge state crowns — what the audit's `original_lamport` names.
     pub(crate) original_lamport: u64,
-    pub(crate) entry_hash: [u8; 32],
+    /// The winning entry's hash, when that entry is still retained. `None` after accepted-entry
+    /// compaction reclaimed it (#1127): `(stream, device, lamport)` still names the slot.
+    pub(crate) entry_hash: Option<[u8; 32]>,
 }
 
 /// The provenance one re-adopted row carries into the audit log.
@@ -1038,7 +1051,9 @@ pub(crate) struct ReadoptionAudit {
     pub(crate) table_name: String,
     pub(crate) row_pk: String,
     pub(crate) original_lamport: u64,
-    pub(crate) original_entry_hash: [u8; 32],
+    /// The winning entry's hash, or `None` when compaction reclaimed it before re-adoption ran —
+    /// `(stream, removed, original_lamport)` still names the slot.
+    pub(crate) original_entry_hash: Option<[u8; 32]>,
     pub(crate) adopted_entry_hash: [u8; 32],
     pub(crate) adopted_at_ms: i64,
 }
@@ -1177,88 +1192,67 @@ pub(crate) fn has_pending_readoption_work(
     )? == 1)
 }
 
-/// Every row op the removed device authored on this stream, reduced to its row identity and
-/// provenance hash. This is the bounded candidate set the #997 redesign requires: the device's own
-/// accepted history, never a scan of every clock or deletion the merge tables have ever seen.
+/// Every row whose whole-row LWW winner is the removed device on this stream, with the winning
+/// entry's provenance when that entry is still retained.
+///
+/// Derived from the MERGE STATE (`sync_row_clocks` / `sync_row_tombstones`), not the entry log:
+/// the repair verdict reads the winner from those same tables, and they are the authoritative
+/// record that survives accepted-entry compaction (#1127). Enumerating `table_sync_entries`
+/// instead would silently shrink the candidate set after a compaction dropped the removed
+/// writer's prefix, completing the removal while compacted winners are never re-authored. Bounded
+/// by the device's surviving merge-state footprint — never a scan of unrelated rows.
 pub(crate) fn readoption_candidates(
     tx: &Transaction<'_>,
     stream: StreamId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<Vec<ReadoptionCandidate>> {
+    let device_hex = device_fingerprint.to_string();
     let mut stmt = tx.prepare(
-        "SELECT lamport, entry_hash, signed_bytes FROM table_sync_entries
-         WHERE stream_id = ?1 AND device_fingerprint = ?2
-         ORDER BY lamport",
+        "SELECT table_name, row_pk, MAX(lamport) FROM (
+             SELECT table_name, row_pk, lamport FROM sync_row_clocks
+              WHERE stream_id = ?1 AND device_fingerprint = ?2
+             UNION ALL
+             SELECT table_name, row_pk, lamport FROM sync_row_tombstones
+              WHERE stream_id = ?1 AND device_fingerprint = ?2
+         )
+         GROUP BY table_name, row_pk
+         ORDER BY MAX(lamport)",
     )?;
     let rows = stmt
-        .query_map(
-            params![stream.to_bytes().as_slice(), device_fingerprint.to_bytes().as_slice()],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)),
-        )?
+        .query_map(params![stream.to_bytes().as_slice(), device_hex], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut candidates = Vec::with_capacity(rows.len());
-    for (lamport, hash, signed_bytes) in rows {
-        let Ok(signed) = entry::decode_signed(&signed_bytes) else {
-            continue;
-        };
-        let op = match row_op::decode(&signed.entry.op_bytes) {
-            Ok(DecodedRowOp::Known(op)) => op,
-            // Retained but not understood here; its table/row identity cannot be established.
-            _ => continue,
-        };
+    for (table_name, row_pk, lamport) in rows {
+        // The winning entry may be below a compacted floor: the audit then records the slot by
+        // `(stream, device, lamport)` with no hash.
+        //
+        // Residual edge, accepted: this lookup does not re-verify the op's table/pk the way
+        // `stale_row_disposition` does, so after a scope move the coordinates could name a
+        // sibling table's entry and the audit would carry a wrong-but-plausible hash. The hash
+        // is provenance only — the repair verdict never consumes it — so the cost is a
+        // misleading audit row, not a wrong repair.
+        let entry_hash: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT entry_hash FROM table_sync_entries
+                 WHERE stream_id = ?1 AND device_fingerprint = ?2 AND lamport = ?3",
+                params![
+                    stream.to_bytes().as_slice(),
+                    device_fingerprint.to_bytes().as_slice(),
+                    lamport
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
         candidates.push(ReadoptionCandidate {
-            table_name: op.table().to_string(),
-            row_pk: row_op::row_pk_string(op.pk()),
+            table_name,
+            row_pk,
             original_lamport: u64::try_from(lamport)?,
-            entry_hash: fixed32(hash)?,
+            entry_hash: entry_hash.map(fixed32).transpose()?,
         });
     }
-    // One candidate per row, and it must be the entry the row's whole-row LWW clock points AT: the
-    // audit's `original_*` columns are provenance for the winning entry, so a later entry that was
-    // quarantined and never owned the clock must not be named. Rows arrive in lamport order, so
-    // the last per row is the fallback when the clock row is gone.
-    let mut by_row: std::collections::HashMap<(String, String), Vec<ReadoptionCandidate>> =
-        std::collections::HashMap::new();
-    for candidate in candidates {
-        by_row
-            .entry((candidate.table_name.clone(), candidate.row_pk.clone()))
-            .or_default()
-            .push(candidate);
-    }
-    let mut out = Vec::with_capacity(by_row.len());
-    for ((table_name, row_pk), entries) in by_row {
-        let winner = winner_lamport_for_row(tx, stream, &table_name, &row_pk)?;
-        let chosen = entries
-            .iter()
-            .find(|candidate| Some(candidate.original_lamport) == winner)
-            .or(entries.last())
-            .expect("one entry per grouped row");
-        out.push(chosen.clone());
-    }
-    out.sort_by_key(|candidate| candidate.original_lamport);
-    Ok(out)
-}
-
-/// The lamport the row's merge state currently crowns — the live clock when present and newer, the
-/// tombstone otherwise. `None` when the row has no merge state at all.
-fn winner_lamport_for_row(
-    tx: &Transaction<'_>,
-    stream: StreamId,
-    table_name: &str,
-    row_pk: &str,
-) -> anyhow::Result<Option<u64>> {
-    let mut stmt = tx.prepare(
-        "SELECT MAX(lamport) FROM (
-             SELECT lamport FROM sync_row_clocks
-              WHERE stream_id = ?1 AND table_name = ?2 AND row_pk = ?3
-             UNION ALL
-             SELECT lamport FROM sync_row_tombstones
-              WHERE stream_id = ?1 AND table_name = ?2 AND row_pk = ?3
-         )",
-    )?;
-    let highest: Option<i64> = stmt
-        .query_row(params![stream.to_bytes().as_slice(), table_name, row_pk], |row| row.get(0))?;
-    highest.map(u64::try_from).transpose().map_err(Into::into)
+    Ok(candidates)
 }
 
 /// Record one re-authored row operation with the removed writer's original entry as provenance.
@@ -1282,7 +1276,7 @@ pub(crate) fn record_readoption_audit(
             audit.table_name,
             audit.row_pk,
             i64::try_from(audit.original_lamport)?,
-            audit.original_entry_hash.as_slice(),
+            audit.original_entry_hash.as_ref().map(<[u8; 32]>::as_slice),
             audit.adopted_entry_hash.as_slice(),
             audit.adopted_at_ms,
         ],
@@ -1572,7 +1566,7 @@ mod tests {
             table_name: "t".to_string(),
             row_pk: "aa".to_string(),
             original_lamport: 7,
-            original_entry_hash: [1; 32],
+            original_entry_hash: Some([1; 32]),
             adopted_entry_hash: [2; 32],
             adopted_at_ms: 42,
         })
