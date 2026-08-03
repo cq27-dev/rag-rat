@@ -23,7 +23,8 @@
 //! the peer can never link, and the receiver adopts the floor as its new root on exact coordinate
 //! match. The old prefix stays stored (projections are unaffected), the tail advances, and
 //! below-floor re-offers read idempotent. A peer forked AT the floor lamport gets ordinary fork
-//! classification, same as at any other tip.
+//! classification, same as at any other tip. Re-rooting also discards fork evidence in a receiver's
+//! divergent below-floor prefix, even when that receiver had not compacted it.
 //!
 //! Two accepted horizons, named rather than hidden:
 //!
@@ -36,11 +37,11 @@
 //!   a spec bump and the next producer pass, the refold reads the same `Unknown` as a possible
 //!   unsent edit and defers replay over those rows — the safe direction, and worth knowing when
 //!   diagnosing a deferred entry after an upgrade.
-//! - **Below-floor equivocations are undetectable on compacted peers.** The accept path answers
-//!   `AlreadyPresent` for any entry below the floor, so a compacted peer discards fork evidence a
-//!   non-compacted peer would still classify. Accepted: `Fork` is non-storing and a below-floor
-//!   entry can never apply, so the divergence costs evidence, never convergence — and evidence loss
-//!   is the price of reclaiming the region the evidence would describe.
+//! - **Below-floor equivocations are undetectable after a floor is recorded.** The accept path
+//!   answers `AlreadyPresent` for any entry below the floor, so the peer discards fork evidence a
+//!   peer without that floor would still classify. Accepted: `Fork` is non-storing and a
+//!   below-floor entry can never apply, so the divergence costs evidence, never convergence — and
+//!   evidence loss is the price of reclaiming the region the evidence would describe.
 
 use rusqlite::{OptionalExtension, Transaction, params};
 

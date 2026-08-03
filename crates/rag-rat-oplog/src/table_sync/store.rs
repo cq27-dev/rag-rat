@@ -358,37 +358,15 @@ pub(crate) fn accept_row_entry(
     }
     // Below the retained floor the prefix is INTENTIONALLY reclaimed (#1127): a redelivery of a
     // compacted entry is idempotent, not an equivocation against the retained tail. The trade is
-    // explicit: below-floor FORK DETECTION is gone on compacted peers — an equivocation in the
-    // reclaimed region reports AlreadyPresent here while a non-compacted peer still classifies it
-    // as a fork. Accepted, because Fork is non-storing and a below-floor entry can never apply;
-    // the divergence costs evidence, never convergence (see the retention module docs).
+    // explicit: below-floor FORK DETECTION is gone once a peer records a floor, whether by local
+    // compaction or re-rooting — an equivocation in the reclaimed region reports AlreadyPresent.
+    // Accepted, because Fork is non-storing and a below-floor entry can never apply; the divergence
+    // costs evidence, never convergence (see the retention module docs).
     if let Some(floor) =
         super::retention::retained_floor(tx, expected_stream, verified.device_fingerprint)?
         && verified.lamport < floor
     {
         return Ok(AcceptOutcome::AlreadyPresent);
-    }
-    // Dedupe against the gapped table HERE, beside the accepted-entry check and BEFORE the
-    // authority gate, so a redelivered gapped entry reports the same way whether or not its
-    // device is still roster-effective — the dedup-precedence-over-authority ordering the
-    // accepted path already has. In the `Gap` arm below instead, a removed device's redelivery
-    // would report `Unauthorized`.
-    if gapped_entry_exists(tx, &verified.entry_hash)? {
-        // An exactly-matching floor entry parked in the gapped table can never promote — its
-        // predecessor was compacted away (rolling upgrade parked it, or ordinary reordering) —
-        // so a plain AlreadyGapped would deadlock the re-root this slice exists to provide.
-        // Take the parked copy out and let the adoption path accept the entry.
-        let adoptable_floor_root =
-            advertised_floor.is_some_and(|floor| {
-                verified.lamport == floor.lamport && verified.entry_hash == floor.entry_hash
-            }) && chain_tail(tx, expected_stream, verified.device_fingerprint)?
-                .is_none_or(|(tip, _)| verified.lamport > tip);
-        if !adoptable_floor_root {
-            return Ok(AcceptOutcome::AlreadyGapped);
-        }
-        tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
-            verified.entry_hash.as_slice()
-        ])?;
     }
     // Authority gate (#935): the signing device must be a roster-effective WRITER of the account.
     // Placed AFTER `entry_exists` so an entry stored while the device WAS a writer still reports
@@ -407,7 +385,26 @@ pub(crate) fn accept_row_entry(
     if !device_is_effective_writer(tx, account_id, verified.device_fingerprint)? {
         return Ok(AcceptOutcome::Unauthorized);
     }
-    let (fit, _tail_lamport) = classify(tx, expected_stream, &verified, advertised_floor)?;
+    // Unlike accepted-entry deduplication, adopting a parked floor mutates storage. Keep it after
+    // the authority gate so a removed writer cannot delete a retained gapped row on redelivery.
+    if gapped_entry_exists(tx, &verified.entry_hash)? {
+        // An exactly-matching floor entry parked in the gapped table can never promote — its
+        // predecessor was compacted away (rolling upgrade parked it, or ordinary reordering) —
+        // so a plain AlreadyGapped would deadlock the re-root this slice exists to provide.
+        // Take the parked copy out and let the adoption path accept the entry.
+        let adoptable_floor_root =
+            advertised_floor.is_some_and(|floor| {
+                verified.lamport == floor.lamport && verified.entry_hash == floor.entry_hash
+            }) && chain_tail(tx, expected_stream, verified.device_fingerprint)?
+                .is_none_or(|(tip, _)| verified.lamport > tip);
+        if !adoptable_floor_root {
+            return Ok(AcceptOutcome::AlreadyGapped);
+        }
+        tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
+            verified.entry_hash.as_slice()
+        ])?;
+    }
+    let fit = classify(tx, expected_stream, &verified, advertised_floor)?;
     if let (ChainFit::RootAdopt, Some(floor)) = (fit, advertised_floor) {
         super::retention::record_adopted_floor(
             tx,
@@ -490,7 +487,7 @@ fn classify(
     stream: StreamId,
     verified: &VerifiedEntry,
     advertised_floor: Option<AdvertisedFloor>,
-) -> anyhow::Result<(ChainFit, Option<u64>)> {
+) -> anyhow::Result<ChainFit> {
     let tail = chain_tail(tx, stream, verified.device_fingerprint)?;
     let tail_lamport = tail.map(|(lamport, _)| lamport);
     let witness =
@@ -514,7 +511,7 @@ fn classify(
                     && floor.lamport <= witness_lamport
             });
             if !regresses_witness {
-                return Ok((ChainFit::RootAdopt, tail_lamport));
+                return Ok(ChainFit::RootAdopt);
             }
         } else if tail_lamport.is_some_and(|tip| floor.lamport > tip) {
             // Re-root (#1127): the chain's accepted tip fell below the advertised floor — the
@@ -522,23 +519,20 @@ fn classify(
             // floor as the new root is the recovery the retention docs name: the old prefix
             // stays stored (projections are unaffected), the tail advances, and below-floor
             // re-offers read idempotent from here on.
-            return Ok((ChainFit::RootAdopt, tail_lamport));
+            return Ok(ChainFit::RootAdopt);
         }
     }
     if let Some((witness_lamport, witness_hash)) = witness {
         if verified.entry_hash == witness_hash && verified.lamport == witness_lamport {
-            return Ok((ChainFit::Restore, tail_lamport));
+            return Ok(ChainFit::Restore);
         }
-        return Ok((
-            match verified.prev_hash {
-                Some(prev) if prev == witness_hash && verified.lamport > witness_lamport =>
-                    ChainFit::Ok,
-                None => ChainFit::Conflict,
-                Some(_) if verified.lamport <= witness_lamport => ChainFit::Conflict,
-                Some(_) => ChainFit::Gap,
-            },
-            tail_lamport,
-        ));
+        return Ok(match verified.prev_hash {
+            Some(prev) if prev == witness_hash && verified.lamport > witness_lamport =>
+                ChainFit::Ok,
+            None => ChainFit::Conflict,
+            Some(_) if verified.lamport <= witness_lamport => ChainFit::Conflict,
+            Some(_) => ChainFit::Gap,
+        });
     }
     let fit = match (verified.prev_hash, tail) {
         // A genesis (no predecessor) is the valid first entry of this device's chain; a genesis
@@ -572,7 +566,7 @@ fn classify(
                 ChainFit::Gap // links to an UNKNOWN predecessor — a genuine missing intermediate.
             },
     };
-    Ok((fit, tail_lamport))
+    Ok(fit)
 }
 
 /// The `(stream, device)` chain's highest-lamport `(lamport, entry_hash)`, or `None` for an empty
@@ -2623,6 +2617,51 @@ mod tests {
         remove_from_roster(&b, account(), secret.public().fingerprint());
         let tx = b.transaction().unwrap();
         assert_eq!(accept(&tx, account(), &signed, &secret.public()), AcceptOutcome::Unauthorized);
+    }
+
+    #[test]
+    fn an_unauthorized_floor_redelivery_keeps_its_gapped_copy() {
+        let secret = DeviceSecret::from_seed(&[1; 32]); // conn() enrolls it as owner
+        let signed = signed_row(&secret, "r1");
+        let mut b = conn();
+        b.execute(
+            "INSERT INTO table_sync_gapped_entries(
+                 entry_hash, stream_id, device_fingerprint, lamport, prev_hash, signed_bytes,
+                 gapped_at_ms
+             ) VALUES (?1, ?2, ?3, 0, ?4, ?5, 0)",
+            params![
+                signed.entry.entry_hash.as_slice(),
+                stream().to_bytes().as_slice(),
+                secret.public().fingerprint().to_bytes().as_slice(),
+                [0u8; 32].as_slice(),
+                signed.signed_bytes.as_slice(),
+            ],
+        )
+        .unwrap();
+        remove_from_roster(&b, account(), secret.public().fingerprint());
+
+        let tx = b.transaction().unwrap();
+        assert_eq!(
+            accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t"],
+                &signed.signed_bytes,
+                &secret.public(),
+                0,
+                Some(AdvertisedFloor {
+                    lamport: signed.entry.lamport,
+                    entry_hash: signed.entry.entry_hash,
+                }),
+            )
+            .unwrap(),
+            AcceptOutcome::Unauthorized,
+        );
+        let held: i64 = tx
+            .query_row("SELECT COUNT(*) FROM table_sync_gapped_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(held, 1, "authority rejection does not delete the parked floor");
     }
 
     #[test]
