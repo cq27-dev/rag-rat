@@ -43,6 +43,7 @@ pub trait TableSyncStore {
         item: &ManifestItem,
         expected_device: Hash,
         signed_bytes: &[u8],
+        advertised_floor: Option<(u64, Hash)>,
     ) -> anyhow::Result<Ingested>;
 }
 
@@ -481,9 +482,13 @@ where
                                         limits.entries_per_session
                                     )));
                                 }
+                                let floor = chains
+                                    .iter()
+                                    .find(|chain| chain.device_fingerprint == device_fingerprint)
+                                    .and_then(|chain| chain.floor);
                                 for bytes in entries {
                                     if store
-                                        .ingest(item, device_fingerprint, &bytes)
+                                        .ingest(item, device_fingerprint, &bytes, floor)
                                         .map_err(TableSessionError::Store)?
                                         == Ingested::Stored
                                     {
@@ -719,6 +724,7 @@ mod tests {
                 .filter(|(device, _)| after_device.is_none_or(|after| *device > after))
                 .take(limit)
                 .map(|(device, (lamport, entry_hash))| ChainHead {
+                    floor: None,
                     device_fingerprint: device,
                     lamport,
                     entry_hash,
@@ -798,6 +804,7 @@ mod tests {
             item: &ManifestItem,
             expected_device: Hash,
             bytes: &[u8],
+            _advertised_floor: Option<(u64, Hash)>,
         ) -> anyhow::Result<Ingested> {
             if !self.supported.contains(item) {
                 return Ok(Ingested::NoChange);
@@ -1009,7 +1016,8 @@ mod tests {
 
     #[test]
     fn peer_frontiers_must_be_provable_prefixes_and_restore_debt_stays_pending() {
-        let local = ChainHead { device_fingerprint: [1; 32], lamport: 3, entry_hash: [3; 32] };
+        let local =
+            ChainHead { device_fingerprint: [1; 32], lamport: 3, entry_hash: [3; 32], floor: None };
         assert!(matches!(
             chain_plan(&local, FrontierState::Accepted { lamport: 3, entry_hash: [4; 32] }),
             Err(TableSessionError::Protocol(_))
@@ -1081,6 +1089,7 @@ mod tests {
                             device_fingerprint: [*device; 32],
                             lamport: 0,
                             entry_hash: [*device; 32],
+                            floor: None,
                         }],
                     })
                     .await
@@ -1102,6 +1111,7 @@ mod tests {
                         device_fingerprint: [device; 32],
                         lamport: 0,
                         entry_hash: [device; 32],
+                        floor: None,
                     }],
                 })
                 .await
@@ -1137,6 +1147,7 @@ mod tests {
                     device_fingerprint: [1; 32],
                     lamport: 0,
                     entry_hash: [1; 32],
+                    floor: None,
                 }],
             })
             .await

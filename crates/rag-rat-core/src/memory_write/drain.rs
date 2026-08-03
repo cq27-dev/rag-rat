@@ -1826,6 +1826,7 @@ mod tests {
                 head.device_fingerprint,
                 &entry.signed_bytes,
                 3,
+                None,
             )
             .unwrap();
         }

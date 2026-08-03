@@ -11,10 +11,11 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use super::engine::{self, IngestOutcome, SyncCtx};
 use super::registry::{SYNCABLE_TABLES, TableSpec};
 use super::scope_stream::scope_stream_id;
-use super::store;
+use super::{retention, store};
 use crate::AccountId;
 use crate::account::{self, RepoIncarnationState};
 use crate::device::DevicePublic;
+use crate::stream::StreamId;
 
 /// One locally-supported repo-scoped table stream.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -38,6 +39,10 @@ pub struct TableSyncChainHead {
     pub device_fingerprint: [u8; 32],
     pub lamport: u64,
     pub entry_hash: [u8; 32],
+    /// The retained floor this chain was compacted below, if any (#1127). Routing advice only:
+    /// a receiver with no local chain may accept the floor entry as its local root; a receiver
+    /// with chain state ignores it entirely.
+    pub floor: Option<(u64, [u8; 32])>,
 }
 
 /// Durable receiver progress for one offered device chain.
@@ -146,6 +151,106 @@ pub fn table_sync_author_pending(
     Ok(authored)
 }
 
+/// Compact accepted chain prefixes for scopes whose retention policy bounds them (#1127).
+///
+/// `retain` answers the per-chain accepted-entry budget for a scope, `None` for full retention
+/// (anchors/1 stays unbounded). A chain with more RECLAIMABLE entries than its budget compacts to
+/// keep its newest; chains within budget are untouched. Entries retained for forward-compat
+/// replay (`pending_reason IS NOT NULL`) are neither counted nor dropped — a chain pinned above
+/// budget by pending entries makes the computed floor not advance, which is a steady-state no-op,
+/// never an error, so the driver is safely re-runnable on any cadence. Each stream compacts in
+/// its own IMMEDIATE transaction, and the caller's authoring pass already ran, so a winner
+/// restamp never disowns an unsent local edit (see the retention module docs).
+///
+/// Returns the number of accepted entries reclaimed.
+pub fn table_sync_compact_overdue(
+    conn: &Connection,
+    account_id: AccountId,
+    now_ms: i64,
+    retain: &dyn Fn(&str) -> Option<u64>,
+) -> anyhow::Result<usize> {
+    let streams = supported_streams_against(conn, account_id, SYNCABLE_TABLES)?;
+    let registry = repo_registry(SYNCABLE_TABLES);
+    let mut compacted = 0;
+    for stream in streams {
+        let Some(keep) = retain(&stream.scope_id) else {
+            continue;
+        };
+        anyhow::ensure!(keep >= 1, "a retention budget of zero keeps no chain tail to build on");
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let chains = {
+            let mut stmt = tx.prepare(
+                "SELECT device_fingerprint, COUNT(*) FROM table_sync_entries
+                 WHERE stream_id = ?1 AND pending_reason IS NULL
+                 GROUP BY device_fingerprint",
+            )?;
+            stmt.query_map([stream.stream_id.as_slice()], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (device_bytes, count) in chains {
+            let count = u64::try_from(count)?;
+            if count <= keep {
+                continue;
+            }
+            // The floor is the oldest RECLAIMABLE entry to retain: the one at offset
+            // (count - keep) in lamport order. compact_chain_prefix drops strictly below it.
+            let floor_lamport: i64 = tx.query_row(
+                "SELECT lamport FROM table_sync_entries
+                 WHERE stream_id = ?1 AND device_fingerprint = ?2 AND pending_reason IS NULL
+                 ORDER BY lamport LIMIT 1 OFFSET ?3",
+                params![
+                    stream.stream_id.as_slice(),
+                    device_bytes.as_slice(),
+                    i64::try_from(count - keep)?
+                ],
+                |row| row.get(0),
+            )?;
+            let floor_lamport = u64::try_from(floor_lamport)?;
+            let device = crate::op::DeviceFingerprint::from_bytes(fixed32(device_bytes)?);
+            // A pending entry below the computed floor would survive locally yet become
+            // unreachable to floor-adopting peers (served early it parks and is swept; served
+            // late it reads as already-present) — silent loss of the forward-compat payload it
+            // exists to retain. Clamp the floor at the lowest pending lamport, so every pending
+            // entry sits AT or above the floor and stays offerable.
+            let lowest_pending: Option<i64> = tx
+                .query_row(
+                    "SELECT MIN(lamport) FROM table_sync_entries
+                     WHERE stream_id = ?1 AND device_fingerprint = ?2
+                       AND pending_reason IS NOT NULL",
+                    params![stream.stream_id.as_slice(), device.to_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let floor_lamport = match lowest_pending {
+                Some(pending) if (pending as u64) < floor_lamport => pending as u64,
+                _ => floor_lamport,
+            };
+            // A chain pinned by pending entries (or simply already compacted past this point)
+            // computes a floor that does not advance: steady state, not the caller bug
+            // compact_chain_prefix's refusal exists to catch.
+            if retention::retained_floor(&tx, StreamId::from_bytes(stream.stream_id), device)?
+                .is_some_and(|current| floor_lamport <= current)
+            {
+                continue;
+            }
+            let report = retention::compact_chain_prefix(
+                &tx,
+                StreamId::from_bytes(stream.stream_id),
+                device,
+                floor_lamport,
+                &registry,
+                now_ms,
+            )?;
+            compacted += report.dropped_entries;
+        }
+        tx.commit()?;
+    }
+    Ok(compacted)
+}
+
 /// Recompute an advertised route from local current-incarnation authority and the production
 /// registry. The advertised stream id is routing advice only; it never creates authority.
 pub fn table_sync_validate_stream(
@@ -207,8 +312,18 @@ pub fn table_sync_ingest(
     expected_device: [u8; 32],
     signed_bytes: &[u8],
     now_ms: i64,
+    advertised_floor: Option<(u64, [u8; 32])>,
 ) -> anyhow::Result<TableSyncIngestOutcome> {
-    ingest_against(conn, account_id, stream, expected_device, signed_bytes, now_ms, SYNCABLE_TABLES)
+    ingest_against(
+        conn,
+        account_id,
+        stream,
+        expected_device,
+        signed_bytes,
+        now_ms,
+        advertised_floor,
+        SYNCABLE_TABLES,
+    )
 }
 
 fn repo_registry(registry: &[TableSpec]) -> Vec<TableSpec> {
@@ -283,8 +398,11 @@ fn accepted_chain_page(
     limit: usize,
 ) -> anyhow::Result<Vec<TableSyncChainHead>> {
     let mut stmt = conn.prepare(
-        "SELECT e.device_fingerprint, e.lamport, e.entry_hash
+        "SELECT e.device_fingerprint, e.lamport, e.entry_hash, f.lamport, f.entry_hash
            FROM table_sync_entries e
+           LEFT JOIN table_sync_retained_floors f
+             ON f.stream_id = e.stream_id
+            AND f.device_fingerprint = e.device_fingerprint
           WHERE e.stream_id = ?1
             AND (?2 IS NULL OR e.device_fingerprint > ?2)
             AND NOT EXISTS (
@@ -302,14 +420,31 @@ fn accepted_chain_page(
             after_device.map(|device| device.to_vec()),
             i64::try_from(limit)?,
         ],
-        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+            ))
+        },
     )?
     .map(|row| {
-        let (device, lamport, hash) = row?;
+        let (device, lamport, hash, floor_lamport, floor_hash) = row?;
+        let floor = floor_lamport
+            .map(|l| -> anyhow::Result<_> {
+                Ok((
+                    u64::try_from(l)?,
+                    fixed32(floor_hash.expect("floor row carries its entry hash"))?,
+                ))
+            })
+            .transpose()?;
         Ok(TableSyncChainHead {
             device_fingerprint: fixed32(device)?,
             lamport: u64::try_from(lamport)?,
             entry_hash: fixed32(hash)?,
+            floor,
         })
     })
     .collect::<anyhow::Result<_>>()
@@ -484,6 +619,7 @@ fn fixed32(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_against(
     conn: &Connection,
     account_id: AccountId,
@@ -491,6 +627,7 @@ fn ingest_against(
     expected_device: [u8; 32],
     signed_bytes: &[u8],
     now_ms: i64,
+    advertised_floor: Option<(u64, [u8; 32])>,
     registry: &[TableSpec],
 ) -> anyhow::Result<TableSyncIngestOutcome> {
     if !validate_stream_against(conn, account_id, stream, registry)? {
@@ -529,7 +666,15 @@ fn ingest_against(
         registry: &registry,
         now_ms,
     };
-    let report = engine::ingest(&tx, &ctx, &stream.scope_id, signed_bytes, &pubkey)?;
+    let report = engine::ingest(
+        &tx,
+        &ctx,
+        &stream.scope_id,
+        signed_bytes,
+        &pubkey,
+        advertised_floor
+            .map(|(lamport, entry_hash)| store::AdvertisedFloor { lamport, entry_hash }),
+    )?;
     if registry.iter().any(|spec| spec.name == "repo_memory_bindings")
         && std::iter::once(&report.outcome)
             .chain(report.promoted.iter())
@@ -633,7 +778,8 @@ mod tests {
         for route in [&stale, &unknown, &forged] {
             assert!(!validate_stream_against(&conn, account(), route, &[REPO_SPEC]).unwrap());
             assert_eq!(
-                ingest_against(&conn, account(), route, [0; 32], &[0], 0, &[REPO_SPEC]).unwrap(),
+                ingest_against(&conn, account(), route, [0; 32], &[0], 0, None, &[REPO_SPEC])
+                    .unwrap(),
                 TableSyncIngestOutcome::NoChange,
             );
         }
@@ -655,6 +801,122 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "invalid routes write no rows to {table}");
         }
+    }
+
+    #[test]
+    fn the_compaction_driver_is_idempotent_past_pending_entries() {
+        let conn = database();
+        let stream = supported_streams_against(&conn, account(), &[REPO_SPEC]).unwrap().remove(0);
+        conn.execute(
+            "INSERT INTO table_sync_streams(stream_id, repo_id, account_id, incarnation_ref, \
+             scope_id) VALUES (?1, 'repo-a', ?2, ?3, 'anchors/1')",
+            params![
+                stream.stream_id.as_slice(),
+                account().to_bytes().as_slice(),
+                INCARNATION.as_slice()
+            ],
+        )
+        .unwrap();
+        for lamport in 0..5i64 {
+            conn.execute(
+                "INSERT INTO table_sync_entries(
+                     entry_hash, stream_id, device_fingerprint, lamport, signed_bytes,
+                     received_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, x'00', 0)",
+                params![
+                    [(lamport + 1) as u8; 32].as_slice(),
+                    stream.stream_id.as_slice(),
+                    [2u8; 32].as_slice(),
+                    lamport
+                ],
+            )
+            .unwrap();
+        }
+        // The tip carries a pending mark: reclaimable entries pin below it.
+        conn.execute(
+            "UPDATE table_sync_entries SET pending_reason = 'unknown_column' WHERE lamport = 4",
+            [],
+        )
+        .unwrap();
+
+        let keep_one = &|_scope: &str| Some(1);
+        let first = table_sync_compact_overdue(&conn, account(), 1, keep_one).unwrap();
+        assert_eq!(first, 3, "reclaimable entries 0..3 drop; the pending tip survives");
+        let floor: Option<i64> = conn
+            .query_row("SELECT lamport FROM table_sync_retained_floors", [], |row| row.get(0))
+            .ok();
+        assert_eq!(floor, Some(3));
+
+        let second = table_sync_compact_overdue(&conn, account(), 2, keep_one).unwrap();
+        assert_eq!(second, 0, "a chain pinned by its pending tip computes a non-advancing floor");
+        let remaining: Vec<i64> = conn
+            .prepare("SELECT lamport FROM table_sync_entries ORDER BY lamport")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining, vec![3, 4], "nothing moves on the second pass");
+
+        let zero = &|_scope: &str| Some(0);
+        assert!(
+            table_sync_compact_overdue(&conn, account(), 3, zero).is_err(),
+            "a zero budget would drop the chain tail itself — refused"
+        );
+    }
+
+    /// A pending entry below the computed floor would survive locally yet be unreachable to
+    /// floor-adopting peers; the driver clamps the floor at the lowest pending lamport.
+    #[test]
+    fn the_compaction_driver_clamps_the_floor_above_pending_entries() {
+        let conn = database();
+        let stream = supported_streams_against(&conn, account(), &[REPO_SPEC]).unwrap().remove(0);
+        conn.execute(
+            "INSERT INTO table_sync_streams(stream_id, repo_id, account_id, incarnation_ref, \
+             scope_id) VALUES (?1, 'repo-a', ?2, ?3, 'anchors/1')",
+            params![
+                stream.stream_id.as_slice(),
+                account().to_bytes().as_slice(),
+                INCARNATION.as_slice()
+            ],
+        )
+        .unwrap();
+        for lamport in 0..5i64 {
+            conn.execute(
+                "INSERT INTO table_sync_entries(
+                     entry_hash, stream_id, device_fingerprint, lamport, signed_bytes,
+                     received_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, x'00', 0)",
+                params![
+                    [(lamport + 1) as u8; 32].as_slice(),
+                    stream.stream_id.as_slice(),
+                    [2u8; 32].as_slice(),
+                    lamport
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE table_sync_entries SET pending_reason = 'unknown_column' WHERE lamport = 1",
+            [],
+        )
+        .unwrap();
+
+        let keep_two = &|_scope: &str| Some(2);
+        let compacted = table_sync_compact_overdue(&conn, account(), 1, keep_two).unwrap();
+        assert_eq!(compacted, 1, "only the genesis drops: the floor clamps at the pending entry");
+        let floor: Option<i64> = conn
+            .query_row("SELECT lamport FROM table_sync_retained_floors", [], |row| row.get(0))
+            .ok();
+        assert_eq!(floor, Some(1), "the pending entry sits AT the floor and stays offerable");
+        let remaining: Vec<i64> = conn
+            .prepare("SELECT lamport FROM table_sync_entries ORDER BY lamport")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining, vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -734,6 +996,7 @@ mod tests {
             device_fingerprint: [2; 32],
             lamport: 3,
             entry_hash: [13; 32],
+            floor: None,
         }]);
         let second = accepted_chain_page(&conn, stream.stream_id, Some([2; 32]), 1).unwrap();
         assert_eq!(second[0].device_fingerprint, [4; 32]);
@@ -928,6 +1191,7 @@ mod tests {
                     heads[0].device_fingerprint,
                     &entry.signed_bytes,
                     3,
+                    None,
                 )
                 .unwrap();
             }
@@ -1118,18 +1382,24 @@ mod tests {
 
         let destination = restore(false);
         assert_eq!(
-            ingest_against(&destination, account, &route, [0; 32], &authored[0], 1, &[REPO_SPEC],)
-                .unwrap(),
+            ingest_against(&destination, account, &route, [0; 32], &authored[0], 1, None, &[
+                REPO_SPEC
+            ])
+            .unwrap(),
             TableSyncIngestOutcome::NoChange,
         );
         assert_eq!(
-            ingest_against(&destination, account, &route, author, &authored[0], 1, &[REPO_SPEC],)
-                .unwrap(),
+            ingest_against(&destination, account, &route, author, &authored[0], 1, None, &[
+                REPO_SPEC
+            ])
+            .unwrap(),
             TableSyncIngestOutcome::Stored,
         );
         assert_eq!(
-            ingest_against(&destination, account, &route, author, &authored[0], 2, &[REPO_SPEC],)
-                .unwrap(),
+            ingest_against(&destination, account, &route, author, &authored[0], 2, None, &[
+                REPO_SPEC
+            ])
+            .unwrap(),
             TableSyncIngestOutcome::NoChange,
         );
         let title: String = destination
@@ -1143,7 +1413,7 @@ mod tests {
 
         let removed = restore(true);
         assert_eq!(
-            ingest_against(&removed, account, &route, author, &authored[0], 1, &[REPO_SPEC],)
+            ingest_against(&removed, account, &route, author, &authored[0], 1, None, &[REPO_SPEC])
                 .unwrap(),
             TableSyncIngestOutcome::NoChange,
         );

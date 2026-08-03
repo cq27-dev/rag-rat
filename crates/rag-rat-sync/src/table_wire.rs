@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use minicbor::{Decoder, Encoder};
 
 /// Dedicated ALPN for table-stream sync. Existing account/content/enrollment ALPNs do not move.
-pub const TABLE_SYNC_ALPN: &[u8] = b"rag-rat/table-sync/2";
+pub const TABLE_SYNC_ALPN: &[u8] = b"rag-rat/table-sync/3";
 
-const FRAME_DOMAIN: &str = "rag-rat/table-sync-frame/2";
+const FRAME_DOMAIN: &str = "rag-rat/table-sync-frame/3";
 pub const MAX_MANIFEST_ITEMS: usize = 1024;
 pub const MAX_REPO_ID_BYTES: usize = 1024;
 pub const MAX_SCOPE_ID_BYTES: usize = 128;
@@ -73,6 +73,9 @@ pub struct ChainHead {
     pub device_fingerprint: Hash,
     pub lamport: u64,
     pub entry_hash: Hash,
+    /// The retained floor the sender compacted this chain below, if any (#1127). Routing advice:
+    /// a receiver with no local chain may accept the floor entry as its local root.
+    pub floor: Option<(u64, Hash)>,
 }
 
 /// Durable receiver progress for one offered device chain.
@@ -155,10 +158,20 @@ impl TableFrame {
                 enc.bytes(stream_id).expect(INFALLIBLE);
                 enc.array(chains.len() as u64).expect(INFALLIBLE);
                 for chain in chains {
-                    enc.array(3).expect(INFALLIBLE);
+                    enc.array(4).expect(INFALLIBLE);
                     enc.bytes(&chain.device_fingerprint).expect(INFALLIBLE);
                     enc.u64(chain.lamport).expect(INFALLIBLE);
                     enc.bytes(&chain.entry_hash).expect(INFALLIBLE);
+                    match chain.floor {
+                        None => {
+                            enc.null().expect(INFALLIBLE);
+                        },
+                        Some((lamport, hash)) => {
+                            enc.array(2).expect(INFALLIBLE);
+                            enc.u64(lamport).expect(INFALLIBLE);
+                            enc.bytes(&hash).expect(INFALLIBLE);
+                        },
+                    }
                 }
             },
             Self::ChainFrontiers { stream_id, frontiers } => {
@@ -262,14 +275,28 @@ impl TableFrame {
                 }
                 let mut chains = Vec::with_capacity(count);
                 for _ in 0..count {
-                    if dec.array().map_err(m)? != Some(3) {
+                    if dec.array().map_err(m)? != Some(4) {
                         return Err(TableWireError::Malformed("chain head arity".into()));
                     }
-                    chains.push(ChainHead {
-                        device_fingerprint: fixed32(dec.bytes().map_err(m)?, "device_fingerprint")?,
-                        lamport: dec.u64().map_err(m)?,
-                        entry_hash: fixed32(dec.bytes().map_err(m)?, "entry_hash")?,
-                    });
+                    let device_fingerprint =
+                        fixed32(dec.bytes().map_err(m)?, "device_fingerprint")?;
+                    let lamport = dec.u64().map_err(m)?;
+                    let entry_hash = fixed32(dec.bytes().map_err(m)?, "entry_hash")?;
+                    let floor = match dec.datatype().map_err(m)? {
+                        minicbor::data::Type::Null => {
+                            dec.null().map_err(m)?;
+                            None
+                        },
+                        _ => {
+                            if dec.array().map_err(m)? != Some(2) {
+                                return Err(TableWireError::Malformed("chain floor arity".into()));
+                            }
+                            let floor_lamport = dec.u64().map_err(m)?;
+                            let floor_hash = fixed32(dec.bytes().map_err(m)?, "floor_hash")?;
+                            Some((floor_lamport, floor_hash))
+                        },
+                    };
+                    chains.push(ChainHead { device_fingerprint, lamport, entry_hash, floor });
                 }
                 validate_devices(chains.iter().map(|chain| chain.device_fingerprint))?;
                 Self::ChainInventory { stream_id, chains }
@@ -445,7 +472,7 @@ mod tests {
     }
 
     fn head(device: u8, lamport: u64, hash: u8) -> ChainHead {
-        ChainHead { device_fingerprint: [device; 32], lamport, entry_hash: [hash; 32] }
+        ChainHead { device_fingerprint: [device; 32], lamport, entry_hash: [hash; 32], floor: None }
     }
 
     #[test]
@@ -489,9 +516,9 @@ mod tests {
         assert_eq!(TableFrame::Done.encode(), [
             0x82, 0x78, 0x1a, b'r', b'a', b'g', b'-', b'r', b'a', b't', b'/', b't', b'a', b'b',
             b'l', b'e', b'-', b's', b'y', b'n', b'c', b'-', b'f', b'r', b'a', b'm', b'e', b'/',
-            b'2', 0x06,
+            b'3', 0x06,
         ]);
-        assert_eq!(TABLE_SYNC_ALPN, b"rag-rat/table-sync/2");
+        assert_eq!(TABLE_SYNC_ALPN, b"rag-rat/table-sync/3");
     }
 
     #[test]
@@ -525,8 +552,8 @@ mod tests {
             golden.extend_from_slice(&bytes);
         }
         assert_eq!(Sha256::digest(golden).as_slice(), &[
-            207, 130, 172, 222, 118, 237, 28, 115, 145, 245, 148, 105, 68, 107, 217, 78, 66, 164,
-            248, 205, 81, 83, 160, 84, 91, 124, 119, 163, 184, 98, 21, 236,
+            82, 135, 194, 249, 15, 17, 225, 24, 26, 241, 90, 71, 188, 230, 43, 81, 125, 48, 242,
+            27, 111, 243, 22, 141, 194, 9, 179, 63, 231, 202, 135, 31,
         ]);
     }
 

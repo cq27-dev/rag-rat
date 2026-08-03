@@ -1149,6 +1149,7 @@ mod tests {
                     device_fingerprint: device,
                     lamport: 0,
                     entry_hash: device,
+                    floor: None,
                 })
                 .collect())
         }
@@ -1212,6 +1213,7 @@ mod tests {
             item: &crate::table_wire::ManifestItem,
             expected_device: [u8; 32],
             signed_bytes: &[u8],
+            _advertised_floor: Option<(u64, [u8; 32])>,
         ) -> anyhow::Result<crate::session::Ingested> {
             if !self.supported.contains(item) {
                 return Ok(crate::session::Ingested::NoChange);

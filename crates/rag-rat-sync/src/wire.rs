@@ -284,7 +284,7 @@ mod tests {
     fn alpn_identifiers_are_frozen() {
         assert_eq!(SYNC_ALPN, b"rag-rat/sync/4");
         assert_eq!(CONTENT_SYNC_ALPN, b"rag-rat/content/3");
-        assert_eq!(crate::table_wire::TABLE_SYNC_ALPN, b"rag-rat/table-sync/2");
+        assert_eq!(crate::table_wire::TABLE_SYNC_ALPN, b"rag-rat/table-sync/3");
         assert_eq!(crate::enrollment::ENROLL_ALPN, b"rag-rat/enroll/1");
         assert_ne!(SYNC_ALPN, CONTENT_SYNC_ALPN);
         assert_ne!(SYNC_ALPN, crate::enrollment::ENROLL_ALPN);

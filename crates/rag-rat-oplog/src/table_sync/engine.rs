@@ -364,11 +364,13 @@ pub(crate) fn ingest(
     scope_id: &str,
     signed_bytes: &[u8],
     pubkey: &DevicePublic,
+    advertised_floor: Option<store::AdvertisedFloor>,
 ) -> anyhow::Result<IngestReport> {
     store::assert_current_incarnation(tx, ctx.account_id, ctx.repo_id, ctx.incarnation_ref)?;
     let device = pubkey.fingerprint();
     let stream = scope_stream_id(ctx.repo_id, ctx.account_id, ctx.incarnation_ref, scope_id);
-    let (outcome, mut tail) = ingest_one(tx, ctx, scope_id, signed_bytes, pubkey)?;
+    let (outcome, mut tail) =
+        ingest_one(tx, ctx, scope_id, signed_bytes, pubkey, advertised_floor)?;
     let mut promoted = Vec::new();
     // Each accepted entry settles the held CHILDREN of two hashes, and both sets must be drained
     // or rows sit in the table forever, keyed to a hash no probe will ever revisit:
@@ -451,7 +453,9 @@ fn drain_children(
 ) -> anyhow::Result<Option<AcceptedEntry>> {
     let mut took_the_slot = None;
     while let Some(child) = store::take_gapped_child(tx, stream, device, parent_hash)? {
-        let (outcome, stored) = ingest_one(tx, ctx, scope_id, &child.signed_bytes, pubkey)?;
+        // A promoted child can never be the advertised floor root: this drain only runs after an
+        // entry was ACCEPTED, so the local chain is non-empty and the floor branch cannot fire.
+        let (outcome, stored) = ingest_one(tx, ctx, scope_id, &child.signed_bytes, pubkey, None)?;
         promoted.push(outcome);
         match stored {
             Some(entry) => took_the_slot = Some(entry),
@@ -476,6 +480,7 @@ fn ingest_one(
     scope_id: &str,
     signed_bytes: &[u8],
     pubkey: &DevicePublic,
+    advertised_floor: Option<store::AdvertisedFloor>,
 ) -> anyhow::Result<(IngestOutcome, Option<AcceptedEntry>)> {
     // Same refusal as the producer: an older binary must not re-park, under its own version, an
     // entry a newer projector already understood and folded.
@@ -502,6 +507,7 @@ fn ingest_one(
             signed_bytes,
             pubkey,
             ctx.now_ms,
+            advertised_floor,
         )? {
             AcceptOutcome::Stored { op, meta, entry_hash, prev_hash } => {
                 let accepted = Some(AcceptedEntry { entry_hash, prev_hash });
@@ -679,7 +685,8 @@ mod tests {
                 registry: REGISTRY,
                 now_ms: 0,
             };
-            let out = entries.iter().map(|bytes| ingest(&tx, &ctx, "demo/1", bytes, from).unwrap());
+            let out =
+                entries.iter().map(|bytes| ingest(&tx, &ctx, "demo/1", bytes, from, None).unwrap());
             let out = out.collect();
             tx.commit().unwrap();
             out
@@ -707,7 +714,7 @@ mod tests {
             };
             let out = entries
                 .iter()
-                .map(|bytes| ingest(&tx, &ctx, "demo/1", bytes, from).unwrap().outcome);
+                .map(|bytes| ingest(&tx, &ctx, "demo/1", bytes, from, None).unwrap().outcome);
             let out = out.collect();
             tx.commit().unwrap();
             out
@@ -1313,7 +1320,7 @@ mod tests {
                 now_ms: 0,
             };
             for bytes in &entry {
-                ingest(&tx, &ctx, "demo/1", bytes, &a.pubkey()).unwrap();
+                ingest(&tx, &ctx, "demo/1", bytes, &a.pubkey(), None).unwrap();
             }
             tx.commit().unwrap();
         }
@@ -2045,7 +2052,7 @@ mod tests {
             registry: REGISTRY,
             now_ms: 0,
         };
-        let error = ingest(&tx, &ctx, "demo/1", &entries[0], &old.pubkey()).unwrap_err();
+        let error = ingest(&tx, &ctx, "demo/1", &entries[0], &old.pubkey(), None).unwrap_err();
         assert!(error.to_string().contains("different stream"));
         for table in ["table_sync_entries", "table_sync_gapped_entries", "sync_row_clocks"] {
             let count: i64 = tx
@@ -2253,7 +2260,9 @@ mod tests {
             };
             for bytes in &entries {
                 assert_eq!(
-                    ingest(&tx, &ctx, "multi/1", bytes, &a_dev.secret().public()).unwrap().outcome,
+                    ingest(&tx, &ctx, "multi/1", bytes, &a_dev.secret().public(), None)
+                        .unwrap()
+                        .outcome,
                     IngestOutcome::Applied,
                 );
             }

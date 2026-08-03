@@ -761,6 +761,109 @@ async fn production_anchors_replicate_through_dispatch_before_local_repo_registr
 }
 
 #[tokio::test]
+async fn a_fresh_peer_converges_through_a_compacted_chain_via_the_advertised_floor() {
+    use rag_rat_sync::{
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,
+        accept_and_dispatch, connect_and_table_sync,
+    };
+
+    let owner = fresh_db();
+    let account = local_account(&owner, NOW).unwrap();
+    let joiner = fresh_db();
+    let (owner_endpoint, joiner_endpoint) = loopback_endpoints().await;
+    enroll_member_over_endpoint(
+        &owner_endpoint,
+        &joiner_endpoint,
+        &owner,
+        &joiner,
+        account,
+        "https://relay.example",
+    )
+    .await;
+
+    owner
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-a', 'repo-a', 0)",
+            [],
+        )
+        .unwrap();
+    rag_rat_oplog::ensure_repo_incarnation(&owner, "repo-a", NOW + 1).unwrap().unwrap();
+    for (memory, path) in [("memory-a", "src/a.rs"), ("memory-b", "src/b.rs")] {
+        owner
+            .execute(
+                "INSERT INTO repo_memory_bindings(
+                     repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                     anchor_status, created_at_ms)
+                 VALUES ('repo-a', ?1, 'path', ?2, ?2, 4, 5, 'current', ?3)",
+                rusqlite::params![memory, path, NOW + 2],
+            )
+            .unwrap();
+        rag_rat_oplog::table_sync_author_pending(&owner, account, NOW + 2).unwrap();
+    }
+    // Compact the owner's chain below all but its last entry: the first binding's winning entry
+    // drops, and only the floor advertisement lets a fresh peer converge.
+    let compacted = rag_rat_oplog::table_sync_compact_overdue(&owner, account, NOW + 3, &|scope| {
+        (scope == "anchors/1").then_some(1)
+    })
+    .unwrap();
+    assert_eq!(compacted, 1, "the first binding's entry is reclaimed");
+    for entry in account_entries_for_sync(&owner, account).unwrap() {
+        rag_rat_oplog::account_ingest(&joiner, &entry.signed_bytes, NOW + 2).unwrap();
+    }
+
+    let mut account_store = OplogSyncStore::new(&owner, account, || NOW);
+    let mut content_store = OplogContentSyncStore::new(&owner, account, || NOW);
+    let mut table_store = OplogTableSyncStore::new(&joiner, account, || NOW);
+    let server = accept_and_dispatch(
+        &owner_endpoint,
+        &mut account_store,
+        &mut content_store,
+        AuthPolicy::Closed,
+        || NOW,
+    );
+    let client = connect_and_table_sync(
+        &joiner_endpoint,
+        direct_addr(&owner_endpoint),
+        &mut table_store,
+        NOW,
+    );
+    let (server, client) = tokio::join!(server, client);
+    let (alpn, _server_report) = server.unwrap();
+    let client_report = client.unwrap();
+    assert_eq!(alpn, TABLE_SYNC_ALPN);
+    assert_eq!(
+        client_report.entries_newly_stored, 1,
+        "only the retained suffix transfers — the floor entry roots the fresh chain",
+    );
+
+    let surviving: bool = joiner
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM repo_memory_bindings
+                 WHERE repo_id = 'repo-a' AND memory_id = 'memory-b')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(surviving, "the row whose entry is at/above the floor converges");
+    let compacted_row: bool = joiner
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM repo_memory_bindings
+                 WHERE repo_id = 'repo-a' AND memory_id = 'memory-a')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!compacted_row, "the reclaimed prefix honestly does not arrive");
+    let floor: Option<i64> = joiner
+        .query_row("SELECT lamport FROM table_sync_retained_floors", [], |row| row.get(0))
+        .ok();
+    assert_eq!(floor, Some(1), "the adopted floor is recorded, so re-offers propagate it");
+}
+
+#[tokio::test]
 async fn closed_table_auth_refusal_reveals_no_manifest() {
     use rag_rat_sync::{AuthPolicy, Frame, OplogContentSyncStore, TABLE_SYNC_ALPN};
     use tokio::io::AsyncReadExt;

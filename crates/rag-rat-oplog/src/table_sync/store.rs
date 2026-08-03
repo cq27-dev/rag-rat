@@ -312,6 +312,7 @@ fn stream_max_lamport(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result<
 /// of whether its payload is applicable, so one undecodable / unknown / out-of-scope payload cannot
 /// wedge every later entry from that device — storage is gated on the CHAIN, application on the
 /// PAYLOAD.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn accept_row_entry(
     tx: &Transaction<'_>,
     account_id: AccountId,
@@ -320,6 +321,7 @@ pub(crate) fn accept_row_entry(
     signed_bytes: &[u8],
     pubkey: &DevicePublic,
     now_ms: i64,
+    advertised_floor: Option<AdvertisedFloor>,
 ) -> anyhow::Result<AcceptOutcome> {
     anyhow::ensure!(
         signed_bytes.len() <= super::TABLE_SYNC_ENTRY_MAX_BYTES,
@@ -391,7 +393,23 @@ pub(crate) fn accept_row_entry(
     if !device_is_effective_writer(tx, account_id, verified.device_fingerprint)? {
         return Ok(AcceptOutcome::Unauthorized);
     }
-    match classify(tx, expected_stream, &verified)? {
+    let (fit, chain_empty) = classify(tx, expected_stream, &verified, advertised_floor)?;
+    if matches!(fit, ChainFit::Ok)
+        && chain_empty
+        && let Some(floor) = advertised_floor
+        && verified.lamport == floor.lamport
+        && verified.entry_hash == floor.entry_hash
+    {
+        super::retention::record_adopted_floor(
+            tx,
+            expected_stream,
+            verified.device_fingerprint,
+            floor.lamport,
+            floor.entry_hash,
+            now_ms,
+        )?;
+    }
+    match fit {
         ChainFit::Ok | ChainFit::Restore => {},
         ChainFit::Gap =>
             return Ok(if retain_gapped_entry(tx, &verified, signed_bytes, now_ms)? {
@@ -442,28 +460,68 @@ enum ChainFit {
     Conflict,
 }
 
+/// The retained floor a peer advertised for one chain: routing advice that lets a receiver with
+/// NO local chain accept the floor entry as its local root instead of parking on a predecessor
+/// the sender has compacted away. Honored only when the entry IS the advertised floor — the
+/// lamport and hash must match exactly, so the advice can never bless an entry the sender did not
+/// itself just produce as the root.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdvertisedFloor {
+    pub lamport: u64,
+    pub entry_hash: [u8; 32],
+}
+
 fn classify(
     tx: &Transaction<'_>,
     stream: StreamId,
     verified: &VerifiedEntry,
-) -> anyhow::Result<ChainFit> {
+    advertised_floor: Option<AdvertisedFloor>,
+) -> anyhow::Result<(ChainFit, bool)> {
     let tail = chain_tail(tx, stream, verified.device_fingerprint)?;
-    if tail.is_none()
-        && let Some((witness_lamport, witness_hash)) =
-            chain_witness(tx, stream, verified.device_fingerprint)?
+    let chain_empty = tail.is_none();
+    let witness =
+        if chain_empty { chain_witness(tx, stream, verified.device_fingerprint)? } else { None };
+    if chain_empty
+        && let Some(floor) = advertised_floor
+        && verified.lamport == floor.lamport
+        && verified.entry_hash == floor.entry_hash
     {
-        if verified.entry_hash == witness_hash && verified.lamport == witness_lamport {
-            return Ok(ChainFit::Restore);
-        }
-        return Ok(match verified.prev_hash {
-            Some(prev) if prev == witness_hash && verified.lamport > witness_lamport =>
-                ChainFit::Ok,
-            None => ChainFit::Conflict,
-            Some(_) if verified.lamport <= witness_lamport => ChainFit::Conflict,
-            Some(_) => ChainFit::Gap,
+        // The sender has reclaimed everything below this entry. Accepting it as the local root
+        // records the floor, so this peer's own re-offers propagate the same root to third
+        // parties instead of re-parking them.
+        //
+        // A retained chain-tip WITNESS is chain state even with an empty log (its accepted
+        // prefix was purged): adopting a floor BELOW the witnessed tip would regress that
+        // boundary, resurrect the purged prefix, and then wedge the chain — successors citing
+        // the witness park forever. Adoption is valid only at or past the witness: the floor
+        // entry being the witness is the compacted-sender/restored-receiver rendezvous.
+        // Ahead of the witness, the only reachable rejoin is tip-as-direct-predecessor — a
+        // receiver two or more entries behind the compacted floor is refused by the session
+        // driver before classify ever runs (that recovery is the follow-up slice in #1127).
+        let regresses_witness = witness.is_some_and(|(witness_lamport, witness_hash)| {
+            !(floor.lamport == witness_lamport && floor.entry_hash == witness_hash)
+                && floor.lamport <= witness_lamport
         });
+        if !regresses_witness {
+            return Ok((ChainFit::Ok, chain_empty));
+        }
     }
-    Ok(match (verified.prev_hash, tail) {
+    if let Some((witness_lamport, witness_hash)) = witness {
+        if verified.entry_hash == witness_hash && verified.lamport == witness_lamport {
+            return Ok((ChainFit::Restore, chain_empty));
+        }
+        return Ok((
+            match verified.prev_hash {
+                Some(prev) if prev == witness_hash && verified.lamport > witness_lamport =>
+                    ChainFit::Ok,
+                None => ChainFit::Conflict,
+                Some(_) if verified.lamport <= witness_lamport => ChainFit::Conflict,
+                Some(_) => ChainFit::Gap,
+            },
+            chain_empty,
+        ));
+    }
+    let fit = match (verified.prev_hash, tail) {
         // A genesis (no predecessor) is the valid first entry of this device's chain; a genesis
         // when a chain already exists is a second head — an equivocation.
         (None, None) => ChainFit::Ok,
@@ -494,7 +552,8 @@ fn classify(
             } else {
                 ChainFit::Gap // links to an UNKNOWN predecessor — a genuine missing intermediate.
             },
-    })
+    };
+    Ok((fit, chain_empty))
 }
 
 /// The `(stream, device)` chain's highest-lamport `(lamport, entry_hash)`, or `None` for an empty
@@ -1602,6 +1661,7 @@ mod tests {
             &signed.signed_bytes,
             &secret.public(),
             0,
+            None,
         )
         .unwrap();
         assert_eq!(outcome, AcceptOutcome::Stored {
@@ -1643,6 +1703,7 @@ mod tests {
             &forged.signed_bytes,
             &secret.public(),
             0,
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("over the 65536-byte transport limit"));
@@ -1681,6 +1742,7 @@ mod tests {
                 &first.signed_bytes,
                 &secret.public(),
                 2,
+                None,
             )
             .unwrap(),
             AcceptOutcome::Stored { .. }
@@ -1734,6 +1796,7 @@ mod tests {
                     &candidate.signed_bytes,
                     &secret.public(),
                     0,
+                    None,
                 )
                 .unwrap(),
                 AcceptOutcome::Stored { .. }
@@ -1795,7 +1858,8 @@ mod tests {
                 &["t"],
                 &signed.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::Stored { .. }
@@ -1808,7 +1872,8 @@ mod tests {
                 &["t"],
                 &signed.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::AlreadyPresent,
@@ -1836,7 +1901,8 @@ mod tests {
                 &["t"],
                 &signed.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .is_err(),
             "an entry cannot be re-homed onto a stream it was not signed for",
@@ -1867,7 +1933,8 @@ mod tests {
                 &["other"],
                 &first.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::StoredInert {
@@ -1886,7 +1953,8 @@ mod tests {
                 &["t"],
                 &second.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::Stored { .. },
@@ -1917,7 +1985,8 @@ mod tests {
                 &["t"],
                 &garbage.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::StoredInert {
@@ -1935,7 +2004,8 @@ mod tests {
                 &["t"],
                 &valid.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::Stored { .. },
@@ -1964,7 +2034,8 @@ mod tests {
                 &["t"],
                 &poison.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .is_err(),
             "an out-of-bound lamport is rejected before it can poison the stream counter",
@@ -2004,7 +2075,8 @@ mod tests {
                     &["t"],
                     &at_bound.signed_bytes,
                     &secret.public(),
-                    0
+                    0,
+                    None,
                 )
                 .unwrap(),
                 AcceptOutcome::Stored { .. },
@@ -2022,7 +2094,8 @@ mod tests {
                 &["t"],
                 &beyond.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .is_err(),
             "a lamport one past the advance bound is refused",
@@ -2052,7 +2125,8 @@ mod tests {
                 &["t"],
                 &second.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::GapRetained,
@@ -2095,8 +2169,17 @@ mod tests {
         let tx = b.transaction().unwrap();
         for bytes in [&first.signed_bytes, &sibling.signed_bytes] {
             assert_eq!(
-                accept_row_entry(&tx, account(), stream(), &["t"], bytes, &secret.public(), 0)
-                    .unwrap(),
+                accept_row_entry(
+                    &tx,
+                    account(),
+                    stream(),
+                    &["t"],
+                    bytes,
+                    &secret.public(),
+                    0,
+                    None
+                )
+                .unwrap(),
                 AcceptOutcome::GapRetained,
             );
         }
@@ -2152,7 +2235,8 @@ mod tests {
                 &["t"],
                 &newcomer.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::GapRetained,
@@ -2197,7 +2281,8 @@ mod tests {
                 &["t"],
                 &far.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::GapChainFull,
@@ -2292,7 +2377,8 @@ mod tests {
                 &["t"],
                 &higher.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::GapChainFull,
@@ -2306,7 +2392,8 @@ mod tests {
                 &["t"],
                 &lower.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::GapRetained,
@@ -2352,6 +2439,7 @@ mod tests {
                     &e.signed_bytes,
                     &secret.public(),
                     0,
+                    None,
                 )
                 .unwrap();
             }
@@ -2396,10 +2484,28 @@ mod tests {
 
         let mut b = conn();
         let tx = b.transaction().unwrap();
-        accept_row_entry(&tx, account(), stream(), &["t"], &e1.signed_bytes, &secret.public(), 0)
-            .unwrap();
-        accept_row_entry(&tx, account(), stream(), &["t"], &e2.signed_bytes, &secret.public(), 0)
-            .unwrap();
+        accept_row_entry(
+            &tx,
+            account(),
+            stream(),
+            &["t"],
+            &e1.signed_bytes,
+            &secret.public(),
+            0,
+            None,
+        )
+        .unwrap();
+        accept_row_entry(
+            &tx,
+            account(),
+            stream(),
+            &["t"],
+            &e2.signed_bytes,
+            &secret.public(),
+            0,
+            None,
+        )
+        .unwrap();
         // Links past the tail to the STORED ancestor e1 (which already has a successor) → an
         // equivocation, not a missing predecessor.
         assert_eq!(
@@ -2410,7 +2516,8 @@ mod tests {
                 &["t"],
                 &fork.signed_bytes,
                 &secret.public(),
-                0
+                0,
+                None,
             )
             .unwrap(),
             AcceptOutcome::Fork,
@@ -2432,7 +2539,7 @@ mod tests {
         signed: &SignedEntry,
         pubkey: &DevicePublic,
     ) -> AcceptOutcome {
-        accept_row_entry(tx, acct, stream(), &["t"], &signed.signed_bytes, pubkey, 0).unwrap()
+        accept_row_entry(tx, acct, stream(), &["t"], &signed.signed_bytes, pubkey, 0, None).unwrap()
     }
 
     fn stream_entry_count(tx: &Transaction<'_>) -> i64 {

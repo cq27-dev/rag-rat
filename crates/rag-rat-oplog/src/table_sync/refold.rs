@@ -586,7 +586,9 @@ mod tests {
             };
             let out = entries
                 .iter()
-                .map(|bytes| engine::ingest(&tx, &ctx, "demo/1", bytes, from).unwrap().outcome)
+                .map(|bytes| {
+                    engine::ingest(&tx, &ctx, "demo/1", bytes, from, None).unwrap().outcome
+                })
                 .collect();
             tx.commit().unwrap();
             out
@@ -1237,7 +1239,7 @@ mod tests {
             registry: OLD_REGISTRY,
             now_ms: 0,
         };
-        let ingested = engine::ingest(&tx, &ctx, "demo/1", &entries[0], &a.pubkey());
+        let ingested = engine::ingest(&tx, &ctx, "demo/1", &entries[0], &a.pubkey(), None);
         assert!(ingested.is_err(), "an older projector must not ingest into a newer store");
         assert!(
             ingested.unwrap_err().to_string().contains("newer rag-rat"),
@@ -2477,7 +2479,9 @@ mod tests {
             };
             let out = entries
                 .iter()
-                .map(|bytes| engine::ingest(&tx, &ctx, "demo/1", bytes, from).unwrap().outcome)
+                .map(|bytes| {
+                    engine::ingest(&tx, &ctx, "demo/1", bytes, from, None).unwrap().outcome
+                })
                 .collect();
             tx.commit().unwrap();
             out

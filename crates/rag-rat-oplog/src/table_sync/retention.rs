@@ -7,15 +7,22 @@
 //! every such row's next producer pass takes the stale-version winner lookup, finds the entry
 //! gone, reads `StaleRow::Unknown`, and the whole table re-authors at once.
 //!
-//! The floor is recorded durably (`table_sync_retained_floors`) so the accept path can tell an
-//! intentionally reclaimed prefix from a chain gap: a re-offered entry below the floor is
-//! idempotently ignored instead of classifying as a fork against the retained tail. What this
-//! slice deliberately does NOT do is signal the floor to a FRESH peer — a peer with no chain
-//! state whose first retained entry cites a pruned predecessor still parks as
-//! `AwaitingPredecessor`. Manifest/hello floor advertisement and peer-side floor acceptance are
-//! the follow-up slice, and the same slice wires the driver: this module is invoked by the
-//! transport's manifest/reconcile path and the first scope whose retention policy demands it
-//! (overlay), not by anchors, which stays fully retained.
+//! The floor is recorded durably (`table_sync_retained_floors`) and advertised on the wire: a
+//! FRESH peer (no local chain) accepts the floor entry as its local root on exact
+//! `(lamport, hash)` match and records the floor, so the signal propagates transitively. Adoption
+//! is bounded by the chain-tip witness: a purged chain's retained tip is chain state, and a floor
+//! at or below a different witness entry classifies as the equivocation it is. A re-offered entry
+//! below the floor is idempotently ignored instead of classifying as a fork against the retained
+//! tail. The driver (`table_sync_compact_overdue`) counts and floors only reclaimable entries,
+//! clamps at the lowest pending lamport so forward-compat payloads stay offerable, treats a
+//! non-advancing floor as the steady-state no-op, and stays inert for anchors/1 — its production
+//! caller arrives with the first scope whose retention policy bounds it (overlay).
+//!
+//! A third state needs a follow-up slice of its own: a peer whose accepted TIP fell below the
+//! sender's floor (offline while the scope churned past it) is neither fresh nor current. The
+//! sender's entries cite a compacted predecessor the receiver never held, every entry parks, and
+//! the chain stalls. Recovery — re-rooting such a chain with floor proof — is tracked in #1127
+//! and deliberately not claimed here.
 //!
 //! Two accepted horizons, named rather than hidden:
 //!
@@ -69,6 +76,51 @@ pub(crate) fn retained_floor(
         )
         .optional()?;
     row.map(u64::try_from).transpose().map_err(Into::into)
+}
+
+/// Record a floor a PEER advertised and this store just accepted as a chain root (#1127 slice b).
+/// Monotonic like the compaction record: an adopted floor can only advance. This is what makes
+/// the signal transitive — this peer's own re-offers present the same floor to third parties.
+///
+/// Also sweeps gapped entries below the adopted floor, mirroring the compaction-side sweep: a
+/// below-floor entry parked by in-session reordering can never promote once the floor is adopted
+/// (its predecessor reports `AlreadyPresent` via the below-floor early return, so no parent
+/// acceptance ever probes it), and without the sweep it burns per-chain gapped capacity forever.
+pub(crate) fn record_adopted_floor(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    device: DeviceFingerprint,
+    lamport: u64,
+    entry_hash: [u8; 32],
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "INSERT INTO table_sync_retained_floors(
+             stream_id, device_fingerprint, lamport, entry_hash, compacted_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(stream_id, device_fingerprint) DO UPDATE SET
+             lamport = excluded.lamport,
+             entry_hash = excluded.entry_hash,
+             compacted_at_ms = excluded.compacted_at_ms
+         WHERE excluded.lamport > table_sync_retained_floors.lamport",
+        params![
+            stream.to_bytes().as_slice(),
+            device.to_bytes().as_slice(),
+            i64::try_from(lamport)?,
+            entry_hash.as_slice(),
+            now_ms,
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM table_sync_gapped_entries
+         WHERE stream_id = ?1 AND device_fingerprint = ?2 AND lamport < ?3",
+        params![
+            stream.to_bytes().as_slice(),
+            device.to_bytes().as_slice(),
+            i64::try_from(lamport)?
+        ],
+    )?;
+    Ok(())
 }
 
 /// Drop every accepted entry on `device`'s chain in `stream` with `lamport < floor_lamport`.
@@ -520,6 +572,7 @@ mod tests {
             &forged.signed_bytes,
             &device.secret().public(),
             0,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -604,6 +657,152 @@ mod tests {
         assert_eq!(remaining, 1, "the one above the floor survives");
     }
 
+    /// Adopting an advertised floor sweeps gapped entries below it: a below-floor entry parked by
+    /// reordering can never promote once the floor is adopted (its predecessor reports
+    /// AlreadyPresent, so nothing ever probes it), and must not burn the per-chain cap forever.
+    #[test]
+    fn adopting_a_floor_sweeps_gapped_entries_below_it() {
+        let mut a = conn();
+        let device = crate::local_device(&a, 0).unwrap();
+        author_chain(&mut a, &device, 4);
+        let (floor_hash, floor_bytes): (Vec<u8>, Vec<u8>) = a
+            .query_row(
+                "SELECT entry_hash, signed_bytes FROM table_sync_entries WHERE lamport = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        // The fresh peer parked a below-floor entry before the floor entry arrived (reordered
+        // delivery), then the floor arrives and roots the chain.
+        let mut b = conn();
+        enroll(&b, &device);
+        b.execute(
+            "INSERT INTO table_sync_gapped_entries(
+                 entry_hash, stream_id, device_fingerprint, lamport, prev_hash, signed_bytes,
+                 gapped_at_ms
+             ) VALUES (x'99', ?1, ?2, 1, x'98', x'00', 0)",
+            params![stream().to_bytes().as_slice(), device.fingerprint().to_bytes().as_slice()],
+        )
+        .unwrap();
+        let tx = b.transaction().unwrap();
+        let outcome = store::accept_row_entry(
+            &tx,
+            account(),
+            stream(),
+            &["t_demo"],
+            &floor_bytes,
+            &device.secret().public(),
+            0,
+            Some(store::AdvertisedFloor {
+                lamport: 2,
+                entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+            }),
+        )
+        .unwrap();
+        assert!(matches!(outcome, store::AcceptOutcome::Stored { .. }));
+        assert_eq!(
+            retained_floor(&tx, stream(), device.fingerprint()).unwrap(),
+            Some(2),
+            "the adopted floor is recorded",
+        );
+        let gapped: i64 = tx
+            .query_row("SELECT COUNT(*) FROM table_sync_gapped_entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(gapped, 0, "the below-floor parked entry is swept on adoption");
+        tx.commit().unwrap();
+    }
+
+    /// A retained chain-tip witness is chain state: adopting a floor BELOW it would regress the
+    /// purge boundary, resurrect the purged prefix, and wedge the chain behind it.
+    #[test]
+    fn floor_adoption_never_regresses_a_witnessed_tip() {
+        let mut a = conn();
+        let device = crate::local_device(&a, 0).unwrap();
+        author_chain(&mut a, &device, 4);
+        let (floor_hash, floor_bytes): (Vec<u8>, Vec<u8>) = a
+            .query_row(
+                "SELECT entry_hash, signed_bytes FROM table_sync_entries WHERE lamport = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        // The receiver purged its accepted log; the chain-tip witness at lamport 3 survives.
+        let mut b = conn();
+        enroll(&b, &device);
+        let tip_hash: Vec<u8> = a
+            .query_row("SELECT entry_hash FROM table_sync_entries WHERE lamport = 3", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        b.execute(
+            "INSERT INTO table_sync_chain_tips(stream_id, device_fingerprint, lamport, entry_hash)
+             VALUES (?1, ?2, 3, ?3)",
+            params![
+                stream().to_bytes().as_slice(),
+                device.fingerprint().to_bytes().as_slice(),
+                tip_hash.as_slice()
+            ],
+        )
+        .unwrap();
+
+        let tx = b.transaction().unwrap();
+        let outcome = store::accept_row_entry(
+            &tx,
+            account(),
+            stream(),
+            &["t_demo"],
+            &floor_bytes,
+            &device.secret().public(),
+            0,
+            Some(store::AdvertisedFloor {
+                lamport: 1,
+                entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            store::AcceptOutcome::Fork,
+            "a floor below the witnessed tip classifies as the equivocation it is, not a root",
+        );
+        assert!(
+            retained_floor(&tx, stream(), device.fingerprint()).unwrap().is_none(),
+            "and no floor is adopted",
+        );
+        tx.commit().unwrap();
+
+        // The same-lamport boundary: an equivocation AT the witnessed lamport (different hash)
+        // is equally not adoptable — the witness branch reports it as the fork it is.
+        let equivocation = crate::entry::sign_entry_from_op_bytes(
+            device.secret(),
+            stream(),
+            None,
+            3,
+            super::super::row_op::encode(&upsert("rx", "fork")),
+        );
+        let tx = b.transaction().unwrap();
+        let outcome = store::accept_row_entry(
+            &tx,
+            account(),
+            stream(),
+            &["t_demo"],
+            &equivocation.signed_bytes,
+            &device.secret().public(),
+            0,
+            Some(store::AdvertisedFloor { lamport: 3, entry_hash: equivocation.entry.entry_hash }),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            store::AcceptOutcome::Fork,
+            "lamport == witness with a different hash is the equivocation, not a root",
+        );
+        assert!(retained_floor(&tx, stream(), device.fingerprint()).unwrap().is_none());
+        tx.commit().unwrap();
+    }
+
     #[test]
     fn a_reoffered_entry_below_the_floor_is_idempotent_not_a_fork() {
         let mut c = conn();
@@ -631,6 +830,7 @@ mod tests {
             &dropped,
             &device.secret().public(),
             0,
+            None,
         )
         .unwrap();
         assert_eq!(outcome, store::AcceptOutcome::AlreadyPresent);

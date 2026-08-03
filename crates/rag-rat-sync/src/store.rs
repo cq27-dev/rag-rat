@@ -356,6 +356,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
             device_fingerprint: chain.device_fingerprint,
             lamport: chain.lamport,
             entry_hash: chain.entry_hash,
+            floor: chain.floor,
         })
         .collect())
     }
@@ -413,6 +414,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
         item: &ManifestItem,
         expected_device: [u8; 32],
         signed_bytes: &[u8],
+        advertised_floor: Option<(u64, [u8; 32])>,
     ) -> anyhow::Result<Ingested> {
         Ok(
             match rag_rat_oplog::table_sync_ingest(
@@ -422,6 +424,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
                 expected_device,
                 signed_bytes,
                 (self.now_fn)(),
+                advertised_floor,
             )? {
                 rag_rat_oplog::TableSyncIngestOutcome::Stored => Ingested::Stored,
                 rag_rat_oplog::TableSyncIngestOutcome::NoChange => Ingested::NoChange,
@@ -478,6 +481,6 @@ mod tests {
         assert!(store.chain_page(&item, None, 1).unwrap().is_empty());
         assert_eq!(store.frontier(&item, [4; 32]).unwrap(), FrontierState::Empty);
         assert!(store.entries(&item, [4; 32], ChainStart::Beginning, 1).unwrap().is_empty());
-        assert_eq!(store.ingest(&item, [4; 32], &[0]).unwrap(), Ingested::NoChange);
+        assert_eq!(store.ingest(&item, [4; 32], &[0], None).unwrap(), Ingested::NoChange);
     }
 }
