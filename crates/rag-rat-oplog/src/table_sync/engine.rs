@@ -453,8 +453,9 @@ fn drain_children(
 ) -> anyhow::Result<Option<AcceptedEntry>> {
     let mut took_the_slot = None;
     while let Some(child) = store::take_gapped_child(tx, stream, device, parent_hash)? {
-        // A promoted child can never be the advertised floor root: this drain only runs after an
-        // entry was ACCEPTED, so the local chain is non-empty and the floor branch cannot fire.
+        // The advertised floor is deliberately NOT passed here: a promoted child is chain
+        // continuation, not a candidate for adoption, and passing the floor would let an exact
+        // match re-classify as RootAdopt where a promotion belongs.
         let (outcome, stored) = ingest_one(tx, ctx, scope_id, &child.signed_bytes, pubkey, None)?;
         promoted.push(outcome);
         match stored {

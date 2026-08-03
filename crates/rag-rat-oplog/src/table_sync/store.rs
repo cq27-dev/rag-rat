@@ -374,7 +374,21 @@ pub(crate) fn accept_row_entry(
     // accepted path already has. In the `Gap` arm below instead, a removed device's redelivery
     // would report `Unauthorized`.
     if gapped_entry_exists(tx, &verified.entry_hash)? {
-        return Ok(AcceptOutcome::AlreadyGapped);
+        // An exactly-matching floor entry parked in the gapped table can never promote — its
+        // predecessor was compacted away (rolling upgrade parked it, or ordinary reordering) —
+        // so a plain AlreadyGapped would deadlock the re-root this slice exists to provide.
+        // Take the parked copy out and let the adoption path accept the entry.
+        let adoptable_floor_root =
+            advertised_floor.is_some_and(|floor| {
+                verified.lamport == floor.lamport && verified.entry_hash == floor.entry_hash
+            }) && chain_tail(tx, expected_stream, verified.device_fingerprint)?
+                .is_none_or(|(tip, _)| verified.lamport > tip);
+        if !adoptable_floor_root {
+            return Ok(AcceptOutcome::AlreadyGapped);
+        }
+        tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
+            verified.entry_hash.as_slice()
+        ])?;
     }
     // Authority gate (#935): the signing device must be a roster-effective WRITER of the account.
     // Placed AFTER `entry_exists` so an entry stored while the device WAS a writer still reports
@@ -393,13 +407,8 @@ pub(crate) fn accept_row_entry(
     if !device_is_effective_writer(tx, account_id, verified.device_fingerprint)? {
         return Ok(AcceptOutcome::Unauthorized);
     }
-    let (fit, chain_empty) = classify(tx, expected_stream, &verified, advertised_floor)?;
-    if matches!(fit, ChainFit::Ok)
-        && chain_empty
-        && let Some(floor) = advertised_floor
-        && verified.lamport == floor.lamport
-        && verified.entry_hash == floor.entry_hash
-    {
+    let (fit, _tail_lamport) = classify(tx, expected_stream, &verified, advertised_floor)?;
+    if let (ChainFit::RootAdopt, Some(floor)) = (fit, advertised_floor) {
         super::retention::record_adopted_floor(
             tx,
             expected_stream,
@@ -410,7 +419,7 @@ pub(crate) fn accept_row_entry(
         )?;
     }
     match fit {
-        ChainFit::Ok | ChainFit::Restore => {},
+        ChainFit::Ok | ChainFit::RootAdopt | ChainFit::Restore => {},
         ChainFit::Gap =>
             return Ok(if retain_gapped_entry(tx, &verified, signed_bytes, now_ms)? {
                 AcceptOutcome::GapRetained
@@ -453,18 +462,23 @@ pub(crate) fn accept_row_entry(
 }
 
 /// How a verified entry fits its `(stream, device)` chain tail.
+#[derive(Clone, Copy)]
 enum ChainFit {
     Ok,
+    /// The entry IS the advertised floor and the chain may adopt it as its root — fresh chain,
+    /// or a re-root past a stale tip. The caller records the adoption on this variant alone, so
+    /// the predicate lives in exactly one place.
+    RootAdopt,
     Restore,
     Gap,
     Conflict,
 }
 
-/// The retained floor a peer advertised for one chain: routing advice that lets a receiver with
-/// NO local chain accept the floor entry as its local root instead of parking on a predecessor
-/// the sender has compacted away. Honored only when the entry IS the advertised floor — the
-/// lamport and hash must match exactly, so the advice can never bless an entry the sender did not
-/// itself just produce as the root.
+/// The retained floor a peer advertised for one chain: routing advice that lets a receiver
+/// accept the floor entry as its chain root — a fresh chain, or a RE-ROOT when the receiver's
+/// accepted tip fell below the floor (offline across the churn). Honored only when the entry IS
+/// the advertised floor — the lamport and hash must match exactly, so the advice can never bless
+/// an entry the sender did not itself just produce as the root.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AdvertisedFloor {
     pub lamport: u64,
@@ -476,39 +490,44 @@ fn classify(
     stream: StreamId,
     verified: &VerifiedEntry,
     advertised_floor: Option<AdvertisedFloor>,
-) -> anyhow::Result<(ChainFit, bool)> {
+) -> anyhow::Result<(ChainFit, Option<u64>)> {
     let tail = chain_tail(tx, stream, verified.device_fingerprint)?;
-    let chain_empty = tail.is_none();
+    let tail_lamport = tail.map(|(lamport, _)| lamport);
     let witness =
-        if chain_empty { chain_witness(tx, stream, verified.device_fingerprint)? } else { None };
-    if chain_empty
-        && let Some(floor) = advertised_floor
+        if tail.is_none() { chain_witness(tx, stream, verified.device_fingerprint)? } else { None };
+    if let Some(floor) = advertised_floor
         && verified.lamport == floor.lamport
         && verified.entry_hash == floor.entry_hash
     {
         // The sender has reclaimed everything below this entry. Accepting it as the local root
         // records the floor, so this peer's own re-offers propagate the same root to third
         // parties instead of re-parking them.
-        //
-        // A retained chain-tip WITNESS is chain state even with an empty log (its accepted
-        // prefix was purged): adopting a floor BELOW the witnessed tip would regress that
-        // boundary, resurrect the purged prefix, and then wedge the chain — successors citing
-        // the witness park forever. Adoption is valid only at or past the witness: the floor
-        // entry being the witness is the compacted-sender/restored-receiver rendezvous.
-        // Ahead of the witness, the only reachable rejoin is tip-as-direct-predecessor — a
-        // receiver two or more entries behind the compacted floor is refused by the session
-        // driver before classify ever runs (that recovery is the follow-up slice in #1127).
-        let regresses_witness = witness.is_some_and(|(witness_lamport, witness_hash)| {
-            !(floor.lamport == witness_lamport && floor.entry_hash == witness_hash)
-                && floor.lamport <= witness_lamport
-        });
-        if !regresses_witness {
-            return Ok((ChainFit::Ok, chain_empty));
+        if tail.is_none() {
+            // A retained chain-tip WITNESS is chain state even with an empty log (its accepted
+            // prefix was purged): adopting a floor BELOW the witnessed tip would regress that
+            // boundary, resurrect the purged prefix, and then wedge the chain — successors
+            // citing the witness park forever. Adoption is valid only at or past the witness:
+            // the floor entry being the witness is the compacted-sender/restored-receiver
+            // rendezvous.
+            let regresses_witness = witness.is_some_and(|(witness_lamport, witness_hash)| {
+                !(floor.lamport == witness_lamport && floor.entry_hash == witness_hash)
+                    && floor.lamport <= witness_lamport
+            });
+            if !regresses_witness {
+                return Ok((ChainFit::RootAdopt, tail_lamport));
+            }
+        } else if tail_lamport.is_some_and(|tip| floor.lamport > tip) {
+            // Re-root (#1127): the chain's accepted tip fell below the advertised floor — the
+            // peer was offline while the sender churned past it and compacted. Adopting the
+            // floor as the new root is the recovery the retention docs name: the old prefix
+            // stays stored (projections are unaffected), the tail advances, and below-floor
+            // re-offers read idempotent from here on.
+            return Ok((ChainFit::RootAdopt, tail_lamport));
         }
     }
     if let Some((witness_lamport, witness_hash)) = witness {
         if verified.entry_hash == witness_hash && verified.lamport == witness_lamport {
-            return Ok((ChainFit::Restore, chain_empty));
+            return Ok((ChainFit::Restore, tail_lamport));
         }
         return Ok((
             match verified.prev_hash {
@@ -518,7 +537,7 @@ fn classify(
                 Some(_) if verified.lamport <= witness_lamport => ChainFit::Conflict,
                 Some(_) => ChainFit::Gap,
             },
-            chain_empty,
+            tail_lamport,
         ));
     }
     let fit = match (verified.prev_hash, tail) {
@@ -553,7 +572,7 @@ fn classify(
                 ChainFit::Gap // links to an UNKNOWN predecessor — a genuine missing intermediate.
             },
     };
-    Ok((fit, chain_empty))
+    Ok((fit, tail_lamport))
 }
 
 /// The `(stream, device)` chain's highest-lamport `(lamport, entry_hash)`, or `None` for an empty

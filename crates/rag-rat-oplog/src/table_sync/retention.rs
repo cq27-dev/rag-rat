@@ -18,11 +18,12 @@
 //! non-advancing floor as the steady-state no-op, and stays inert for anchors/1 — its production
 //! caller arrives with the first scope whose retention policy bounds it (overlay).
 //!
-//! A third state needs a follow-up slice of its own: a peer whose accepted TIP fell below the
-//! sender's floor (offline while the scope churned past it) is neither fresh nor current. The
-//! sender's entries cite a compacted predecessor the receiver never held, every entry parks, and
-//! the chain stalls. Recovery — re-rooting such a chain with floor proof — is tracked in #1127
-//! and deliberately not claimed here.
+//! A peer whose accepted TIP fell below the sender's floor (offline while the scope churned
+//! past it) recovers by re-rooting: the session plans the offer AT the floor instead of a suffix
+//! the peer can never link, and the receiver adopts the floor as its new root on exact coordinate
+//! match. The old prefix stays stored (projections are unaffected), the tail advances, and
+//! below-floor re-offers read idempotent. A peer forked AT the floor lamport gets ordinary fork
+//! classification, same as at any other tip.
 //!
 //! Two accepted horizons, named rather than hidden:
 //!
@@ -800,6 +801,182 @@ mod tests {
             "lamport == witness with a different hash is the equivocation, not a root",
         );
         assert!(retained_floor(&tx, stream(), device.fingerprint()).unwrap().is_none());
+        tx.commit().unwrap();
+    }
+
+    /// The rejoin case the floor exists for: a peer whose accepted tip fell below the sender's
+    /// floor re-roots onto it instead of parking forever on a compacted predecessor.
+    #[test]
+    fn a_peer_whose_tip_fell_below_the_floor_re_roots_and_converges() {
+        let mut a = conn();
+        let device = crate::local_device(&a, 0).unwrap();
+        author_chain(&mut a, &device, 6);
+        let bytes = |lamport: i64| -> (Vec<u8>, Vec<u8>) {
+            a.query_row(
+                "SELECT entry_hash, signed_bytes FROM table_sync_entries WHERE lamport = ?1",
+                [lamport],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let floor_hash = bytes(4).0;
+
+        // The peer holds entries 0..2 (its tip is 2), then rejoins after the sender compacted
+        // below floor 4. Entry 3 is NOT delivered — its hash is the predecessor entry 4 cites.
+        let mut b = conn();
+        enroll(&b, &device);
+        for lamport in 0..3 {
+            let (_, signed_bytes) = bytes(lamport);
+            let tx = b.transaction().unwrap();
+            store::accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t_demo"],
+                &signed_bytes,
+                &device.secret().public(),
+                0,
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // The floor entry arrives with its advertisement: adopted as the new root, not parked on
+        // the compacted predecessor it cites.
+        let tx = b.transaction().unwrap();
+        let outcome = store::accept_row_entry(
+            &tx,
+            account(),
+            stream(),
+            &["t_demo"],
+            &bytes(4).1,
+            &device.secret().public(),
+            0,
+            Some(store::AdvertisedFloor {
+                lamport: 4,
+                entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, store::AcceptOutcome::Stored { .. }),
+            "the floor re-roots the stalled chain: {outcome:?}",
+        );
+        assert_eq!(retained_floor(&tx, stream(), device.fingerprint()).unwrap(), Some(4));
+
+        // The chain continues from the new root, and the skipped prefix is idempotent, not fork.
+        let outcome = store::accept_row_entry(
+            &tx,
+            account(),
+            stream(),
+            &["t_demo"],
+            &bytes(5).1,
+            &device.secret().public(),
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, store::AcceptOutcome::Stored { .. }),
+            "entry 5 chains: {outcome:?}"
+        );
+        let outcome = store::accept_row_entry(
+            &tx,
+            account(),
+            stream(),
+            &["t_demo"],
+            &bytes(3).1,
+            &device.secret().public(),
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome, store::AcceptOutcome::AlreadyPresent, "below the floor is idempotent");
+        tx.commit().unwrap();
+    }
+
+    /// A parked gapped copy of the floor entry can never promote (its predecessor was compacted),
+    /// so AlreadyGapped must not deadlock the re-root: the copy is taken out and the entry
+    /// adopted as root.
+    #[test]
+    fn a_parked_floor_entry_does_not_deadlock_the_reroot() {
+        let mut a = conn();
+        let device = crate::local_device(&a, 0).unwrap();
+        author_chain(&mut a, &device, 6);
+        let (floor_hash, floor_bytes): (Vec<u8>, Vec<u8>) = a
+            .query_row(
+                "SELECT entry_hash, signed_bytes FROM table_sync_entries WHERE lamport = 4",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        // The peer holds entries 0..2, and the floor entry ITSELF is parked in its gapped table
+        // — the rolling-upgrade shape: a new sender offered At(floor) to a pre-PR receiver,
+        // which parked it on the compacted predecessor.
+        let mut b = conn();
+        enroll(&b, &device);
+        for lamport in 0..3 {
+            let (_, signed_bytes): (Vec<u8>, Vec<u8>) = a
+                .query_row(
+                    "SELECT entry_hash, signed_bytes FROM table_sync_entries WHERE lamport = ?1",
+                    [lamport],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let tx = b.transaction().unwrap();
+            store::accept_row_entry(
+                &tx,
+                account(),
+                stream(),
+                &["t_demo"],
+                &signed_bytes,
+                &device.secret().public(),
+                0,
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        b.execute(
+            "INSERT INTO table_sync_gapped_entries(
+                 entry_hash, stream_id, device_fingerprint, lamport, prev_hash, signed_bytes,
+                 gapped_at_ms
+             ) VALUES (?1, ?2, ?3, 4, x'00', ?4, 0)",
+            params![
+                floor_hash.as_slice(),
+                stream().to_bytes().as_slice(),
+                device.fingerprint().to_bytes().as_slice(),
+                floor_bytes.as_slice()
+            ],
+        )
+        .unwrap();
+
+        let tx = b.transaction().unwrap();
+        let outcome = store::accept_row_entry(
+            &tx,
+            account(),
+            stream(),
+            &["t_demo"],
+            &floor_bytes,
+            &device.secret().public(),
+            0,
+            Some(store::AdvertisedFloor {
+                lamport: 4,
+                entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, store::AcceptOutcome::Stored { .. }),
+            "the parked floor entry is adopted, not short-circuited: {outcome:?}",
+        );
+        assert_eq!(retained_floor(&tx, stream(), device.fingerprint()).unwrap(), Some(4));
+        let gapped: i64 = tx
+            .query_row("SELECT COUNT(*) FROM table_sync_gapped_entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(gapped, 0, "the parked copy is gone");
         tx.commit().unwrap();
     }
 

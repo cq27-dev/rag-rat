@@ -547,8 +547,21 @@ fn chain_plan(local: &ChainHead, frontier: FrontierState) -> Result<ChainPlan, T
             }
             Ok(ChainPlan::Complete)
         },
-        FrontierState::Accepted { lamport, entry_hash } =>
-            Ok(ChainPlan::Send(ChainStart::After { lamport, entry_hash })),
+        FrontierState::Accepted { lamport, entry_hash } => {
+            if let Some((floor_lamport, floor_hash)) = local.floor
+                && lamport < floor_lamport
+            {
+                // The peer's accepted tip fell below our retained floor: offering the suffix
+                // after its tip parks forever — every entry's predecessor was compacted away.
+                // Offer the floor as a re-root instead; the receiver adopts it as its new chain
+                // root and converges from there (#1127).
+                return Ok(ChainPlan::Send(ChainStart::At {
+                    lamport: floor_lamport,
+                    entry_hash: floor_hash,
+                }));
+            }
+            Ok(ChainPlan::Send(ChainStart::After { lamport, entry_hash }))
+        },
         FrontierState::Restore { lamport, .. } if lamport > local.lamport => Ok(ChainPlan::Pending),
         FrontierState::Restore { lamport, entry_hash } =>
             Ok(ChainPlan::Send(ChainStart::At { lamport, entry_hash })),
@@ -1035,6 +1048,28 @@ mod tests {
         assert_eq!(
             chain_plan(&local, FrontierState::Restore { lamport: 4, entry_hash: [4; 32] }).unwrap(),
             ChainPlan::Pending
+        );
+    }
+
+    #[test]
+    fn a_tip_below_the_sender_floor_plans_a_reroot_not_a_suffix() {
+        let local = ChainHead {
+            device_fingerprint: [1; 32],
+            lamport: 8,
+            entry_hash: [8; 32],
+            floor: Some((4, [4; 32])),
+        };
+        assert_eq!(
+            chain_plan(&local, FrontierState::Accepted { lamport: 2, entry_hash: [2; 32] })
+                .unwrap(),
+            ChainPlan::Send(ChainStart::At { lamport: 4, entry_hash: [4; 32] }),
+            "the receiver re-roots onto the floor instead of parking on compacted predecessors"
+        );
+        // A tip AT or above the floor keeps the ordinary suffix plan.
+        assert_eq!(
+            chain_plan(&local, FrontierState::Accepted { lamport: 6, entry_hash: [6; 32] })
+                .unwrap(),
+            ChainPlan::Send(ChainStart::After { lamport: 6, entry_hash: [6; 32] })
         );
     }
 
