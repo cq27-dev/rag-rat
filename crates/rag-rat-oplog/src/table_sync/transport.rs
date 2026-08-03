@@ -86,6 +86,56 @@ pub fn table_sync_supported_streams(
     supported_streams_against(conn, account_id, SYNCABLE_TABLES)
 }
 
+/// Sweep gapped entries older than [`store::GAPPED_ENTRY_MAX_AGE_MS`], with everything held
+/// behind them (#1127 slice c). A stalled chain otherwise burns its per-chain cap forever: the
+/// predecessor never arrives and nothing reclaims. Expiry is recovery-safe — a peer re-offers
+/// from the receiver's accepted frontier, so an entry dropped here is re-retained on arrival.
+///
+/// Runs from [`table_sync_author_pending`], which is itself the session-prepare hook — a cadence
+/// that exists only on WRITER sessions (`can_push`). A pull-only (read-only grant) replica
+/// ingests and parks entries without ever running this sweep: its gapped table is bounded by the
+/// per-chain cap alone. Named rather than fixed — if receive-only replicas become a real shape,
+/// the horizon needs a read-path cadence of its own.
+///
+/// The scan reads the whole gapped table once per prepare; no index, deliberately — the table is
+/// bounded at the per-chain cap times bounded chains, and the sweep runs on the session cadence,
+/// not per query. Returns the number of entries discarded.
+pub(crate) fn table_sync_sweep_expired_gapped(
+    conn: &Connection,
+    now_ms: i64,
+) -> anyhow::Result<usize> {
+    let cutoff = now_ms.saturating_sub(store::GAPPED_ENTRY_MAX_AGE_MS);
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let expired: Vec<(Vec<u8>, Vec<u8>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT stream_id, entry_hash FROM table_sync_gapped_entries
+             WHERE gapped_at_ms < ?1",
+        )?;
+        stmt.query_map([cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let mut swept = 0;
+    for (stream_id, hash) in expired {
+        let hash = fixed32(hash)?;
+        // The descendant sweep below may have already reclaimed this row behind an earlier root;
+        // only a real deletion counts (and only a real root needs its subtree walked).
+        if tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
+            hash.as_slice()
+        ])? == 0
+        {
+            continue;
+        }
+        swept += 1;
+        swept += store::discard_gapped_descendants(
+            &tx,
+            StreamId::from_bytes(fixed32(stream_id)?),
+            &hash,
+        )?;
+    }
+    tx.commit()?;
+    Ok(swept)
+}
+
 /// Author every unpublished local row in the production registry before a table manifest is built.
 ///
 /// The count includes entries authored by re-adoption (#997): a removal drain can be the only
@@ -95,6 +145,7 @@ pub fn table_sync_author_pending(
     account_id: AccountId,
     now_ms: i64,
 ) -> anyhow::Result<usize> {
+    table_sync_sweep_expired_gapped(conn, now_ms)?;
     let streams = supported_streams_against(conn, account_id, SYNCABLE_TABLES)?;
     let repos: BTreeSet<(String, [u8; 32])> =
         streams.into_iter().map(|stream| (stream.repo_id, stream.incarnation_ref)).collect();
@@ -917,6 +968,52 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(remaining, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn the_gapped_horizon_sweeps_expired_entries_with_their_descendants() {
+        let conn = database();
+        let stream = supported_streams_against(&conn, account(), &[REPO_SPEC]).unwrap().remove(0);
+        let horizon = store::GAPPED_ENTRY_MAX_AGE_MS;
+        let seed = |hash: [u8; 32], prev: [u8; 32], lamport: i64, gapped_at: i64| {
+            conn.execute(
+                "INSERT INTO table_sync_gapped_entries(
+                     entry_hash, stream_id, device_fingerprint, lamport, prev_hash, signed_bytes,
+                     gapped_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, x'00', ?6)",
+                params![
+                    hash.as_slice(),
+                    stream.stream_id.as_slice(),
+                    [2u8; 32].as_slice(),
+                    lamport,
+                    prev.as_slice(),
+                    gapped_at
+                ],
+            )
+            .unwrap();
+        };
+        seed([0x11; 32], [0x00; 32], 5, 0); // expired root
+        seed([0x12; 32], [0x11; 32], 6, 0); // its expired descendant
+        seed([0x14; 32], [0x11; 32], 8, horizon + 500); // a RECENT descendant of the expired root
+        seed([0x13; 32], [0x00; 32], 7, horizon + 500); // recent, unrelated, survives
+
+        let swept = table_sync_sweep_expired_gapped(&conn, horizon + 1_000).unwrap();
+        assert_eq!(
+            swept, 3,
+            "the expired root takes its whole parked subtree — a child of an expired root can \
+             never promote, however recently it was parked",
+        );
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM table_sync_gapped_entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "only the unrelated recent entry survives");
+
+        // Expiry is recovery-safe: the dropped root can be parked again when it really arrives.
+        seed([0x11; 32], [0x00; 32], 5, horizon + 1_000);
+        let reparked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM table_sync_gapped_entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(reparked, 2, "redelivery re-retains an expired entry");
     }
 
     #[test]

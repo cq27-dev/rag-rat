@@ -618,6 +618,13 @@ pub(crate) struct GappedEntry {
 /// griefing, not a defense against arbitrary peers.
 const MAX_GAPPED_PER_CHAIN: usize = 4096;
 
+/// How long a gapped entry may wait for its chain predecessor before retention gives up (#1127
+/// slice c). The cap bounds HOW MANY a chain may hold; this bounds HOW LONG, so a stalled chain
+/// cannot hold its capacity forever. Seven days is far past any honest sync cadence, and expiry
+/// is cheap to recover from: a peer re-offers from the receiver's accepted frontier, so an entry
+/// dropped here is simply re-retained when it actually arrives.
+pub(crate) const GAPPED_ENTRY_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
 fn gapped_entry_exists(tx: &Transaction<'_>, entry_hash: &[u8; 32]) -> anyhow::Result<bool> {
     Ok(tx
         .query_row(
