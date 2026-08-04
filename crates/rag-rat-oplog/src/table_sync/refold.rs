@@ -38,7 +38,7 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::apply::{self, ApplyOutcome};
-use super::registry::TableSpec;
+use super::registry::{MEMORIES_LANE_TABLES, TableSpec};
 use super::row_op::{self, DecodedRowOp};
 use super::store::{self, PendingEntry, PendingReason, Worklist};
 use crate::entry;
@@ -57,7 +57,7 @@ use crate::op::OpMeta;
 /// registering a table or widening a spec forces an append, and an append is the bump. A widening
 /// that is not a registry change (a new row-op kind) still has to append a generation by hand,
 /// repeating the previous snapshot.
-pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 2;
+pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 3;
 
 const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
 
@@ -321,11 +321,30 @@ fn replay_pending_entry(
     }
     let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
     match apply::apply_row_op_on_stream(tx, spec, &context.repo_id, pending.stream_id, &op, meta)? {
-        // Folded. `Superseded` — outranked by a newer winner, or suppressed by a tombstone — is
-        // equally a correct fold and equally not outstanding work: the entry was evaluated and
-        // lost on the merits, and no later binary changes that.
-        ApplyOutcome::Applied | ApplyOutcome::Superseded =>
-            store::clear_entry_pending(tx, &pending.entry_hash),
+        // Folded and CHANGED the projection: advance the memories Lens lanes so a row landed by
+        // replay (e.g. an entry parked as `NewerSpecVersion` by an older binary, applied here after
+        // the upgrade) surfaces in Lens without waiting for an unrelated write. Mirrors the
+        // direct-ingest bump; gated on repo registration for the same reason (no phantom
+        // `'__unassigned__'` `repo_meta` rows). Unlike the ingest site, replay holds the exact
+        // `spec`, so it gates on the applied table feeding the memories lane rather than
+        // approximating over the whole registry — a future non-memory scope replays without
+        // a spurious bump.
+        ApplyOutcome::Applied => {
+            if MEMORIES_LANE_TABLES.contains(&spec.name)
+                && rag_rat_db::schema::repo_id_is_registered(tx, &context.repo_id)?
+            {
+                rag_rat_db::meta::bump_lens_revisions(tx, &context.repo_id, &[
+                    rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+                    rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+                ])?;
+            }
+            store::clear_entry_pending(tx, &pending.entry_hash)
+        },
+        // `Superseded` — outranked by a newer winner, or suppressed by a tombstone — is equally a
+        // correct fold and equally not outstanding work, but it did NOT change the projection, so
+        // no lane bump: the entry was evaluated and lost on the merits, and no later binary
+        // changes that.
+        ApplyOutcome::Superseded => store::clear_entry_pending(tx, &pending.entry_hash),
         // Terminal, so it stops being outstanding: a type mismatch or a constraint violation is a
         // BROKEN PRODUCER — the values do not fit the declared column types or the table's
         // constraints, and no future binary makes them fit. (A missing column is NOT this case: it
@@ -678,6 +697,166 @@ mod tests {
         assert!(b.produce(NEW_REGISTRY, "repo").is_empty());
         // The refold is one-shot: the stamp is current, so a second open does no work.
         assert!(!refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+    }
+
+    // A repo-scoped memory-lane table (the real `memory_reality`, present in the applied schema),
+    // modelled old/new the same way as t_demo: `evidence_json` is local under v1 and a synced added
+    // column under v2, so a v2 op parks on a v1 peer and lands on refold.
+    const OLD_REALITY_COLS: &[ColumnSpec] = &[
+        ColumnSpec::required("content_hash", ValueType::Text),
+        ColumnSpec::required("verdict", ValueType::Text),
+        ColumnSpec::required("direction", ValueType::Text),
+        ColumnSpec::required("checked_against_commit", ValueType::Text),
+        ColumnSpec::required("checked_inputs_hash", ValueType::Text),
+        ColumnSpec::required("model_id", ValueType::Text),
+        ColumnSpec::required("prompt_version", ValueType::Text),
+        ColumnSpec::required("checked_at_ms", ValueType::I64),
+    ];
+    const REALITY_PK: &[ColumnSpec] = &[
+        ColumnSpec::required("repo_id", ValueType::Text),
+        ColumnSpec::required("memory_id", ValueType::Text),
+    ];
+    const OLD_REALITY: TableSpec = TableSpec {
+        name: "memory_reality",
+        scope_id: "overlay/1",
+        spec_version: 1,
+        pk: REALITY_PK,
+        columns: OLD_REALITY_COLS,
+        local_columns: &["evidence_json"],
+        repo_column: Some("repo_id"),
+    };
+    const NEW_REALITY: TableSpec = TableSpec {
+        name: "memory_reality",
+        scope_id: "overlay/1",
+        spec_version: 2,
+        pk: REALITY_PK,
+        columns: &[
+            ColumnSpec::required("content_hash", ValueType::Text),
+            ColumnSpec::required("verdict", ValueType::Text),
+            ColumnSpec::required("direction", ValueType::Text),
+            ColumnSpec::required("checked_against_commit", ValueType::Text),
+            ColumnSpec::required("checked_inputs_hash", ValueType::Text),
+            ColumnSpec::required("model_id", ValueType::Text),
+            ColumnSpec::required("prompt_version", ValueType::Text),
+            ColumnSpec::required("checked_at_ms", ValueType::I64),
+            ColumnSpec::added("evidence_json", ValueType::Text, 2, DefaultValue::Null),
+        ],
+        local_columns: &[],
+        repo_column: Some("repo_id"),
+    };
+
+    fn lens_memories_revision(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row(
+            "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM repo_meta
+                 WHERE repo_id = 'repo' AND key = 'lens_memories_revision'), 0)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The refold guard (`MEMORIES_LANE_TABLES.contains(&spec.name)`) fires for a memory-lane
+    /// table: a `memory_reality` row parked as `NewerSpecVersion` and applied on refold
+    /// advances the memories Lens lane, so a row landed by replay surfaces in Lens without an
+    /// unrelated write.
+    #[test]
+    fn refold_replay_of_a_memory_lane_row_bumps_the_memories_lens_lane() {
+        let mut a = Device::new();
+        let mut b = Device::new();
+        // The bump is registration-gated, so the repo must exist on B.
+        b.conn
+            .execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo', \
+                 'repo', 0)",
+                [],
+            )
+            .unwrap();
+        b.enroll(a.pubkey().fingerprint());
+
+        a.conn
+            .execute(
+                "INSERT INTO memory_reality(
+                     memory_id, repo_id, content_hash, verdict, direction, checked_against_commit,
+                     checked_inputs_hash, evidence_json, model_id, prompt_version, checked_at_ms)
+                 VALUES ('m1', 'repo', 'h', 'confirmed', 'note_ahead', 'c', 'i', '[]', 'model',
+                         'v1', 0)",
+                [],
+            )
+            .unwrap();
+        let entries = a.produce(&[NEW_REALITY], "repo");
+        assert_eq!(entries.len(), 1);
+
+        // B (old spec) parks the newer op without applying it — no bump yet.
+        let outcomes: Vec<IngestOutcome> = {
+            let tx = b.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account(),
+                incarnation_ref: [0x44; 32],
+                device: &b.local,
+                registry: &[OLD_REALITY],
+                now_ms: 0,
+            };
+            let out = entries
+                .iter()
+                .map(|bytes| {
+                    engine::ingest(&tx, &ctx, "overlay/1", bytes, &a.pubkey(), None)
+                        .unwrap()
+                        .outcome
+                })
+                .collect();
+            tx.commit().unwrap();
+            out
+        };
+        assert_eq!(outcomes, vec![IngestOutcome::Retained(
+            PendingReason::NewerSpecVersion.as_db_str()
+        )]);
+        assert_eq!(lens_memories_revision(&b.conn), 0, "a parked entry has not applied");
+
+        // Refold under the new spec applies it, and the guard advances the memories lane.
+        assert!(refold_stale_projections_against(&b.conn, &[NEW_REALITY]).unwrap());
+        let applied: bool = b
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_reality WHERE repo_id = 'repo' AND memory_id \
+                 = 'm1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(applied, "the parked memory_reality row lands on refold");
+        assert!(
+            lens_memories_revision(&b.conn) >= 1,
+            "replaying a memory-lane row advances the memories lane"
+        );
+    }
+
+    /// The negative half of the guard: a non-memory table (`t_demo`) applied on refold must NOT
+    /// touch the memories lane, so a future non-memory scope replays without a spurious bump.
+    #[test]
+    fn refold_replay_of_a_non_memory_row_leaves_the_memories_lens_lane_untouched() {
+        let mut a = Device::new();
+        let mut b = Device::new();
+        b.conn
+            .execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo', \
+                 'repo', 0)",
+                [],
+            )
+            .unwrap();
+        let entries = author_wide_row(&mut a);
+        b.enroll(a.pubkey().fingerprint());
+        assert_eq!(b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey()), vec![
+            IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        ]);
+
+        assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+        assert_eq!(b.row(), Some(("v1".to_string(), Some("wide".to_string()))), "t_demo applied");
+        assert_eq!(
+            lens_memories_revision(&b.conn),
+            0,
+            "a non-memory table's replay must not bump the memories lane"
+        );
     }
 
     #[test]

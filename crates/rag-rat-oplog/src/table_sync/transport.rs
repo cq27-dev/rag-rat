@@ -9,7 +9,7 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::engine::{self, IngestOutcome, SyncCtx};
-use super::registry::{SYNCABLE_TABLES, TableSpec};
+use super::registry::{MEMORIES_LANE_TABLES, SYNCABLE_TABLES, TableSpec};
 use super::scope_stream::scope_stream_id;
 use super::{retention, store};
 use crate::AccountId;
@@ -200,6 +200,23 @@ pub fn table_sync_author_pending(
         tx.commit()?;
     }
     Ok(authored)
+}
+
+/// The per-(stream, device) accepted-entry budget for a scope: `None` = full retention, `Some(n)` =
+/// keep the newest `n` reclaimable entries and compact the rest. This is the production
+/// `retain` argument to [`table_sync_compact_overdue`].
+///
+/// `anchors/1` is fully retained (durable memory anchors — every entry is history worth keeping).
+/// `overlay/1` is the first bounded scope: its per-edit `Remove`+insert churn on `memory_summaries`
+/// would grow a chain without limit, so each device chain keeps [`OVERLAY_ACCEPTED_RETENTION`]
+/// accepted entries. An unknown scope defaults to full retention.
+pub const OVERLAY_ACCEPTED_RETENTION: u64 = 256;
+
+pub fn scope_retention_budget(scope_id: &str) -> Option<u64> {
+    match scope_id {
+        "overlay/1" => Some(OVERLAY_ACCEPTED_RETENTION),
+        _ => None,
+    }
 }
 
 /// Compact accepted chain prefixes for scopes whose retention policy bounds them (#1127).
@@ -726,7 +743,13 @@ fn ingest_against(
         advertised_floor
             .map(|(lamport, entry_hash)| store::AdvertisedFloor { lamport, entry_hash }),
     )?;
-    if registry.iter().any(|spec| spec.name == "repo_memory_bindings")
+    // An applied row on this stream changed derived memory state, so advance the memories Lens
+    // lanes (the explicit replacement for the row triggers overlay/1 and anchors/1 dropped). The
+    // registered-repo gate matches the dropped triggers and avoids phantom `'__unassigned__'` rows.
+    // `IngestOutcome` does not name the applied table, so this bumps whenever a memories-lane table
+    // is registered at all — correct while every registered table (bindings, memory_reality,
+    // memory_summaries) feeds this lane; revisit the gate if a non-memory table ever registers.
+    if registry.iter().any(|spec| MEMORIES_LANE_TABLES.contains(&spec.name))
         && std::iter::once(&report.outcome)
             .chain(report.promoted.iter())
             .any(|outcome| matches!(outcome, IngestOutcome::Applied))
@@ -914,6 +937,92 @@ mod tests {
             table_sync_compact_overdue(&conn, account(), 3, zero).is_err(),
             "a zero budget would drop the chain tail itself — refused"
         );
+    }
+
+    #[test]
+    fn scope_retention_budget_bounds_overlay_and_leaves_anchors_full() {
+        assert_eq!(scope_retention_budget("overlay/1"), Some(OVERLAY_ACCEPTED_RETENTION));
+        assert_eq!(scope_retention_budget("anchors/1"), None);
+        assert_eq!(scope_retention_budget("distill/1"), None);
+        assert_eq!(scope_retention_budget("unknown/1"), None);
+    }
+
+    /// Seed `count` reclaimable (non-pending) accepted entries on a single-device chain, with
+    /// globally-unique entry hashes derived from `(tag, lamport)`. Records the stream's apply
+    /// context first — compaction needs it to restamp a dropped winner's published record.
+    fn seed_reclaimable_chain(conn: &Connection, stream: &TableSyncStream, tag: u8, count: i64) {
+        conn.execute(
+            "INSERT INTO table_sync_streams(stream_id, repo_id, account_id, incarnation_ref, \
+             scope_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                stream.stream_id.as_slice(),
+                stream.repo_id,
+                account().to_bytes().as_slice(),
+                stream.incarnation_ref.as_slice(),
+                stream.scope_id,
+            ],
+        )
+        .unwrap();
+        for lamport in 0..count {
+            let mut entry_hash = [0u8; 32];
+            entry_hash[0] = tag;
+            entry_hash[1..9].copy_from_slice(&(lamport as u64).to_le_bytes());
+            conn.execute(
+                "INSERT INTO table_sync_entries(
+                     entry_hash, stream_id, device_fingerprint, lamport, signed_bytes,
+                     received_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, x'00', 0)",
+                params![
+                    entry_hash.as_slice(),
+                    stream.stream_id.as_slice(),
+                    [7u8; 32].as_slice(),
+                    lamport
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn the_production_policy_compacts_overlay_chains_and_leaves_anchors_full() {
+        let conn = database();
+        let streams = table_sync_supported_streams(&conn, account()).unwrap();
+        let overlay = streams
+            .iter()
+            .find(|s| s.repo_id == "repo-a" && s.scope_id == "overlay/1")
+            .expect("repo-a advertises an overlay stream");
+        let anchors = streams
+            .iter()
+            .find(|s| s.repo_id == "repo-a" && s.scope_id == "anchors/1")
+            .expect("repo-a advertises an anchors stream");
+
+        // Overlay is bounded; give it more than its budget. Anchors is full-retention; a chain the
+        // same length must be left untouched.
+        let overlay_len = i64::try_from(OVERLAY_ACCEPTED_RETENTION).unwrap() + 4;
+        seed_reclaimable_chain(&conn, overlay, 0xAA, overlay_len);
+        seed_reclaimable_chain(&conn, anchors, 0xBB, overlay_len);
+
+        let dropped =
+            table_sync_compact_overdue(&conn, account(), 1, &scope_retention_budget).unwrap();
+        assert_eq!(dropped, 4, "overlay compacts to its 256-entry budget; 4 oldest are reclaimed");
+
+        let overlay_remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM table_sync_entries WHERE stream_id = ?1",
+                [overlay.stream_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(overlay_remaining, i64::try_from(OVERLAY_ACCEPTED_RETENTION).unwrap());
+
+        let anchors_remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM table_sync_entries WHERE stream_id = ?1",
+                [anchors.stream_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(anchors_remaining, overlay_len, "anchors is full-retention — nothing reclaimed");
     }
 
     /// A pending entry below the computed floor would survive locally yet be unreachable to
@@ -1209,13 +1318,20 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_advertises_one_anchors_stream_per_current_repo() {
+    fn production_registry_advertises_anchors_and_overlay_per_current_repo() {
         let conn = database();
         let streams = table_sync_supported_streams(&conn, account()).unwrap();
-        assert_eq!(streams.len(), 2);
-        assert!(streams.iter().all(|stream| stream.scope_id == "anchors/1"));
-        assert_eq!(streams.iter().map(|stream| stream.repo_id.as_str()).collect::<Vec<_>>(), [
-            "repo-a", "repo-b"
+        // Each current repo advertises one stream per registered scope: anchors/1 and overlay/1.
+        let mut pairs: Vec<(String, String)> = streams
+            .iter()
+            .map(|stream| (stream.repo_id.clone(), stream.scope_id.clone()))
+            .collect();
+        pairs.sort();
+        assert_eq!(pairs, vec![
+            ("repo-a".to_string(), "anchors/1".to_string()),
+            ("repo-a".to_string(), "overlay/1".to_string()),
+            ("repo-b".to_string(), "anchors/1".to_string()),
+            ("repo-b".to_string(), "overlay/1".to_string()),
         ]);
     }
 

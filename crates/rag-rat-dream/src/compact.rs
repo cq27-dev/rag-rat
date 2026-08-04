@@ -321,6 +321,7 @@ fn record_summary(conn: &Connection, r: RecordSummary<'_>) -> rusqlite::Result<(
             r.now_ms,
         ],
     )?;
+    super::bump_memory_lens_lanes(conn, r.repo_id)?;
     Ok(())
 }
 
@@ -777,6 +778,34 @@ mod tests {
             rag_rat_query::memory::evidence::note_content_hash("note", "a body worth compacting")
         );
         assert_eq!(row.4, 7000);
+    }
+
+    #[test]
+    fn a_summary_write_advances_the_memories_lens_lane() {
+        // V107 dropped the memory_summaries revision triggers, so a summary write advances the
+        // memories Lens lane only via the explicit bump on the dream write path. Gated on repo
+        // registration, so the repo must exist in `repos`.
+        let c = mem_db();
+        set_repo(&c, "r");
+        c.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
+            [],
+        )
+        .unwrap();
+        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
+        let lane = || -> i64 {
+            c.query_row(
+                "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM repo_meta
+                     WHERE repo_id = 'r' AND key = 'lens_memories_revision'), 0)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let before = lane();
+        let model = MockChatModel::new([GOOD_SUMMARY]);
+        run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 7000).unwrap();
+        assert!(lane() > before, "writing a summary advances the memories lane (trigger-free)");
     }
 
     #[test]

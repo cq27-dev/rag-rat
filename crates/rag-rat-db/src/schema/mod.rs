@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 106;
+pub const LATEST_SCHEMA_VERSION: u32 = 107;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -798,6 +798,13 @@ const MIGRATION_106_DESCRIPTION: &str = "Make table_sync_readoption_audit.origin
                                          nullable (#1127): a winner reclaimed by accepted-entry \
                                          compaction before re-adoption ran has no hash to record; \
                                          the slot stays named by (stream, device, lamport)";
+const MIGRATION_107_ID: &str = "107_syncable_overlay_tables";
+const MIGRATION_107_CHECKSUM: &str = "sha256:rag-rat-syncable-overlay-tables-v107";
+const MIGRATION_107_DESCRIPTION: &str =
+    "Drop the Lens revision triggers on memory_reality and memory_summaries (#1133): the \
+     overlay/1 table-sync scope applies these rows under whole-row LWW, and a trigger firing on a \
+     wire-applied row is a device-local side effect; the dream write and the sync apply advance \
+     the Lens lanes explicitly instead";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1668,6 +1675,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_106_CHECKSUM,
         description: MIGRATION_106_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_readoption_audit_nullable_winner),
+    },
+    Migration {
+        id: MIGRATION_107_ID,
+        checksum: MIGRATION_107_CHECKSUM,
+        description: MIGRATION_107_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_syncable_overlay_tables),
     },
 ];
 

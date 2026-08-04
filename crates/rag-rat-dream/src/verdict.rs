@@ -848,6 +848,7 @@ fn record_verdict(conn: &Connection, r: RecordVerdict<'_>) -> rusqlite::Result<(
             r.now_ms,
         ],
     )?;
+    crate::bump_memory_lens_lanes(conn, r.repo_id)?;
     Ok(())
 }
 
@@ -889,6 +890,7 @@ fn record_uncitable(conn: &Connection, r: Uncitable<'_>) -> rusqlite::Result<()>
             r.now_ms,
         ],
     )?;
+    crate::bump_memory_lens_lanes(conn, r.repo_id)?;
     Ok(())
 }
 

@@ -170,7 +170,8 @@ pub use stream::StreamId;
 pub use table_sync::{
     TABLE_SYNC_ENTRY_MAX_BYTES, TableSyncChainEntry, TableSyncChainHead, TableSyncEntryStart,
     TableSyncFrontier, TableSyncIngestOutcome, TableSyncStream,
-    refold_stale_table_sync_projections, table_sync_author_pending, table_sync_chain_entries,
-    table_sync_chain_frontier, table_sync_chain_page_after, table_sync_compact_overdue,
-    table_sync_ingest, table_sync_supported_streams, table_sync_validate_stream,
+    refold_stale_table_sync_projections, scope_retention_budget, table_sync_author_pending,
+    table_sync_chain_entries, table_sync_chain_frontier, table_sync_chain_page_after,
+    table_sync_compact_overdue, table_sync_ingest, table_sync_supported_streams,
+    table_sync_validate_stream,
 };

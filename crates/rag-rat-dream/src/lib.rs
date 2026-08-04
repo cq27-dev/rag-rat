@@ -258,6 +258,27 @@ pub(crate) fn removal_guarded_write_tx(
     Ok(())
 }
 
+/// Advance the per-repo Lens lanes a dream overlay write feeds — the aggregate enrichment clock and
+/// the memories lane — for a registered repo.
+///
+/// This is the explicit replacement for the `memory_reality` / `memory_summaries` revision triggers
+/// V107 dropped: those tables sync on `overlay/1`, and a trigger firing on a whole-row-LWW apply is
+/// a device-local side effect the sync apply must not have. Instead the dream write advances the
+/// lanes here and the sync apply advances them at its own site (`table_sync` transport), so the
+/// only lane movement is the one the code chooses. Call it on the SAME connection as the write
+/// (inside [`removal_guarded_write_tx`]) so Lens's same-transaction invariant holds. Gated on repo
+/// registration to match the dropped triggers (which fired only for a known repo) and to avoid
+/// phantom `repo_meta` rows under the `'__unassigned__'` sentinel.
+pub(crate) fn bump_memory_lens_lanes(conn: &Connection, repo_id: &str) -> rusqlite::Result<()> {
+    if rag_rat_db::schema::repo_id_is_registered(conn, repo_id)? {
+        rag_rat_db::meta::bump_lens_revisions(conn, repo_id, &[
+            rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+            rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+        ])?;
+    }
+    Ok(())
+}
+
 /// Whether the model passes would call the model AT ALL this run — the zero-work guard for
 /// EPHEMERAL `[llm.dream.remote]`. A fully churn-skipped (or all-uncitable) repo returns `false`,
 /// so `rag-rat dream --verify/--compact` never cold-starts a paid GPU box that would then do zero

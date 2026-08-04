@@ -553,6 +553,16 @@ fn register_repo_inner(
         // normal open applies the full ladder) so this adoption never trips "no such column". Uses
         // `source_id` (not the placeholder literal) so a shallow-clone upgrade re-points periphery
         // rows off the `local:` incumbent too, exactly like the core/papertrail loop above.
+        //
+        // Lens-lane refresh for the adopted repo: `memory_reality` / `memory_summaries` are in this
+        // list, and V107 dropped their revision triggers (they sync on overlay/1). This bare UPDATE
+        // therefore does NOT bump the memories lane directly. It does not need to:
+        // `repo_memories` is ALSO in this same list (see the array), and it KEEPS its revision
+        // trigger, so re-pointing it in this loop advances the memories lane once for the
+        // adopted `repo_id` whenever it has any memory at all — the only case where a stale
+        // verdict/summary would matter. If `repo_memories`' triggers are ever removed too,
+        // add an explicit `bump_lens_revisions` here so adoption keeps refreshing the overlay
+        // rows.
         for table in A5_PERIPHERY_DIRECT_SCOPED_TABLES {
             if super::column_exists(&tx, table, "repo_id")? {
                 // `main.`-qualified for the same view-shadowing reason as the core loop above.

@@ -252,6 +252,13 @@ fn lens_version_tracks_binding_validation_and_in_place_enrichment_updates() {
         params![db.active_repo_id, memory.memory_id],
     )
     .unwrap();
+    // memory_summaries syncs on overlay/1 and is trigger-free; the dream write advances the
+    // memories lane explicitly, mirrored here.
+    rag_rat_db::meta::bump_lens_revisions(conn, &db.active_repo_id, &[
+        rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+        rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+    ])
+    .unwrap();
     let after_summary_update = db.lens_version().unwrap();
     assert_ne!(
         before_summary_update.revision, after_summary_update.revision,
@@ -271,6 +278,13 @@ fn lens_version_tracks_binding_validation_and_in_place_enrichment_updates() {
          WHERE repo_id = ?1 AND memory_id = ?2",
         params![db.active_repo_id, memory.memory_id],
     )
+    .unwrap();
+    // memory_reality syncs on overlay/1 and is trigger-free; the dream write advances the memories
+    // lane explicitly, mirrored here.
+    rag_rat_db::meta::bump_lens_revisions(conn, &db.active_repo_id, &[
+        rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+        rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+    ])
     .unwrap();
     let after_reality_update = db.lens_version().unwrap();
     assert_ne!(

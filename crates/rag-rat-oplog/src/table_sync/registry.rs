@@ -198,9 +198,75 @@ const MEMORY_BINDINGS: TableSpec = TableSpec {
     repo_column: Some("repo_id"),
 };
 
+// A memory verdict is regenerable model output; every non-pk column is a portable fact about the
+// verdict or the check that produced it (`checked_against_commit`/`checked_inputs_hash` are the
+// churn-skip comparators — replicating them lets a receiver skip re-verification, which is the
+// point of the scope). Nothing here is checkout-local, so `local_columns` is empty; a NULL value
+// (an uncitable row's verdict/direction/model_id) is wire-legal under whole-row LWW.
+const MEMORY_REALITY_PK: &[ColumnSpec] = &[
+    ColumnSpec::required("repo_id", ValueType::Text),
+    ColumnSpec::required("memory_id", ValueType::Text),
+];
+
+const MEMORY_REALITY_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec::required("content_hash", ValueType::Text),
+    ColumnSpec::required("verdict", ValueType::Text),
+    ColumnSpec::required("direction", ValueType::Text),
+    ColumnSpec::required("checked_against_commit", ValueType::Text),
+    ColumnSpec::required("checked_inputs_hash", ValueType::Text),
+    ColumnSpec::required("evidence_json", ValueType::Text),
+    ColumnSpec::required("model_id", ValueType::Text),
+    ColumnSpec::required("prompt_version", ValueType::Text),
+    ColumnSpec::required("checked_at_ms", ValueType::I64),
+];
+
+const MEMORY_REALITY: TableSpec = TableSpec {
+    name: "memory_reality",
+    scope_id: "overlay/1",
+    spec_version: 1,
+    pk: MEMORY_REALITY_PK,
+    columns: MEMORY_REALITY_COLUMNS,
+    local_columns: &[],
+    repo_column: Some("repo_id"),
+};
+
+// A compacted memory summary keyed WITH `content_hash`, so a title/body edit is a new row rather
+// than an in-place overwrite. Every non-pk column is regenerable model output; nothing is local.
+const MEMORY_SUMMARIES_PK: &[ColumnSpec] = &[
+    ColumnSpec::required("repo_id", ValueType::Text),
+    ColumnSpec::required("memory_id", ValueType::Text),
+    ColumnSpec::required("content_hash", ValueType::Text),
+];
+
+const MEMORY_SUMMARIES_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec::required("summary", ValueType::Text),
+    ColumnSpec::required("model_id", ValueType::Text),
+    ColumnSpec::required("prompt_version", ValueType::Text),
+    ColumnSpec::required("generated_at_ms", ValueType::I64),
+];
+
+const MEMORY_SUMMARIES: TableSpec = TableSpec {
+    name: "memory_summaries",
+    scope_id: "overlay/1",
+    spec_version: 1,
+    pk: MEMORY_SUMMARIES_PK,
+    columns: MEMORY_SUMMARIES_COLUMNS,
+    local_columns: &[],
+    repo_column: Some("repo_id"),
+};
+
 /// The production table registry. `anchors/1` retains durable memory-binding history in full;
-/// higher-churn overlay and distill tables remain unregistered until their retention milestones.
-pub(crate) const SYNCABLE_TABLES: &[TableSpec] = &[MEMORY_BINDINGS];
+/// `overlay/1` carries regenerable dream output (verdicts, summaries) under a bounded retention
+/// budget. The `distill/1` scope remains unregistered until its retention milestone.
+pub(crate) const SYNCABLE_TABLES: &[TableSpec] =
+    &[MEMORY_BINDINGS, MEMORY_REALITY, MEMORY_SUMMARIES];
+
+/// Registered tables whose rows feed the per-repo memories Lens lane
+/// (`LENS_MEMORIES_REVISION_META`). The apply-side lane bump consults this because `IngestOutcome`
+/// does not name the applied table; keep it in sync with any memory-facing table added to
+/// [`SYNCABLE_TABLES`].
+pub(crate) const MEMORIES_LANE_TABLES: &[&str] =
+    &["repo_memory_bindings", "memory_reality", "memory_summaries"];
 
 /// One table's REPLICATED CONTRACT within a projector generation — everything that decides what
 /// this binary can project from the wire, and nothing that does not.
@@ -277,6 +343,72 @@ pub(crate) const PROJECTOR_GENERATIONS: &[&[TableGeneration]] = &[
             ("moniker_tool_version", ValueType::Text, None),
         ],
     }],
+    // v3: regenerable dream output (verdicts, summaries) replicates on the bounded overlay/1
+    // stream. A generation is a whole-registry snapshot, so this repeats the anchors table and
+    // adds the two overlay tables, in `SYNCABLE_TABLES` order.
+    &[
+        TableGeneration {
+            table: "repo_memory_bindings",
+            scope_id: "anchors/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("memory_id", ValueType::Text),
+                ("binding_kind", ValueType::Text),
+                ("binding_id", ValueType::Text),
+            ],
+            columns: &[
+                ("path", ValueType::Text, None),
+                ("start_line", ValueType::I64, None),
+                ("end_line", ValueType::I64, None),
+                ("commit_hash", ValueType::Text, None),
+                ("tracker", ValueType::Text, None),
+                ("project", ValueType::Text, None),
+                ("item_key", ValueType::Text, None),
+                ("created_at_ms", ValueType::I64, None),
+                ("symbol_kind", ValueType::Text, None),
+                ("signature_hash", ValueType::Text, None),
+                ("moniker_tool", ValueType::Text, None),
+                ("moniker_tool_version", ValueType::Text, None),
+            ],
+        },
+        TableGeneration {
+            table: "memory_reality",
+            scope_id: "overlay/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[("repo_id", ValueType::Text), ("memory_id", ValueType::Text)],
+            columns: &[
+                ("content_hash", ValueType::Text, None),
+                ("verdict", ValueType::Text, None),
+                ("direction", ValueType::Text, None),
+                ("checked_against_commit", ValueType::Text, None),
+                ("checked_inputs_hash", ValueType::Text, None),
+                ("evidence_json", ValueType::Text, None),
+                ("model_id", ValueType::Text, None),
+                ("prompt_version", ValueType::Text, None),
+                ("checked_at_ms", ValueType::I64, None),
+            ],
+        },
+        TableGeneration {
+            table: "memory_summaries",
+            scope_id: "overlay/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("memory_id", ValueType::Text),
+                ("content_hash", ValueType::Text),
+            ],
+            columns: &[
+                ("summary", ValueType::Text, None),
+                ("model_id", ValueType::Text, None),
+                ("prompt_version", ValueType::Text, None),
+                ("generated_at_ms", ValueType::I64, None),
+            ],
+        },
+    ],
 ];
 
 /// Assert a spec classifies EVERY physical column of its table exactly once — as pk, a synced
@@ -761,6 +893,22 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    /// Every production spec must classify its live physical schema exactly — the invariant that
+    /// stops a column being added to a registered table without a matching spec edit. Runs against
+    /// the real migration ladder, not a synthetic fixture, so a drift between the CREATE TABLE and
+    /// the `TableSpec` fails here.
+    #[test]
+    fn the_production_specs_cover_their_live_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        for spec in SYNCABLE_TABLES {
+            assert_spec_covers_schema(&conn, spec).unwrap_or_else(|err| {
+                panic!("spec for `{}` does not cover its schema: {err}", spec.name)
+            });
+        }
+        assert_registry_consistent(SYNCABLE_TABLES).unwrap();
     }
 
     /// The comparable shape of one generation: `(table, spec_version, [(column, in_version,

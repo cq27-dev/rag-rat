@@ -6352,6 +6352,62 @@ mod lens_lane_revision_migration_tests {
     }
 }
 
+#[cfg(test)]
+mod syncable_overlay_migration_tests {
+    use super::*;
+
+    fn triggers_on(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The overlay tables must carry NO triggers after the ladder, and stay that way when the whole
+    /// ladder replays (V093/V102 recreate the revision triggers ahead of V107 on every
+    /// `index --full`, so V107's drop has to be unconditional to survive the replay).
+    #[test]
+    fn v107_leaves_the_overlay_tables_trigger_free_across_a_full_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        assert_eq!(triggers_on(&conn, "memory_reality"), 0);
+        assert_eq!(triggers_on(&conn, "memory_summaries"), 0);
+    }
+
+    /// With the triggers gone, a raw row write no longer advances the memories Lens lane — the
+    /// whole point of V107: under overlay/1 the lane is advanced by the dream write and the
+    /// sync apply explicitly, never as a side effect of the physical write.
+    #[test]
+    fn a_raw_overlay_write_no_longer_bumps_the_memories_lane() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
+            [],
+        )
+        .unwrap();
+        let lane = || crate::meta::repo_meta(&conn, "r", crate::meta::LENS_MEMORIES_REVISION_META);
+        let before = lane().unwrap();
+        conn.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_at_ms)
+             VALUES ('m', 'r', 'h', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+             generated_at_ms)
+             VALUES ('m', 'r', 'h', 's', 0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(before, lane().unwrap(), "a raw overlay write must not move the lane");
+    }
+}
+
 /// V095 (#1002): per-TABLE spec versioning, plus a direct pointer from a row to its winning entry.
 ///
 /// `sync_published_rows.spec_version` replaces V093's `projector_version`. The anti-echo hash
@@ -7482,6 +7538,38 @@ pub fn apply_readoption_audit_nullable_winner(conn: &Connection) -> rusqlite::Re
              RENAME TO table_sync_readoption_audit;
          CREATE INDEX IF NOT EXISTS table_sync_readoption_audit_stream
              ON table_sync_readoption_audit(account_id, stream_id);",
+    )
+}
+
+/// V107 (#1133): make `memory_reality` and `memory_summaries` syncable on the `overlay/1` scope by
+/// dropping their Lens revision triggers.
+///
+/// Both tables carry two trigger families that bump a per-repo Lens lane on every physical row
+/// write: the V093 `*_lens_revision_*` set (the aggregate enrichment clock) and the V102
+/// `*_lane_revision_*` set (the split memories lane). Under `overlay/1` a row arrives by whole-row
+/// LWW apply, and a trigger firing on a wire-applied row is a device-local side effect that also
+/// fires on redeliveries, losing writes, and refold replay — exactly what the sync apply must not
+/// do. The dream write path and the sync apply path advance the enrichment and memories lanes
+/// explicitly instead (`meta::bump_lens_revisions`), so the only remaining lane movement is the one
+/// the code chooses.
+///
+/// The DROP is UNCONDITIONAL: `schema::apply` replays the whole additive ladder, so V093/V102
+/// recreate these triggers ahead of this migration on every `index --full`; short-circuiting on
+/// table shape would let the recreated triggers survive the replay.
+pub fn apply_syncable_overlay_tables(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS memory_reality_lens_revision_insert;
+         DROP TRIGGER IF EXISTS memory_reality_lens_revision_delete;
+         DROP TRIGGER IF EXISTS memory_reality_lens_revision_update;
+         DROP TRIGGER IF EXISTS memory_reality_lane_revision_insert;
+         DROP TRIGGER IF EXISTS memory_reality_lane_revision_delete;
+         DROP TRIGGER IF EXISTS memory_reality_lane_revision_update;
+         DROP TRIGGER IF EXISTS memory_summaries_lens_revision_insert;
+         DROP TRIGGER IF EXISTS memory_summaries_lens_revision_delete;
+         DROP TRIGGER IF EXISTS memory_summaries_lens_revision_update;
+         DROP TRIGGER IF EXISTS memory_summaries_lane_revision_insert;
+         DROP TRIGGER IF EXISTS memory_summaries_lane_revision_delete;
+         DROP TRIGGER IF EXISTS memory_summaries_lane_revision_update;",
     )
 }
 

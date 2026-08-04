@@ -319,7 +319,19 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
     }
 
     fn prepare(&mut self) -> anyhow::Result<()> {
-        rag_rat_oplog::table_sync_author_pending(self.conn, self.account_id, (self.now_fn)())?;
+        // Author local edits FIRST, then compact: the retention docs require the authoring pass to
+        // have run so a winner restamp never disowns an unsent local edit. `prepare` runs only when
+        // the local device can push, so a read-only peer never compacts. Compaction is a
+        // re-runnable steady-state no-op — bounded scopes (overlay/1) trim to their budget,
+        // fully-retained scopes (anchors/1) are inert.
+        let now_ms = (self.now_fn)();
+        rag_rat_oplog::table_sync_author_pending(self.conn, self.account_id, now_ms)?;
+        rag_rat_oplog::table_sync_compact_overdue(
+            self.conn,
+            self.account_id,
+            now_ms,
+            &rag_rat_oplog::scope_retention_budget,
+        )?;
         Ok(())
     }
 

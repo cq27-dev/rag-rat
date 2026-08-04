@@ -761,6 +761,211 @@ async fn production_anchors_replicate_through_dispatch_before_local_repo_registr
 }
 
 #[tokio::test]
+async fn production_overlay_replicates_summaries_and_verdicts() {
+    use rag_rat_sync::{
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,
+        accept_and_dispatch, connect_and_table_sync,
+    };
+
+    let owner = fresh_db();
+    let account = local_account(&owner, NOW).unwrap();
+    let joiner = fresh_db();
+    let (owner_endpoint, joiner_endpoint) = loopback_endpoints().await;
+    enroll_member_over_endpoint(
+        &owner_endpoint,
+        &joiner_endpoint,
+        &owner,
+        &joiner,
+        account,
+        "https://relay.example",
+    )
+    .await;
+
+    owner
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-a', 'repo-a', 0)",
+            [],
+        )
+        .unwrap();
+    rag_rat_oplog::ensure_repo_incarnation(&owner, "repo-a", NOW + 1).unwrap().unwrap();
+    // Regenerable dream output: one verdict (memory_reality) and one summary (memory_summaries).
+    owner
+        .execute(
+            "INSERT INTO memory_reality(
+                 memory_id, repo_id, content_hash, verdict, direction, checked_inputs_hash,
+                 evidence_json, model_id, prompt_version, checked_at_ms)
+             VALUES ('memory-a', 'repo-a', 'hash-a', 'confirmed', 'note_ahead', 'inputs-a',
+                     '[]', 'model-x', 'v1', ?1)",
+            [NOW + 2],
+        )
+        .unwrap();
+    owner
+        .execute(
+            "INSERT INTO memory_summaries(
+                 memory_id, repo_id, content_hash, summary, model_id, prompt_version,
+                 generated_at_ms)
+             VALUES ('memory-a', 'repo-a', 'hash-a', 'A concise summary.', 'model-x', 'v1', ?1)",
+            [NOW + 2],
+        )
+        .unwrap();
+    for entry in account_entries_for_sync(&owner, account).unwrap() {
+        rag_rat_oplog::account_ingest(&joiner, &entry.signed_bytes, NOW + 2).unwrap();
+    }
+    // The joiner is actively working in repo-a, so the apply-side lane bump has a registered repo
+    // to advance (the bump is gated on registration to avoid phantom rows on a peer that only
+    // relays).
+    joiner
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-a', 'repo-a', 0)",
+            [],
+        )
+        .unwrap();
+
+    let mut account_store = OplogSyncStore::new(&owner, account, || NOW);
+    let mut content_store = OplogContentSyncStore::new(&owner, account, || NOW);
+    let mut table_store = OplogTableSyncStore::new(&joiner, account, || NOW);
+    let server = accept_and_dispatch(
+        &owner_endpoint,
+        &mut account_store,
+        &mut content_store,
+        AuthPolicy::Closed,
+        || NOW,
+    );
+    let client = connect_and_table_sync(
+        &joiner_endpoint,
+        direct_addr(&owner_endpoint),
+        &mut table_store,
+        NOW,
+    );
+    let (server, client) = tokio::join!(server, client);
+    let (alpn, server_report) = server.unwrap();
+    let client_report = client.unwrap();
+    assert_eq!(alpn, TABLE_SYNC_ALPN);
+    assert_eq!(server_report.entries_sent, 2, "one verdict and one summary");
+    assert_eq!(client_report.entries_newly_stored, 2);
+
+    let verdict: String = joiner
+        .query_row(
+            "SELECT verdict FROM memory_reality WHERE repo_id = 'repo-a' AND memory_id = \
+             'memory-a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(verdict, "confirmed");
+    let summary: String = joiner
+        .query_row(
+            "SELECT summary FROM memory_summaries
+             WHERE repo_id = 'repo-a' AND memory_id = 'memory-a' AND content_hash = 'hash-a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(summary, "A concise summary.");
+    // The apply advanced the memories Lens lane on the receiver, so the synced rows surface in Lens
+    // without a local dream pass.
+    let lane: i64 = joiner
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM repo_meta
+             WHERE repo_id = 'repo-a' AND key = 'lens_memories_revision'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(lane >= 1, "applying overlay rows advances the memories lane");
+}
+
+#[tokio::test]
+async fn a_pruned_overlay_summary_is_removed_on_the_peer() {
+    use rag_rat_sync::{
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, accept_and_dispatch,
+        connect_and_table_sync,
+    };
+
+    let owner = fresh_db();
+    let account = local_account(&owner, NOW).unwrap();
+    let joiner = fresh_db();
+    let (owner_endpoint, joiner_endpoint) = loopback_endpoints().await;
+    enroll_member_over_endpoint(
+        &owner_endpoint,
+        &joiner_endpoint,
+        &owner,
+        &joiner,
+        account,
+        "https://relay.example",
+    )
+    .await;
+
+    owner
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-a', 'repo-a', 0)",
+            [],
+        )
+        .unwrap();
+    rag_rat_oplog::ensure_repo_incarnation(&owner, "repo-a", NOW + 1).unwrap().unwrap();
+    owner
+        .execute(
+            "INSERT INTO memory_summaries(
+                 memory_id, repo_id, content_hash, summary, model_id, prompt_version,
+                 generated_at_ms)
+             VALUES ('memory-a', 'repo-a', 'hash-old', 'Stale summary.', 'model-x', 'v1', ?1)",
+            [NOW + 2],
+        )
+        .unwrap();
+    for entry in account_entries_for_sync(&owner, account).unwrap() {
+        rag_rat_oplog::account_ingest(&joiner, &entry.signed_bytes, NOW + 2).unwrap();
+    }
+
+    let sync_once = async |owner: &_, joiner: &_| {
+        let mut account_store = OplogSyncStore::new(owner, account, || NOW);
+        let mut content_store = OplogContentSyncStore::new(owner, account, || NOW);
+        let mut table_store = OplogTableSyncStore::new(joiner, account, || NOW);
+        let server = accept_and_dispatch(
+            &owner_endpoint,
+            &mut account_store,
+            &mut content_store,
+            AuthPolicy::Closed,
+            || NOW,
+        );
+        let client = connect_and_table_sync(
+            &joiner_endpoint,
+            direct_addr(&owner_endpoint),
+            &mut table_store,
+            NOW,
+        );
+        let (server, client) = tokio::join!(server, client);
+        server.unwrap();
+        client.unwrap();
+    };
+
+    sync_once(&owner, &joiner).await;
+    let present: bool = joiner
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM memory_summaries WHERE content_hash = 'hash-old')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(present, "the summary replicates on the first pass");
+
+    // A newer note supersedes the old summary: the producer's prune deletes the old row locally,
+    // and the next authoring pass emits a Remove that must delete it on the peer too.
+    owner.execute("DELETE FROM memory_summaries WHERE content_hash = 'hash-old'", []).unwrap();
+    sync_once(&owner, &joiner).await;
+    let gone: bool = joiner
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM memory_summaries WHERE content_hash = 'hash-old')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(gone, "the pruned summary is removed on the peer");
+}
+
+#[tokio::test]
 async fn a_fresh_peer_converges_through_a_compacted_chain_via_the_advertised_floor() {
     use rag_rat_sync::{
         AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,
