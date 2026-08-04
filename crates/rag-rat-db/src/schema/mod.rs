@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 107;
+pub const LATEST_SCHEMA_VERSION: u32 = 108;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -805,6 +805,13 @@ const MIGRATION_107_DESCRIPTION: &str =
      overlay/1 table-sync scope applies these rows under whole-row LWW, and a trigger firing on a \
      wire-applied row is a device-local side effect; the dream write and the sync apply advance \
      the Lens lanes explicitly instead";
+const MIGRATION_108_ID: &str = "108_syncable_distill_records";
+const MIGRATION_108_CHECKSUM: &str = "sha256:rag-rat-syncable-distill-records-v108";
+const MIGRATION_108_DESCRIPTION: &str =
+    "Rebuild papertrail_distill onto the thread natural key (repo_id first), dropping the \
+     device-local AUTOINCREMENT id, so the distill/1 table-sync scope can replicate distilled \
+     records under whole-row LWW (#1135); also drops its Lens revision triggers (the sync apply \
+     advances the papertrail lane explicitly)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1019,6 +1026,7 @@ const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[
     MIGRATION_099_ID,
     MIGRATION_103_ID,
     MIGRATION_106_ID,
+    MIGRATION_108_ID,
 ];
 
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
@@ -1682,6 +1690,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_107_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_syncable_overlay_tables),
     },
+    Migration {
+        id: MIGRATION_108_ID,
+        checksum: MIGRATION_108_CHECKSUM,
+        description: MIGRATION_108_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_syncable_distill_records),
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -1909,6 +1923,7 @@ mod ledger_atomicity {
         MIGRATION_099_ID,
         MIGRATION_103_ID,
         MIGRATION_106_ID,
+        MIGRATION_108_ID,
     ];
 
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.

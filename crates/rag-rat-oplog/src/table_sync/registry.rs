@@ -255,18 +255,77 @@ const MEMORY_SUMMARIES: TableSpec = TableSpec {
     repo_column: Some("repo_id"),
 };
 
-/// The production table registry. `anchors/1` retains durable memory-binding history in full;
-/// `overlay/1` carries regenerable dream output (verdicts, summaries) under a bounded retention
-/// budget. The `distill/1` scope remains unregistered until its retention milestone.
-pub(crate) const SYNCABLE_TABLES: &[TableSpec] =
-    &[MEMORY_BINDINGS, MEMORY_REALITY, MEMORY_SUMMARIES];
+// A distilled papertrail record — costly LLM output keyed by the thread natural key. Every non-pk
+// column is portable derived output or a mechanical facet; the parent carries no checkout-local
+// resolution state (that lives on `papertrail_distill_anchors`, a later scope stage). The 0/1
+// verified/override facets declare `Bool` (wire-validated to 0/1); `quotes_materialized` and
+// `anchors_qualified_count` are COUNTS, so `I64`, as are timestamps and versions.
+const DISTILL_RECORD_PK: &[ColumnSpec] = &[
+    ColumnSpec::required("repo_id", ValueType::Text),
+    ColumnSpec::required("tracker", ValueType::Text),
+    ColumnSpec::required("project", ValueType::Text),
+    ColumnSpec::required("item_kind", ValueType::Text),
+    ColumnSpec::required("item_key", ValueType::Text),
+];
 
-/// Registered tables whose rows feed the per-repo memories Lens lane
-/// (`LENS_MEMORIES_REVISION_META`). The apply-side lane bump consults this because `IngestOutcome`
-/// does not name the applied table; keep it in sync with any memory-facing table added to
-/// [`SYNCABLE_TABLES`].
-pub(crate) const MEMORIES_LANE_TABLES: &[&str] =
-    &["repo_memory_bindings", "memory_reality", "memory_summaries"];
+const DISTILL_RECORD_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec::required("distill_input_hash", ValueType::Text),
+    ColumnSpec::required("pipeline_version", ValueType::I64),
+    ColumnSpec::required("root_issue", ValueType::Text),
+    ColumnSpec::required("root_cause", ValueType::Text),
+    ColumnSpec::required("root_cause_class", ValueType::Text),
+    ColumnSpec::required("decision_chosen", ValueType::Text),
+    ColumnSpec::required("outcome_summary", ValueType::Text),
+    ColumnSpec::required("outcome_status_model", ValueType::Text),
+    ColumnSpec::required("epistemic_status_decision", ValueType::Text),
+    ColumnSpec::required("epistemic_status_outcome", ValueType::Text),
+    ColumnSpec::required("fix_edge_source", ValueType::Text),
+    ColumnSpec::required("quotes_materialized", ValueType::I64),
+    ColumnSpec::required("anchors_qualified_count", ValueType::I64),
+    ColumnSpec::required("thread_shape", ValueType::Text),
+    ColumnSpec::required("outcome_claim_verified", ValueType::Bool),
+    ColumnSpec::required("decision_provenance_verified", ValueType::Bool),
+    ColumnSpec::required("revert_override", ValueType::Bool),
+    ColumnSpec::required("closing_keyword_floor", ValueType::Text),
+    ColumnSpec::required("distilled_at_ms", ValueType::I64),
+    ColumnSpec::required("prompt_version", ValueType::I64),
+    ColumnSpec::required("model_input_hash", ValueType::Text),
+];
+
+const DISTILL_RECORD: TableSpec = TableSpec {
+    name: "papertrail_distill",
+    scope_id: "distill/1",
+    spec_version: 1,
+    pk: DISTILL_RECORD_PK,
+    columns: DISTILL_RECORD_COLUMNS,
+    local_columns: &[],
+    repo_column: Some("repo_id"),
+};
+
+/// The production table registry. `anchors/1` retains durable memory-binding history in full;
+/// `overlay/1` carries regenerable dream output (verdicts, summaries) and `distill/1` the distilled
+/// papertrail records — both under a bounded retention budget.
+pub(crate) const SYNCABLE_TABLES: &[TableSpec] =
+    &[MEMORY_BINDINGS, MEMORY_REALITY, MEMORY_SUMMARIES, DISTILL_RECORD];
+
+/// The per-repo Lens lane metas a scope's applied rows advance — the aggregate enrichment clock
+/// plus the scope's specific lane. Returned to the apply-side and refold bump sites, which cannot
+/// always name the applied table but always know the stream/entry's `scope_id`. An unknown scope
+/// advances nothing. Keep in sync with the scopes in [`SYNCABLE_TABLES`].
+pub(crate) fn scope_lens_metas(scope_id: &str) -> &'static [&'static str] {
+    match scope_id {
+        // anchors/1 and overlay/1 are memory-facing scopes.
+        "anchors/1" | "overlay/1" => &[
+            rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+            rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+        ],
+        "distill/1" => &[
+            rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+            rag_rat_db::meta::LENS_PAPERTRAIL_REVISION_META,
+        ],
+        _ => &[],
+    }
+}
 
 /// One table's REPLICATED CONTRACT within a projector generation — everything that decides what
 /// this binary can project from the wire, and nothing that does not.
@@ -406,6 +465,108 @@ pub(crate) const PROJECTOR_GENERATIONS: &[&[TableGeneration]] = &[
                 ("model_id", ValueType::Text, None),
                 ("prompt_version", ValueType::Text, None),
                 ("generated_at_ms", ValueType::I64, None),
+            ],
+        },
+    ],
+    // v4: distilled papertrail records replicate on the bounded distill/1 stream. A generation is
+    // a whole-registry snapshot, so this repeats v3's three tables and adds the distill
+    // parent, in `SYNCABLE_TABLES` order.
+    &[
+        TableGeneration {
+            table: "repo_memory_bindings",
+            scope_id: "anchors/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("memory_id", ValueType::Text),
+                ("binding_kind", ValueType::Text),
+                ("binding_id", ValueType::Text),
+            ],
+            columns: &[
+                ("path", ValueType::Text, None),
+                ("start_line", ValueType::I64, None),
+                ("end_line", ValueType::I64, None),
+                ("commit_hash", ValueType::Text, None),
+                ("tracker", ValueType::Text, None),
+                ("project", ValueType::Text, None),
+                ("item_key", ValueType::Text, None),
+                ("created_at_ms", ValueType::I64, None),
+                ("symbol_kind", ValueType::Text, None),
+                ("signature_hash", ValueType::Text, None),
+                ("moniker_tool", ValueType::Text, None),
+                ("moniker_tool_version", ValueType::Text, None),
+            ],
+        },
+        TableGeneration {
+            table: "memory_reality",
+            scope_id: "overlay/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[("repo_id", ValueType::Text), ("memory_id", ValueType::Text)],
+            columns: &[
+                ("content_hash", ValueType::Text, None),
+                ("verdict", ValueType::Text, None),
+                ("direction", ValueType::Text, None),
+                ("checked_against_commit", ValueType::Text, None),
+                ("checked_inputs_hash", ValueType::Text, None),
+                ("evidence_json", ValueType::Text, None),
+                ("model_id", ValueType::Text, None),
+                ("prompt_version", ValueType::Text, None),
+                ("checked_at_ms", ValueType::I64, None),
+            ],
+        },
+        TableGeneration {
+            table: "memory_summaries",
+            scope_id: "overlay/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("memory_id", ValueType::Text),
+                ("content_hash", ValueType::Text),
+            ],
+            columns: &[
+                ("summary", ValueType::Text, None),
+                ("model_id", ValueType::Text, None),
+                ("prompt_version", ValueType::Text, None),
+                ("generated_at_ms", ValueType::I64, None),
+            ],
+        },
+        TableGeneration {
+            table: "papertrail_distill",
+            scope_id: "distill/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("tracker", ValueType::Text),
+                ("project", ValueType::Text),
+                ("item_kind", ValueType::Text),
+                ("item_key", ValueType::Text),
+            ],
+            columns: &[
+                ("distill_input_hash", ValueType::Text, None),
+                ("pipeline_version", ValueType::I64, None),
+                ("root_issue", ValueType::Text, None),
+                ("root_cause", ValueType::Text, None),
+                ("root_cause_class", ValueType::Text, None),
+                ("decision_chosen", ValueType::Text, None),
+                ("outcome_summary", ValueType::Text, None),
+                ("outcome_status_model", ValueType::Text, None),
+                ("epistemic_status_decision", ValueType::Text, None),
+                ("epistemic_status_outcome", ValueType::Text, None),
+                ("fix_edge_source", ValueType::Text, None),
+                ("quotes_materialized", ValueType::I64, None),
+                ("anchors_qualified_count", ValueType::I64, None),
+                ("thread_shape", ValueType::Text, None),
+                ("outcome_claim_verified", ValueType::Bool, None),
+                ("decision_provenance_verified", ValueType::Bool, None),
+                ("revert_override", ValueType::Bool, None),
+                ("closing_keyword_floor", ValueType::Text, None),
+                ("distilled_at_ms", ValueType::I64, None),
+                ("prompt_version", ValueType::I64, None),
+                ("model_input_hash", ValueType::Text, None),
             ],
         },
     ],
@@ -909,6 +1070,26 @@ mod tests {
             });
         }
         assert_registry_consistent(SYNCABLE_TABLES).unwrap();
+    }
+
+    /// Every registered scope must map to a non-empty Lens-lane set. `scope_lens_metas` is a
+    /// hand-maintained match on scope-id literals; without this a new scope silently drops Lens
+    /// invalidation (the apply/refold bump sites short-circuit cleanly on an empty set, so nothing
+    /// errors) — this test forces the match to be extended alongside `SYNCABLE_TABLES`.
+    #[test]
+    fn every_registered_scope_maps_to_a_lens_lane() {
+        for spec in SYNCABLE_TABLES {
+            assert!(
+                !scope_lens_metas(spec.scope_id).is_empty(),
+                "scope `{}` (table `{}`) has no scope_lens_metas entry",
+                spec.scope_id,
+                spec.name,
+            );
+        }
+        assert!(
+            scope_lens_metas("nonexistent/1").is_empty(),
+            "an unregistered scope bumps nothing"
+        );
     }
 
     /// The comparable shape of one generation: `(table, spec_version, [(column, in_version,

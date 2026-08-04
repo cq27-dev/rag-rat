@@ -966,6 +966,131 @@ async fn a_pruned_overlay_summary_is_removed_on_the_peer() {
 }
 
 #[tokio::test]
+async fn production_distill_records_replicate_and_regenerate() {
+    use rag_rat_sync::{
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,
+        accept_and_dispatch, connect_and_table_sync,
+    };
+
+    let owner = fresh_db();
+    let account = local_account(&owner, NOW).unwrap();
+    let joiner = fresh_db();
+    let (owner_endpoint, joiner_endpoint) = loopback_endpoints().await;
+    enroll_member_over_endpoint(
+        &owner_endpoint,
+        &joiner_endpoint,
+        &owner,
+        &joiner,
+        account,
+        "https://relay.example",
+    )
+    .await;
+
+    for db in [&owner, &joiner] {
+        db.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-a', 'repo-a', 0)",
+            [],
+        )
+        .unwrap();
+    }
+    rag_rat_oplog::ensure_repo_incarnation(&owner, "repo-a", NOW + 1).unwrap().unwrap();
+    // A distilled record for a closed issue thread; also seed a sibling repo's record to prove
+    // cross-repo isolation (repo-b never rides repo-a's stream).
+    let seed_record = |item_key: &str, repo: &str, hash: &str, cause: &str| {
+        owner
+            .execute(
+                "INSERT INTO papertrail_distill
+                     (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+                      root_cause, fix_edge_source, thread_shape, distilled_at_ms, repo_id)
+                 VALUES ('github', 'o/r', 'issue', ?1, ?2, 2, ?3, 'provider', 'investigation',
+                         ?4, ?5)",
+                rusqlite::params![item_key, hash, cause, NOW + 2, repo],
+            )
+            .unwrap();
+    };
+    seed_record("7", "repo-a", "sha256:in-a", "the original cause");
+    owner
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-b', 'repo-b', 0)",
+            [],
+        )
+        .unwrap();
+    seed_record("9", "repo-b", "sha256:in-b", "a sibling repo cause");
+
+    for entry in account_entries_for_sync(&owner, account).unwrap() {
+        rag_rat_oplog::account_ingest(&joiner, &entry.signed_bytes, NOW + 2).unwrap();
+    }
+
+    // Whole-row LWW resolves by lamport (authoring increments it), not wall-clock, so both passes
+    // use the same clock — the regeneration below still wins on its higher authored lamport.
+    let reconcile = async || {
+        let mut account_store = OplogSyncStore::new(&owner, account, || NOW);
+        let mut content_store = OplogContentSyncStore::new(&owner, account, || NOW);
+        let mut table_store = OplogTableSyncStore::new(&joiner, account, || NOW);
+        let server = accept_and_dispatch(
+            &owner_endpoint,
+            &mut account_store,
+            &mut content_store,
+            AuthPolicy::Closed,
+            || NOW,
+        );
+        let client = connect_and_table_sync(
+            &joiner_endpoint,
+            direct_addr(&owner_endpoint),
+            &mut table_store,
+            NOW,
+        );
+        let (server, client) = tokio::join!(server, client);
+        let (alpn, _) = server.unwrap();
+        client.unwrap();
+        assert_eq!(alpn, TABLE_SYNC_ALPN);
+    };
+
+    reconcile().await;
+    let cause: String = joiner
+        .query_row(
+            "SELECT root_cause FROM papertrail_distill
+             WHERE repo_id = 'repo-a' AND item_kind = 'issue' AND item_key = '7'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cause, "the original cause", "the distilled record replicates");
+    // repo-a advertises no route for repo-b's incarnation, so repo-b's record never lands.
+    let sibling: bool = joiner
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM papertrail_distill WHERE repo_id = 'repo-b')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!sibling, "a sibling repo's distilled record never crosses repo-a's stream");
+
+    // Regeneration: the record is re-distilled (new distill_input_hash + fields). A whole-row LWW
+    // upsert on the stable natural key replaces it on the peer.
+    owner
+        .execute(
+            "UPDATE papertrail_distill
+             SET distill_input_hash = 'sha256:in-a2', root_cause = 'the regenerated cause'
+             WHERE repo_id = 'repo-a' AND item_key = '7'",
+            [],
+        )
+        .unwrap();
+    reconcile().await;
+    let regenerated: String = joiner
+        .query_row(
+            "SELECT root_cause FROM papertrail_distill
+             WHERE repo_id = 'repo-a' AND item_kind = 'issue' AND item_key = '7'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(regenerated, "the regenerated cause", "regeneration upserts the record on the peer");
+}
+
+#[tokio::test]
 async fn a_fresh_peer_converges_through_a_compacted_chain_via_the_advertised_floor() {
     use rag_rat_sync::{
         AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,

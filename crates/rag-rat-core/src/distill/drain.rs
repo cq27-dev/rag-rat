@@ -838,6 +838,10 @@ fn persist_success(
         params![repo_id, job.queue_id, job.enqueued_at_ms, job.attempts],
     )?;
     anyhow::ensure!(deleted == 1, "distill queue identity changed inside success transaction");
+    // The record's model output changed, so advance the papertrail Lens lane (V108 dropped the
+    // `papertrail_distill` row triggers). In this same IMMEDIATE transaction, so Lens sees the
+    // write and the lane bump atomically.
+    super::bump_papertrail_lens_lanes(conn, repo_id)?;
     Ok(true)
 }
 
@@ -1033,6 +1037,25 @@ mod tests {
         migrations::apply_distill_safe_input_snapshot(&conn).unwrap();
         migrations::apply_distill_enriched_context(&conn).unwrap();
         migrations::apply_distill_evidence_source_part(&conn).unwrap();
+        // `persist_success` advances the papertrail Lens lane, which needs a registered repo and
+        // the `repo_meta` sink (V108 dropped the row triggers). This partial fixture
+        // predates the full schema, so create both and register the repo the seeds use.
+        conn.execute_batch(
+            "CREATE TABLE repos(
+                 repo_id TEXT NOT NULL PRIMARY KEY,
+                 display_name TEXT,
+                 registered_at_ms INTEGER NOT NULL
+             ) STRICT;
+             INSERT INTO repos(repo_id, display_name, registered_at_ms)
+                 VALUES ('repo', 'repo', 0);
+             CREATE TABLE repo_meta(
+                 repo_id TEXT NOT NULL,
+                 key TEXT NOT NULL,
+                 value TEXT,
+                 PRIMARY KEY(repo_id, key)
+             ) STRICT;",
+        )
+        .unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
@@ -1518,6 +1541,14 @@ mod tests {
                  repo_id TEXT NOT NULL, PRIMARY KEY(repo_id, hash)
              ) STRICT;
              CREATE TABLE model_probe(value INTEGER NOT NULL);
+             CREATE TABLE repos(
+                 repo_id TEXT NOT NULL PRIMARY KEY, display_name TEXT,
+                 registered_at_ms INTEGER NOT NULL
+             ) STRICT;
+             INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo', 'repo', 0);
+             CREATE TABLE repo_meta(
+                 repo_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT, PRIMARY KEY(repo_id, key)
+             ) STRICT;
              PRAGMA journal_mode = WAL;",
         )
         .unwrap();

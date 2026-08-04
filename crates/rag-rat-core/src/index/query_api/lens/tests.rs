@@ -308,6 +308,13 @@ fn lens_version_tracks_binding_validation_and_in_place_enrichment_updates() {
         [&db.active_repo_id],
     )
     .unwrap();
+    // papertrail_distill syncs on distill/1 and is trigger-free (V108); the extract/drain writers
+    // advance the papertrail lane explicitly, mirrored here.
+    rag_rat_db::meta::bump_lens_revisions(conn, &db.active_repo_id, &[
+        rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+        rag_rat_db::meta::LENS_PAPERTRAIL_REVISION_META,
+    ])
+    .unwrap();
     let after_distill_update = db.lens_version().unwrap();
     assert_ne!(
         before_distill_update.revision, after_distill_update.revision,

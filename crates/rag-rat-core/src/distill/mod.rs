@@ -25,3 +25,26 @@ pub use drain::DistillDrainReport;
 pub(crate) use drain::{drain, pending_count};
 pub use extract::ExtractReport;
 pub(crate) use extract::{enqueue_eligible, extract};
+
+/// Advance the per-repo papertrail Lens lanes a distill write feeds — the aggregate enrichment
+/// clock and the papertrail lane.
+///
+/// This is the explicit replacement for the `papertrail_distill` revision triggers V108 dropped:
+/// the table syncs on `distill/1`, and a trigger firing on a whole-row-LWW apply is a device-local
+/// side effect the sync apply must not have. So the extract/drain writers advance the lanes here
+/// and the sync apply advances them at its own site. Call it on the SAME connection as the write,
+/// once per pass (matching the old trigger's per-write bump collapses to per-pass — the lane is a
+/// monotonic counter). Gated on repo registration: an ungated `bump_lens_revisions` throws on the
+/// `repo_meta`→`repos` foreign key, and it avoids phantom `'__unassigned__'` rows.
+pub(crate) fn bump_papertrail_lens_lanes(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+) -> rusqlite::Result<()> {
+    if rag_rat_db::schema::repo_id_is_registered(conn, repo_id)? {
+        rag_rat_db::meta::bump_lens_revisions(conn, repo_id, &[
+            rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+            rag_rat_db::meta::LENS_PAPERTRAIL_REVISION_META,
+        ])?;
+    }
+    Ok(())
+}

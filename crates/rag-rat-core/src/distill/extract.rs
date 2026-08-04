@@ -289,13 +289,16 @@ pub(crate) fn extract(
             .collect();
 
         let mut report = ExtractReport { eligible: plans.len(), ..Default::default() };
-        // Reconcile against the planned set: a persisted record whose thread is still mirrored but no
-        // longer planned — a reopened issue, an un-merged PR, or a PR now coalesced into an issue —
-        // loses its stale record/junctions/queue so consumers never see an ineligible or duplicate
-        // record. A record whose thread the mirror no longer carries is left untouched (see above).
+        // Reconcile against the planned set: a persisted record whose thread is still mirrored but
+        // no longer planned — a reopened issue, an un-merged PR, or a PR now coalesced into
+        // an issue — loses its stale record/junctions/queue so consumers never see an
+        // ineligible or duplicate record. A record whose thread the mirror no longer
+        // carries is left untouched (see above).
+        let mut records_deleted = 0usize;
         for existing in load_record_keys(conn, &repo_id)? {
             if mirrored.contains(&existing) && !planned.contains(&existing) {
                 delete_record(conn, &repo_id, &existing)?;
+                records_deleted += 1;
             }
         }
         // The cheap sync enqueue queues eligible PRs BEFORE extraction runs, so a thread queued but
@@ -328,6 +331,12 @@ pub(crate) fn extract(
                 OutcomeStatus::Reverted => report.mechanical_reverted += 1,
                 _ => report.mechanical_unclear += 1,
             }
+        }
+        // A pass that wrote or deleted any record changed papertrail-distill state, so advance the
+        // papertrail Lens lane (V108 dropped the row triggers). Once per pass, inside this txn; a
+        // no-op pass (no plans, no reconcile deletes) leaves the lane untouched.
+        if report.records_written > 0 || records_deleted > 0 {
+            super::bump_papertrail_lens_lanes(conn, &repo_id)?;
         }
         Ok(report)
     })
@@ -3397,8 +3406,9 @@ mod tests {
 
         // The local mirror no longer carries the thread — a thin/empty-mirror device (fresh
         // enrollment, or a roster peer without tracker credentials), or an item deleted upstream.
-        // Absent from the mirror is "no opinion", never "delete": once distill/1 replicates records,
-        // deleting here would author a `Remove` that wipes the fleet's records (#1135).
+        // Absent from the mirror is "no opinion", never "delete": once distill/1 replicates
+        // records, deleting here would author a `Remove` that wipes the fleet's records
+        // (#1135).
         conn.execute("DELETE FROM papertrail_items", []).unwrap();
         let report = extract(&conn, None, &ExtractOptions::default()).unwrap();
         assert_eq!(report.records_written, 0, "an empty mirror plans nothing");
@@ -3407,6 +3417,33 @@ mod tests {
             1,
             "a record whose thread the mirror no longer carries is preserved, not reconciled away",
         );
+    }
+
+    #[test]
+    fn an_extraction_that_writes_a_record_advances_the_papertrail_lens_lane() {
+        let conn = scoped_conn("repoA");
+        // V108 dropped the papertrail_distill triggers, so the extract pass advances the lane
+        // explicitly — gated on repo registration.
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repoA', 'repoA', \
+             0)",
+            [],
+        )
+        .unwrap();
+        seed_item(&conn, "repoA", "issue", "7", "A bug.", "closed", None);
+        let lane = || -> i64 {
+            conn.query_row(
+                "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM repo_meta
+                     WHERE repo_id = 'repoA' AND key = 'lens_papertrail_revision'), 0)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let before = lane();
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        assert_eq!(distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill"), 1);
+        assert!(lane() > before, "writing a distilled record advances the papertrail lane");
     }
 
     #[test]

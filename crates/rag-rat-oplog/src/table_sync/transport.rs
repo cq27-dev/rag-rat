@@ -9,7 +9,7 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::engine::{self, IngestOutcome, SyncCtx};
-use super::registry::{MEMORIES_LANE_TABLES, SYNCABLE_TABLES, TableSpec};
+use super::registry::{SYNCABLE_TABLES, TableSpec, scope_lens_metas};
 use super::scope_stream::scope_stream_id;
 use super::{retention, store};
 use crate::AccountId;
@@ -212,9 +212,16 @@ pub fn table_sync_author_pending(
 /// accepted entries. An unknown scope defaults to full retention.
 pub const OVERLAY_ACCEPTED_RETENTION: u64 = 256;
 
+/// `distill/1` is higher-churn than overlay: one record regeneration authors a burst of entries
+/// across the cluster, so the budget must clear several full-cluster regenerations before the
+/// retained floor advances. A large initial backfill exceeds this immediately and converges through
+/// the retained-floor/compaction path — by design, not loss.
+pub const DISTILL_ACCEPTED_RETENTION: u64 = 512;
+
 pub fn scope_retention_budget(scope_id: &str) -> Option<u64> {
     match scope_id {
         "overlay/1" => Some(OVERLAY_ACCEPTED_RETENTION),
+        "distill/1" => Some(DISTILL_ACCEPTED_RETENTION),
         _ => None,
     }
 }
@@ -743,22 +750,19 @@ fn ingest_against(
         advertised_floor
             .map(|(lamport, entry_hash)| store::AdvertisedFloor { lamport, entry_hash }),
     )?;
-    // An applied row on this stream changed derived memory state, so advance the memories Lens
-    // lanes (the explicit replacement for the row triggers overlay/1 and anchors/1 dropped). The
+    // An applied row on this stream changed derived state, so advance the Lens lanes that scope
+    // feeds (the explicit replacement for the row triggers the synced scopes dropped). All entries
+    // in one ingest belong to one stream, hence one scope, so `scope_lens_metas(stream.scope_id)`
+    // is the exact lane set even though `IngestOutcome` does not name the applied table. The
     // registered-repo gate matches the dropped triggers and avoids phantom `'__unassigned__'` rows.
-    // `IngestOutcome` does not name the applied table, so this bumps whenever a memories-lane table
-    // is registered at all — correct while every registered table (bindings, memory_reality,
-    // memory_summaries) feeds this lane; revisit the gate if a non-memory table ever registers.
-    if registry.iter().any(|spec| MEMORIES_LANE_TABLES.contains(&spec.name))
+    let lens_metas = scope_lens_metas(&stream.scope_id);
+    if !lens_metas.is_empty()
         && std::iter::once(&report.outcome)
             .chain(report.promoted.iter())
             .any(|outcome| matches!(outcome, IngestOutcome::Applied))
         && rag_rat_db::schema::repo_id_is_registered(&tx, &stream.repo_id)?
     {
-        rag_rat_db::meta::bump_lens_revisions(&tx, &stream.repo_id, &[
-            rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
-            rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
-        ])?;
+        rag_rat_db::meta::bump_lens_revisions(&tx, &stream.repo_id, lens_metas)?;
     }
     tx.commit()?;
     Ok(match report.outcome {
@@ -942,8 +946,8 @@ mod tests {
     #[test]
     fn scope_retention_budget_bounds_overlay_and_leaves_anchors_full() {
         assert_eq!(scope_retention_budget("overlay/1"), Some(OVERLAY_ACCEPTED_RETENTION));
+        assert_eq!(scope_retention_budget("distill/1"), Some(DISTILL_ACCEPTED_RETENTION));
         assert_eq!(scope_retention_budget("anchors/1"), None);
-        assert_eq!(scope_retention_budget("distill/1"), None);
         assert_eq!(scope_retention_budget("unknown/1"), None);
     }
 
@@ -1318,10 +1322,11 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_advertises_anchors_and_overlay_per_current_repo() {
+    fn production_registry_advertises_every_scope_per_current_repo() {
         let conn = database();
         let streams = table_sync_supported_streams(&conn, account()).unwrap();
-        // Each current repo advertises one stream per registered scope: anchors/1 and overlay/1.
+        // Each current repo advertises one stream per registered scope: anchors/1, overlay/1,
+        // distill/1.
         let mut pairs: Vec<(String, String)> = streams
             .iter()
             .map(|stream| (stream.repo_id.clone(), stream.scope_id.clone()))
@@ -1329,8 +1334,10 @@ mod tests {
         pairs.sort();
         assert_eq!(pairs, vec![
             ("repo-a".to_string(), "anchors/1".to_string()),
+            ("repo-a".to_string(), "distill/1".to_string()),
             ("repo-a".to_string(), "overlay/1".to_string()),
             ("repo-b".to_string(), "anchors/1".to_string()),
+            ("repo-b".to_string(), "distill/1".to_string()),
             ("repo-b".to_string(), "overlay/1".to_string()),
         ]);
     }

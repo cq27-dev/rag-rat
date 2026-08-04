@@ -6406,6 +6406,70 @@ mod syncable_overlay_migration_tests {
         .unwrap();
         assert_eq!(before, lane().unwrap(), "a raw overlay write must not move the lane");
     }
+
+    /// V108 rebuilds `papertrail_distill` onto the thread natural key, drops the device-local `id`,
+    /// and drops its papertrail-lane triggers — and stays that way across a full ladder replay
+    /// (V093/V102 recreate the triggers ahead of V108 on every `index --full`).
+    #[test]
+    fn v108_rebuilds_distill_to_the_natural_key_and_drops_triggers_across_a_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        assert_eq!(triggers_on(&conn, "papertrail_distill"), 0);
+        assert_eq!(primary_key_columns(&conn, "papertrail_distill").unwrap(), [
+            "repo_id",
+            "tracker",
+            "project",
+            "item_kind",
+            "item_key"
+        ]);
+        let has_id: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('papertrail_distill') WHERE name = 'id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_id, 0, "the device-local AUTOINCREMENT id is dropped");
+    }
+
+    /// The rebuild copies every row: a distilled record present in the pre-V108 shape survives,
+    /// re-keyed by its natural key.
+    #[test]
+    fn v108_preserves_distilled_records_through_the_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::apply_distill_record_store(&conn).unwrap();
+        // V079 adds the two columns the rebuild's INSERT..SELECT reads.
+        super::apply_distill_safe_input_snapshot(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill
+                 (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+                  root_cause, fix_edge_source, thread_shape, distilled_at_ms, repo_id)
+             VALUES ('github', 'o/r', 'issue', '7', 'sha256:in', 2, 'the cause', 'provider',
+                     'investigation', 1, 'r')",
+            [],
+        )
+        .unwrap();
+        super::apply_syncable_distill_records(&conn).unwrap();
+        let (cause, pipeline): (String, i64) = conn
+            .query_row(
+                "SELECT root_cause, pipeline_version FROM papertrail_distill
+                 WHERE repo_id = 'r' AND tracker = 'github' AND project = 'o/r'
+                   AND item_kind = 'issue' AND item_key = '7'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cause, "the cause");
+        assert_eq!(pipeline, 2);
+        assert_eq!(primary_key_columns(&conn, "papertrail_distill").unwrap(), [
+            "repo_id",
+            "tracker",
+            "project",
+            "item_kind",
+            "item_key"
+        ]);
+    }
 }
 
 /// V095 (#1002): per-TABLE spec versioning, plus a direct pointer from a row to its winning entry.
@@ -7570,6 +7634,93 @@ pub fn apply_syncable_overlay_tables(conn: &Connection) -> rusqlite::Result<()> 
          DROP TRIGGER IF EXISTS memory_summaries_lane_revision_insert;
          DROP TRIGGER IF EXISTS memory_summaries_lane_revision_delete;
          DROP TRIGGER IF EXISTS memory_summaries_lane_revision_update;",
+    )
+}
+
+/// V108 (#1135): make `papertrail_distill` a deterministic whole-row table for `distill/1`.
+///
+/// The old shape keyed on an AUTOINCREMENT `id` (device-local, non-deterministic) with the thread
+/// natural key only as a UNIQUE index — incompatible with whole-row LWW sync. The rebuilt table
+/// keys on `(repo_id, tracker, project, item_kind, item_key)` (repo_id part of the PK, as the
+/// transport requires), drops `id`, has no FK or triggers, and adds the `CHECK(x IN (0,1))` the
+/// store lint asks for on the genuine boolean facets (NOT on `quotes_materialized`/
+/// `anchors_qualified_count`, which are counts). Children reference the thread by its natural key,
+/// never `id`, so dropping it breaks nothing.
+///
+/// The trigger DROP is UNCONDITIONAL and precedes the shape short-circuit: `schema::apply` replays
+/// the whole ladder, so V093/V102 recreate the papertrail-lane triggers ahead of this migration on
+/// every `index --full`. Under `distill/1` a row arrives by whole-row LWW, so the distill write and
+/// the sync apply advance the papertrail Lens lane explicitly instead of via a trigger.
+pub fn apply_syncable_distill_records(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS papertrail_distill_lens_revision_insert;
+         DROP TRIGGER IF EXISTS papertrail_distill_lens_revision_delete;
+         DROP TRIGGER IF EXISTS papertrail_distill_lens_revision_update;
+         DROP TRIGGER IF EXISTS papertrail_distill_lane_revision_insert;
+         DROP TRIGGER IF EXISTS papertrail_distill_lane_revision_delete;
+         DROP TRIGGER IF EXISTS papertrail_distill_lane_revision_update;",
+    )?;
+    if table_is_strict(conn, "papertrail_distill")?
+        && primary_key_columns(conn, "papertrail_distill")?
+            == ["repo_id", "tracker", "project", "item_kind", "item_key"]
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS papertrail_distill_v108;
+         CREATE TABLE papertrail_distill_v108(
+             tracker TEXT NOT NULL,
+             project TEXT NOT NULL,
+             item_kind TEXT NOT NULL,
+             item_key TEXT NOT NULL,
+             distill_input_hash TEXT NOT NULL,
+             pipeline_version INTEGER NOT NULL,
+             root_issue TEXT,
+             root_cause TEXT,
+             root_cause_class TEXT,
+             decision_chosen TEXT,
+             outcome_summary TEXT,
+             outcome_status_model TEXT,
+             epistemic_status_decision TEXT,
+             epistemic_status_outcome TEXT,
+             fix_edge_source TEXT NOT NULL,
+             -- COUNTS, not booleans (quotes_materialized is the evidence-unit count) — no 0/1 \
+         CHECK.
+             quotes_materialized INTEGER NOT NULL DEFAULT 0,
+             anchors_qualified_count INTEGER NOT NULL DEFAULT 0,
+             thread_shape TEXT NOT NULL,
+             -- Genuine 0/1 facets: carry the CHECK the store lint asks for (Bool has no pragma the
+             -- lint can require it through).
+             outcome_claim_verified INTEGER NOT NULL DEFAULT 0
+                 CHECK(outcome_claim_verified IN (0, 1)),
+             decision_provenance_verified INTEGER NOT NULL DEFAULT 0
+                 CHECK(decision_provenance_verified IN (0, 1)),
+             revert_override INTEGER NOT NULL DEFAULT 0 CHECK(revert_override IN (0, 1)),
+             closing_keyword_floor TEXT,
+             distilled_at_ms INTEGER NOT NULL,
+             repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+             prompt_version INTEGER,
+             model_input_hash TEXT,
+             PRIMARY KEY(repo_id, tracker, project, item_kind, item_key)
+         ) STRICT;
+         INSERT INTO papertrail_distill_v108(
+             tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+             root_issue, root_cause, root_cause_class, decision_chosen, outcome_summary,
+             outcome_status_model, epistemic_status_decision, epistemic_status_outcome,
+             fix_edge_source, quotes_materialized, anchors_qualified_count, thread_shape,
+             outcome_claim_verified, decision_provenance_verified, revert_override,
+             closing_keyword_floor, distilled_at_ms, repo_id, prompt_version, model_input_hash)
+         SELECT
+             tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+             root_issue, root_cause, root_cause_class, decision_chosen, outcome_summary,
+             outcome_status_model, epistemic_status_decision, epistemic_status_outcome,
+             fix_edge_source, quotes_materialized, anchors_qualified_count, thread_shape,
+             outcome_claim_verified, decision_provenance_verified, revert_override,
+             closing_keyword_floor, distilled_at_ms, repo_id, prompt_version, model_input_hash
+         FROM papertrail_distill;
+         DROP TABLE papertrail_distill;
+         ALTER TABLE papertrail_distill_v108 RENAME TO papertrail_distill;",
     )
 }
 

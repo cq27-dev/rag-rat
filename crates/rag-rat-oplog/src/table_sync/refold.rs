@@ -38,7 +38,7 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::apply::{self, ApplyOutcome};
-use super::registry::{MEMORIES_LANE_TABLES, TableSpec};
+use super::registry::TableSpec;
 use super::row_op::{self, DecodedRowOp};
 use super::store::{self, PendingEntry, PendingReason, Worklist};
 use crate::entry;
@@ -57,7 +57,7 @@ use crate::op::OpMeta;
 /// registering a table or widening a spec forces an append, and an append is the bump. A widening
 /// that is not a registry change (a new row-op kind) still has to append a generation by hand,
 /// repeating the previous snapshot.
-pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 3;
+pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 4;
 
 const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
 
@@ -321,22 +321,19 @@ fn replay_pending_entry(
     }
     let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
     match apply::apply_row_op_on_stream(tx, spec, &context.repo_id, pending.stream_id, &op, meta)? {
-        // Folded and CHANGED the projection: advance the memories Lens lanes so a row landed by
-        // replay (e.g. an entry parked as `NewerSpecVersion` by an older binary, applied here after
-        // the upgrade) surfaces in Lens without waiting for an unrelated write. Mirrors the
-        // direct-ingest bump; gated on repo registration for the same reason (no phantom
-        // `'__unassigned__'` `repo_meta` rows). Unlike the ingest site, replay holds the exact
-        // `spec`, so it gates on the applied table feeding the memories lane rather than
-        // approximating over the whole registry — a future non-memory scope replays without
-        // a spurious bump.
+        // Folded and CHANGED the projection: advance the Lens lanes the applied table's scope feeds
+        // so a row landed by replay (e.g. an entry parked as `NewerSpecVersion` by an older binary,
+        // applied here after the upgrade) surfaces in Lens without waiting for an unrelated write.
+        // Mirrors the direct-ingest bump; gated on repo registration for the same reason (no
+        // phantom `'__unassigned__'` `repo_meta` rows). `scope_lens_metas` returns the
+        // exact lane set for the applied entry's scope (memories for anchors/overlay,
+        // papertrail for distill), so an unsupported scope bumps nothing.
         ApplyOutcome::Applied => {
-            if MEMORIES_LANE_TABLES.contains(&spec.name)
+            let lens_metas = super::registry::scope_lens_metas(&context.scope_id);
+            if !lens_metas.is_empty()
                 && rag_rat_db::schema::repo_id_is_registered(tx, &context.repo_id)?
             {
-                rag_rat_db::meta::bump_lens_revisions(tx, &context.repo_id, &[
-                    rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
-                    rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
-                ])?;
+                rag_rat_db::meta::bump_lens_revisions(tx, &context.repo_id, lens_metas)?;
             }
             store::clear_entry_pending(tx, &pending.entry_hash)
         },
@@ -755,7 +752,7 @@ mod tests {
         .unwrap()
     }
 
-    /// The refold guard (`MEMORIES_LANE_TABLES.contains(&spec.name)`) fires for a memory-lane
+    /// The refold guard (`scope_lens_metas` for the applied entry's scope) fires for a memory-lane
     /// table: a `memory_reality` row parked as `NewerSpecVersion` and applied on refold
     /// advances the memories Lens lane, so a row landed by replay surfaces in Lens without an
     /// unrelated write.
