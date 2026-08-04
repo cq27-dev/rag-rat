@@ -270,12 +270,31 @@ pub(crate) fn extract(
             })
             .collect();
 
+        // The threads this device actually mirrors. A record whose thread is ABSENT here is "no
+        // opinion, never delete" — not "delete": once `distill/1` replicates these records (#1135),
+        // `delete_record` authors a producer `Remove`, so a thin/empty-mirror device (fresh
+        // enrollment, or a roster peer without tracker credentials — exactly whom the roster-only
+        // scope serves) would otherwise reconcile its empty plan into Removes that wipe the fleet's
+        // distilled records. Only a thread STILL mirrored but no longer eligible is stale here.
+        let mirrored: BTreeSet<RecordKey> = items
+            .iter()
+            .map(|item| {
+                (
+                    item.tracker.clone(),
+                    item.project.clone(),
+                    item.kind.as_db_str().to_string(),
+                    item.key.clone(),
+                )
+            })
+            .collect();
+
         let mut report = ExtractReport { eligible: plans.len(), ..Default::default() };
-        // Reconcile against the planned set: any persisted record no longer planned — a reopened
-        // issue, an un-merged PR, or a PR now coalesced into an issue — loses its stale
-        // record/junctions/queue so consumers never see an ineligible or duplicate record.
+        // Reconcile against the planned set: a persisted record whose thread is still mirrored but no
+        // longer planned — a reopened issue, an un-merged PR, or a PR now coalesced into an issue —
+        // loses its stale record/junctions/queue so consumers never see an ineligible or duplicate
+        // record. A record whose thread the mirror no longer carries is left untouched (see above).
         for existing in load_record_keys(conn, &repo_id)? {
-            if !planned.contains(&existing) {
+            if mirrored.contains(&existing) && !planned.contains(&existing) {
                 delete_record(conn, &repo_id, &existing)?;
             }
         }
@@ -3367,6 +3386,27 @@ mod tests {
             "the ineligible record is reconciled away",
         );
         assert_eq!(distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill_queue"), 0);
+    }
+
+    #[test]
+    fn a_record_whose_thread_is_absent_from_the_mirror_is_preserved_not_reconciled_away() {
+        let conn = scoped_conn("repoA");
+        seed_item(&conn, "repoA", "issue", "7", "A bug.", "closed", None);
+        extract(&conn, None, &ExtractOptions::default()).unwrap();
+        assert_eq!(distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill"), 1);
+
+        // The local mirror no longer carries the thread — a thin/empty-mirror device (fresh
+        // enrollment, or a roster peer without tracker credentials), or an item deleted upstream.
+        // Absent from the mirror is "no opinion", never "delete": once distill/1 replicates records,
+        // deleting here would author a `Remove` that wipes the fleet's records (#1135).
+        conn.execute("DELETE FROM papertrail_items", []).unwrap();
+        let report = extract(&conn, None, &ExtractOptions::default()).unwrap();
+        assert_eq!(report.records_written, 0, "an empty mirror plans nothing");
+        assert_eq!(
+            distill_count(&conn, "SELECT COUNT(*) FROM papertrail_distill"),
+            1,
+            "a record whose thread the mirror no longer carries is preserved, not reconciled away",
+        );
     }
 
     #[test]
