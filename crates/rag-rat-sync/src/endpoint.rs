@@ -33,14 +33,15 @@ use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 
 use crate::auth::{
-    AuthConfig, AuthPolicy, AuthRole, DEFAULT_PRE_AUTH_TIMEOUT, NodeAuth, run_auth_phase,
+    AuthConfig, AuthPolicy, AuthRole, DEFAULT_PRE_AUTH_TIMEOUT, NodeAuth, Selected, run_auth_phase,
+    run_auth_phase_selected,
 };
 use crate::enrollment::{
     ENROLL_ALPN, EnrollmentAcceptorOutcome, EnrollmentReceipt, EnrollmentRequest, InviteError,
     RESPONSE_ACK, RESPONSE_ACK_TIMEOUT, run_enrollment_acceptor, run_enrollment_dialer,
 };
 use crate::session::{DEFAULT_IDLE_TIMEOUT, SessionError, SessionReport, SyncStore, run_session};
-use crate::store::OplogSyncStore;
+use crate::store::{OplogContentSyncStore, OplogSyncStore};
 use crate::table_session::{
     TableSessionError, TableSessionReport, TableSyncStore, run_table_session,
 };
@@ -850,6 +851,145 @@ where
         }
     };
     // Keep the acceptor alive until the dialer reads its final acknowledgement and closes.
+    let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
+    conn.close(0u32.into(), b"done");
+    Ok((alpn, report))
+}
+
+/// One account a multi-account host serves: the account-log + content stores (BOTH for that one
+/// account) and its per-account admission [`AuthPolicy`]. A host holds a bounded slice of these; a
+/// connection selects one by the account the dialer names.
+///
+/// Constructed only through [`HostedAccount::new`], which REFUSES a `sync`/`content` pair for
+/// different accounts — the same invariant [`dispatch_connection`] enforces at runtime, lifted to
+/// construction so a misaligned pair (a content store for account B behind account A's log) is
+/// unrepresentable and can never serve one account's content to another's authenticated peer. The
+/// caller is responsible for passing DISTINCT accounts in the hosted slice; a duplicate account id
+/// is served by its first entry.
+pub struct HostedAccount<'a> {
+    sync: OplogSyncStore<'a>,
+    content: OplogContentSyncStore<'a>,
+    policy: AuthPolicy,
+}
+
+impl<'a> HostedAccount<'a> {
+    /// Bind an account's `sync` + `content` stores and its admission `policy` for hosting. Errors
+    /// if the two stores are for different accounts — the cross-account-content isolation
+    /// guard.
+    pub fn new(
+        sync: OplogSyncStore<'a>,
+        content: OplogContentSyncStore<'a>,
+        policy: AuthPolicy,
+    ) -> Result<Self, SyncFailure> {
+        if sync.account_id() != content.account_id() {
+            return Err(SyncFailure::Endpoint(EndpointError::Connect(
+                "account and content stores are for different accounts".into(),
+            )));
+        }
+        Ok(Self { sync, content, policy })
+    }
+}
+
+/// Accept ONE inbound connection and run its session for whichever of the host's BOUNDED SET of
+/// `accounts` the dialer names in its auth frame — one endpoint fronting N accounts (one store pair
+/// each). The dialer's named account selects the store pair, then the negotiated ALPN routes
+/// exactly as [`dispatch_connection`] does for the single-account case.
+///
+/// Isolation: the selected account's own stores serve the session, and every store rejects a
+/// foreign account's entries at ingest, so a session for one account never reads or writes
+/// another's. An account the host does not serve — or a peer that fails the selected account's
+/// policy — is refused with the SAME uniform [`AuthError`](crate::AuthError) as a rejected binding,
+/// so a peer cannot probe which accounts a host holds. No inventory leaves the host before
+/// selection + the binding check succeed.
+///
+/// Per-account policy is honored (a public `Open` account and a private `Closed` one may share the
+/// endpoint); table streams are always served under `Closed` regardless of the account's mode.
+/// `ENROLL_ALPN` is refused here: enrollment names its account out-of-band before any auth frame,
+/// and a host onboards accounts as the DIALER, not by accepting enrollment across its hosted set.
+pub async fn dispatch_connection_multi(
+    conn: IrohConnection,
+    local_node: [u8; 32],
+    accounts: &mut [HostedAccount<'_>],
+    now_ms: impl Fn() -> i64 + Copy,
+) -> Result<(Vec<u8>, SessionReport), SyncFailure> {
+    let remote_node = *conn.remote_id().as_bytes();
+    let alpn = conn.alpn().to_vec();
+    // The multi host serves the account-log, content, and table streams. ENROLL_ALPN (and any
+    // unbound ALPN) is refused BEFORE a stream opens — no route, no handshake.
+    if alpn.as_slice() != SYNC_ALPN
+        && alpn.as_slice() != CONTENT_SYNC_ALPN
+        && alpn.as_slice() != TABLE_SYNC_ALPN
+    {
+        conn.close(0u32.into(), b"unknown-alpn");
+        return Err(SyncFailure::Endpoint(EndpointError::Connect(format!(
+            "multi-account host does not serve ALPN {alpn:?}"
+        ))));
+    }
+    let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.accept_bi())
+        .await
+        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("peer opened no stream".into())))?
+        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
+    // Read the clock only now that a peer has connected (see `accept_and_sync`).
+    let auth_now_ms = now_ms();
+    let table_alpn = alpn.as_slice() == TABLE_SYNC_ALPN;
+    // Authorize FIRST, selecting the account from the dialer's frame — no inventory (not even which
+    // account is served) leaves the host until selection + the binding check pass. `account_id` and
+    // `policy` in the config are placeholders the selection overrides.
+    let (selected_account, capabilities) = run_auth_phase_selected(
+        &mut send,
+        &mut recv,
+        AuthConfig {
+            role: AuthRole::Acceptor,
+            account_id: [0u8; 32],
+            local_node,
+            remote_node,
+            policy: AuthPolicy::Closed,
+            now_ms: auth_now_ms,
+            pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+        },
+        |peer_account| {
+            accounts.iter().find(|account| account.sync.account_id() == *peer_account).map(
+                |account| Selected {
+                    account_id: *peer_account,
+                    auth: &account.sync,
+                    // Table streams are private account data — never Open, whatever the account's
+                    // mode.
+                    policy: if table_alpn { AuthPolicy::Closed } else { account.policy },
+                },
+            )
+        },
+    )
+    .await
+    .map_err(SyncFailure::Auth)?;
+    // The selector's shared borrow has ended; take the selected store pair mutably for the session.
+    let account = accounts
+        .iter_mut()
+        .find(|account| account.sync.account_id() == selected_account)
+        .expect("run_auth_phase_selected returns only an account the selector accepted");
+    let report = if alpn.as_slice() == SYNC_ALPN {
+        run_session(&mut account.sync, send, recv, AuthRole::Acceptor, capabilities)
+            .await
+            .map_err(SyncFailure::Session)?
+    } else if alpn.as_slice() == CONTENT_SYNC_ALPN {
+        run_session(&mut account.content, send, recv, AuthRole::Acceptor, capabilities)
+            .await
+            .map_err(SyncFailure::Session)?
+    } else {
+        let mut table_store = crate::store::OplogTableSyncStore::new(
+            account.sync.connection(),
+            AccountId::from_bytes(account.sync.account_id()),
+            now_ms,
+        );
+        let table =
+            run_table_session(&mut table_store, send, recv, AuthRole::Acceptor, capabilities)
+                .await
+                .map_err(SyncFailure::TableSession)?;
+        SessionReport {
+            entries_sent: table.entries_sent,
+            entries_received: table.entries_received,
+            entries_newly_stored: table.entries_newly_stored,
+        }
+    };
     let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
     conn.close(0u32.into(), b"done");
     Ok((alpn, report))
@@ -1672,6 +1812,175 @@ mod tests {
             rag_rat_oplog::account_entries_for_sync(&destination, account).unwrap().len(),
             expected.len(),
             "the anonymous dialer restored the selected server's account snapshot",
+        );
+    }
+
+    #[tokio::test]
+    async fn two_accounts_share_one_endpoint_and_route_by_the_named_account() {
+        // Two DISTINCT accounts, each in its own store, hosted on ONE endpoint via
+        // `dispatch_connection_multi`. A dialer naming account A restores A; a dialer naming
+        // account B restores B — over the SAME listener. Because each dialer's store is
+        // scoped to its own account (a foreign account's entries are rejected at ingest), a
+        // B-dialer restoring B's log proves the host SELECTED B's store, not a fixed first
+        // account — the isolation + routing guarantee together.
+        let db_a = database();
+        let acct_a = rag_rat_oplog::local_account(&db_a, NOW).unwrap();
+        let db_b = database();
+        let acct_b = rag_rat_oplog::local_account(&db_b, NOW).unwrap();
+        let a_expected = rag_rat_oplog::account_entries_for_sync(&db_a, acct_a).unwrap();
+        let b_expected = rag_rat_oplog::account_entries_for_sync(&db_b, acct_b).unwrap();
+        assert_ne!(acct_a.to_bytes(), acct_b.to_bytes(), "the two hosted accounts are distinct");
+
+        let (listener, dialer) = loopback_endpoints().await;
+        let local_node = *listener.id().as_bytes();
+        let mut hosts = vec![
+            HostedAccount::new(
+                crate::store::OplogSyncStore::new(&db_a, acct_a, || NOW),
+                crate::store::OplogContentSyncStore::new(&db_a, acct_a, || NOW),
+                AuthPolicy::Open,
+            )
+            .unwrap(),
+            HostedAccount::new(
+                crate::store::OplogSyncStore::new(&db_b, acct_b, || NOW),
+                crate::store::OplogContentSyncStore::new(&db_b, acct_b, || NOW),
+                AuthPolicy::Open,
+            )
+            .unwrap(),
+        ];
+
+        // Round 1 — a fresh peer anonymously restores account A.
+        let dest_a = database();
+        let mut dest_a_store = crate::store::OplogSyncStore::new(&dest_a, acct_a, || NOW);
+        let server = async {
+            let conn = accept_connection(&listener).await?;
+            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW).await
+        };
+        let client = connect_and_sync(
+            &dialer,
+            direct_addr(&listener),
+            SYNC_ALPN,
+            &mut dest_a_store,
+            AuthPolicy::Open,
+            NOW,
+        );
+        let (server_result, _client_result) = tokio::join!(server, client);
+        let (_alpn, report_a) = server_result.unwrap();
+        assert_eq!(report_a.entries_sent, a_expected.len(), "the host served account A's log");
+        assert_eq!(
+            rag_rat_oplog::account_entries_for_sync(&dest_a, acct_a).unwrap().len(),
+            a_expected.len(),
+            "the A-dialer restored account A",
+        );
+
+        // Round 2 — a fresh peer anonymously restores account B over the SAME host.
+        let dest_b = database();
+        let mut dest_b_store = crate::store::OplogSyncStore::new(&dest_b, acct_b, || NOW);
+        let server = async {
+            let conn = accept_connection(&listener).await?;
+            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW).await
+        };
+        let client = connect_and_sync(
+            &dialer,
+            direct_addr(&listener),
+            SYNC_ALPN,
+            &mut dest_b_store,
+            AuthPolicy::Open,
+            NOW,
+        );
+        let (server_result, _client_result) = tokio::join!(server, client);
+        let (_alpn, report_b) = server_result.unwrap();
+        assert_eq!(report_b.entries_sent, b_expected.len(), "the host served account B's log");
+        assert_eq!(
+            rag_rat_oplog::account_entries_for_sync(&dest_b, acct_b).unwrap().len(),
+            b_expected.len(),
+            "the B-dialer restored account B — selection served B's store, not a fixed first \
+             account",
+        );
+    }
+
+    #[test]
+    fn hosted_account_rejects_a_sync_content_pair_for_different_accounts() {
+        // The isolation guard lifted to construction: a content store behind another account's log
+        // is unrepresentable, so a connection authenticated for A can never reach B's content.
+        let db_a = database();
+        let acct_a = rag_rat_oplog::local_account(&db_a, NOW).unwrap();
+        let db_b = database();
+        let acct_b = rag_rat_oplog::local_account(&db_b, NOW).unwrap();
+        let mismatched = HostedAccount::new(
+            crate::store::OplogSyncStore::new(&db_a, acct_a, || NOW),
+            crate::store::OplogContentSyncStore::new(&db_b, acct_b, || NOW),
+            AuthPolicy::Open,
+        );
+        assert!(mismatched.is_err(), "a sync/content pair for different accounts is refused");
+    }
+
+    #[tokio::test]
+    async fn a_multi_host_applies_each_accounts_own_admission_policy() {
+        // One host, two accounts: A is Open, B is Closed. An anonymous dialer restores A but is
+        // refused on B — the policy is per-account (from the selection), not endpoint-wide.
+        let db_a = database();
+        let acct_a = rag_rat_oplog::local_account(&db_a, NOW).unwrap();
+        let db_b = database();
+        let acct_b = rag_rat_oplog::local_account(&db_b, NOW).unwrap();
+        let a_expected = rag_rat_oplog::account_entries_for_sync(&db_a, acct_a).unwrap();
+        let (listener, dialer) = loopback_endpoints().await;
+        let local_node = *listener.id().as_bytes();
+        let mut hosts = vec![
+            HostedAccount::new(
+                crate::store::OplogSyncStore::new(&db_a, acct_a, || NOW),
+                crate::store::OplogContentSyncStore::new(&db_a, acct_a, || NOW),
+                AuthPolicy::Open,
+            )
+            .unwrap(),
+            HostedAccount::new(
+                crate::store::OplogSyncStore::new(&db_b, acct_b, || NOW),
+                crate::store::OplogContentSyncStore::new(&db_b, acct_b, || NOW),
+                AuthPolicy::Closed,
+            )
+            .unwrap(),
+        ];
+
+        // The Open account A admits the anonymous dialer and restores its log.
+        let dest_a = database();
+        let mut dest_a_store = crate::store::OplogSyncStore::new(&dest_a, acct_a, || NOW);
+        let server = async {
+            let conn = accept_connection(&listener).await?;
+            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW).await
+        };
+        let client = connect_and_sync(
+            &dialer,
+            direct_addr(&listener),
+            SYNC_ALPN,
+            &mut dest_a_store,
+            AuthPolicy::Open,
+            NOW,
+        );
+        let (server_a, _client_a) = tokio::join!(server, client);
+        assert!(server_a.is_ok(), "the Open account admits the anonymous dialer: {server_a:?}");
+        assert_eq!(
+            rag_rat_oplog::account_entries_for_sync(&dest_a, acct_a).unwrap().len(),
+            a_expected.len(),
+        );
+
+        // The Closed account B refuses the same anonymous dialer — on the SAME host.
+        let dest_b = database();
+        let mut dest_b_store = crate::store::OplogSyncStore::new(&dest_b, acct_b, || NOW);
+        let server = async {
+            let conn = accept_connection(&listener).await?;
+            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW).await
+        };
+        let client = connect_and_sync(
+            &dialer,
+            direct_addr(&listener),
+            SYNC_ALPN,
+            &mut dest_b_store,
+            AuthPolicy::Open,
+            NOW,
+        );
+        let (server_b, _client_b) = tokio::join!(server, client);
+        assert!(
+            matches!(server_b, Err(SyncFailure::Auth(_))),
+            "the Closed account refuses the anonymous dialer: {server_b:?}"
         );
     }
 

@@ -54,9 +54,10 @@ pub enum AuthPolicy {
     /// Admit any dialer for reads on the account/`/3` content paths. A valid roster binding
     /// determines its capability when available; a rejected binding remains read-only. Only a
     /// dialer whose local authority is unavailable permits its explicitly selected server to
-    /// send the snapshot needed to restore roster state. Does NOT reach `/5` tables:
-    /// `accept_and_dispatch` pins `TABLE_SYNC_ALPN` to `Closed` regardless of the configured
-    /// policy, so a table manifest is never revealed to an unverified peer.
+    /// send the snapshot needed to restore roster state. Does NOT reach `/5` tables: the
+    /// dispatchers (`dispatch_connection` and the multi-account `dispatch_connection_multi`)
+    /// pin `TABLE_SYNC_ALPN` to `Closed` regardless of the configured policy, so a table
+    /// manifest is never revealed to an unverified peer.
     Open,
     /// Admit only a peer whose binding verifies against this account's roster and the connection's
     /// authenticated remote node id. The default for a private account.
@@ -200,6 +201,16 @@ impl std::fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
+/// A hosted account chosen for a connection by [`run_auth_phase_selected`], from the account the
+/// dialer named in its opening auth frame. Carries that account's authorizer and its PER-ACCOUNT
+/// policy — a public (`Open`) account and a private (`Closed`) one may share one endpoint, so the
+/// mode must come from the selection, never an endpoint-wide default.
+pub struct Selected<'a> {
+    pub account_id: [u8; 32],
+    pub auth: &'a dyn NodeAuth,
+    pub policy: AuthPolicy,
+}
+
 /// Run the mutual auth handshake. On success, returns what each side may transmit in the data
 /// phase; the caller passes those capabilities to [`crate::session::run_session`] over the same
 /// stream. On `Err` the caller drops the connection without revealing any inventory.
@@ -214,25 +225,73 @@ where
     R: AsyncRead + Unpin,
     A: NodeAuth,
 {
-    let (local, peer) = match cfg.role {
-        // Acceptor verifies the dialer BEFORE revealing its own binding.
+    match cfg.role {
+        // Single-account acceptor: admit iff the dialer named OUR one account. Expressed as the
+        // degenerate one-account selector so the acceptor path is shared with multi-account
+        // hosting.
         AuthRole::Acceptor => {
-            let peer = verify_peer(recv, auth, &cfg).await?;
-            let local = send_ours(send, auth, &cfg).await?;
-            (local, peer)
+            let (_account, caps) = run_auth_phase_selected(send, recv, cfg, |peer_account| {
+                (*peer_account == cfg.account_id).then_some(Selected {
+                    account_id: cfg.account_id,
+                    auth,
+                    policy: cfg.policy,
+                })
+            })
+            .await?;
+            Ok(caps)
         },
-        // Dialer presents first (to the node it already authenticated), then verifies the acceptor
-        // before proceeding to the data phase.
+        // Dialer presents first (to the node it already authenticated, naming its own account),
+        // then verifies the acceptor before proceeding to the data phase.
         AuthRole::Dialer => {
             let local = send_ours(send, auth, &cfg).await?;
             let peer = verify_peer(recv, auth, &cfg).await?;
-            (local, peer)
+            let granted_by_peer = exchange_grants(send, recv, peer, cfg.pre_auth_timeout).await?;
+            Ok(SessionCapabilities::new(local.restricted_by(granted_by_peer), peer))
         },
+    }
+}
+
+/// The acceptor half of the handshake for a host that serves a BOUNDED SET of accounts on one
+/// endpoint. Reads the dialer's auth frame, hands the named account to `select` to choose the
+/// hosted account (its authorizer + per-account policy), verifies the dialer's binding against THAT
+/// account, then reveals the acceptor's own binding for it. Returns the selected account id so the
+/// caller can route the data phase to that account's stores.
+///
+/// An account the host does not serve is refused with the SAME uniform [`AuthError::Unauthorized`]
+/// as a rejected binding — no wire signal distinguishes "account not hosted here" from "not
+/// authorized", so a peer cannot probe which accounts a host holds. No inventory (not even the
+/// account confirmation in the acceptor's frame) is revealed before `select` and the binding check
+/// succeed.
+pub async fn run_auth_phase_selected<'sel, W, R, F>(
+    send: &mut W,
+    recv: &mut R,
+    cfg: AuthConfig,
+    select: F,
+) -> Result<([u8; 32], SessionCapabilities), AuthError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    F: FnOnce(&[u8; 32]) -> Option<Selected<'sel>>,
+{
+    let (peer_account, binding) = read_peer_auth(recv, cfg.pre_auth_timeout).await?;
+    let Some(selected) = select(&peer_account) else {
+        return Err(AuthError::Unauthorized);
     };
-    // A peer's view of our binding can be stricter than our own role due to stale or divergent
-    // roster state. Exchange the actual grants before any inventory, and honor both verdicts.
+    let peer = authorize_binding(
+        selected.auth,
+        &binding,
+        selected.policy,
+        AuthRole::Acceptor,
+        &cfg.remote_node,
+        cfg.now_ms,
+    )?;
+    // Mint our own frame for the SELECTED account (and under its policy), not the placeholder the
+    // caller passed. Everything else in `cfg` (nodes, clock, timeout) is connection-level.
+    let account_cfg =
+        AuthConfig { account_id: selected.account_id, policy: selected.policy, ..cfg };
+    let local = send_ours(send, selected.auth, &account_cfg).await?;
     let granted_by_peer = exchange_grants(send, recv, peer, cfg.pre_auth_timeout).await?;
-    Ok(SessionCapabilities::new(local.restricted_by(granted_by_peer), peer))
+    Ok((selected.account_id, SessionCapabilities::new(local.restricted_by(granted_by_peer), peer)))
 }
 
 async fn exchange_grants<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
@@ -297,42 +356,51 @@ async fn send_ours<W: AsyncWrite + Unpin>(
     }
 }
 
-async fn verify_peer<R: AsyncRead + Unpin>(
+/// Read the peer's opening `Frame::Auth` off the stream, returning the account it named and the
+/// binding it presented. Split out of [`verify_peer`] so the acceptor can SELECT which hosted
+/// account to authorize against (multi-account hosting) between this read and the policy check,
+/// rather than only equality-checking a pre-fixed account.
+async fn read_peer_auth<R: AsyncRead + Unpin>(
     recv: &mut R,
-    auth: &dyn NodeAuth,
-    cfg: &AuthConfig,
-) -> Result<PeerCapability, AuthError> {
+    pre_auth_timeout: Duration,
+) -> Result<([u8; 32], Vec<u8>), AuthError> {
     let read = codec::read_frame_within(recv, MAX_AUTH_FRAME_BYTES);
-    let frame = match tokio::time::timeout(cfg.pre_auth_timeout, read).await {
+    let frame = match tokio::time::timeout(pre_auth_timeout, read).await {
         Ok(Ok(frame)) => frame,
         Ok(Err(e)) => return Err(AuthError::Codec(e)),
         Err(_elapsed) => return Err(AuthError::Timeout),
     };
-    let Frame::Auth { account_id: peer_account, binding } = frame else {
+    let Frame::Auth { account_id, binding } = frame else {
         return Err(AuthError::Protocol("peer did not open with an auth frame".into()));
     };
-    // Account scope is enforced regardless of policy — even an Open endpoint must not proceed to
-    // the data phase (whose Hello reveals the hosted account id + inventory) for a peer that
-    // named a DIFFERENT account. Open relaxes the BINDING check, never the scope. Uniform error
-    // either way.
-    if peer_account != cfg.account_id {
-        return Err(AuthError::Unauthorized);
-    }
-    // Every rejection below is the SAME uniform error — no not-on-roster / bad-sig distinction on
-    // the wire.
-    match cfg.policy {
+    Ok((account_id, binding))
+}
+
+/// Policy verdict for a peer binding, against a CHOSEN account's `auth`. The account-scope decision
+/// (equality for single-account, selection for multi-account) happens in the caller BEFORE this;
+/// here only the binding is judged. Every rejection is the SAME uniform error — no
+/// not-on-roster / bad-sig distinction on the wire.
+fn authorize_binding(
+    auth: &dyn NodeAuth,
+    binding: &[u8],
+    policy: AuthPolicy,
+    role: AuthRole,
+    remote_node: &[u8; 32],
+    now_ms: i64,
+) -> Result<PeerCapability, AuthError> {
+    match policy {
         // Open admission grants an unverified dialer READ, never WRITE. A fresh dialer cannot yet
         // verify the selected server's roster binding, so it must permit that acceptor to serve the
         // requested snapshot; ingest still verifies every entry from scratch.
-        AuthPolicy::Open => match auth.authorize(&binding, &cfg.remote_node, cfg.now_ms) {
+        AuthPolicy::Open => match auth.authorize(binding, remote_node, now_ms) {
             Ok(PeerAuthorization::Granted(capability)) => Ok(capability),
-            Ok(PeerAuthorization::Unavailable) if cfg.role == AuthRole::Dialer =>
+            Ok(PeerAuthorization::Unavailable) if role == AuthRole::Dialer =>
                 Ok(PeerCapability::ReadWrite),
             Ok(PeerAuthorization::Rejected | PeerAuthorization::Unavailable) | Err(_) =>
                 Ok(PeerCapability::ReadOnly),
         },
         AuthPolicy::Closed => {
-            match auth.authorize(&binding, &cfg.remote_node, cfg.now_ms) {
+            match auth.authorize(binding, remote_node, now_ms) {
                 Ok(PeerAuthorization::Granted(capability)) => Ok(capability),
                 Ok(PeerAuthorization::Rejected | PeerAuthorization::Unavailable) =>
                     Err(AuthError::Unauthorized),
@@ -342,6 +410,22 @@ async fn verify_peer<R: AsyncRead + Unpin>(
             }
         },
     }
+}
+
+async fn verify_peer<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    auth: &dyn NodeAuth,
+    cfg: &AuthConfig,
+) -> Result<PeerCapability, AuthError> {
+    let (peer_account, binding) = read_peer_auth(recv, cfg.pre_auth_timeout).await?;
+    // Account scope is enforced regardless of policy — even an Open endpoint must not proceed to
+    // the data phase (whose Hello reveals the hosted account id + inventory) for a peer that
+    // named a DIFFERENT account. Open relaxes the BINDING check, never the scope. Uniform error
+    // either way.
+    if peer_account != cfg.account_id {
+        return Err(AuthError::Unauthorized);
+    }
+    authorize_binding(auth, &binding, cfg.policy, cfg.role, &cfg.remote_node, cfg.now_ms)
 }
 
 #[cfg(test)]
@@ -653,5 +737,102 @@ mod tests {
         ] {
             assert!(!format!("{e}").is_empty());
         }
+    }
+
+    const ACCT_B: [u8; 32] = [7u8; 32];
+
+    /// Run the acceptor via the MULTI-account `run_auth_phase_selected` against `hosted`
+    /// (account_id → its authorizer + per-account policy); the dialer names `dialer_account`.
+    async fn run_selected_pair(
+        dialer: FakeAuth,
+        dialer_account: [u8; 32],
+        hosted: Vec<([u8; 32], FakeAuth, AuthPolicy)>,
+    ) -> (Result<SessionCapabilities, AuthError>, Result<([u8; 32], SessionCapabilities), AuthError>)
+    {
+        let (mut d_send, mut a_recv) = tokio::io::duplex(1 << 16);
+        let (mut a_send, mut d_recv) = tokio::io::duplex(1 << 16);
+        let timeout = Duration::from_millis(300);
+        let dialer_side = run_auth_phase(&mut d_send, &mut d_recv, &dialer, AuthConfig {
+            role: AuthRole::Dialer,
+            account_id: dialer_account,
+            local_node: D_NODE,
+            remote_node: A_NODE,
+            policy: AuthPolicy::Open,
+            now_ms: 1,
+            pre_auth_timeout: timeout,
+        });
+        let acceptor_side = run_auth_phase_selected(
+            &mut a_send,
+            &mut a_recv,
+            AuthConfig {
+                role: AuthRole::Acceptor,
+                account_id: [0u8; 32],
+                local_node: A_NODE,
+                remote_node: D_NODE,
+                policy: AuthPolicy::Closed,
+                now_ms: 1,
+                pre_auth_timeout: timeout,
+            },
+            |peer_account| {
+                hosted
+                    .iter()
+                    .find(|(id, _, _)| id == peer_account)
+                    .map(|(id, auth, policy)| Selected { account_id: *id, auth, policy: *policy })
+            },
+        );
+        tokio::join!(dialer_side, acceptor_side)
+    }
+
+    #[tokio::test]
+    async fn selects_the_hosted_account_the_dialer_names() {
+        // A host holding both accounts admits a dialer for EACH, resolving to the one it named.
+        for named in [ACCT, ACCT_B] {
+            let (dialer, acceptor) = run_selected_pair(ok_auth(), named, vec![
+                (ACCT, ok_auth(), AuthPolicy::Closed),
+                (ACCT_B, ok_auth(), AuthPolicy::Closed),
+            ])
+            .await;
+            let (selected, _caps) = acceptor.unwrap();
+            assert_eq!(selected, named, "the session resolves to the account the dialer named");
+            assert!(dialer.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unhosted_account_with_the_uniform_error() {
+        // A dialer naming an account the host does not serve gets the SAME error as a rejected
+        // binding — no signal reveals which accounts are hosted.
+        let unhosted = [0x9u8; 32];
+        let (_dialer, acceptor) =
+            run_selected_pair(ok_auth(), unhosted, vec![(ACCT, ok_auth(), AuthPolicy::Closed)])
+                .await;
+        assert!(
+            matches!(acceptor, Err(AuthError::Unauthorized)),
+            "an unhosted account is refused uniformly: {acceptor:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn honors_the_selected_accounts_policy_not_an_endpoint_wide_one() {
+        // The selected account is Open, so an unverified dialer is admitted READ-ONLY — even though
+        // the acceptor's config policy is Closed. The policy comes from the SELECTION.
+        let unverified_at_acceptor = FakeAuth {
+            binding: vec![],
+            local_capability: PeerCapability::ReadWrite,
+            authorization: PeerAuthorization::Rejected,
+        };
+        let (_dialer, acceptor) = run_selected_pair(ok_auth(), ACCT, vec![(
+            ACCT,
+            unverified_at_acceptor,
+            AuthPolicy::Open,
+        )])
+        .await;
+        let (selected, caps) = acceptor.unwrap();
+        assert_eq!(selected, ACCT);
+        assert_eq!(
+            caps.peer,
+            PeerCapability::ReadOnly,
+            "Open admits the unverified dialer read-only; a Closed selection would have refused it"
+        );
     }
 }
