@@ -416,6 +416,40 @@ const DISTILL_EVIDENCE: TableSpec = TableSpec {
     repo_column: Some("repo_id"),
 };
 
+// An anchor candidate, keyed by the thread + its stable candidate ordinal. Portable facts (kind,
+// exact file path, name, model selection) replicate; `logical_symbol_id`/`resolved` are
+// checkout-local resolution state — a `sym_<hex>` handle valid only in the local index, remapped
+// per checkout by the relocation engine — so they are `local_columns` and never cross the wire. (A
+// synced symbol anchor therefore surfaces as drive-by only after a local re-resolution path exists;
+// a file anchor surfaces immediately via `records_for_path`.)
+const DISTILL_ANCHOR_PK: &[ColumnSpec] = &[
+    ColumnSpec::required("repo_id", ValueType::Text),
+    ColumnSpec::required("tracker", ValueType::Text),
+    ColumnSpec::required("project", ValueType::Text),
+    ColumnSpec::required("item_kind", ValueType::Text),
+    ColumnSpec::required("item_key", ValueType::Text),
+    ColumnSpec::required("candidate_ordinal", ValueType::I64),
+];
+
+const DISTILL_ANCHOR_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec::required("anchor_kind", ValueType::Text),
+    ColumnSpec::required("file_path", ValueType::Text),
+    ColumnSpec::required("name", ValueType::Text),
+    ColumnSpec::required("selected", ValueType::Bool),
+];
+
+const DISTILL_ANCHOR_LOCAL_COLUMNS: &[&str] = &["logical_symbol_id", "resolved"];
+
+const DISTILL_ANCHORS: TableSpec = TableSpec {
+    name: "papertrail_distill_anchors",
+    scope_id: "distill/1",
+    spec_version: 1,
+    pk: DISTILL_ANCHOR_PK,
+    columns: DISTILL_ANCHOR_COLUMNS,
+    local_columns: DISTILL_ANCHOR_LOCAL_COLUMNS,
+    repo_column: Some("repo_id"),
+};
+
 /// The production table registry. `anchors/1` retains durable memory-binding history in full;
 /// `overlay/1` carries regenerable dream output (verdicts, summaries) and `distill/1` the distilled
 /// papertrail record plus its enrichment children — both under a bounded retention budget.
@@ -428,6 +462,7 @@ pub(crate) const SYNCABLE_TABLES: &[TableSpec] = &[
     DISTILL_ALTERNATIVES,
     DISTILL_RECORD_COMMITS,
     DISTILL_EVIDENCE,
+    DISTILL_ANCHORS,
 ];
 
 /// The per-repo Lens lane metas a scope's applied rows advance — the aggregate enrichment clock
@@ -1145,6 +1180,202 @@ pub(crate) const PROJECTOR_GENERATIONS: &[&[TableGeneration]] = &[
                 ("author_kind", ValueType::Text, None),
                 ("author_association", ValueType::Text, None),
                 ("unit_created_at_ms", ValueType::I64, None),
+            ],
+        },
+    ],
+    // v8: the distill anchors child joins distill/1. Whole-registry snapshot: v7's eight tables
+    // plus anchors, in `SYNCABLE_TABLES` order. Anchors' local columns (logical_symbol_id,
+    // resolved) are excluded from the generation by design.
+    &[
+        TableGeneration {
+            table: "repo_memory_bindings",
+            scope_id: "anchors/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("memory_id", ValueType::Text),
+                ("binding_kind", ValueType::Text),
+                ("binding_id", ValueType::Text),
+            ],
+            columns: &[
+                ("path", ValueType::Text, None),
+                ("start_line", ValueType::I64, None),
+                ("end_line", ValueType::I64, None),
+                ("commit_hash", ValueType::Text, None),
+                ("tracker", ValueType::Text, None),
+                ("project", ValueType::Text, None),
+                ("item_key", ValueType::Text, None),
+                ("created_at_ms", ValueType::I64, None),
+                ("symbol_kind", ValueType::Text, None),
+                ("signature_hash", ValueType::Text, None),
+                ("moniker_tool", ValueType::Text, None),
+                ("moniker_tool_version", ValueType::Text, None),
+            ],
+        },
+        TableGeneration {
+            table: "memory_reality",
+            scope_id: "overlay/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[("repo_id", ValueType::Text), ("memory_id", ValueType::Text)],
+            columns: &[
+                ("content_hash", ValueType::Text, None),
+                ("verdict", ValueType::Text, None),
+                ("direction", ValueType::Text, None),
+                ("checked_against_commit", ValueType::Text, None),
+                ("checked_inputs_hash", ValueType::Text, None),
+                ("evidence_json", ValueType::Text, None),
+                ("model_id", ValueType::Text, None),
+                ("prompt_version", ValueType::Text, None),
+                ("checked_at_ms", ValueType::I64, None),
+            ],
+        },
+        TableGeneration {
+            table: "memory_summaries",
+            scope_id: "overlay/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("memory_id", ValueType::Text),
+                ("content_hash", ValueType::Text),
+            ],
+            columns: &[
+                ("summary", ValueType::Text, None),
+                ("model_id", ValueType::Text, None),
+                ("prompt_version", ValueType::Text, None),
+                ("generated_at_ms", ValueType::I64, None),
+            ],
+        },
+        TableGeneration {
+            table: "papertrail_distill",
+            scope_id: "distill/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("tracker", ValueType::Text),
+                ("project", ValueType::Text),
+                ("item_kind", ValueType::Text),
+                ("item_key", ValueType::Text),
+            ],
+            columns: &[
+                ("distill_input_hash", ValueType::Text, None),
+                ("pipeline_version", ValueType::I64, None),
+                ("root_issue", ValueType::Text, None),
+                ("root_cause", ValueType::Text, None),
+                ("root_cause_class", ValueType::Text, None),
+                ("decision_chosen", ValueType::Text, None),
+                ("outcome_summary", ValueType::Text, None),
+                ("outcome_status_model", ValueType::Text, None),
+                ("epistemic_status_decision", ValueType::Text, None),
+                ("epistemic_status_outcome", ValueType::Text, None),
+                ("fix_edge_source", ValueType::Text, None),
+                ("quotes_materialized", ValueType::I64, None),
+                ("anchors_qualified_count", ValueType::I64, None),
+                ("thread_shape", ValueType::Text, None),
+                ("outcome_claim_verified", ValueType::Bool, None),
+                ("decision_provenance_verified", ValueType::Bool, None),
+                ("revert_override", ValueType::Bool, None),
+                ("closing_keyword_floor", ValueType::Text, None),
+                ("distilled_at_ms", ValueType::I64, None),
+                ("prompt_version", ValueType::I64, None),
+                ("model_input_hash", ValueType::Text, None),
+            ],
+        },
+        TableGeneration {
+            table: "papertrail_distill_edges",
+            scope_id: "distill/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("tracker", ValueType::Text),
+                ("project", ValueType::Text),
+                ("src_item_kind", ValueType::Text),
+                ("src_item_key", ValueType::Text),
+                ("dst_item_kind", ValueType::Text),
+                ("dst_item_key", ValueType::Text),
+                ("edge_kind", ValueType::Text),
+            ],
+            columns: &[("created_at_ms", ValueType::I64, None)],
+        },
+        TableGeneration {
+            table: "papertrail_distill_alternatives",
+            scope_id: "distill/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("tracker", ValueType::Text),
+                ("project", ValueType::Text),
+                ("item_kind", ValueType::Text),
+                ("item_key", ValueType::Text),
+                ("ordinal", ValueType::I64),
+            ],
+            columns: &[("alternative", ValueType::Text, None), ("reason", ValueType::Text, None)],
+        },
+        TableGeneration {
+            table: "papertrail_distill_record_commits",
+            scope_id: "distill/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("tracker", ValueType::Text),
+                ("project", ValueType::Text),
+                ("item_kind", ValueType::Text),
+                ("item_key", ValueType::Text),
+                ("commit_sha", ValueType::Text),
+            ],
+            columns: &[("created_at_ms", ValueType::I64, None)],
+        },
+        TableGeneration {
+            table: "papertrail_distill_evidence",
+            scope_id: "distill/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("tracker", ValueType::Text),
+                ("project", ValueType::Text),
+                ("item_kind", ValueType::Text),
+                ("item_key", ValueType::Text),
+                ("ordinal", ValueType::I64),
+            ],
+            columns: &[
+                ("field", ValueType::Text, None),
+                ("source_kind", ValueType::Text, None),
+                ("source_part", ValueType::Text, None),
+                ("source_id", ValueType::Text, None),
+                ("byte_start", ValueType::I64, None),
+                ("byte_end", ValueType::I64, None),
+                ("quote", ValueType::Text, None),
+                ("author", ValueType::Text, None),
+                ("author_kind", ValueType::Text, None),
+                ("author_association", ValueType::Text, None),
+                ("unit_created_at_ms", ValueType::I64, None),
+            ],
+        },
+        TableGeneration {
+            table: "papertrail_distill_anchors",
+            scope_id: "distill/1",
+            spec_version: 1,
+            repo_column: Some("repo_id"),
+            pk: &[
+                ("repo_id", ValueType::Text),
+                ("tracker", ValueType::Text),
+                ("project", ValueType::Text),
+                ("item_kind", ValueType::Text),
+                ("item_key", ValueType::Text),
+                ("candidate_ordinal", ValueType::I64),
+            ],
+            columns: &[
+                ("anchor_kind", ValueType::Text, None),
+                ("file_path", ValueType::Text, None),
+                ("name", ValueType::Text, None),
+                ("selected", ValueType::Bool, None),
             ],
         },
     ],

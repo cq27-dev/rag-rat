@@ -1047,6 +1047,18 @@ async fn production_distill_records_replicate_and_regenerate() {
             [],
         )
         .unwrap();
+    // An anchor whose portable facts (kind/name/file_path/selected) must cross, while its
+    // device-local resolution (`logical_symbol_id`, `resolved`) must stay owner-only.
+    owner
+        .execute(
+            "INSERT INTO papertrail_distill_anchors
+                 (tracker, project, item_kind, item_key, candidate_ordinal, anchor_kind,
+                  logical_symbol_id, file_path, name, resolved, selected, repo_id)
+             VALUES ('github', 'o/r', 'issue', '7', 0, 'symbol',
+                     'sym_owner_local', 'src/x.rs', 'Foo', 1, 1, 'repo-a')",
+            [],
+        )
+        .unwrap();
     owner
         .execute(
             "INSERT INTO repos(repo_id, display_name, registered_at_ms)
@@ -1132,6 +1144,34 @@ async fn production_distill_records_replicate_and_regenerate() {
         )
         .unwrap();
     assert_eq!(quote, "the exact cause quote", "the distill evidence child replicates");
+    // The anchor's portable facts cross the wire...
+    let (kind, name, path, selected): (String, String, String, i64) = joiner
+        .query_row(
+            "SELECT anchor_kind, name, file_path, selected FROM papertrail_distill_anchors
+             WHERE repo_id = 'repo-a' AND item_key = '7' AND candidate_ordinal = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (kind.as_str(), name.as_str(), path.as_str(), selected),
+        ("symbol", "Foo", "src/x.rs", 1),
+        "the anchor's portable facts (kind/name/file_path/selected) replicate"
+    );
+    // ...but its device-local resolution does not — the peer re-resolves locally.
+    let (local_sym, resolved): (Option<String>, i64) = joiner
+        .query_row(
+            "SELECT logical_symbol_id, resolved FROM papertrail_distill_anchors
+             WHERE repo_id = 'repo-a' AND item_key = '7' AND candidate_ordinal = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (local_sym, resolved),
+        (None, 0),
+        "the owner's local symbol handle and resolved flag never cross the wire"
+    );
     // repo-a advertises no route for repo-b's incarnation, so repo-b's record never lands.
     let sibling: bool = joiner
         .query_row(
@@ -1162,6 +1202,41 @@ async fn production_distill_records_replicate_and_regenerate() {
         )
         .unwrap();
     assert_eq!(regenerated, "the regenerated cause", "regeneration upserts the record on the peer");
+
+    // The make-or-break case: the peer resolves the anchor in ITS OWN index (local columns set),
+    // then a winning remote Upsert changes a PORTABLE column. The whole-row-LWW applier must update
+    // the portable cell without clobbering the peer's local resolution — the columns/local_columns
+    // split is exactly what a future `INSERT OR REPLACE` refactor could silently break.
+    joiner
+        .execute(
+            "UPDATE papertrail_distill_anchors
+             SET logical_symbol_id = 'sym_joiner_local', resolved = 1
+             WHERE repo_id = 'repo-a' AND item_key = '7' AND candidate_ordinal = 0",
+            [],
+        )
+        .unwrap();
+    owner
+        .execute(
+            "UPDATE papertrail_distill_anchors SET selected = 0
+             WHERE repo_id = 'repo-a' AND item_key = '7' AND candidate_ordinal = 0",
+            [],
+        )
+        .unwrap();
+    reconcile().await;
+    let (selected, local_sym, resolved): (i64, Option<String>, i64) = joiner
+        .query_row(
+            "SELECT selected, logical_symbol_id, resolved FROM papertrail_distill_anchors
+             WHERE repo_id = 'repo-a' AND item_key = '7' AND candidate_ordinal = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(selected, 0, "the winning remote Upsert applies the portable column change");
+    assert_eq!(
+        (local_sym.as_deref(), resolved),
+        (Some("sym_joiner_local"), 1),
+        "the peer's own anchor resolution survives a winning whole-row update"
+    );
 }
 
 #[tokio::test]

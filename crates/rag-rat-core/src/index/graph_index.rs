@@ -298,6 +298,8 @@ fn rewrite_logical_symbol_references(
     // that updated "the id columns" silently skipped this one (#810). A stale token then points at
     // whatever now occupies that id — surfacing the previous occupant's decision record on an
     // unrelated symbol, the failure mode that matters most here.
+    // Capture the anchor repos BEFORE the remap rewrites the handle they match on.
+    let anchor_repos = distill_anchor_lens_repos(conn, from)?;
     if table_present(conn, "papertrail_distill_anchors")? {
         conn.execute(
             "UPDATE papertrail_distill_anchors SET logical_symbol_id = ?1
@@ -309,6 +311,13 @@ fn rewrite_logical_symbol_references(
         )?;
     }
     bump_binding_lens_revisions(conn, &lens_repos)?;
+    // The anchor's `logical_symbol_id`/`resolved` are checkout-local and never author a sync entry;
+    // this is a local Lens-freshness bump (the papertrail-lane drive-by changed), replacing the
+    // trigger V112 dropped. `bump_papertrail_lens_lanes` advances both enrichment + papertrail and
+    // is registration-gated.
+    for repo_id in &anchor_repos {
+        crate::distill::bump_papertrail_lens_lanes(conn, repo_id)?;
+    }
     Ok(())
 }
 
@@ -380,6 +389,33 @@ fn bump_binding_lens_revisions(
     Ok(())
 }
 
+/// Registered repos that carry a distill anchor for `from`'s `sym_<hex>` handle. Captured BEFORE a
+/// relocation rewrites/nulls that handle, so the caller can advance the papertrail Lens lane for
+/// the affected repos — `papertrail_distill_anchors` sync (#1139) dropped the row triggers that
+/// used to do this. The JOIN to `repos` keeps only registered repos (an ungated
+/// `bump_lens_revisions` throws on the `repo_meta`→`repos` FK); the table-presence guard returns
+/// empty at migration-time schema states where the anchors/`repos`/`repo_meta` tables do not yet
+/// exist.
+fn distill_anchor_lens_repos(
+    conn: &rusqlite::Connection,
+    from: i64,
+) -> rusqlite::Result<Vec<String>> {
+    if !(table_present(conn, "papertrail_distill_anchors")?
+        && table_present(conn, "repos")?
+        && table_present(conn, "repo_meta")?)
+    {
+        return Ok(Vec::new());
+    }
+    let handle = rag_rat_base::serde_big_id::format_sym_handle(from);
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT a.repo_id
+         FROM papertrail_distill_anchors AS a
+         JOIN repos AS r ON r.repo_id = a.repo_id
+         WHERE a.logical_symbol_id = ?1",
+    )?;
+    stmt.query_map([handle], |row| row.get(0))?.collect()
+}
+
 /// NULL every CALL-PATH reference to a drifted id the heal could not realign (#493 review),
 /// including a persisted edge callee identity after rebuilding its derived hashes when possible.
 /// Call-path references are the exception to the self-healing ladder: `validate_call_path_binding`
@@ -427,6 +463,8 @@ fn null_call_path_references(
             params![from],
         )?;
     }
+    // Capture the anchor repos BEFORE the vacate nulls the handle they match on.
+    let anchor_repos = distill_anchor_lens_repos(conn, from)?;
     if table_present(conn, "papertrail_distill_anchors")? {
         conn.execute(
             "UPDATE papertrail_distill_anchors SET logical_symbol_id = NULL, resolved = 0
@@ -435,6 +473,11 @@ fn null_call_path_references(
         )?;
     }
     bump_binding_lens_revisions(conn, &lens_repos)?;
+    // Local-column relocation → a local Lens-freshness bump for the anchor's repos (see the sibling
+    // remap site); never authors a sync entry.
+    for repo_id in &anchor_repos {
+        crate::distill::bump_papertrail_lens_lanes(conn, repo_id)?;
+    }
     Ok(())
 }
 
@@ -2214,5 +2257,76 @@ mod chunk_path_tests {
         assert_eq!(chunk_part_suffix("docs/x.md::#context-intro#3"), "#3");
         // A bare trailing `#` marks nothing.
         assert_eq!(chunk_part_suffix("src/lib.rs::Foo#"), "");
+    }
+}
+
+#[cfg(test)]
+mod relocation_lens_bump_tests {
+    use rag_rat_base::serde_big_id::format_sym_handle;
+    use rusqlite::{Connection, params};
+
+    use super::{null_call_path_references, rewrite_logical_symbol_references};
+
+    fn papertrail_rev(conn: &Connection, repo_id: &str) -> i64 {
+        rag_rat_db::meta::repo_meta(conn, repo_id, rag_rat_db::meta::LENS_PAPERTRAIL_REVISION_META)
+            .unwrap()
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    fn scratch_with_anchor(handle_id: i64) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_anchors
+                 (tracker, project, item_kind, item_key, candidate_ordinal, anchor_kind,
+                  logical_symbol_id, file_path, name, resolved, selected, repo_id)
+             VALUES ('github', 'o/r', 'issue', '5', 0, 'symbol', ?1, 'src/x.rs', 'Foo', 1, 1, 'r')",
+            params![format_sym_handle(handle_id)],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// A logical-id remap carries the anchor's opaque handle to the new id AND advances the
+    /// papertrail Lens lane for the anchor's repo — the row triggers that used to do this were
+    /// dropped when the table became syncable, so the relocation code now owns the bump.
+    #[test]
+    fn a_remap_bumps_the_papertrail_lane_for_the_anchor_repo() {
+        let conn = scratch_with_anchor(100);
+        let before = papertrail_rev(&conn, "r");
+        rewrite_logical_symbol_references(&conn, 100, 200, true).unwrap();
+        let token: String = conn
+            .query_row(
+                "SELECT logical_symbol_id FROM papertrail_distill_anchors WHERE item_key = '5'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(token, format_sym_handle(200), "the handle follows the symbol");
+        assert!(papertrail_rev(&conn, "r") > before, "the papertrail lane advances");
+    }
+
+    /// A no-winner vacate clears the anchor's local resolution and likewise advances the lane.
+    #[test]
+    fn a_vacate_bumps_the_papertrail_lane_for_the_anchor_repo() {
+        let conn = scratch_with_anchor(100);
+        let before = papertrail_rev(&conn, "r");
+        null_call_path_references(&conn, 100, true).unwrap();
+        let (token, resolved): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT logical_symbol_id, resolved FROM papertrail_distill_anchors
+                 WHERE item_key = '5'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((token, resolved), (None, 0), "the local resolution is cleared");
+        assert!(papertrail_rev(&conn, "r") > before, "the papertrail lane advances");
     }
 }

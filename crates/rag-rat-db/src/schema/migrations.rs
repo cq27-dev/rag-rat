@@ -6669,6 +6669,76 @@ mod syncable_overlay_migration_tests {
             .unwrap();
         assert_eq!(rows, vec![(0, "first".to_string()), (1, "second".to_string())]);
     }
+
+    /// The full ladder re-keys anchors onto the natural key, drops the AUTOINCREMENT id, and is
+    /// idempotent on a second apply. V078's index names survive (non-unique) so its replay guard
+    /// and the drive-by `selected = 1` lookups stay indexed.
+    #[test]
+    fn v112_rekeys_anchors_onto_the_natural_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        assert_eq!(primary_key_columns(&conn, "papertrail_distill_anchors").unwrap(), [
+            "repo_id",
+            "tracker",
+            "project",
+            "item_kind",
+            "item_key",
+            "candidate_ordinal"
+        ]);
+        let has_id: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('papertrail_distill_anchors')
+                 WHERE name = 'id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_id, 0, "the AUTOINCREMENT id is dropped");
+        for index in [
+            "idx_papertrail_distill_anchors_candidate",
+            "idx_papertrail_distill_anchors_selected",
+            "idx_papertrail_distill_anchors_symbol",
+        ] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "V112 keeps index `{index}`");
+        }
+    }
+
+    /// The rebuild copies the device-local columns (`logical_symbol_id`, `resolved`) and the
+    /// selection state verbatim — the whole-row-LWW applier never sees these, so the migration is
+    /// the only thing that can lose them.
+    #[test]
+    fn v112_preserves_local_resolution_and_selection() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::apply_distill_record_store(&conn).unwrap();
+        super::apply_distill_anchor_selection(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_anchors
+                 (tracker, project, item_kind, item_key, candidate_ordinal, anchor_kind,
+                  logical_symbol_id, file_path, name, resolved, selected, repo_id)
+             VALUES ('github', 'o/r', 'issue', '9', 0, 'symbol',
+                     'sym_abc', 'src/x.rs', 'Foo', 1, 1, 'r')",
+            [],
+        )
+        .unwrap();
+        super::apply_syncable_distill_anchors(&conn).unwrap();
+        let (sym, resolved, selected): (String, i64, i64) = conn
+            .query_row(
+                "SELECT logical_symbol_id, resolved, selected FROM papertrail_distill_anchors
+                 WHERE repo_id = 'r' AND item_key = '9' AND candidate_ordinal = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((sym.as_str(), resolved, selected), ("sym_abc", 1, 1));
+    }
 }
 
 /// V095 (#1002): per-TABLE spec versioning, plus a direct pointer from a row to its winning entry.
@@ -8090,6 +8160,83 @@ pub fn apply_syncable_distill_evidence(conn: &Connection) -> rusqlite::Result<()
          FROM papertrail_distill_evidence AS e;
          DROP TABLE papertrail_distill_evidence;
          ALTER TABLE papertrail_distill_evidence_v111 RENAME TO papertrail_distill_evidence;",
+    )
+}
+
+/// V112 (#1139): make the distill `anchors` child syncable on `distill/1`.
+///
+/// Re-key onto the existing UNIQUE natural key `(repo_id, tracker, project, item_kind, item_key,
+/// candidate_ordinal)`, drop the device-local AUTOINCREMENT `id`, and drop the six Lens-revision
+/// triggers (3 V093 `*_lens_revision_*` on the enrichment lane, 3 V102 `*_lane_revision_*` on the
+/// papertrail lane) unconditionally, before the shape short-circuit, so a full-ladder replay that
+/// recreates them still ends trigger-free. The write and apply paths advance the lanes explicitly.
+///
+/// `logical_symbol_id` and `resolved` stay as columns but are the table's checkout-local resolution
+/// state — the registry marks them `local_columns`, so they never replicate. `candidate_ordinal`'s
+/// and `selected`'s CHECKs are preserved. The `(repo_id, logical_symbol_id)` symbol index is
+/// recreated (the rebuild drops all indexes and it serves the drive-by symbol joins); the former
+/// UNIQUE candidate index is intentionally NOT recreated — the PK subsumes it.
+pub fn apply_syncable_distill_anchors(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS papertrail_distill_anchors_lens_revision_insert;
+         DROP TRIGGER IF EXISTS papertrail_distill_anchors_lens_revision_delete;
+         DROP TRIGGER IF EXISTS papertrail_distill_anchors_lens_revision_update;
+         DROP TRIGGER IF EXISTS papertrail_distill_anchors_lane_revision_insert;
+         DROP TRIGGER IF EXISTS papertrail_distill_anchors_lane_revision_delete;
+         DROP TRIGGER IF EXISTS papertrail_distill_anchors_lane_revision_update;",
+    )?;
+    if table_is_strict(conn, "papertrail_distill_anchors")?
+        && primary_key_columns(conn, "papertrail_distill_anchors")?
+            == ["repo_id", "tracker", "project", "item_kind", "item_key", "candidate_ordinal"]
+    {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS papertrail_distill_anchors_v112;
+         CREATE TABLE papertrail_distill_anchors_v112(
+             tracker TEXT NOT NULL,
+             project TEXT NOT NULL,
+             item_kind TEXT NOT NULL,
+             item_key TEXT NOT NULL,
+             candidate_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(candidate_ordinal >= 0),
+             anchor_kind TEXT NOT NULL,
+             logical_symbol_id TEXT,
+             file_path TEXT,
+             name TEXT NOT NULL,
+             resolved INTEGER NOT NULL DEFAULT 0,
+             selected INTEGER NOT NULL DEFAULT 0 CHECK(selected IN (0, 1)),
+             repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+             PRIMARY KEY(repo_id, tracker, project, item_kind, item_key, candidate_ordinal)
+         ) STRICT;
+         INSERT INTO papertrail_distill_anchors_v112(
+             tracker, project, item_kind, item_key, candidate_ordinal, anchor_kind,
+             logical_symbol_id, file_path, name, resolved, selected, repo_id)
+         SELECT tracker, project, item_kind, item_key, candidate_ordinal, anchor_kind,
+             logical_symbol_id, file_path, name, resolved, selected, repo_id
+         FROM papertrail_distill_anchors;
+         DROP TABLE papertrail_distill_anchors;
+         ALTER TABLE papertrail_distill_anchors_v112 RENAME TO papertrail_distill_anchors;
+         -- `idx_papertrail_distill_anchors_thread` (repo_id, tracker, project, item_kind, \
+         item_key)
+         -- is deliberately NOT recreated: it is a strict prefix of the new PK, so the PK autoindex
+         -- serves the same thread lookups, and nothing references it by name.
+         CREATE INDEX IF NOT EXISTS idx_papertrail_distill_anchors_symbol
+             ON papertrail_distill_anchors(repo_id, logical_symbol_id);
+         -- Recreate the candidate index as NON-UNIQUE (the PK now enforces the uniqueness the
+         -- registry lint would reject a second UNIQUE index for). It is otherwise redundant with \
+         the
+         -- PK, but V078's backfill keys its 'already applied' guard on this index's existence by
+         -- name: without it, a full-ladder replay re-runs V078's id-based backfill against this
+         -- id-less rebuilt table and errors. Keeping the name satisfies that guard.
+         CREATE INDEX IF NOT EXISTS idx_papertrail_distill_anchors_candidate
+             ON papertrail_distill_anchors(repo_id, tracker, project, item_kind, item_key,
+                                           candidate_ordinal);
+         -- The V078 partial `selected` index (recreated identically; non-unique, so the lint is
+         -- satisfied) — keeps the drive-by `selected = 1` lookups indexed and preserves the index
+         -- inventory later migrations/tests expect.
+         CREATE INDEX IF NOT EXISTS idx_papertrail_distill_anchors_selected
+             ON papertrail_distill_anchors(repo_id, tracker, project, item_kind, item_key,
+                                           candidate_ordinal) WHERE selected = 1;",
     )
 }
 
