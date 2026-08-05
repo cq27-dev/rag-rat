@@ -38,23 +38,29 @@ pub const DEFAULT_PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`crate::codec::MAX_FRAME_BYTES`].
 const MAX_AUTH_FRAME_BYTES: u32 = 1024;
 
-/// How a peer decides whether to admit a connection. Local policy, never negotiated on the wire —
-/// an impostor cannot assert `Open` to exempt itself from the other side's `Closed`. Per-ACCOUNT,
-/// not per-endpoint: one transport node may legitimately serve several accounts, so a public
-/// account being `Open` must not open a private one on the same endpoint.
+/// The two supported service modes for admitting a connection. Local policy, never negotiated on
+/// the wire — an impostor cannot assert `Open` to exempt itself from the other side's `Closed`.
+/// Per-ACCOUNT, not per-endpoint: one transport node may legitimately serve several accounts, so a
+/// public account being `Open` must not open a private one on the same endpoint.
+///
+/// The mode governs TRANSPORT-LEVEL admission and the granted [`PeerCapability`] only; fold-level
+/// WRITE AUTHORITY is always roster+role gated at INGEST, mode-independent. A transport `ReadWrite`
+/// grant (including the `Open` bootstrap below) is capability, not authorship — every received
+/// entry still passes the store's cryptographic + authority checks — so no mode can make an
+/// unverified peer's entries authoritative. (Onboarding a not-yet-roster device is a separate
+/// exchange on `ENROLL_ALPN`, not an admission mode of the data path.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthPolicy {
-    /// Admit any dialer for reads. A valid roster binding determines its capability when available;
-    /// a rejected binding remains read-only. Only a dialer whose local authority is unavailable
-    /// permits its explicitly selected server to send the snapshot needed to restore roster state.
+    /// Admit any dialer for reads on the account/`/3` content paths. A valid roster binding
+    /// determines its capability when available; a rejected binding remains read-only. Only a
+    /// dialer whose local authority is unavailable permits its explicitly selected server to
+    /// send the snapshot needed to restore roster state. Does NOT reach `/5` tables:
+    /// `accept_and_dispatch` pins `TABLE_SYNC_ALPN` to `Closed` regardless of the configured
+    /// policy, so a table manifest is never revealed to an unverified peer.
     Open,
     /// Admit only a peer whose binding verifies against this account's roster and the connection's
     /// authenticated remote node id. The default for a private account.
     Closed,
-    /// Admit a not-yet-roster peer via a one-time invite token — the onboarding/pairing flow. Not
-    /// implemented in this slice (it needs the token issue/redeem exchange); a session configured
-    /// with it fails closed rather than silently admitting.
-    InviteToken,
 }
 
 /// Which end of the connection this peer is — determines the send/verify order above.
@@ -335,8 +341,6 @@ async fn verify_peer<R: AsyncRead + Unpin>(
                 Err(_) => Err(AuthError::Unauthorized),
             }
         },
-        AuthPolicy::InviteToken =>
-            Err(AuthError::Protocol("invite-token admission is not supported yet".into())),
     }
 }
 
@@ -554,16 +558,6 @@ mod tests {
         assert!(
             matches!(accept, Err(AuthError::Unauthorized)),
             "an open endpoint still enforces the account scope: {accept:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn invite_token_policy_fails_closed_until_implemented() {
-        let (_d, a) =
-            run_pair(ok_auth(), ACCT, AuthPolicy::Closed, ok_auth(), AuthPolicy::InviteToken).await;
-        assert!(
-            matches!(a, Err(AuthError::Protocol(_))),
-            "invite-token is not admitted yet: {a:?}"
         );
     }
 
