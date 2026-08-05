@@ -1010,6 +1010,25 @@ async fn production_distill_records_replicate_and_regenerate() {
             .unwrap();
     };
     seed_record("7", "repo-a", "sha256:in-a", "the original cause");
+    // An enrichment edge and a rejected alternative on the same repo-a thread — the child tables.
+    owner
+        .execute(
+            "INSERT INTO papertrail_distill_edges
+                 (tracker, project, src_item_kind, src_item_key, dst_item_kind, dst_item_key,
+                  edge_kind, created_at_ms, repo_id)
+             VALUES ('github', 'o/r', 'issue', '7', 'change_request', '8', 'coalesced', ?1,
+                     'repo-a')",
+            [NOW + 2],
+        )
+        .unwrap();
+    owner
+        .execute(
+            "INSERT INTO papertrail_distill_alternatives
+                 (tracker, project, item_kind, item_key, ordinal, alternative, reason, repo_id)
+             VALUES ('github', 'o/r', 'issue', '7', 0, 'revert instead', 'loses the fix', 'repo-a')",
+            [],
+        )
+        .unwrap();
     owner
         .execute(
             "INSERT INTO repos(repo_id, display_name, registered_at_ms)
@@ -1058,6 +1077,25 @@ async fn production_distill_records_replicate_and_regenerate() {
         )
         .unwrap();
     assert_eq!(cause, "the original cause", "the distilled record replicates");
+    let edge_kind: String = joiner
+        .query_row(
+            "SELECT edge_kind FROM papertrail_distill_edges
+             WHERE repo_id = 'repo-a' AND src_item_key = '7' AND dst_item_key = '8'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(edge_kind, "coalesced", "the distill edge child replicates");
+    let (alternative, reason): (String, String) = joiner
+        .query_row(
+            "SELECT alternative, reason FROM papertrail_distill_alternatives
+             WHERE repo_id = 'repo-a' AND item_key = '7' AND ordinal = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(alternative, "revert instead", "the distill alternative child replicates");
+    assert_eq!(reason, "loses the fix", "the alternative's nullable reason column replicates too");
     // repo-a advertises no route for repo-b's incarnation, so repo-b's record never lands.
     let sibling: bool = joiner
         .query_row(

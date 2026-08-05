@@ -57,7 +57,7 @@ use crate::op::OpMeta;
 /// registering a table or widening a spec forces an append, and an append is the bump. A widening
 /// that is not a registry change (a new row-op kind) still has to append a generation by hand,
 /// repeating the previous snapshot.
-pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 4;
+pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 5;
 
 const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
 

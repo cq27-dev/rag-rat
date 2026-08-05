@@ -6470,6 +6470,88 @@ mod syncable_overlay_migration_tests {
             "item_key"
         ]);
     }
+
+    /// V109 rebuilds the edges + alternatives children onto their natural keys, dropping `id`,
+    /// across a full ladder replay.
+    #[test]
+    fn v109_rebuilds_edges_and_alternatives_to_natural_keys_across_a_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        assert_eq!(primary_key_columns(&conn, "papertrail_distill_edges").unwrap(), [
+            "repo_id",
+            "tracker",
+            "project",
+            "src_item_kind",
+            "src_item_key",
+            "dst_item_kind",
+            "dst_item_key",
+            "edge_kind"
+        ]);
+        assert_eq!(primary_key_columns(&conn, "papertrail_distill_alternatives").unwrap(), [
+            "repo_id",
+            "tracker",
+            "project",
+            "item_kind",
+            "item_key",
+            "ordinal"
+        ]);
+        for table in ["papertrail_distill_edges", "papertrail_distill_alternatives"] {
+            let has_id: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'id'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(has_id, 0, "{table} drops the AUTOINCREMENT id");
+        }
+    }
+
+    /// The rebuild copies every edge and alternative row, re-keyed by its natural key.
+    #[test]
+    fn v109_preserves_edge_and_alternative_rows_through_the_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::apply_distill_record_store(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_edges
+                 (tracker, project, src_item_kind, src_item_key, dst_item_kind, dst_item_key,
+                  edge_kind, created_at_ms, repo_id)
+             VALUES ('github', 'o/r', 'issue', '7', 'change_request', '8', 'coalesced', 5, 'r')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_alternatives
+                 (tracker, project, item_kind, item_key, ordinal, alternative, reason, repo_id)
+             VALUES ('github', 'o/r', 'issue', '7', 0, 'do X', 'too slow', 'r')",
+            [],
+        )
+        .unwrap();
+        super::apply_syncable_distill_edges_and_alternatives(&conn).unwrap();
+        let created_at: i64 = conn
+            .query_row(
+                "SELECT created_at_ms FROM papertrail_distill_edges
+                 WHERE repo_id = 'r' AND edge_kind = 'coalesced'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_at, 5);
+        let (alternative, reason): (String, String) = conn
+            .query_row(
+                "SELECT alternative, reason FROM papertrail_distill_alternatives
+                 WHERE repo_id = 'r' AND item_key = '7' AND ordinal = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(alternative, "do X");
+        assert_eq!(
+            reason, "too slow",
+            "the nullable reason column is preserved through the rebuild"
+        );
+    }
 }
 
 /// V095 (#1002): per-TABLE spec versioning, plus a direct pointer from a row to its winning entry.
@@ -7722,6 +7804,80 @@ pub fn apply_syncable_distill_records(conn: &Connection) -> rusqlite::Result<()>
          DROP TABLE papertrail_distill;
          ALTER TABLE papertrail_distill_v108 RENAME TO papertrail_distill;",
     )
+}
+
+/// V109 (#1137): make the distill `edges` and `alternatives` children syncable on `distill/1`.
+///
+/// Like the parent (V108), each keyed on a device-local AUTOINCREMENT `id` with its natural key
+/// only as a UNIQUE index. Rebuild each onto the natural key (repo_id first), dropping `id`;
+/// neither carries triggers, local columns, or FKs. Each block short-circuits once its table is
+/// already in the rebuilt shape, so a full-ladder replay is a no-op.
+pub fn apply_syncable_distill_edges_and_alternatives(conn: &Connection) -> rusqlite::Result<()> {
+    if !(table_is_strict(conn, "papertrail_distill_edges")?
+        && primary_key_columns(conn, "papertrail_distill_edges")?
+            == [
+                "repo_id",
+                "tracker",
+                "project",
+                "src_item_kind",
+                "src_item_key",
+                "dst_item_kind",
+                "dst_item_key",
+                "edge_kind",
+            ])
+    {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS papertrail_distill_edges_v109;
+             CREATE TABLE papertrail_distill_edges_v109(
+                 tracker TEXT NOT NULL,
+                 project TEXT NOT NULL,
+                 src_item_kind TEXT NOT NULL,
+                 src_item_key TEXT NOT NULL,
+                 dst_item_kind TEXT NOT NULL,
+                 dst_item_key TEXT NOT NULL,
+                 edge_kind TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL,
+                 repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+                 PRIMARY KEY(repo_id, tracker, project, src_item_kind, src_item_key,
+                             dst_item_kind, dst_item_key, edge_kind)
+             ) STRICT;
+             INSERT INTO papertrail_distill_edges_v109(
+                 tracker, project, src_item_kind, src_item_key, dst_item_kind, dst_item_key,
+                 edge_kind, created_at_ms, repo_id)
+             SELECT tracker, project, src_item_kind, src_item_key, dst_item_kind, dst_item_key,
+                 edge_kind, created_at_ms, repo_id
+             FROM papertrail_distill_edges;
+             DROP TABLE papertrail_distill_edges;
+             ALTER TABLE papertrail_distill_edges_v109 RENAME TO papertrail_distill_edges;",
+        )?;
+    }
+    if !(table_is_strict(conn, "papertrail_distill_alternatives")?
+        && primary_key_columns(conn, "papertrail_distill_alternatives")?
+            == ["repo_id", "tracker", "project", "item_kind", "item_key", "ordinal"])
+    {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS papertrail_distill_alternatives_v109;
+             CREATE TABLE papertrail_distill_alternatives_v109(
+                 tracker TEXT NOT NULL,
+                 project TEXT NOT NULL,
+                 item_kind TEXT NOT NULL,
+                 item_key TEXT NOT NULL,
+                 ordinal INTEGER NOT NULL,
+                 alternative TEXT NOT NULL,
+                 reason TEXT,
+                 repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+                 PRIMARY KEY(repo_id, tracker, project, item_kind, item_key, ordinal)
+             ) STRICT;
+             INSERT INTO papertrail_distill_alternatives_v109(
+                 tracker, project, item_kind, item_key, ordinal, alternative, reason, repo_id)
+             SELECT tracker, project, item_kind, item_key, ordinal, alternative, reason, repo_id
+             FROM papertrail_distill_alternatives;
+             DROP TABLE papertrail_distill_alternatives;
+             ALTER TABLE papertrail_distill_alternatives_v109
+                 RENAME TO papertrail_distill_alternatives;",
+        )?;
+    }
+    Ok(())
 }
 
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
