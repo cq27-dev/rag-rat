@@ -6612,6 +6612,63 @@ mod syncable_overlay_migration_tests {
         assert_eq!(sha, "abc123");
         assert_eq!(created, 0, "a legacy row gets created_at_ms = 0 until it is re-mined");
     }
+
+    /// V111 rebuilds evidence onto its natural key with a per-thread ordinal, drops `id`, across a
+    /// full ladder replay.
+    #[test]
+    fn v111_rebuilds_evidence_to_the_natural_key_with_an_ordinal_across_a_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        assert_eq!(primary_key_columns(&conn, "papertrail_distill_evidence").unwrap(), [
+            "repo_id",
+            "tracker",
+            "project",
+            "item_kind",
+            "item_key",
+            "ordinal"
+        ]);
+        let has_id: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('papertrail_distill_evidence')
+                 WHERE name = 'id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_id, 0, "the AUTOINCREMENT id is dropped");
+    }
+
+    /// The rebuild copies every evidence row and assigns per-thread ordinals in id order.
+    #[test]
+    fn v111_backfills_per_thread_evidence_ordinals_in_id_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::apply_distill_record_store(&conn).unwrap();
+        super::apply_distill_evidence_source_part(&conn).unwrap();
+        // Two evidence rows on one thread, inserted in order → ordinals 0, 1.
+        for quote in ["first", "second"] {
+            conn.execute(
+                "INSERT INTO papertrail_distill_evidence
+                     (tracker, project, item_kind, item_key, field, source_kind, source_id,
+                      byte_start, byte_end, quote, repo_id)
+                 VALUES ('github', 'o/r', 'issue', '7', 'root_cause', 'item', '7', 0, 5, ?1, 'r')",
+                [quote],
+            )
+            .unwrap();
+        }
+        super::apply_syncable_distill_evidence(&conn).unwrap();
+        let rows: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT ordinal, quote FROM papertrail_distill_evidence
+                 WHERE repo_id = 'r' AND item_key = '7' ORDER BY ordinal",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![(0, "first".to_string()), (1, "second".to_string())]);
+    }
 }
 
 /// V095 (#1002): per-TABLE spec versioning, plus a direct pointer from a row to its winning entry.
@@ -7976,6 +8033,63 @@ pub fn apply_syncable_distill_record_commits(conn: &Connection) -> rusqlite::Res
          DROP TABLE papertrail_distill_record_commits;
          ALTER TABLE papertrail_distill_record_commits_v110
              RENAME TO papertrail_distill_record_commits;",
+    )
+}
+
+/// V111 (#1139): make the distill `evidence` child syncable on `distill/1`.
+///
+/// The table had no natural unique key — a model can cite the same unit twice for one field, and
+/// title/body citations share `source_id` — so a composite discriminator is duplicate-unsafe. The
+/// rebuild adds a stable per-thread `ordinal` (assigned at insert in citation order by the drain,
+/// backfilled here by `id` order within each thread so existing rows get a deterministic sequence),
+/// keys on `(repo_id, tracker, project, item_kind, item_key, ordinal)`, and drops the device-local
+/// AUTOINCREMENT `id`. No triggers, local columns, or FKs; `source_part` keeps its CHECK.
+/// Short-circuits once the table is already in the rebuilt shape.
+pub fn apply_syncable_distill_evidence(conn: &Connection) -> rusqlite::Result<()> {
+    if table_is_strict(conn, "papertrail_distill_evidence")?
+        && primary_key_columns(conn, "papertrail_distill_evidence")?
+            == ["repo_id", "tracker", "project", "item_kind", "item_key", "ordinal"]
+    {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS papertrail_distill_evidence_v111;
+         CREATE TABLE papertrail_distill_evidence_v111(
+             tracker TEXT NOT NULL,
+             project TEXT NOT NULL,
+             item_kind TEXT NOT NULL,
+             item_key TEXT NOT NULL,
+             ordinal INTEGER NOT NULL,
+             field TEXT NOT NULL,
+             source_kind TEXT NOT NULL,
+             source_part TEXT CHECK(source_part IN ('title', 'body', 'comment')),
+             source_id TEXT NOT NULL,
+             byte_start INTEGER NOT NULL,
+             byte_end INTEGER NOT NULL,
+             quote TEXT NOT NULL,
+             author TEXT,
+             author_kind TEXT,
+             author_association TEXT,
+             unit_created_at_ms INTEGER,
+             repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+             PRIMARY KEY(repo_id, tracker, project, item_kind, item_key, ordinal)
+         ) STRICT;
+         INSERT INTO papertrail_distill_evidence_v111(
+             tracker, project, item_kind, item_key, ordinal, field, source_kind, source_part,
+             source_id, byte_start, byte_end, quote, author, author_kind, author_association,
+             unit_created_at_ms, repo_id)
+         SELECT
+             e.tracker, e.project, e.item_kind, e.item_key,
+             (SELECT COUNT(*) FROM papertrail_distill_evidence AS earlier
+              WHERE earlier.repo_id = e.repo_id AND earlier.tracker = e.tracker
+                AND earlier.project = e.project AND earlier.item_kind = e.item_kind
+                AND earlier.item_key = e.item_key AND earlier.id < e.id),
+             e.field, e.source_kind, e.source_part, e.source_id, e.byte_start, e.byte_end,
+             e.quote, e.author, e.author_kind, e.author_association, e.unit_created_at_ms, \
+         e.repo_id
+         FROM papertrail_distill_evidence AS e;
+         DROP TABLE papertrail_distill_evidence;
+         ALTER TABLE papertrail_distill_evidence_v111 RENAME TO papertrail_distill_evidence;",
     )
 }
 

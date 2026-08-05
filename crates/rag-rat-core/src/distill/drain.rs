@@ -791,8 +791,11 @@ fn persist_success(
         return Ok(false);
     }
     clear_model_junctions(conn, repo_id, &job.key)?;
-    for evidence in evidence {
-        insert_evidence(conn, repo_id, &job.key, &evidence)?;
+    // The per-thread `ordinal` is the whole-row-LWW key discriminator (evidence has no natural
+    // unique key); assign it in citation order — the order `collect_evidence` produced these
+    // rows.
+    for (ordinal, evidence) in evidence.iter().enumerate() {
+        insert_evidence(conn, repo_id, ordinal, &job.key, evidence)?;
     }
     for (ordinal, rejected) in output.decision.rejected.iter().enumerate() {
         conn.execute(
@@ -898,21 +901,23 @@ fn collect_evidence<'a>(
 fn insert_evidence(
     conn: &Connection,
     repo_id: &str,
+    ordinal: usize,
     key: &ThreadKey,
     evidence: &EvidenceRow<'_>,
 ) -> anyhow::Result<()> {
     let quote = &evidence.source.exact_text[evidence.unit.byte_start..evidence.unit.byte_end];
     conn.execute(
         "INSERT INTO papertrail_distill_evidence
-             (tracker, project, item_kind, item_key, field, source_kind, source_part, source_id,
-              byte_start, byte_end, quote, author, author_kind, author_association,
+             (tracker, project, item_kind, item_key, ordinal, field, source_kind, source_part,
+              source_id, byte_start, byte_end, quote, author, author_kind, author_association,
               unit_created_at_ms, repo_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             key.tracker,
             key.project,
             key.item_kind,
             key.item_key,
+            i64::try_from(ordinal)?,
             evidence.field,
             evidence.source.source_kind,
             // source_part (#801) distinguishes a title citation from a body citation on the same
@@ -1037,6 +1042,9 @@ mod tests {
         migrations::apply_distill_safe_input_snapshot(&conn).unwrap();
         migrations::apply_distill_enriched_context(&conn).unwrap();
         migrations::apply_distill_evidence_source_part(&conn).unwrap();
+        // The evidence insert now writes the per-thread ordinal (V111), so the evidence table must
+        // be in its rebuilt shape in these partial-schema fixtures.
+        migrations::apply_syncable_distill_evidence(&conn).unwrap();
         // `persist_success` advances the papertrail Lens lane, which needs a registered repo and
         // the `repo_meta` sink (V108 dropped the row triggers). This partial fixture
         // predates the full schema, so create both and register the repo the seeds use.
@@ -1346,6 +1354,9 @@ mod tests {
         migrations::apply_distill_safe_input_snapshot(&conn).unwrap();
         migrations::apply_distill_enriched_context(&conn).unwrap();
         migrations::apply_distill_evidence_source_part(&conn).unwrap();
+        // The evidence insert now writes the per-thread ordinal (V111), so the evidence table must
+        // be in its rebuilt shape in these partial-schema fixtures.
+        migrations::apply_syncable_distill_evidence(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
@@ -1535,6 +1546,9 @@ mod tests {
         migrations::apply_distill_safe_input_snapshot(&conn).unwrap();
         migrations::apply_distill_enriched_context(&conn).unwrap();
         migrations::apply_distill_evidence_source_part(&conn).unwrap();
+        // The evidence insert now writes the per-thread ordinal (V111), so the evidence table must
+        // be in its rebuilt shape in these partial-schema fixtures.
+        migrations::apply_syncable_distill_evidence(&conn).unwrap();
         conn.execute_batch(
             "CREATE TABLE git_commits(
                  hash TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,

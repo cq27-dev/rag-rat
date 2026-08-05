@@ -3812,9 +3812,10 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO papertrail_distill_evidence
-                 (tracker, project, item_kind, item_key, field, source_kind, source_id,
+                 (tracker, project, item_kind, item_key, ordinal, field, source_kind, source_id,
                   byte_start, byte_end, quote, repo_id)
-             VALUES ('github','o/r','change_request','9','root_cause','item','9',0,3,'the','repoA')",
+             VALUES \
+             ('github','o/r','change_request','9',0,'root_cause','item','9',0,3,'the','repoA')",
             [],
         )
         .unwrap();

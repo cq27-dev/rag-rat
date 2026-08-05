@@ -1039,6 +1039,16 @@ async fn production_distill_records_replicate_and_regenerate() {
         .unwrap();
     owner
         .execute(
+            "INSERT INTO papertrail_distill_evidence
+                 (tracker, project, item_kind, item_key, ordinal, field, source_kind, source_id,
+                  byte_start, byte_end, quote, repo_id)
+             VALUES ('github', 'o/r', 'issue', '7', 0, 'root_cause', 'item', '7', 0, 5,
+                     'the exact cause quote', 'repo-a')",
+            [],
+        )
+        .unwrap();
+    owner
+        .execute(
             "INSERT INTO repos(repo_id, display_name, registered_at_ms)
              VALUES ('repo-b', 'repo-b', 0)",
             [],
@@ -1113,6 +1123,15 @@ async fn production_distill_records_replicate_and_regenerate() {
         )
         .unwrap();
     assert_eq!(commit_sha, "fixsha1", "the distill record_commits child replicates");
+    let quote: String = joiner
+        .query_row(
+            "SELECT quote FROM papertrail_distill_evidence
+             WHERE repo_id = 'repo-a' AND item_key = '7' AND ordinal = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(quote, "the exact cause quote", "the distill evidence child replicates");
     // repo-a advertises no route for repo-b's incarnation, so repo-b's record never lands.
     let sibling: bool = joiner
         .query_row(

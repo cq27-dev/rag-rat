@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 110;
+pub const LATEST_SCHEMA_VERSION: u32 = 111;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -824,6 +824,12 @@ const MIGRATION_110_DESCRIPTION: &str =
     "Rebuild papertrail_distill_record_commits onto its natural key (repo_id first), dropping the \
      device-local AUTOINCREMENT id and adding a created_at_ms non-key column so the key-only \
      table can replicate on the distill/1 table-sync scope under whole-row LWW (#1139)";
+const MIGRATION_111_ID: &str = "111_syncable_distill_evidence";
+const MIGRATION_111_CHECKSUM: &str = "sha256:rag-rat-syncable-distill-evidence-v111";
+const MIGRATION_111_DESCRIPTION: &str =
+    "Rebuild papertrail_distill_evidence onto its natural key (repo_id first) with a per-thread \
+     ordinal, dropping the device-local AUTOINCREMENT id, so the distill evidence child \
+     replicates on the distill/1 table-sync scope under whole-row LWW (#1139)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1041,6 +1047,7 @@ const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[
     MIGRATION_108_ID,
     MIGRATION_109_ID,
     MIGRATION_110_ID,
+    MIGRATION_111_ID,
 ];
 
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
@@ -1722,6 +1729,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_110_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_syncable_distill_record_commits),
     },
+    Migration {
+        id: MIGRATION_111_ID,
+        checksum: MIGRATION_111_CHECKSUM,
+        description: MIGRATION_111_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_syncable_distill_evidence),
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -1952,6 +1965,7 @@ mod ledger_atomicity {
         MIGRATION_108_ID,
         MIGRATION_109_ID,
         MIGRATION_110_ID,
+        MIGRATION_111_ID,
     ];
 
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.
