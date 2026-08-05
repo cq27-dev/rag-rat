@@ -1030,6 +1030,10 @@ mod tests {
         entries: HashMap<[u8; 32], Vec<u8>>,
         local_capability: PeerCapability,
         peer_authorization: PeerAuthorization,
+        /// Counts `snapshot()` calls, so a test can prove no inventory was computed before
+        /// admission (#406/#881: the auth phase gates the session, so a rejected peer must
+        /// trigger zero snapshots). Cloned out before the store moves into a session.
+        snapshot_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl TestStore {
@@ -1044,6 +1048,7 @@ mod tests {
                 entries: entries.into_iter().collect(),
                 local_capability,
                 peer_authorization: PeerAuthorization::Granted(peer_capability),
+                snapshot_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
     }
@@ -1054,6 +1059,7 @@ mod tests {
         }
 
         fn snapshot(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+            self.snapshot_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.entries.iter().map(|(hash, bytes)| (*hash, bytes.clone())).collect())
         }
 
@@ -1533,6 +1539,51 @@ mod tests {
         assert_eq!(server_store.entries.len(), expected.len());
         assert_eq!(reader_store.entries.len(), expected.len() + 1);
         assert!(reader_store.entries.contains_key(&reader_only.0));
+        // An ADMITTED peer does trigger the inventory snapshot — the counter the admission-refusal
+        // test asserts stays zero is a real instrument, not a no-op.
+        assert!(server_store.snapshot_calls.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    /// #406 admission: a peer the acceptor's policy rejects must learn NOTHING — the acceptor must
+    /// not even COMPUTE its inventory before the remote passes admission. The auth phase gates the
+    /// session, so a rejected dialer triggers zero `snapshot()` calls (and the acceptor errors out
+    /// before `run_session` ever sends a Hello). The acceptor holds real entries, so the guard is
+    /// not vacuous: were the snapshot computed pre-auth, the counter would be non-zero.
+    #[tokio::test]
+    async fn no_inventory_is_computed_for_a_peer_that_fails_admission() {
+        let account = [0xa3; 32];
+        let held: Vec<_> = (1..=3).map(test_entry).collect();
+        let mut server_store =
+            TestStore::new(account, held, PeerCapability::ReadWrite, PeerCapability::ReadWrite);
+        // The acceptor rejects the dialer's binding under its Closed policy.
+        server_store.peer_authorization = PeerAuthorization::Rejected;
+        let server_snapshots = server_store.snapshot_calls.clone();
+        let mut dialer_store =
+            TestStore::new(account, [], PeerCapability::ReadWrite, PeerCapability::ReadWrite);
+        let (listener, dialer) = loopback_endpoints().await;
+
+        let server = accept_and_sync(&listener, &mut server_store, AuthPolicy::Closed, || NOW);
+        let client = connect_and_sync(
+            &dialer,
+            direct_addr(&listener),
+            SYNC_ALPN,
+            &mut dialer_store,
+            AuthPolicy::Closed,
+            NOW,
+        );
+        let (server_result, client_result) = tokio::join!(server, client);
+
+        assert!(
+            matches!(server_result, Err(SyncFailure::Auth(crate::auth::AuthError::Unauthorized))),
+            "the acceptor refuses the rejected peer on ADMISSION (not a timeout/protocol fault): \
+             {server_result:?}"
+        );
+        assert!(client_result.is_err(), "the dialer gets no session: {client_result:?}");
+        assert_eq!(
+            server_snapshots.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no inventory may be computed before admission succeeds"
+        );
     }
 
     #[tokio::test]
