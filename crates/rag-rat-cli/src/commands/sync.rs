@@ -99,7 +99,7 @@ fn serve(config: &Config, once: bool) -> anyhow::Result<()> {
 
 /// Owner-side pairing (`sync init`): mint a one-time invite, print the ticket, then host the
 /// enrollment exchange AND the joiner's follow-up account + content restore until interrupted. It
-/// is the same accept loop as [`serve`] — `accept_and_dispatch` already routes the enrollment ALPN
+/// is the same accept loop as [`serve`] — `dispatch_connection` already routes the enrollment ALPN
 /// against the owner's database — so `init` is simply "mint, then serve". Never `--once`: a joiner
 /// needs the enrollment connection plus two sync connections.
 fn init(config: &Config, mint: InviteMint) -> anyhow::Result<()> {
@@ -234,22 +234,47 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
         // ONE ctrl_c future for the whole loop: a fresh `ctrl_c()` per iteration would let a signal
         // delivered between iterations be swallowed by tokio's driver and missed.
         let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
+        // `local_node` is already bound above (the roster gate); reuse it for
+        // `dispatch_connection`. Global inbound accept-rate limit: refuses a connection
+        // flood BEFORE the handshake, regardless of peer id (Sybil-resistant). Loop-owned;
+        // the accept is sequential so no locking.
+        let mut accept_rate = rag_rat_sync::GlobalAcceptRateLimiter::new();
         loop {
             // One endpoint, one accept loop: a connection carries the ACCOUNT-LOG ALPN or the
-            // CONTENT ALPN, and `accept_and_dispatch` routes it to the matching store after the
-            // (account-level) auth phase. Both stores are cheap handles reconstructed per accept.
+            // CONTENT ALPN (or ENROLL/TABLE), and `dispatch_connection` routes it to
+            // the matching store after the (account-level) auth phase. Both stores are
+            // cheap handles reconstructed per accept.
             let mut account_store = OplogSyncStore::new(conn, account_id, time::now_ms);
             let mut content_store = OplogContentSyncStore::new(conn, account_id, time::now_ms);
+            // Accept + rate check + dispatch stay in ONE selected future so ctrl_c interrupts a
+            // peer mid-session. `Some(None)` = refused by the accept-rate limit
+            // (nothing served); `None` = shutdown. `accept_connection_within_rate`
+            // reads `now_ms` once a peer connects, so the auth timestamp never predates
+            // the connection.
             let outcome = tokio::select! {
-                // `accept_and_dispatch` reads `now_ms` once a peer connects — the server may wait
-                // here arbitrarily long, so the auth timestamp must not predate the connection.
-                result = rag_rat_sync::accept_and_dispatch(
-                    &endpoint,
-                    &mut account_store,
-                    &mut content_store,
-                    policy,
-                    time::now_ms,
-                ) => Some(result),
+                result = async {
+                    match rag_rat_sync::accept_connection_within_rate(
+                        &endpoint,
+                        &mut accept_rate,
+                        time::now_ms,
+                    )
+                    .await
+                    {
+                        Ok(Some(conn)) => Some(
+                            rag_rat_sync::dispatch_connection(
+                                conn,
+                                local_node,
+                                &mut account_store,
+                                &mut content_store,
+                                policy,
+                                time::now_ms,
+                            )
+                            .await,
+                        ),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                } => Some(result),
                 _ = &mut shutdown => None,
             };
             match outcome {
@@ -257,7 +282,10 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
                     tracing::info!("interrupted; shutting down");
                     break;
                 },
-                Some(Ok((alpn, report))) => {
+                // Refused by the accept-rate limit before the handshake — nothing served, take the
+                // next connection (never an error, so `--once` is unaffected by a refusal).
+                Some(None) => continue,
+                Some(Some(Ok((alpn, report)))) => {
                     if alpn.as_slice() == rag_rat_sync::SYNC_ALPN
                         && report.entries_sent == 0
                         && report.entries_received == 0
@@ -282,8 +310,8 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
                 // In one-shot mode the session IS the command's result, so a failed session is a
                 // failed command (scripted checks must see the non-zero exit). The long-running
                 // server logs and moves on to the next peer instead.
-                Some(Err(e)) if once => return Err(anyhow!("sync session failed: {e}")),
-                Some(Err(e)) => {
+                Some(Some(Err(e))) if once => return Err(anyhow!("sync session failed: {e}")),
+                Some(Some(Err(e))) => {
                     tracing::warn!(error = %e, "sync session failed");
                     // A closed endpoint makes `accept` fail immediately and forever, so continuing
                     // would spin the loop at 100% CPU logging the same error — exit non-zero.

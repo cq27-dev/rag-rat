@@ -739,6 +739,89 @@ pub async fn accept_connection(endpoint: &Endpoint) -> Result<IrohConnection, Sy
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))
 }
 
+/// Inbound connections admitted per second in steady state once the burst is spent. Sized to clear
+/// legitimate multi-peer inbound (a joiner opens ~4 rapid connections — enrollment + account log +
+/// content + table) while bounding a flood. Implementation-local constant, not config.
+const ACCEPT_REFILL_PER_SEC: f64 = 8.0;
+/// Maximum inbound connections admitted in one instantaneous burst.
+const ACCEPT_BURST: f64 = 32.0;
+
+/// A GLOBAL inbound-connection rate limiter: one token bucket bounding total accept rate regardless
+/// of peer identity. Per-peer-by-node-id limiting is the wrong lever — an iroh node id is a keypair
+/// mintable in microseconds, so a flood rotates ids and evades any per-id bucket while making the
+/// id map its own memory/eviction target. The Sybil-resistant bound is global and refused before
+/// the handshake. In-memory and transient by design: a restart resetting the window to full burst
+/// is correct for a live-traffic control (contrast the durable byte ceilings on the ingest paths).
+#[derive(Debug)]
+pub struct GlobalAcceptRateLimiter {
+    tokens: f64,
+    burst: f64,
+    refill_per_sec: f64,
+    last_ms: Option<i64>,
+}
+
+impl Default for GlobalAcceptRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GlobalAcceptRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            tokens: ACCEPT_BURST,
+            burst: ACCEPT_BURST,
+            refill_per_sec: ACCEPT_REFILL_PER_SEC,
+            last_ms: None,
+        }
+    }
+
+    /// Refill by the time elapsed since the last call (capped at `burst`, so idle time never
+    /// accrues unbounded credit), then spend one token. Returns `false` when the bucket is
+    /// empty — the connection should be refused. `now_ms` is injected so refill is
+    /// deterministically testable.
+    pub fn allow(&mut self, now_ms: i64) -> bool {
+        if let Some(last) = self.last_ms {
+            let elapsed_secs = (now_ms - last).max(0) as f64 / 1000.0;
+            self.tokens = (self.tokens + elapsed_secs * self.refill_per_sec).min(self.burst);
+        }
+        self.last_ms = Some(now_ms);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Accept one inbound connection, refusing it BEFORE the TLS handshake when the global accept-rate
+/// `limiter` is exhausted. `Ok(None)` means the connection was refused by the rate limit — the
+/// caller continues its accept loop; `Ok(Some(conn))` means admitted and handshaken. Refusing at
+/// the `Incoming` stage costs no handshake CPU and reveals nothing to the peer.
+pub async fn accept_connection_within_rate(
+    endpoint: &Endpoint,
+    limiter: &mut GlobalAcceptRateLimiter,
+    now_ms: impl Fn() -> i64,
+) -> Result<Option<IrohConnection>, SyncFailure> {
+    let incoming = endpoint
+        .accept()
+        .await
+        .ok_or_else(|| SyncFailure::Endpoint(EndpointError::Connect("endpoint closed".into())))?;
+    // Read the clock only NOW that a peer has connected — `accept()` can idle arbitrarily long, and
+    // a timestamp taken before the wait would under-credit the bucket's refill and wrongly
+    // refuse a connection arriving after a load-then-idle stretch.
+    if !limiter.allow(now_ms()) {
+        incoming.refuse();
+        return Ok(None);
+    }
+    let conn = timeout(DEFAULT_IDLE_TIMEOUT, incoming)
+        .await
+        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("handshake timed out".into())))?
+        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
+    Ok(Some(conn))
+}
+
 /// Run the ALPN-selected sync session for an already-accepted connection.
 pub async fn dispatch_connection<C>(
     conn: IrohConnection,
@@ -1507,6 +1590,102 @@ mod tests {
             .port();
         EndpointAddr::new(endpoint.id())
             .with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+    }
+
+    #[test]
+    fn accept_rate_admits_a_burst_then_denies() {
+        let mut limiter = GlobalAcceptRateLimiter::new();
+        // The full burst is admitted at one instant...
+        for i in 0..ACCEPT_BURST as usize {
+            assert!(limiter.allow(NOW), "burst connection {i} within capacity");
+        }
+        // ...and the next one at the same instant is denied.
+        assert!(!limiter.allow(NOW), "the connection past the burst is refused");
+    }
+
+    #[test]
+    fn accept_rate_refills_over_time() {
+        let mut limiter = GlobalAcceptRateLimiter::new();
+        while limiter.allow(NOW) {} // drain the burst
+        assert!(!limiter.allow(NOW), "drained");
+        // One second later, exactly `ACCEPT_REFILL_PER_SEC` tokens are available again.
+        let later = NOW + 1000;
+        for i in 0..ACCEPT_REFILL_PER_SEC as usize {
+            assert!(limiter.allow(later), "refilled token {i} available after 1s");
+        }
+        assert!(!limiter.allow(later), "no more than the per-second refill accrues in 1s");
+    }
+
+    #[test]
+    fn accept_rate_refill_is_capped_at_the_burst() {
+        let mut limiter = GlobalAcceptRateLimiter::new();
+        while limiter.allow(NOW) {} // drain
+        // A long idle must not accrue unbounded credit — only up to the burst.
+        let long_idle = NOW + 1_000_000;
+        for i in 0..ACCEPT_BURST as usize {
+            assert!(limiter.allow(long_idle), "capped-refill token {i}");
+        }
+        assert!(!limiter.allow(long_idle), "idle time accrues at most one burst, not more");
+    }
+
+    #[test]
+    fn accept_rate_never_denies_traffic_under_the_rate() {
+        let mut limiter = GlobalAcceptRateLimiter::new();
+        // One connection every 250ms = 4/s, well under the 8/s refill — never denied over a long
+        // run.
+        for tick in 0..200 {
+            let now = NOW + tick * 250;
+            assert!(limiter.allow(now), "steady sub-rate traffic at tick {tick} is admitted");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_drained_accept_rate_refuses_a_connection_before_the_handshake() {
+        let (listener, dialer) = loopback_endpoints().await;
+        let mut limiter = GlobalAcceptRateLimiter::new();
+        while limiter.allow(NOW) {} // drain so the next accept is refused
+
+        let server = accept_connection_within_rate(&listener, &mut limiter, || NOW);
+        let client = async {
+            // The refused `Incoming` makes the dial fail rather than establish a session.
+            timeout(DEFAULT_IDLE_TIMEOUT, dialer.connect(direct_addr(&listener), SYNC_ALPN)).await
+        };
+        let (server_result, client_result) = tokio::join!(server, client);
+
+        assert!(
+            matches!(server_result, Ok(None)),
+            "a drained limiter refuses at the Incoming stage: {server_result:?}"
+        );
+        assert!(
+            matches!(client_result, Ok(Err(_)) | Err(_)),
+            "the dialer's connection does not establish"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_accept_rate_clock_is_read_when_the_peer_connects_not_before_the_wait() {
+        // Drain the bucket, then let the connection arrive an HOUR later. The limiter must refill
+        // against the CONNECT time — read via the closure after `accept()` resolves — not a
+        // timestamp captured before the idle wait. With an eagerly-captured clock this
+        // would wrongly refuse a legitimate connection after any load-then-idle stretch;
+        // the closure makes it admit.
+        let (listener, dialer) = loopback_endpoints().await;
+        let mut limiter = GlobalAcceptRateLimiter::new();
+        while limiter.allow(NOW) {}
+        let connect_at = NOW + 3_600_000;
+
+        let server = accept_connection_within_rate(&listener, &mut limiter, move || connect_at);
+        let client = async {
+            timeout(DEFAULT_IDLE_TIMEOUT, dialer.connect(direct_addr(&listener), SYNC_ALPN)).await
+        };
+        let (server_result, client_result) = tokio::join!(server, client);
+
+        assert!(
+            matches!(server_result, Ok(Some(_))),
+            "the bucket refilled to the connect time admits the delayed connection: \
+             {server_result:?}"
+        );
+        assert!(matches!(client_result, Ok(Ok(_))), "the dialer connects: {client_result:?}");
     }
 
     async fn accept_test_table_sync(

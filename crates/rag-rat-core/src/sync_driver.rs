@@ -546,9 +546,21 @@ async fn accept_loop(
     database: PathBuf,
 ) {
     let sessions = Arc::new(tokio::sync::Semaphore::new(RESIDENT_SESSION_MAX));
+    // Global inbound accept-rate limit: refuses a connection flood BEFORE the handshake, regardless
+    // of peer id (Sybil-resistant). Loop-owned, so no locking.
+    let mut accept_rate = rag_rat_sync::GlobalAcceptRateLimiter::new();
     loop {
-        let connection = match rag_rat_sync::accept_connection(&endpoint).await {
-            Ok(connection) => connection,
+        let connection = match rag_rat_sync::accept_connection_within_rate(
+            &endpoint,
+            &mut accept_rate,
+            time::now_ms,
+        )
+        .await
+        {
+            Ok(Some(connection)) => connection,
+            // Refused by the accept-rate limit before the handshake — nothing served, take the
+            // next.
+            Ok(None) => continue,
             Err(error) if endpoint.is_closed() => {
                 tracing::warn!(%error, "resident sync endpoint closed");
                 return;
