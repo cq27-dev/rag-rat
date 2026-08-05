@@ -28,6 +28,15 @@ pub fn drain_synced_memory(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Re-resolve synced SYMBOL distill anchors against the active repo's local index — call at a
+/// table-sync (`/5`) settle point so a replicated anchor surfaces as drive-by in the SAME session
+/// it arrived, without waiting for the next index open. A device never receives an anchor's
+/// device-local `logical_symbol_id`/`resolved` (they are `local_columns`); this derives them from
+/// the anchor's portable `(name, file_path)`. Idempotent — a no-op when nothing resolved anew.
+pub fn resolve_synced_distill_anchors(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    index::resolve_synced_distill_anchors(conn)
+}
+
 /// Lightweight, lock-free count of active repo memories whose anchor is `gone`/`stale` — the same
 /// population `memory_doctor` lists. Opens a BARE read-only connection (no git resolution, scope
 /// view, or schema migration), so it is cheap enough to call on every MCP tool result to nudge the

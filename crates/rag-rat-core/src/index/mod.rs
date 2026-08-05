@@ -61,6 +61,17 @@ pub fn migration_hooks() -> rag_rat_db::MigrationHooks {
         realign_logical_symbol_ids: graph_index::realign_logical_symbol_ids,
     }
 }
+
+/// Re-resolve synced SYMBOL distill anchors for the active repo against its current local index —
+/// the table-sync settle-point entry (a peer receives an anchor's portable facts but never its
+/// device-local `logical_symbol_id`/`resolved`). Resolves the active repo at its live generation;
+/// safe on a view-less connection (both scope reads fall back to the sole-repo / live generation).
+pub(crate) fn resolve_synced_distill_anchors(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let generation = rag_rat_db::schema::active_generation(conn)?;
+    graph_index::resolve_synced_symbol_anchors(conn, &repo_id, generation)?;
+    Ok(())
+}
 // Only tests reach `install_scope_view` directly now: non-test code resolves the repo id
 // explicitly (`resolve_scope_repo_id`) and passes it into `install_worktree_scope_view`, which
 // writes the scope itself rather than routing through the config-blind `active_repo_id`

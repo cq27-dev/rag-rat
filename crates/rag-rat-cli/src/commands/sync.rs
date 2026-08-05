@@ -266,6 +266,10 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
                         ensure_founder_table_repo_incarnations(conn)?;
                     } else if alpn.as_slice() == rag_rat_sync::CONTENT_SYNC_ALPN {
                         rag_rat_core::drain_synced_memory(conn)?;
+                    } else if alpn.as_slice() == rag_rat_sync::TABLE_SYNC_ALPN {
+                        // Synced anchors arrive without device-local resolution; derive it now so
+                        // they surface as drive-by this session rather than at the next index open.
+                        rag_rat_core::resolve_synced_distill_anchors(conn)?;
                     }
                     tracing::info!(
                         stream = %String::from_utf8_lossy(&alpn),
@@ -483,6 +487,8 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
                 true
             }
         };
+        // Resolve the anchors this restore just pulled against the local index before folding.
+        rag_rat_core::resolve_synced_distill_anchors(conn)?;
         db.fold_wal();
 
         // The inviter's node id in dial form, so the operator can add it to `[sync] server_peers`

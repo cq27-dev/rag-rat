@@ -949,6 +949,77 @@ fn a_remap_heals_a_logical_id_referenced_only_by_a_distill_anchor() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// #1143: a SYMBOL anchor synced from a peer arrives with `logical_symbol_id = NULL` / `resolved =
+/// 0` (both are `local_columns`, never sent), so it surfaces through neither read path. The on-open
+/// pass must re-derive its handle from the portable `(name, file_path)` against THIS checkout's
+/// index — driven here through the real `open_config` entry point (which runs
+/// `ensure_graph_index_current`), then confirmed by `records_for_symbol` returning the record.
+#[test]
+fn an_unresolved_synced_symbol_anchor_is_resolved_on_open_and_surfaces_as_drive_by() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn drift_anchor() -> u32 { 7 }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let repo_id = rag_rat_db::schema::active_repo_id(db.storage.connection()).unwrap();
+    // A distilled provider-edge record plus a SELECTED symbol anchor as a peer would replicate it:
+    // portable facts only, the device-local resolution left unset.
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO papertrail_distill
+                 (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
+                  root_issue, fix_edge_source, thread_shape, anchors_qualified_count,
+                  distilled_at_ms, repo_id)
+             VALUES \
+             ('github','o/r','issue','5','sha256:h',3,'5','provider','investigation',1,10,?1)",
+            params![repo_id],
+        )
+        .unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO papertrail_distill_anchors
+                 (tracker, project, item_kind, item_key, anchor_kind, logical_symbol_id, file_path,
+                  name, resolved, candidate_ordinal, selected, repo_id)
+             VALUES ('github','o/r','issue','5','symbol',NULL,'src/lib.rs','drift_anchor',0,0,1,?1)",
+            params![repo_id],
+        )
+        .unwrap();
+    drop(db);
+
+    // Reopen through the sanctioned entry point — this runs `ensure_graph_index_current`, whose
+    // wrapper resolves the anchor against the current index.
+    let db = IndexDatabase::open_config(&config).unwrap();
+    let conn = db.storage.connection();
+    let logical_id: i64 = conn
+        .query_row("SELECT id FROM logical_symbols WHERE logical_name = 'drift_anchor'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let (token, resolved): (Option<String>, i64) = conn
+        .query_row(
+            "SELECT logical_symbol_id, resolved FROM papertrail_distill_anchors WHERE item_key = \
+             '5'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (token.as_deref(), resolved),
+        (Some(rag_rat_base::serde_big_id::format_sym_handle(logical_id).as_str()), 1),
+        "the synced anchor resolves to this checkout's symbol on open"
+    );
+    let records = rag_rat_papertrail::records_for_symbol(conn, &repo_id, logical_id, 10).unwrap();
+    assert_eq!(
+        records.iter().map(|record| record.item_key.as_str()).collect::<Vec<_>>(),
+        ["5"],
+        "the resolved anchor now surfaces the distilled record as symbol drive-by"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// The same gap, for `repo_node_edges.target_logical_symbol_id` — an INTEGER column that was simply
 /// never added to either the remap or the snapshot's reference set. Referenced only by that edge.
 #[test]

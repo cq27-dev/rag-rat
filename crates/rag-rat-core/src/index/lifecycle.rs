@@ -375,6 +375,13 @@ impl IndexDatabase {
     /// "database is locked" under concurrent MCP clients (#143). Unlike `open_config` it performs
     /// NO on-open heal writes (`ensure_model_manifest` / `ensure_graph_index_current`).
     ///
+    /// This also means it does NOT re-resolve synced distill anchors (a write): that runs at the
+    /// table-sync settle points as anchors are ingested — normally the same session they arrive —
+    /// and again in `open_config`'s `ensure_graph_index_current`, so a read-only reader serves
+    /// already- resolved rows. An anchor that reached the DB through neither (e.g. a copied
+    /// store) stays unresolved until the next read-write open resolves it, the same
+    /// deferred-materialization posture as the synced-memory drain.
+    ///
     /// Returns `Ok(None)` — caller falls back to the read-write `open_config`, which heals once and
     /// after which reads are lock-free again — when any of these is true:
     /// - the DB has never been opened for write (read-only open errors),

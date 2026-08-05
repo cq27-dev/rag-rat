@@ -584,6 +584,11 @@ async fn accept_loop(
                 .await?;
                 if alpn.as_slice() == rag_rat_sync::CONTENT_SYNC_ALPN {
                     crate::drain_synced_memory(conn)?;
+                } else if alpn.as_slice() == rag_rat_sync::TABLE_SYNC_ALPN {
+                    // The resident host holds the index open, so the on-open re-resolution never
+                    // re-fires for anchors pushed here — resolve them at the session's settle
+                    // point.
+                    crate::resolve_synced_distill_anchors(conn)?;
                 }
                 anyhow::Ok(report)
             }
@@ -708,6 +713,10 @@ async fn reconcile(
             tracing::warn!(peer, %error, "device sync table reconciliation failed");
         }
     }
+    // Resolve any anchors this run's table reconciliation pulled against the local index, so they
+    // surface as drive-by without waiting for the next index open (idempotent when nothing
+    // changed).
+    crate::resolve_synced_distill_anchors(conn)?;
     let ok = reached.iter().filter(|reached| **reached).count();
     let peers = reached.len() + resolved.unresolved_configured;
     Ok((peers, ok, peers - ok))

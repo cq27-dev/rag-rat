@@ -481,6 +481,76 @@ fn null_call_path_references(
     Ok(())
 }
 
+/// Re-derive the device-local resolution (`logical_symbol_id` / `resolved`) of SELECTED SYMBOL
+/// distill anchors for `repo_id` from their portable `(name, file_path)` against the repo's current
+/// index at `generation`. A SYMBOL anchor's `logical_symbol_id`/`resolved` are `local_columns` — a
+/// peer never receives them — so a replicated anchor lands unresolved and surfaces through NEITHER
+/// read path (`records_for_symbol` matches the handle; `records_for_path`'s symbol branch wants
+/// `resolved = 1`). This is what lets a synced SYMBOL anchor surface as drive-by on the peer, and
+/// it mirrors the owner's mining-time `(name, file_path) → logical_symbol_id` resolution
+/// (`distill::candidates::symbols_in_file`).
+///
+/// It overwrites a handle ONLY when it is NULL or no longer NAMES the anchor's symbol. "Valid" is
+/// NAME-bound, not file-bound: a live handle whose symbol has the anchor's `name` (in any file) is
+/// kept, so a symbol that merely moved files keeps its resolution (`records_for_symbol` joins on
+/// the handle, and the whole #810 relocation posture carries handles across drift), and a genuine
+/// same-name overload anchor keeps its own precise handle rather than being collapsed onto the
+/// lowest-id sibling. A NULL is filled; a stale handle (a regeneration changed the `name` at a
+/// fixed `candidate_ordinal`, leaving the old handle) is re-derived to the lowest-`symbols.id`
+/// match.
+///
+/// The symbol subquery is pinned to `repo_id` + `generation` because this runs on the view-less
+/// bare-open path where `files`/`symbols` are the unscoped base tables holding every repo and every
+/// (until-gc) generation — the `all_symbols` #89/A3/A6 rule. Resolution is deliberately
+/// worktree-INVARIANT (repo + generation, not the active commit/worktree overlay), like
+/// `all_symbols`: a logical symbol is the repo-level identity that GROUPS a file's overlays, so
+/// overlays of one file share a handle, and the read paths (`records_for_path`'s live-file join) do
+/// the per-checkout scoping at query time. The differs-only WHERE (`derived IS NOT stored`) means
+/// `conn.changes()` counts only rows whose resolution truly changed, so the registration-gated
+/// papertrail Lens-lane bump fires exactly when drive-by output changed.
+pub(crate) fn resolve_synced_symbol_anchors(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    generation: i64,
+) -> rusqlite::Result<()> {
+    if !table_present(conn, "papertrail_distill_anchors")? {
+        return Ok(());
+    }
+    // The lowest-`symbols.id` handle for the anchor's `(name, file_path)` in this repo+generation,
+    // or NULL. Reused verbatim for the SET, the `resolved` flag, and the differs guard. The
+    // tables are `main.`-qualified (base, not the per-connection scope VIEW): the view is
+    // already repo-scoped but does NOT project `repo_id`/`generation`, so the explicit pin here
+    // must read the base tables — the `all_symbols` #89/A3/A6 rule, and what makes this correct
+    // on BOTH the view-installed (incremental/open) and view-less (bare-open) paths.
+    const DERIVED: &str = "SELECT 'sym_' || format('%x', m.logical_symbol_id)
+         FROM main.symbols s
+         JOIN main.files f ON f.id = s.file_id
+         JOIN main.logical_symbol_members m ON m.symbol_id = s.id
+         WHERE f.repo_id = ?1 AND f.generation = ?2 AND f.kind != 'deleted'
+           AND f.path = a.file_path AND s.name = a.name
+         ORDER BY s.id LIMIT 1";
+    // Name-bound validity: does the STORED handle still name a symbol called `a.name` (any file)?
+    const STORED_HANDLE_STILL_NAMES_IT: &str = "SELECT 1
+         FROM main.symbols s
+         JOIN main.files f ON f.id = s.file_id
+         JOIN main.logical_symbol_members m ON m.symbol_id = s.id
+         WHERE f.repo_id = ?1 AND f.generation = ?2 AND f.kind != 'deleted' AND s.name = a.name
+           AND 'sym_' || format('%x', m.logical_symbol_id) = a.logical_symbol_id";
+    let sql = format!(
+        "UPDATE papertrail_distill_anchors AS a
+         SET logical_symbol_id = ({DERIVED}),
+             resolved = CASE WHEN ({DERIVED}) IS NOT NULL THEN 1 ELSE 0 END
+         WHERE a.repo_id = ?1 AND a.anchor_kind = 'symbol' AND a.selected = 1
+           AND ({DERIVED}) IS NOT a.logical_symbol_id
+           AND (a.logical_symbol_id IS NULL OR NOT EXISTS ({STORED_HANDLE_STILL_NAMES_IT}))"
+    );
+    let changed = conn.execute(&sql, params![repo_id, generation])?;
+    if changed > 0 {
+        crate::distill::bump_papertrail_lens_lanes(conn, repo_id)?;
+    }
+    Ok(())
+}
+
 /// Move a drifted reference OFF an OCCUPIED id (a LIVE row now belonging to a DIFFERENT symbol)
 /// the heal could not realign (#493) — the vanished-id case needs no such move (a dead id already
 /// resolves to nothing). Call-path references are handled separately by
@@ -1776,6 +1846,23 @@ impl IndexDatabase {
     }
 
     pub(super) fn ensure_graph_index_current(&self) -> anyhow::Result<()> {
+        self.ensure_graph_index_current_inner()?;
+        // Re-resolve synced SYMBOL anchors against the now-current index. This must run OUTSIDE the
+        // inner heal's early returns: a peer that synced anchors but whose code index is unchanged
+        // hits those returns on every open, and that is exactly the case this pass exists for. It
+        // is a differs-only UPDATE (a no-op in steady state) and read-only opens skip
+        // `ensure` entirely, so there is no write-on-read hazard. Same-session immediacy
+        // after a sync is handled at the table-sync settle points; this is the safety net
+        // that resolves at the next index open.
+        resolve_synced_symbol_anchors(
+            self.storage.connection(),
+            &self.active_repo_id,
+            self.active_generation,
+        )?;
+        Ok(())
+    }
+
+    fn ensure_graph_index_current_inner(&self) -> anyhow::Result<()> {
         let graph_current =
             self.repo_meta("graph_index_version")?.as_deref() == Some(GRAPH_INDEX_VERSION);
         let active_derivation_owed = self.active_derivation_rows_owed()?;
@@ -2328,5 +2415,251 @@ mod relocation_lens_bump_tests {
             .unwrap();
         assert_eq!((token, resolved), (None, 0), "the local resolution is cleared");
         assert!(papertrail_rev(&conn, "r") > before, "the papertrail lane advances");
+    }
+}
+
+#[cfg(test)]
+mod synced_anchor_resolution_tests {
+    use rag_rat_base::serde_big_id::format_sym_handle;
+    use rusqlite::{Connection, params};
+
+    use super::resolve_synced_symbol_anchors;
+
+    fn papertrail_rev(conn: &Connection, repo_id: &str) -> i64 {
+        rag_rat_db::meta::repo_meta(conn, repo_id, rag_rat_db::meta::LENS_PAPERTRAIL_REVISION_META)
+            .unwrap()
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    fn scratch() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        // Hand-seed the symbol index directly (FK off), the raw-`main`-table fixture Fable's review
+        // requires: a scope view would mask a consolidated-repo / superseded-generation bug.
+        conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        for repo in ["r", "s"] {
+            conn.execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
+                [repo],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn add_file(conn: &Connection, id: i64, path: &str, repo: &str, generation: i64) {
+        conn.execute(
+            "INSERT INTO files(id, path, language, kind, sha256, modified_at_ms, indexed_at_ms,
+                               repo_id, generation)
+             VALUES (?1, ?2, 'rust', 'source', 'sha', 0, 0, ?3, ?4)",
+            params![id, path, repo, generation],
+        )
+        .unwrap();
+    }
+
+    fn add_symbol(conn: &Connection, sym_id: i64, file_id: i64, name: &str, logical: i64) {
+        conn.execute(
+            "INSERT INTO symbols(id, file_id, language, name, kind, start_byte, end_byte)
+             VALUES (?1, ?2, 'rust', ?3, 'function', 0, 0)",
+            params![sym_id, file_id, name],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, start_line, \
+             end_line)
+             VALUES (?1, ?2, 0, 0)",
+            params![logical, sym_id],
+        )
+        .unwrap();
+    }
+
+    /// A selected symbol anchor; `handle` is its stored `logical_symbol_id` (None =
+    /// synced/unresolved).
+    fn add_anchor(conn: &Connection, item_key: &str, repo: &str, name: &str, handle: Option<i64>) {
+        conn.execute(
+            "INSERT INTO papertrail_distill_anchors
+                 (tracker, project, item_kind, item_key, candidate_ordinal, anchor_kind,
+                  logical_symbol_id, file_path, name, resolved, selected, repo_id)
+             VALUES ('github', 'o/r', 'issue', ?1, 0, 'symbol', ?2, 'src/x.rs', ?3,
+                     ?4, 1, ?5)",
+            params![item_key, handle.map(format_sym_handle), name, handle.is_some() as i64, repo],
+        )
+        .unwrap();
+    }
+
+    fn anchor(conn: &Connection, item_key: &str) -> (Option<String>, i64) {
+        conn.query_row(
+            "SELECT logical_symbol_id, resolved FROM papertrail_distill_anchors
+             WHERE item_key = ?1 AND repo_id = 'r'",
+            [item_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolves_a_null_synced_anchor_and_bumps_the_lane() {
+        let conn = scratch();
+        add_file(&conn, 1, "src/x.rs", "r", 0);
+        add_symbol(&conn, 10, 1, "Foo", 100);
+        add_anchor(&conn, "5", "r", "Foo", None);
+        let before = papertrail_rev(&conn, "r");
+        resolve_synced_symbol_anchors(&conn, "r", 0).unwrap();
+        assert_eq!(anchor(&conn, "5"), (Some(format_sym_handle(100)), 1));
+        assert!(papertrail_rev(&conn, "r") > before, "a fresh resolution bumps the lane");
+    }
+
+    #[test]
+    fn a_second_run_changes_nothing_and_does_not_bump() {
+        let conn = scratch();
+        add_file(&conn, 1, "src/x.rs", "r", 0);
+        add_symbol(&conn, 10, 1, "Foo", 100);
+        add_anchor(&conn, "5", "r", "Foo", None);
+        resolve_synced_symbol_anchors(&conn, "r", 0).unwrap();
+        let settled = papertrail_rev(&conn, "r");
+        resolve_synced_symbol_anchors(&conn, "r", 0).unwrap();
+        assert_eq!(anchor(&conn, "5"), (Some(format_sym_handle(100)), 1));
+        assert_eq!(papertrail_rev(&conn, "r"), settled, "an idempotent re-run must not bump");
+    }
+
+    #[test]
+    fn a_valid_overload_handle_is_preserved() {
+        let conn = scratch();
+        add_file(&conn, 1, "src/x.rs", "r", 0);
+        // Two same-name symbols, distinct handles — the owner mined each its own precise anchor.
+        add_symbol(&conn, 30, 1, "Dup", 300);
+        add_symbol(&conn, 31, 1, "Dup", 301);
+        add_anchor(&conn, "5", "r", "Dup", Some(300));
+        add_anchor(&conn, "6", "r", "Dup", Some(301));
+        let before = papertrail_rev(&conn, "r");
+        resolve_synced_symbol_anchors(&conn, "r", 0).unwrap();
+        // The second anchor keeps 301 rather than collapsing onto the lowest-id 300.
+        assert_eq!(anchor(&conn, "5"), (Some(format_sym_handle(300)), 1));
+        assert_eq!(anchor(&conn, "6"), (Some(format_sym_handle(301)), 1));
+        assert_eq!(papertrail_rev(&conn, "r"), before, "preserving valid handles does not bump");
+    }
+
+    #[test]
+    fn a_stale_handle_whose_name_moved_on_is_re_derived() {
+        let conn = scratch();
+        add_file(&conn, 1, "src/x.rs", "r", 0);
+        add_symbol(&conn, 10, 1, "Foo", 100);
+        add_symbol(&conn, 20, 1, "Bar", 200);
+        // A regeneration made candidate_ordinal 0 name "Bar", but the synced handle still names
+        // Foo.
+        add_anchor(&conn, "5", "r", "Bar", Some(100));
+        resolve_synced_symbol_anchors(&conn, "r", 0).unwrap();
+        assert_eq!(anchor(&conn, "5"), (Some(format_sym_handle(200)), 1), "re-derived to Bar");
+    }
+
+    #[test]
+    fn a_live_handle_whose_symbol_moved_files_is_kept() {
+        let conn = scratch();
+        add_file(&conn, 1, "src/x.rs", "r", 0);
+        add_file(&conn, 2, "src/y.rs", "r", 0);
+        // The symbol now lives in y.rs, but the anchor's file_path still says x.rs. Validity is
+        // name-bound, so the live handle is kept (records_for_symbol joins on the handle).
+        add_symbol(&conn, 40, 2, "Moved", 400);
+        add_anchor(&conn, "5", "r", "Moved", Some(400));
+        let before = papertrail_rev(&conn, "r");
+        resolve_synced_symbol_anchors(&conn, "r", 0).unwrap();
+        assert_eq!(anchor(&conn, "5"), (Some(format_sym_handle(400)), 1), "the live handle stays");
+        assert_eq!(papertrail_rev(&conn, "r"), before);
+    }
+
+    #[test]
+    fn a_null_anchor_with_no_local_match_stays_unresolved_and_does_not_bump() {
+        let conn = scratch();
+        add_file(&conn, 1, "src/x.rs", "r", 0);
+        add_symbol(&conn, 10, 1, "Foo", 100);
+        add_anchor(&conn, "5", "r", "Ghost", None);
+        let before = papertrail_rev(&conn, "r");
+        resolve_synced_symbol_anchors(&conn, "r", 0).unwrap();
+        assert_eq!(anchor(&conn, "5"), (None, 0), "no local symbol → still unresolved");
+        assert_eq!(papertrail_rev(&conn, "r"), before, "a no-op must not bump");
+    }
+
+    #[test]
+    fn file_and_unselected_anchors_are_left_alone() {
+        let conn = scratch();
+        add_file(&conn, 1, "src/x.rs", "r", 0);
+        add_symbol(&conn, 10, 1, "Foo", 100);
+        // A FILE anchor (surfaces via the synced file_path) and an UNSELECTED symbol candidate.
+        conn.execute(
+            "INSERT INTO papertrail_distill_anchors
+                 (tracker, project, item_kind, item_key, candidate_ordinal, anchor_kind,
+                  logical_symbol_id, file_path, name, resolved, selected, repo_id)
+             VALUES ('github', 'o/r', 'issue', '7', 0, 'file', NULL, 'src/x.rs', 'src/x.rs', 1, 1, \
+             'r'),
+                    ('github', 'o/r', 'issue', '8', 1, 'symbol', NULL, 'src/x.rs', 'Foo', 0, 0, \
+             'r')",
+            [],
+        )
+        .unwrap();
+        resolve_synced_symbol_anchors(&conn, "r", 0).unwrap();
+        assert_eq!(anchor(&conn, "7"), (None, 1), "the file anchor is untouched");
+        assert_eq!(anchor(&conn, "8"), (None, 0), "the unselected candidate is untouched");
+    }
+
+    #[test]
+    fn a_shared_path_resolves_only_against_the_active_repo() {
+        let conn = scratch();
+        // Both repos have a `src/x.rs` with a `Foo`; the pass must pick repo r's symbol.
+        add_file(&conn, 1, "src/x.rs", "r", 0);
+        add_symbol(&conn, 10, 1, "Foo", 100);
+        add_file(&conn, 2, "src/x.rs", "s", 0);
+        add_symbol(&conn, 20, 2, "Foo", 999);
+        add_anchor(&conn, "5", "r", "Foo", None);
+        resolve_synced_symbol_anchors(&conn, "r", 0).unwrap();
+        assert_eq!(
+            anchor(&conn, "5"),
+            (Some(format_sym_handle(100)), 1),
+            "resolves against repo r, never the sibling repo's same-path symbol"
+        );
+    }
+
+    #[test]
+    fn overlapping_worktree_overlays_resolve_to_the_shared_logical_id() {
+        let conn = scratch();
+        // Two worktree overlays of the SAME file (same repo + generation, distinct worktree_id) —
+        // as a linked checkout produces. Both hold a `Foo` folded into ONE logical symbol (logical
+        // grouping is cross-overlay), so resolution is worktree-invariant: it yields the shared
+        // handle whichever overlay's symbol row wins the lowest-id tiebreak.
+        for (file_id, sym_id, worktree) in [(1, 10, "wt-a"), (2, 11, "wt-b")] {
+            conn.execute(
+                "INSERT INTO files(id, path, language, kind, sha256, modified_at_ms, \
+                 indexed_at_ms,
+                                   repo_id, generation, worktree_id)
+                 VALUES (?1, 'src/x.rs', 'rust', 'source', 'sha', 0, 0, 'r', 0, ?2)",
+                params![file_id, worktree],
+            )
+            .unwrap();
+            add_symbol(&conn, sym_id, file_id, "Foo", 100);
+        }
+        add_anchor(&conn, "5", "r", "Foo", None);
+        resolve_synced_symbol_anchors(&conn, "r", 0).unwrap();
+        assert_eq!(
+            anchor(&conn, "5"),
+            (Some(format_sym_handle(100)), 1),
+            "overlays of one file share a logical id, so resolution is worktree-invariant"
+        );
+    }
+
+    #[test]
+    fn a_superseded_generation_symbol_is_excluded() {
+        let conn = scratch();
+        // A dead generation-0 `Foo` and a live generation-1 `Foo`, both at src/x.rs in repo r.
+        add_file(&conn, 1, "src/x.rs", "r", 0);
+        add_symbol(&conn, 10, 1, "Foo", 100);
+        add_file(&conn, 2, "src/x.rs", "r", 1);
+        add_symbol(&conn, 20, 2, "Foo", 500);
+        add_anchor(&conn, "5", "r", "Foo", None);
+        resolve_synced_symbol_anchors(&conn, "r", 1).unwrap();
+        assert_eq!(
+            anchor(&conn, "5"),
+            (Some(format_sym_handle(500)), 1),
+            "resolves against the live generation, never a superseded row"
+        );
     }
 }
