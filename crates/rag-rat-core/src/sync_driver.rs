@@ -1,7 +1,8 @@
 //! Shared device-sync driver for the CLI fallback and the active MCP resident host.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -27,6 +28,11 @@ const ADVERTISEMENT_REFRESH: Duration = Duration::from_secs(1);
 /// Bound pre-auth peers as well as authenticated sessions: each task owns a SQLite connection
 /// until the stream-idle timeout expires.
 const RESIDENT_SESSION_MAX: usize = 8;
+/// The most concurrent inbound sessions ONE peer (by node id) may hold. Below
+/// `RESIDENT_SESSION_MAX` so no single peer monopolizes the pool, and above a legitimate peer's
+/// real concurrency (dialers sync sequentially — ~1-2 in flight while a session's post-work
+/// overlaps the peer's next dial), so honest use is never denied.
+const RESIDENT_SESSIONS_PER_PEER_MAX: usize = 4;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DeviceSyncOutcome {
@@ -540,6 +546,52 @@ fn write_advertisement(conn: &Connection, record: &PersistedAdvertisement) -> an
     rag_rat_db::meta::set_meta(conn, DISCOVERY_ADVERTISEMENT, &serde_json::to_string(record)?)
 }
 
+/// Per-peer concurrent-session fairness for the resident accept loop: bounds how many in-flight
+/// sessions one node id holds, so a stuck or greedy fixed-identity peer can't occupy every
+/// `RESIDENT_SESSION_MAX` slot and starve others. Honest-peer FAIRNESS, not anti-Sybil — a node id
+/// is mintable, so id rotation evades this; that flood is shed upstream by the Sybil-proof global
+/// accept-rate limit (`GlobalAcceptRateLimiter`). This is a DIFFERENT map from the per-id rate
+/// limit that comment rejects: it is keyed only by ids with a LIVE session (entries removed at
+/// zero, bounded by `RESIDENT_SESSION_MAX`), not by ids-ever-seen — so it needs no eviction and
+/// cannot be a memory target.
+#[derive(Clone, Default)]
+struct PerPeerSessionLimiter {
+    in_flight: Arc<Mutex<HashMap<[u8; 32], usize>>>,
+}
+
+impl PerPeerSessionLimiter {
+    /// Reserve a session slot for `peer`, or `None` if it already holds `max`. The returned guard
+    /// releases the slot on drop — task completion, including a panicked task's unwind.
+    fn try_acquire(&self, peer: [u8; 32], max: usize) -> Option<PerPeerSessionSlot> {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|poison| poison.into_inner());
+        if in_flight.get(&peer).copied().unwrap_or(0) >= max {
+            return None;
+        }
+        *in_flight.entry(peer).or_insert(0) += 1;
+        Some(PerPeerSessionSlot { in_flight: Arc::clone(&self.in_flight), peer })
+    }
+}
+
+/// RAII release of one [`PerPeerSessionLimiter`] slot.
+struct PerPeerSessionSlot {
+    in_flight: Arc<Mutex<HashMap<[u8; 32], usize>>>,
+    peer: [u8; 32],
+}
+
+impl Drop for PerPeerSessionSlot {
+    fn drop(&mut self) {
+        // Poison-tolerant: this runs during task teardown, possibly a panic unwind; a `.unwrap()`
+        // on a poisoned lock here would escalate to an abort.
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(count) = in_flight.get_mut(&self.peer) {
+            *count -= 1;
+            if *count == 0 {
+                in_flight.remove(&self.peer);
+            }
+        }
+    }
+}
+
 async fn accept_loop(
     endpoint: iroh::Endpoint,
     account: rag_rat_oplog::AccountId,
@@ -549,6 +601,8 @@ async fn accept_loop(
     // Global inbound accept-rate limit: refuses a connection flood BEFORE the handshake, regardless
     // of peer id (Sybil-resistant). Loop-owned, so no locking.
     let mut accept_rate = rag_rat_sync::GlobalAcceptRateLimiter::new();
+    // Per-peer concurrent-session fairness: one node id may not hold every session slot.
+    let per_peer = PerPeerSessionLimiter::default();
     loop {
         let connection = match rag_rat_sync::accept_connection_within_rate(
             &endpoint,
@@ -570,16 +624,27 @@ async fn accept_loop(
                 continue;
             },
         };
+        // Per-peer fairness BEFORE the global permit, so an over-cap peer never even transiently
+        // consumes one of the shared slots. `remote_id()` is the iroh-authenticated peer node id.
+        let Some(peer_slot) = per_peer
+            .try_acquire(*connection.remote_id().as_bytes(), RESIDENT_SESSIONS_PER_PEER_MAX)
+        else {
+            connection.close(0u32.into(), b"peer-session-limit");
+            continue;
+        };
         let Ok(permit) = Arc::clone(&sessions).try_acquire_owned() else {
             // Do not queue unauthenticated peers behind the session limit. Their connections can
             // wait out the stream timeout otherwise, consuming endpoint and OS resources.
             connection.close(0u32.into(), b"session-limit");
-            continue;
+            continue; // `peer_slot` drops here, releasing this peer's reservation.
         };
         let database = database.clone();
         let node = *endpoint.id().as_bytes();
         tokio::task::spawn_local(async move {
             let _permit = permit;
+            // Held to task end so this peer's slot is reserved for the whole session, then released
+            // on drop (normal completion or a panic unwind).
+            let _peer_slot = peer_slot;
             let result = async {
                 let storage = IndexConnection::open(&database)?;
                 let conn = storage.connection();
@@ -849,9 +914,10 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PersistedAdvertisement, RESIDENT_NUDGE,
-        RefusedPublication, can_host, can_sync, device_sync_run, nudge_resident_host,
-        read_advertisement, refused_publication_is_due, retry_is_due, write_advertisement,
+        DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PerPeerSessionLimiter, PersistedAdvertisement,
+        RESIDENT_NUDGE, RefusedPublication, can_host, can_sync, device_sync_run,
+        nudge_resident_host, read_advertisement, refused_publication_is_due, retry_is_due,
+        write_advertisement,
     };
 
     #[test]
@@ -1013,5 +1079,56 @@ mod tests {
             retry_after,
         ));
         assert!(retry_is_due(Some(attempted_at), attempted_at + retry_after, retry_after,));
+    }
+
+    const PEER_A: [u8; 32] = [0xa; 32];
+    const PEER_B: [u8; 32] = [0xb; 32];
+
+    #[test]
+    fn per_peer_limiter_admits_up_to_max_then_denies() {
+        let limiter = PerPeerSessionLimiter::default();
+        let slots: Vec<_> = (0..3).map(|_| limiter.try_acquire(PEER_A, 3)).collect();
+        assert!(slots.iter().all(Option::is_some), "the first `max` slots are admitted");
+        assert!(limiter.try_acquire(PEER_A, 3).is_none(), "the slot past `max` is denied");
+        // A denied acquire must not mutate the map (no phantom entry, count still exactly `max`).
+        let map = limiter.in_flight.lock().unwrap();
+        assert_eq!(map.len(), 1, "denial adds no entry");
+        assert_eq!(map.get(&PEER_A).copied(), Some(3), "denial does not inflate the count");
+    }
+
+    #[test]
+    fn per_peer_limiter_releases_and_prunes_on_slot_drop() {
+        let limiter = PerPeerSessionLimiter::default();
+        let a = limiter.try_acquire(PEER_A, 1).expect("first slot");
+        assert!(limiter.try_acquire(PEER_A, 1).is_none(), "at capacity");
+        drop(a);
+        assert!(
+            !limiter.in_flight.lock().unwrap().contains_key(&PEER_A),
+            "the entry is removed at zero — the map holds only live sessions",
+        );
+        assert!(limiter.try_acquire(PEER_A, 1).is_some(), "the released slot is available again");
+    }
+
+    #[test]
+    fn per_peer_limiter_is_independent_per_peer() {
+        let limiter = PerPeerSessionLimiter::default();
+        let _a = limiter.try_acquire(PEER_A, 1).expect("A slot");
+        assert!(limiter.try_acquire(PEER_A, 1).is_none(), "A is at capacity");
+        assert!(limiter.try_acquire(PEER_B, 1).is_some(), "B has its own independent cap");
+    }
+
+    #[test]
+    fn per_peer_slot_releases_even_when_dropped_during_unwind() {
+        let limiter = PerPeerSessionLimiter::default();
+        let taken = limiter.clone();
+        // A panic while the slot is in scope must still run its Drop (release), not leak the count.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = taken.try_acquire(PEER_A, 1).expect("slot");
+            panic!("session task panicked mid-flight");
+        }));
+        assert!(
+            limiter.try_acquire(PEER_A, 1).is_some(),
+            "the slot was released on the panic unwind, not leaked",
+        );
     }
 }
