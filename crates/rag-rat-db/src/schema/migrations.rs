@@ -6552,6 +6552,66 @@ mod syncable_overlay_migration_tests {
             "the nullable reason column is preserved through the rebuild"
         );
     }
+
+    /// V110 rebuilds record_commits onto its natural key, drops `id`, and adds `created_at_ms`,
+    /// across a full ladder replay.
+    #[test]
+    fn v110_rebuilds_record_commits_to_the_natural_key_across_a_replay() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        assert_eq!(primary_key_columns(&conn, "papertrail_distill_record_commits").unwrap(), [
+            "repo_id",
+            "tracker",
+            "project",
+            "item_kind",
+            "item_key",
+            "commit_sha"
+        ]);
+        let has_id: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('papertrail_distill_record_commits')
+                 WHERE name = 'id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_id, 0, "the AUTOINCREMENT id is dropped");
+        let has_created: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('papertrail_distill_record_commits')
+                 WHERE name = 'created_at_ms'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_created, 1, "the created_at_ms non-key column is added");
+    }
+
+    /// The rebuild copies every commit link (legacy rows get created_at_ms = 0).
+    #[test]
+    fn v110_preserves_record_commit_rows_through_the_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::apply_distill_record_store(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO papertrail_distill_record_commits
+                 (tracker, project, item_kind, item_key, commit_sha, repo_id)
+             VALUES ('github', 'o/r', 'issue', '7', 'abc123', 'r')",
+            [],
+        )
+        .unwrap();
+        super::apply_syncable_distill_record_commits(&conn).unwrap();
+        let (sha, created): (String, i64) = conn
+            .query_row(
+                "SELECT commit_sha, created_at_ms FROM papertrail_distill_record_commits
+                 WHERE repo_id = 'r' AND item_key = '7'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sha, "abc123");
+        assert_eq!(created, 0, "a legacy row gets created_at_ms = 0 until it is re-mined");
+    }
 }
 
 /// V095 (#1002): per-TABLE spec versioning, plus a direct pointer from a row to its winning entry.
@@ -7878,6 +7938,45 @@ pub fn apply_syncable_distill_edges_and_alternatives(conn: &Connection) -> rusql
         )?;
     }
     Ok(())
+}
+
+/// V110 (#1139): make the distill `record_commits` child syncable on `distill/1`.
+///
+/// The table was key-only (its only columns were the natural key + `commit_sha`), which the
+/// whole-row apply path rejects — a syncable table needs at least one non-key synced column. The
+/// rebuild keys on `(repo_id, tracker, project, item_kind, item_key, commit_sha)` (its former
+/// UNIQUE index), drops the device-local AUTOINCREMENT `id`, and adds `created_at_ms` (when the
+/// fixing-commit link was recorded) as that non-key column. Legacy rows get `0`; a record
+/// regeneration rewrites them with the real timestamp (the mechanical junctions are cleared and
+/// re-mined). No triggers, local columns, or FKs. Short-circuits once the table is already in the
+/// rebuilt shape.
+pub fn apply_syncable_distill_record_commits(conn: &Connection) -> rusqlite::Result<()> {
+    if table_is_strict(conn, "papertrail_distill_record_commits")?
+        && primary_key_columns(conn, "papertrail_distill_record_commits")?
+            == ["repo_id", "tracker", "project", "item_kind", "item_key", "commit_sha"]
+    {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS papertrail_distill_record_commits_v110;
+         CREATE TABLE papertrail_distill_record_commits_v110(
+             tracker TEXT NOT NULL,
+             project TEXT NOT NULL,
+             item_kind TEXT NOT NULL,
+             item_key TEXT NOT NULL,
+             commit_sha TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL DEFAULT 0,
+             repo_id TEXT NOT NULL DEFAULT '__unassigned__',
+             PRIMARY KEY(repo_id, tracker, project, item_kind, item_key, commit_sha)
+         ) STRICT;
+         INSERT INTO papertrail_distill_record_commits_v110(
+             tracker, project, item_kind, item_key, commit_sha, created_at_ms, repo_id)
+         SELECT tracker, project, item_kind, item_key, commit_sha, 0, repo_id
+         FROM papertrail_distill_record_commits;
+         DROP TABLE papertrail_distill_record_commits;
+         ALTER TABLE papertrail_distill_record_commits_v110
+             RENAME TO papertrail_distill_record_commits;",
+    )
 }
 
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {

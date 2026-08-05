@@ -646,7 +646,7 @@ fn write_record(
         let fix_diffs = fix_diff_snapshots(repo, &plan.fix_shas, &anchors);
         replace_fix_diffs(conn, repo_id, plan, &fix_diffs)?;
     }
-    write_commits(conn, repo_id, plan, &plan.fix_shas)?;
+    write_commits(conn, repo_id, now, plan, &plan.fix_shas)?;
     write_coalesced_edges(conn, repo_id, now, plan)?;
     if rebuild_anchor_candidates {
         write_anchors(conn, repo_id, plan, &anchors)?;
@@ -1870,15 +1870,16 @@ fn replace_xrefs(
 fn write_commits(
     conn: &Connection,
     repo_id: &str,
+    now: i64,
     plan: &RecordPlan,
     shas: &[String],
 ) -> anyhow::Result<()> {
     for sha in shas {
         conn.execute(
             "INSERT OR IGNORE INTO papertrail_distill_record_commits
-                 (tracker, project, item_kind, item_key, commit_sha, repo_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![plan.tracker, plan.project, plan.kind.as_db_str(), plan.key, sha, repo_id],
+                 (tracker, project, item_kind, item_key, commit_sha, created_at_ms, repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![plan.tracker, plan.project, plan.kind.as_db_str(), plan.key, sha, now, repo_id],
         )?;
     }
     Ok(())
