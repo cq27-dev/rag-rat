@@ -3985,6 +3985,7 @@ mod tests {
                 relation_policy: None,
                 node_overrides: Vec::new(),
             },
+            access_mode: crate::stream::AccessMode::Private,
         };
         let stream_id = stream::derive_v2(&spec).unwrap();
         let stream_spec_bytes = stream::canonical_spec_v2_bytes(&spec).unwrap();

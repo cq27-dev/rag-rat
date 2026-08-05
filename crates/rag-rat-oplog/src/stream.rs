@@ -194,6 +194,41 @@ fn encode_policy(enc: &mut Encoder<&mut Vec<u8>>, policy: &CanonicalPolicy) {
     }
 }
 
+/// Who may PULL a stream (#407). The mode is committed INSIDE the hashed `/2` identity (see
+/// [`canonical_spec_v2_bytes`]), so it is fixed at stream creation and cannot be flipped: a
+/// different mode is a different `stream_id`, which is exactly the "mode conversion is a deliberate
+/// re-publication, never a flag flip" rule. `Private` is the default and the pre-#407 behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccessMode {
+    /// Only roster/grant-authorized peers of the owning account may pull. Every pre-#407 stream.
+    #[default]
+    Private,
+    /// Anyone may pull the stream's signed-plaintext (`crypto_suite = 0`) entries; writes stay
+    /// grant-gated. The public-knowledge-base mode.
+    PublicRead,
+}
+
+impl AccessMode {
+    /// The canonical wire tag for the mode, appended as the 7th `/2` spec element for a non-default
+    /// mode. `Private` has no tag — it is encoded by OMISSION (the 6-element form), so every
+    /// private stream keeps its exact pre-#407 bytes and id.
+    fn wire_tag(self) -> Option<u64> {
+        match self {
+            AccessMode::Private => None,
+            AccessMode::PublicRead => Some(1),
+        }
+    }
+
+    /// The mode named by a 7th-element wire tag, or an error for an unknown / non-canonical tag
+    /// (tag 0 would be `Private`, which must be encoded by omission, so it is rejected here).
+    fn from_wire_tag(tag: u64) -> anyhow::Result<Self> {
+        match tag {
+            1 => Ok(AccessMode::PublicRead),
+            other => anyhow::bail!("unknown or non-canonical stream/2 access-mode tag {other}"),
+        }
+    }
+}
+
 /// The owner-bound stream policy (`/2`, §14): the `/1` visibility policy plus the owning account.
 /// The owner is committed INSIDE the hashed identity, so ownership is self-certifying and
 /// immutable.
@@ -204,6 +239,9 @@ pub struct StreamSpecV2 {
     /// The visibility policy (repos, kind/relation filters, per-node overrides), same shape as
     /// `/1`.
     pub policy: StreamSpec,
+    /// Who may pull this stream (#407). Committed into the identity; `Private` for every pre-#407
+    /// stream and encoded by omission so their ids never move.
+    pub access_mode: AccessMode,
 }
 
 /// The owner-bound (`/2`) counterpart of [`owner_stream`]: the same full-visibility policy, wrapped
@@ -212,7 +250,11 @@ pub struct StreamSpecV2 {
 /// their visibility rule. C3.4 authors a `StreamOwn` over the returned spec to publish ownership;
 /// nothing switches the live authoring path here.
 pub fn owner_stream_v2(repo_id: &str, account_id: AccountId) -> StreamSpecV2 {
-    StreamSpecV2 { owner_account_id: account_id, policy: owner_stream_spec(repo_id) }
+    StreamSpecV2 {
+        owner_account_id: account_id,
+        policy: owner_stream_spec(repo_id),
+        access_mode: AccessMode::Private,
+    }
 }
 
 /// Derive the owner-bound `stream_id` (`/2`, §14): `sha256(cbor(["rag-rat/stream/2",
@@ -234,10 +276,16 @@ pub fn canonical_spec_v2_bytes(spec: &StreamSpecV2) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(128);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(6).expect(INFALLIBLE);
+        // `Private` is encoded by OMISSION (6 elements, byte-identical to pre-#407) so private
+        // stream ids never move; a non-default mode appends a 7th tag element.
+        let mode_tag = spec.access_mode.wire_tag();
+        enc.array(if mode_tag.is_some() { 7 } else { 6 }).expect(INFALLIBLE);
         enc.str(STREAM_V2_DOMAIN).expect(INFALLIBLE);
         enc.bytes(&spec.owner_account_id.to_bytes()).expect(INFALLIBLE);
         encode_policy(&mut enc, &policy);
+        if let Some(tag) = mode_tag {
+            enc.u64(tag).expect(INFALLIBLE);
+        }
     }
     Ok(buf)
 }
@@ -249,7 +297,13 @@ pub fn canonical_spec_v2_bytes(spec: &StreamSpecV2) -> anyhow::Result<Vec<u8>> {
 pub fn decode_spec_v2(bytes: &[u8]) -> anyhow::Result<StreamSpecV2> {
     cbor::require_canonical_cbor(bytes)?;
     let mut dec = Decoder::new(bytes);
-    anyhow::ensure!(dec.array()? == Some(6), "stream/2 spec must be a 6-element array");
+    // 6 elements = the pre-#407 form (`Private` by omission); 7 = a non-default access mode
+    // appended.
+    let arity = dec.array()?;
+    anyhow::ensure!(
+        matches!(arity, Some(6) | Some(7)),
+        "stream/2 spec must be a 6- or 7-element array"
+    );
     anyhow::ensure!(dec.str()? == STREAM_V2_DOMAIN, "unknown stream spec domain");
     let owner_account_id = AccountId::from_bytes(decode_fixed::<32>(&mut dec, "owner account")?);
     let policy = StreamSpec {
@@ -258,8 +312,15 @@ pub fn decode_spec_v2(bytes: &[u8]) -> anyhow::Result<StreamSpecV2> {
         relation_policy: decode_optional_str_array(&mut dec)?,
         node_overrides: decode_overrides(&mut dec)?,
     };
+    let access_mode = if arity == Some(7) {
+        // `from_wire_tag` rejects tag 0 (`Private`), so an explicit `Private` in 7-element form is
+        // refused here; the re-encode check below independently enforces the same canonical rule.
+        AccessMode::from_wire_tag(dec.u64()?)?
+    } else {
+        AccessMode::Private
+    };
     anyhow::ensure!(dec.position() == bytes.len(), "trailing bytes in stream/2 spec");
-    let spec = StreamSpecV2 { owner_account_id, policy };
+    let spec = StreamSpecV2 { owner_account_id, policy, access_mode };
     anyhow::ensure!(
         canonical_spec_v2_bytes(&spec)? == bytes,
         "stream/2 spec is not in canonical set order"
@@ -502,7 +563,11 @@ mod tests {
     }
 
     fn spec_v2() -> StreamSpecV2 {
-        StreamSpecV2 { owner_account_id: owner(), policy: filtered_spec() }
+        StreamSpecV2 {
+            owner_account_id: owner(),
+            policy: filtered_spec(),
+            access_mode: AccessMode::Private,
+        }
     }
 
     #[test]
@@ -549,6 +614,7 @@ mod tests {
                 relation_policy: None,
                 node_overrides: Vec::new(),
             },
+            access_mode: AccessMode::Private,
         })
         .unwrap();
         assert_eq!(bytes[0], 0x86, "6-element array header");
@@ -572,6 +638,7 @@ mod tests {
                 relation_policy: None,
                 node_overrides: Vec::new(),
             },
+            access_mode: AccessMode::Private,
         });
     }
 
@@ -651,6 +718,7 @@ mod tests {
                 relation_policy: None,
                 node_overrides: Vec::new(),
             },
+            access_mode: AccessMode::Private,
         })
         .unwrap();
         let a = bytes.windows(6).position(|window| window == b"repo-a").unwrap();
@@ -675,14 +743,75 @@ mod tests {
         let a = derive_v2(&StreamSpecV2 {
             owner_account_id: AccountId::from_bytes([0x11; 32]),
             policy: filtered_spec(),
+            access_mode: AccessMode::Private,
         })
         .unwrap();
         let b = derive_v2(&StreamSpecV2 {
             owner_account_id: AccountId::from_bytes([0x22; 32]),
             policy: filtered_spec(),
+            access_mode: AccessMode::Private,
         })
         .unwrap();
         assert_ne!(a, b, "a different owner must derive a different stream_id");
+    }
+
+    #[test]
+    fn public_read_round_trips_and_derives_a_distinct_identity() {
+        // A public_read stream encodes a 7th element, round-trips, and — because the mode is folded
+        // into the id — derives a DIFFERENT stream_id than the same policy/owner as Private. That
+        // is the "mode conversion is a new stream, never a flag flip" guarantee, by
+        // construction.
+        let private = spec_v2();
+        let public = StreamSpecV2 { access_mode: AccessMode::PublicRead, ..spec_v2() };
+        let bytes = canonical_spec_v2_bytes(&public).unwrap();
+        assert_eq!(bytes[0], 0x87, "public_read is a 7-element array");
+        // `filtered_spec()` is deliberately unsorted, so the decode canonicalizes the policy order;
+        // round-trip at the canonical-bytes level (like the sibling round-trip test) and confirm
+        // the mode survived.
+        let decoded = decode_spec_v2(&bytes).unwrap();
+        assert_eq!(decoded.access_mode, AccessMode::PublicRead, "the mode round-trips");
+        assert_eq!(
+            canonical_spec_v2_bytes(&decoded).unwrap(),
+            bytes,
+            "public_read round-trips canonically",
+        );
+        assert_ne!(
+            derive_v2(&private).unwrap(),
+            derive_v2(&public).unwrap(),
+            "flipping the access mode is a different stream_id, not a mutation",
+        );
+    }
+
+    #[test]
+    fn private_is_encoded_by_omission_so_its_bytes_and_id_never_move() {
+        // Private MUST stay byte-identical to the pre-#407 6-element form (the goldens above pin
+        // the ids). An explicit Private can only be the 6-element form.
+        let private = spec_v2();
+        let bytes = canonical_spec_v2_bytes(&private).unwrap();
+        assert_eq!(bytes[0], 0x86, "Private stays a 6-element array (mode omitted)");
+        assert_eq!(decode_spec_v2(&bytes).unwrap().access_mode, AccessMode::Private);
+    }
+
+    #[test]
+    fn a_seven_element_spec_carrying_private_is_rejected_as_non_canonical() {
+        // Tag 0 (Private) in 7-element form is refused: Private must be encoded by omission, so
+        // `from_wire_tag(0)` bails before the decode completes (the re-encode canonicity check
+        // would reject it too, but the tag check fires first).
+        let public = StreamSpecV2 { access_mode: AccessMode::PublicRead, ..spec_v2() };
+        let mut bytes = canonical_spec_v2_bytes(&public).unwrap();
+        // Rewrite the trailing mode tag from 1 (PublicRead) to 0 (Private) in place.
+        let last = *bytes.last().unwrap();
+        assert_eq!(last, 0x01, "the trailing PublicRead tag is a CBOR unsigned 1");
+        *bytes.last_mut().unwrap() = 0x00;
+        assert!(decode_spec_v2(&bytes).is_err(), "explicit Private in 7-element form is rejected");
+    }
+
+    #[test]
+    fn an_unknown_access_mode_tag_is_rejected() {
+        let public = StreamSpecV2 { access_mode: AccessMode::PublicRead, ..spec_v2() };
+        let mut bytes = canonical_spec_v2_bytes(&public).unwrap();
+        *bytes.last_mut().unwrap() = 0x09; // an unknown mode tag
+        assert!(decode_spec_v2(&bytes).is_err(), "an unknown access-mode tag fails closed");
     }
 
     #[test]
