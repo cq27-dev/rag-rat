@@ -49,13 +49,28 @@ pub fn ensure_owned_stream_v2_in_tx(
     repo_id: &str,
     now_ms: i64,
 ) -> anyhow::Result<StreamId> {
+    ensure_owned_stream_v2_with_mode_in_tx(tx, repo_id, stream::AccessMode::Private, now_ms)
+}
+
+/// Like [`ensure_owned_stream_v2_in_tx`], but authors the `/2` owner stream under an explicit
+/// [`AccessMode`](stream::AccessMode). A `PublicRead` stream has a DISTINCT identity from the
+/// repo's private `/2` stream — the mode folds into `stream_id` — so publishing a public knowledge
+/// base is a separate stream a peer may read anonymously, never a flag flipped on the private one.
+/// Same check-fact-first idempotence and in-txn contract as the private ensure.
+pub fn ensure_owned_stream_v2_with_mode_in_tx(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    access_mode: stream::AccessMode,
+    now_ms: i64,
+) -> anyhow::Result<StreamId> {
     // The local account (author == owner of its `/2` streams) must already exist; resolve it and
     // its genesis entry hash (the founder incarnation a control op cites) WITHOUT minting.
     let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
         "cannot ensure a /2 owned stream before the store's local account is minted (call \
          local_account first)",
     )?;
-    let spec = stream::owner_stream_v2(repo_id, account_id);
+    let mut spec = stream::owner_stream_v2(repo_id, account_id);
+    spec.access_mode = access_mode;
     let stream_id = stream::derive_v2(&spec)?;
 
     // Check-fact-first. If the account already owns this stream, author NOTHING: a second

@@ -6,11 +6,11 @@
 //! transport therefore adds no trust — a synced entry passes exactly the checks a local write does.
 
 use rag_rat_oplog::{
-    AccountId, ContentIngestOutcome, DeviceRole, IngestOutcome, NodeAuthError,
+    AccessMode, AccountId, ContentIngestOutcome, DeviceRole, IngestOutcome, NodeAuthError,
     account_effective_count, account_entries_for_sync, account_entry_ref, account_ingest,
     account_signed_entry_exists, account_signed_hash, content_entries_for_sync, content_entry_ref,
     content_ingest, content_signed_entry_exists, content_signed_hash, sign_local_node_binding,
-    verify_node_binding,
+    stream_access_mode, stream_owner_account, verify_node_binding,
 };
 use rusqlite::Connection;
 
@@ -161,10 +161,10 @@ impl SyncStore for OplogSyncStore<'_> {
 /// memories themselves, where [`OplogSyncStore`] moves the account log that authorizes them.
 ///
 /// Scoped to a single account, like the account-log store: a session restores the account's own
-/// memories onto a fresh sibling. Content authored by OTHER accounts (shared streams) is a later
-/// slice (#407) and is refused here. Received bytes go through [`content_ingest`], which
-/// re-resolves the roster key and re-verifies the signature from scratch — the transport adds no
-/// trust.
+/// memories onto a fresh sibling. Content authored by OTHER accounts is admitted only on a
+/// `public_read` stream (#407) — private foreign content is still refused here. Received bytes go
+/// through [`content_ingest`], which re-resolves the roster key and re-verifies the signature from
+/// scratch — the transport adds no trust.
 ///
 /// Run this AFTER an account-log session in the same restore: `content_ingest` needs the roster and
 /// grant material the account log carries to ACCEPT (rather than park) a candidate, so the account
@@ -201,19 +201,36 @@ impl SyncStore for OplogContentSyncStore<'_> {
     }
 
     fn ingest(&mut self, signed_bytes: &[u8]) -> anyhow::Result<Ingested> {
-        // Refuse content whose CLAIMED author is a DIFFERENT account than this session before it
-        // reaches `content_ingest`. This is a session-scope PRE-FILTER, not a trust boundary: the
-        // claimed author is attacker-settable, so `content_ingest` re-resolves the roster key and
-        // rejects anything not signed by a device in the account's roster regardless. The
-        // pre-filter keeps an honestly-labeled foreign entry from parking in this account's
-        // pre-verify table through a session that never named the other account. An
-        // undecodable entry is a peer to distrust — dropped as NoChange, not a
-        // session-fatal error.
-        let Ok((_stream, entry_account, _entry_hash)) = content_entry_ref(signed_bytes) else {
+        // Admit this account's OWN content, plus foreign content on a `public_read` stream, before
+        // it reaches `content_ingest`. This is a session-scope PRE-FILTER, not a trust boundary:
+        // the claimed author is attacker-settable, so `content_ingest` re-resolves the roster key
+        // and rejects anything not signed by a device in the author's roster regardless — the
+        // pre-filter only widens WHICH foreign candidates reach that verifier, never how they are
+        // trusted. Private (and not-yet-known-owner) foreign content is dropped so it never parks
+        // in this account's pre-verify table through a session that never named the other account.
+        // An undecodable entry is a peer to distrust — dropped as NoChange, not a session-fatal
+        // error.
+        let Ok((stream, entry_account, _entry_hash)) = content_entry_ref(signed_bytes) else {
             return Ok(Ingested::NoChange);
         };
         if entry_account != self.account_id {
-            return Ok(Ingested::NoChange);
+            // Resolve the access mode from the STREAM's owner, never from the attacker-settable
+            // claimed author — that also correctly admits grant-gated contributor content
+            // (grantee != owner) on a public stream, which `content_ingest` then gates on the
+            // grant. A dropped entry is re-offered by the next session's snapshot diff, so once the
+            // owner's account log is folded locally the admission converges (E2b orders owner log
+            // before content on delivery, so first-session convergence is the norm). ANY failure to
+            // resolve the owner/mode (owner not yet synced, a corrupt ownership fact) is treated as
+            // "not public" and drops the entry as NoChange — fail-closed AND never session-fatal,
+            // matching the undecodable-entry posture above rather than aborting the whole session.
+            let public =
+                stream_owner_account(self.conn, stream).ok().flatten().is_some_and(|owner| {
+                    stream_access_mode(self.conn, owner, stream).ok()
+                        == Some(AccessMode::PublicRead)
+                });
+            if !public {
+                return Ok(Ingested::NoChange);
+            }
         }
         // Skip content already held — matched by the EXACT signed envelope, not entry_hash: a
         // distinct signature of the same body is a different entry the peer may need, so it must

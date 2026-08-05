@@ -20,7 +20,7 @@ use super::{AccountId, content, fold, secrets, snapshot};
 use crate::cbor;
 use crate::device::{DevicePublic, DeviceX25519Public};
 use crate::op::DeviceFingerprint;
-use crate::stream::StreamId;
+use crate::stream::{AccessMode, StreamId};
 
 type EntryHash = [u8; 32];
 type BranchKey = (u8, DeviceFingerprint, Option<EntryHash>);
@@ -1000,6 +1000,59 @@ pub fn stream_owner_account(
         )
         .optional()?;
     owner.map(|bytes| Ok(AccountId::from_bytes(fixed(&bytes)?))).transpose()
+}
+
+/// The [`AccessMode`] of `stream_id` as declared in `owner_account_id`'s effective `StreamOwn`
+/// fact.
+///
+/// Decode-on-read: `account_stream_ownership` records only the owning entry hash (`own_id`), so the
+/// mode is read back from that `StreamOwn` entry's spec bytes — no dedicated column. Returns
+/// [`AccessMode::Private`] (FAIL-CLOSED) whenever no effective ownership fact is folded locally: an
+/// unknown or not-yet-synced owner is treated as private, never public, so admission callers open
+/// nothing on a stream whose owner authority has not yet arrived. Resolve the owner FROM THE STREAM
+/// via [`stream_owner_account`] before calling — never from an attacker-settable claimed author.
+pub fn stream_access_mode(
+    conn: &Connection,
+    owner_account_id: AccountId,
+    stream_id: StreamId,
+) -> anyhow::Result<AccessMode> {
+    let own_id: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT own_id FROM account_stream_ownership
+             WHERE account_id = ?1 AND stream_id = ?2",
+            params![owner_account_id.to_bytes().as_slice(), stream_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(own_id) = own_id else {
+        return Ok(AccessMode::Private);
+    };
+    let raw: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT signed_bytes FROM account_entries
+             WHERE entry_hash = ?1 AND account_id = ?2",
+            params![own_id.as_slice(), owner_account_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        // Ownership projected effective but its source entry is not present — fail closed.
+        return Ok(AccessMode::Private);
+    };
+    let entry = envelope::decode_account_signed(&raw)?;
+    let DecodedAccountOp::Known(AccountOp::StreamOwn { stream_id: owned, stream_spec_bytes }) =
+        ops::decode(entry.header.entry_type, &entry.payload)?
+    else {
+        anyhow::bail!("ownership fact does not name a StreamOwn operation");
+    };
+    let spec = crate::stream::decode_spec_v2(&stream_spec_bytes)?;
+    // The fold makes a StreamOwn effective only after checking `derive_v2(spec) == stream_id`, so
+    // this must already hold; re-assert to document the dependency this decode-on-read leans on.
+    anyhow::ensure!(
+        owned == stream_id && crate::stream::derive_v2(&spec)? == stream_id,
+        "ownership fact spec does not derive its stream id",
+    );
+    Ok(spec.access_mode)
 }
 
 /// Whether an account has folded to `contested` — a genuine owner-key-compromise / equivocation
@@ -3977,19 +4030,64 @@ mod tests {
     }
 
     fn stream_own(account_id: AccountId) -> (crate::stream::StreamId, AccountOp) {
+        stream_own_mode(account_id, crate::stream::AccessMode::Private, "repo-a")
+    }
+
+    fn stream_own_mode(
+        account_id: AccountId,
+        access_mode: crate::stream::AccessMode,
+        repo: &str,
+    ) -> (crate::stream::StreamId, AccountOp) {
         let spec = StreamSpecV2 {
             owner_account_id: account_id,
             policy: StreamSpec {
-                repo_set: vec!["repo-a".to_string()],
+                repo_set: vec![repo.to_string()],
                 kind_allow_list: None,
                 relation_policy: None,
                 node_overrides: Vec::new(),
             },
-            access_mode: crate::stream::AccessMode::Private,
+            access_mode,
         };
         let stream_id = stream::derive_v2(&spec).unwrap();
         let stream_spec_bytes = stream::canonical_spec_v2_bytes(&spec).unwrap();
         (stream_id, AccountOp::StreamOwn { stream_id, stream_spec_bytes })
+    }
+
+    #[test]
+    fn stream_access_mode_reads_public_and_private_and_fails_closed_on_unknown() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        // A public_read stream: the accessor decodes PublicRead from the folded StreamOwn spec.
+        let (public_stream, public_op) =
+            stream_own_mode(account_id, AccessMode::PublicRead, "repo-pub");
+        let (public_bytes, public_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &public_op);
+        account_ingest(&conn, &public_bytes, NOW + 1).unwrap();
+        assert_eq!(
+            stream_access_mode(&conn, account_id, public_stream).unwrap(),
+            AccessMode::PublicRead,
+        );
+
+        // A private stream on the same account resolves Private — and has a DISTINCT id, since the
+        // mode folds into the stream identity.
+        let (private_stream, private_op) =
+            stream_own_mode(account_id, AccessMode::Private, "repo-priv");
+        let (private_bytes, _) =
+            op(account_id, &founder, 2, Some(public_hash), Some(genesis_hash), &private_op);
+        account_ingest(&conn, &private_bytes, NOW + 2).unwrap();
+        assert_ne!(public_stream, private_stream);
+        assert_eq!(
+            stream_access_mode(&conn, account_id, private_stream).unwrap(),
+            AccessMode::Private,
+        );
+
+        // A stream with no folded ownership fact fails closed to Private — never public — so an
+        // unknown or not-yet-synced owner opens nothing at an admission caller.
+        let unknown = StreamId::from_bytes([0x77; 32]);
+        assert_eq!(stream_access_mode(&conn, account_id, unknown).unwrap(), AccessMode::Private);
     }
 
     fn device_remove(dev: &Dev, control_cut: super::super::cut::Cut) -> AccountOp {

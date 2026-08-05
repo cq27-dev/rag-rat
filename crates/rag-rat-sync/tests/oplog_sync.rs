@@ -294,11 +294,12 @@ async fn a_fresh_peer_restores_the_accounts_content_after_the_account_log() {
     assert_eq!(accepted, 2, "the restored content folds accepted once authority is in place");
 }
 
-/// A content entry authored by a DIFFERENT account than the session is scoped to must not be stored
-/// — the account-scoped content store refuses it before ingest, so a peer cannot flood this
-/// account's pre-verify table with foreign candidates through a session that never named them.
+/// A content entry authored by a DIFFERENT account on a PRIVATE stream must not be stored — the
+/// content store refuses foreign content before ingest unless it is on a `public_read` stream, so a
+/// peer cannot flood this account's pre-verify table with private foreign candidates through a
+/// session that never named them. (The public-stream exception is covered below.)
 #[tokio::test]
-async fn foreign_account_content_is_not_stored() {
+async fn foreign_account_content_on_a_private_stream_is_not_stored() {
     use rag_rat_oplog::{
         MemoryOp, NodeContent, NodeId, SealPolicy, author_content_batch, content_entries_for_sync,
         ensure_owned_stream_v2_in_tx,
@@ -349,6 +350,142 @@ async fn foreign_account_content_is_not_stored() {
     assert!(
         content_entries_for_sync(&mine, other_account).unwrap().is_empty(),
         "the other account was not grown through my session",
+    );
+}
+
+/// Author real content on a `public_read` stream owned by `other`, returning `other`'s account id,
+/// its account-log entries (genesis + the public `StreamOwn`), and the authored content bytes. The
+/// two E2a tests below differ only in WHEN they fold `other`'s account log into the subscriber.
+fn public_stream_content_from_another_account()
+-> (Connection, rag_rat_oplog::AccountId, Vec<Vec<u8>>, Vec<u8>) {
+    use rag_rat_oplog::{
+        AccessMode, MemoryOp, NodeContent, NodeId, SealPolicy, account_entries_for_sync,
+        author_content_batch, content_entries_for_sync, ensure_owned_stream_v2_with_mode_in_tx,
+    };
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    let other = fresh_db();
+    let other_account = local_account(&other, NOW).unwrap();
+    let public_stream = {
+        let tx = Transaction::new_unchecked(&other, TransactionBehavior::Immediate).unwrap();
+        let s =
+            ensure_owned_stream_v2_with_mode_in_tx(&tx, "repo-pub", AccessMode::PublicRead, NOW)
+                .unwrap();
+        tx.commit().unwrap();
+        s
+    };
+    author_content_batch(
+        &other,
+        public_stream,
+        &[MemoryOp::NodeCreate {
+            node_id: NodeId::from("n1"),
+            content: NodeContent {
+                kind: "Invariant".into(),
+                title: "t".into(),
+                body: "body".into(),
+                confidence: "high".into(),
+                source: "agent".into(),
+                tags: Vec::new(),
+                payload: None,
+            },
+        }],
+        SealPolicy::Plaintext,
+        NOW,
+    )
+    .unwrap();
+    let account_log = account_entries_for_sync(&other, other_account)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.signed_bytes);
+    // seq order: genesis (seq 0) precedes the StreamOwn (seq 1), so a single in-order pass folds
+    // both; a re-pass would settle any parked tail regardless.
+    let account_log: Vec<Vec<u8>> = account_log.collect();
+    let content = content_entries_for_sync(&other, other_account).unwrap()[0].signed_bytes.clone();
+    (other, other_account, account_log, content)
+}
+
+/// Foreign content on a `public_read` stream IS admitted — and folds accepted — once the owner's
+/// account log is present locally. This is the acceptance half of anonymous pull (#407): the store
+/// no longer refuses foreign content whose stream the owner published public, and `content_ingest`
+/// verifies it against the owner's synced roster exactly as it does the account's own content.
+#[tokio::test]
+async fn foreign_content_on_a_public_stream_is_admitted_once_the_owner_log_is_present() {
+    use rag_rat_oplog::{
+        ContentRefoldBudget, account_ingest, content_entries_for_sync,
+        settle_pending_content_refolds,
+    };
+    use rag_rat_sync::{OplogContentSyncStore, SyncStore};
+
+    let (_other, other_account, account_log, content) =
+        public_stream_content_from_another_account();
+
+    // A subscriber account holds the owner's account log (roster + public StreamOwn) before ingest.
+    let mine = fresh_db();
+    let my_account = local_account(&mine, NOW).unwrap();
+    assert_ne!(my_account.to_bytes(), other_account.to_bytes());
+    for bytes in &account_log {
+        account_ingest(&mine, bytes, NOW).unwrap();
+    }
+
+    let mut store = OplogContentSyncStore::new(&mine, my_account, || NOW);
+    assert_eq!(
+        store.ingest(&content).unwrap(),
+        rag_rat_sync::Ingested::Stored,
+        "foreign content on a public_read stream is admitted to ingest",
+    );
+    assert_eq!(
+        content_entries_for_sync(&mine, other_account).unwrap().len(),
+        1,
+        "the public stream's content landed under the owner account",
+    );
+    // And it folds ACCEPTED — the subscriber recomputes authority from the synced owner log, never
+    // trusting the sender.
+    settle_pending_content_refolds(&mine, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+    let accepted: i64 = mine
+        .query_row(
+            "SELECT count(*) FROM content_entries WHERE author_account_id = ?1 AND accepted = 1",
+            [other_account.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(accepted, 1, "public foreign content folds accepted against the synced owner log");
+}
+
+/// Out-of-order delivery converges without a park path: a public entry that arrives BEFORE the
+/// owner's account log drops as `NoChange` (the owner is unknown, so it fails closed to private),
+/// and the next re-offer — after the owner log is folded — is admitted. Drop-and-resync, no new
+/// parking dimension.
+#[tokio::test]
+async fn public_content_before_the_owner_log_drops_then_converges_on_re_offer() {
+    use rag_rat_oplog::account_ingest;
+    use rag_rat_sync::{OplogContentSyncStore, SyncStore};
+
+    let (_other, _other_account, account_log, content) =
+        public_stream_content_from_another_account();
+
+    let mine = fresh_db();
+    let my_account = local_account(&mine, NOW).unwrap();
+
+    // Owner log absent → the stream's owner/mode is unknown → fail closed, dropped (not parked).
+    // The scope ends the store's borrow of `mine` so the owner log can be folded next.
+    {
+        let mut store = OplogContentSyncStore::new(&mine, my_account, || NOW);
+        assert_eq!(
+            store.ingest(&content).unwrap(),
+            rag_rat_sync::Ingested::NoChange,
+            "a public entry whose owner log has not arrived is dropped, not parked",
+        );
+    }
+
+    // Owner log arrives; the re-offer is admitted — snapshot-diff convergence, no park path needed.
+    for bytes in &account_log {
+        account_ingest(&mine, bytes, NOW).unwrap();
+    }
+    let mut store = OplogContentSyncStore::new(&mine, my_account, || NOW);
+    assert_eq!(
+        store.ingest(&content).unwrap(),
+        rag_rat_sync::Ingested::Stored,
+        "once the owner log is folded, the re-offered public entry is admitted",
     );
 }
 

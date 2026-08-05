@@ -46,8 +46,8 @@ mod storage;
 pub use authoring::{
     EnrollingDevice, author_device_add_in_tx, author_enrollment_device_add_in_tx,
     enrollment_authoring_fits, enrollment_authoring_requirements, ensure_owned_stream_v2_in_tx,
-    established_owned_stream_v2, owned_stream_v2_id, retry_enrollment_pre_verify,
-    validate_device_add_label,
+    ensure_owned_stream_v2_with_mode_in_tx, established_owned_stream_v2, owned_stream_v2_id,
+    retry_enrollment_pre_verify, validate_device_add_label,
 };
 pub use bootstrap::{
     AuthoredDurability, ENROLLMENT_HELD_ENTRY_HASHES_MAX, EnrollmentBootstrap, EnrollmentBudget,
@@ -129,6 +129,7 @@ pub use storage::{
     account_signed_entry_exists, account_signed_hash, auth_len_freshness,
     backfill_authority_projection, grant_effective_for_device, owned_streams_for_account,
     owner_control_authority, owner_control_authority_in_snapshot, owner_secrets_authority,
-    roster_content_authority, stream_owner_effective, verify_enrollment_device_add,
+    roster_content_authority, stream_access_mode, stream_owner_account, stream_owner_effective,
+    verify_enrollment_device_add,
 };
-pub(crate) use storage::{device_is_effective_writer, stored_device_pubkeys, stream_owner_account};
+pub(crate) use storage::{device_is_effective_writer, stored_device_pubkeys};

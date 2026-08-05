@@ -115,16 +115,17 @@ pub use account::{
     content_stream_has_sealed_ratchet, content_stream_is_empty, current_sealing_key,
     decode_content_signed, enroll_stream_keys_for_device_in_tx, enrollment_authoring_fits,
     enrollment_authoring_requirements, enrollment_budget, ensure_owned_stream_v2_in_tx,
-    ensure_repo_incarnation, ensure_stream_key_current_in_tx, established_owned_stream_v2,
-    grant_effective_for_device, held_account_entry_hashes, historical_content_keyring,
-    live_stream_key_targets_for_device, local_account, mint_and_author_stream_key_wrap_in_tx,
-    owned_stream_v2_id, owned_streams_for_account, owner_control_authority,
-    owner_control_authority_in_snapshot, owner_secrets_authority, prepare_content_authoring,
-    prune_account_candidate_reservations_in_tx, read_local_account, read_local_account_genesis,
-    release_account_candidate_reservation_in_tx, repo_incarnation_state,
-    retry_enrollment_pre_verify, roster_content_authority, rotate_stream_key_in_tx,
-    select_current_sealing_wrap, settle_pending_content_refold_for_stream_in_tx,
-    settle_pending_content_refolds, sign_local_node_binding, stream_key_rotation_needed,
+    ensure_owned_stream_v2_with_mode_in_tx, ensure_repo_incarnation,
+    ensure_stream_key_current_in_tx, established_owned_stream_v2, grant_effective_for_device,
+    held_account_entry_hashes, historical_content_keyring, live_stream_key_targets_for_device,
+    local_account, mint_and_author_stream_key_wrap_in_tx, owned_stream_v2_id,
+    owned_streams_for_account, owner_control_authority, owner_control_authority_in_snapshot,
+    owner_secrets_authority, prepare_content_authoring, prune_account_candidate_reservations_in_tx,
+    read_local_account, read_local_account_genesis, release_account_candidate_reservation_in_tx,
+    repo_incarnation_state, retry_enrollment_pre_verify, roster_content_authority,
+    rotate_stream_key_in_tx, select_current_sealing_wrap,
+    settle_pending_content_refold_for_stream_in_tx, settle_pending_content_refolds,
+    sign_local_node_binding, stream_access_mode, stream_key_rotation_needed, stream_owner_account,
     stream_owner_effective, upsert_account_candidate_reservation_in_tx, validate_device_add_label,
     verify_enrollment_device_add, verify_node_binding,
 };
@@ -164,7 +165,7 @@ pub use op::{
 // per J1).
 pub use project::ProjectedState;
 pub use store::{author_batch, author_op, load_projection};
-pub use stream::StreamId;
+pub use stream::{AccessMode, StreamId};
 // The table-sync forward-compat seam (#1001): replay entries retained but not projected when
 // they arrived. Belongs at store open, before producing — see the module docs.
 pub use table_sync::{
