@@ -78,26 +78,45 @@ PreToolUse hook that auto-augments your `grep`/`rg` calls with symbol + memory c
 
 ## Rule 2 — Record durable learnings as rag-rat memories before you finish
 
-When you discover something **durable and non-obvious** — a load-bearing invariant, a decision + its
-rationale, a risk/footgun that cost you time, a perf or platform quirk — record it with
-`memory_create` **before finishing the task**. If you had to read several files and reason to learn
-it, the next agent should get it in one MCP call.
+**The gate, before anything else: could the next agent recover this by reading the repo?** If yes,
+don't record it. A memory that restates what the code, the types, the tests, or the history already
+say leaves the reader *worse off*, not merely no better — it costs attention and returns nothing. On
+most tasks the honest answer is **record nothing**; that is the common outcome, not a failure to try
+hard enough. What passes the gate is what you had to read several files and reason to learn, and
+that the repo states nowhere.
+
+**Rejected alternatives lead.** The approach that was *not* taken leaves no artifact anywhere — not
+in the diff, not in the types, not in the history — which makes it at once the most-asked question
+about unfamiliar code and the least-supplied answer. If your task settled a choice, record the
+alternative and why it lost (`RejectedAlternative`) before you record anything about what the code
+now does.
 
 **Why rag-rat and not your harness's own notes:** rag-rat memories live in the repo's shared index,
 so they surface for **every** agent that queries it — Claude Code, Codex, any future tool — not just
 the one that wrote them. Your harness's private memory is invisible to the others. rag-rat is the
 **cross-agent memory layer**.
 
-**Write the present tense, not a changelog.** A memory is read by someone about to change the code,
-so it must say **what is true now and what to do about it**. Narrating what shipped is unactionable:
-"this was fixed in #123", "the predicate used to fail open", "stage 2 landed the split" all cost the
-reader attention and tell them nothing they can act on. Worse, a memory written as history goes stale
-the moment the next change lands, and it teaches the reader to distrust the rest of the entry.
+**Translate; never store the trajectory.** What you did, in what order, is worth less than nothing
+to the next reader — a replayed trace scores worse than having no memory at all. Distill it to a
+situation and an action — *when X, do Y, because Z* — and quote the evidence you generalised from
+(the failing line, the error, the constraint). Situated questions are not answered by general
+advice, and the quote is what spares the reader from trusting a summary of a summary.
 
-The same applies when you **update** one. If the thing a memory warned about has been fixed, do not
-append a status section — rewrite the body to state the rule that now holds, and delete the warning.
-If nothing actionable survives, `memory_mark_obsolete` it. A memory whose top half is a list of
-completed work is one nobody finishes reading.
+**Revise before you create.** A memory that has drifted actively misleads, while a missing one
+merely fails to help — so correcting or retiring a wrong record is the highest-value write
+available. `memory_search` first: if something already covers the ground, `memory_update` it; reach
+for `memory_create` only when nothing does.
+
+**Terseness is a staleness strategy, not a style preference.** Every extra detail is one more thing a
+later change can falsify, and a record that contradicts the source on one line gets distrusted on all
+of them. State the rule and the reason, then stop.
+
+**Write the present tense, not a changelog.** A memory is read by someone about to change the code,
+so it must say **what is true now and what to do about it**. "This was fixed in #123", "the predicate
+used to fail open", "stage 2 landed the split" are unactionable, and history goes stale the moment
+the next change lands. The same applies when you update one: if the thing a memory warned about has
+been fixed, rewrite the body to state the rule that now holds rather than appending a status section,
+and `memory_mark_obsolete` it if nothing actionable survives.
 
 Keep: invariants, the reasoning behind a decision, traps and their failure modes, what to reach for,
 what is still unresolved. Drop: PR/stage narration, "used to be", anything whose only value is that
@@ -105,7 +124,6 @@ it happened. Referencing an issue or test *name* is fine when it is a pointer th
 it is the story that does not belong.
 
 Do it well:
-- **`memory_search` first** to avoid duplicates.
 - **Anchor to the tightest stable target:** prefer an `id` binding (the `sym_<hex>` handle —
   self-heals across cross-file moves); fall back to a `path` binding for file/area notes, or a
   commit/GitHub ref for historical rationale.
@@ -113,9 +131,8 @@ Do it well:
   this / why not that), `Risk`/`BugPattern` (footguns), `PerformanceNote`, `PlatformQuirk`,
   `FFIBoundary`. Write a concrete title and a body with the **why** + **how to apply** — not just the
   what, and not what changed.
-- **`memory_update` / `memory_mark_obsolete`** when a memory is wrong or superseded — don't leave
-  stale guidance. After a large refactor, **`memory_doctor`** flags `gone` anchors and
-  **`memory_rebind`** re-anchors them.
+- **After a large refactor**, `memory_doctor` flags `gone` anchors and `memory_rebind` re-anchors
+  them.
 
 The memory layer is kept honest by **`dream`** — a maintenance worklist of load-bearing code with no
 memory (coverage gaps) and memories that have drifted from the source. The **dream-review** skill is
