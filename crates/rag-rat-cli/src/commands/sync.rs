@@ -202,7 +202,6 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
             },
             None => None,
         };
-        let policy = AuthPolicy::Closed;
 
         // A host is advertised by the same persisted controller the resident MCP host uses. It
         // owns its timer and DB handles, so resealing never waits for (or cancels) an inbound sync.
@@ -270,17 +269,33 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
                     )
                     .await
                     {
-                        Ok(Some(conn)) => Some(
-                            rag_rat_sync::dispatch_connection(
-                                conn,
-                                local_node,
-                                &mut account_store,
-                                &mut content_store,
-                                policy,
-                                time::now_ms,
+                        Ok(Some(incoming)) => {
+                            // Serve a published public-KB account PublicRead (anonymous read),
+                            // everything else Closed — derived AFTER the peer lands so a `sync
+                            // publish` while parked waiting takes effect on this very connection. A
+                            // DB read fault fails closed (Closed); the store's fully-public snapshot
+                            // guard is the backstop either way.
+                            let policy = if rag_rat_core::sync_driver::account_is_public_kb(
+                                conn, account_id,
                             )
-                            .await,
-                        ),
+                            .unwrap_or(false)
+                            {
+                                AuthPolicy::PublicRead
+                            } else {
+                                AuthPolicy::Closed
+                            };
+                            Some(
+                                rag_rat_sync::dispatch_connection(
+                                    incoming,
+                                    local_node,
+                                    &mut account_store,
+                                    &mut content_store,
+                                    policy,
+                                    time::now_ms,
+                                )
+                                .await,
+                            )
+                        },
                         Ok(None) => None,
                         Err(error) => Some(Err(error)),
                     }

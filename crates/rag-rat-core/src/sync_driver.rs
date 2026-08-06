@@ -344,6 +344,21 @@ fn refused_publication_is_due(
     )
 }
 
+/// Whether `account` is a published public knowledge base — served under `AuthPolicy::PublicRead`
+/// (anonymous read) rather than `Closed`. True iff the account is fully public (no private stream)
+/// AND owns at least one stream, so a vacuously-fully-public FRESH/empty account is NOT exposed;
+/// only a deliberate `sync publish` (which refuses a non-fully-public account and ensures the
+/// public stream) satisfies both. Evaluated PER-CONNECTION by the serve loops so a node published
+/// while the host runs starts serving public without a restart; the store's own
+/// `account_is_fully_public` snapshot guard remains the fail-closed backstop.
+pub fn account_is_public_kb(
+    conn: &Connection,
+    account: rag_rat_oplog::AccountId,
+) -> anyhow::Result<bool> {
+    Ok(rag_rat_oplog::account_is_fully_public(conn, account)?
+        && !rag_rat_oplog::owned_streams_for_account(conn, account)?.is_empty())
+}
+
 /// Maintain a serving host's discovery announcement independently of its inbound session loop.
 ///
 /// The record in `index_meta` is reused only for the same endpoint identity, account tag, and
@@ -650,12 +665,20 @@ async fn accept_loop(
                 let conn = storage.connection();
                 let mut account_store = OplogSyncStore::new(conn, account, time::now_ms);
                 let mut content_store = OplogContentSyncStore::new(conn, account, time::now_ms);
+                // A published public-KB account is served PublicRead (anonymous read); every other
+                // account stays Closed. Derived per-connection so a mid-run `sync publish` takes
+                // effect without a restart.
+                let policy = if account_is_public_kb(conn, account)? {
+                    AuthPolicy::PublicRead
+                } else {
+                    AuthPolicy::Closed
+                };
                 let (alpn, report) = rag_rat_sync::dispatch_connection(
                     connection,
                     node,
                     &mut account_store,
                     &mut content_store,
-                    AuthPolicy::Closed,
+                    policy,
                     time::now_ms,
                 )
                 .await?;
@@ -915,10 +938,45 @@ mod tests {
 
     use super::{
         DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PerPeerSessionLimiter, PersistedAdvertisement,
-        RESIDENT_NUDGE, RefusedPublication, can_host, can_sync, device_sync_run,
-        nudge_resident_host, read_advertisement, refused_publication_is_due, retry_is_due,
-        write_advertisement,
+        RESIDENT_NUDGE, RefusedPublication, account_is_public_kb, can_host, can_sync,
+        device_sync_run, nudge_resident_host, read_advertisement, refused_publication_is_due,
+        retry_is_due, write_advertisement,
     };
+
+    fn schema_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        conn
+    }
+
+    fn own_stream(conn: &Connection, mode: rag_rat_oplog::AccessMode) {
+        use rusqlite::{Transaction, TransactionBehavior};
+        rag_rat_oplog::local_account(conn, 1_000).unwrap();
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(&tx, "repo-a", mode, 1_000).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn account_is_public_kb_only_for_a_published_fully_public_account() {
+        // A minted-but-empty account (no owned stream) is NOT served public — else a fresh node
+        // would expose itself vacuously.
+        let empty = schema_conn();
+        let empty_account = rag_rat_oplog::local_account(&empty, 1_000).unwrap();
+        assert!(!account_is_public_kb(&empty, empty_account).unwrap());
+
+        // A private stream is not fully public.
+        let private = schema_conn();
+        own_stream(&private, rag_rat_oplog::AccessMode::Private);
+        let private_account = rag_rat_oplog::local_account(&private, 1_000).unwrap();
+        assert!(!account_is_public_kb(&private, private_account).unwrap());
+
+        // A published account (public stream, fully public) IS served public.
+        let public = schema_conn();
+        own_stream(&public, rag_rat_oplog::AccessMode::PublicRead);
+        let public_account = rag_rat_oplog::local_account(&public, 1_000).unwrap();
+        assert!(account_is_public_kb(&public, public_account).unwrap());
+    }
 
     #[test]
     fn nudge_is_durable_when_no_resident_host_is_live() {
