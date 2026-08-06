@@ -87,9 +87,14 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # rust-cache restore keys can bring back ort-sys link metadata from before ORT_CACHE_DIR was
-      # target-local. Force the build script to re-emit -L for the current cache location.
-      - run: cargo clean -p ort-sys
+      # rust-cache can restore a PARTIAL ort-sys download — a cache marker present but the native
+      # onnxruntime lib missing — so `cargo clean` alone re-emits link metadata pointing at a lib
+      # that isn't there ("could not find native static library `onnxruntime`"). Nuke the downloaded
+      # cache too so the build script re-downloads it clean and a poisoned cache can't resurface.
+      - shell: bash
+        run: |
+          cargo clean -p ort-sys
+          rm -rf "$ORT_CACHE_DIR"
       # Align the MSVC C runtime so the link succeeds. esaxx-rs (a C++ dep via
       # tokenizers <- model2vec/fastembed) hardcodes cc's .static_crt(true) => /MT, but the ort_sys
       # ONNX Runtime prebuilt is /MD; the mismatch is LNK2038/LNK1319 on Windows. cc appends env

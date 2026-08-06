@@ -101,11 +101,15 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # rust-cache restore keys can bring back ort-sys link metadata from before ORT_CACHE_DIR was
-      # target-local. Force the build script to re-emit -L for the current cache location.
-      - run: cargo clean -p ort-sys
-      # Compile the default feature set (downloads the ONNX runtime once, then cached) so the
-      # released binary's embedding paths never break silently.
+      # rust-cache can restore a PARTIAL ort-sys download — a cache marker present but the native
+      # onnxruntime lib missing — so `cargo clean` alone re-emits link metadata pointing at a lib
+      # that isn't there ("could not find native static library `onnxruntime`"). Nuke the downloaded
+      # cache too so the build script re-downloads it clean and a poisoned cache can't resurface.
+      - run: |
+          cargo clean -p ort-sys
+          rm -rf "$ORT_CACHE_DIR"
+      # Compile the default feature set (re-downloads the ONNX runtime) so the released binary's
+      # embedding paths never break silently.
       - run: cargo build --workspace --locked
 
   coverage:
