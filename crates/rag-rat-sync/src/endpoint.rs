@@ -42,6 +42,7 @@ use crate::enrollment::{
 };
 use crate::session::{
     DEFAULT_IDLE_TIMEOUT, ServeScope, SessionError, SessionReport, SyncStore, run_session,
+    run_session_limited,
 };
 use crate::store::{OplogContentSyncStore, OplogSyncStore};
 use crate::table_session::{
@@ -725,7 +726,9 @@ where
 {
     let local_node = *endpoint.id().as_bytes();
     let conn = accept_connection(endpoint).await?;
-    dispatch_connection(conn, local_node, account_store, content_store, policy, now_ms).await
+    // Unmetered convenience/test wrapper — the live serve loops (resident host, `sync serve`) call
+    // `dispatch_connection` directly with the shared egress limiter.
+    dispatch_connection(conn, local_node, account_store, content_store, policy, now_ms, None).await
 }
 
 /// Accept and complete the transport handshake for one inbound connection. Kept separate from
@@ -747,6 +750,15 @@ pub async fn accept_connection(endpoint: &Endpoint) -> Result<IrohConnection, Sy
 const ACCEPT_REFILL_PER_SEC: f64 = 8.0;
 /// Maximum inbound connections admitted in one instantaneous burst.
 const ACCEPT_BURST: f64 = 32.0;
+
+/// Bytes served per second in steady state once the burst is spent — the sustained egress ceiling a
+/// public serving host allows across ALL peers. A text knowledge base is small, so a legitimate
+/// full pull clears the burst instantly; the ceiling bounds an anonymous peer that re-pulls to
+/// drain upload bandwidth. Implementation-local constants, not config (a host can be given a knob
+/// later).
+const EGRESS_REFILL_BYTES_PER_SEC: f64 = 16.0 * 1024.0 * 1024.0;
+/// Bytes servable in one instantaneous burst before the steady-state ceiling applies.
+const EGRESS_BURST_BYTES: f64 = 64.0 * 1024.0 * 1024.0;
 
 /// A GLOBAL inbound-connection rate limiter: one token bucket bounding total accept rate regardless
 /// of peer identity. Per-peer-by-node-id limiting is the wrong lever — an iroh node id is a keypair
@@ -790,6 +802,56 @@ impl GlobalAcceptRateLimiter {
         self.last_ms = Some(now_ms);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A GLOBAL byte-rate limiter bounding total EGRESS (data served to peers) regardless of peer
+/// identity — the anti-drain counterpart to [`GlobalAcceptRateLimiter`]. Global, not per-peer, for
+/// the same Sybil reason: a per-id budget is evaded by rotating node ids. Shared across the host's
+/// concurrent per-connection tasks (an `Arc<Mutex<_>>`), checked at each outgoing page. In-memory
+/// and transient: a restart resetting to full burst is correct for live-traffic control.
+#[derive(Debug)]
+pub struct GlobalEgressLimiter {
+    tokens: f64,
+    burst: f64,
+    refill_per_sec: f64,
+    last_ms: Option<i64>,
+}
+
+impl Default for GlobalEgressLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GlobalEgressLimiter {
+    pub fn new() -> Self {
+        Self {
+            tokens: EGRESS_BURST_BYTES,
+            burst: EGRESS_BURST_BYTES,
+            refill_per_sec: EGRESS_REFILL_BYTES_PER_SEC,
+            last_ms: None,
+        }
+    }
+
+    /// Refill by elapsed time (capped at `burst`), then, IF any credit remains, spend `bytes` (the
+    /// balance may go negative for an oversized page) and permit the page; otherwise refuse so the
+    /// sender stops after the pages already sent. Permitting on ANY positive credit guarantees
+    /// forward progress even for a page larger than the whole burst — a reader is never wedged,
+    /// only throttled, and the unsent tail is re-offered by the next session's inventory diff.
+    /// `now_ms` injected for deterministic tests.
+    pub fn allow(&mut self, bytes: usize, now_ms: i64) -> bool {
+        if let Some(last) = self.last_ms {
+            let elapsed_secs = (now_ms - last).max(0) as f64 / 1000.0;
+            self.tokens = (self.tokens + elapsed_secs * self.refill_per_sec).min(self.burst);
+        }
+        self.last_ms = Some(now_ms);
+        if self.tokens > 0.0 {
+            self.tokens -= bytes as f64;
             true
         } else {
             false
@@ -844,6 +906,7 @@ pub async fn dispatch_connection<C>(
     content_store: &mut C,
     policy: AuthPolicy,
     now_ms: impl Fn() -> i64 + Copy,
+    egress: Option<std::sync::Arc<std::sync::Mutex<GlobalEgressLimiter>>>,
 ) -> Result<(Vec<u8>, SessionReport), SyncFailure>
 where
     C: SyncStore,
@@ -931,14 +994,35 @@ where
     content_store.set_serve_scope(scope);
     // Route the session to the store the negotiated ALPN names (validated above, so the final
     // `else` is the table stream, not an unknown-ALPN fallthrough).
+    // The account log and `/3` content are the anonymous-servable paths, so their egress is metered
+    // against the shared budget. Table sync is pinned `Closed` (unreachable by an anonymous peer),
+    // so it carries no anonymous egress and is left unmetered here.
     let report = if alpn.as_slice() == SYNC_ALPN {
-        run_session(account_store, send, recv, AuthRole::Acceptor, capabilities)
-            .await
-            .map_err(SyncFailure::Session)?
+        run_session_limited(
+            account_store,
+            send,
+            recv,
+            AuthRole::Acceptor,
+            capabilities,
+            DEFAULT_IDLE_TIMEOUT,
+            egress,
+            now_ms,
+        )
+        .await
+        .map_err(SyncFailure::Session)?
     } else if alpn.as_slice() == CONTENT_SYNC_ALPN {
-        run_session(content_store, send, recv, AuthRole::Acceptor, capabilities)
-            .await
-            .map_err(SyncFailure::Session)?
+        run_session_limited(
+            content_store,
+            send,
+            recv,
+            AuthRole::Acceptor,
+            capabilities,
+            DEFAULT_IDLE_TIMEOUT,
+            egress,
+            now_ms,
+        )
+        .await
+        .map_err(SyncFailure::Session)?
     } else {
         let mut table_store = crate::store::OplogTableSyncStore::new(
             account_store.connection(),
@@ -1016,6 +1100,7 @@ pub async fn dispatch_connection_multi(
     local_node: [u8; 32],
     accounts: &mut [HostedAccount<'_>],
     now_ms: impl Fn() -> i64 + Copy,
+    egress: Option<std::sync::Arc<std::sync::Mutex<GlobalEgressLimiter>>>,
 ) -> Result<(Vec<u8>, SessionReport), SyncFailure> {
     let remote_node = *conn.remote_id().as_bytes();
     let alpn = conn.alpn().to_vec();
@@ -1078,14 +1163,34 @@ pub async fn dispatch_connection_multi(
     let scope = serve_scope_for(alpn_policy, admission);
     account.sync.set_serve_scope(scope);
     account.content.set_serve_scope(scope);
+    // As in `dispatch_connection`: the anonymous-servable account + content paths are
+    // egress-metered; table sync is pinned `Closed` (no anonymous egress) and left unmetered.
     let report = if alpn.as_slice() == SYNC_ALPN {
-        run_session(&mut account.sync, send, recv, AuthRole::Acceptor, capabilities)
-            .await
-            .map_err(SyncFailure::Session)?
+        run_session_limited(
+            &mut account.sync,
+            send,
+            recv,
+            AuthRole::Acceptor,
+            capabilities,
+            DEFAULT_IDLE_TIMEOUT,
+            egress,
+            now_ms,
+        )
+        .await
+        .map_err(SyncFailure::Session)?
     } else if alpn.as_slice() == CONTENT_SYNC_ALPN {
-        run_session(&mut account.content, send, recv, AuthRole::Acceptor, capabilities)
-            .await
-            .map_err(SyncFailure::Session)?
+        run_session_limited(
+            &mut account.content,
+            send,
+            recv,
+            AuthRole::Acceptor,
+            capabilities,
+            DEFAULT_IDLE_TIMEOUT,
+            egress,
+            now_ms,
+        )
+        .await
+        .map_err(SyncFailure::Session)?
     } else {
         let mut table_store = crate::store::OplogTableSyncStore::new(
             account.sync.connection(),
@@ -1659,6 +1764,20 @@ mod tests {
     }
 
     #[test]
+    fn egress_bounds_bytes_then_refills() {
+        let mut limiter = GlobalEgressLimiter::new();
+        // A page is permitted while any credit remains, even one larger than the whole burst
+        // (forward progress), driving the balance to zero-or-below.
+        assert!(limiter.allow(EGRESS_BURST_BYTES as usize, NOW), "the burst is servable");
+        assert!(
+            !limiter.allow(1, NOW),
+            "a further page at the same instant is refused (no credit)"
+        );
+        // One second refills `EGRESS_REFILL_BYTES_PER_SEC`, so serving resumes.
+        assert!(limiter.allow(1, NOW + 1000), "refilled credit permits serving again after 1s");
+    }
+
+    #[test]
     fn accept_rate_refills_over_time() {
         let mut limiter = GlobalAcceptRateLimiter::new();
         while limiter.allow(NOW) {} // drain the burst
@@ -2088,7 +2207,7 @@ mod tests {
         let mut dest_a_store = crate::store::OplogSyncStore::new(&dest_a, acct_a, || NOW);
         let server = async {
             let conn = accept_connection(&listener).await?;
-            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW).await
+            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW, None).await
         };
         let client = connect_and_sync(
             &dialer,
@@ -2112,7 +2231,7 @@ mod tests {
         let mut dest_b_store = crate::store::OplogSyncStore::new(&dest_b, acct_b, || NOW);
         let server = async {
             let conn = accept_connection(&listener).await?;
-            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW).await
+            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW, None).await
         };
         let client = connect_and_sync(
             &dialer,
@@ -2180,7 +2299,7 @@ mod tests {
         let mut dest_a_store = crate::store::OplogSyncStore::new(&dest_a, acct_a, || NOW);
         let server = async {
             let conn = accept_connection(&listener).await?;
-            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW).await
+            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW, None).await
         };
         let client = connect_and_sync(
             &dialer,
@@ -2202,7 +2321,7 @@ mod tests {
         let mut dest_b_store = crate::store::OplogSyncStore::new(&dest_b, acct_b, || NOW);
         let server = async {
             let conn = accept_connection(&listener).await?;
-            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW).await
+            dispatch_connection_multi(conn, local_node, &mut hosts, || NOW, None).await
         };
         let client = connect_and_sync(
             &dialer,

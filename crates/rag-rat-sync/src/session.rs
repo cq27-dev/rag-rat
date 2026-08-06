@@ -166,8 +166,8 @@ where
 /// within `idle_timeout`. Exposed so tests can exercise the timeout without waiting the default.
 pub async fn run_session_with_idle_timeout<S, R, W>(
     store: &mut S,
-    mut send: W,
-    mut recv: R,
+    send: W,
+    recv: R,
     role: AuthRole,
     capabilities: SessionCapabilities,
     idle_timeout: Duration,
@@ -176,6 +176,32 @@ where
     S: SyncStore,
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
+{
+    run_session_limited(store, send, recv, role, capabilities, idle_timeout, None, || 0).await
+}
+
+/// [`run_session_with_idle_timeout`] plus a GLOBAL egress cap. When `egress` is `Some`, each
+/// outgoing entries page is charged against the shared [`crate::GlobalEgressLimiter`], and the
+/// sender STOPS after the last page the budget allowed (sending `Done` early) — the withheld tail
+/// is re-offered by the next session's inventory diff, so a throttled reader converges across
+/// retries. `None` leaves the session unmetered (the dialer paths and tests). `now_ms` is read only
+/// when `egress` is `Some`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_session_limited<S, R, W, F>(
+    store: &mut S,
+    mut send: W,
+    mut recv: R,
+    role: AuthRole,
+    capabilities: SessionCapabilities,
+    idle_timeout: Duration,
+    egress: Option<std::sync::Arc<std::sync::Mutex<crate::GlobalEgressLimiter>>>,
+    now_ms: F,
+) -> Result<SessionReport, SessionError>
+where
+    S: SyncStore,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: Fn() -> i64,
 {
     let account_id = store.account_id();
     let snapshot = store.snapshot().map_err(SessionError::Store)?;
@@ -202,6 +228,21 @@ where
         } else {
             Vec::new()
         };
+        // Global egress cap: TRIM the set to the prefix the shared byte budget affords, then page
+        // it normally — the paging below is unchanged, so every `more` flag stays correct
+        // and the receiver never sees a truncated-but-`more:true` stream. The trimmed tail
+        // is re-offered by the next session's inventory diff (convergence). Charged per
+        // entry under ONE lock, held only here (never across an await); the balance may go
+        // negative on an oversized entry, and permitting while ANY credit remains
+        // guarantees forward progress. Poison-tolerant so a panic in one session task
+        // cannot wedge all future serving.
+        if let Some(limiter) = &egress {
+            let now = now_ms();
+            let mut guard = limiter.lock().unwrap_or_else(|poison| poison.into_inner());
+            let kept = to_send.iter().take_while(|entry| guard.allow(entry.len(), now)).count();
+            drop(guard);
+            to_send.truncate(kept);
+        }
         let total = to_send.len();
         // Drain into fixed pages so no single frame exceeds the per-page cap.
         let mut rest = to_send.split_off(0);
@@ -501,6 +542,124 @@ mod tests {
         assert_eq!(server.entries.len(), full.len());
         assert_eq!(reader.entries.len(), full.len() + 1);
         assert!(reader.entries.contains_key(&reader_only.0));
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_egress_budget_serves_nothing_then_converges_after_refill() {
+        use std::sync::{Arc, Mutex};
+        let now = 1_700_000_000_000i64;
+        let full: Vec<_> = (0u8..5).map(entry).collect();
+
+        // A shared egress limiter overspent so its balance is negative at `now`.
+        let egress = Arc::new(Mutex::new(crate::GlobalEgressLimiter::new()));
+        egress.lock().unwrap().allow(256 * 1024 * 1024, now);
+
+        // Round 1 at `now` (no refill): an exhausted budget serves nothing.
+        {
+            let mut server = MemStore::new([0xe6; 32], &full);
+            let mut reader = MemStore::new([0xe6; 32], &[]);
+            let (server_send, reader_recv) = tokio::io::duplex(1 << 20);
+            let (reader_send, server_recv) = tokio::io::duplex(1 << 20);
+            let (s, r) = tokio::join!(
+                run_session_limited(
+                    &mut server,
+                    server_send,
+                    server_recv,
+                    AuthRole::Acceptor,
+                    SessionCapabilities::new(PeerCapability::ReadWrite, PeerCapability::ReadOnly),
+                    DEFAULT_IDLE_TIMEOUT,
+                    Some(egress.clone()),
+                    move || now,
+                ),
+                run_session(
+                    &mut reader,
+                    reader_send,
+                    reader_recv,
+                    AuthRole::Dialer,
+                    SessionCapabilities::new(PeerCapability::ReadOnly, PeerCapability::ReadWrite),
+                ),
+            );
+            s.unwrap();
+            r.unwrap();
+            assert!(reader.entries.is_empty(), "an exhausted egress budget serves nothing");
+        }
+
+        // Round 2 with the clock advanced past a full refill: the withheld set is served —
+        // convergence across retries.
+        {
+            let later = now + 60_000;
+            let mut server = MemStore::new([0xe6; 32], &full);
+            let mut reader = MemStore::new([0xe6; 32], &[]);
+            let (server_send, reader_recv) = tokio::io::duplex(1 << 20);
+            let (reader_send, server_recv) = tokio::io::duplex(1 << 20);
+            let (s, r) = tokio::join!(
+                run_session_limited(
+                    &mut server,
+                    server_send,
+                    server_recv,
+                    AuthRole::Acceptor,
+                    SessionCapabilities::new(PeerCapability::ReadWrite, PeerCapability::ReadOnly),
+                    DEFAULT_IDLE_TIMEOUT,
+                    Some(egress.clone()),
+                    move || later,
+                ),
+                run_session(
+                    &mut reader,
+                    reader_send,
+                    reader_recv,
+                    AuthRole::Dialer,
+                    SessionCapabilities::new(PeerCapability::ReadOnly, PeerCapability::ReadWrite),
+                ),
+            );
+            s.unwrap();
+            r.unwrap();
+            assert_eq!(reader.entries.len(), full.len(), "after refill the withheld set is served");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generous_egress_budget_serves_a_multi_page_transfer_intact() {
+        use std::sync::{Arc, Mutex};
+        // Distinct 32-byte hashes so the set exceeds one page (`entry`'s u8 seed caps at 256).
+        let make = |i: usize| -> (Hash, Vec<u8>) {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let mut bytes = vec![0u8; 40];
+            bytes[..32].copy_from_slice(&hash);
+            (hash, bytes)
+        };
+        let count = MAX_ENTRIES_PER_PAGE + 10; // spans more than one page
+        let full: Vec<_> = (0..count).map(make).collect();
+        let mut server = MemStore::new([0xe7; 32], &full);
+        let mut reader = MemStore::new([0xe7; 32], &[]);
+        // A fresh (generous) budget must not disturb a normal multi-page transfer: every page's
+        // `more` flag stays correct and the receiver's truncation guard never fires.
+        let egress = Arc::new(Mutex::new(crate::GlobalEgressLimiter::new()));
+        let (server_send, reader_recv) = tokio::io::duplex(1 << 20);
+        let (reader_send, server_recv) = tokio::io::duplex(1 << 20);
+        let (s, r) = tokio::join!(
+            run_session_limited(
+                &mut server,
+                server_send,
+                server_recv,
+                AuthRole::Acceptor,
+                SessionCapabilities::new(PeerCapability::ReadWrite, PeerCapability::ReadOnly),
+                DEFAULT_IDLE_TIMEOUT,
+                Some(egress),
+                || 1_700_000_000_000,
+            ),
+            run_session(
+                &mut reader,
+                reader_send,
+                reader_recv,
+                AuthRole::Dialer,
+                SessionCapabilities::new(PeerCapability::ReadOnly, PeerCapability::ReadWrite),
+            ),
+        );
+        let server_report = s.unwrap();
+        r.unwrap();
+        assert_eq!(reader.entries.len(), count, "the whole multi-page set is served intact");
+        assert_eq!(server_report.entries_sent, count, "entries_sent reflects the full transfer");
     }
 
     #[tokio::test]

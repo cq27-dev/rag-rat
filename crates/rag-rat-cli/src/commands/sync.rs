@@ -248,6 +248,11 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
         // flood BEFORE the handshake, regardless of peer id (Sybil-resistant). Loop-owned;
         // the accept is sequential so no locking.
         let mut accept_rate = rag_rat_sync::GlobalAcceptRateLimiter::new();
+        // Global egress byte cap bounding total data served — a peer cannot drain the host by
+        // re-pulling. An `Arc<Mutex>` to match the shared-handle API (the CLI accept is sequential,
+        // so there is never real contention).
+        let egress =
+            std::sync::Arc::new(std::sync::Mutex::new(rag_rat_sync::GlobalEgressLimiter::new()));
         loop {
             // One endpoint, one accept loop: a connection carries the ACCOUNT-LOG ALPN or the
             // CONTENT ALPN (or ENROLL/TABLE), and `dispatch_connection` routes it to
@@ -292,6 +297,7 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
                                     &mut content_store,
                                     policy,
                                     time::now_ms,
+                                    Some(egress.clone()),
                                 )
                                 .await,
                             )

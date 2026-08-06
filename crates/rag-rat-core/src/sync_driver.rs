@@ -618,6 +618,10 @@ async fn accept_loop(
     let mut accept_rate = rag_rat_sync::GlobalAcceptRateLimiter::new();
     // Per-peer concurrent-session fairness: one node id may not hold every session slot.
     let per_peer = PerPeerSessionLimiter::default();
+    // Global egress byte cap shared across all concurrent session tasks (an `Arc<Mutex>` — unlike
+    // the sequential accept limiter above, sessions run in parallel): bounds total data served
+    // so a peer cannot drain the host by re-pulling.
+    let egress = Arc::new(Mutex::new(rag_rat_sync::GlobalEgressLimiter::new()));
     loop {
         let connection = match rag_rat_sync::accept_connection_within_rate(
             &endpoint,
@@ -655,6 +659,7 @@ async fn accept_loop(
         };
         let database = database.clone();
         let node = *endpoint.id().as_bytes();
+        let egress = Arc::clone(&egress);
         tokio::task::spawn_local(async move {
             let _permit = permit;
             // Held to task end so this peer's slot is reserved for the whole session, then released
@@ -680,6 +685,7 @@ async fn accept_loop(
                     &mut content_store,
                     policy,
                     time::now_ms,
+                    Some(egress),
                 )
                 .await?;
                 if alpn.as_slice() == rag_rat_sync::CONTENT_SYNC_ALPN {
