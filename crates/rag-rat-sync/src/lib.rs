@@ -28,8 +28,9 @@ pub mod table_wire;
 pub mod wire;
 
 pub use auth::{
-    AuthConfig, AuthError, AuthPolicy, AuthRole, LocalAuth, NodeAuth, PeerAuthorization,
-    PeerCapability, Selected, SessionCapabilities, run_auth_phase, run_auth_phase_selected,
+    AuthConfig, AuthError, AuthPolicy, AuthRole, LocalAuth, NodeAuth, PeerAdmission,
+    PeerAuthorization, PeerCapability, Selected, SessionCapabilities, run_auth_phase,
+    run_auth_phase_selected,
 };
 pub use endpoint::{
     DiscoveredPeers, EndpointError, GlobalAcceptRateLimiter, HostedAccount, MAX_RECONCILE_ROUNDS,

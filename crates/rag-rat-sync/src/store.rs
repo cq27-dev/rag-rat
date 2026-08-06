@@ -8,12 +8,12 @@
 use rag_rat_oplog::{
     AccessMode, AccountId, ContentIngestOutcome, DeviceRole, IngestOutcome, NodeAuthError,
     account_effective_count, account_entries_for_enrollment, account_entries_for_sync,
-    account_entry_ref, account_ingest, account_signed_entry_exists, account_signed_hash,
-    content_entries_for_public_sync, content_entries_for_sync, content_entry_ref, content_ingest,
-    content_signed_entry_exists, content_signed_hash, sign_local_node_binding, stream_access_mode,
-    stream_owner_account, verify_node_binding,
+    account_entry_ref, account_ingest, account_is_fully_public, account_signed_entry_exists,
+    account_signed_hash, content_entries_for_public_sync, content_entries_for_sync,
+    content_entry_ref, content_ingest, content_signed_entry_exists, content_signed_hash,
+    sign_local_node_binding, stream_access_mode, stream_owner_account, verify_node_binding,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::auth::{LocalAuth, NodeAuth, PeerAuthorization, PeerCapability};
 use crate::session::{Ingested, ServeScope, SyncStore};
@@ -124,7 +124,20 @@ impl SyncStore for OplogSyncStore<'_> {
         // subscriber needs to verify the content.
         let entries = match self.serve_scope {
             ServeScope::Full => account_entries_for_sync(self.conn, self.account_id)?,
-            ServeScope::PublicOnly => account_entries_for_enrollment(self.conn, self.account_id)?,
+            ServeScope::PublicOnly => {
+                // Fail-closed, co-located guard: never serve an account that holds ANY private
+                // stream to an anonymous reader, whatever selected the policy. Aborts the session
+                // (serves nothing) rather than leaking a private `StreamOwn`. Guard and serve read
+                // ONE deferred snapshot so a concurrent `StreamOwn` committed on another connection
+                // can never slip a private stream in between the check and the read (the resident
+                // host runs sessions on separate connections, so this is a real race).
+                let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Deferred)?;
+                anyhow::ensure!(
+                    account_is_fully_public(&tx, self.account_id)?,
+                    "refusing PublicOnly serve: account holds a non-public stream",
+                );
+                account_entries_for_enrollment(&tx, self.account_id)?
+            },
         };
         Ok(entries
             .into_iter()
@@ -224,7 +237,16 @@ impl SyncStore for OplogContentSyncStore<'_> {
         // not relay forged candidates to anonymous readers.
         let entries = match self.serve_scope {
             ServeScope::Full => content_entries_for_sync(self.conn, self.account_id)?,
-            ServeScope::PublicOnly => content_entries_for_public_sync(self.conn, self.account_id)?,
+            ServeScope::PublicOnly => {
+                // Same fail-closed guard as the account store, in one deferred snapshot so the
+                // check and the serve see identical state.
+                let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Deferred)?;
+                anyhow::ensure!(
+                    account_is_fully_public(&tx, self.account_id)?,
+                    "refusing PublicOnly serve: account holds a non-public stream",
+                );
+                content_entries_for_public_sync(&tx, self.account_id)?
+            },
         };
         Ok(entries
             .into_iter()

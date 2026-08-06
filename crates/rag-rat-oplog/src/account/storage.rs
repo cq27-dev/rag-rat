@@ -1055,6 +1055,49 @@ pub fn stream_access_mode(
     Ok(spec.access_mode)
 }
 
+/// Whether EVERY `StreamOwn` this account holds declares `PublicRead` — the fully-public gate for
+/// anonymous serving (#407 E2b). Scans RAW `StreamOwn` candidate rows in `account_entries`
+/// (effective AND non-effective/forked), NOT just effective ownership: the authenticated account
+/// serve ([`account_entries_for_enrollment`]) ships every candidate, so a single `Private` (or
+/// undecodable) `StreamOwn` anywhere means the account has private material and must never be
+/// served to an anonymous reader. FAIL-CLOSED: any decode anomaly returns `false`. Vacuously `true`
+/// for an account with no `StreamOwn`. A store serving [`crate::stream::AccessMode`]-scoped
+/// `PublicOnly` content gates on this so a mis-flagged account leaks nothing, independent of how
+/// its policy was selected.
+pub fn account_is_fully_public(conn: &Connection, account_id: AccountId) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT signed_bytes FROM account_entries
+         WHERE account_id = ?1 AND entry_type = ?2 AND log_id = ?3",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                account_id.to_bytes().as_slice(),
+                ops::entry_type::STREAM_OWN,
+                fold::CONTROL_LOG,
+            ],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for raw in rows {
+        let Ok(entry) = envelope::decode_account_signed(&raw) else {
+            return Ok(false);
+        };
+        let Ok(DecodedAccountOp::Known(AccountOp::StreamOwn { stream_spec_bytes, .. })) =
+            ops::decode(entry.header.entry_type, &entry.payload)
+        else {
+            return Ok(false);
+        };
+        let is_public = crate::stream::decode_spec_v2(&stream_spec_bytes)
+            .map(|spec| spec.access_mode == crate::stream::AccessMode::PublicRead)
+            .unwrap_or(false);
+        if !is_public {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Whether an account has folded to `contested` — a genuine owner-key-compromise / equivocation
 /// event (§12), which HALTS authority mutation. Content authorized by a contested account is
 /// fail-closed: parked (quota-bounded), never accepted, and reclassified if the account recovers.
@@ -4088,6 +4131,33 @@ mod tests {
         // unknown or not-yet-synced owner opens nothing at an admission caller.
         let unknown = StreamId::from_bytes([0x77; 32]);
         assert_eq!(stream_access_mode(&conn, account_id, unknown).unwrap(), AccessMode::Private);
+    }
+
+    #[test]
+    fn account_is_fully_public_gates_on_every_stream_own_being_public() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+        // No StreamOwn yet — vacuously fully public.
+        assert!(account_is_fully_public(&conn, account_id).unwrap());
+
+        // One public StreamOwn — still fully public.
+        let (_pub_stream, public_op) =
+            stream_own_mode(account_id, AccessMode::PublicRead, "repo-pub");
+        let (public_bytes, public_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &public_op);
+        account_ingest(&conn, &public_bytes, NOW + 1).unwrap();
+        assert!(account_is_fully_public(&conn, account_id).unwrap());
+
+        // Add a private StreamOwn — no longer fully public, so anonymous serving must be refused.
+        let (_priv_stream, private_op) =
+            stream_own_mode(account_id, AccessMode::Private, "repo-priv");
+        let (private_bytes, _) =
+            op(account_id, &founder, 2, Some(public_hash), Some(genesis_hash), &private_op);
+        account_ingest(&conn, &private_bytes, NOW + 2).unwrap();
+        assert!(!account_is_fully_public(&conn, account_id).unwrap());
     }
 
     fn device_remove(dev: &Dev, control_cut: super::super::cut::Cut) -> AccountOp {

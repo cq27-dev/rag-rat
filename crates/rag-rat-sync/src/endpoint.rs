@@ -33,14 +33,16 @@ use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 
 use crate::auth::{
-    AuthConfig, AuthPolicy, AuthRole, DEFAULT_PRE_AUTH_TIMEOUT, NodeAuth, Selected, run_auth_phase,
-    run_auth_phase_selected,
+    AuthConfig, AuthPolicy, AuthRole, DEFAULT_PRE_AUTH_TIMEOUT, NodeAuth, PeerAdmission, Selected,
+    run_auth_phase, run_auth_phase_selected,
 };
 use crate::enrollment::{
     ENROLL_ALPN, EnrollmentAcceptorOutcome, EnrollmentReceipt, EnrollmentRequest, InviteError,
     RESPONSE_ACK, RESPONSE_ACK_TIMEOUT, run_enrollment_acceptor, run_enrollment_dialer,
 };
-use crate::session::{DEFAULT_IDLE_TIMEOUT, SessionError, SessionReport, SyncStore, run_session};
+use crate::session::{
+    DEFAULT_IDLE_TIMEOUT, ServeScope, SessionError, SessionReport, SyncStore, run_session,
+};
 use crate::store::{OplogContentSyncStore, OplogSyncStore};
 use crate::table_session::{
     TableSessionError, TableSessionReport, TableSyncStore, run_table_session,
@@ -451,7 +453,7 @@ pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
             SyncFailure::Endpoint(EndpointError::Connect("opening a stream timed out".into()))
         })?
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
-    let capabilities = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
+    let (capabilities, _admission) = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
         role: AuthRole::Dialer,
         account_id: store.account_id(),
         local_node,
@@ -496,7 +498,7 @@ pub async fn connect_and_table_sync<S: TableSyncStore + NodeAuth>(
             ))
         })?
         .map_err(|error| SyncFailure::Endpoint(EndpointError::Connect(error.to_string())))?;
-    let capabilities = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
+    let (capabilities, _admission) = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
         role: AuthRole::Dialer,
         account_id: store.account_id(),
         local_node,
@@ -683,7 +685,7 @@ pub async fn accept_and_sync<S: SyncStore + NodeAuth>(
     let now_ms = now_ms();
     // Authorize the dialer BEFORE run_session so no inventory (not even account confirmation)
     // leaves this peer until the remote passes our policy (#881).
-    let capabilities = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
+    let (capabilities, _admission) = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
         role: AuthRole::Acceptor,
         account_id: store.account_id(),
         local_node,
@@ -822,6 +824,18 @@ pub async fn accept_connection_within_rate(
     Ok(Some(conn))
 }
 
+/// The serve scope an acceptor grants a peer (#407 E2b): narrow to [`ServeScope::PublicOnly`] iff a
+/// `PublicRead` account admitted this peer by FALLBACK — i.e. an anonymous reader with no verified
+/// binding. A verified member of a public account, and every `Open`/`Closed` session, serves the
+/// full account. Derived from the SELECTED per-ALPN policy (tables are pinned `Closed`, so they
+/// never reach public-only) and the auth admission outcome.
+fn serve_scope_for(policy: AuthPolicy, admission: PeerAdmission) -> ServeScope {
+    match (policy, admission) {
+        (AuthPolicy::PublicRead, PeerAdmission::Fallback) => ServeScope::PublicOnly,
+        _ => ServeScope::Full,
+    }
+}
+
 /// Run the ALPN-selected sync session for an already-accepted connection.
 pub async fn dispatch_connection<C>(
     conn: IrohConnection,
@@ -892,21 +906,29 @@ where
     }
     // Read the clock only now that a peer has connected (see `accept_and_sync`).
     let auth_now_ms = now_ms();
+    // Table streams are private account data. Open/bootstrap/public admission is only for the
+    // account + content paths; a table manifest is never revealed to an unverified peer.
+    let alpn_policy = if alpn.as_slice() == TABLE_SYNC_ALPN { AuthPolicy::Closed } else { policy };
     // The auth phase is store-agnostic (the binding is account-level), so authorize with the
     // account store BEFORE any inventory — no stream leaves this peer until it passes the policy.
-    let capabilities = run_auth_phase(&mut send, &mut recv, &*account_store, AuthConfig {
-        role: AuthRole::Acceptor,
-        account_id: account_store.account_id(),
-        local_node,
-        remote_node,
-        // Table streams are private account data. Open/bootstrap admission is only for restoring
-        // the account log; it can never reveal a table manifest.
-        policy: if alpn.as_slice() == TABLE_SYNC_ALPN { AuthPolicy::Closed } else { policy },
-        now_ms: auth_now_ms,
-        pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
-    })
-    .await
-    .map_err(SyncFailure::Auth)?;
+    let (capabilities, admission) =
+        run_auth_phase(&mut send, &mut recv, &*account_store, AuthConfig {
+            role: AuthRole::Acceptor,
+            account_id: account_store.account_id(),
+            local_node,
+            remote_node,
+            policy: alpn_policy,
+            now_ms: auth_now_ms,
+            pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+        })
+        .await
+        .map_err(SyncFailure::Auth)?;
+    // Narrow the serve to public-only for an anonymous (fallback-admitted) reader of a `PublicRead`
+    // account (#407); a verified member — or any Open/Closed session — serves the full account. Set
+    // on both stores; only the ALPN's store actually serves, and the store re-checks fully-public.
+    let scope = serve_scope_for(alpn_policy, admission);
+    account_store.set_serve_scope(scope);
+    content_store.set_serve_scope(scope);
     // Route the session to the store the negotiated ALPN names (validated above, so the final
     // `else` is the table stream, not an unknown-ALPN fallthrough).
     let report = if alpn.as_slice() == SYNC_ALPN {
@@ -1018,7 +1040,7 @@ pub async fn dispatch_connection_multi(
     // Authorize FIRST, selecting the account from the dialer's frame — no inventory (not even which
     // account is served) leaves the host until selection + the binding check pass. `account_id` and
     // `policy` in the config are placeholders the selection overrides.
-    let (selected_account, capabilities) = run_auth_phase_selected(
+    let (selected_account, capabilities, admission) = run_auth_phase_selected(
         &mut send,
         &mut recv,
         AuthConfig {
@@ -1049,6 +1071,13 @@ pub async fn dispatch_connection_multi(
         .iter_mut()
         .find(|account| account.sync.account_id() == selected_account)
         .expect("run_auth_phase_selected returns only an account the selector accepted");
+    // Narrow the serve to public-only for an anonymous reader of a `PublicRead` account (the
+    // selected account's policy under this ALPN — tables pinned `Closed`), same as the
+    // single-account dispatcher; the store re-checks fully-public before serving.
+    let alpn_policy = if table_alpn { AuthPolicy::Closed } else { account.policy };
+    let scope = serve_scope_for(alpn_policy, admission);
+    account.sync.set_serve_scope(scope);
+    account.content.set_serve_scope(scope);
     let report = if alpn.as_slice() == SYNC_ALPN {
         run_session(&mut account.sync, send, recv, AuthRole::Acceptor, capabilities)
             .await
@@ -1124,6 +1153,30 @@ mod tests {
     use crate::auth::{LocalAuth, PeerAuthorization, PeerCapability};
 
     const NOW: i64 = 1_700_000_000_000;
+
+    /// The serve scope narrows to `PublicOnly` for EXACTLY one case — an anonymous (fallback)
+    /// reader of a `PublicRead` account. A verified member of a public account, and every
+    /// `Open`/`Closed` session regardless of admission, serves `Full`.
+    #[test]
+    fn serve_scope_narrows_only_for_a_public_read_fallback_reader() {
+        assert_eq!(
+            serve_scope_for(AuthPolicy::PublicRead, PeerAdmission::Fallback),
+            ServeScope::PublicOnly,
+        );
+        assert_eq!(
+            serve_scope_for(AuthPolicy::PublicRead, PeerAdmission::Verified),
+            ServeScope::Full
+        );
+        for policy in [AuthPolicy::Open, AuthPolicy::Closed] {
+            for admission in [PeerAdmission::Verified, PeerAdmission::Fallback] {
+                assert_eq!(
+                    serve_scope_for(policy, admission),
+                    ServeScope::Full,
+                    "{policy:?}/{admission:?}"
+                );
+            }
+        }
+    }
 
     fn database() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1700,17 +1753,18 @@ mod tests {
         let local_node = *endpoint.id().as_bytes();
         let remote_node = *conn.remote_id().as_bytes();
         let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-        let capabilities = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
-            role: AuthRole::Acceptor,
-            account_id: store.account_id(),
-            local_node,
-            remote_node,
-            policy: AuthPolicy::Closed,
-            now_ms: NOW,
-            pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
-        })
-        .await
-        .unwrap();
+        let (capabilities, _admission) =
+            run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
+                role: AuthRole::Acceptor,
+                account_id: store.account_id(),
+                local_node,
+                remote_node,
+                policy: AuthPolicy::Closed,
+                now_ms: NOW,
+                pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+            })
+            .await
+            .unwrap();
         let report =
             run_table_session(store, send, recv, AuthRole::Acceptor, capabilities).await.unwrap();
         let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;

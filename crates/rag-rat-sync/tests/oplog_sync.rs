@@ -458,6 +458,104 @@ async fn the_public_only_serve_is_a_complete_verifiable_set_for_a_fresh_reader()
     );
 }
 
+/// The `PublicOnly` serve is FAIL-CLOSED, in the store: an account holding any private stream
+/// refuses to serve to an anonymous reader (both the account-log and content stores), whatever
+/// selected the scope — so a mis-flagged account leaks nothing.
+#[test]
+fn public_only_serve_refuses_an_account_with_a_private_stream() {
+    use rag_rat_oplog::ensure_owned_stream_v2_in_tx;
+    use rag_rat_sync::{OplogContentSyncStore, OplogSyncStore, ServeScope, SyncStore};
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    let db = fresh_db();
+    let account = local_account(&db, NOW).unwrap();
+    {
+        // `ensure_owned_stream_v2_in_tx` authors a PRIVATE `/2` stream — the account is not public.
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate).unwrap();
+        ensure_owned_stream_v2_in_tx(&tx, "repo-priv", NOW).unwrap();
+        tx.commit().unwrap();
+    }
+
+    let mut account_store = OplogSyncStore::new(&db, account, || NOW);
+    account_store.set_serve_scope(ServeScope::PublicOnly);
+    assert!(
+        account_store.snapshot().is_err(),
+        "the account-log PublicOnly serve refuses a private-stream account",
+    );
+    let content_store = {
+        let mut s = OplogContentSyncStore::new(&db, account, || NOW);
+        s.set_serve_scope(ServeScope::PublicOnly);
+        s
+    };
+    assert!(
+        content_store.snapshot().is_err(),
+        "the content PublicOnly serve refuses a private-stream account",
+    );
+}
+
+/// End to end over real iroh dispatch: an ANONYMOUS dialer (no roster binding) pulls a fully-public
+/// account under `AuthPolicy::PublicRead` — the account log then the content — and folds the
+/// content ACCEPTED, never having been a member. The dispatcher derives `PublicOnly` from the
+/// fallback admission and the store serves it.
+#[tokio::test]
+async fn an_anonymous_dialer_pulls_a_public_account_over_dispatch_and_accepts_it() {
+    use rag_rat_oplog::{ContentRefoldBudget, settle_pending_content_refolds};
+    use rag_rat_sync::{
+        AuthPolicy, CONTENT_SYNC_ALPN, OplogContentSyncStore, OplogSyncStore, SYNC_ALPN,
+        accept_and_dispatch, connect_and_sync,
+    };
+
+    // Owner: a fully-public account with a public stream + content. Subscriber: fresh, un-enrolled.
+    let (owner, owner_account, _log, _entry) = public_stream_content_from_another_account();
+    let subscriber = fresh_db();
+    let (owner_ep, sub_ep) = loopback_endpoints().await;
+    let policy = AuthPolicy::PublicRead;
+
+    // Account log FIRST — the owner's roster + public StreamOwn, served PublicOnly to the anonymous
+    // dialer (the dispatcher derives the scope from its fallback admission).
+    {
+        let mut owner_acc = OplogSyncStore::new(&owner, owner_account, || NOW);
+        let mut owner_cont = OplogContentSyncStore::new(&owner, owner_account, || NOW);
+        let mut sub_acc = OplogSyncStore::new(&subscriber, owner_account, || NOW);
+        let server =
+            accept_and_dispatch(&owner_ep, &mut owner_acc, &mut owner_cont, policy, || NOW);
+        let client =
+            connect_and_sync(&sub_ep, direct_addr(&owner_ep), SYNC_ALPN, &mut sub_acc, policy, NOW);
+        let (s, c) = tokio::join!(server, client);
+        assert_eq!(s.unwrap().0, SYNC_ALPN);
+        c.unwrap();
+    }
+    // Content next — accepted now that its authority is present on the subscriber.
+    {
+        let mut owner_acc = OplogSyncStore::new(&owner, owner_account, || NOW);
+        let mut owner_cont = OplogContentSyncStore::new(&owner, owner_account, || NOW);
+        let mut sub_cont = OplogContentSyncStore::new(&subscriber, owner_account, || NOW);
+        let server =
+            accept_and_dispatch(&owner_ep, &mut owner_acc, &mut owner_cont, policy, || NOW);
+        let client = connect_and_sync(
+            &sub_ep,
+            direct_addr(&owner_ep),
+            CONTENT_SYNC_ALPN,
+            &mut sub_cont,
+            policy,
+            NOW,
+        );
+        let (s, c) = tokio::join!(server, client);
+        assert_eq!(s.unwrap().0, CONTENT_SYNC_ALPN);
+        c.unwrap();
+    }
+
+    settle_pending_content_refolds(&subscriber, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+    let accepted: i64 = subscriber
+        .query_row(
+            "SELECT count(*) FROM content_entries WHERE author_account_id = ?1 AND accepted = 1",
+            [owner_account.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(accepted, 1, "an anonymous pull of a public account folds its content accepted");
+}
+
 /// Foreign content on a `public_read` stream IS admitted — and folds accepted — once the owner's
 /// account log is present locally. This is the acceptance half of anonymous pull (#407): the store
 /// no longer refuses foreign content whose stream the owner published public, and `content_ingest`

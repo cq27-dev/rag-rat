@@ -62,6 +62,13 @@ pub enum AuthPolicy {
     /// Admit only a peer whose binding verifies against this account's roster and the connection's
     /// authenticated remote node id. The default for a private account.
     Closed,
+    /// Admit any dialer exactly like [`AuthPolicy::Open`], but SERVE a fallback-admitted
+    /// (anonymous) reader only the account's authenticated PUBLIC material — the mode for a
+    /// public knowledge base (#407). Admission is identical to `Open`; the difference is the
+    /// serve scope the dispatcher derives from the admission outcome (a verified member still
+    /// gets the full account; an anonymous reader gets
+    /// [`crate::session::ServeScope::PublicOnly`]). Like `Open`, does NOT reach `/5` tables.
+    PublicRead,
 }
 
 /// Which end of the connection this peer is — determines the send/verify order above.
@@ -102,6 +109,19 @@ pub enum PeerAuthorization {
     Granted(PeerCapability),
     Rejected,
     Unavailable,
+}
+
+/// How a peer was admitted: whether its OWN binding verified against the account roster, or it was
+/// admitted only by policy fallback (the `Open`/`PublicRead` read-only bootstrap). A deliberately
+/// granted read-only MEMBER and an anonymous reader both hold [`PeerCapability::ReadOnly`], so
+/// capability alone cannot tell them apart — the serve scope for a public account depends on this
+/// distinction (a member gets the full account; only a fallback reader is narrowed to public-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAdmission {
+    /// The peer's binding verified against the roster — a member device.
+    Verified,
+    /// Admitted by policy without a verified binding (`Open`/`PublicRead` fallback).
+    Fallback,
 }
 
 /// The binding this side presents and its locally-derived data-phase capability.
@@ -219,7 +239,7 @@ pub async fn run_auth_phase<W, R, A>(
     recv: &mut R,
     auth: &A,
     cfg: AuthConfig,
-) -> Result<SessionCapabilities, AuthError>
+) -> Result<(SessionCapabilities, PeerAdmission), AuthError>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -230,23 +250,26 @@ where
         // degenerate one-account selector so the acceptor path is shared with multi-account
         // hosting.
         AuthRole::Acceptor => {
-            let (_account, caps) = run_auth_phase_selected(send, recv, cfg, |peer_account| {
-                (*peer_account == cfg.account_id).then_some(Selected {
-                    account_id: cfg.account_id,
-                    auth,
-                    policy: cfg.policy,
+            let (_account, caps, admission) =
+                run_auth_phase_selected(send, recv, cfg, |peer_account| {
+                    (*peer_account == cfg.account_id).then_some(Selected {
+                        account_id: cfg.account_id,
+                        auth,
+                        policy: cfg.policy,
+                    })
                 })
-            })
-            .await?;
-            Ok(caps)
+                .await?;
+            Ok((caps, admission))
         },
         // Dialer presents first (to the node it already authenticated, naming its own account),
-        // then verifies the acceptor before proceeding to the data phase.
+        // then verifies the acceptor before proceeding to the data phase. The returned admission
+        // describes how THIS side admitted the acceptor (unused for serve scope — only an acceptor
+        // serves — but returned for symmetry).
         AuthRole::Dialer => {
             let local = send_ours(send, auth, &cfg).await?;
-            let peer = verify_peer(recv, auth, &cfg).await?;
+            let (peer, admission) = verify_peer(recv, auth, &cfg).await?;
             let granted_by_peer = exchange_grants(send, recv, peer, cfg.pre_auth_timeout).await?;
-            Ok(SessionCapabilities::new(local.restricted_by(granted_by_peer), peer))
+            Ok((SessionCapabilities::new(local.restricted_by(granted_by_peer), peer), admission))
         },
     }
 }
@@ -267,7 +290,7 @@ pub async fn run_auth_phase_selected<'sel, W, R, F>(
     recv: &mut R,
     cfg: AuthConfig,
     select: F,
-) -> Result<([u8; 32], SessionCapabilities), AuthError>
+) -> Result<([u8; 32], SessionCapabilities, PeerAdmission), AuthError>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -277,7 +300,7 @@ where
     let Some(selected) = select(&peer_account) else {
         return Err(AuthError::Unauthorized);
     };
-    let peer = authorize_binding(
+    let (peer, admission) = authorize_binding(
         selected.auth,
         &binding,
         selected.policy,
@@ -291,7 +314,11 @@ where
         AuthConfig { account_id: selected.account_id, policy: selected.policy, ..cfg };
     let local = send_ours(send, selected.auth, &account_cfg).await?;
     let granted_by_peer = exchange_grants(send, recv, peer, cfg.pre_auth_timeout).await?;
-    Ok((selected.account_id, SessionCapabilities::new(local.restricted_by(granted_by_peer), peer)))
+    Ok((
+        selected.account_id,
+        SessionCapabilities::new(local.restricted_by(granted_by_peer), peer),
+        admission,
+    ))
 }
 
 async fn exchange_grants<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
@@ -387,21 +414,27 @@ fn authorize_binding(
     role: AuthRole,
     remote_node: &[u8; 32],
     now_ms: i64,
-) -> Result<PeerCapability, AuthError> {
+) -> Result<(PeerCapability, PeerAdmission), AuthError> {
     match policy {
-        // Open admission grants an unverified dialer READ, never WRITE. A fresh dialer cannot yet
-        // verify the selected server's roster binding, so it must permit that acceptor to serve the
-        // requested snapshot; ingest still verifies every entry from scratch.
-        AuthPolicy::Open => match auth.authorize(binding, remote_node, now_ms) {
-            Ok(PeerAuthorization::Granted(capability)) => Ok(capability),
-            Ok(PeerAuthorization::Unavailable) if role == AuthRole::Dialer =>
-                Ok(PeerCapability::ReadWrite),
-            Ok(PeerAuthorization::Rejected | PeerAuthorization::Unavailable) | Err(_) =>
-                Ok(PeerCapability::ReadOnly),
-        },
+        // Open (and PublicRead — identical admission) grant an unverified dialer READ, never WRITE.
+        // A fresh dialer cannot yet verify the selected server's roster binding, so it must
+        // permit that acceptor to serve the requested snapshot; ingest still verifies every
+        // entry from scratch. A verified binding is a member (`Verified`); anything
+        // admitted without one is `Fallback`, which is what narrows a public account's
+        // serve to public-only downstream.
+        AuthPolicy::Open | AuthPolicy::PublicRead =>
+            match auth.authorize(binding, remote_node, now_ms) {
+                Ok(PeerAuthorization::Granted(capability)) =>
+                    Ok((capability, PeerAdmission::Verified)),
+                Ok(PeerAuthorization::Unavailable) if role == AuthRole::Dialer =>
+                    Ok((PeerCapability::ReadWrite, PeerAdmission::Fallback)),
+                Ok(PeerAuthorization::Rejected | PeerAuthorization::Unavailable) | Err(_) =>
+                    Ok((PeerCapability::ReadOnly, PeerAdmission::Fallback)),
+            },
         AuthPolicy::Closed => {
             match auth.authorize(binding, remote_node, now_ms) {
-                Ok(PeerAuthorization::Granted(capability)) => Ok(capability),
+                Ok(PeerAuthorization::Granted(capability)) =>
+                    Ok((capability, PeerAdmission::Verified)),
                 Ok(PeerAuthorization::Rejected | PeerAuthorization::Unavailable) =>
                     Err(AuthError::Unauthorized),
                 // A real fault (DB read failed) is not the same as a rejected peer, but it still
@@ -416,7 +449,7 @@ async fn verify_peer<R: AsyncRead + Unpin>(
     recv: &mut R,
     auth: &dyn NodeAuth,
     cfg: &AuthConfig,
-) -> Result<PeerCapability, AuthError> {
+) -> Result<(PeerCapability, PeerAdmission), AuthError> {
     let (peer_account, binding) = read_peer_auth(recv, cfg.pre_auth_timeout).await?;
     // Account scope is enforced regardless of policy — even an Open endpoint must not proceed to
     // the data phase (whose Hello reveals the hosted account id + inventory) for a peer that
@@ -490,7 +523,10 @@ mod tests {
             now_ms: 1,
             pre_auth_timeout: timeout,
         });
-        tokio::join!(dialer_side, acceptor_side)
+        // Drop the admission outcome so the existing assertions keep comparing
+        // `SessionCapabilities` directly; the admission surface has its own test.
+        let (dialer, acceptor) = tokio::join!(dialer_side, acceptor_side);
+        (dialer.map(|(caps, _)| caps), acceptor.map(|(caps, _)| caps))
     }
 
     fn ok_auth() -> FakeAuth {
@@ -499,6 +535,45 @@ mod tests {
             local_capability: PeerCapability::ReadWrite,
             authorization: PeerAuthorization::Granted(PeerCapability::ReadWrite),
         }
+    }
+
+    /// The admission outcome distinguishes a verified member from an anonymous fallback reader —
+    /// the signal the public-serve scope derives from (#407 E2b). A granted binding is
+    /// `Verified` under EVERY policy; a rejected binding is admitted `Fallback` read-only under
+    /// `Open`/`PublicRead` and refused outright under `Closed`.
+    #[test]
+    fn admission_distinguishes_verified_from_fallback() {
+        let rejected = FakeAuth {
+            binding: Vec::new(),
+            local_capability: PeerCapability::ReadOnly,
+            authorization: PeerAuthorization::Rejected,
+        };
+        for policy in [AuthPolicy::Open, AuthPolicy::Closed, AuthPolicy::PublicRead] {
+            let (cap, admission) =
+                authorize_binding(&ok_auth(), &[1, 2, 3], policy, AuthRole::Acceptor, &D_NODE, 1)
+                    .unwrap();
+            assert_eq!(
+                admission,
+                PeerAdmission::Verified,
+                "a granted binding is a member ({policy:?})"
+            );
+            assert_eq!(cap, PeerCapability::ReadWrite);
+        }
+        for policy in [AuthPolicy::Open, AuthPolicy::PublicRead] {
+            let (cap, admission) =
+                authorize_binding(&rejected, &[], policy, AuthRole::Acceptor, &D_NODE, 1).unwrap();
+            assert_eq!(
+                admission,
+                PeerAdmission::Fallback,
+                "a rejected binding is fallback ({policy:?})"
+            );
+            assert_eq!(cap, PeerCapability::ReadOnly, "fallback admits read-only");
+        }
+        assert!(
+            authorize_binding(&rejected, &[], AuthPolicy::Closed, AuthRole::Acceptor, &D_NODE, 1)
+                .is_err(),
+            "Closed refuses a rejected binding outright",
+        );
     }
 
     #[tokio::test]
@@ -780,7 +855,10 @@ mod tests {
                     .map(|(id, auth, policy)| Selected { account_id: *id, auth, policy: *policy })
             },
         );
-        tokio::join!(dialer_side, acceptor_side)
+        // Drop the admission outcome to keep the existing assertions comparing
+        // capabilities/account.
+        let (dialer, acceptor) = tokio::join!(dialer_side, acceptor_side);
+        (dialer.map(|(caps, _)| caps), acceptor.map(|(account, caps, _)| (account, caps)))
     }
 
     #[tokio::test]
