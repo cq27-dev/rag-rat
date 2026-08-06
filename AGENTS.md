@@ -80,7 +80,8 @@ fails to help — so correcting or retiring a wrong record is the highest-value 
 
 **Terseness is a staleness strategy, not a style preference.** Every extra detail is one more thing a
 later change can falsify, and a record that contradicts the source on one line gets distrusted on all
-of them. State the rule and the reason, then stop.
+of them. State the rule and the reason, then stop. Aim under 900 characters; most memories land at
+300–600. Past that you are usually restating code the reader can go read.
 
 How to do it well:
 - **Anchor to the tightest stable target.** Prefer an `id` binding (the `sym_<hex>` logical-symbol
@@ -88,7 +89,11 @@ How to do it well:
   binding for file/area-level notes, or a commit/GitHub ref for historical rationale.
 - **Pick the right `kind`:** `Invariant` (must stay true), `Decision`/`RejectedAlternative` (why it's
   this way / why not the other), `Risk` / `BugPattern` (footguns), `PerformanceNote`, `PlatformQuirk`,
-  `FFIBoundary`. Write a concrete title, and a body with the *why* and *how to apply* — not just *what*.
+  `FFIBoundary`. The body carries the *why* and *how to apply* — not just *what*.
+- **The title states the rule, not the story.** `#407 E3a: …`, `C4.3b`, `V042 … (phase A5)` are
+  titles nobody can act on: they name the work, and the reader has to open the body to find out
+  whether it concerns them. Name the constraint or the trap instead, and leave an issue number as a
+  trailing pointer only when it earns its place. Max 160 characters.
 - **Write the present tense, not a changelog.** A memory says what is true NOW and what to do about
   it. "Fixed in #123", "used to fail open", "stage 2 landed the split" are unactionable: they cost
   the reader attention, go stale on the next change, and teach them to distrust the rest of the
@@ -122,8 +127,12 @@ the process that produced them:
 
 A reviewer should not be able to tell from a PR whether one agent or twenty produced it — only what
 changed and why. Durable, checkable references are encouraged: issue/PR numbers, commit SHAs, test
-names, file paths. (This is about *public* artifacts; rag-rat memories are the internal cross-agent
-layer and may record provenance freely.)
+names, file paths.
+
+Memories are held to the same bar for a different reason. A phase code, a round number, or a review
+play-by-play inside a memory is not a privacy problem — it is the narration that goes stale first
+and buries the rule underneath it. Durable, checkable references belong there too; the story does
+not.
 
 ## Repo orientation
 

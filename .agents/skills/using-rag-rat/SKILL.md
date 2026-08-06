@@ -109,7 +109,8 @@ for `memory_create` only when nothing does.
 
 **Terseness is a staleness strategy, not a style preference.** Every extra detail is one more thing a
 later change can falsify, and a record that contradicts the source on one line gets distrusted on all
-of them. State the rule and the reason, then stop.
+of them. State the rule and the reason, then stop. Aim under 900 characters; most memories land at
+300–600. Past that you are usually restating code the reader can go read.
 
 **Write the present tense, not a changelog.** A memory is read by someone about to change the code,
 so it must say **what is true now and what to do about it**. "This was fixed in #123", "the predicate
@@ -129,8 +130,12 @@ Do it well:
   commit/GitHub ref for historical rationale.
 - **Pick the right `kind`:** `Invariant` (must stay true), `Decision`/`RejectedAlternative` (why
   this / why not that), `Risk`/`BugPattern` (footguns), `PerformanceNote`, `PlatformQuirk`,
-  `FFIBoundary`. Write a concrete title and a body with the **why** + **how to apply** — not just the
-  what, and not what changed.
+  `FFIBoundary`. The body carries the **why** + **how to apply** — not just the what, and not what
+  changed.
+- **The title states the rule, not the story.** `#407 E3a: …`, `C4.3b`, `V042 … (phase A5)` are
+  titles nobody can act on: they name the work, so the reader must open the body to learn whether it
+  concerns them. Name the constraint or the trap instead, and leave an issue number as a trailing
+  pointer only when it earns its place. Max 160 characters.
 - **After a large refactor**, `memory_doctor` flags `gone` anchors and `memory_rebind` re-anchors
   them.
 
