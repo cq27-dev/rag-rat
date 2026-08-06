@@ -61,8 +61,8 @@ pub(super) use storage::{
 // and dedup received ones by signed-envelope hash. Consumed by the transport crate's content
 // SyncStore, so these are plain (un-frozen) re-exports.
 pub use storage::{
-    SyncContentEntry, content_entries_for_sync, content_entry_ref, content_signed_entry_exists,
-    content_signed_hash,
+    SyncContentEntry, content_entries_for_public_sync, content_entries_for_sync, content_entry_ref,
+    content_signed_entry_exists, content_signed_hash,
 };
 #[cfg(test)]
 pub(super) use storage::{pre_verify_content_sweeps, reset_pre_verify_content_sweeps};

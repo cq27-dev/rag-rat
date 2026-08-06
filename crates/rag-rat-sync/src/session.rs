@@ -52,12 +52,35 @@ fn bounded_inventory(hashes: impl Iterator<Item = Hash>) -> Vec<Hash> {
     hashes.take(MAX_HELLO_HASHES).collect()
 }
 
+/// How much of a store's data a session may SERVE to the connected peer (#407 E2b). Orthogonal to
+/// `PeerCapability`, which only governs whether the peer may PUSH — this governs what the acceptor
+/// OFFERS. Defaults to [`ServeScope::Full`] on a freshly constructed store; a dispatcher narrows it
+/// to [`ServeScope::PublicOnly`] AFTER auth, before the session reads the snapshot, for an
+/// anonymous (fallback-admitted) reader of a `public_read` account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServeScope {
+    /// The whole account: every held entry including unauthenticated parked candidates. Members,
+    /// `Open` restore, and `Closed` sessions.
+    #[default]
+    Full,
+    /// Only AUTHENTICATED, publicly-readable material — no parked/pre-verify candidates. The scope
+    /// an anonymous peer receives from a fully-public account.
+    PublicOnly,
+}
+
 /// The store side of a session: what a peer offers and where received entries land. Implemented
 /// over the op log for production and over an in-memory map for tests.
 pub trait SyncStore {
     /// The account this session is scoped to. A peer whose hello names a different account is a
     /// misdirected connection and the session aborts.
     fn account_id(&self) -> Hash;
+
+    /// Narrow (or restore) how much this store SERVES for the rest of the session — see
+    /// [`ServeScope`]. Called by the dispatcher after auth and before the snapshot is read. No
+    /// default: every impl must decide, so a new store can never silently serve `Full` to an
+    /// anonymous peer (fail-closed by construction). A store that only ever serves itself/members
+    /// may implement it as a no-op.
+    fn set_serve_scope(&mut self, scope: ServeScope);
 
     /// Every held account-log entry as `(dedup_key, signed_bytes)`, read ONCE at session start. The
     /// key is the SIGNED-envelope hash (`sha256(signed_bytes)`), NOT the entry_hash — two envelopes
@@ -389,6 +412,7 @@ mod tests {
         fn account_id(&self) -> Hash {
             self.account
         }
+        fn set_serve_scope(&mut self, _scope: ServeScope) {}
         fn snapshot(&self) -> anyhow::Result<Vec<(Hash, Vec<u8>)>> {
             let mut v: Vec<_> = self.entries.iter().map(|(h, b)| (*h, b.clone())).collect();
             v.sort_by_key(|(h, _)| *h);

@@ -1281,6 +1281,8 @@ mod tests {
             self.account
         }
 
+        fn set_serve_scope(&mut self, _scope: crate::session::ServeScope) {}
+
         fn snapshot(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
             self.snapshot_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.entries.iter().map(|(hash, bytes)| (*hash, bytes.clone())).collect())

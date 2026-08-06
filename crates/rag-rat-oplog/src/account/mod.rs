@@ -79,8 +79,8 @@ pub use content::{
 // The phase-D (#406) content sync read seams, consumed by the transport crate — plain
 // re-exports.
 pub use content::{
-    SyncContentEntry, content_entries_for_sync, content_entry_ref, content_signed_entry_exists,
-    content_signed_hash,
+    SyncContentEntry, content_entries_for_public_sync, content_entries_for_sync, content_entry_ref,
+    content_signed_entry_exists, content_signed_hash,
 };
 // The in-tx `/3` content-author seam + its genesis-detection reader (C3.4b-i, #663): #664
 // retargets the live memory path onto them, so they are plain re-exports.

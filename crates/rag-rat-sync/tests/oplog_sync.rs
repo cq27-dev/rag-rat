@@ -404,6 +404,60 @@ fn public_stream_content_from_another_account()
     (other, other_account, account_log, content)
 }
 
+/// The `PublicOnly` serve (#407 E2b) is a COMPLETE, verifiable set: an anonymous reader that folds
+/// only what the public serve offers — the `PublicOnly` account log + the `PublicOnly` content —
+/// accepts the content, with no other input. This is the fold-level guarantee E2a's slice could not
+/// yet make: it proves the served set is not merely shaped right but actually foldable to
+/// acceptance, because the whole control log (unfilterable — one hash-chain per device) is served
+/// intact.
+#[tokio::test]
+async fn the_public_only_serve_is_a_complete_verifiable_set_for_a_fresh_reader() {
+    use rag_rat_oplog::{ContentRefoldBudget, account_ingest, settle_pending_content_refolds};
+    use rag_rat_sync::{OplogContentSyncStore, OplogSyncStore, ServeScope, SyncStore};
+
+    // A fully-public account with a public stream + content.
+    let (other, other_account, _full_log, _one_entry) =
+        public_stream_content_from_another_account();
+
+    // Serve exactly what an anonymous reader receives: the PublicOnly account log + PublicOnly
+    // content, taken from the real stores under `ServeScope::PublicOnly`.
+    let mut account_serve = OplogSyncStore::new(&other, other_account, || NOW);
+    account_serve.set_serve_scope(ServeScope::PublicOnly);
+    let served_account: Vec<Vec<u8>> =
+        account_serve.snapshot().unwrap().into_iter().map(|(_, b)| b).collect();
+    let mut content_serve = OplogContentSyncStore::new(&other, other_account, || NOW);
+    content_serve.set_serve_scope(ServeScope::PublicOnly);
+    let served_content: Vec<Vec<u8>> =
+        content_serve.snapshot().unwrap().into_iter().map(|(_, b)| b).collect();
+    assert!(!served_content.is_empty(), "the public account has content to verify");
+
+    // A fresh subscriber folds ONLY the served sets and must accept the content.
+    let mine = fresh_db();
+    let my_account = local_account(&mine, NOW).unwrap();
+    assert_ne!(my_account.to_bytes(), other_account.to_bytes());
+    for bytes in &served_account {
+        account_ingest(&mine, bytes, NOW).unwrap();
+    }
+    let mut store = OplogContentSyncStore::new(&mine, my_account, || NOW);
+    for bytes in &served_content {
+        store.ingest(bytes).unwrap();
+    }
+    settle_pending_content_refolds(&mine, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+
+    let accepted: i64 = mine
+        .query_row(
+            "SELECT count(*) FROM content_entries WHERE author_account_id = ?1 AND accepted = 1",
+            [other_account.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        accepted as usize,
+        served_content.len(),
+        "the PublicOnly serve is a complete, foldable, acceptable set on its own",
+    );
+}
+
 /// Foreign content on a `public_read` stream IS admitted — and folds accepted — once the owner's
 /// account log is present locally. This is the acceptance half of anonymous pull (#407): the store
 /// no longer refuses foreign content whose stream the owner published public, and `content_ingest`

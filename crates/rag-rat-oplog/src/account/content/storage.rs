@@ -2250,6 +2250,45 @@ pub fn content_entries_for_sync(
     Ok(out)
 }
 
+/// The public-serve variant of [`content_entries_for_sync`] (#407): AUTHENTICATED `content_entries`
+/// rows only — the parked `content_pre_verify` candidates are EXCLUDED, because those are
+/// unauthenticated bytes from arbitrary peers and a public server must not relay forged candidates
+/// to anonymous readers. Still author-scoped (`author_account_id = account_id`): serving
+/// guest/foreign authors' content is a separate concern (an anonymous reader has no way to fetch a
+/// guest's account log to verify it). Only served for a fully-public account, so no per-stream
+/// `access_mode` filter is applied here — the caller gates on that.
+pub fn content_entries_for_public_sync(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<Vec<SyncContentEntry>> {
+    let mut held = conn.prepare(
+        "SELECT entry_hash, stream_id, seq, signed_bytes
+         FROM content_entries WHERE author_account_id = ?1
+         ORDER BY stream_id, seq, entry_hash",
+    )?;
+    let rows = held
+        .query_map(params![account_id.to_bytes().as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(hash, stream, seq, signed_bytes)| {
+            Ok(SyncContentEntry {
+                stream_id: StreamId::from_bytes(fixed::<32>(&stream)?),
+                author_account_id: account_id,
+                seq: u64::from_be_bytes(fixed::<8>(&seq)?),
+                entry_hash: fixed::<32>(&hash)?,
+                signed_bytes,
+            })
+        })
+        .collect()
+}
+
 fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
     bytes.try_into().map_err(|_| anyhow::anyhow!("expected {N} bytes, got {}", bytes.len()))
 }
@@ -2654,6 +2693,39 @@ mod tests {
             .find(|e| e.entry_hash == parked.entry_hash)
             .expect("the parked content entry is offered, not hidden");
         assert_eq!(row.signed_bytes, parked.signed_bytes, "the exact parked bytes are offered");
+    }
+
+    /// The public-serve variant (#407 E2b) offers the authenticated `content_entries` rows but NOT
+    /// the parked `content_pre_verify` candidates — a public server must never relay
+    /// unauthenticated, attacker-settable bytes to an anonymous reader.
+    #[test]
+    fn content_entries_for_public_sync_omits_parked_candidates() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[7; 32]);
+        let (account, roster) = signed_roster(&secret);
+        // A parked candidate: the roster is NOT ingested, so its key cannot resolve and it lands in
+        // content_pre_verify rather than content_entries.
+        let parked = content(&secret, account, roster.entry_hash, 0, None);
+        assert_eq!(
+            content_ingest(&conn, &parked.signed_bytes, 1).unwrap(),
+            ContentIngestOutcome::PreVerify,
+        );
+        // An authenticated held row, straight into content_entries.
+        seed_content_candidates(&conn, account, [9_u8; 32], 77, 1, 64);
+
+        let all = content_entries_for_sync(&conn, account).unwrap();
+        assert!(
+            all.iter().any(|e| e.entry_hash == parked.entry_hash),
+            "the whole-account serve includes the parked candidate",
+        );
+
+        let public = content_entries_for_public_sync(&conn, account).unwrap();
+        assert!(
+            !public.iter().any(|e| e.entry_hash == parked.entry_hash),
+            "the public serve omits the parked candidate",
+        );
+        assert_eq!(public.len(), 1, "only the one authenticated content_entries row is served");
+        assert_eq!(all.len(), public.len() + 1, "the parked candidate is the sole difference");
     }
 
     /// `content_signed_entry_exists` is signed-envelope precise, not entry_hash precise, and

@@ -7,15 +7,16 @@
 
 use rag_rat_oplog::{
     AccessMode, AccountId, ContentIngestOutcome, DeviceRole, IngestOutcome, NodeAuthError,
-    account_effective_count, account_entries_for_sync, account_entry_ref, account_ingest,
-    account_signed_entry_exists, account_signed_hash, content_entries_for_sync, content_entry_ref,
-    content_ingest, content_signed_entry_exists, content_signed_hash, sign_local_node_binding,
-    stream_access_mode, stream_owner_account, verify_node_binding,
+    account_effective_count, account_entries_for_enrollment, account_entries_for_sync,
+    account_entry_ref, account_ingest, account_signed_entry_exists, account_signed_hash,
+    content_entries_for_public_sync, content_entries_for_sync, content_entry_ref, content_ingest,
+    content_signed_entry_exists, content_signed_hash, sign_local_node_binding, stream_access_mode,
+    stream_owner_account, verify_node_binding,
 };
 use rusqlite::Connection;
 
 use crate::auth::{LocalAuth, NodeAuth, PeerAuthorization, PeerCapability};
-use crate::session::{Ingested, SyncStore};
+use crate::session::{Ingested, ServeScope, SyncStore};
 use crate::table_session::{ChainEntry, ChainStart, TableSyncStore};
 use crate::table_wire::{ChainHead, FrontierState, ManifestItem};
 
@@ -87,11 +88,14 @@ pub struct OplogSyncStore<'a> {
     /// long-idle acceptor stamps `received_at_ms` (and drives pre-verify eviction ordering) with
     /// the receipt time, not a stale construction time.
     now_fn: fn() -> i64,
+    /// How much of the account log this session serves (#407 E2b). `Full` by default; a dispatcher
+    /// narrows it to `PublicOnly` post-auth for an anonymous reader of a public account.
+    serve_scope: ServeScope,
 }
 
 impl<'a> OplogSyncStore<'a> {
     pub fn new(conn: &'a Connection, account_id: AccountId, now_fn: fn() -> i64) -> Self {
-        Self { conn, account_id, now_fn }
+        Self { conn, account_id, now_fn, serve_scope: ServeScope::Full }
     }
 
     pub(crate) fn connection(&self) -> &'a Connection {
@@ -104,11 +108,25 @@ impl SyncStore for OplogSyncStore<'_> {
         self.account_id.to_bytes()
     }
 
+    fn set_serve_scope(&mut self, scope: ServeScope) {
+        self.serve_scope = scope;
+    }
+
     fn snapshot(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
         // Key by the SIGNED-envelope hash, not `entry_hash`: two envelopes can share an entry_hash
         // but differ in signature (pre-verify keeps competing signatures for exactly this reason),
         // and diffing by entry_hash would let a peer holding the valid signature suppress it.
-        Ok(account_entries_for_sync(self.conn, self.account_id)?
+        //
+        // `PublicOnly` serves the AUTHENTICATED account log only (`account_entries_for_enrollment`,
+        // which omits the unauthenticated parked `account_pre_verify` rows) — a public server must
+        // not relay forged candidates to anonymous readers. For a fully-public account (the only
+        // account served `PublicOnly`) this is the whole control + secrets log, exactly what a
+        // subscriber needs to verify the content.
+        let entries = match self.serve_scope {
+            ServeScope::Full => account_entries_for_sync(self.conn, self.account_id)?,
+            ServeScope::PublicOnly => account_entries_for_enrollment(self.conn, self.account_id)?,
+        };
+        Ok(entries
             .into_iter()
             .map(|e| (account_signed_hash(&e.signed_bytes), e.signed_bytes))
             .collect())
@@ -176,11 +194,13 @@ pub struct OplogContentSyncStore<'a> {
     /// A CLOCK read at ingest time (see [`OplogSyncStore::now_fn`]), not a captured instant, so a
     /// long-idle acceptor stamps received content with its receipt time.
     now_fn: fn() -> i64,
+    /// How much content this session serves (#407 E2b) — see [`OplogSyncStore`]'s field.
+    serve_scope: ServeScope,
 }
 
 impl<'a> OplogContentSyncStore<'a> {
     pub fn new(conn: &'a Connection, account_id: AccountId, now_fn: fn() -> i64) -> Self {
-        Self { conn, account_id, now_fn }
+        Self { conn, account_id, now_fn, serve_scope: ServeScope::Full }
     }
 }
 
@@ -189,12 +209,24 @@ impl SyncStore for OplogContentSyncStore<'_> {
         self.account_id.to_bytes()
     }
 
+    fn set_serve_scope(&mut self, scope: ServeScope) {
+        self.serve_scope = scope;
+    }
+
     fn snapshot(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
         // Key by the SIGNED-envelope hash, not `entry_hash`: two content envelopes can share an
         // entry_hash but differ in signature (content_pre_verify keeps competing signatures for
         // exactly this reason), and diffing by entry_hash would let a peer holding the valid
         // signature suppress it against one holding only an invalid variant.
-        Ok(content_entries_for_sync(self.conn, self.account_id)?
+        //
+        // `PublicOnly` serves only AUTHENTICATED content (`content_entries_for_public_sync`, which
+        // omits the unauthenticated parked `content_pre_verify` candidates) — a public server must
+        // not relay forged candidates to anonymous readers.
+        let entries = match self.serve_scope {
+            ServeScope::Full => content_entries_for_sync(self.conn, self.account_id)?,
+            ServeScope::PublicOnly => content_entries_for_public_sync(self.conn, self.account_id)?,
+        };
+        Ok(entries
             .into_iter()
             .map(|e| (content_signed_hash(&e.signed_bytes), e.signed_bytes))
             .collect())
