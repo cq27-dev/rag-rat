@@ -48,17 +48,39 @@ server is read-only on source — it never edits files; it writes only its own S
 
 ## Record durable learnings as rag-rat memories
 
-**This is required, not optional.** When you discover something durable and non-obvious — a
-load-bearing invariant, a decision + its rationale, a risk/footgun that cost you time, a perf
-characteristic, a "do not do X because Y" — record it with `memory_create` **before you finish the
-task**. If you had to read three files and reason for ten minutes to learn it, the next agent should
-get it in one MCP call. Don't let hard-won context evaporate.
+**Running the gate is required, not optional — producing a record is not.** Before you finish a
+task, ask: **could the next agent recover this by reading the repo?** If yes, don't record it. A
+memory that restates the code, the types, the tests, or the history leaves the reader *worse off*
+than none at all — it costs attention and returns nothing. On most tasks the honest answer is
+**record nothing**, and that is the common outcome, not a failure to try hard enough. What passes
+the gate is what you had to read three files and reason for ten minutes to learn, and that the repo
+states nowhere — don't let that evaporate.
+
+**Rejected alternatives lead.** The approach *not* taken leaves no artifact anywhere — not in the
+diff, not in the types, not in the history — which makes it at once the most-asked question about
+unfamiliar code and the least-supplied answer. If your work settled a choice, record the alternative
+and why it lost (`RejectedAlternative`) before anything about what the code now does.
 
 **Why rag-rat and not your own notes:** rag-rat memories live in this repo's shared index, so they
 surface for **every** agent that uses the rag-rat MCP — Claude Code, Codex, and any future tool —
 not just the one that wrote them. An agent's private/session memory (e.g. Claude Code's file memory,
 Codex's own store) is invisible to the others. rag-rat is the **cross-agent memory layer**; put
 anything another agent would benefit from here.
+
+**Translate; never store the trajectory.** What you did, in what order, is worth less than nothing
+to the next reader — a replayed trace scores worse than having no memory at all. Distill it to a
+situation and an action — *when X, do Y, because Z* — and quote the evidence you generalised from
+(the failing line, the error, the constraint). Situated questions are not answered by general
+advice, and the quote is what spares the reader from trusting a summary of a summary.
+
+**Revise before you create.** A memory that has drifted actively misleads, while a missing one merely
+fails to help — so correcting or retiring a wrong record is the highest-value write available.
+`memory_search` first: if something already covers the ground, `memory_update` it; reach for
+`memory_create` only when nothing does, and `memory_mark_obsolete` when nothing actionable survives.
+
+**Terseness is a staleness strategy, not a style preference.** Every extra detail is one more thing a
+later change can falsify, and a record that contradicts the source on one line gets distrusted on all
+of them. State the rule and the reason, then stop.
 
 How to do it well:
 - **Anchor to the tightest stable target.** Prefer an `id` binding (the `sym_<hex>` logical-symbol
@@ -71,10 +93,8 @@ How to do it well:
   it. "Fixed in #123", "used to fail open", "stage 2 landed the split" are unactionable: they cost
   the reader attention, go stale on the next change, and teach them to distrust the rest of the
   entry. When updating a memory whose warning no longer applies, rewrite the body to state the rule
-  that now holds — do not append a status section — and `memory_mark_obsolete` it if nothing
-  actionable survives. An issue or test *name* is a fine pointer; the story is not.
-- **`memory_search` first** to avoid duplicates; **`memory_update` / `memory_mark_obsolete`** when a
-  memory is wrong or superseded (don't leave stale guidance).
+  that now holds — do not append a status section. An issue or test *name* is a fine pointer; the
+  story is not.
 - **After large refactors**, run `rag-rat memory doctor` and re-anchor anything it flags `gone`
   (`rag-rat memory rebind <id> --symbol <name>`); content-confirmed moves re-anchor automatically.
 - This works the same from any agent: Claude Code calls the MCP `memory_create` tool; the `rag-rat`
