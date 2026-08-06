@@ -114,10 +114,25 @@ pub fn ensure_owned_stream_v2_with_mode_in_tx(
 /// resolver: a `None` means "no principal to author under yet", so the caller SKIPS authoring
 /// rather than forcing a mint — the exact analog of an unstable scope.
 pub fn owned_stream_v2_id(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<StreamId>> {
+    owned_stream_v2_id_with_mode(conn, repo_id, stream::AccessMode::Private)
+}
+
+/// [`owned_stream_v2_id`] for a chosen [`AccessMode`]. A `PublicRead` `/2` stream has a DISTINCT id
+/// from the `Private` one (the mode folds into `stream_id`), so a caller publishing a public
+/// knowledge base MUST resolve, author, drain, reconcile, and catch-up with the SAME mode or the
+/// live-write and mirror paths target different streams. The authoring mode is the caller's
+/// persisted intent, not derivable from an empty account — hence a parameter, not an op-log read.
+pub fn owned_stream_v2_id_with_mode(
+    conn: &Connection,
+    repo_id: &str,
+    access_mode: stream::AccessMode,
+) -> anyhow::Result<Option<StreamId>> {
     let Some(LocalAccountRef { account_id, .. }) = bootstrap::local_account_ref(conn)? else {
         return Ok(None);
     };
-    Ok(Some(stream::derive_v2(&stream::owner_stream_v2(repo_id, account_id))?))
+    let mut spec = stream::owner_stream_v2(repo_id, account_id);
+    spec.access_mode = access_mode;
+    Ok(Some(stream::derive_v2(&spec)?))
 }
 
 /// The repo's `/2` owner stream, but ONLY once it is fully ESTABLISHED: the local account is minted
@@ -132,10 +147,22 @@ pub fn established_owned_stream_v2(
     conn: &Connection,
     repo_id: &str,
 ) -> anyhow::Result<Option<StreamId>> {
+    established_owned_stream_v2_with_mode(conn, repo_id, stream::AccessMode::Private)
+}
+
+/// [`established_owned_stream_v2`] for a chosen [`AccessMode`] — see
+/// [`owned_stream_v2_id_with_mode`] on why the mode is a parameter.
+pub fn established_owned_stream_v2_with_mode(
+    conn: &Connection,
+    repo_id: &str,
+    access_mode: stream::AccessMode,
+) -> anyhow::Result<Option<StreamId>> {
     let Some(LocalAccountRef { account_id, .. }) = bootstrap::local_account_ref(conn)? else {
         return Ok(None);
     };
-    let stream_id = stream::derive_v2(&stream::owner_stream_v2(repo_id, account_id))?;
+    let mut spec = stream::owner_stream_v2(repo_id, account_id);
+    spec.access_mode = access_mode;
+    let stream_id = stream::derive_v2(&spec)?;
     match storage::stream_owner_effective(conn, account_id, stream_id)? {
         AuthorityQuery::Effective(_) => Ok(Some(stream_id)),
         AuthorityQuery::Unknown | AuthorityQuery::Invalid(_) => Ok(None),

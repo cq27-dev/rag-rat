@@ -249,6 +249,13 @@ pub(crate) struct SyncArgs {
 pub(crate) enum SyncCommand {
     /// Permanently enable sealed authoring for subsequent local memory changes.
     Enable,
+    /// Permanently publish this repo's account as a public knowledge base (anonymous read-only).
+    #[command(long_about = "Marks this repo's account as public in its entirety: subsequent \
+                            memory authoring uses a public_read stream and the account becomes \
+                            servable to anonymous readers. One-way and refuses if the account \
+                            already holds any private memories or authors sealed — publish a \
+                            fresh, dedicated public index, not an existing private repo.")]
+    Publish,
     /// Re-wrap existing live keys to an effective device without rotating them.
     #[command(long_about = "The target device must already be enrolled and effective. Re-wraps \
                             existing live keys without rotating them; this does not enroll the \

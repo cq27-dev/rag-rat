@@ -46,7 +46,8 @@ mod storage;
 pub use authoring::{
     EnrollingDevice, author_device_add_in_tx, author_enrollment_device_add_in_tx,
     enrollment_authoring_fits, enrollment_authoring_requirements, ensure_owned_stream_v2_in_tx,
-    ensure_owned_stream_v2_with_mode_in_tx, established_owned_stream_v2, owned_stream_v2_id,
+    ensure_owned_stream_v2_with_mode_in_tx, established_owned_stream_v2,
+    established_owned_stream_v2_with_mode, owned_stream_v2_id, owned_stream_v2_id_with_mode,
     retry_enrollment_pre_verify, validate_device_add_label,
 };
 pub use bootstrap::{

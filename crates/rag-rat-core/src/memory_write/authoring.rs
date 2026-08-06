@@ -87,6 +87,46 @@ struct MemoryRow {
     tags: Vec<String>,
 }
 
+/// The repo's memory-authoring ACCESS MODE — the one-way publish INTENT, persisted in repo meta.
+/// This is the AUTHORING-side seed: the live-write sites are conn-only and the first memory write
+/// mints the account + authors a `/2` StreamOwn, so the mode a `PublicRead` node must author under
+/// cannot come from `Config` (unreachable at those sites) nor be derived from an empty op-log — it
+/// is read from here. The op-log's StreamOwn set stays the SERVE-side truth
+/// (`account_is_fully_public`).
+const STREAM_ACCESS_MODE_META_KEY: &str = "memory_stream_access_mode";
+
+/// The persisted access-mode intent for `repo_id`: `public` → `PublicRead`; absent → `Private` (the
+/// default); any other token refuses to author (a malformed one-way ratchet must not silently
+/// downgrade to a public or private write).
+pub(crate) fn owner_stream_access_mode(
+    conn: &Connection,
+    repo_id: &str,
+) -> anyhow::Result<rag_rat_oplog::AccessMode> {
+    match rag_rat_db::meta::repo_meta(conn, repo_id, STREAM_ACCESS_MODE_META_KEY)?.as_deref() {
+        Some("public") => return Ok(rag_rat_oplog::AccessMode::PublicRead),
+        Some(other) => anyhow::bail!(
+            "repo `{repo_id}` has unknown memory stream access mode `{other}`; refusing to author"
+        ),
+        None => {},
+    }
+    // Derived one-way ratchet (mirrors the seal policy's `content_stream_has_sealed_ratchet`): if
+    // the account ALREADY owns this repo's `PublicRead` `/2` stream, stay public even when the
+    // intent row is absent (deleted / a meta bug). Otherwise a write would resolve `Private`,
+    // find the (distinct) Private-mode stream unowned, and author a SECOND `Private` StreamOwn
+    // — permanently mixing the account (unservable forever; the control log is append-only).
+    // Uses only plain reads (no nested transaction), so it is safe at every caller, including
+    // those inside an open txn.
+    if let Some(public_id) = rag_rat_oplog::owned_stream_v2_id_with_mode(
+        conn,
+        repo_id,
+        rag_rat_oplog::AccessMode::PublicRead,
+    )? && rag_rat_oplog::stream_owner_account(conn, public_id)?.is_some()
+    {
+        return Ok(rag_rat_oplog::AccessMode::PublicRead);
+    }
+    Ok(rag_rat_oplog::AccessMode::Private)
+}
+
 const STREAM_SEAL_POLICY_META_KEY: &str = "memory_stream_seal_policy";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,12 +551,17 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
 }
 
 fn ensure_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::Result<StreamId> {
-    if let Some(stream) = rag_rat_oplog::established_owned_stream_v2(conn, repo_id)? {
+    // Resolve the /2 stream under the repo's persisted access-mode intent, so live-write, drain,
+    // reconcile, and catch-up all target the SAME stream id (a `PublicRead` stream has a distinct
+    // id from the `Private` one). Absent intent = Private, today's behavior.
+    let mode = owner_stream_access_mode(conn, repo_id)?;
+    if let Some(stream) = rag_rat_oplog::established_owned_stream_v2_with_mode(conn, repo_id, mode)?
+    {
         return Ok(stream);
     }
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let stream = rag_rat_oplog::ensure_owned_stream_v2_in_tx(&tx, repo_id, now_ms)?;
+    let stream = rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(&tx, repo_id, mode, now_ms)?;
     tx.commit()?;
     Ok(stream)
 }
@@ -579,6 +624,14 @@ pub(crate) fn enable_sealed_authoring(conn: &Connection, now_ms: i64) -> anyhow:
     {
         anyhow::bail!("sync enable requires a stable repo identity (not legacy or local-only)");
     }
+    // Publish and sealing are mutually-exclusive one-way intents (a public reader cannot unwrap
+    // sealed bytes); the reverse guard lives in `enable_public_authoring`.
+    if owner_stream_access_mode(conn, &repo_id)? == rag_rat_oplog::AccessMode::PublicRead {
+        anyhow::bail!(
+            "repo `{repo_id}` is a published public knowledge base; sealing is incompatible with \
+             public authoring"
+        );
+    }
     rag_rat_oplog::local_account(conn, now_ms)?;
     let stream = ensure_owner_stream(conn, &repo_id, now_ms)?;
     let was_enabled =
@@ -632,6 +685,54 @@ pub(crate) fn enable_sealed_authoring(conn: &Connection, now_ms: i64) -> anyhow:
     Ok(!was_enabled)
 }
 
+/// Mark the active repo's account as a PUBLIC knowledge base: persist the one-way `public`
+/// access-mode intent and ensure its `PublicRead` `/2` owner stream. Thereafter every conn-only
+/// writer authors public (via [`owner_stream_access_mode`]), and serving selects
+/// `AuthPolicy::PublicRead`. Returns whether this call newly enabled it (idempotent). Refuses —
+/// rather than brick the account — when: the repo id is legacy/local-only; sealing is intended
+/// (publish and sealing are mutually-exclusive one-way intents; a public reader could never unwrap
+/// sealed bytes); or the account already holds any private stream (`account_is_fully_public`
+/// false), since a mixed account can never be served public and the private StreamOwn can never be
+/// un-authored — publishing an existing private repo is not supported (start a fresh public index).
+pub(crate) fn enable_public_authoring(conn: &Connection, now_ms: i64) -> anyhow::Result<bool> {
+    let repo_id = memory_repo_scope(conn)?.context("sync publish requires an active repo scope")?;
+    if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
+        || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
+    {
+        anyhow::bail!("sync publish requires a stable repo identity (not legacy or local-only)");
+    }
+    if explicit_stream_seal_policy(conn, &repo_id)? == Some(StreamSealPolicy::Sealed) {
+        anyhow::bail!(
+            "repo `{repo_id}` authors sealed memories; publishing requires plaintext (a public \
+             reader cannot unwrap sealed content)"
+        );
+    }
+    let account = rag_rat_oplog::local_account(conn, now_ms)?;
+    anyhow::ensure!(
+        rag_rat_oplog::account_is_fully_public(conn, account)?,
+        "repo `{repo_id}`'s account already owns a private stream; a public knowledge base must \
+         be a fresh index (publishing an existing private repo is not supported)"
+    );
+    let was_enabled =
+        owner_stream_access_mode(conn, &repo_id)? == rag_rat_oplog::AccessMode::PublicRead;
+
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Persist intent FIRST so the ensure below (and every later writer) resolves the PublicRead
+    // stream; the one-way ratchet holds even if external tooling deletes the intent row, because
+    // the op-log's PublicRead StreamOwn then makes `account_is_fully_public` true and
+    // re-authoring private is refused by this guard.
+    rag_rat_db::meta::set_repo_meta(&tx, &repo_id, STREAM_ACCESS_MODE_META_KEY, "public")?;
+    rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(
+        &tx,
+        &repo_id,
+        rag_rat_oplog::AccessMode::PublicRead,
+        now_ms,
+    )?;
+    tx.commit()?;
+    Ok(!was_enabled)
+}
+
 pub(crate) fn catch_up_enrolled_device_keys(
     conn: &Connection,
     target: rag_rat_oplog::DeviceFingerprint,
@@ -644,8 +745,9 @@ pub(crate) fn catch_up_enrolled_device_keys(
     {
         anyhow::bail!("sync catch-up requires a stable repo identity (not legacy or local-only)");
     }
-    let stream =
-        rag_rat_oplog::established_owned_stream_v2(conn, &repo_id)?.with_context(|| {
+    let mode = owner_stream_access_mode(conn, &repo_id)?;
+    let stream = rag_rat_oplog::established_owned_stream_v2_with_mode(conn, &repo_id, mode)?
+        .with_context(|| {
             format!(
                 "sync catch-up requires an established owner stream for active repo `{repo_id}`"
             )
@@ -658,7 +760,7 @@ pub(crate) fn catch_up_enrolled_device_keys(
         "active repo scope changed while starting sync catch-up; retry"
     );
     anyhow::ensure!(
-        rag_rat_oplog::owned_stream_v2_id(&tx, &repo_id)? == Some(stream),
+        rag_rat_oplog::owned_stream_v2_id_with_mode(&tx, &repo_id, mode)? == Some(stream),
         "active repo owner stream changed while starting sync catch-up; retry"
     );
     let report =
@@ -715,7 +817,8 @@ fn stable_owner_stream_for_repo(
     {
         return Ok(None);
     }
-    rag_rat_oplog::owned_stream_v2_id(conn, repo_id)
+    let mode = owner_stream_access_mode(conn, repo_id)?;
+    rag_rat_oplog::owned_stream_v2_id_with_mode(conn, repo_id, mode)
 }
 
 /// Reject a live content op whose ASSEMBLED signed `/3` envelope would exceed the §18a 256 KiB cap
@@ -1714,6 +1817,96 @@ mod tests {
         .unwrap();
         crate::memory_write::remove_edge(&conn, &edge.edge_key).unwrap();
         assert!(content_suites(&conn).into_iter().all(|suite| suite == 1));
+    }
+
+    #[test]
+    fn publish_is_idempotent_makes_the_account_public_and_authors_public() {
+        let conn = scoped_conn();
+        assert!(enable_public_authoring(&conn, 1_000).unwrap());
+        assert!(!enable_public_authoring(&conn, 2_000).unwrap());
+        assert_eq!(
+            rag_rat_db::meta::repo_meta(&conn, REPO, STREAM_ACCESS_MODE_META_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("public")
+        );
+        let account = rag_rat_oplog::local_account(&conn, 1_000).unwrap();
+        assert!(rag_rat_oplog::account_is_fully_public(&conn, account).unwrap());
+
+        // Live-write, drain, and reconcile all resolve the SAME public stream id — distinct from
+        // the Private-mode id, so nothing desyncs.
+        let public_id = rag_rat_oplog::owned_stream_v2_id_with_mode(
+            &conn,
+            REPO,
+            rag_rat_oplog::AccessMode::PublicRead,
+        )
+        .unwrap()
+        .unwrap();
+        let private_id = rag_rat_oplog::owned_stream_v2_id_with_mode(
+            &conn,
+            REPO,
+            rag_rat_oplog::AccessMode::Private,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(public_id, private_id, "the public stream has a distinct identity");
+        assert_eq!(stable_owner_stream_for_repo(&conn, REPO).unwrap(), Some(public_id));
+
+        // A created memory authors onto the public stream and the account stays fully public.
+        let m = create_concept(&conn, "public one").unwrap().memory.memory_id;
+        assert!(is_projected(&conn, &m));
+        assert!(rag_rat_oplog::account_is_fully_public(&conn, account).unwrap());
+    }
+
+    #[test]
+    fn publish_refuses_an_account_that_already_has_private_memories() {
+        let conn = scoped_conn();
+        // Authors a Private `/2` StreamOwn — the account can never become fully public thereafter.
+        create_concept(&conn, "private history").unwrap();
+        let err = enable_public_authoring(&conn, 2_000).unwrap_err().to_string();
+        assert!(err.contains("private stream") || err.contains("fresh index"), "got: {err}");
+    }
+
+    #[test]
+    fn publish_and_seal_are_mutually_exclusive_both_directions() {
+        let sealed_first = scoped_conn();
+        enable_sealed_authoring(&sealed_first, 1_000).unwrap();
+        assert!(
+            enable_public_authoring(&sealed_first, 2_000).is_err(),
+            "a sealed repo cannot be published"
+        );
+
+        let public_first = scoped_conn();
+        enable_public_authoring(&public_first, 1_000).unwrap();
+        assert!(
+            enable_sealed_authoring(&public_first, 2_000).is_err(),
+            "a published repo cannot be sealed"
+        );
+    }
+
+    #[test]
+    fn publish_access_mode_ratchet_survives_a_deleted_intent_row() {
+        let conn = scoped_conn();
+        enable_public_authoring(&conn, 1_000).unwrap();
+        let account = rag_rat_oplog::local_account(&conn, 1_000).unwrap();
+        // Simulate intent-row loss (external tooling / a meta bug): the op-log's PublicRead
+        // StreamOwn must keep the mode public, or the next write authors a second (Private)
+        // StreamOwn and permanently mixes the account.
+        conn.execute("DELETE FROM repo_meta WHERE repo_id = ?1 AND key = ?2", rusqlite::params![
+            REPO,
+            STREAM_ACCESS_MODE_META_KEY
+        ])
+        .unwrap();
+        assert_eq!(
+            owner_stream_access_mode(&conn, REPO).unwrap(),
+            rag_rat_oplog::AccessMode::PublicRead,
+            "the derived op-log fact keeps the ratchet public after intent-row loss"
+        );
+        create_concept(&conn, "after intent loss").unwrap();
+        assert!(
+            rag_rat_oplog::account_is_fully_public(&conn, account).unwrap(),
+            "a lost intent row must not let a Private StreamOwn mix the published account"
+        );
     }
 
     #[test]

@@ -102,9 +102,13 @@ pub(crate) fn drain_synced_stream_for_repo(
     {
         return Ok(DrainOutcome::default());
     }
-    // Forward-derive the owner stream. `None` = no local account minted yet ⇒ nothing could have
-    // been authored/ingested onto this stream ⇒ nothing to drain (the analog of an unstable scope).
-    let Some(stream) = rag_rat_oplog::owned_stream_v2_id(conn, repo_id)? else {
+    // Forward-derive the owner stream under the repo's access-mode intent — the SAME stream id the
+    // live-write authored onto, so a published (PublicRead) repo drains its own public stream
+    // rather than an empty Private one. `None` = no local account minted yet ⇒ nothing could
+    // have been authored/ingested onto this stream ⇒ nothing to drain (the analog of an
+    // unstable scope).
+    let mode = super::authoring::owner_stream_access_mode(conn, repo_id)?;
+    let Some(stream) = rag_rat_oplog::owned_stream_v2_id_with_mode(conn, repo_id, mode)? else {
         return Ok(DrainOutcome::default());
     };
 

@@ -21,6 +21,18 @@ impl IndexDatabase {
         )
     }
 
+    /// Mark this repo's account as a public knowledge base: persist the one-way `public`
+    /// access-mode intent and ensure its `PublicRead` `/2` owner stream, so subsequent memory
+    /// authoring is public and the account is servable to anonymous readers. Refuses if the
+    /// account already holds a private stream (publishing an existing private repo is not
+    /// supported) or authors sealed.
+    pub fn sync_publish(&self) -> anyhow::Result<bool> {
+        crate::memory_write::enable_public_authoring(
+            self.storage.connection(),
+            rag_rat_base::time::now_ms(),
+        )
+    }
+
     /// Re-wrap the active repo stream's existing live keys to an already-effective enrolled device.
     /// This authors same-key siblings only; it does not enroll, pair, transport, or rotate keys.
     pub fn sync_catch_up(

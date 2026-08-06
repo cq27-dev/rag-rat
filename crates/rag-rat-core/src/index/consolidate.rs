@@ -97,9 +97,11 @@ const CARRIED_META_KEYS: &[&str] = &[
     "active_embedding_remote_config",
     "active_embedding_model_provisional",
     "memory_stream_seal_policy",
+    "memory_stream_access_mode",
 ];
 
 const MEMORY_STREAM_SEAL_POLICY_META_KEY: &str = "memory_stream_seal_policy";
+const MEMORY_STREAM_ACCESS_MODE_META_KEY: &str = "memory_stream_access_mode";
 
 /// How long consolidate waits for the repo's per-repo write locks (global-side and legacy-side)
 /// before refusing — an in-flight index/maintenance pass finishes well within it, and an explicit
@@ -1323,7 +1325,8 @@ fn copy_model_state(source: &Connection, tx: &Connection, repo_id: &str) -> anyh
     let mut count = 0u64;
     let mut active_model: Option<String> = None;
     for key in CARRIED_META_KEYS {
-        if *key == MEMORY_STREAM_SEAL_POLICY_META_KEY {
+        if *key == MEMORY_STREAM_SEAL_POLICY_META_KEY || *key == MEMORY_STREAM_ACCESS_MODE_META_KEY
+        {
             continue;
         }
         let value: Option<String> = source
@@ -1354,6 +1357,7 @@ fn copy_model_state(source: &Connection, tx: &Connection, repo_id: &str) -> anyh
         count += changed as u64;
     }
     count += merge_stream_seal_policy(source, tx, repo_id)?;
+    count += merge_stream_access_mode(source, tx, repo_id)?;
     if let Some(model_id) = active_model {
         carry_active_model_readiness(source, tx, &model_id)?;
     }
@@ -1403,6 +1407,70 @@ fn merge_stream_seal_policy(
         Ok(tx.execute(
             "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, 'sealed')",
             params![repo_id, MEMORY_STREAM_SEAL_POLICY_META_KEY],
+        )? as u64)
+    } else {
+        Ok(0)
+    }
+}
+
+/// Merge the owner-stream ACCESS MODE. Unlike the seal ratchet there is NO safe winner: access mode
+/// folds into the stream identity, so a public and a non-public index own DIFFERENT `/2` streams —
+/// silently picking one would either strand content or (private→public) leak private memories onto
+/// a public-labeled stream. So two EXPLICIT modes that disagree REFUSE. The only persisted token is
+/// `public` (absence = private default); the consolidation target is fresh, so a lone `public`
+/// source carries onto the absent target (making the consolidated index public), exactly as
+/// intended for a published node switching embedding models.
+fn merge_stream_access_mode(
+    source: &Connection,
+    tx: &Connection,
+    repo_id: &str,
+) -> anyhow::Result<u64> {
+    let source_value: Option<String> = source
+        .query_row(
+            "SELECT value FROM repo_meta WHERE key = ?1 LIMIT 1",
+            [MEMORY_STREAM_ACCESS_MODE_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let target_value: Option<String> = tx
+        .query_row(
+            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = ?2",
+            params![repo_id, MEMORY_STREAM_ACCESS_MODE_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+
+    for (side, value) in
+        [("legacy source", source_value.as_deref()), ("target", target_value.as_deref())]
+    {
+        if let Some(value) = value
+            && value != "public"
+        {
+            anyhow::bail!(
+                "{side} repo `{repo_id}` has unknown memory stream access mode `{value}`; \
+                 refusing to consolidate"
+            );
+        }
+    }
+
+    // Two explicit-but-disagreeing modes have no safe winner. With only `public`/absent this can
+    // only be source-`public` vs target-`public` (agree) today; the guard future-proofs a
+    // `private` token.
+    if let (Some(s), Some(t)) = (source_value.as_deref(), target_value.as_deref())
+        && s != t
+    {
+        anyhow::bail!(
+            "legacy source and target repo `{repo_id}` disagree on memory stream access mode \
+             (`{s}` vs `{t}`); refusing to consolidate a public and a non-public index"
+        );
+    }
+
+    if source_value.is_some() && target_value.is_none() {
+        Ok(tx.execute(
+            "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, 'public')",
+            params![repo_id, MEMORY_STREAM_ACCESS_MODE_META_KEY],
         )? as u64)
     } else {
         Ok(0)
@@ -2376,6 +2444,48 @@ mod tests {
             }),
             "every reconciled content row is suite 1",
         );
+    }
+
+    #[test]
+    fn public_access_mode_carries_through_import() {
+        let source = seeded_source();
+        source
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', ?1, \
+                 'public')",
+                [MEMORY_STREAM_ACCESS_MODE_META_KEY],
+            )
+            .unwrap();
+        let target = fresh_target();
+
+        import_from_source(&source, &target, "global-repo").unwrap();
+
+        let mode: String = target
+            .query_row(
+                "SELECT value FROM repo_meta WHERE repo_id = 'global-repo' AND key = ?1",
+                [MEMORY_STREAM_ACCESS_MODE_META_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mode, "public", "consolidation carries the public access-mode intent");
+    }
+
+    #[test]
+    fn unknown_source_access_mode_aborts_import_before_any_authoring() {
+        let source = seeded_source();
+        source
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', ?1, \
+                 'future-mode')",
+                [MEMORY_STREAM_ACCESS_MODE_META_KEY],
+            )
+            .unwrap();
+        let target = fresh_target();
+
+        let err = import_from_source(&source, &target, "global-repo")
+            .err()
+            .expect("an unknown access mode must fail closed");
+        assert!(err.to_string().contains("unknown memory stream access mode"), "got: {err}");
     }
 
     #[test]

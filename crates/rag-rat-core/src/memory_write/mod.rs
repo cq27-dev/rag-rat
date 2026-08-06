@@ -25,7 +25,9 @@ pub(crate) use authoring::backfill_memory_oplog;
 // The scope-explicit reconcile entry (#541): `authoring` is a PRIVATE module, so
 // `index::consolidate` names this through this re-export (Task 5 of #541).
 pub(crate) use authoring::reconcile_owner_stream_for_repo;
-pub(crate) use authoring::{catch_up_enrolled_device_keys, enable_sealed_authoring};
+pub(crate) use authoring::{
+    catch_up_enrolled_device_keys, enable_public_authoring, enable_sealed_authoring,
+};
 // The synced-content drain entries (#691 A1): the per-repo drain (consolidate) and the
 // store-global drain (open/migrate) that materialize accepted synced `/3` content into the
 // local memory tables.
