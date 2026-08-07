@@ -323,7 +323,12 @@ fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<Cons
     // transaction.
     let source_storage = IndexConnection::open_read_only_blocking(&source)
         .with_context(|| format!("opening the legacy index {} read-only", source.display()))?;
-    let counts = import_from_source(source_storage.connection(), target_conn, &repo_id)?;
+    let counts = import_from_source(
+        source_storage.connection(),
+        target_conn,
+        &repo_id,
+        ImportMode::ConsolidateLegacy,
+    )?;
     drop(source_storage);
 
     // The schema-only open above deliberately bypasses the normal open/migrate hook. Bring the
@@ -548,6 +553,22 @@ struct ImportCounts {
     meta_keys: u64,
 }
 
+/// Which caller is driving [`import_from_source`], and thus what the source is and what to carry.
+/// The two callers make opposite assumptions about the source that every SELECT depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportMode {
+    /// Forward-migrate a legacy per-repo DB into the global store. The source is SINGLE-repo by
+    /// construction, so no repo filter; migrate every row (both origins) under the new identity,
+    /// and carry the machine-local model state + embedding cache (same-machine migration).
+    ConsolidateLegacy,
+    /// Seed a public knowledge-base node from ONE repo's authored memories in a MULTI-repo global
+    /// source. Scope the source read to `repo_id` (else other private repos leak onto a public
+    /// node), copy only `origin='local'` rows (never re-publish a peer's synced content as our
+    /// own), and carry NO machine state (the node runs on a different machine and establishes
+    /// its own model + re-embeds under it).
+    SeedPublic,
+}
+
 /// Copy every authored + expensive row from `source` into `target` under `repo_id`, in ONE
 /// IMMEDIATE transaction (all-or-nothing; the SQLite write lock is taken up front instead of on a
 /// mid-transaction upgrade). Every SOURCE table is guarded by presence so a legacy DB predating a
@@ -595,6 +616,7 @@ fn import_from_source(
     source: &Connection,
     target: &Connection,
     repo_id: &str,
+    mode: ImportMode,
 ) -> anyhow::Result<ImportCounts> {
     let tx =
         rusqlite::Transaction::new_unchecked(target, rusqlite::TransactionBehavior::Immediate)?;
@@ -604,7 +626,8 @@ fn import_from_source(
     // legacy memory id colliding with ANOTHER repo's memory in the global store would otherwise
     // have its memory dropped while its tags/bindings/call-paths silently contaminate the other
     // repo's memory.
-    let CopiedMemories { rows_written: memories, id_map } = copy_memories(source, &tx, repo_id)?;
+    let CopiedMemories { rows_written: memories, id_map } =
+        copy_memories(source, &tx, repo_id, mode)?;
     // Mirror invariant: children of EVERY mapped id are replaced, not unioned. Digest the target's
     // child slices before and after — identical slice ⇒ that table reports 0 (an honest no-op).
     let pre = child_slice_digests(&tx, &id_map)?;
@@ -616,9 +639,18 @@ fn import_from_source(
         tags: copy_tags(source, &tx, &id_map)?,
         call_paths: copy_call_paths(source, &tx, &id_map)?,
         call_path_edges: copy_call_path_edges(source, &tx, &id_map)?,
-        edges: copy_node_edges(source, &tx, repo_id, &id_map)?,
-        embedding_cache_rows: copy_embedding_cache(source, &tx)?,
-        meta_keys: copy_model_state(source, &tx, repo_id)?,
+        edges: copy_node_edges(source, &tx, repo_id, &id_map, mode)?,
+        // Seed carries NO machine state: the embedding cache is content-derived from other private
+        // repos on this box, and the model-state meta names this machine's embedder — the public
+        // node runs elsewhere and establishes its own (see `ImportMode::SeedPublic`).
+        embedding_cache_rows: match mode {
+            ImportMode::ConsolidateLegacy => copy_embedding_cache(source, &tx)?,
+            ImportMode::SeedPublic => 0,
+        },
+        meta_keys: match mode {
+            ImportMode::ConsolidateLegacy => copy_model_state(source, &tx, repo_id)?,
+            ImportMode::SeedPublic => 0,
+        },
     };
     rag_rat_query::memory::remap_call_path_callee_logical_symbol_ids(&tx, source, &callee_remap)?;
     let post = child_slice_digests(&tx, &id_map)?;
@@ -637,6 +669,66 @@ fn import_from_source(
     rebuild_memory_fts_for_repo(&tx, repo_id)?;
     tx.commit()?;
     Ok(counts)
+}
+
+/// Refuse to seed a public node from a source repo that authors SEALED memories. A sealed source is
+/// a strong "keep encrypted" signal and publishing is a one-way ratchet, so fail BEFORE publish
+/// commits rather than silently republishing sealed-at-rest content as world-readable plaintext
+/// (the bodies live plaintext in `repo_memories` regardless). Absent seal meta ⇒ proceed. Any
+/// present value refuses (`sealed`, or an unknown future token — a public node accepts only a
+/// plainly unsealed source).
+pub(crate) fn ensure_source_unsealed(source_path: &Path, repo_id: &str) -> anyhow::Result<()> {
+    let source = IndexConnection::open_read_only_blocking(source_path)
+        .with_context(|| format!("opening seed index {} read-only", source_path.display()))?;
+    if !schema::table_exists(source.connection(), "repo_meta")? {
+        return Ok(());
+    }
+    let policy: Option<String> = source
+        .connection()
+        .query_row(
+            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = ?2",
+            params![repo_id, MEMORY_STREAM_SEAL_POLICY_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(policy) = policy {
+        anyhow::bail!(
+            "seed source repo `{repo_id}` authors sealed memories (policy `{policy}`); a public \
+             knowledge base can only be seeded from a plaintext source — publishing sealed \
+             content to anonymous readers is refused"
+        );
+    }
+    Ok(())
+}
+
+/// Seed a freshly-published public node from ONE repo's locally-authored memories in `source_path`
+/// (a multi-repo global store), then author them onto the node's PublicRead owner stream. Reuses
+/// the consolidation import under [`ImportMode::SeedPublic`] — scoped to `repo_id`,
+/// `origin='local'` only, no machine-state carry. The caller must have already refused a sealed
+/// source ([`ensure_source_unsealed`]) and published the node
+/// ([`crate::memory_write::enable_public_authoring`]) — publish sets the access-mode intent that
+/// makes the reconcile below resolve the PublicRead `/2` stream.
+pub(crate) fn seed_from_index(
+    target: &Connection,
+    source_path: &Path,
+    repo_id: &str,
+    now_ms: i64,
+) -> anyhow::Result<u64> {
+    let source = IndexConnection::open_read_only_blocking(source_path)
+        .with_context(|| format!("opening seed index {} read-only", source_path.display()))?;
+    // One deferred read snapshot over the whole import: the source is the operator's LIVE index
+    // (watcher/MCP may be writing), so a concurrent write must not tear the parent/child copies.
+    let snapshot = source.connection().unchecked_transaction()?;
+    let counts = import_from_source(&snapshot, target, repo_id, ImportMode::SeedPublic)?;
+    drop(snapshot);
+    drop(source);
+    // Idempotent guard: ensure the store-global `/3` projection is current before the reconcile
+    // anti-join trusts it (no-op when already fresh).
+    rag_rat_oplog::rebuild_all_content_projections_if_stale(target)?;
+    // Author the seeded `origin='local'` rows onto the owner stream — PublicRead, because publish
+    // set the access-mode intent the stream resolver reads.
+    crate::memory_write::reconcile_owner_stream_for_repo(target, repo_id, now_ms)?;
+    Ok(counts.memories)
 }
 
 /// Re-derive every persisted call-path callee id under the destination repo identity. The source
@@ -837,16 +929,26 @@ fn copy_memories(
     source: &Connection,
     tx: &Connection,
     repo_id: &str,
+    mode: ImportMode,
 ) -> anyhow::Result<CopiedMemories> {
     if !schema::table_exists(source, "repo_memories")? {
         return Ok(CopiedMemories::default());
     }
-    let mut stmt = source.prepare(
-        "SELECT id, kind, title, body, confidence, status, created_by, created_at_ms, \
-         updated_at_ms, source, source_text_hash, input_hash, memory_version, payload_json FROM \
-         repo_memories",
-    )?;
-    let mut rows = stmt.query([])?;
+    const BASE: &str = "SELECT id, kind, title, body, confidence, status, created_by, \
+                        created_at_ms, updated_at_ms, source, source_text_hash, input_hash, \
+                        memory_version, payload_json FROM repo_memories";
+    // Seed scopes the read to the ONE published repo (a multi-repo source would otherwise leak
+    // other private repos onto a public node) and drops peer-`synced` rows; legacy consolidation's
+    // source is single-repo and migrates everything.
+    let sql = match mode {
+        ImportMode::ConsolidateLegacy => BASE.to_string(),
+        ImportMode::SeedPublic => format!("{BASE} WHERE repo_id = ?1 AND origin = 'local'"),
+    };
+    let mut stmt = source.prepare(&sql)?;
+    let mut rows = match mode {
+        ImportMode::ConsolidateLegacy => stmt.query([])?,
+        ImportMode::SeedPublic => stmt.query(params![repo_id])?,
+    };
     let mut count = 0u64;
     let mut id_map: BTreeMap<String, String> = BTreeMap::new();
     while let Some(row) = rows.next()? {
@@ -1098,14 +1200,23 @@ fn copy_node_edges(
     tx: &Connection,
     repo_id: &str,
     id_map: &BTreeMap<String, String>,
+    mode: ImportMode,
 ) -> anyhow::Result<u64> {
     if !schema::table_exists(source, "repo_node_edges")? {
         return Ok(0);
     }
-    let mut stmt = source.prepare(
-        "SELECT source_node_id, relation, target_repo_id, target_kind, target_anchor, \
-         created_at_ms FROM repo_node_edges",
-    )?;
+    // Edges carry their OWN `origin`: a peer's edge onto one of our local memories is `synced` yet
+    // its source node is in `id_map`, so seed must drop it here or it would be re-authored as our
+    // own public `EdgeAdd`. (Repo scope rides `id_map`, already filtered by `copy_memories`.)
+    let sql = match mode {
+        ImportMode::ConsolidateLegacy =>
+            "SELECT source_node_id, relation, target_repo_id, target_kind, target_anchor, \
+             created_at_ms FROM repo_node_edges",
+        ImportMode::SeedPublic =>
+            "SELECT source_node_id, relation, target_repo_id, target_kind, target_anchor, \
+             created_at_ms FROM repo_node_edges WHERE origin = 'local'",
+    };
+    let mut stmt = source.prepare(sql)?;
     let mut rows = stmt.query([])?;
     let mut count = 0u64;
     while let Some(row) = rows.next()? {
@@ -1118,15 +1229,23 @@ fn copy_node_edges(
         let target_kind = row.get::<_, String>(3)?;
         let src_target_anchor = row.get::<_, String>(4)?;
         let created_at_ms = row.get::<_, i64>(5)?;
-        let (target_repo_id, target_anchor, target_node_id, anchor_status) =
-            match target_kind.as_str() {
-                "node" => match id_map.get(&src_target_anchor) {
-                    Some(mapped) =>
-                        (repo_id.to_string(), mapped.clone(), Some(mapped.clone()), "current"),
-                    None => (src_target_repo, src_target_anchor.clone(), None, "unresolved"),
-                },
-                _ => (repo_id.to_string(), src_target_anchor.clone(), None, "current"),
-            };
+        let (target_repo_id, target_anchor, target_node_id, anchor_status) = match target_kind
+            .as_str()
+        {
+            "node" => match id_map.get(&src_target_anchor) {
+                Some(mapped) =>
+                    (repo_id.to_string(), mapped.clone(), Some(mapped.clone()), "current"),
+                // A node target outside the imported set. `add_edge` allows explicit cross-repo
+                // node edges, so on a MULTI-repo seed source this points at a DIFFERENT private
+                // repo (id_map holds only the published repo) — carrying its repo_id + node id
+                // would leak that repo onto the public op-log once the edge is authored. Drop
+                // it. Legacy consolidation's source is single-repo, so an unresolved node target
+                // is provably foreign and is KEPT as an explicit cross-repo reference.
+                None if matches!(mode, ImportMode::SeedPublic) => continue,
+                None => (src_target_repo, src_target_anchor.clone(), None, "unresolved"),
+            },
+            _ => (repo_id.to_string(), src_target_anchor.clone(), None, "current"),
+        };
         let key = rag_rat_query::memory::edge_key(
             source_node_id,
             &relation,
@@ -1686,11 +1805,197 @@ mod tests {
         conn.query_row(sql, [], |row| row.get(0)).unwrap()
     }
 
+    /// A MULTI-repo source (what a live global store looks like) for the seed path: repo
+    /// `global-repo` holds two local memories, one peer-`synced` memory, and — on `pm1` — one local
+    /// and one synced edge; repo `other-repo` holds an unrelated local memory that must NEVER reach
+    /// a public node. Plus machine-local model meta + embedding cache (must NOT be carried).
+    fn seed_source_multi() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        for (id, repo, origin) in [
+            ("pm1", "global-repo", "local"),
+            ("pm2", "global-repo", "local"),
+            ("ps1", "global-repo", "synced"),
+            ("om1", "other-repo", "local"),
+        ] {
+            conn.execute(
+                "INSERT INTO repo_memories(id, kind, title, body, confidence, status, \
+                 created_at_ms, updated_at_ms, source, memory_version, origin, repo_id)
+                 VALUES (?1, 'Invariant', ?1, 'body', 'high', 'active', 0, 0, 'agent', 'v1', ?2, \
+                 ?3)",
+                params![id, origin, repo],
+            )
+            .unwrap();
+        }
+        // pm1's edges span every seed-relevant shape: a local github ref (kept), a synced github
+        // ref (dropped by origin), a same-repo node edge (kept, resolves through id_map), and a
+        // cross-repo node edge into `other-repo` (dropped by seed — it would leak that repo).
+        // (key, relation, target_repo, target_kind, target_anchor, origin)
+        for (key, relation, target_repo, target_kind, target_anchor, origin) in [
+            ("e-gh-local", "tracks", "global-repo", "github", "o/r#7", "local"),
+            ("e-gh-synced", "relates_to", "global-repo", "github", "o/r#8", "synced"),
+            ("e-node-same", "depends_on", "global-repo", "node", "pm2", "local"),
+            ("e-node-xrepo", "supersedes", "other-repo", "node", "om1", "local"),
+        ] {
+            conn.execute(
+                "INSERT INTO repo_node_edges(edge_key, repo_id, source_node_id, relation, \
+                 target_repo_id, target_kind, target_anchor, anchor_status, created_at_ms, origin)
+                 VALUES (?1, 'global-repo', 'pm1', ?2, ?3, ?4, ?5, 'current', 0, ?6)",
+                params![key, relation, target_repo, target_kind, target_anchor, origin],
+            )
+            .unwrap();
+        }
+        for hash in ["ih1", "ih2"] {
+            conn.execute(
+                "INSERT INTO embedding_cache(input_hash, model_id, embedding_dim, vector_blob, \
+                 computed_at_ms, last_used_at_ms) VALUES (?1, 'model-a', 384, X'00', 0, 0)",
+                params![hash],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', \
+             'active_embedding_model', 'model-a')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn seed_imports_only_this_repos_local_memories() {
+        let source = seed_source_multi();
+        let target = fresh_target();
+        let counts =
+            import_from_source(&source, &target, "global-repo", ImportMode::SeedPublic).unwrap();
+        // Only global-repo's two LOCAL memories: the synced one and other-repo's are excluded.
+        assert_eq!(counts.memories, 2);
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories"), 2);
+        assert_eq!(
+            count(&target, "SELECT COUNT(*) FROM repo_memories WHERE id IN ('pm1','pm2')"),
+            2,
+        );
+        assert_eq!(
+            count(&target, "SELECT COUNT(*) FROM repo_memories WHERE id IN ('ps1','om1')"),
+            0,
+            "peer-synced and other-repo memories never reach a public node",
+        );
+    }
+
+    #[test]
+    fn seed_keeps_only_resolvable_local_edges() {
+        let source = seed_source_multi();
+        let target = fresh_target();
+        import_from_source(&source, &target, "global-repo", ImportMode::SeedPublic).unwrap();
+        // Kept: the local github ref (`tracks`) and the same-repo node edge (`depends_on`).
+        // Dropped: the synced github ref (`relates_to`, origin) and the cross-repo node edge
+        // (`supersedes`, whose target lives in another private repo — carrying it would leak that
+        // repo's id onto the public op-log).
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_node_edges"), 2);
+        assert_eq!(
+            count(&target, "SELECT COUNT(*) FROM repo_node_edges WHERE relation='tracks'"),
+            1
+        );
+        assert_eq!(
+            count(&target, "SELECT COUNT(*) FROM repo_node_edges WHERE relation='depends_on'"),
+            1,
+        );
+        assert_eq!(
+            count(
+                &target,
+                "SELECT COUNT(*) FROM repo_node_edges WHERE relation IN \
+                 ('relates_to','supersedes')",
+            ),
+            0,
+        );
+        // No other private repo's id reaches the public node through an edge target.
+        assert_eq!(
+            count(
+                &target,
+                "SELECT COUNT(*) FROM repo_node_edges WHERE target_repo_id='other-repo'"
+            ),
+            0,
+            "a cross-repo node edge target never leaks another repo onto a public node",
+        );
+    }
+
+    #[test]
+    fn seed_carries_no_machine_state() {
+        let source = seed_source_multi();
+        let target = fresh_target();
+        let counts =
+            import_from_source(&source, &target, "global-repo", ImportMode::SeedPublic).unwrap();
+        assert_eq!(counts.embedding_cache_rows, 0, "the embedding cache is not carried");
+        assert_eq!(counts.meta_keys, 0, "model-state meta is not carried");
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM embedding_cache"), 0);
+        assert_eq!(
+            count(&target, "SELECT COUNT(*) FROM repo_meta WHERE key='active_embedding_model'"),
+            0,
+            "the source machine's embedder identity does not follow onto the public node",
+        );
+    }
+
+    #[test]
+    fn consolidate_still_imports_all_repos_and_origins() {
+        // Guards against the seed filters regressing the legacy path: no repo filter, no origin
+        // filter, machine state carried. (Consolidate's real source is single-repo; this reuses the
+        // multi-repo fixture only to prove every row is taken.)
+        let source = seed_source_multi();
+        let target = fresh_target();
+        let counts =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
+        assert_eq!(counts.memories, 4, "all repos, both origins");
+        assert_eq!(counts.edges, 4, "every edge: both origins, github + node, cross-repo included");
+        assert_eq!(counts.embedding_cache_rows, 2, "cache carried");
+        assert_eq!(counts.meta_keys, 1, "model-state meta carried");
+    }
+
+    #[test]
+    fn ensure_source_unsealed_refuses_a_sealed_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+            conn.execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('r', ?1, 'sealed')",
+                params![MEMORY_STREAM_SEAL_POLICY_META_KEY],
+            )
+            .unwrap();
+        }
+        let err = ensure_source_unsealed(&path, "r").unwrap_err().to_string();
+        assert!(err.contains("sealed"), "sealed source is refused: {err}");
+    }
+
+    #[test]
+    fn ensure_source_unsealed_allows_a_plaintext_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+            conn.execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        ensure_source_unsealed(&path, "r").unwrap();
+    }
+
     #[test]
     fn import_stamps_the_new_repo_id_and_nulls_local_rowids() {
         let source = seeded_source();
         let target = fresh_target();
-        let counts = import_from_source(&source, &target, "global-repo").unwrap();
+        let counts =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
 
         assert_eq!(counts.memories, 3);
         assert_eq!(counts.bindings, 1);
@@ -1836,7 +2141,13 @@ mod tests {
             .unwrap();
 
         let target = fresh_target();
-        import_from_source(source.storage.connection(), &target, "global-repo").unwrap();
+        import_from_source(
+            source.storage.connection(),
+            &target,
+            "global-repo",
+            ImportMode::ConsolidateLegacy,
+        )
+        .unwrap();
         let (target_callee, target_fingerprint, edge_hash, path_hash, binding_hash): (
             i64,
             String,
@@ -1928,7 +2239,7 @@ mod tests {
     fn import_preserves_moniker_binding_provenance() {
         let source = seeded_source();
         let target = fresh_target();
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
 
         let provenance = |column: &str| -> Option<String> {
             target
@@ -1954,7 +2265,7 @@ mod tests {
     fn imported_memories_are_findable_via_memory_fts() {
         let source = seeded_source();
         let target = fresh_target();
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
 
         let hits: i64 = target
             .query_row(
@@ -1981,12 +2292,16 @@ mod tests {
     fn import_is_idempotent_and_reports_honest_counts() {
         let source = seeded_source();
         let target = fresh_target();
-        let first = import_from_source(&source, &target, "global-repo").unwrap();
+        let first =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
         assert_eq!(first.memories, 3);
         assert_eq!(first.edges, 3, "all three edges (node, github, cross-repo) were carried");
         // A second import (a retry after a rename that never happened) inserts no duplicates AND
         // reports ZERO copies — the summary must not claim work the `INSERT OR IGNORE`s skipped.
-        let second = import_from_source(&source, &target, "global-repo").unwrap();
+        let second =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
         assert_eq!(second.memories, 0, "re-run reports zero memories copied");
         assert_eq!(second.bindings, 0);
         assert_eq!(second.tags, 0);
@@ -2047,7 +2362,7 @@ mod tests {
     fn a_retry_after_a_failed_rename_carries_legacy_edits_made_in_the_window() {
         let source = seeded_source();
         let target = fresh_target();
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
         // ... the rename fails here; the legacy DB stays live and the user edits m1: new body,
         // tag set REPLACED (alpha removed, window added), binding re-anchored. Every authored
         // mutation path bumps `updated_at_ms` (update_memory / rebind_memory), mirrored here.
@@ -2066,7 +2381,9 @@ mod tests {
             .execute("UPDATE repo_memory_bindings SET path='src/y.rs' WHERE memory_id='m1'", [])
             .unwrap();
 
-        let counts = import_from_source(&source, &target, "global-repo").unwrap();
+        let counts =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
         assert_eq!(counts.memories, 1, "only the edited memory reports as written");
         assert_eq!(counts.tags, 1, "the replaced tag set reports its reinserted row");
         assert_eq!(counts.bindings, 1);
@@ -2099,7 +2416,9 @@ mod tests {
             1
         );
         // Untouched memories reported nothing and kept their rows: convergence.
-        let third = import_from_source(&source, &target, "global-repo").unwrap();
+        let third =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
         assert_eq!(third.memories, 0, "a further no-edit retry is a true no-op");
         assert_eq!(third.tags, 0);
         assert_eq!(third.bindings, 0);
@@ -2134,7 +2453,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
         let remapped = remapped_memory_id("global-repo", "m1");
 
         // ... rename fails; the user edits m1 in the still-live legacy DB: body + tag replaced.
@@ -2150,7 +2469,9 @@ mod tests {
             .execute("INSERT INTO repo_memory_tags(memory_id, tag) VALUES ('m1','remap-tag')", [])
             .unwrap();
 
-        let counts = import_from_source(&source, &target, "global-repo").unwrap();
+        let counts =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
         assert_eq!(counts.memories, 1, "the remapped parent's refresh reports honestly");
 
         let body: String = target
@@ -2183,7 +2504,9 @@ mod tests {
         assert_eq!((other_title.as_str(), other_repo.as_str()), ("other title", "other-repo"));
 
         // Convergence: a no-edit retry reports zeros.
-        let third = import_from_source(&source, &target, "global-repo").unwrap();
+        let third =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
         assert_eq!(third.memories, 0);
         assert_eq!(third.tags, 0);
     }
@@ -2197,7 +2520,7 @@ mod tests {
     fn a_retry_carries_a_window_model_switch() {
         let source = seeded_source();
         let target = fresh_target();
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
 
         // ... rename fails; the user switches models in the still-live legacy DB.
         source
@@ -2215,7 +2538,9 @@ mod tests {
             )
             .unwrap();
 
-        let counts = import_from_source(&source, &target, "global-repo").unwrap();
+        let counts =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
         assert!(counts.meta_keys >= 2, "the upserted model + deleted remote config both report");
 
         let meta = |key: &str| -> Option<String> {
@@ -2240,7 +2565,9 @@ mod tests {
             .unwrap();
         assert_eq!(status, "Ready");
 
-        let third = import_from_source(&source, &target, "global-repo").unwrap();
+        let third =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
         assert_eq!(third.meta_keys, 0, "a no-edit retry writes no meta");
     }
 
@@ -2273,7 +2600,9 @@ mod tests {
             .execute("INSERT INTO repo_memory_tags(memory_id, tag) VALUES ('m1', 'other-tag')", [])
             .unwrap();
 
-        let counts = import_from_source(&source, &target, "global-repo").unwrap();
+        let counts =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
         assert_eq!(counts.memories, 3, "the colliding memory is remapped, not dropped");
 
         // The other repo's memory is untouched — content, ownership, and its own children.
@@ -2317,7 +2646,9 @@ mod tests {
         }
 
         // RETRY: the deterministic remap converges — zero new rows, no duplicate remapped copies.
-        let retry = import_from_source(&source, &target, "global-repo").unwrap();
+        let retry =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
         assert_eq!(retry.memories, 0, "the retry re-derives the SAME remapped id and no-ops");
         let remapped_copies: i64 = target
             .query_row(
@@ -2366,7 +2697,7 @@ mod tests {
             )
             .unwrap();
 
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
         let stray: i64 = target
             .query_row(
                 "SELECT COUNT(*) FROM repo_memory_tags WHERE memory_id='foreign-mem'",
@@ -2394,7 +2725,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
         let value: String = target
             .query_row(
                 "SELECT value FROM repo_meta WHERE repo_id='global-repo' AND \
@@ -2418,7 +2749,7 @@ mod tests {
             .unwrap();
         let target = fresh_target();
 
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
         crate::memory_write::reconcile_owner_stream_for_repo(
             &target,
             "global-repo",
@@ -2458,7 +2789,7 @@ mod tests {
             .unwrap();
         let target = fresh_target();
 
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
 
         let mode: String = target
             .query_row(
@@ -2482,9 +2813,10 @@ mod tests {
             .unwrap();
         let target = fresh_target();
 
-        let err = import_from_source(&source, &target, "global-repo")
-            .err()
-            .expect("an unknown access mode must fail closed");
+        let err =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .err()
+                .expect("an unknown access mode must fail closed");
         assert!(err.to_string().contains("unknown memory stream access mode"), "got: {err}");
     }
 
@@ -2500,9 +2832,10 @@ mod tests {
             .unwrap();
         let target = fresh_target();
 
-        let err = import_from_source(&source, &target, "global-repo")
-            .err()
-            .expect("an unknown policy must fail closed");
+        let err =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .err()
+                .expect("an unknown policy must fail closed");
         assert!(err.to_string().contains("unknown memory stream seal policy"));
         assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories"), 0);
         assert_eq!(count(&target, "SELECT COUNT(*) FROM content_entries"), 0);
@@ -2519,8 +2852,8 @@ mod tests {
             )
             .unwrap();
 
-        import_from_source(&source, &target, "global-repo").unwrap();
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
         let policy = || -> String {
             target
                 .query_row(
@@ -2539,9 +2872,10 @@ mod tests {
                 [MEMORY_STREAM_SEAL_POLICY_META_KEY],
             )
             .unwrap();
-        let err = import_from_source(&source, &target, "global-repo")
-            .err()
-            .expect("plaintext must not override a sealed target");
+        let err =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .err()
+                .expect("plaintext must not override a sealed target");
         assert!(err.to_string().contains("unknown memory stream seal policy"));
         assert_eq!(policy(), "sealed", "the conflicting import cannot downgrade the target");
         assert_eq!(count(&target, "SELECT COUNT(*) FROM content_entries"), 0);
@@ -2556,7 +2890,7 @@ mod tests {
     fn import_carries_portable_meta_and_leaves_db_local_state() {
         let source = seeded_source();
         let target = fresh_target();
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
 
         let meta = |key: &str| -> Option<String> {
             target
@@ -2613,7 +2947,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
         let (installed, status): (i64, String) = target
             .query_row(
                 "SELECT installed, status FROM ai_models WHERE model_id='model-a'",
@@ -2637,7 +2971,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        import_from_source(&source, &target, "global-repo").unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
         let (installed, disabled, status): (i64, i64, String) = target
             .query_row(
                 "SELECT installed, disabled, status FROM ai_models WHERE model_id='model-a'",
@@ -2775,7 +3109,9 @@ mod tests {
 
         // The import itself does NOT touch the op-log (it predates #541's reconcile call) — only
         // `repo_memories`/`repo_node_edges` gain the imported rows.
-        let counts = import_from_source(&source, &target, "global-repo").unwrap();
+        let counts =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .unwrap();
         assert_eq!(counts.memories, 3, "sanity: the import still carries all 3 source memories");
         assert_eq!(
             projected_m1(&target),

@@ -1167,3 +1167,87 @@ fn dream_ephemeral_zero_work_guard_skips_cli_provisioning() {
         "expected the CLI zero-work guard note, got stderr:\n{stderr}"
     );
 }
+
+/// A memory anchored to the fixture's file, for the seed tests.
+fn seed_mk(title: &str, body: &str) -> RepoMemoryCreate {
+    RepoMemoryCreate {
+        kind: "Invariant".into(),
+        title: title.into(),
+        body: body.into(),
+        confidence: "high".into(),
+        created_by: Some("op".into()),
+        source: Some("agent".into()),
+        tags: vec![],
+        payload_json: None,
+        bind: RepoMemoryBindTarget { path: Some("src/common.rs".into()), ..Default::default() },
+    }
+}
+
+/// `sync publish --seed <index>`: a fresh public node imports THIS repo's locally-authored memories
+/// out of a separate source index and authors them onto its public stream; re-seeding is
+/// convergent. Source and target are the SAME repo (⇒ same machine-independent repo_id) in separate
+/// stores — the real shape: seed a dedicated public node from your existing private index.
+#[test]
+fn sync_publish_seed_imports_local_memories_onto_a_public_node() {
+    let cache = unique_dir("seed-cache");
+    let root = keyless_repo("seed", &[("common.rs", chunky_fn("seed_anchor"))]);
+
+    // SOURCE: the operator's private store, with two locally-authored memories.
+    let source_data = unique_dir("seed-source-data");
+    run_ok(&root, &source_data, &cache, &["index", "--full"]);
+    {
+        let src = open_scoped(&root, &source_data);
+        src.memory_create(seed_mk("Alpha invariant", "quokkamarker body")).unwrap();
+        src.memory_create(seed_mk("Beta invariant", "lorikeetmarker body")).unwrap();
+    }
+
+    // TARGET: a fresh, dedicated public node — the same repo in a separate store.
+    let target_data = unique_dir("seed-target-data");
+    run_ok(&root, &target_data, &cache, &["index", "--full"]);
+    let target = open_scoped(&root, &target_data);
+
+    let report = target.sync_publish_seed(&global_db(&source_data)).unwrap();
+    assert!(report.published, "a fresh node flips the publish ratchet");
+    assert_eq!(report.imported_memories, 2);
+
+    // The seeded memories are present and searchable on the public node.
+    let found = target
+        .memory_search("quokkamarker", 10, rag_rat_base::config::MemorySurface::Full)
+        .unwrap();
+    assert!(!found.is_empty(), "a seeded memory is searchable on the public node");
+
+    // Re-seeding is convergent AND proves the seeded content landed on the PUBLIC stream: this call
+    // re-runs `enable_public_authoring`, whose `account_is_fully_public` gate would ERROR if the
+    // first seed had authored onto a private owner stream. It returning Ok(published=false) means
+    // the account owns only PublicRead streams — the seeded memories are servable to anonymous
+    // readers — and the content-gated upsert wrote nothing new.
+    let again = target.sync_publish_seed(&global_db(&source_data)).unwrap();
+    assert!(!again.published, "already published");
+    assert_eq!(again.imported_memories, 0, "re-seeding imports nothing new");
+}
+
+/// A sealed source is refused BEFORE the publish ratchet fires: a public reader cannot unwrap
+/// sealed content, so publishing it is refused, and the node is left unpublished (recoverable).
+#[test]
+fn sync_publish_seed_refuses_a_sealed_source_before_publishing() {
+    let cache = unique_dir("seed-sealed-cache");
+    let root = keyless_repo("seed-sealed", &[("common.rs", chunky_fn("sealed_anchor"))]);
+
+    let source_data = unique_dir("seed-sealed-source");
+    run_ok(&root, &source_data, &cache, &["index", "--full"]);
+    run_ok(&root, &source_data, &cache, &["--json", "sync", "enable"]); // seal the source
+
+    let target_data = unique_dir("seed-sealed-target");
+    run_ok(&root, &target_data, &cache, &["index", "--full"]);
+    let target = open_scoped(&root, &target_data);
+
+    let err = target.sync_publish_seed(&global_db(&source_data)).unwrap_err().to_string();
+    assert!(err.contains("sealed"), "a sealed source is refused: {err}");
+
+    // The refusal ran before publish, so the node is still unpublished — a plain publish still
+    // reports a first-time flip.
+    assert!(
+        target.sync_publish().unwrap(),
+        "the sealed refusal ran before the publish ratchet fired",
+    );
+}

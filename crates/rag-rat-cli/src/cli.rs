@@ -254,8 +254,21 @@ pub(crate) enum SyncCommand {
                             memory authoring uses a public_read stream and the account becomes \
                             servable to anonymous readers. One-way and refuses if the account \
                             already holds any private memories or authors sealed — publish a \
-                            fresh, dedicated public index, not an existing private repo.")]
-    Publish,
+                            fresh, dedicated public index, not an existing private repo. Pass \
+                            --seed to first import this repo's locally-authored memories from an \
+                            existing index.")]
+    Publish {
+        /// Seed the fresh public node from an existing rag-rat index before publishing: import
+        /// THIS repo's locally-authored memories from the index at this path, then author
+        /// them onto the public stream. Only your own authorship is copied (peer-synced
+        /// memories are excluded); refuses a sealed source. Index the node's repo first so
+        /// anchors resolve. Re-running re-mirrors from the source — it is authoritative for
+        /// seeded memories, so edits made directly on the node to a seeded memory (its
+        /// tags/edges included) are replaced by the source's current state; memories authored
+        /// fresh on the node are untouched.
+        #[arg(long, value_name = "SOURCE_INDEX_PATH")]
+        seed: Option<PathBuf>,
+    },
     /// Re-wrap existing live keys to an effective device without rotating them.
     #[command(long_about = "The target device must already be enrolled and effective. Re-wraps \
                             existing live keys without rotating them; this does not enroll the \
@@ -984,6 +997,24 @@ mod tests {
     fn help_flag_short_circuits() {
         let err = Cli::try_parse_from(["rag-rat", "--help"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn sync_publish_seed_flag_parses() {
+        let bare = Cli::try_parse_from(["rag-rat", "sync", "publish"]).expect("parse");
+        match bare.command {
+            Command::Sync(SyncArgs { command: SyncCommand::Publish { seed } }) =>
+                assert_eq!(seed, None),
+            other => panic!("expected sync publish, got {other:?}"),
+        }
+        let seeded =
+            Cli::try_parse_from(["rag-rat", "sync", "publish", "--seed", "/src/idx.sqlite"])
+                .expect("parse");
+        match seeded.command {
+            Command::Sync(SyncArgs { command: SyncCommand::Publish { seed } }) =>
+                assert_eq!(seed.as_deref(), Some(std::path::Path::new("/src/idx.sqlite"))),
+            other => panic!("expected sync publish --seed, got {other:?}"),
+        }
     }
 
     #[test]

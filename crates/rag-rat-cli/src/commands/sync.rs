@@ -35,7 +35,7 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 ttl: Duration::from_secs(*ttl_secs),
             }),
         SyncCommand::Join { ticket } => return join(config, ticket),
-        SyncCommand::Enable | SyncCommand::Publish | SyncCommand::CatchUp { .. } => {},
+        SyncCommand::Enable | SyncCommand::Publish { .. } | SyncCommand::CatchUp { .. } => {},
     }
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
@@ -51,12 +51,19 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "note": "subsequent local memory changes are sealed; transport is not configured",
             }))
         },
-        SyncCommand::Publish => {
-            let published = db.sync_publish()?;
+        SyncCommand::Publish { seed } => {
+            let (published, seeded_memories) = match seed.as_deref() {
+                Some(path) => {
+                    let report = db.sync_publish_seed(path)?;
+                    (report.published, Some(report.imported_memories))
+                },
+                None => (db.sync_publish()?, None),
+            };
             print_output(&serde_json::json!({
                 "status": if published { "published" } else { "already_published" },
                 "repo_id": db.active_repo_id,
                 "public_read": true,
+                "seeded_memories": seeded_memories,
                 "transport_configured": false,
                 "note": "this account is now a public knowledge base; subsequent memory changes are public and the account is servable to anonymous readers once `sync serve` runs",
             }))

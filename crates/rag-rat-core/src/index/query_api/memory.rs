@@ -1,6 +1,8 @@
 //! Repo-memory query surface on `IndexDatabase`: create/update/obsolete, search, anchor resolution
 //! (by symbol / path / call-path), rebind, and the validate/doctor anchor-health passes.
 
+use anyhow::Context as _;
+
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +11,14 @@ pub struct SyncCatchUpReport {
     pub required: u64,
     pub already_covered: u64,
     pub authored: u64,
+}
+
+/// Outcome of `sync publish --seed`: whether the publish ratchet flipped this run, and how many
+/// memories were imported from the seed source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishSeedReport {
+    pub published: bool,
+    pub imported_memories: u64,
 }
 
 impl IndexDatabase {
@@ -31,6 +41,32 @@ impl IndexDatabase {
             self.storage.connection(),
             rag_rat_base::time::now_ms(),
         )
+    }
+
+    /// Publish this repo's account as a public knowledge base AND seed it from `source`: refuse a
+    /// sealed source, flip the one-way publish ratchet, then import this repo's locally-authored
+    /// memories out of `source` (a separate rag-rat index) and author them onto the PublicRead
+    /// owner stream. The sealed-source refusal runs BEFORE publish, so a bad source never
+    /// leaves a half-published node; a failure between the publish and the import is
+    /// recoverable by re-running.
+    pub fn sync_publish_seed(&self, source: &std::path::Path) -> anyhow::Result<PublishSeedReport> {
+        let conn = self.storage.connection();
+        let repo_id = rag_rat_query::memory::memory_repo_scope(conn)?
+            .context("sync publish requires an active repo scope")?;
+        crate::index::consolidate::ensure_source_unsealed(source, &repo_id)?;
+        let published =
+            crate::memory_write::enable_public_authoring(conn, rag_rat_base::time::now_ms())?;
+        let imported_memories = crate::index::consolidate::seed_from_index(
+            conn,
+            source,
+            &repo_id,
+            rag_rat_base::time::now_ms(),
+        )
+        .context(
+            "the public node is published, but seeding failed; re-run `sync publish --seed \
+             <path>` to complete",
+        )?;
+        Ok(PublishSeedReport { published, imported_memories })
     }
 
     /// Re-wrap the active repo stream's existing live keys to an already-effective enrolled device.
