@@ -45,10 +45,10 @@ mod storage;
 // probe). #664 wires all three into `query::memory`, so they are plain re-exports.
 pub use authoring::{
     EnrollingDevice, author_device_add_in_tx, author_enrollment_device_add_in_tx,
-    enrollment_authoring_fits, enrollment_authoring_requirements, ensure_owned_stream_v2_in_tx,
-    ensure_owned_stream_v2_with_mode_in_tx, established_owned_stream_v2,
-    established_owned_stream_v2_with_mode, owned_stream_v2_id, owned_stream_v2_id_with_mode,
-    retry_enrollment_pre_verify, validate_device_add_label,
+    author_stream_grant_in_tx, enrollment_authoring_fits, enrollment_authoring_requirements,
+    ensure_owned_stream_v2_in_tx, ensure_owned_stream_v2_with_mode_in_tx,
+    established_owned_stream_v2, established_owned_stream_v2_with_mode, owned_stream_v2_id,
+    owned_stream_v2_id_with_mode, retry_enrollment_pre_verify, validate_device_add_label,
 };
 pub use bootstrap::{
     AuthoredDurability, ENROLLMENT_HELD_ENTRY_HASHES_MAX, EnrollmentBootstrap, EnrollmentBudget,
@@ -128,9 +128,9 @@ pub use storage::{
     CapacityScope, IngestOutcome, SyncAccountEntry, account_effective_count,
     account_entries_for_enrollment, account_entries_for_sync, account_entry_ref, account_ingest,
     account_is_fully_public, account_signed_entry_exists, account_signed_hash, auth_len_freshness,
-    backfill_authority_projection, grant_effective_for_device, owned_streams_for_account,
-    owner_control_authority, owner_control_authority_in_snapshot, owner_secrets_authority,
-    roster_content_authority, stream_access_mode, stream_owner_account, stream_owner_effective,
-    verify_enrollment_device_add,
+    backfill_authority_projection, grant_effective_for_device, grant_effective_in_snapshot,
+    owned_streams_for_account, owner_control_authority, owner_control_authority_in_snapshot,
+    owner_secrets_authority, roster_content_authority, stream_access_mode, stream_owner_account,
+    stream_owner_effective, verify_enrollment_device_add,
 };
 pub(crate) use storage::{device_is_effective_writer, stored_device_pubkeys};

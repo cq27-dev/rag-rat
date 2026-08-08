@@ -811,7 +811,19 @@ pub fn grant_effective(
     grantee_account_id: AccountId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    let conn: &Connection = &read_tx;
+    grant_effective_in_snapshot(&read_tx, owner_account_id, grant_id, stream_id, grantee_account_id)
+}
+
+/// The body of [`grant_effective`], reading whatever snapshot `conn` is already in — so an
+/// owner authoring a grant can verify the resulting FACT inside its own IMMEDIATE txn (mirrors
+/// [`grant_effective_for_device_in_snapshot`] and the DeviceAdd post-author fact check).
+pub fn grant_effective_in_snapshot(
+    conn: &Connection,
+    owner_account_id: AccountId,
+    grant_id: EntryHash,
+    stream_id: StreamId,
+    grantee_account_id: AccountId,
+) -> anyhow::Result<fold::AuthorityQuery<fold::GrantAuthority>> {
     let row: Option<StoredGrantRow> = conn
         .query_row(
             "SELECT stream_id, grantee_account_id, role, effective_at, closed_at

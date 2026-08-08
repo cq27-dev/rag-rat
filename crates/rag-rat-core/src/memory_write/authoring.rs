@@ -769,6 +769,55 @@ pub(crate) fn catch_up_enrolled_device_keys(
     Ok(report)
 }
 
+/// Grant `grantee_account_id` Writer authority on the ACTIVE repo's owner stream (#1164), so a
+/// separate identity can author memories into this repo's shared set. Owner-only: authoring the
+/// grant verifies it became the effective fact, which a non-owner device cannot produce. v1
+/// requires a PUBLISHED (public_read) repo — a grant on a private stream would need stream-key
+/// wraps to the grantee, which is out of scope. Returns the grant id. Mirrors the catch-up seam's
+/// resolve-then- re-check-under-lock discipline.
+pub(crate) fn grant_repo_writer(
+    conn: &Connection,
+    grantee_account_id: rag_rat_oplog::AccountId,
+    now_ms: i64,
+) -> anyhow::Result<[u8; 32]> {
+    let repo_id = memory_repo_scope(conn)?.context("sync grant requires an active repo scope")?;
+    if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
+        || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
+    {
+        anyhow::bail!("sync grant requires a stable repo identity (not legacy or local-only)");
+    }
+    let mode = owner_stream_access_mode(conn, &repo_id)?;
+    anyhow::ensure!(
+        mode == rag_rat_oplog::AccessMode::PublicRead,
+        "sync grant requires a published repo — run `sync publish` first (granting a writer on a \
+         private stream is not yet supported: the grantee would need stream-key wraps)"
+    );
+    let stream = rag_rat_oplog::established_owned_stream_v2_with_mode(conn, &repo_id, mode)?
+        .with_context(|| {
+            format!("sync grant requires an established owner stream for active repo `{repo_id}`")
+        })?;
+
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        memory_repo_scope(&tx)?.as_deref() == Some(repo_id.as_str()),
+        "active repo scope changed while starting sync grant; retry"
+    );
+    anyhow::ensure!(
+        rag_rat_oplog::owned_stream_v2_id_with_mode(&tx, &repo_id, mode)? == Some(stream),
+        "active repo owner stream changed while starting sync grant; retry"
+    );
+    let grant_id = rag_rat_oplog::author_stream_grant_in_tx(
+        &tx,
+        stream,
+        grantee_account_id,
+        rag_rat_oplog::GrantRole::Writer,
+        now_ms,
+    )?;
+    tx.commit()?;
+    Ok(grant_id)
+}
+
 /// Reconcile the ACTIVE repo's owner stream (scope read from the connection) — the idempotent call
 /// every live memory/edge mutation makes before authoring (#532), now self-healing per node/edge (a
 /// ghost row is authored on the next mutation, so no later lifecycle op on it is inert). A no-op on

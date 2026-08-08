@@ -473,6 +473,46 @@ fn author_device_add_with_promotion_in_tx(
     Ok(entry_hash)
 }
 
+/// Author a `StreamGrant` granting `grantee_account_id` `role` on `stream_id`, on the local
+/// (owner) account's control log, then VERIFY THE FACT — the grant became effective at the
+/// requested role for that subject — not the entry status. Returns the `grant_id` (the grant
+/// entry's hash).
+///
+/// Owner-only by construction: a `StreamGrant` from a device without effective owner authority
+/// folds `Rejected`, leaving no effective grant, so the fact check errors. Mirrors
+/// [`author_device_add_with_promotion_in_tx`]'s "tie the result to our own entry" discipline — a
+/// concurrently-ingested grant for the same subject cannot make a rejected entry look successful.
+/// Runs entirely in the caller's IMMEDIATE txn (no open/commit/ingest).
+pub fn author_stream_grant_in_tx(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    grantee_account_id: AccountId,
+    role: ops::GrantRole,
+    now_ms: i64,
+) -> anyhow::Result<EntryHash> {
+    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
+        "cannot author a stream grant before the store's local account is minted (call \
+         local_account first)",
+    )?;
+    let device = local_device(tx, now_ms)?;
+    let op = AccountOp::StreamGrant { stream_id, grantee_account_id, grant_role: role };
+    let grant_id = author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, now_ms)?;
+    match storage::grant_effective_in_snapshot(
+        tx,
+        account_id,
+        grant_id,
+        stream_id,
+        grantee_account_id,
+    )? {
+        AuthorityQuery::Effective(fact) if fact.role == role => {},
+        _ => anyhow::bail!(
+            "the stream grant did not become an effective {role:?} grant — the local device lacks \
+             effective owner authority on this account, or a concurrent op won the fold",
+        ),
+    }
+    Ok(grant_id)
+}
+
 /// Retry pre-verify rows unlocked by a committed enrollment in a separate maintenance transaction.
 pub fn retry_enrollment_pre_verify(
     conn: &Connection,
@@ -584,6 +624,38 @@ mod tests {
                 payload: None,
             },
         }
+    }
+
+    #[test]
+    fn author_stream_grant_makes_the_grantee_an_effective_writer() {
+        let conn = db();
+        let account = bootstrap::local_account(&conn, NOW).expect("mint local account");
+        let stream = ensure_committed(&conn, "repo-x");
+        let grantee = AccountId::from_bytes([0x77; 32]);
+        assert_ne!(grantee, account, "the grantee is a separate identity");
+
+        let grant_id = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let g = author_stream_grant_in_tx(&tx, stream, grantee, ops::GrantRole::Writer, NOW)
+                .expect("the owner authors a writer grant");
+            tx.commit().unwrap();
+            g
+        };
+
+        // The grant is the effective fact, at Writer, for exactly this (stream, grantee).
+        match storage::grant_effective(&conn, account, grant_id, stream, grantee).unwrap() {
+            AuthorityQuery::Effective(fact) => assert_eq!(fact.role, ops::GrantRole::Writer),
+            other => panic!("expected an effective writer grant, got {other:?}"),
+        }
+        // The same grant does NOT cover a different grantee (subject binding).
+        let other_grantee = AccountId::from_bytes([0x88; 32]);
+        assert!(
+            matches!(
+                storage::grant_effective(&conn, account, grant_id, stream, other_grantee).unwrap(),
+                AuthorityQuery::Invalid(_)
+            ),
+            "the grant binds to its named grantee, not any account",
+        );
     }
 
     #[test]

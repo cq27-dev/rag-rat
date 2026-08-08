@@ -323,6 +323,19 @@ pub(crate) enum SyncCommand {
         #[arg(value_name = "TICKET")]
         ticket: String,
     },
+    /// Print this store's local account id — the identity an owner grants with `sync grant`.
+    Whoami,
+    /// Grant another identity Writer authority on this repo's shared memories (owner-only).
+    #[command(long_about = "Authors a Writer grant so a SEPARATE identity (its own account) may \
+                            author memories into this repo's shared set under its own identity. \
+                            Owner-only, and requires a published repo (`sync publish` first) — a \
+                            grant on a private stream is not yet supported. The account id comes \
+                            from the grantee's `rag-rat sync whoami`.")]
+    Grant {
+        /// The 64-hex account id to grant, from the grantee's `rag-rat sync whoami`.
+        #[arg(value_name = "ACCOUNT_ID")]
+        account: String,
+    },
 }
 
 /// Roster role an operator grants a joining device at `sync init` time. Mirrors
@@ -1014,6 +1027,19 @@ mod tests {
             Command::Sync(SyncArgs { command: SyncCommand::Publish { seed } }) =>
                 assert_eq!(seed.as_deref(), Some(std::path::Path::new("/src/idx.sqlite"))),
             other => panic!("expected sync publish --seed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_grant_and_whoami_parse() {
+        let whoami = Cli::try_parse_from(["rag-rat", "sync", "whoami"]).expect("parse");
+        assert!(matches!(whoami.command, Command::Sync(SyncArgs { command: SyncCommand::Whoami })));
+        let grant =
+            Cli::try_parse_from(["rag-rat", "sync", "grant", &"ab".repeat(32)]).expect("parse");
+        match grant.command {
+            Command::Sync(SyncArgs { command: SyncCommand::Grant { account } }) =>
+                assert_eq!(account, "ab".repeat(32)),
+            other => panic!("expected sync grant, got {other:?}"),
         }
     }
 

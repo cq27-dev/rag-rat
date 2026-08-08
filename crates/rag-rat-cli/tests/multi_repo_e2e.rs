@@ -1251,3 +1251,33 @@ fn sync_publish_seed_refuses_a_sealed_source_before_publishing() {
         "the sealed refusal ran before the publish ratchet fired",
     );
 }
+
+/// `sync grant` (#1164): the owner grants a separate identity Writer authority on the repo's
+/// memories. Requires a published repo; `whoami` reports the identity to grant.
+#[test]
+fn sync_grant_requires_publish_then_authors_a_writer_grant() {
+    let cache = unique_dir("grant-cache");
+    let root = keyless_repo("grant", &[("common.rs", chunky_fn("grant_anchor"))]);
+    let data = unique_dir("grant-data");
+    run_ok(&root, &data, &cache, &["index", "--full"]);
+    let db = open_scoped(&root, &data);
+
+    // `whoami` mints + reports this store's 64-hex account id.
+    let me = db.sync_whoami().unwrap();
+    assert_eq!(me.len(), 64, "whoami reports a 64-hex account id");
+
+    // A separate identity to grant (any 64-hex string is a valid account id).
+    let grantee = "ab".repeat(32);
+
+    // Granting before publish is refused (v1: public streams only).
+    let before = db.sync_grant(&grantee).unwrap_err().to_string();
+    assert!(before.contains("published"), "grant requires a published repo: {before}");
+
+    // Publish, then grant returns the grant id as hex.
+    assert!(db.sync_publish().unwrap());
+    let grant_id = db.sync_grant(&grantee).unwrap();
+    assert_eq!(grant_id.len(), 64, "the grant id is returned as hex");
+
+    // A malformed account id is rejected.
+    assert!(db.sync_grant("not-a-valid-hex-account-id").is_err());
+}

@@ -35,7 +35,11 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 ttl: Duration::from_secs(*ttl_secs),
             }),
         SyncCommand::Join { ticket } => return join(config, ticket),
-        SyncCommand::Enable | SyncCommand::Publish { .. } | SyncCommand::CatchUp { .. } => {},
+        SyncCommand::Enable
+        | SyncCommand::Publish { .. }
+        | SyncCommand::CatchUp { .. }
+        | SyncCommand::Whoami
+        | SyncCommand::Grant { .. } => {},
     }
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
@@ -81,6 +85,25 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "pairing_performed": false,
                 "transport_configured": false,
                 "note": "existing live keys were re-wrapped without rotation; no enrollment, pairing, or transport occurred",
+            }))
+        },
+        SyncCommand::Whoami => {
+            let account_id = db.sync_whoami()?;
+            print_output(&serde_json::json!({
+                "account_id": account_id,
+                "repo_id": db.active_repo_id,
+                "note": "share this account id with an owner so they can `sync grant` it write access to their repo's memories",
+            }))
+        },
+        SyncCommand::Grant { account } => {
+            let grant_id = db.sync_grant(account)?;
+            print_output(&serde_json::json!({
+                "status": "granted",
+                "repo_id": db.active_repo_id,
+                "grantee_account_id": account,
+                "grant_id": grant_id,
+                "role": "writer",
+                "note": "the grantee may now author memories into this repo once it syncs this account's log; revoke is a separate command (not yet available)",
             }))
         },
         SyncCommand::Serve { .. } | SyncCommand::Init { .. } | SyncCommand::Join { .. } =>
