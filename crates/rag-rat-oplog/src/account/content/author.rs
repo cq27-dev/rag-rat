@@ -15,9 +15,12 @@
 //! citing our own current fold length means our entries never park `auth_len_ahead` against our own
 //! fold.
 //!
-//! `lamport = seq`. The seq is dense and monotone under the single local writer, and it IS the
-//! projection LWW key ([`crate::project`] orders on `(lamport, device)`); a non-monotone
-//! value would let a `NodeUpdate` lose to its own earlier `NodeCreate`.
+//! `lamport` is the stream-global LWW clock (#1164): `max(accepted stream lamports) + 1`, the
+//! projection LWW key ([`crate::project`] orders on `(lamport, device)`). Under a single writer it
+//! coincides with the dense per-author `seq` (that chain is the only source of accepted lamports),
+//! but a granted contributor authoring on the SAME owner stream mints above the owner's tip so its
+//! later edit cannot lose to a shorter chain. `seq` stays per-`(stream, author, device)` dense for
+//! chain integrity, so `lamport == seq` no longer holds once a second writer shares the stream.
 //!
 //! VERIFY-ACCEPTED. After the single batch refold, the seam reads back each authored entry's status
 //! and `bail!`s if any is not `accepted`, so the whole batch — and the mutation that triggered it —
@@ -153,11 +156,22 @@ pub fn author_content_batch_in_tx(
     // effective control-fold length as both auth_len fields.
     let auth_len = account_storage::account_effective_count(tx, account_id)?;
 
+    // Stream-global LWW clock (#1164): the next lamport is `max(accepted stream lamports) + 1`, so
+    // a granted contributor authoring on this owner stream orders AFTER everything already
+    // accepted — a per-author chain-tail lamport would let a short-chain writer's later edit
+    // lose the `(lamport, device)` projection LWW. For a SINGLE writer this stays equal to
+    // `seq` (its own dense chain is the only source of accepted lamports), preserving prior
+    // behavior.
+    let lamport_base = match stream_max_content_lamport(tx, stream_id)? {
+        Some(max) => max.checked_add(1).context("/3 stream lamport clock overflow")?,
+        None => 0,
+    };
     let mut authored = Vec::with_capacity(ops.len());
-    for op in ops {
-        // Mint from the candidate tail. Under verify-accepted+rollback the candidate tail IS the
-        // accepted tail, so no separate accepted-tail read is needed; the in-txn read sees the
-        // entries this loop already inserted, so each op chains off the one before it.
+    for (index, op) in ops.iter().enumerate() {
+        // Mint the seq from the candidate tail. Under verify-accepted+rollback the candidate tail
+        // IS the accepted tail, so no separate accepted-tail read is needed; the in-txn
+        // read sees the entries this loop already inserted, so each op chains off the one
+        // before it.
         let (seq, prev_hash) = match content_chain_tail(tx, stream_id, account_id, fingerprint)? {
             Some(tail) => (
                 tail.seq
@@ -167,13 +181,14 @@ pub fn author_content_batch_in_tx(
             ),
             None => (0, None),
         };
+        let lamport =
+            lamport_base.checked_add(index as u64).context("/3 stream lamport clock overflow")?;
         let header = ContentEntryHeader {
             stream_id,
             author_account_id: account_id,
             device_fingerprint: fingerprint,
             seq,
-            // Monotone with seq — it is the projection LWW key (see the module header).
-            lamport: seq,
+            lamport,
             prev_hash,
             // Owner-authored: author == owner, so no delegated grant.
             grant_id: None,
@@ -528,8 +543,13 @@ fn seal_and_author_in_tx(
     let fingerprint = device.fingerprint();
     let auth_len = account_storage::account_effective_count(tx, account_id)?;
 
+    // Stream-global LWW clock (#1164) — see `author_content_batch_in_tx`.
+    let lamport_base = match stream_max_content_lamport(tx, stream_id)? {
+        Some(max) => max.checked_add(1).context("/3 stream lamport clock overflow")?,
+        None => 0,
+    };
     let mut authored = Vec::with_capacity(ops.len());
-    for op in ops {
+    for (index, op) in ops.iter().enumerate() {
         let (seq, prev_hash) = match content_chain_tail(tx, stream_id, account_id, fingerprint)? {
             Some(tail) => (
                 tail.seq
@@ -539,6 +559,8 @@ fn seal_and_author_in_tx(
             ),
             None => (0, None),
         };
+        let lamport =
+            lamport_base.checked_add(index as u64).context("/3 stream lamport clock overflow")?;
         // `crypto_suite`/`key_id` stay 0/None here — `seal_and_sign_content_entry` finalizes them
         // to suite 1 + the key's id, so a suite-1-over-plaintext header is unconstructible.
         let header = ContentEntryHeader {
@@ -546,7 +568,7 @@ fn seal_and_author_in_tx(
             author_account_id: account_id,
             device_fingerprint: fingerprint,
             seq,
-            lamport: seq,
+            lamport,
             prev_hash,
             grant_id: None,
             roster_ref: genesis_hash,
@@ -687,6 +709,33 @@ fn content_chain_tail(
         Ok(ContentChainTail { seq, entry_hash: fixed::<32>(&entry_hash)? })
     })
     .transpose()
+}
+
+/// The highest `lamport` among a stream's ACCEPTED `/3` entries — the stream-global LWW clock, or
+/// `None` for a stream with no accepted entries. Authoring mints the next tick as `max + 1` so a
+/// SECOND writer (a granted contributor) always orders after everything already accepted, keeping
+/// the `(lamport, device)` projection LWW causal across authors; a per-author chain-tail lamport
+/// would let a short-chain writer's later edit lose.
+///
+/// ponytail: O(accepted entries) — `lamport` lives only in the signed envelope (not a
+/// `content_entries` column), so this decodes each. Fine at the current authoring cadence; if a
+/// large stream's per-write latency ever matters, denormalize `content_entries.lamport` and read
+/// `MAX(lamport)` (the `/5` table-sync layer already stores it that way).
+fn stream_max_content_lamport(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+) -> anyhow::Result<Option<u64>> {
+    let mut stmt = tx.prepare(
+        "SELECT signed_bytes FROM content_entries WHERE stream_id = ?1 AND accepted = 1",
+    )?;
+    let rows =
+        stmt.query_map(params![stream_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut max: Option<u64> = None;
+    for row in rows {
+        let signed = envelope::decode_content_signed(&row?)?;
+        max = Some(max.map_or(signed.header.lamport, |m| m.max(signed.header.lamport)));
+    }
+    Ok(max)
 }
 
 /// The current `/3` status of one entry, or `None` if the refold wrote no status row for it.
@@ -1011,6 +1060,26 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_second_owner_batch_continues_the_stream_lamport_clock() {
+        // The stream-global clock (#1164): a later batch mints lamports above the stream's current
+        // max, not from a reset — so a second writer authoring later always orders after. For a
+        // single writer this stays equal to `seq`.
+        let conn = db();
+        let stream = StreamId::from_bytes(STREAM_A);
+        let _account = owned_stream_account(&conn, stream);
+
+        let first =
+            author_committed(&conn, stream, &[node_create("n1", "a"), node_create("n2", "b")]);
+        let second = author_committed(&conn, stream, &[node_create("n3", "c")]);
+
+        assert_eq!(header_of(&conn, &first[0]).lamport, 0);
+        assert_eq!(header_of(&conn, &first[1]).lamport, 1);
+        let third = header_of(&conn, &second[0]);
+        assert_eq!(third.lamport, 2, "the second batch continues from the stream max, not a reset");
+        assert_eq!(third.seq, 2, "for a single writer lamport still tracks seq");
     }
 
     #[test]

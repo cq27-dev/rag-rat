@@ -243,6 +243,58 @@ mod tests {
     }
 
     #[test]
+    fn cross_author_content_edits_collapse_under_chain_tail_lamport() {
+        // The two-writer hazard (#1164). `/3` currently mints `lamport = per-(stream,author)-chain
+        // seq`, but this fold orders every register by `(lamport, device)` STREAM-WIDE. So when two
+        // identities write one stream, cross-author ordering tracks relative chain LENGTH, not
+        // causal order. A contributor with a long chain creates mem_x at a high lamport; the owner
+        // later makes the authoritative CONTENT edit, but its short chain lands the edit at a low
+        // lamport — and it is silently lost:
+        let (contributor, owner) = (0xCC, 0x00);
+        let buggy = project(&[
+            at(99, contributor, create("mem_x", "contributor-v1")),
+            at(5, owner, update("mem_x", "owner-corrected-later")),
+        ]);
+        assert_eq!(
+            node(&buggy, "mem_x").content.title,
+            "contributor-v1",
+            "chain-tail lamport loses the owner's causally-later content edit",
+        );
+        // Stream-global lamport (`max over accepted stream entries + 1`) restores causal LWW — the
+        // slice-2 fix: the later edit gets a higher lamport and wins.
+        let fixed = project(&[
+            at(99, contributor, create("mem_x", "contributor-v1")),
+            at(100, owner, update("mem_x", "owner-corrected-later")),
+        ]);
+        assert_eq!(
+            node(&fixed, "mem_x").content.title,
+            "owner-corrected-later",
+            "stream-global lamport lets the causally-later edit win",
+        );
+    }
+
+    #[test]
+    fn owner_obsolete_of_a_contributor_node_is_safe_regardless_of_lamport() {
+        // Refinement of the hazard: status and content are INDEPENDENT dimensions, so the owner's
+        // dream obsolete (a NodeStatus) never competes with the contributor's create/update
+        // (content). Even far below the contributor's lamport, the sole status op wins — so the
+        // common maintenance op (owner obsoletes a contributor node) is correct as-is. The lamport
+        // fix is needed for same-node cross-author CONTENT edits and status-vs-status races, not
+        // this case.
+        let (contributor, owner) = (0xCC, 0x00);
+        let state = project(&[
+            at(380, contributor, create("mem_y", "from-contributor")),
+            at(51, owner, status("mem_y", NodeStatus::Obsolete)),
+        ]);
+        assert_eq!(
+            node(&state, "mem_y").status,
+            NodeStatus::Obsolete,
+            "the owner's obsolete wins as the sole status op despite a lower lamport",
+        );
+        assert_eq!(node(&state, "mem_y").content.title, "from-contributor");
+    }
+
+    #[test]
     fn content_and_status_are_independent_dimensions() {
         // A status op must not disturb content, and an update must not disturb status.
         let state = project(&[
