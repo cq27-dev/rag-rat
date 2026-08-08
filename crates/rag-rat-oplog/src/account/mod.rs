@@ -85,7 +85,10 @@ pub use content::{
 };
 // The in-tx `/3` content-author seam + its genesis-detection reader (C3.4b-i, #663): #664
 // retargets the live memory path onto them, so they are plain re-exports.
-pub use content::{author_content_batch_in_tx, content_op_is_authorable, content_stream_is_empty};
+pub use content::{
+    author_content_batch_in_tx, author_grantee_content_batch_in_tx, content_op_is_authorable,
+    content_stream_is_empty,
+};
 // The V070 projection-table guard, reused by the memory-layer content projection's upgrade
 // re-fold (#688).
 pub(crate) use content::{content_projected_tables_exist, open_sealed_payload};
@@ -128,9 +131,9 @@ pub use storage::{
     CapacityScope, IngestOutcome, SyncAccountEntry, account_effective_count,
     account_entries_for_enrollment, account_entries_for_sync, account_entry_ref, account_ingest,
     account_is_fully_public, account_signed_entry_exists, account_signed_hash, auth_len_freshness,
-    backfill_authority_projection, grant_effective_for_device, grant_effective_in_snapshot,
-    owned_streams_for_account, owner_control_authority, owner_control_authority_in_snapshot,
-    owner_secrets_authority, roster_content_authority, stream_access_mode, stream_owner_account,
-    stream_owner_effective, verify_enrollment_device_add,
+    backfill_authority_projection, effective_writer_grant, grant_effective_for_device,
+    grant_effective_in_snapshot, owned_streams_for_account, owner_control_authority,
+    owner_control_authority_in_snapshot, owner_secrets_authority, roster_content_authority,
+    stream_access_mode, stream_owner_account, stream_owner_effective, verify_enrollment_device_add,
 };
 pub(crate) use storage::{device_is_effective_writer, stored_device_pubkeys};

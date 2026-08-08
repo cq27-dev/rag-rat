@@ -236,6 +236,99 @@ pub fn author_content_batch_in_tx(
     Ok(authored)
 }
 
+/// Author a batch of ops as a GRANTED CONTRIBUTOR (#1164): the local account is NOT the stream
+/// owner but holds an effective Writer grant, so it authors onto the OWNER's `stream_id` citing
+/// `grant_id`, under its OWN account + device, with `owner_auth_len` read from the owner's synced
+/// control fold and `author_auth_len` from its own. Verify-accepted-or-rollback like the owner
+/// seam.
+///
+/// Plaintext only — v1 grants target public streams, which carry no content keys (a sealed grantee
+/// path would need stream-key wraps to the grantee). The caller resolves `stream_id` /
+/// `owner_account_id` / `grant_id` from the synced grant (see `storage::effective_writer_grant`).
+/// The grantee's `roster_ref` is its OWN genesis: it is the founder of its own account, so no
+/// non-founder authority machinery is needed — the cross-account authorization is the `grant_id`,
+/// not the roster.
+pub fn author_grantee_content_batch_in_tx(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    owner_account_id: AccountId,
+    grant_id: EntryHash,
+    ops: &[MemoryOp],
+    now_ms: i64,
+) -> anyhow::Result<Vec<EntryHash>> {
+    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?
+        .context("cannot author granted /3 content before the store's local account is minted")?;
+    anyhow::ensure!(
+        account_id != owner_account_id,
+        "author_grantee_content_batch_in_tx is for a NON-owner contributor; the stream owner \
+         authors via author_content_batch_in_tx",
+    );
+    let device = local_device(tx, now_ms)?;
+    let fingerprint = device.fingerprint();
+    // Cite the OWNER's current fold count for the ownership/grant citations' freshness, and our OWN
+    // count for our roster citation — the two provenance halves the acceptance fold checks
+    // separately.
+    let owner_auth_len = account_storage::account_effective_count(tx, owner_account_id)?;
+    let author_auth_len = account_storage::account_effective_count(tx, account_id)?;
+    let lamport_base = match stream_max_content_lamport(tx, stream_id)? {
+        Some(max) => max.checked_add(1).context("/3 stream lamport clock overflow")?,
+        None => 0,
+    };
+    let mut authored = Vec::with_capacity(ops.len());
+    for (index, op) in ops.iter().enumerate() {
+        // The contributor chains its OWN dense seq on the owner's stream, independent of the
+        // owner's chain (the chain tail is keyed by (stream, author, device)).
+        let (seq, prev_hash) = match content_chain_tail(tx, stream_id, account_id, fingerprint)? {
+            Some(tail) => (
+                tail.seq
+                    .checked_add(1)
+                    .context("/3 content chain tail is at u64::MAX seq; cannot extend")?,
+                Some(tail.entry_hash),
+            ),
+            None => (0, None),
+        };
+        let lamport =
+            lamport_base.checked_add(index as u64).context("/3 stream lamport clock overflow")?;
+        let header = ContentEntryHeader {
+            stream_id,
+            author_account_id: account_id,
+            device_fingerprint: fingerprint,
+            seq,
+            lamport,
+            prev_hash,
+            grant_id: Some(grant_id),
+            roster_ref: genesis_hash,
+            owner_auth_len,
+            author_auth_len,
+            crypto_suite: 0,
+            key_id: None,
+        };
+        let payload = op::encode(op);
+        let signed = envelope::sign_content_entry(device.secret(), &header, &payload)?;
+        let verified = VerifiedContentEntry {
+            header: signed.header,
+            payload: signed.payload,
+            header_bytes: signed.header_bytes,
+            entry_hash: signed.entry_hash,
+        };
+        content_storage::insert_candidate(tx, &verified, &signed.signed_bytes, now_ms)?;
+        authored.push(verified.entry_hash);
+    }
+    content_storage::refold_content_stream(tx, stream_id)?;
+    for entry_hash in &authored {
+        match content_status(tx, entry_hash)?.as_deref() {
+            Some("accepted") => {},
+            other => anyhow::bail!(
+                "authored granted /3 content did not fold accepted (status {other:?}); rolling \
+                 back the batch — the grant may be missing/closed, the owner log unsynced, or the \
+                 role not Writer",
+            ),
+        }
+    }
+    content_projection::reproject_accepted_content_stream(tx, stream_id)?;
+    Ok(authored)
+}
+
 /// The privacy intent for a `/3` content batch (sync phase C5, #608). The caller states it
 /// EXPLICITLY — wrap presence is a downgrade-ratchet INPUT, never the privacy oracle: a private
 /// stream's accepted-wrap set can legitimately empty under sync lag or a retro-condemn, and

@@ -3511,6 +3511,71 @@ mod tests {
         assert_eq!(verdict_after_ingest(&conn, &entry), ("accepted".into(), 1));
     }
 
+    fn seed_auth_state_live(conn: &Connection, account: AccountId, effective_count: i64) {
+        conn.execute(
+            "INSERT INTO account_auth_state(
+                 account_id, classification, contested_depth, successor_account_id, \
+             effective_count)
+             VALUES(?1, 'live', NULL, NULL, ?2)",
+            params![account.to_bytes().as_slice(), effective_count],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_granted_contributor_authors_accepted_content_on_the_owner_stream() {
+        // The grantee is THIS store's own (local) identity; the owner is a separate account whose
+        // ownership + Writer grant this store has synced. Driving the real
+        // `author_grantee_content_batch_in_tx` seam proves a contributor's locally-authored entry
+        // folds ACCEPTED on the owner's stream (not just that the acceptance evaluator would admit
+        // a hand-crafted one).
+        let conn = db();
+        let stream = StreamId::from_bytes(STREAM);
+        let grantee = crate::account::local_account(&conn, NOW).unwrap();
+        let owner = AccountId::from_bytes([0x51; 32]);
+        assert_ne!(owner, grantee, "the owner is a separate identity from the contributor");
+        seed_ownership(&conn, owner);
+        seed_auth_state_live(&conn, owner, 1);
+        let grant_id = [0x71; 32];
+        seed_grant(&conn, grant_id, owner, grantee, "writer");
+
+        // The contributor can find its own grant on the owner's stream.
+        assert_eq!(
+            crate::account::effective_writer_grant(&conn, owner, stream, grantee).unwrap(),
+            Some(grant_id),
+            "the reverse resolver finds the contributor's effective writer grant",
+        );
+
+        let hashes = {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .unwrap();
+            let h = crate::account::author_grantee_content_batch_in_tx(
+                &tx,
+                stream,
+                owner,
+                grant_id,
+                &[node_create("g1")],
+                NOW,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            h
+        };
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(
+            verdict(&conn, &hashes[0]),
+            ("accepted".into(), 1),
+            "the contributor's granted content folds accepted on the owner's stream",
+        );
+        assert!(
+            projected_node_ids(&conn).contains(&"g1".to_string()),
+            "and materializes into the owner-stream projection",
+        );
+    }
+
     #[test]
     fn a_contributor_whose_grant_only_reads_is_rejected() {
         let conn = db();

@@ -846,6 +846,35 @@ pub fn grant_effective_in_snapshot(
     validated_fact(authority, effective_at, closed_at)
 }
 
+/// The `grant_id` of an effective (not-closed) Writer grant for `grantee_account_id` on
+/// `(owner_account_id, stream_id)`, or `None`. A granted contributor uses this to cite its grant
+/// when authoring onto the owner's stream (#1164): the grant lives in the OWNER's control log and
+/// is synced to the contributor, so this reads the projected `account_stream_grants` row. Unlike
+/// [`grant_effective`] (which VERIFIES a known `grant_id`), this SEARCHES for the contributor's
+/// grant.
+pub fn effective_writer_grant(
+    conn: &Connection,
+    owner_account_id: AccountId,
+    stream_id: StreamId,
+    grantee_account_id: AccountId,
+) -> anyhow::Result<Option<EntryHash>> {
+    let grant_id: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT grant_id FROM account_stream_grants
+             WHERE owner_account_id = ?1 AND stream_id = ?2 AND grantee_account_id = ?3
+               AND role = ?4 AND closed_at IS NULL",
+            params![
+                owner_account_id.to_bytes().as_slice(),
+                stream_id.to_bytes().as_slice(),
+                grantee_account_id.to_bytes().as_slice(),
+                GrantRole::Writer.as_db_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    grant_id.map(|bytes| fixed(&bytes)).transpose()
+}
+
 /// Resolve a grant and the requesting device's revoke cut as ONE authorization decision. C2 must
 /// use this combined seam when admitting content: two independent calls could otherwise straddle
 /// a refold and combine an old effective grant with a new (or absent) cut projection.
