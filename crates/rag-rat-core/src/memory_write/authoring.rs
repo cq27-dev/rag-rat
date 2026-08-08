@@ -179,7 +179,7 @@ pub(crate) const CONTRIBUTION_OWNER_META_KEY: &str = "memory_contribution_owner"
 
 /// The configured contribution-owner account for `repo_id`, or `None`. Stored as a 64-hex account
 /// id.
-fn contribution_owner_account(
+pub(super) fn contribution_owner_account(
     conn: &Connection,
     repo_id: &str,
 ) -> anyhow::Result<Option<rag_rat_oplog::AccountId>> {

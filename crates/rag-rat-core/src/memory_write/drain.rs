@@ -111,7 +111,19 @@ pub(crate) fn drain_synced_stream_for_repo(
     let Some(stream) = rag_rat_oplog::owned_stream_v2_id_with_mode(conn, repo_id, mode)? else {
         return Ok(DrainOutcome::default());
     };
+    drain_stream_for_repo(conn, repo_id, stream, now_ms)
+}
 
+/// Drain a SPECIFIC owner `stream` into `repo_id`'s local memory tables — the shared gate, settle,
+/// worker, and watermark used by both the local-owned-stream drain above and the contribution-owner
+/// drain below (#1164). `stream` is a parameter so a granted contributor can drain the OWNER's
+/// stream, which its local-account derivation would never resolve.
+fn drain_stream_for_repo(
+    conn: &Connection,
+    repo_id: &str,
+    stream: StreamId,
+    now_ms: i64,
+) -> anyhow::Result<DrainOutcome> {
     // Cheap read-only gate: skip the write txn + O(projection) scan entirely when the projection is
     // unchanged since this stream was last drained and nothing is pending. Every drain seam routes
     // through here (open, consolidate, and the long-running watcher pass), so all three go O(1)
@@ -147,6 +159,36 @@ pub(crate) fn drain_synced_stream_for_repo(
     Ok(outcome)
 }
 
+/// For a granted CONTRIBUTOR (#1164): drain the CONFIGURED owner's `/2` stream into this store's
+/// `repo_id` tables, so the contributor reads back the OWNER's (and other contributors') memories —
+/// not just its own (which the direct table write already materialized). The owner-account
+/// derivation is what the local-account front-door cannot reach. No-op when the repo is not in
+/// contribution mode, or when the configured owner IS this store (then the front-door handles it).
+fn drain_contribution_owner_stream_for_repo(
+    conn: &Connection,
+    repo_id: &str,
+    now_ms: i64,
+) -> anyhow::Result<DrainOutcome> {
+    if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
+        || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
+    {
+        return Ok(DrainOutcome::default());
+    }
+    let Some(owner) = super::authoring::contribution_owner_account(conn, repo_id)? else {
+        return Ok(DrainOutcome::default());
+    };
+    if rag_rat_oplog::read_local_account(conn)? == Some(owner) {
+        return Ok(DrainOutcome::default());
+    }
+    // Contribution targets the owner's PublicRead stream (v1 public only).
+    let stream = rag_rat_oplog::owner_stream_v2_id_for_account(
+        repo_id,
+        owner,
+        rag_rat_oplog::AccessMode::PublicRead,
+    )?;
+    drain_stream_for_repo(conn, repo_id, stream, now_ms)
+}
+
 /// Drain every registered real repo's synced stream — the store-global counterpart wired into the
 /// open/migrate seam, after the projection is rebuilt current. Per-repo derivation means a repo
 /// with no minted account (or no synced content) is a cheap no-op, so this stays light on a plain
@@ -158,6 +200,9 @@ pub(crate) fn drain_synced_streams_for_all_repos(
     let mut total = DrainOutcome::default();
     for repo_id in rag_rat_db::schema::real_repo_ids(conn)? {
         total.add(drain_synced_stream_for_repo(conn, &repo_id, now_ms)?);
+        // For a contributor repo, also drain the owner's stream so its memories (and other
+        // contributors') materialize locally (#1164). A no-op for non-contribution repos.
+        total.add(drain_contribution_owner_stream_for_repo(conn, &repo_id, now_ms)?);
     }
     Ok(total)
 }

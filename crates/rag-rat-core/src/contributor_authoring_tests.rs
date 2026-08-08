@@ -52,6 +52,16 @@ fn concept(title: &str) -> RepoMemoryCreate {
     }
 }
 
+/// The memory titles this store holds for the repo, sorted.
+fn memory_titles(conn: &Connection) -> Vec<String> {
+    let mut stmt =
+        conn.prepare("SELECT title FROM repo_memories WHERE repo_id = ?1 ORDER BY title").unwrap();
+    stmt.query_map([REPO], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
 /// Replicate `src`'s account log (roster/ownership/grant) + content into `dst` — the state a
 /// contributor gains by syncing the owner's log.
 fn sync_account_into(dst: &Connection, src: &Connection, account: rag_rat_oplog::AccountId) {
@@ -114,6 +124,18 @@ fn a_configured_contributor_authors_onto_the_owners_stream() {
         )
         .unwrap();
     assert_eq!(contributor_owned, 0, "a contributor owns no stream of its own");
+
+    // Read-back (#1164): draining the OWNER's synced stream materializes the owner's memory into
+    // the contributor's own tables — while its own memory (a direct table write) stays. So the
+    // contributor reads the union, not just what it wrote.
+    crate::drain_synced_memory(&contributor).unwrap();
+    let titles = memory_titles(&contributor);
+    assert!(
+        titles.contains(&"owner-note".to_string()),
+        "the contributor reads back the owner's memory after draining the owner's stream: \
+         {titles:?}",
+    );
+    assert!(titles.contains(&"contributor-note".to_string()), "and still sees its own: {titles:?}",);
 }
 
 #[test]
