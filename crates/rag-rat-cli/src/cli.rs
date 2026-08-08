@@ -336,6 +336,17 @@ pub(crate) enum SyncCommand {
         #[arg(value_name = "ACCOUNT_ID")]
         account: String,
     },
+    /// Contribute this repo's memories to another identity's shared knowledge base.
+    #[command(long_about = "Configures this repo to author its memories onto ANOTHER account's \
+                            owner stream (the paste flow): subsequent memory changes target that \
+                            owner via this account's Writer grant. The owner must first `sync \
+                            grant` this account (its id from `sync whoami`) and this store must \
+                            sync the owner's log; contributing targets a published (public) repo.")]
+    Contribute {
+        /// The 64-hex owner account id to contribute to, from the owner's `rag-rat sync whoami`.
+        #[arg(value_name = "OWNER_ACCOUNT_ID")]
+        account: String,
+    },
 }
 
 /// Roster role an operator grants a joining device at `sync init` time. Mirrors
@@ -1040,6 +1051,17 @@ mod tests {
             Command::Sync(SyncArgs { command: SyncCommand::Grant { account } }) =>
                 assert_eq!(account, "ab".repeat(32)),
             other => panic!("expected sync grant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_contribute_parses() {
+        let cli = Cli::try_parse_from(["rag-rat", "sync", "contribute", &"cd".repeat(32)])
+            .expect("parse");
+        match cli.command {
+            Command::Sync(SyncArgs { command: SyncCommand::Contribute { account } }) =>
+                assert_eq!(account, "cd".repeat(32)),
+            other => panic!("expected sync contribute, got {other:?}"),
         }
     }
 

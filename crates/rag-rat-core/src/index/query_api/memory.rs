@@ -108,6 +108,18 @@ impl IndexDatabase {
         Ok(rag_rat_base::hash::hex_lower(&grant_id))
     }
 
+    /// Configure the active repo to contribute memories to `owner_account_hex` (paste flow, #1164):
+    /// subsequent memory authoring targets that owner's stream via this account's Writer grant. The
+    /// owner must `sync grant` this account (its id from `sync whoami`) and this store must sync
+    /// the owner's log before authoring succeeds.
+    pub fn sync_contribute(&self, owner_account_hex: &str) -> anyhow::Result<()> {
+        crate::memory_write::set_contribution_owner(
+            self.storage.connection(),
+            owner_account_hex,
+            rag_rat_base::time::now_ms(),
+        )
+    }
+
     /// Re-wrap the active repo stream's existing live keys to an already-effective enrolled device.
     /// This authors same-key siblings only; it does not enroll, pair, transport, or rotate keys.
     pub fn sync_catch_up(

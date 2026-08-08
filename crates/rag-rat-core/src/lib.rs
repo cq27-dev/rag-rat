@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod contributor_authoring_tests;
 pub mod distill;
 #[cfg(feature = "eval")]
 pub mod eval;

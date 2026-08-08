@@ -135,6 +135,20 @@ pub fn owned_stream_v2_id_with_mode(
     Ok(Some(stream::derive_v2(&spec)?))
 }
 
+/// The `/2` owner stream id for `repo_id` owned by an EXPLICIT `owner_account_id` at `access_mode`
+/// — a pure derivation with no local-account read. A granted contributor (#1164) uses this to
+/// target the OWNER's stream; every other `/2` resolver binds the LOCAL account, which is wrong for
+/// a contributor. The contributor learns `owner_account_id` from its configured contribution owner.
+pub fn owner_stream_v2_id_for_account(
+    repo_id: &str,
+    owner_account_id: AccountId,
+    access_mode: stream::AccessMode,
+) -> anyhow::Result<StreamId> {
+    let mut spec = stream::owner_stream_v2(repo_id, owner_account_id);
+    spec.access_mode = access_mode;
+    stream::derive_v2(&spec)
+}
+
 /// The repo's `/2` owner stream, but ONLY once it is fully ESTABLISHED: the local account is minted
 /// AND its `StreamOwn` has folded `Effective` (the ownership fact is live), so an owner-authored
 /// `/3` batch on it would accept. `None` when no account is minted OR ownership has not folded

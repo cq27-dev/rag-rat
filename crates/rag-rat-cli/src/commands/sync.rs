@@ -39,7 +39,8 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         | SyncCommand::Publish { .. }
         | SyncCommand::CatchUp { .. }
         | SyncCommand::Whoami
-        | SyncCommand::Grant { .. } => {},
+        | SyncCommand::Grant { .. }
+        | SyncCommand::Contribute { .. } => {},
     }
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
@@ -104,6 +105,15 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "grant_id": grant_id,
                 "role": "writer",
                 "note": "the grantee may now author memories into this repo once it syncs this account's log; revoke is a separate command (not yet available)",
+            }))
+        },
+        SyncCommand::Contribute { account } => {
+            db.sync_contribute(account)?;
+            print_output(&serde_json::json!({
+                "status": "contributing",
+                "repo_id": db.active_repo_id,
+                "owner_account_id": account,
+                "note": "memory changes for this repo now target the owner's stream; the owner must `sync grant` this account and this store must sync the owner's log before authoring succeeds",
             }))
         },
         SyncCommand::Serve { .. } | SyncCommand::Init { .. } | SyncCommand::Join { .. } =>

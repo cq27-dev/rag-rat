@@ -27,7 +27,7 @@ pub(crate) use authoring::backfill_memory_oplog;
 pub(crate) use authoring::reconcile_owner_stream_for_repo;
 pub(crate) use authoring::{
     catch_up_enrolled_device_keys, enable_public_authoring, enable_sealed_authoring,
-    grant_repo_writer,
+    grant_repo_writer, set_contribution_owner,
 };
 // The synced-content drain entries (#691 A1): the per-repo drain (consolidate) and the
 // store-global drain (open/migrate) that materialize accepted synced `/3` content into the

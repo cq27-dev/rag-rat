@@ -146,9 +146,151 @@ impl StreamSealPolicy {
 
 pub(crate) struct PreparedOwnerAuthoring {
     repo_id: String,
+    /// The `/2` stream to author onto — this store's own owned stream in `Owner` mode, the
+    /// CONFIGURED owner's stream in `Grantee` mode.
     stream: StreamId,
-    policy: StreamSealPolicy,
-    prepared: PreparedContentAuthoring,
+    role: AuthoringRole,
+}
+
+/// How this store authors `/3` content for a repo. `Owner` is the default — the local account owns
+/// the stream. `Grantee` (#1164) is a granted contributor authoring onto ANOTHER account's stream.
+enum AuthoringRole {
+    Owner { policy: StreamSealPolicy, prepared: PreparedContentAuthoring },
+    Grantee { owner_account: rag_rat_oplog::AccountId, grant_id: [u8; 32] },
+}
+
+impl PreparedOwnerAuthoring {
+    /// The owner-mode prepared `/3` batch. The reconcile paths build and use Owner-role handles
+    /// only (a contributor skips reconcile via `backfill_memory_oplog`), so a Grantee handle
+    /// here is a programming error, not a runtime condition.
+    fn owner_prepared(&self) -> anyhow::Result<&PreparedContentAuthoring> {
+        match &self.role {
+            AuthoringRole::Owner { prepared, .. } => Ok(prepared),
+            AuthoringRole::Grantee { .. } => anyhow::bail!(
+                "reconcile is owner-only, but a grantee-role prepared handle reached it"
+            ),
+        }
+    }
+}
+
+/// The `repo_meta` key holding the account this repo contributes memories to (the paste-flow owner
+/// id, set by `sync contribute`). Absent = this store authors its own owner stream.
+pub(crate) const CONTRIBUTION_OWNER_META_KEY: &str = "memory_contribution_owner";
+
+/// The configured contribution-owner account for `repo_id`, or `None`. Stored as a 64-hex account
+/// id.
+fn contribution_owner_account(
+    conn: &Connection,
+    repo_id: &str,
+) -> anyhow::Result<Option<rag_rat_oplog::AccountId>> {
+    let Some(hex) = rag_rat_db::meta::repo_meta(conn, repo_id, CONTRIBUTION_OWNER_META_KEY)? else {
+        return Ok(None);
+    };
+    Ok(Some(parse_account_id_hex(&hex)?))
+}
+
+/// Whether this repo authors as a granted CONTRIBUTOR — an owner is configured and it is not this
+/// store's own account. A light check (no grant lookup) so `backfill_memory_oplog` can cheaply skip
+/// the owner-only establish/reconcile path; the grant is required (and its absence errors) later,
+/// in [`grantee_context`] at prepare/author time.
+fn is_contribution_mode(conn: &Connection, repo_id: &str) -> anyhow::Result<bool> {
+    let Some(owner) = contribution_owner_account(conn, repo_id)? else {
+        return Ok(false);
+    };
+    Ok(rag_rat_oplog::read_local_account(conn)? != Some(owner))
+}
+
+struct GranteeContext {
+    owner_account: rag_rat_oplog::AccountId,
+    stream: StreamId,
+    grant_id: [u8; 32],
+}
+
+/// Resolve grantee-authoring context for `repo_id`: the configured contribution owner, its
+/// `PublicRead` owner stream, and this store's effective Writer grant on it. `None` when not in
+/// contribution mode. Errors (fail loud) when configured but the grant is missing — the operator
+/// must `sync grant` this account from the owner and sync the owner's log first.
+fn grantee_context(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<GranteeContext>> {
+    let Some(owner_account) = contribution_owner_account(conn, repo_id)? else {
+        return Ok(None);
+    };
+    let local = rag_rat_oplog::read_local_account(conn)?;
+    if local == Some(owner_account) {
+        return Ok(None);
+    }
+    let local = local.context(
+        "contribution mode requires a local account; index or sync this repo before authoring",
+    )?;
+    // v1 contribution targets a published (public_read) owner stream — no content-key wraps needed.
+    let stream = rag_rat_oplog::owner_stream_v2_id_for_account(
+        repo_id,
+        owner_account,
+        rag_rat_oplog::AccessMode::PublicRead,
+    )?;
+    let grant_id = rag_rat_oplog::effective_writer_grant(conn, owner_account, stream, local)?
+        .with_context(|| {
+            format!(
+                "no effective writer grant for this account on repo `{repo_id}`'s owner stream — \
+                 the owner must `sync grant` this account (its id from `sync whoami`) and this \
+                 store must sync the owner's log before it can contribute"
+            )
+        })?;
+    Ok(Some(GranteeContext { owner_account, stream, grant_id }))
+}
+
+/// Decode a 64-hex account id into an [`rag_rat_oplog::AccountId`].
+fn parse_account_id_hex(value: &str) -> anyhow::Result<rag_rat_oplog::AccountId> {
+    anyhow::ensure!(
+        value.len() == 64,
+        "account id must be 64 hex characters (got {})",
+        value.len()
+    );
+    let mut bytes = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = rag_rat_base::hash::hex_nibble(pair[0])
+            .with_context(|| format!("account id has invalid hex at position {}", index * 2))?;
+        let low = rag_rat_base::hash::hex_nibble(pair[1])
+            .with_context(|| format!("account id has invalid hex at position {}", index * 2 + 1))?;
+        bytes[index] = high << 4 | low;
+    }
+    Ok(rag_rat_oplog::AccountId::from_bytes(bytes))
+}
+
+/// Configure the ACTIVE repo to contribute memories to `owner_account_hex` (paste flow, #1164):
+/// record the owner id so subsequent memory authoring targets the owner's stream via this account's
+/// Writer grant. Mints this store's local account (the identity the owner grants). Requires a
+/// stable repo scope and an owner id distinct from this account. The grant itself must be issued by
+/// the owner (`sync grant`) and synced before authoring succeeds.
+pub(crate) fn set_contribution_owner(
+    conn: &Connection,
+    owner_account_hex: &str,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    let repo_id =
+        memory_repo_scope(conn)?.context("sync contribute requires an active repo scope")?;
+    if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
+        || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
+    {
+        anyhow::bail!("sync contribute requires a stable repo identity (not legacy or local-only)");
+    }
+    let owner = parse_account_id_hex(owner_account_hex)?;
+    let local = rag_rat_oplog::local_account(conn, now_ms)?;
+    anyhow::ensure!(
+        owner != local,
+        "cannot contribute to your own account — the owner is a SEPARATE identity (its id from \
+         the owner's `sync whoami`)"
+    );
+    let canonical = rag_rat_base::hash::hex_lower(&owner.to_bytes());
+
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        memory_repo_scope(&tx)?.as_deref() == Some(repo_id.as_str()),
+        "active repo scope changed while starting sync contribute; retry"
+    );
+    rag_rat_db::meta::set_repo_meta(&tx, &repo_id, CONTRIBUTION_OWNER_META_KEY, &canonical)?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn explicit_stream_seal_policy(
@@ -535,7 +677,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
             &tx,
             stream,
             &ops,
-            &prepared.prepared,
+            prepared.owner_prepared()?,
             now_ms,
         )
         .with_context(|| {
@@ -582,7 +724,11 @@ fn prepare_owner_authoring(
     }
     let prepared =
         rag_rat_oplog::prepare_content_authoring(conn, stream, policy.seal_policy(), now_ms)?;
-    Ok(Some(PreparedOwnerAuthoring { repo_id: repo_id.to_string(), stream, policy, prepared }))
+    Ok(Some(PreparedOwnerAuthoring {
+        repo_id: repo_id.to_string(),
+        stream,
+        role: AuthoringRole::Owner { policy, prepared },
+    }))
 }
 
 pub(crate) fn prepare_live_authoring(
@@ -599,6 +745,22 @@ pub(crate) fn prepare_live_authoring(
         }
         return Ok(None);
     };
+    // Grantee mode (#1164): a granted contributor authors onto the CONFIGURED owner's stream via
+    // its grant. Grants target public plaintext streams, so the authorability guard uses
+    // Plaintext.
+    if let Some(ctx) = grantee_context(conn, &repo_id)? {
+        for op in ops {
+            reject_unauthorable_content_op(op, StreamSealPolicy::Plaintext)?;
+        }
+        return Ok(Some(PreparedOwnerAuthoring {
+            repo_id,
+            stream: ctx.stream,
+            role: AuthoringRole::Grantee {
+                owner_account: ctx.owner_account,
+                grant_id: ctx.grant_id,
+            },
+        }));
+    }
     let Some(stream) = stable_owner_stream_for_repo(conn, &repo_id)? else {
         for op in ops {
             reject_unauthorable_content_op(op, StreamSealPolicy::Plaintext)?;
@@ -677,7 +839,7 @@ pub(crate) fn enable_sealed_authoring(conn: &Connection, now_ms: i64) -> anyhow:
             &tx,
             stream,
             &ops,
-            &prepared.prepared,
+            prepared.owner_prepared()?,
             now_ms,
         )?;
     }
@@ -826,6 +988,13 @@ pub(crate) fn backfill_memory_oplog(conn: &Connection, now_ms: i64) -> anyhow::R
     let Some(repo_id) = memory_repo_scope(conn)? else {
         return Ok(());
     };
+    // A granted contributor does not own the stream: there is no `StreamOwn` to establish and no
+    // local owner history to reconcile — its live authoring goes straight to the owner's stream via
+    // the grant (#1164). The owner-only establish/reconcile below would try to author under local
+    // ownership and is skipped entirely.
+    if is_contribution_mode(conn, &repo_id)? {
+        return Ok(());
+    }
     sync_owner_stream(conn, &repo_id, now_ms)
 }
 
@@ -945,20 +1114,42 @@ fn author_in_owner_stream(
         memory_repo_scope(tx)?.as_deref() == Some(prepared.repo_id.as_str()),
         "prepared /3 authoring belongs to a different repo scope"
     );
-    anyhow::ensure!(
-        stream_seal_policy(tx, &prepared.repo_id, prepared.stream)? == prepared.policy,
-        "memory stream seal policy changed while preparing live authoring; retry"
-    );
+    // The whole-op authorability guard runs for both roles; a grant targets a public plaintext
+    // stream, so its guard policy is Plaintext.
+    let guard_policy = match &prepared.role {
+        AuthoringRole::Owner { policy, .. } => *policy,
+        AuthoringRole::Grantee { .. } => StreamSealPolicy::Plaintext,
+    };
     for op in ops {
-        reject_unauthorable_content_op(op, prepared.policy)?;
+        reject_unauthorable_content_op(op, guard_policy)?;
     }
-    rag_rat_oplog::author_prepared_content_batch_in_tx(
-        tx,
-        prepared.stream,
-        ops,
-        &prepared.prepared,
-        now_ms,
-    )?;
+    match &prepared.role {
+        AuthoringRole::Owner { policy, prepared: content } => {
+            anyhow::ensure!(
+                stream_seal_policy(tx, &prepared.repo_id, prepared.stream)? == *policy,
+                "memory stream seal policy changed while preparing live authoring; retry"
+            );
+            rag_rat_oplog::author_prepared_content_batch_in_tx(
+                tx,
+                prepared.stream,
+                ops,
+                content,
+                now_ms,
+            )?;
+        },
+        // Grantee: author onto the OWNER's stream citing the grant (#1164). No seal-policy recheck
+        // — the stream is the owner's and v1 grants are plaintext-public.
+        AuthoringRole::Grantee { owner_account, grant_id } => {
+            rag_rat_oplog::author_grantee_content_batch_in_tx(
+                tx,
+                prepared.stream,
+                *owner_account,
+                *grant_id,
+                ops,
+                now_ms,
+            )?;
+        },
+    }
     Ok(())
 }
 
