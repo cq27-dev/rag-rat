@@ -72,6 +72,11 @@ impl IndexDatabase {
         let repo_id = rag_rat_query::memory::memory_repo_scope(conn)?
             .context("sync publish requires an active repo scope")?;
         crate::index::consolidate::ensure_source_unsealed(source, &repo_id)?;
+        // BEFORE publishing: publishing establishes this store's own PublicRead stream and is a
+        // one-way ratchet, but a contributor's writes target the CONFIGURED owner's stream, so the
+        // seeded rows would have nowhere to be authored and the fresh public stream would stay
+        // empty while the CLI reported them seeded. Refuse while nothing irreversible has happened.
+        crate::memory_write::ensure_not_contributing(conn, &repo_id, "`sync publish --seed`")?;
         let published =
             crate::memory_write::enable_public_authoring(conn, rag_rat_base::time::now_ms())?;
         let imported_memories = crate::index::consolidate::seed_from_index(

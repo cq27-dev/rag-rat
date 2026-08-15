@@ -117,12 +117,22 @@ fn authoritative_content_stream(
         && rag_rat_oplog::read_local_account(conn)? != Some(owner)
     {
         // Contribution targets the owner's PublicRead stream (v1 public only).
-        return rag_rat_oplog::owner_stream_v2_id_for_account(
+        let stream = rag_rat_oplog::owner_stream_v2_id_for_account(
             repo_id,
             owner,
             rag_rat_oplog::AccessMode::PublicRead,
-        )
-        .map(Some);
+        )?;
+        // A DERIVED stream id is not yet an authority. `sync contribute` deliberately succeeds
+        // before the owner's log is synced (configure, then sync), and a mistyped owner id derives
+        // a stream that will never exist at all — in both cases the projection is EMPTY, and
+        // handing that to the drain would make the removal anti-joins condemn every synced row the
+        // repo currently reads. So authority begins only once the ownership fact has folded here.
+        // Until then this repo drains NOTHING: `None` rather than falling through to the local
+        // stream, whose own empty projection would condemn exactly the same rows.
+        if rag_rat_oplog::stream_owner_account(conn, stream)? != Some(owner) {
+            return Ok(None);
+        }
+        return Ok(Some(stream));
     }
     // Forward-derive the owner stream under the repo's access-mode intent — the SAME stream id the
     // live-write authored onto, so a published (PublicRead) repo drains its own public stream

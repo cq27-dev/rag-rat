@@ -214,6 +214,27 @@ fn is_contribution_mode(conn: &Connection, repo_id: &str) -> anyhow::Result<bool
     Ok(rag_rat_oplog::read_local_account(conn)? != Some(owner))
 }
 
+/// Refuse `operation` when `repo_id` is configured to contribute to another account. Both
+/// operations that reconcile IMPORTED rows (legacy consolidation, `sync publish --seed`) need a
+/// stream this store owns, which a contributor does not have — and both are irreversible enough
+/// that continuing on a half-applied import is worse than stopping.
+pub(crate) fn ensure_not_contributing(
+    conn: &Connection,
+    repo_id: &str,
+    operation: &str,
+) -> anyhow::Result<()> {
+    if let Some(owner) = contribution_owner_account(conn, repo_id)?
+        && rag_rat_oplog::read_local_account(conn)? != Some(owner)
+    {
+        anyhow::bail!(
+            "repo `{repo_id}` is configured to contribute memories to account {}, so it owns no \
+             memory stream of its own — {operation} is not supported in contribution mode",
+            rag_rat_base::hash::hex_lower(&owner.to_bytes()),
+        );
+    }
+    Ok(())
+}
+
 struct GranteeContext {
     owner_account: rag_rat_oplog::AccountId,
     stream: StreamId,
@@ -1035,13 +1056,18 @@ pub(crate) fn reconcile_owner_stream_for_repo(
     repo_id: &str,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    // Contribution mode runs NO reconcile, at EVERY entry point — not just the live-write one
-    // (`backfill_memory_oplog`). A granted contributor owns no stream for this repo: reconciling
-    // would establish one and re-author its `origin='local'` rows onto it, splitting the repo's
-    // memories across a stream nobody reads and the owner's stream where they already live.
-    if is_contribution_mode(conn, repo_id)? {
-        return Ok(());
-    }
+    // A granted contributor owns no stream for this repo, so this reconcile cannot run: it would
+    // establish one and author the imported rows onto a stream nobody reads, while the configured
+    // owner — where this repo's memories actually live — never receives them.
+    //
+    // FAIL, do not skip. Both callers (legacy consolidation, `sync publish --seed`) call this
+    // specifically to author freshly-IMPORTED rows, and consolidation renames the source database
+    // away once it returns. Reporting success without authoring would strand those rows with no
+    // `NodeCreate`, leaving every later update or status op on them inert — the import silently
+    // half-applied. Authoring them as a grantee is the real feature; until it exists, say so.
+    // (The live-write path skips silently instead, and correctly: `backfill_memory_oplog` has
+    // nothing to reconcile because each mutation already authors onto the owner's stream.)
+    ensure_not_contributing(conn, repo_id, "importing memories into this repo")?;
     sync_owner_stream(conn, repo_id, now_ms)
 }
 

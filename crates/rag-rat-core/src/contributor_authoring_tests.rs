@@ -223,18 +223,21 @@ fn a_contribution_keeps_its_local_authorship_while_received_content_stays_remova
     );
 }
 
-/// Contribution mode runs NO reconcile at EITHER entry point. The live-write one
-/// (`backfill_memory_oplog`) is gated, and so is the consolidation one — a contributor owns no
-/// stream for this repo, so reconciling would establish one and re-author its `origin='local'`
-/// rows onto a stream nobody reads, splitting the repo's memories in two.
+/// The import reconcile FAILS in contribution mode rather than establishing a stream the
+/// contributor does not own. Its callers author freshly-IMPORTED rows and then move on (legacy
+/// consolidation renames the source database away), so silently reporting success would strand
+/// those rows with no `NodeCreate` and leave every later op on them inert.
 #[test]
-fn a_contributor_never_reconciles_a_stream_of_its_own() {
+fn the_import_reconcile_refuses_in_contribution_mode_instead_of_half_applying() {
     let (_owner, contributor, _owner_account) = contribution_pair();
     create_memory(&contributor, concept("contributor-note")).unwrap();
-    crate::memory_write::reconcile_owner_stream_for_repo(&contributor, REPO, NOW).unwrap();
+    let err = crate::memory_write::reconcile_owner_stream_for_repo(&contributor, REPO, NOW)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("contribution mode"), "refuses with an actionable message: {err}");
 
-    // Scoped to the CONTRIBUTOR's account — the table also holds the owner's record, ingested with
-    // the owner's log.
+    // And it established nothing on the way out. Scoped to the CONTRIBUTOR's account — the table
+    // also holds the owner's record, ingested with the owner's log.
     let contributor_account = local_account(&contributor, NOW).unwrap();
     let owned: i64 = contributor
         .query_row(
@@ -243,18 +246,29 @@ fn a_contributor_never_reconciles_a_stream_of_its_own() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(owned, 0, "reconcile established no stream for the contributor");
-    let own_stream = rag_rat_oplog::owned_stream_v2_id(&contributor, REPO).unwrap().unwrap();
-    let on_own_stream: i64 = contributor
-        .query_row(
-            "SELECT COUNT(*) FROM content_entries WHERE stream_id = ?1",
-            [own_stream.to_bytes().as_slice()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        on_own_stream, 0,
-        "and authored nothing onto it — the owner's stream has the memory"
+    assert_eq!(owned, 0, "no stream established for the contributor");
+}
+
+/// A configured owner is not yet an AUTHORITY. `sync contribute` succeeds before the owner's log
+/// is synced (configure, then sync), and a mistyped owner id derives a stream that never exists —
+/// both leave an EMPTY projection. Draining it would let the removal anti-joins condemn every
+/// synced row the repo currently reads, so the drain does nothing until ownership has folded.
+#[test]
+fn an_unsynced_or_mistyped_owner_never_becomes_removal_authority() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    crate::drain_synced_memory(&contributor).unwrap();
+    assert!(memory_titles(&contributor).contains(&"owner-note".to_string()));
+
+    // Re-point at an owner whose log was never synced (the mistyped-id / configure-before-sync
+    // case): `set_contribution_owner` clears the incoming stream's watermark, so the next drain
+    // would otherwise make a FULL pass over an empty projection.
+    crate::memory_write::set_contribution_owner(&contributor, &"ab".repeat(32), NOW).unwrap();
+    crate::drain_synced_memory(&contributor).unwrap();
+
+    let titles = memory_titles(&contributor);
+    assert!(
+        titles.contains(&"owner-note".to_string()),
+        "an unverified owner stream removes nothing: {titles:?}",
     );
 }
 
