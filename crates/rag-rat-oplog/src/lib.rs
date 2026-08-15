@@ -150,7 +150,8 @@ pub use content_projection::{
 // `oplog_meta`) so the memory drain skips its O(projection) scan when nothing changed since it
 // last ran — the store-global watcher pass would otherwise re-scan every stream every pass.
 pub use content_projection::{
-    content_drain_needed, content_projection_epoch, record_content_drained,
+    clear_content_drain_watermark, content_drain_needed, content_projection_epoch,
+    record_content_drained,
 };
 // The op-log's first crate-internal API surface (#524): the MINTING primitives + the op
 // vocabulary the memory subsystem needs to author + backfill entries. Every submodule above is

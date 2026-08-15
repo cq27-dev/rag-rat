@@ -173,6 +173,23 @@ impl PreparedOwnerAuthoring {
     }
 }
 
+/// The `origin` a live write stamps on the `repo_memories` / `repo_node_edges` row it is authoring
+/// for — `'local'` normally, `'synced'` for a granted contributor (#1164).
+///
+/// A contributor's row is backed by the OWNER's stream projection, not by a pending local edit this
+/// store will reconcile later: contribution mode has no reconcile (`backfill_memory_oplog` skips
+/// it). Stamping `'synced'` is what places the row under the drain's authority, so when an
+/// authority refold later condemns the entry (a revoked grant, a device cut ordered before it) the
+/// drain's `origin='synced'` removal anti-join drops the row. Left `'local'` it would be
+/// unreachable by every mechanism — not pending, not repaired, just permanently readable content
+/// the projection no longer accepts.
+pub(crate) fn live_write_origin(prepared: Option<&PreparedOwnerAuthoring>) -> &'static str {
+    match prepared.map(|p| &p.role) {
+        Some(AuthoringRole::Grantee { .. }) => "synced",
+        _ => "local",
+    }
+}
+
 /// The `repo_meta` key holding the account this repo contributes memories to (the paste-flow owner
 /// id, set by `sync contribute`). Absent = this store authors its own owner stream.
 pub(crate) const CONTRIBUTION_OWNER_META_KEY: &str = "memory_contribution_owner";
@@ -289,6 +306,18 @@ pub(crate) fn set_contribution_owner(
         "active repo scope changed while starting sync contribute; retry"
     );
     rag_rat_db::meta::set_repo_meta(&tx, &repo_id, CONTRIBUTION_OWNER_META_KEY, &canonical)?;
+    // This repo's AUTHORITATIVE content stream just changed (see
+    // `drain::authoritative_content_stream` — exactly one materializes the repo). Forget the
+    // incoming stream's drain watermark so the next drain makes a FULL pass: only that runs the
+    // removal anti-joins that clear whatever the OUTGOING stream materialized. Re-pointing back
+    // at a previously-drained owner would otherwise short-circuit on a watermark that is still
+    // current and leave the other owner's memories in place.
+    let stream = rag_rat_oplog::owner_stream_v2_id_for_account(
+        &repo_id,
+        owner,
+        rag_rat_oplog::AccessMode::PublicRead,
+    )?;
+    rag_rat_oplog::clear_content_drain_watermark(&tx, stream)?;
     tx.commit()?;
     Ok(())
 }

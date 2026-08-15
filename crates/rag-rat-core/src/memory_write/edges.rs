@@ -111,9 +111,9 @@ pub(crate) fn add_edge(
         "
         INSERT INTO repo_node_edges(
             edge_key, repo_id, source_node_id, relation, target_repo_id, target_kind,
-            target_anchor, target_node_id, anchor_status, created_at_ms
+            target_anchor, target_node_id, anchor_status, created_at_ms, origin
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         ON CONFLICT(edge_key) DO UPDATE SET
             target_repo_id = excluded.target_repo_id,
             target_node_id = excluded.target_node_id,
@@ -129,7 +129,8 @@ pub(crate) fn add_edge(
             target_anchor,
             target_node_id,
             anchor_status,
-            now
+            now,
+            authoring::live_write_origin(prepared.as_ref())
         ],
     )?;
     if edge_is_new {

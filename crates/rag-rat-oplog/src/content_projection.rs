@@ -312,6 +312,21 @@ pub fn record_content_drained(tx: &Transaction<'_>, stream_id: StreamId) -> anyh
     Ok(())
 }
 
+/// Forget `stream`'s drain watermark, so the next [`content_drain_needed`] is `true` and the drain
+/// makes a FULL pass. Needed when a repo's AUTHORITATIVE content stream changes (a contributor
+/// re-points at a different owner): the incoming stream may already be watermarked at its current
+/// epoch, and only a full pass runs the removal anti-joins that clear the OUTGOING stream's
+/// materialized rows — without this the repo keeps showing the old stream's memories.
+pub fn clear_content_drain_watermark(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+) -> anyhow::Result<()> {
+    tx.execute("DELETE FROM oplog_meta WHERE key = 'content:drain-wm:' || hex(?1)", params![
+        stream_id.to_bytes().as_slice()
+    ])?;
+    Ok(())
+}
+
 /// Rewrite one stream's rows in `content_projected_nodes` / `content_projected_edges` — clear the
 /// stream's prior rows, then insert the folded state (mirrors [`crate::store::reproject`]).
 fn write_projection(

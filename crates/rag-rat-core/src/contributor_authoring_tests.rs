@@ -74,8 +74,10 @@ fn sync_account_into(dst: &Connection, src: &Connection, account: rag_rat_oplog:
     settle_pending_content_refolds(dst, &ContentRefoldBudget::unbounded(), NOW).unwrap();
 }
 
-#[test]
-fn a_configured_contributor_authors_onto_the_owners_stream() {
+/// An owner that published + authored `owner-note` and granted a SEPARATE contributor identity
+/// Writer, with the owner's log synced in and contribution configured on the contributor side.
+/// Returns `(owner, contributor, owner_account)`.
+fn contribution_pair() -> (Connection, Connection, rag_rat_oplog::AccountId) {
     // OWNER: publish, author, and mint its account.
     let owner = scoped_conn();
     let owner_account = local_account(&owner, NOW).unwrap();
@@ -91,9 +93,16 @@ fn a_configured_contributor_authors_onto_the_owners_stream() {
     grant_repo_writer(&owner, contributor_account, NOW).unwrap();
     sync_account_into(&contributor, &owner, owner_account);
 
-    // Configure contribution (paste flow) and author.
+    // Configure contribution (the paste flow).
     let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
     crate::memory_write::set_contribution_owner(&contributor, &owner_hex, NOW).unwrap();
+    (owner, contributor, owner_account)
+}
+
+#[test]
+fn a_configured_contributor_authors_onto_the_owners_stream() {
+    let (_owner, contributor, owner_account) = contribution_pair();
+    let contributor_account = local_account(&contributor, NOW).unwrap();
     create_memory(&contributor, concept("contributor-note")).unwrap();
 
     // The contributor's memory is an ACCEPTED entry on the OWNER's stream, authored under the
@@ -136,6 +145,89 @@ fn a_configured_contributor_authors_onto_the_owners_stream() {
          {titles:?}",
     );
     assert!(titles.contains(&"contributor-note".to_string()), "and still sees its own: {titles:?}",);
+}
+
+/// EXACTLY ONE stream materializes a repo. A contributor's own owned stream is NOT it — nothing is
+/// ever authored there, so its projection is a rival authority whose removal anti-join reads every
+/// row the owner's stream materialized as condemned. Draining both would delete the owner's
+/// memories (and, on the next pass with a moved epoch, restore them and delete the contributor's) —
+/// a ping-pong the per-stream watermarks then freeze. Poison the local stream's projection and
+/// assert the drain never reads it.
+#[test]
+fn the_contributors_own_stream_is_not_a_rival_authority_over_the_repo() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    crate::drain_synced_memory(&contributor).unwrap();
+    assert!(memory_titles(&contributor).contains(&"owner-note".to_string()));
+
+    // Plant a row on the contributor's OWN owned stream and make that stream look freshly changed.
+    // If the drain still treated it as an authority it would materialize `local-stream-ghost` and
+    // condemn `owner-note` (absent from this projection) on the very next pass.
+    let own_stream = rag_rat_oplog::owned_stream_v2_id(&contributor, REPO).unwrap().unwrap();
+    contributor
+        .execute(
+            "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
+             VALUES (?1, 'ghost', ?2, 'active')",
+            params![
+                own_stream.to_bytes().as_slice(),
+                serde_json::json!({
+                    "kind": "Concept", "title": "local-stream-ghost", "body": "b",
+                    "confidence": "high", "source": "agent", "tags": [], "payload": null,
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+    let tx = contributor.unchecked_transaction().unwrap();
+    rag_rat_oplog::clear_content_drain_watermark(&tx, own_stream).unwrap();
+    tx.commit().unwrap();
+
+    crate::drain_synced_memory(&contributor).unwrap();
+    let titles = memory_titles(&contributor);
+    assert!(
+        titles.contains(&"owner-note".to_string()),
+        "the owner's stream stays authoritative: {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"local-stream-ghost".to_string()),
+        "the contributor's own stream is not drained into the repo: {titles:?}",
+    );
+}
+
+/// A contributor's row is backed by the OWNER's projection, not by a pending local edit awaiting a
+/// reconcile that contribution mode never runs — so it is stamped `origin='synced'` and the drain's
+/// removal anti-join can reach it. When an authority refold condemns the entry, the row must stop
+/// being readable; stamped `'local'` it would be immortal.
+#[test]
+fn a_condemned_contribution_stops_being_readable() {
+    let (_owner, contributor, owner_account) = contribution_pair();
+    create_memory(&contributor, concept("contributor-note")).unwrap();
+    let origin: String = contributor
+        .query_row("SELECT origin FROM repo_memories WHERE title = 'contributor-note'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(origin, "synced", "a contribution is stream-backed, not a pending local edit");
+
+    // A refold condemns the entry: its node leaves the owner-stream projection.
+    let owner_stream =
+        owner_stream_v2_id_for_account(REPO, owner_account, AccessMode::PublicRead).unwrap();
+    contributor
+        .execute(
+            "DELETE FROM content_projected_nodes WHERE stream_id = ?1 AND node_id IN
+                 (SELECT id FROM repo_memories WHERE title = 'contributor-note')",
+            params![owner_stream.to_bytes().as_slice()],
+        )
+        .unwrap();
+    let tx = contributor.unchecked_transaction().unwrap();
+    rag_rat_oplog::clear_content_drain_watermark(&tx, owner_stream).unwrap();
+    tx.commit().unwrap();
+
+    crate::drain_synced_memory(&contributor).unwrap();
+    let titles = memory_titles(&contributor);
+    assert!(
+        !titles.contains(&"contributor-note".to_string()),
+        "a condemned contribution is removed, not left permanently readable: {titles:?}",
+    );
 }
 
 #[test]
