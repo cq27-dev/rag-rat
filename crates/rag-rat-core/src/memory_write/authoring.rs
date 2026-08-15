@@ -1061,10 +1061,16 @@ pub(crate) fn reconcile_owner_stream_for_repo(
     // owner — where this repo's memories actually live — never receives them.
     //
     // FAIL, do not skip. Both callers (legacy consolidation, `sync publish --seed`) call this
-    // specifically to author freshly-IMPORTED rows, and consolidation renames the source database
-    // away once it returns. Reporting success without authoring would strand those rows with no
-    // `NodeCreate`, leaving every later update or status op on them inert — the import silently
-    // half-applied. Authoring them as a grantee is the real feature; until it exists, say so.
+    // specifically to author freshly-IMPORTED rows. Reporting success without authoring would
+    // strand them with no `NodeCreate`, leaving every later update or status op on them inert.
+    // Authoring them as a grantee is the real feature; until it exists, say so.
+    //
+    // This is the BACKSTOP, not the gate. By the time control reaches here the import has already
+    // committed, so failing leaves the very half-applied state the refusal exists to prevent —
+    // which is why both callers refuse BEFORE their irreversible step (`consolidate::run_inner`
+    // before importing, `sync_publish_seed` before publishing). Keep this arm so a future third
+    // caller fails loudly instead of silently skipping, and give it the same pre-check.
+    //
     // (The live-write path skips silently instead, and correctly: `backfill_memory_oplog` has
     // nothing to reconcile because each mutation already authors onto the owner's stream.)
     ensure_not_contributing(conn, repo_id, "importing memories into this repo")?;

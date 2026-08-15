@@ -301,6 +301,19 @@ fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<Cons
         &crate::index::migration_hooks(),
     )?;
 
+    // Refuse a contribution-configured target BEFORE any import side effect. The reconcile that
+    // signs the imported rows onto an owned stream cannot run for a contributor (it owns none), and
+    // it is reached only AFTER `import_from_source` has committed — so failing there would leave
+    // exactly the half-applied state it exists to prevent: persisted rows and FTS children with no
+    // `NodeCreate`, re-imported and re-failed on every retry. Stopping here leaves the legacy file
+    // unrenamed and the target untouched, so the run is retryable once the repo is no longer
+    // configured to contribute.
+    crate::memory_write::ensure_not_contributing(
+        target_conn,
+        &repo_id,
+        "consolidating a legacy index",
+    )?;
+
     // Bring the SOURCE to current schema too (read-write, under the source-side locks held above,
     // and about to be renamed `.imported` anyway): an old-vintage legacy DB this binary never
     // opened keeps its model meta in the pre-V039 `index_meta`/`reconcile_meta` tables, and the
