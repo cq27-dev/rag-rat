@@ -90,9 +90,9 @@ pub(crate) fn create_memory(
         "
         INSERT INTO repo_memories(
             id, kind, title, body, confidence, status, created_by, created_at_ms, updated_at_ms,
-            source, payload_json, source_text_hash, input_hash, memory_version, origin
+            source, payload_json, source_text_hash, input_hash, memory_version
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?7, ?8, ?9, ?10, ?11, 'v1', ?12)
+        VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?7, ?8, ?9, ?10, ?11, 'v1')
         ",
         params![
             id,
@@ -105,8 +105,7 @@ pub(crate) fn create_memory(
             source,
             request.payload_json,
             binding.as_ref().and_then(|b| b.source_text_hash.clone()),
-            input_hash,
-            authoring::live_write_origin(prepared.as_ref())
+            input_hash
         ],
     )?;
     // Unanchored nodes (#463) skip binding writes entirely — nothing to insert or auto-moniker.

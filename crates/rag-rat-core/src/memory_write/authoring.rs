@@ -173,22 +173,19 @@ impl PreparedOwnerAuthoring {
     }
 }
 
-/// The `origin` a live write stamps on the `repo_memories` / `repo_node_edges` row it is authoring
-/// for — `'local'` normally, `'synced'` for a granted contributor (#1164).
-///
-/// A contributor's row is backed by the OWNER's stream projection, not by a pending local edit this
-/// store will reconcile later: contribution mode has no reconcile (`backfill_memory_oplog` skips
-/// it). Stamping `'synced'` is what places the row under the drain's authority, so when an
-/// authority refold later condemns the entry (a revoked grant, a device cut ordered before it) the
-/// drain's `origin='synced'` removal anti-join drops the row. Left `'local'` it would be
-/// unreachable by every mechanism — not pending, not repaired, just permanently readable content
-/// the projection no longer accepts.
-pub(crate) fn live_write_origin(prepared: Option<&PreparedOwnerAuthoring>) -> &'static str {
-    match prepared.map(|p| &p.role) {
-        Some(AuthoringRole::Grantee { .. }) => "synced",
-        _ => "local",
-    }
-}
+// A granted contributor's rows stay `origin='local'`, which is their AUTHORSHIP: this store wrote
+// them, and `origin` is what `ImportMode::SeedPublic` reads to decide whose memories a public seed
+// carries. It is deliberately NOT re-purposed to mean "under the drain's removal authority" — those
+// two meanings diverge for exactly these rows (locally authored, yet projected on another account's
+// stream), and one column cannot carry both.
+//
+// The consequence is bounded and accepted: when an authority refold condemns a contribution (a
+// revoked grant, a device cut ordered before it), the owner's stream stops accepting and serving
+// it, but the contributor keeps its own copy of its own writing. Content this store RECEIVED is
+// `origin='synced'` and the drain's anti-join does remove it, so a revoke never leaves another
+// account's condemned content readable here. Separating the two would need a third `origin` value
+// (a CHECK rewrite on both tables) — worth it only once a case appears where a contributor must
+// forget what it authored itself.
 
 /// The `repo_meta` key holding the account this repo contributes memories to (the paste-flow owner
 /// id, set by `sync contribute`). Absent = this store authors its own owner stream.
@@ -1038,6 +1035,13 @@ pub(crate) fn reconcile_owner_stream_for_repo(
     repo_id: &str,
     now_ms: i64,
 ) -> anyhow::Result<()> {
+    // Contribution mode runs NO reconcile, at EVERY entry point — not just the live-write one
+    // (`backfill_memory_oplog`). A granted contributor owns no stream for this repo: reconciling
+    // would establish one and re-author its `origin='local'` rows onto it, splitting the repo's
+    // memories across a stream nobody reads and the owner's stream where they already live.
+    if is_contribution_mode(conn, repo_id)? {
+        return Ok(());
+    }
     sync_owner_stream(conn, repo_id, now_ms)
 }
 

@@ -193,40 +193,68 @@ fn the_contributors_own_stream_is_not_a_rival_authority_over_the_repo() {
     );
 }
 
-/// A contributor's row is backed by the OWNER's projection, not by a pending local edit awaiting a
-/// reconcile that contribution mode never runs — so it is stamped `origin='synced'` and the drain's
-/// removal anti-join can reach it. When an authority refold condemns the entry, the row must stop
-/// being readable; stamped `'local'` it would be immortal.
+/// `origin` is AUTHORSHIP, not drain authority. A contribution is written by THIS store, so it
+/// stays `'local'` — that is what a public seed (`origin='local'` only) reads to decide whose
+/// memories it carries, and re-purposing the column to mean "removable by the drain" would silently
+/// drop every grantee write from a seed. The accepted consequence: a condemned contribution stays
+/// readable HERE (this store's own writing), while content it RECEIVED is `'synced'` and the
+/// drain's anti-join does remove it — a revoke never leaves another account's condemned content
+/// behind.
 #[test]
-fn a_condemned_contribution_stops_being_readable() {
-    let (_owner, contributor, owner_account) = contribution_pair();
+fn a_contribution_keeps_its_local_authorship_while_received_content_stays_removable() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
     create_memory(&contributor, concept("contributor-note")).unwrap();
-    let origin: String = contributor
-        .query_row("SELECT origin FROM repo_memories WHERE title = 'contributor-note'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(origin, "synced", "a contribution is stream-backed, not a pending local edit");
+    crate::drain_synced_memory(&contributor).unwrap();
 
-    // A refold condemns the entry: its node leaves the owner-stream projection.
-    let owner_stream =
-        owner_stream_v2_id_for_account(REPO, owner_account, AccessMode::PublicRead).unwrap();
-    contributor
-        .execute(
-            "DELETE FROM content_projected_nodes WHERE stream_id = ?1 AND node_id IN
-                 (SELECT id FROM repo_memories WHERE title = 'contributor-note')",
-            params![owner_stream.to_bytes().as_slice()],
+    let origin = |title: &str| -> String {
+        contributor
+            .query_row("SELECT origin FROM repo_memories WHERE title = ?1", [title], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        origin("contributor-note"),
+        "local",
+        "this store authored it, so a public seed must still carry it",
+    );
+    assert_eq!(
+        origin("owner-note"),
+        "synced",
+        "content received from the owner's stream stays under the drain's removal authority",
+    );
+}
+
+/// Contribution mode runs NO reconcile at EITHER entry point. The live-write one
+/// (`backfill_memory_oplog`) is gated, and so is the consolidation one — a contributor owns no
+/// stream for this repo, so reconciling would establish one and re-author its `origin='local'`
+/// rows onto a stream nobody reads, splitting the repo's memories in two.
+#[test]
+fn a_contributor_never_reconciles_a_stream_of_its_own() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    create_memory(&contributor, concept("contributor-note")).unwrap();
+    crate::memory_write::reconcile_owner_stream_for_repo(&contributor, REPO, NOW).unwrap();
+
+    // Scoped to the CONTRIBUTOR's account — the table also holds the owner's record, ingested with
+    // the owner's log.
+    let contributor_account = local_account(&contributor, NOW).unwrap();
+    let owned: i64 = contributor
+        .query_row(
+            "SELECT COUNT(*) FROM account_stream_ownership WHERE account_id = ?1",
+            [contributor_account.to_bytes().as_slice()],
+            |r| r.get(0),
         )
         .unwrap();
-    let tx = contributor.unchecked_transaction().unwrap();
-    rag_rat_oplog::clear_content_drain_watermark(&tx, owner_stream).unwrap();
-    tx.commit().unwrap();
-
-    crate::drain_synced_memory(&contributor).unwrap();
-    let titles = memory_titles(&contributor);
-    assert!(
-        !titles.contains(&"contributor-note".to_string()),
-        "a condemned contribution is removed, not left permanently readable: {titles:?}",
+    assert_eq!(owned, 0, "reconcile established no stream for the contributor");
+    let own_stream = rag_rat_oplog::owned_stream_v2_id(&contributor, REPO).unwrap().unwrap();
+    let on_own_stream: i64 = contributor
+        .query_row(
+            "SELECT COUNT(*) FROM content_entries WHERE stream_id = ?1",
+            [own_stream.to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        on_own_stream, 0,
+        "and authored nothing onto it — the owner's stream has the memory"
     );
 }
 
