@@ -347,6 +347,24 @@ pub(crate) enum SyncCommand {
         #[arg(value_name = "OWNER_ACCOUNT_ID")]
         account: String,
     },
+    /// Fetch ANOTHER account's memories from a peer that serves them.
+    #[command(long_about = "Syncs a DIFFERENT account's log and memories from a peer, then \
+                            materializes them locally. This is how a contributor gets the \
+                            owner's memories, and how an owner collects a contributor's — each \
+                            side syncs the other's account. Normally you do not run this: the \
+                            resident sync host does it automatically after a HEAD change. Reach \
+                            for it when automation is off or you want the fetch now. The peer \
+                            must be serving (`rag-rat sync serve`) and reachable via --peer or \
+                            [sync] server_peers.")]
+    Pull {
+        /// The 64-hex account id to fetch, from that side's `rag-rat sync whoami`.
+        #[arg(value_name = "ACCOUNT_ID")]
+        account: String,
+        /// Node id of the peer serving that account. Defaults to the configured
+        /// `[sync] server_peers`.
+        #[arg(long, value_name = "NODE_ID")]
+        peer: Option<String>,
+    },
 }
 
 /// Roster role an operator grants a joining device at `sync init` time. Mirrors

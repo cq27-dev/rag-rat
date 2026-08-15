@@ -1966,3 +1966,151 @@ async fn an_entry_for_another_account_is_not_stored() {
         "the other account was not grown through my session",
     );
 }
+
+/// The round trip #1164 never had: a granted CONTRIBUTOR authors onto the OWNER's stream, and the
+/// owner collects that memory **over the wire** by pulling the CONTRIBUTOR's account.
+///
+/// Why the owner must pull the contributor and not the reverse: content is offered by AUTHOR
+/// (`content_entries_for_sync` filters `author_account_id`), so the contributor's entries — though
+/// they live on the owner's stream — are only ever offered by a session scoped to the CONTRIBUTOR's
+/// account. Every merged #1164 test moved logs with direct `account_ingest`, which hid the fact
+/// that no session did this.
+///
+/// The dialer policy is the load-bearing detail: on first contact the owner holds zero roster facts
+/// for the contributor, so `authorize` returns `Unavailable`. Under `Closed` that is `Unauthorized`
+/// and the pull fails outright; `PublicRead` maps it to the ReadWrite bootstrap fallback.
+#[tokio::test]
+async fn an_owner_collects_a_contributors_memory_by_pulling_the_contributors_account() {
+    use rag_rat_oplog::{
+        AccessMode, ContentRefoldBudget, MemoryOp, NodeContent, NodeId,
+        author_grantee_content_batch_in_tx, author_stream_grant_in_tx, content_entries_for_sync,
+        effective_writer_grant, owner_stream_v2_id_for_account, settle_pending_content_refolds,
+    };
+    use rag_rat_sync::{
+        AuthPolicy, CONTENT_SYNC_ALPN, OplogContentSyncStore, OplogSyncStore, SYNC_ALPN,
+        accept_and_dispatch, connect_and_sync,
+    };
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    // OWNER: a published account owning the repo's memory stream.
+    let (owner, owner_account, owner_log, _entry) = public_stream_content_from_another_account();
+    let owner_stream =
+        owner_stream_v2_id_for_account("repo-pub", owner_account, AccessMode::PublicRead).unwrap();
+
+    // CONTRIBUTOR: a separate identity, granted Writer by the owner.
+    let contributor = fresh_db();
+    let contributor_account = local_account(&contributor, NOW).unwrap();
+    assert_ne!(owner_account, contributor_account, "separate identities");
+    {
+        let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+        author_stream_grant_in_tx(
+            &tx,
+            owner_stream,
+            contributor_account,
+            rag_rat_oplog::GrantRole::Writer,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    // The contributor learns the grant by syncing the owner's log (the direction PR 1's `sync pull`
+    // serves; modelled here by ingest so this test isolates the OTHER direction).
+    let _ = &owner_log; // captured before the grant; re-read below so the grant is included.
+    for entry in rag_rat_oplog::account_entries_for_sync(&owner, owner_account).unwrap() {
+        rag_rat_oplog::account_ingest(&contributor, &entry.signed_bytes, NOW).unwrap();
+    }
+    settle_pending_content_refolds(&contributor, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+    let grant_id =
+        effective_writer_grant(&contributor, owner_account, owner_stream, contributor_account)
+            .unwrap()
+            .expect("the grant reached the contributor");
+
+    // The contribution: authored under the CONTRIBUTOR's identity, onto the OWNER's stream.
+    {
+        let tx = Transaction::new_unchecked(&contributor, TransactionBehavior::Immediate).unwrap();
+        author_grantee_content_batch_in_tx(
+            &tx,
+            owner_stream,
+            owner_account,
+            grant_id,
+            &[MemoryOp::NodeCreate {
+                node_id: NodeId::from("contributed-1"),
+                content: NodeContent {
+                    kind: "Invariant".into(),
+                    title: "from the contributor".into(),
+                    body: "body".into(),
+                    confidence: "high".into(),
+                    source: "agent".into(),
+                    tags: Vec::new(),
+                    payload: None,
+                },
+            }],
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        content_entries_for_sync(&contributor, contributor_account).unwrap().len(),
+        1,
+        "the contribution is offered under the CONTRIBUTOR's account, not the owner's",
+    );
+    assert!(
+        content_entries_for_sync(&owner, contributor_account).unwrap().is_empty(),
+        "premise: the owner does not hold it yet",
+    );
+
+    // THE PULL. Owner dials the contributor and syncs the CONTRIBUTOR's account: log first (content
+    // acceptance re-derives authority from it), then content.
+    let (contributor_ep, owner_ep) = loopback_endpoints().await;
+    let policy = AuthPolicy::PublicRead;
+    for alpn in [SYNC_ALPN, CONTENT_SYNC_ALPN] {
+        let mut serve_acc = OplogSyncStore::new(&contributor, contributor_account, || NOW);
+        let mut serve_cont = OplogContentSyncStore::new(&contributor, contributor_account, || NOW);
+        let server =
+            accept_and_dispatch(&contributor_ep, &mut serve_acc, &mut serve_cont, policy, || NOW);
+        if alpn == SYNC_ALPN {
+            let mut pull = OplogSyncStore::new(&owner, contributor_account, || NOW);
+            let client = connect_and_sync(
+                &owner_ep,
+                direct_addr(&contributor_ep),
+                alpn,
+                &mut pull,
+                policy,
+                NOW,
+            );
+            let (s, c) = tokio::join!(server, client);
+            assert_eq!(s.unwrap().0, alpn);
+            c.expect("pulling a foreign account's log must succeed on first contact");
+        } else {
+            let mut pull = OplogContentSyncStore::new(&owner, contributor_account, || NOW);
+            let client = connect_and_sync(
+                &owner_ep,
+                direct_addr(&contributor_ep),
+                alpn,
+                &mut pull,
+                policy,
+                NOW,
+            );
+            let (s, c) = tokio::join!(server, client);
+            assert_eq!(s.unwrap().0, alpn);
+            c.expect("pulling a foreign account's content must succeed");
+        }
+    }
+    settle_pending_content_refolds(&owner, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+
+    // The owner now holds the contribution, ACCEPTED on its own stream, authored by the
+    // contributor.
+    let accepted: i64 = owner
+        .query_row(
+            "SELECT COUNT(*) FROM content_entries
+             WHERE stream_id = ?1 AND author_account_id = ?2 AND accepted = 1",
+            rusqlite::params![
+                owner_stream.to_bytes().as_slice(),
+                contributor_account.to_bytes().as_slice()
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(accepted, 1, "the contributor's memory reached the owner over the wire, accepted");
+}

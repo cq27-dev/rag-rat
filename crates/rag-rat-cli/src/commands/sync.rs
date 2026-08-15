@@ -35,6 +35,7 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 ttl: Duration::from_secs(*ttl_secs),
             }),
         SyncCommand::Join { ticket } => return join(config, ticket),
+        SyncCommand::Pull { account, peer } => return pull(config, account, peer.as_deref()),
         SyncCommand::Enable
         | SyncCommand::Publish { .. }
         | SyncCommand::CatchUp { .. }
@@ -116,7 +117,10 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "note": "memory changes for this repo now target the owner's stream; the owner must `sync grant` this account and this store must sync the owner's log before authoring succeeds",
             }))
         },
-        SyncCommand::Serve { .. } | SyncCommand::Init { .. } | SyncCommand::Join { .. } =>
+        SyncCommand::Serve { .. }
+        | SyncCommand::Init { .. }
+        | SyncCommand::Join { .. }
+        | SyncCommand::Pull { .. } =>
             unreachable!("the network commands are dispatched before the write lock"),
     }
 }
@@ -614,6 +618,176 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
         }))?;
         anyhow::Ok(())
     })
+}
+
+/// Fetch a DIFFERENT account's log and content from a peer, then materialize them locally.
+///
+/// The escape hatch behind automatic sync (#1174): the resident host runs this same shape after a
+/// HEAD change, and an operator reaches for the command when automation is off. Cross-account
+/// contribution needs it in both directions — a contributor fetches the owner's memories, and an
+/// owner collects a contributor's — because content is offered by AUTHOR
+/// (`content_entries_for_sync` filters `author_account_id`), so each side must sync the OTHER's
+/// account to see what that side wrote.
+///
+/// Deliberately NOT a `sync join`: no enrollment, no `/5` table restore (foreign table streams are
+/// private account data, pinned `Closed`), and no founder-incarnation repair.
+fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyhow::Result<()> {
+    let target = parse_account_id_hex(account_hex)?;
+    let relay = effective_relay_url(config);
+
+    let lock_repo = locks::write_lock_repo_id(config);
+    let repo_lock = locks::WriteLock::acquire_timeout(
+        &config.database,
+        &lock_repo,
+        SERVE_SESSION_LOCK_TIMEOUT,
+    )?
+    .ok_or_else(|| anyhow!("the index write lock is busy (another writer is mid-pass); retry"))?;
+    let db = crate::open_index(config)?;
+    let node_key = {
+        let conn = db.connection();
+        // Pulling your OWN account is device sync, not a cross-account fetch — say so rather than
+        // opening a session that would work but confuse the mental model.
+        if rag_rat_oplog::read_local_account(conn)? == Some(target) {
+            bail!(
+                "that is this store's own account — use `rag-rat sync serve` on the other device \
+                 and let device sync run, or `sync join` to enroll a new one"
+            );
+        }
+        rag_rat_oplog::local_device(conn, time::now_ms())?;
+        node_secret(conn)?
+    };
+    drop(repo_lock);
+
+    let peers: Vec<String> = match peer_override {
+        Some(peer) => vec![peer.to_string()],
+        None => config.sync.server_peers.clone(),
+    };
+    if peers.is_empty() {
+        bail!(
+            "no peer to pull from: pass --peer <NODE_ID> or set [sync] server_peers. Discovery \
+             cannot find a FOREIGN account's host — its discovery tag derives from that account's \
+             own secret, which only its own devices hold"
+        );
+    }
+
+    let runtime =
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    runtime.block_on(async move {
+        let conn = db.connection();
+        let endpoint = rag_rat_sync::build_endpoint(*node_key, &relay)
+            .await
+            .with_context(|| format!("binding the sync endpoint over relay {relay}"))?;
+
+        let mut last_error: Option<String> = None;
+        let mut reached: Option<(String, usize, usize, bool)> = None;
+        for peer_id in &peers {
+            let addr = match rag_rat_sync::peer_addr(peer_id, &relay) {
+                Ok(addr) => addr,
+                Err(error) => {
+                    last_error = Some(format!("peer `{peer_id}` is not a valid node id: {error}"));
+                    continue;
+                },
+            };
+            // ACCOUNT LOG FIRST, then content: content acceptance re-derives authority from the
+            // account log, so a content session run first would park every candidate until a later
+            // settle. One command, correct order, nothing parked in the normal case.
+            //
+            // `PublicRead`, never `Closed`: on first contact this store holds ZERO roster facts for
+            // the foreign account, so `authorize` returns `Unavailable` — which `Closed` maps to
+            // `Unauthorized`, failing every first pull. `PublicRead` maps `Unavailable` + dialer to
+            // the ReadWrite bootstrap fallback built for exactly this. Admission is not trust:
+            // `account_ingest` / `content_ingest` re-verify every entry from scratch.
+            let mut account_store = OplogSyncStore::new(conn, target, time::now_ms);
+            let account_report = match rag_rat_sync::connect_and_reconcile(
+                &endpoint,
+                addr.clone(),
+                rag_rat_sync::SYNC_ALPN,
+                &mut account_store,
+                AuthPolicy::PublicRead,
+                time::now_ms,
+                rag_rat_sync::MAX_RECONCILE_ROUNDS,
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    last_error = Some(format!("{peer_id}: account log: {error}"));
+                    continue;
+                },
+            };
+            let mut content_store = OplogContentSyncStore::new(conn, target, time::now_ms);
+            let content_report = match rag_rat_sync::connect_and_reconcile(
+                &endpoint,
+                addr,
+                rag_rat_sync::CONTENT_SYNC_ALPN,
+                &mut content_store,
+                AuthPolicy::PublicRead,
+                time::now_ms,
+                rag_rat_sync::MAX_RECONCILE_ROUNDS,
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    last_error = Some(format!("{peer_id}: content: {error}"));
+                    continue;
+                },
+            };
+            reached = Some((
+                peer_id.clone(),
+                account_report.entries_newly_stored,
+                content_report.entries_newly_stored,
+                account_report.converged && content_report.converged,
+            ));
+            break;
+        }
+
+        let Some((peer_id, account_entries, content_entries, converged)) = reached else {
+            bail!(
+                "could not pull account {} from any configured peer: {}",
+                hash::hex_lower(&target.to_bytes()),
+                last_error.unwrap_or_else(|| "no peer reachable".to_string())
+            );
+        };
+
+        // Materialize what landed. The drain mirrors the accepted projection into `repo_memories`;
+        // in contribution mode it drains the CONFIGURED owner's stream, which is exactly the stream
+        // this pull just filled.
+        rag_rat_core::drain_synced_memory(conn)?;
+        rag_rat_core::resolve_synced_distill_anchors(conn)?;
+        db.fold_wal();
+
+        crate::print_output(&serde_json::json!({
+            "status": "pulled",
+            "account_id": hash::hex_lower(&target.to_bytes()),
+            "peer": peer_id,
+            "account_entries_stored": account_entries,
+            "content_entries_stored": content_entries,
+            "converged": converged,
+            "note": "memories from this account are now searchable locally; their code anchors do \
+                     not cross an account boundary, so they will not attach as drive-by context",
+        }))?;
+        anyhow::Ok(())
+    })
+}
+
+/// Decode a 64-hex account id for the CLI surface.
+fn parse_account_id_hex(value: &str) -> anyhow::Result<rag_rat_oplog::AccountId> {
+    let value = value.trim();
+    anyhow::ensure!(
+        value.len() == 64,
+        "an account id is 64 hex characters (got {}) — take it from `rag-rat sync whoami`",
+        value.len()
+    );
+    let mut bytes = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = hash::hex_nibble(pair[0])
+            .with_context(|| format!("account id has invalid hex at position {}", index * 2))?;
+        let low = hash::hex_nibble(pair[1])
+            .with_context(|| format!("account id has invalid hex at position {}", index * 2 + 1))?;
+        bytes[index] = high << 4 | low;
+    }
+    Ok(rag_rat_oplog::AccountId::from_bytes(bytes))
 }
 
 pub(crate) use rag_rat_core::sync_driver::{DeviceSyncOutcome, device_sync_run};

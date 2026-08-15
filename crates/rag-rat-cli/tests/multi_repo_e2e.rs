@@ -142,8 +142,11 @@ fn sync_enable_is_narrow_idempotent_and_help_is_honest() {
     assert!(help.contains("init"));
     assert!(help.contains("join"));
     assert!(!help.contains("disable"));
+    // `pull` exists (#1174) — it is how a store fetches ANOTHER account's memories. `push` does
+    // not, and is not an oversight: a contributor dialing an owner is admitted ReadOnly and cannot
+    // push, so replication runs pull-only in both directions.
+    assert!(help.contains("pull"));
     assert!(!help.contains("push"));
-    assert!(!help.contains("pull"));
 
     let enabled = run_ok(&root, &data_dir, &model_cache, &["--json", "sync", "enable"]);
     assert!(enabled.contains("\"status\": \"enabled\""));

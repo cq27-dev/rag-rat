@@ -355,8 +355,25 @@ pub fn account_is_public_kb(
     conn: &Connection,
     account: rag_rat_oplog::AccountId,
 ) -> anyhow::Result<bool> {
-    Ok(rag_rat_oplog::account_is_fully_public(conn, account)?
-        && !rag_rat_oplog::owned_streams_for_account(conn, account)?.is_empty())
+    if !rag_rat_oplog::account_is_fully_public(conn, account)? {
+        return Ok(false);
+    }
+    if !rag_rat_oplog::owned_streams_for_account(conn, account)?.is_empty() {
+        return Ok(true);
+    }
+    // A granted CONTRIBUTOR owns no stream at all (#1164) — it authors onto the owner's — so the
+    // owns-a-stream test alone would serve it `Closed` and nothing could ever pull its account log.
+    // That breaks the very direction contribution needs: content is offered by AUTHOR, so the owner
+    // collects a contributor's memories by syncing the CONTRIBUTOR's account, which requires the
+    // contributor to be servable. Holding an effective Writer grant is the same kind of deliberate
+    // act as publishing — it is not the vacuously-public fresh account the stream test exists to
+    // keep unexposed.
+    //
+    // The exposure is stated rather than implied: this makes the contributor's account log readable
+    // by ANY dialer, not just the owner, because public admission is anonymous. Grants imply a
+    // PublicRead stream, so the content it authored is public regardless; what this adds is the
+    // contributor's own roster metadata.
+    rag_rat_oplog::account_holds_effective_writer_grant(conn, account)
 }
 
 /// Maintain a serving host's discovery announcement independently of its inbound session loop.
@@ -982,6 +999,45 @@ mod tests {
         own_stream(&public, rag_rat_oplog::AccessMode::PublicRead);
         let public_account = rag_rat_oplog::local_account(&public, 1_000).unwrap();
         assert!(account_is_public_kb(&public, public_account).unwrap());
+    }
+
+    /// A granted CONTRIBUTOR owns no stream (#1164), so the owns-a-stream test alone would serve it
+    /// `Closed` and nothing could pull its account log — breaking the direction contribution needs,
+    /// since content is offered by AUTHOR and the owner collects a contributor's memories by
+    /// syncing the CONTRIBUTOR's account. Holding an effective Writer grant is the deliberate act
+    /// that distinguishes it from the vacuously-public fresh account the stream test guards.
+    #[test]
+    fn a_grant_holding_contributor_is_servable_even_though_it_owns_no_stream() {
+        let contributor = schema_conn();
+        let account = rag_rat_oplog::local_account(&contributor, 1_000).unwrap();
+        // Owns nothing: today's rule refuses it.
+        assert!(!account_is_public_kb(&contributor, account).unwrap());
+
+        // The owner's grant, as it lands after the contributor syncs the owner's log.
+        contributor
+            .execute(
+                "INSERT INTO account_stream_grants(
+                     owner_account_id, grant_id, stream_id, grantee_account_id, role, effective_at)
+                 VALUES (?1, ?2, ?3, ?4, 'writer', 1000)",
+                rusqlite::params![
+                    [0xAAu8; 32].as_slice(),
+                    [0xBBu8; 32].as_slice(),
+                    [0xCCu8; 32].as_slice(),
+                    account.to_bytes().as_slice(),
+                ],
+            )
+            .unwrap();
+        assert!(
+            account_is_public_kb(&contributor, account).unwrap(),
+            "a contributor holding an effective writer grant is servable",
+        );
+
+        // A CLOSED grant is not: a revoked contributor stops being servable on that basis alone.
+        contributor.execute("UPDATE account_stream_grants SET closed_at = 2000", []).unwrap();
+        assert!(
+            !account_is_public_kb(&contributor, account).unwrap(),
+            "a revoked grant no longer makes the account servable",
+        );
     }
 
     #[test]

@@ -130,8 +130,9 @@ pub use secrets::{
 pub use snapshot::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub use storage::{
     CapacityScope, IngestOutcome, SyncAccountEntry, account_effective_count,
-    account_entries_for_enrollment, account_entries_for_sync, account_entry_ref, account_ingest,
-    account_is_fully_public, account_signed_entry_exists, account_signed_hash, auth_len_freshness,
+    account_entries_for_enrollment, account_entries_for_sync, account_entry_ref,
+    account_holds_effective_writer_grant, account_ingest, account_is_fully_public,
+    account_signed_entry_exists, account_signed_hash, auth_len_freshness,
     backfill_authority_projection, effective_writer_grant, grant_effective_for_device,
     grant_effective_in_snapshot, owned_streams_for_account, owner_control_authority,
     owner_control_authority_in_snapshot, owner_secrets_authority, roster_content_authority,

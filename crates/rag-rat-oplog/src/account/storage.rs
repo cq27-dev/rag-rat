@@ -875,6 +875,26 @@ pub fn effective_writer_grant(
     grant_id.map(|bytes| fixed(&bytes)).transpose()
 }
 
+/// Whether `grantee_account_id` holds ANY effective (not-closed) Writer grant, on any owner's
+/// stream. Unlike [`effective_writer_grant`], which answers "may this account write to THIS
+/// stream", this answers "is this account a contributor at all" — the question the serve policy
+/// asks when deciding whether an account that owns no stream of its own is nonetheless a
+/// deliberately-participating identity worth serving (#1164), rather than a fresh empty account
+/// that must stay unexposed.
+pub fn account_holds_effective_writer_grant(
+    conn: &Connection,
+    grantee_account_id: AccountId,
+) -> anyhow::Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM account_stream_grants
+             WHERE grantee_account_id = ?1 AND role = ?2 AND closed_at IS NULL)",
+        params![grantee_account_id.to_bytes().as_slice(), GrantRole::Writer.as_db_str()],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
 /// Resolve a grant and the requesting device's revoke cut as ONE authorization decision. C2 must
 /// use this combined seam when admitting content: two independent calls could otherwise straddle
 /// a refold and combine an old effective grant with a new (or absent) cut projection.
