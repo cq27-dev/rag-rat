@@ -186,11 +186,13 @@ tree-sitter-typescript = "=0.23.2"
 # drop (already in the tree transitively via ed25519-dalek; pinned here as a direct dep).
 zeroize = "1"
 
-# `cc` compiles the bundled SQLite amalgamation at the profile's opt-level, which is 0 for
-# `cargo build`/`cargo test` — an unoptimized SQLite is dramatically slower at the heavy INSERT
-# workload the indexing tests run. Build just this one C-heavy dep at opt-level 3 so dev/test stays
-# fast; it's compiled once then cached.
-[profile.dev.package.libsqlite3-sys]
+# Dependencies build at the profile's opt-level, which is 0 for `cargo build`/`cargo test`. The
+# tests lean hard on compute-heavy deps — ed25519/x25519 signing and verification, SQLite's bundled
+# amalgamation, blake3/sha2, tree-sitter, zstd — and unoptimized they run one to two orders of
+# magnitude slower, which is most of the test suite's wall time. Build every non-workspace dep at
+# opt-level 3; they are compiled once and then cached, while the workspace crates stay at 0 so
+# incremental rebuilds of the code under edit remain fast.
+[profile.dev.package."*"]
 opt-level = 3
 
 # The profile that 'dist' will build with
