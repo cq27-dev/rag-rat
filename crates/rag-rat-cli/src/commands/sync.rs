@@ -635,6 +635,24 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
     let target = parse_account_id_hex(account_hex)?;
     let relay = effective_relay_url(config);
 
+    // The per-database SESSION lock, held for the whole pull. Any process that opens an iroh
+    // endpoint for a database must hold it: the endpoint identity comes from the persisted
+    // `sync_node_secret`, so a second endpoint binds the SAME node id and the two race relay
+    // registration and inbound sessions. A resident MCP host or `sync serve` holds this for its
+    // lifetime, which is exactly the common case here — an operator reaching for `pull` while the
+    // resident is up.
+    let _session = locks::WriteLock::acquire_sync_session_timeout(
+        &config.database,
+        SERVE_SESSION_LOCK_TIMEOUT,
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "another sync session already holds this database's node identity (a resident MCP \
+             host, a `serve` peer, or a device sync is running); stop it and retry, or let it do \
+             the pull for you"
+        )
+    })?;
+
     let lock_repo = locks::write_lock_repo_id(config);
     let repo_lock = locks::WriteLock::acquire_timeout(
         &config.database,

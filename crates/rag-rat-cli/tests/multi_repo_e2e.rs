@@ -1284,3 +1284,48 @@ fn sync_grant_requires_publish_then_authors_a_writer_grant() {
     // A malformed account id is rejected.
     assert!(db.sync_grant("not-a-valid-hex-account-id").is_err());
 }
+
+/// `sync pull` (#1174) must hold the per-database SESSION lock for its whole run. Every process
+/// that opens an iroh endpoint for a database has to: the endpoint identity comes from the
+/// persisted `sync_node_secret`, so a second endpoint binds the SAME node id and the two race relay
+/// registration and inbound sessions. A resident MCP host or `sync serve` holds this lock for its
+/// lifetime — exactly the situation an operator reaching for `pull` is usually in.
+#[test]
+fn sync_pull_refuses_while_another_session_holds_the_node_identity() {
+    let model_cache = unique_dir("pull-cache");
+    let root = keyless_repo("pull", &[("common.rs", chunky_fn("pull_anchor"))]);
+    let data_dir = unique_dir("pull-data");
+    run_ok(&root, &data_dir, &model_cache, &["index", "--full"]);
+
+    // Resolve the database the CLI itself would use, rather than re-deriving discovery here.
+    let dumped = run_ok(&root, &data_dir, &model_cache, &["--json", "dump-config"]);
+    let database: std::path::PathBuf = serde_json::from_str::<serde_json::Value>(&dumped)
+        .expect("dump-config emits JSON")["database"]
+        .as_str()
+        .expect("dump-config reports the resolved database path")
+        .into();
+    let held = rag_rat_base::locks::WriteLock::acquire_sync_session_timeout(
+        &database,
+        std::time::Duration::from_secs(5),
+    )
+    .expect("taking the session lock")
+    .expect("the session lock is free in a fresh fixture");
+
+    let out = run(&root, &data_dir, &model_cache, &["sync", "pull", &"ab".repeat(32)]);
+    assert!(!out.status.success(), "pull must refuse while another session holds the identity");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("node identity"),
+        "the refusal must name the conflict, not fail obscurely: {stderr}",
+    );
+
+    // Released, and the command gets past the lock (it then fails for want of a peer, which is a
+    // DIFFERENT and correct refusal — proving the lock was the only thing blocking it).
+    drop(held);
+    let out = run(&root, &data_dir, &model_cache, &["sync", "pull", &"ab".repeat(32)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("node identity"),
+        "with the lock free the identity conflict is gone: {stderr}",
+    );
+}

@@ -60,6 +60,9 @@ tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 tikv-jemalloc-ctl = "0.7"
 
 [dev-dependencies]
+# The sync-session lock lives in base; the `sync pull` test holds it to prove the command refuses
+# to bind a second endpoint on this database's node identity.
+rag-rat-base.workspace = true
 # MCP tool results render as TOON; integration tests decode them back to JSON Values to assert.
 toon-format.workspace = true
 tempfile.workspace = true
