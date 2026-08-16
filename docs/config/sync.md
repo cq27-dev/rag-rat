@@ -155,6 +155,14 @@ server_peers = ["<the node id `sync serve` printed>"]
 The trade is that a host you have not pinned becomes unreachable, so pin every host you intend to
 use — including any you add later.
 
+`server_peers` is also where cross-account hosts go: a contribution owner's host, or a
+contributor's. Discovery cannot find them — a foreign account's discovery tag derives from a
+secret only its own devices hold — so automatic cross-account sync dials only pinned peers. Once
+a pinned host answers for a foreign account, the device remembers which one and skips it during
+its own device sync (a host serves only its own account, so dialing it there could never
+succeed). Removing a host from `server_peers` stops all dialing to it, including remembered
+cross-account pulls.
+
 ## What each service learns
 
 - **The relay** forwards opaque encrypted QUIC traffic between peers.

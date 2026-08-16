@@ -782,8 +782,17 @@ async fn reconcile(
         },
     )
     .await;
-    let mut reached = vec![false; resolved.peers.len()];
-    for (index, (peer, address)) in resolved.peers.iter().enumerate() {
+    // Scope the DEVICE-sync phases to peers that can serve this account. A peer memoized as a
+    // FOREIGN-account host serves only its own account by construction, so dialing it here would
+    // fail the account-scope handshake, log a device-sync failure, and count an error on every
+    // cadence — while the cross-account pass below succeeds against the same host. Until the
+    // first successful foreign pull memoizes a host it is still dialed once per pass; that
+    // warmup noise is bounded and self-healing, unlike the permanent false alarm it replaces.
+    let foreign_hosts = foreign_pull_hosts(conn)?;
+    let device_peers: Vec<(String, rag_rat_sync::EndpointAddr)> =
+        resolved.peers.into_iter().filter(|(peer, _)| !foreign_hosts.contains(peer)).collect();
+    let mut reached = vec![false; device_peers.len()];
+    for (index, (peer, address)) in device_peers.iter().enumerate() {
         let mut store = OplogSyncStore::new(conn, account, time::now_ms);
         match rag_rat_sync::connect_and_reconcile(
             endpoint,
@@ -803,7 +812,7 @@ async fn reconcile(
     }
     ensure_founder_incarnations(conn)?;
     // A newly authored founder incarnation must reach peers before their table manifests run.
-    for (index, (peer, address)) in resolved.peers.iter().enumerate() {
+    for (index, (peer, address)) in device_peers.iter().enumerate() {
         if !reached[index] {
             continue;
         }
@@ -830,7 +839,7 @@ async fn reconcile(
             },
         }
     }
-    for (index, (peer, address)) in resolved.peers.iter().enumerate() {
+    for (index, (peer, address)) in device_peers.iter().enumerate() {
         if !reached[index] {
             continue;
         }
@@ -902,6 +911,33 @@ fn foreign_pull_targets(
 /// re-probing (and re-warning about) every configured peer that does not hold the account.
 const PULL_PEER_MEMO_PREFIX: &str = "sync_pull_peer:";
 
+/// Peers memoized as FOREIGN-account hosts. A production host serves only its OWN account, so
+/// the local-account (device sync) phase can never succeed against one of these — dialing them
+/// there fails the account-scope handshake and reads as a broken device sync every cadence.
+fn foreign_pull_hosts(conn: &Connection) -> anyhow::Result<Vec<String>> {
+    rag_rat_db::meta::meta_values_with_prefix(conn, PULL_PEER_MEMO_PREFIX)
+}
+
+/// The peers to dial for one foreign account, memoized answerer first. The memo ORDERS the
+/// configured peer set, never extends it: a host removed from `[sync] server_peers` must stop
+/// being dialed, so a memo that is no longer configured is cleared rather than honored.
+fn ordered_pull_peers(
+    conn: &Connection,
+    memo_key: &str,
+    peers: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let memo = rag_rat_db::meta::read_meta(conn, memo_key)?.filter(|peer| peers.contains(peer));
+    if memo.is_none() {
+        // Clears a decommissioned host's memo; a no-op when nothing was stored.
+        rag_rat_db::meta::delete_meta(conn, memo_key)?;
+    }
+    Ok(memo
+        .iter()
+        .chain(peers.iter().filter(|peer| Some(*peer) != memo.as_ref()))
+        .cloned()
+        .collect())
+}
+
 async fn pull_foreign_accounts(
     config: &Config,
     conn: &Connection,
@@ -925,24 +961,21 @@ async fn pull_foreign_accounts(
     for target in targets {
         let account_hex = hash::hex_lower(&target.to_bytes());
         let memo_key = format!("{PULL_PEER_MEMO_PREFIX}{account_hex}");
-        let memo = rag_rat_db::meta::read_meta(conn, &memo_key)?;
-        let ordered: Vec<(String, rag_rat_sync::EndpointAddr)> = memo
-            .iter()
-            .chain(peers.iter().filter(|peer| Some(*peer) != memo.as_ref()))
-            .filter_map(|peer| match rag_rat_sync::peer_addr(peer, &relay) {
-                Ok(addr) => Some((peer.clone(), addr)),
-                Err(error) => {
-                    tracing::warn!(peer, %error, "skipping cross-account peer: invalid node id");
-                    None
-                },
-            })
-            .collect();
+        let ordered: Vec<(String, rag_rat_sync::EndpointAddr)> = ordered_pull_peers(
+            conn, &memo_key, peers,
+        )?
+        .into_iter()
+        .filter_map(|peer| match rag_rat_sync::peer_addr(&peer, &relay) {
+            Ok(addr) => Some((peer, addr)),
+            Err(error) => {
+                tracing::warn!(peer, %error, "skipping cross-account peer: invalid node id");
+                None
+            },
+        })
+        .collect();
         let outcome = pull_account_via_peers(conn, endpoint, target, &ordered).await?;
         match outcome.peer {
-            Some(peer) =>
-                if memo.as_deref() != Some(peer.as_str()) {
-                    rag_rat_db::meta::set_meta(conn, &memo_key, &peer)?;
-                },
+            Some(peer) => rag_rat_db::meta::set_meta(conn, &memo_key, &peer)?,
             None => tracing::warn!(
                 account = %account_hex,
                 error = outcome.last_error.as_deref().unwrap_or("no peer reachable"),
@@ -1196,10 +1229,11 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PerPeerSessionLimiter, PersistedAdvertisement,
-        RESIDENT_NUDGE, RefusedPublication, account_is_public_kb, can_host, can_sync,
-        device_sync_run, foreign_pull_targets, nudge_resident_host, pull_account_via_peers,
-        read_advertisement, refused_publication_is_due, retry_is_due, write_advertisement,
+        DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PULL_PEER_MEMO_PREFIX, PerPeerSessionLimiter,
+        PersistedAdvertisement, RESIDENT_NUDGE, RefusedPublication, account_is_public_kb, can_host,
+        can_sync, device_sync_run, foreign_pull_hosts, foreign_pull_targets, nudge_resident_host,
+        ordered_pull_peers, pull_account_via_peers, read_advertisement, refused_publication_is_due,
+        retry_is_due, write_advertisement,
     };
 
     fn schema_conn() -> Connection {
@@ -1601,6 +1635,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(foreign_pull_targets(&store, local).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_memoized_peer_orders_the_configured_set_and_a_decommissioned_one_is_cleared() {
+        let conn = schema_conn();
+        let key = format!("{PULL_PEER_MEMO_PREFIX}aa");
+        let peers = vec!["node-a".to_string(), "node-b".to_string()];
+
+        // No memo: configured order, nothing stored.
+        assert_eq!(ordered_pull_peers(&conn, &key, &peers).unwrap(), peers);
+
+        // A memoized answerer moves to the front without duplicating.
+        rag_rat_db::meta::set_meta(&conn, &key, "node-b").unwrap();
+        assert_eq!(ordered_pull_peers(&conn, &key, &peers).unwrap(), vec![
+            "node-b".to_string(),
+            "node-a".to_string()
+        ]);
+
+        // Decommissioned: the memoized host left [sync] server_peers, so it is neither dialed
+        // nor kept — the memo orders the configured set, never extends it.
+        let remaining = vec!["node-a".to_string()];
+        assert_eq!(ordered_pull_peers(&conn, &key, &remaining).unwrap(), remaining);
+        assert_eq!(rag_rat_db::meta::read_meta(&conn, &key).unwrap(), None, "stale memo cleared");
+    }
+
+    #[test]
+    fn only_pull_memo_keys_mark_a_peer_as_a_foreign_host() {
+        let conn = schema_conn();
+        assert!(foreign_pull_hosts(&conn).unwrap().is_empty());
+        rag_rat_db::meta::set_meta(&conn, &format!("{PULL_PEER_MEMO_PREFIX}aa"), "node-f").unwrap();
+        // Unrelated meta keys — including other sync keys — never mark a device-sync peer.
+        rag_rat_db::meta::set_meta(&conn, RESIDENT_NUDGE, "5").unwrap();
+        rag_rat_db::meta::set_meta(&conn, "sync_pull_peerless", "node-x").unwrap();
+        assert_eq!(foreign_pull_hosts(&conn).unwrap(), vec!["node-f".to_string()]);
     }
 
     /// A relay-free endpoint pair for exercising the pull helper over a real wire.

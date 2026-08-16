@@ -283,6 +283,15 @@ pub fn delete_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The values of every `index_meta` key starting with `prefix`. GLOB (not LIKE) so `_` in a key
+/// prefix stays literal; callers pass fixed prefixes without GLOB metacharacters (`*?[`).
+pub fn meta_values_with_prefix(conn: &Connection, prefix: &str) -> anyhow::Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT value FROM index_meta WHERE key GLOB ?1 || '*' ORDER BY key")?;
+    let rows = stmt.query_map([prefix], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 pub fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
     Ok(conn
         .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
