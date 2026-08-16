@@ -1,6 +1,6 @@
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -38,7 +38,7 @@ impl ServerHandler for RagRatService {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let tools = crate::tools::TOOL_NAMES
             .iter()
@@ -50,10 +50,86 @@ impl ServerHandler for RagRatService {
                 Tool::new((*name).to_string(), crate::tools::description(name), input_schema)
             })
             .collect();
-        // `with_all_items` fills the SEP-2322 / SEP-2549 result fields with their protocol
-        // defaults (`result_type: complete`, no TTL, no cache scope). The whole catalog ships in
-        // one page, so there is no cursor; rmcp strips `result_type` again for peers that
-        // negotiated a protocol version predating the field.
-        Ok(ListToolsResult::with_all_items(tools))
+        // `with_all_items` fills the SEP-2322 result field with its protocol default
+        // (`result_type: complete`). The whole catalog ships in one page, so there is no cursor;
+        // rmcp strips `result_type` again for peers that negotiated a protocol version predating
+        // the field.
+        let mut result = ListToolsResult::with_all_items(tools);
+        // SEP-2549 makes `ttlMs` / `cacheScope` REQUIRED on list results as of protocol
+        // 2026-07-28 — strict clients reject a `tools/list` response without them, which bricks
+        // the whole server (no tools ever load). Immediately-stale public hints preserve the
+        // pre-SEP-2549 behavior (no client caching). Older peers may reject unknown fields, so
+        // the hints are gated on the negotiated version, mirroring rmcp's `#[tool_handler]`.
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        if supports_cache_hints {
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rmcp::model::ClientInfo;
+    use rmcp::{ClientHandler, ServiceExt};
+
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    struct VersionedClient {
+        protocol_version: ProtocolVersion,
+    }
+
+    impl ClientHandler for VersionedClient {
+        fn get_info(&self) -> ClientInfo {
+            let mut info = ClientInfo::default();
+            info.protocol_version = self.protocol_version.clone();
+            info
+        }
+    }
+
+    /// Drive `tools/list` through a real in-process client/server pair so the negotiated protocol
+    /// version reaches the handler exactly as it does over stdio.
+    async fn list_tools_at(protocol_version: ProtocolVersion) -> ListToolsResult {
+        let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
+        let service = RagRatService::new_dormant(rag_rat_core::OutputFormat::Json);
+        let server = tokio::spawn(async move {
+            service.serve(server_transport).await?.waiting().await?;
+            anyhow::Ok(())
+        });
+        let client = VersionedClient { protocol_version }
+            .serve(client_transport)
+            .await
+            .expect("client should connect");
+        let tools = client.list_tools(None).await.expect("tools/list should succeed");
+        client.cancel().await.expect("client should cancel");
+        server.await.expect("server task should join").expect("server should exit cleanly");
+        tools
+    }
+
+    /// SEP-2549: strict 2026-07-28 clients reject a `tools/list` response without `ttlMs` /
+    /// `cacheScope`, which bricks the whole server — no tools ever load.
+    #[tokio::test]
+    async fn list_tools_emits_required_cache_hints_for_2026_07_28() {
+        let tools = list_tools_at(ProtocolVersion::V_2026_07_28).await;
+        assert_eq!(
+            (tools.ttl_ms, tools.cache_scope),
+            (Some(0), Some(CacheScope::Public)),
+            "2026-07-28 peers must receive the required cache hints"
+        );
+    }
+
+    /// Peers on older protocol versions keep the pre-SEP-2549 wire shape: strict legacy clients
+    /// may reject unknown fields.
+    #[tokio::test]
+    async fn list_tools_omits_cache_hints_for_legacy_peers() {
+        let tools = list_tools_at(ProtocolVersion::V_2025_06_18).await;
+        assert_eq!(
+            (tools.ttl_ms, tools.cache_scope),
+            (None, None),
+            "legacy peers must keep the pre-SEP-2549 wire shape"
+        );
     }
 }

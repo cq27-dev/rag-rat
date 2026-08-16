@@ -47,6 +47,9 @@ windows-sys.workspace = true
 # Already built transitively via rag-rat-core; a direct dev-dep lets the busy-retry test (#220)
 # construct a SQLITE_BUSY error to drive `with_busy_retry`.
 rusqlite.workspace = true
+# `client` lets the cache-hint tests drive `list_tools` through a real in-process
+# client/server pair, exercising the negotiated-protocol-version gate end to end.
+rmcp = { workspace = true, features = ["client"] }
 tower = { version = "0.5", features = ["util"] }
 
 [features]

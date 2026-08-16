@@ -124,7 +124,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # when installed in the OS store; minimal Linux images must include a CA bundle. The transport is
 # driven on the papertrail module's private runtime at the sync boundary.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-rmcp = { version = "3.0.1", features = ["transport-io"] }
+rmcp = { version = "3.1.2", features = ["transport-io"] }
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 rayon = "1.12"
 regex = "1.13"
