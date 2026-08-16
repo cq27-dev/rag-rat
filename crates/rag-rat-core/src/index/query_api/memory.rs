@@ -21,24 +21,6 @@ pub struct PublishSeedReport {
     pub imported_memories: u64,
 }
 
-/// Decode a 64-hex account id (as `sync whoami` prints) into an [`rag_rat_oplog::AccountId`].
-fn parse_account_id_hex(value: &str) -> anyhow::Result<rag_rat_oplog::AccountId> {
-    anyhow::ensure!(
-        value.len() == 64,
-        "account id must be 64 hex characters (got {})",
-        value.len()
-    );
-    let mut bytes = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = rag_rat_base::hash::hex_nibble(pair[0])
-            .with_context(|| format!("account id has invalid hex at position {}", index * 2))?;
-        let low = rag_rat_base::hash::hex_nibble(pair[1])
-            .with_context(|| format!("account id has invalid hex at position {}", index * 2 + 1))?;
-        bytes[index] = high << 4 | low;
-    }
-    Ok(rag_rat_oplog::AccountId::from_bytes(bytes))
-}
-
 impl IndexDatabase {
     /// Permanently enable sealed local memory authoring for this repo. Existing suite-0 history is
     /// retained; subsequent live and reconcile entries use suite 1.
@@ -104,7 +86,7 @@ impl IndexDatabase {
     /// the active repo's owner stream (#1164), so that identity can author memories into this
     /// repo's shared set. Owner-only; requires a published repo. Returns the grant id as hex.
     pub fn sync_grant(&self, grantee_account_hex: &str) -> anyhow::Result<String> {
-        let grantee = parse_account_id_hex(grantee_account_hex)?;
+        let grantee = rag_rat_oplog::AccountId::from_hex(grantee_account_hex)?;
         let grant_id = crate::memory_write::grant_repo_writer(
             self.storage.connection(),
             grantee,

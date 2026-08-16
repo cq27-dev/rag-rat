@@ -200,7 +200,7 @@ pub(super) fn contribution_owner_account(
     let Some(hex) = rag_rat_db::meta::repo_meta(conn, repo_id, CONTRIBUTION_OWNER_META_KEY)? else {
         return Ok(None);
     };
-    Ok(Some(parse_account_id_hex(&hex)?))
+    Ok(Some(rag_rat_oplog::AccountId::from_hex(&hex)?))
 }
 
 /// Whether this repo authors as a granted CONTRIBUTOR — an owner is configured and it is not this
@@ -273,24 +273,6 @@ fn grantee_context(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<Gr
     Ok(Some(GranteeContext { owner_account, stream, grant_id }))
 }
 
-/// Decode a 64-hex account id into an [`rag_rat_oplog::AccountId`].
-fn parse_account_id_hex(value: &str) -> anyhow::Result<rag_rat_oplog::AccountId> {
-    anyhow::ensure!(
-        value.len() == 64,
-        "account id must be 64 hex characters (got {})",
-        value.len()
-    );
-    let mut bytes = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = rag_rat_base::hash::hex_nibble(pair[0])
-            .with_context(|| format!("account id has invalid hex at position {}", index * 2))?;
-        let low = rag_rat_base::hash::hex_nibble(pair[1])
-            .with_context(|| format!("account id has invalid hex at position {}", index * 2 + 1))?;
-        bytes[index] = high << 4 | low;
-    }
-    Ok(rag_rat_oplog::AccountId::from_bytes(bytes))
-}
-
 /// Configure the ACTIVE repo to contribute memories to `owner_account_hex` (paste flow, #1164):
 /// record the owner id so subsequent memory authoring targets the owner's stream via this account's
 /// Writer grant. Mints this store's local account (the identity the owner grants). Requires a
@@ -308,7 +290,7 @@ pub(crate) fn set_contribution_owner(
     {
         anyhow::bail!("sync contribute requires a stable repo identity (not legacy or local-only)");
     }
-    let owner = parse_account_id_hex(owner_account_hex)?;
+    let owner = rag_rat_oplog::AccountId::from_hex(owner_account_hex)?;
     let local = rag_rat_oplog::local_account(conn, now_ms)?;
     anyhow::ensure!(
         owner != local,

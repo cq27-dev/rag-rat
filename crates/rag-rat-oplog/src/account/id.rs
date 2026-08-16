@@ -28,6 +28,34 @@ impl AccountId {
     pub fn to_bytes(self) -> [u8; 32] {
         self.0
     }
+
+    /// Decode the 64-hex form an operator copies between machines — the inverse of
+    /// `hash::hex_lower(id.to_bytes())`, which is what `sync whoami` prints and what `sync grant` /
+    /// `sync contribute` / `sync pull` accept.
+    ///
+    /// Lives on the type rather than at each call site: the format is this type's, and the error
+    /// wording is the same wherever an operator pastes an id. The digit loop is deliberate rather
+    /// than `hash::hex_decode` — a paste is hand-handled, so the failing POSITION is worth
+    /// reporting, and the shared decoder returns only `None`.
+    pub fn from_hex(value: &str) -> anyhow::Result<Self> {
+        let value = value.trim();
+        anyhow::ensure!(
+            value.len() == 64,
+            "an account id is 64 hex characters (got {}) — take it from `rag-rat sync whoami`",
+            value.len()
+        );
+        let mut bytes = [0u8; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = rag_rat_base::hash::hex_nibble(pair[0]).ok_or_else(|| {
+                anyhow::anyhow!("account id has invalid hex at position {}", index * 2)
+            })?;
+            let low = rag_rat_base::hash::hex_nibble(pair[1]).ok_or_else(|| {
+                anyhow::anyhow!("account id has invalid hex at position {}", index * 2 + 1)
+            })?;
+            bytes[index] = high << 4 | low;
+        }
+        Ok(Self(bytes))
+    }
 }
 
 /// Derive the `account_id` from the canonical-CBOR bytes of the account's `AccountGenesis` payload
@@ -49,6 +77,30 @@ pub(super) fn account_id_from_genesis_payload(genesis_payload_bytes: &[u8]) -> A
 
 #[cfg(test)]
 mod tests {
+    /// `from_hex` is the one decoder every operator-facing surface uses (`sync grant` /
+    /// `contribute` / `pull`), so its rejections are the error text a person actually reads.
+    #[test]
+    fn from_hex_round_trips_and_names_the_failing_position() {
+        let id = AccountId::from_bytes([0xAB; 32]);
+        let hex = rag_rat_base::hash::hex_lower(&id.to_bytes());
+        assert_eq!(AccountId::from_hex(&hex).unwrap(), id, "round trips");
+        assert_eq!(
+            AccountId::from_hex(&format!("  {hex}  ")).unwrap(),
+            id,
+            "a pasted id carries whitespace",
+        );
+
+        let short = AccountId::from_hex("abcd").unwrap_err().to_string();
+        assert!(short.contains("64 hex characters"), "length is named: {short}");
+        assert!(short.contains("whoami"), "and where to get one: {short}");
+
+        // Position 5 (the 6th character) is the bad nibble.
+        let mut bad = hex.clone();
+        bad.replace_range(5..6, "z");
+        let err = AccountId::from_hex(&bad).unwrap_err().to_string();
+        assert!(err.contains("position 5"), "the failing position is reported: {err}");
+    }
+
     use sha2::{Digest, Sha256};
 
     use super::*;

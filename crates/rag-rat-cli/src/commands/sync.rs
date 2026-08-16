@@ -633,7 +633,7 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
 /// Deliberately NOT a `sync join`: no enrollment, no `/5` table restore (foreign table streams are
 /// private account data, pinned `Closed`), and no founder-incarnation repair.
 fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyhow::Result<()> {
-    let target = parse_account_id_hex(account_hex)?;
+    let target = rag_rat_oplog::AccountId::from_hex(account_hex)?;
     let relay = effective_relay_url(config);
 
     // The per-database SESSION lock, held for the whole pull. Any process that opens an iroh
@@ -846,25 +846,6 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
         }))?;
         anyhow::Ok(())
     })
-}
-
-/// Decode a 64-hex account id for the CLI surface.
-fn parse_account_id_hex(value: &str) -> anyhow::Result<rag_rat_oplog::AccountId> {
-    let value = value.trim();
-    anyhow::ensure!(
-        value.len() == 64,
-        "an account id is 64 hex characters (got {}) — take it from `rag-rat sync whoami`",
-        value.len()
-    );
-    let mut bytes = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = hash::hex_nibble(pair[0])
-            .with_context(|| format!("account id has invalid hex at position {}", index * 2))?;
-        let low = hash::hex_nibble(pair[1])
-            .with_context(|| format!("account id has invalid hex at position {}", index * 2 + 1))?;
-        bytes[index] = high << 4 | low;
-    }
-    Ok(rag_rat_oplog::AccountId::from_bytes(bytes))
 }
 
 pub(crate) use rag_rat_core::sync_driver::{DeviceSyncOutcome, device_sync_run};
