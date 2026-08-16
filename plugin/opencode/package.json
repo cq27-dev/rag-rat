@@ -1,6 +1,6 @@
 {
   "name": "@rag-rat/plugin-opencode",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "description": "opencode plugin for rag-rat: self-registers the rag-rat MCP server (semantic search, symbol/graph navigation, impact-surface preflight, repo memory) and wires session/grep/edit hooks through the shared agent-hook.",
   "license": "MIT",
   "type": "module",

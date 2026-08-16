@@ -11,7 +11,7 @@
       "name": "rag-rat",
       "source": "plugin",
       "description": "Local repo-intelligence index + MCP server: semantic search, symbol/graph navigation, impact-surface preflight, git + GitHub papertrail, and a source-anchored memory graph.",
-      "version": "0.22.0",
+      "version": "0.23.0",
       "homepage": "https://github.com/cq27-dev/rag-rat",
       "repository": "https://github.com/cq27-dev/rag-rat",
       "license": "MIT",
