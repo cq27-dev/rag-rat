@@ -1,4 +1,5 @@
 mod baseline;
+mod end_state;
 // The individual migration STEPS (`apply_*`) are reached through this module rather than
 // re-exported: `migrations::apply_oplog_storage(conn)` says where the step comes from, whereas a
 // bare `apply_oplog_storage(conn)` at a call site in another crate reads like a local function.
@@ -968,9 +969,24 @@ pub fn apply(conn: &Connection, hooks: &MigrationHooks) -> rusqlite::Result<()> 
     // (many tests do, then write `files` rows) needs the function registered before any `files`
     // write. Idempotent and connection-local (no DB write), so it is safe ahead of the baseline.
     crate::content_digest::register_content_digest_fold(conn)?;
+    // A database with nothing in it has nothing to migrate, so it is provisioned at the ladder's
+    // end state in one pass instead of replaying every step to arrive at the same place. Any
+    // database that holds an object — including the populated store `index --full` re-applies over
+    // — takes the ladder below, which is the only path that can preserve what is already there.
+    if end_state::database_is_empty(conn)? {
+        end_state::provision_end_state(conn)?;
+        let _ = migrations::record_migration_provenance(conn);
+        return Ok(());
+    }
+    apply_ladder(conn, hooks)
+}
+
+/// Every migration in order, over whatever the database already holds. This is `apply`'s path for
+/// a populated store, and the definition [`end_state`]'s generated dump is checked against.
+fn apply_ladder(conn: &Connection, hooks: &MigrationHooks) -> rusqlite::Result<()> {
     provision_baseline(conn)?;
-    // Every additive migration in order. A fresh DB runs them all; data backfills on empty tables
-    // are no-ops. (An EXISTING DB takes the forward-only path via `migrate_forward`, not this.)
+    // Every additive migration in order; data backfills on empty tables are no-ops. (An EXISTING
+    // DB takes the forward-only path via `migrate_forward`, not this.)
     for step in ADDITIVE_MIGRATIONS {
         apply_and_record_migration(conn, step, hooks)?;
     }
