@@ -104,7 +104,7 @@ pub use account::{
     RepoIncarnationState, RosterContentAuthority, RotationOutcome, SealPolicy, SealingKeyOutcome,
     SelectedWrap, SignedContentEntry, SnapshotAuthorOutcome, SyncAccountEntry, SyncContentEntry,
     VerifiedContentEntry, account_effective_count, account_entries_for_enrollment,
-    account_entries_for_sync, account_entry_ref, account_holds_effective_writer_grant,
+    account_entries_for_sync, account_entry_ref, account_holds_effective_public_writer_grant,
     account_ingest, account_is_fully_public, account_signed_entry_exists, account_signed_hash,
     adopt_enrollment_bootstrap, adopt_local_account, advance_repo_incarnation_in_tx,
     auth_len_freshness, author_content_batch, author_content_batch_in_tx, author_device_add_in_tx,

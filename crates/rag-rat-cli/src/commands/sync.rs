@@ -648,8 +648,8 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
     .ok_or_else(|| {
         anyhow!(
             "another sync session already holds this database's node identity (a resident MCP \
-             host, a `serve` peer, or a device sync is running); stop it and retry, or let it do \
-             the pull for you"
+             host, a `serve` peer, or a device sync is running); stop it and retry — it cannot \
+             pull a foreign account on your behalf"
         )
     })?;
 
@@ -733,6 +733,17 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
                     continue;
                 },
             };
+            // A non-converged account leg means the round cap was hit with the store still possibly
+            // incomplete. Content acceptance re-derives authority from that log, so proceeding
+            // would silently leave valid entries unaccepted — and a cross-account pull has no
+            // automatic retry to repair it later. Treat the peer as unusable and try the next.
+            if !account_report.converged {
+                last_error = Some(format!(
+                    "{peer_id}: the account log did not converge before the round limit; its \
+                     content would be judged against incomplete authority"
+                ));
+                continue;
+            }
             let mut content_store = OplogContentSyncStore::new(conn, target, time::now_ms);
             let content_report = match rag_rat_sync::connect_and_reconcile(
                 &endpoint,
@@ -755,7 +766,7 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
                 peer_id.clone(),
                 account_report.entries_newly_stored,
                 content_report.entries_newly_stored,
-                account_report.converged && content_report.converged,
+                content_report.converged,
             ));
             break;
         }
@@ -768,22 +779,48 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
             );
         };
 
-        // Materialize what landed. The drain mirrors the accepted projection into `repo_memories`;
-        // in contribution mode it drains the CONFIGURED owner's stream, which is exactly the stream
-        // this pull just filled.
+        // Materialize what landed, and MEASURE the result rather than asserting it. The drain
+        // mirrors exactly ONE authoritative stream per repo: the configured contribution owner's,
+        // or this store's own. Those cover the two directions contribution needs — a contributor
+        // pulling its owner, and an owner pulling a contributor (whose entries sit on the owner's
+        // own stream). A standalone reader pulling some third account it neither owns nor
+        // contributes to has nowhere to put the content, and must not be told otherwise.
+        let repo_id = db.active_repo_id.clone();
+        let count_memories = |conn: &rusqlite::Connection| -> anyhow::Result<i64> {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM repo_memories WHERE repo_id = ?1",
+                [&repo_id],
+                |row| row.get(0),
+            )?)
+        };
+        let before = count_memories(conn)?;
         rag_rat_core::drain_synced_memory(conn)?;
         rag_rat_core::resolve_synced_distill_anchors(conn)?;
+        let materialized = count_memories(conn)? - before;
         db.fold_wal();
 
+        let note = if !converged {
+            "the round limit was reached before this account converged — re-run to finish; what \
+             arrived is durable"
+        } else if materialized > 0 {
+            "these memories are searchable locally; their code anchors do not cross an account \
+             boundary, so they will not attach as drive-by context"
+        } else if content_entries > 0 {
+            "content arrived but nothing materialized into this repo's memories: a repo mirrors \
+             ONE stream — its own, or a configured contribution owner's. Run `sync contribute \
+             <this account>` to mirror it, or pull from a store that owns or contributes to it"
+        } else {
+            "already up to date with this account"
+        };
         crate::print_output(&serde_json::json!({
-            "status": "pulled",
+            "status": if converged { "pulled" } else { "incomplete" },
             "account_id": hash::hex_lower(&target.to_bytes()),
             "peer": peer_id,
             "account_entries_stored": account_entries,
             "content_entries_stored": content_entries,
+            "memories_materialized": materialized,
             "converged": converged,
-            "note": "memories from this account are now searchable locally; their code anchors do \
-                     not cross an account boundary, so they will not attach as drive-by context",
+            "note": note,
         }))?;
         anyhow::Ok(())
     })

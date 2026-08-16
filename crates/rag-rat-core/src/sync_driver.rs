@@ -365,15 +365,22 @@ pub fn account_is_public_kb(
     // owns-a-stream test alone would serve it `Closed` and nothing could ever pull its account log.
     // That breaks the very direction contribution needs: content is offered by AUTHOR, so the owner
     // collects a contributor's memories by syncing the CONTRIBUTOR's account, which requires the
-    // contributor to be servable. Holding an effective Writer grant is the same kind of deliberate
-    // act as publishing — it is not the vacuously-public fresh account the stream test exists to
-    // keep unexposed.
+    // contributor to be servable.
     //
-    // The exposure is stated rather than implied: this makes the contributor's account log readable
-    // by ANY dialer, not just the owner, because public admission is anonymous. Grants imply a
-    // PublicRead stream, so the content it authored is public regardless; what this adds is the
-    // contributor's own roster metadata.
-    rag_rat_oplog::account_holds_effective_writer_grant(conn, account)
+    // The grant must target a PUBLIC stream, checked HERE and not assumed.
+    // `account_is_fully_public` above only inspects streams this account OWNS — it says nothing
+    // about the foreign stream a grant points at — and the fold does not yet require
+    // `PublicRead` for `StreamGrant` (#1178), so a valid grant on a PRIVATE stream exists as
+    // far as this predicate is concerned. Treating any grant as evidence would let that private
+    // relationship open the account log to every anonymous dialer. `stream_access_mode` fails
+    // closed to `Private` when the ownership fact is absent, so an unverifiable grant does not
+    // qualify either.
+    //
+    // The exposure that remains is stated rather than implied: a qualifying contributor's account
+    // log becomes readable by ANY dialer, not just the owner, because public admission is
+    // anonymous. The content it authored is on a public stream by the check above; what this
+    // adds is the contributor's own roster metadata.
+    rag_rat_oplog::account_holds_effective_public_writer_grant(conn, account)
 }
 
 /// Maintain a serving host's discovery announcement independently of its inbound session loop.
@@ -1004,35 +1011,127 @@ mod tests {
     /// A granted CONTRIBUTOR owns no stream (#1164), so the owns-a-stream test alone would serve it
     /// `Closed` and nothing could pull its account log — breaking the direction contribution needs,
     /// since content is offered by AUTHOR and the owner collects a contributor's memories by
-    /// syncing the CONTRIBUTOR's account. Holding an effective Writer grant is the deliberate act
-    /// that distinguishes it from the vacuously-public fresh account the stream test guards.
+    /// syncing the CONTRIBUTOR's account.
+    ///
+    /// The grant must target a PUBLIC stream. The fold does not yet require it (#1178) and
+    /// `account_is_fully_public` only inspects streams the account OWNS, so without an explicit
+    /// access-mode check a PRIVATE relationship would open the account log to anonymous dialers.
     #[test]
-    fn a_grant_holding_contributor_is_servable_even_though_it_owns_no_stream() {
+    fn only_a_public_stream_grant_makes_a_stream_less_contributor_servable() {
+        use rusqlite::{Transaction, TransactionBehavior};
+
+        // A real owner with a real PublicRead stream, and a real grant to the contributor.
+        let owner = schema_conn();
+        let owner_account = rag_rat_oplog::local_account(&owner, 1_000).unwrap();
+        let public_stream = {
+            let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+            let s = rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(
+                &tx,
+                "repo-a",
+                rag_rat_oplog::AccessMode::PublicRead,
+                1_000,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            s
+        };
+
         let contributor = schema_conn();
         let account = rag_rat_oplog::local_account(&contributor, 1_000).unwrap();
-        // Owns nothing: today's rule refuses it.
+        // Owns nothing: refused, as a vacuously-public fresh account must be.
         assert!(!account_is_public_kb(&contributor, account).unwrap());
 
-        // The owner's grant, as it lands after the contributor syncs the owner's log.
+        {
+            let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+            rag_rat_oplog::author_stream_grant_in_tx(
+                &tx,
+                public_stream,
+                account,
+                rag_rat_oplog::GrantRole::Writer,
+                1_000,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        // A grant this store cannot VERIFY does not qualify: the row is present but the owner's
+        // ownership fact has not been synced, so `stream_access_mode` fails closed to Private.
         contributor
             .execute(
                 "INSERT INTO account_stream_grants(
                      owner_account_id, grant_id, stream_id, grantee_account_id, role, effective_at)
                  VALUES (?1, ?2, ?3, ?4, 'writer', 1000)",
                 rusqlite::params![
-                    [0xAAu8; 32].as_slice(),
-                    [0xBBu8; 32].as_slice(),
-                    [0xCCu8; 32].as_slice(),
+                    owner_account.to_bytes().as_slice(),
+                    [0x01u8; 32].as_slice(),
+                    public_stream.to_bytes().as_slice(),
                     account.to_bytes().as_slice(),
                 ],
             )
             .unwrap();
         assert!(
-            account_is_public_kb(&contributor, account).unwrap(),
-            "a contributor holding an effective writer grant is servable",
+            !account_is_public_kb(&contributor, account).unwrap(),
+            "an unverifiable grant fails closed — no ownership fact, no exposure",
         );
 
-        // A CLOSED grant is not: a revoked contributor stops being servable on that basis alone.
+        // Sync the owner's log: the ownership fact and the real grant both land, and NOW the
+        // contributor is servable.
+        contributor.execute("DELETE FROM account_stream_grants", []).unwrap();
+        for entry in rag_rat_oplog::account_entries_for_sync(&owner, owner_account).unwrap() {
+            rag_rat_oplog::account_ingest(&contributor, &entry.signed_bytes, 1_000).unwrap();
+        }
+        assert!(
+            account_is_public_kb(&contributor, account).unwrap(),
+            "a verified grant on a PublicRead stream makes a stream-less contributor servable",
+        );
+
+        // A PRIVATE stream grant must not: same shape, different access mode.
+        let private_owner = schema_conn();
+        let private_owner_account = rag_rat_oplog::local_account(&private_owner, 1_000).unwrap();
+        let private_stream = {
+            let tx =
+                Transaction::new_unchecked(&private_owner, TransactionBehavior::Immediate).unwrap();
+            let s = rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(
+                &tx,
+                "repo-priv",
+                rag_rat_oplog::AccessMode::Private,
+                1_000,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            s
+        };
+        {
+            let tx =
+                Transaction::new_unchecked(&private_owner, TransactionBehavior::Immediate).unwrap();
+            rag_rat_oplog::author_stream_grant_in_tx(
+                &tx,
+                private_stream,
+                account,
+                rag_rat_oplog::GrantRole::Writer,
+                1_000,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let only_private = schema_conn();
+        let solo = rag_rat_oplog::local_account(&only_private, 1_000).unwrap();
+        for entry in
+            rag_rat_oplog::account_entries_for_sync(&private_owner, private_owner_account).unwrap()
+        {
+            rag_rat_oplog::account_ingest(&only_private, &entry.signed_bytes, 1_000).unwrap();
+        }
+        only_private
+            .execute("UPDATE account_stream_grants SET grantee_account_id = ?1", rusqlite::params![
+                solo.to_bytes().as_slice()
+            ])
+            .unwrap();
+        assert!(
+            !account_is_public_kb(&only_private, solo).unwrap(),
+            "a grant on a PRIVATE stream must never justify anonymous exposure",
+        );
+
+        // And a CLOSED grant stops conferring servability at all.
         contributor.execute("UPDATE account_stream_grants SET closed_at = 2000", []).unwrap();
         assert!(
             !account_is_public_kb(&contributor, account).unwrap(),
