@@ -28,7 +28,9 @@ pub(crate) use authoring::{
 };
 // The scope-explicit reconcile entry (#541): `authoring` is a PRIVATE module, so
 // `index::consolidate` names this through this re-export (Task 5 of #541).
-pub(crate) use authoring::{ensure_not_contributing, reconcile_owner_stream_for_repo};
+pub(crate) use authoring::{
+    contribution_targets, ensure_not_contributing, reconcile_owner_stream_for_repo,
+};
 // The synced-content drain entries (#691 A1): the per-repo drain (consolidate) and the
 // store-global drain (open/migrate) that materialize accepted synced `/3` content into the
 // local memory tables.

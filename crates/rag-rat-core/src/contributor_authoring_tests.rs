@@ -318,3 +318,33 @@ fn contributing_from_a_store_with_a_private_stream_is_refused() {
     assert!(err.contains("private memory streams"), "the refusal names the cause: {err}");
     assert!(err.contains("dedicated index"), "and hands over the escape: {err}");
 }
+
+/// The configure-time refusal is a ONE-TIME check, so it cannot be the only one: ordinary authoring
+/// in a SECOND repo would later establish that repo's default PRIVATE stream, and an account is
+/// fetchable by a peer only while every stream it owns is public. The contributions this store has
+/// already authored would silently become unreachable. Enforce it where the conflict is created.
+#[test]
+fn a_contributing_store_refuses_to_establish_a_private_stream_later() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    create_memory(&contributor, concept("contributor-note")).unwrap();
+
+    // A second repo in the same index, authored the ordinary way — no sync configuration at all.
+    contributor
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-b', 'b', 0)",
+            [],
+        )
+        .unwrap();
+    contributor
+        .execute(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', \
+             'repo-b')",
+            [],
+        )
+        .unwrap();
+
+    let err = create_memory(&contributor, concept("private-repo-note")).unwrap_err().to_string();
+    assert!(err.contains("PRIVATE memory stream"), "the refusal names the conflict: {err}");
+    assert!(err.contains("separate database"), "and hands over an escape: {err}");
+    assert!(err.contains("sync publish"), "and the other escape: {err}");
+}

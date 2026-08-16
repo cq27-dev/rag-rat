@@ -193,6 +193,21 @@ pub(crate) const CONTRIBUTION_OWNER_META_KEY: &str = "memory_contribution_owner"
 
 /// The configured contribution-owner account for `repo_id`, or `None`. Stored as a 64-hex account
 /// id.
+/// Every `(repo_id, owner)` this store is configured to contribute to. Small by construction — one
+/// entry per contributing repo — and the input to both the serve predicate (which grant matters)
+/// and the private-stream guard (whether ANY repo is contributing).
+pub(crate) fn contribution_targets(
+    conn: &Connection,
+) -> anyhow::Result<Vec<(String, rag_rat_oplog::AccountId)>> {
+    let mut out = Vec::new();
+    for repo_id in rag_rat_db::schema::real_repo_ids(conn)? {
+        if let Some(owner) = contribution_owner_account(conn, &repo_id)? {
+            out.push((repo_id, owner));
+        }
+    }
+    Ok(out)
+}
+
 pub(super) fn contribution_owner_account(
     conn: &Connection,
     repo_id: &str,
@@ -751,6 +766,31 @@ fn ensure_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow:
     }
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Establishing a PRIVATE stream here would silently un-serve every repo this store contributes
+    // to: an account is servable to a peer only when ALL of its streams are public, content is
+    // served by its AUTHOR, and the owner is not enrolled here — so the contributions this store
+    // has already authored, and any it authors later, become permanently unreachable.
+    //
+    // The configure-time check in `set_contribution_owner` cannot cover this: it runs once, and the
+    // conflicting stream is created later by ordinary authoring in a DIFFERENT repo. Enforce it
+    // where the conflict is actually created, inside the same transaction that would create it.
+    //
+    // Yes, this means memory authoring in an unrelated private repo fails while this index
+    // contributes. That is the honest ordering: the alternative is authoring memories nobody can
+    // ever fetch and discovering it much later. The error names both escapes.
+    if mode != rag_rat_oplog::AccessMode::PublicRead {
+        let contributing = contribution_targets(&tx)?;
+        if let Some((contributing_repo, owner)) = contributing.first() {
+            anyhow::bail!(
+                "repo `{repo_id}` would need a PRIVATE memory stream, but this index contributes \
+                 repo `{contributing_repo}`'s memories to account {} — and an account is \
+                 fetchable by a peer only while all of its streams are public, so this would \
+                 strand those contributions unreachable. Index `{repo_id}` in a separate \
+                 database, or publish it with `rag-rat sync publish`",
+                rag_rat_base::hash::hex_lower(&owner.to_bytes()),
+            );
+        }
+    }
     let stream = rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(&tx, repo_id, mode, now_ms)?;
     tx.commit()?;
     Ok(stream)

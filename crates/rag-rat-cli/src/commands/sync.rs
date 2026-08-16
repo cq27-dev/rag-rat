@@ -759,6 +759,18 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
                 ));
                 continue;
             }
+            // A quiet round can also mean the peer simply had nothing: an EMPTY account store
+            // completes the PublicRead protocol, and `Unavailable` hands the dialer the bootstrap
+            // ReadWrite capability, so round one is quiet and `converged` is true without this
+            // store ever learning the account. Require the target to actually be known here.
+            if rag_rat_oplog::account_effective_count(conn, target)? == 0 {
+                last_error = Some(format!(
+                    "{peer_id}: completed the exchange without sending account {}'s log — it does \
+                     not hold that account. Check the id, or point --peer at a machine that does",
+                    hash::hex_lower(&target.to_bytes())
+                ));
+                continue;
+            }
             if !account_report.converged {
                 last_error = Some(format!(
                     "{peer_id}: the account log did not converge before the round limit; its \
