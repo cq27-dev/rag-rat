@@ -115,7 +115,7 @@ pub use account::{
     content_op_is_authorable, content_op_is_sealed_authorable, content_signed_entry_exists,
     content_signed_hash, content_stream_has_pending_refold, content_stream_has_sealed_ratchet,
     content_stream_is_empty, current_sealing_key, decode_content_signed, effective_writer_grant,
-    enroll_stream_keys_for_device_in_tx, enrollment_authoring_fits,
+    effective_writer_grantees, enroll_stream_keys_for_device_in_tx, enrollment_authoring_fits,
     enrollment_authoring_requirements, enrollment_budget, ensure_owned_stream_v2_in_tx,
     ensure_owned_stream_v2_with_mode_in_tx, ensure_repo_incarnation,
     ensure_stream_key_current_in_tx, established_owned_stream_v2,

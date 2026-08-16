@@ -281,8 +281,9 @@ fn grantee_context(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<Gr
         .with_context(|| {
             format!(
                 "no effective writer grant for this account on repo `{repo_id}`'s owner stream — \
-                 the owner must `sync grant` this account (its id from `sync whoami`) and this \
-                 store must sync the owner's log before it can contribute"
+                 the owner must `sync grant` this account (its id from `sync whoami`), and this \
+                 store needs the owner's log: automatic sync pulls it once the owner's host is in \
+                 [sync] server_peers, or run `rag-rat sync pull <owner-account>` now"
             )
         })?;
     Ok(Some(GranteeContext { owner_account, stream, grant_id }))

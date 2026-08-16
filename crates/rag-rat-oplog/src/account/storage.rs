@@ -875,6 +875,32 @@ pub fn effective_writer_grant(
     grant_id.map(|bytes| fixed(&bytes)).transpose()
 }
 
+/// The distinct accounts holding an effective (not-closed) Writer grant on any stream owned by
+/// `owner_account_id`. Automatic cross-account sync (#1175) pulls each grantee's own account —
+/// content is offered by AUTHOR, so a contributor's entries on the owner's stream travel only when
+/// the OWNER dials the contributor and syncs the CONTRIBUTOR's account. Reader grants never
+/// author, so they are excluded. Owner-leading, so the scan rides the `(owner, stream, grantee)`
+/// index.
+pub fn effective_writer_grantees(
+    conn: &Connection,
+    owner_account_id: AccountId,
+) -> anyhow::Result<Vec<AccountId>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT grantee_account_id FROM account_stream_grants
+         WHERE owner_account_id = ?1 AND role = ?2 AND closed_at IS NULL
+         ORDER BY grantee_account_id",
+    )?;
+    let rows = stmt.query_map(
+        params![owner_account_id.to_bytes().as_slice(), GrantRole::Writer.as_db_str()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut grantees = Vec::new();
+    for row in rows {
+        grantees.push(AccountId::from_bytes(fixed(&row?)?));
+    }
+    Ok(grantees)
+}
+
 /// Whether `grantee_account_id` holds an effective (not-closed) Writer grant on a stream that
 /// resolves **`PublicRead`**. Unlike [`effective_writer_grant`], which answers "may this account
 /// write to THIS stream", this answers "is this account a public contributor at all" — the question
@@ -4614,6 +4640,54 @@ mod tests {
             error.to_string().contains("open grant unexpectedly has a persisted device cut"),
             "unexpected corrupt-projection error: {error:#}",
         );
+    }
+
+    #[test]
+    fn effective_writer_grantees_lists_open_writer_grants_only() {
+        let conn = db();
+        let founder = Dev::new(1);
+        let writer = AccountId::from_bytes([0x44; 32]);
+        let reader = AccountId::from_bytes([0x55; 32]);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (stream_id, own_op) = stream_own(account_id);
+        let (own_bytes, own_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
+        let writer_op = AccountOp::StreamGrant {
+            stream_id,
+            grantee_account_id: writer,
+            grant_role: GrantRole::Writer,
+        };
+        let (writer_bytes, grant_id) =
+            op(account_id, &founder, 2, Some(own_hash), Some(genesis_hash), &writer_op);
+        account_ingest(&conn, &writer_bytes, NOW + 2).unwrap();
+        // A Reader never authors content, so it must not become a pull target.
+        let reader_op = AccountOp::StreamGrant {
+            stream_id,
+            grantee_account_id: reader,
+            grant_role: GrantRole::Reader,
+        };
+        let (reader_bytes, reader_hash) =
+            op(account_id, &founder, 3, Some(grant_id), Some(genesis_hash), &reader_op);
+        account_ingest(&conn, &reader_bytes, NOW + 3).unwrap();
+        assert_eq!(effective_writer_grantees(&conn, account_id).unwrap(), vec![writer]);
+
+        let revoke_op = AccountOp::StreamRevoke {
+            stream_id,
+            grantee_account_id: writer,
+            grant_id,
+            device_cuts: vec![DeviceCut {
+                device_fingerprint: Dev::new(2).fp,
+                seq: u64::MAX,
+                hash: [0x99; 32],
+            }],
+            reason: "access ended".to_string(),
+        };
+        let (revoke_bytes, _) =
+            op(account_id, &founder, 4, Some(reader_hash), Some(genesis_hash), &revoke_op);
+        account_ingest(&conn, &revoke_bytes, NOW + 4).unwrap();
+        assert!(effective_writer_grantees(&conn, account_id).unwrap().is_empty());
     }
 
     #[test]
