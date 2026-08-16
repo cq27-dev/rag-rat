@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.22.0...rag-rat-base-v0.23.0) - 2026-08-16
+
+### Added
+
+- *(sync)* sync devices through active MCP ([#1114](https://github.com/cq27-dev/rag-rat/pull/1114))
+
+### Fixed
+
+- *(index)* match target include/exclude patterns as globs ([#1072](https://github.com/cq27-dev/rag-rat/pull/1072)) ([#1118](https://github.com/cq27-dev/rag-rat/pull/1118))
+
 ## [0.22.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.21.1...rag-rat-base-v0.22.0) - 2026-08-02
 
 ### Added
