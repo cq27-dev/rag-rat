@@ -19,15 +19,38 @@ pub use output::{OutputFormat, render};
 
 /// Settle and materialize accepted `/3` memory content before dependent `/5` anchor rows are
 /// reconciled.
-pub fn drain_synced_memory(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+/// What a drain actually did. A net `repo_memories` row count cannot express this: an UPDATE leaves
+/// the count unchanged and a retro-condemn REMOVAL lowers it, so a caller measuring table size
+/// reports "nothing materialized" for a real update and a negative delta for a real removal.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryDrainEffects {
+    pub nodes_written: u32,
+    pub nodes_removed: u32,
+    pub edges_written: u32,
+    pub edges_removed: u32,
+}
+
+impl MemoryDrainEffects {
+    /// Whether the drain changed anything at all.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+pub fn drain_synced_memory(conn: &rusqlite::Connection) -> anyhow::Result<MemoryDrainEffects> {
     let now = rag_rat_base::time::now_ms();
     rag_rat_oplog::settle_pending_content_refolds(
         conn,
         &rag_rat_oplog::ContentRefoldBudget::unbounded(),
         now,
     )?;
-    memory_write::drain_synced_streams_for_all_repos(conn, now)?;
-    Ok(())
+    let outcome = memory_write::drain_synced_streams_for_all_repos(conn, now)?;
+    Ok(MemoryDrainEffects {
+        nodes_written: outcome.nodes_written,
+        nodes_removed: outcome.nodes_removed,
+        edges_written: outcome.edges_written,
+        edges_removed: outcome.edges_removed,
+    })
 }
 
 /// Re-resolve synced SYMBOL distill anchors against the active repo's local index — call at a

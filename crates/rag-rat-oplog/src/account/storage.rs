@@ -882,6 +882,15 @@ pub fn effective_writer_grant(
 /// nonetheless a deliberately-participating identity worth serving (#1164), rather than a fresh
 /// empty account that must stay unexposed.
 ///
+/// AVAILABILITY CAVEAT. Servability tracks CURRENT grant effectiveness, so closing a contributor's
+/// last public grant also closes the only door through which its account is reachable — content is
+/// served by its AUTHOR account, and the owner is not enrolled in the contributor's account. Cut
+/// semantics deliberately keep entries at or below the cut accepted, so a pre-revocation
+/// contribution that was never replicated stays VALID but becomes UNREACHABLE. Automatic
+/// cross-account sync (#1175) shrinks that window to "unreplicated at the moment of revocation";
+/// closing it properly is revoke's problem (#1177) — replicate before closing, or serve a bounded
+/// tail afterwards.
+///
 /// The access-mode check is load-bearing and cannot be assumed away: the fold does not yet require
 /// `PublicRead` for a `StreamGrant` (#1178), so a grant on a PRIVATE stream is representable, and
 /// counting it would let a private relationship justify exposing an account log to anonymous

@@ -2255,12 +2255,36 @@ pub fn content_entries_for_sync(
 /// unauthenticated bytes from arbitrary peers and a public server must not relay forged candidates
 /// to anonymous readers. Still author-scoped (`author_account_id = account_id`): serving
 /// guest/foreign authors' content is a separate concern (an anonymous reader has no way to fetch a
-/// guest's account log to verify it). Only served for a fully-public account, so no per-stream
-/// `access_mode` filter is applied here — the caller gates on that.
+/// guest's account log to verify it).
+///
+/// EVERY row is filtered by ITS OWN stream's access mode, not by a caller-level "this account is
+/// public" gate. That gate is `account_is_fully_public`, which inspects only streams the account
+/// OWNS — and a granted CONTRIBUTOR (#1164) owns none while authoring onto other accounts' streams,
+/// possibly a public one AND a private one. A single public grant is enough to make such an account
+/// servable, so an account-level gate would ship its private-stream contributions to anonymous
+/// readers alongside the public ones. `stream_access_mode` fails closed to `Private`, so a stream
+/// whose ownership fact is not folded here is withheld rather than leaked.
 pub fn content_entries_for_public_sync(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<Vec<SyncContentEntry>> {
+    // Resolved once per distinct stream: an account's rows span very few streams, and each miss
+    // costs an ownership lookup plus a StreamOwn decode.
+    let mut public: std::collections::HashMap<StreamId, bool> = std::collections::HashMap::new();
+    let mut stream_is_public = |conn: &Connection, stream: StreamId| -> anyhow::Result<bool> {
+        if let Some(known) = public.get(&stream) {
+            return Ok(*known);
+        }
+        let verdict = match crate::account::storage::stream_owner_account(conn, stream)? {
+            Some(owner) =>
+                crate::account::storage::stream_access_mode(conn, owner, stream)?
+                    == crate::stream::AccessMode::PublicRead,
+            // No owner fact folded here: fail closed rather than serve an unattributable stream.
+            None => false,
+        };
+        public.insert(stream, verdict);
+        Ok(verdict)
+    };
     let mut held = conn.prepare(
         "SELECT entry_hash, stream_id, seq, signed_bytes
          FROM content_entries WHERE author_account_id = ?1
@@ -2276,17 +2300,21 @@ pub fn content_entries_for_public_sync(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter()
-        .map(|(hash, stream, seq, signed_bytes)| {
-            Ok(SyncContentEntry {
-                stream_id: StreamId::from_bytes(fixed::<32>(&stream)?),
-                author_account_id: account_id,
-                seq: u64::from_be_bytes(fixed::<8>(&seq)?),
-                entry_hash: fixed::<32>(&hash)?,
-                signed_bytes,
-            })
-        })
-        .collect()
+    let mut out = Vec::with_capacity(rows.len());
+    for (hash, stream, seq, signed_bytes) in rows {
+        let stream_id = StreamId::from_bytes(fixed::<32>(&stream)?);
+        if !stream_is_public(conn, stream_id)? {
+            continue;
+        }
+        out.push(SyncContentEntry {
+            stream_id,
+            author_account_id: account_id,
+            seq: u64::from_be_bytes(fixed::<8>(&seq)?),
+            entry_hash: fixed::<32>(&hash)?,
+            signed_bytes,
+        });
+    }
+    Ok(out)
 }
 
 fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
@@ -2724,8 +2752,17 @@ mod tests {
             !public.iter().any(|e| e.entry_hash == parked.entry_hash),
             "the public serve omits the parked candidate",
         );
-        assert_eq!(public.len(), 1, "only the one authenticated content_entries row is served");
-        assert_eq!(all.len(), public.len() + 1, "the parked candidate is the sole difference");
+        // And it omits the authenticated row too — for a DIFFERENT reason. Every row is filtered by
+        // its own stream's access mode, and this fixture's stream has no folded ownership fact, so
+        // it is unattributable and fails closed. That per-stream filter is what stops a streamless
+        // contributor (#1164) holding grants on a public AND a private stream from serving its
+        // private-stream contributions to anonymous readers: one public grant makes the ACCOUNT
+        // servable, so only a per-stream check can withhold the private rows.
+        assert!(
+            public.is_empty(),
+            "rows on a stream that does not resolve PublicRead are withheld, whatever the account",
+        );
+        assert_eq!(all.len(), 2, "both rows are still served on the whole-account (Full) path");
     }
 
     /// `content_signed_entry_exists` is signed-envelope precise, not entry_hash precise, and

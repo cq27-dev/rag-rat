@@ -697,7 +697,11 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
             .with_context(|| format!("binding the sync endpoint over relay {relay}"))?;
 
         let mut last_error: Option<String> = None;
-        let mut reached: Option<(String, usize, usize, bool)> = None;
+        // Durable across attempts: a peer can store entries and then fail to converge, and those
+        // bytes stay. Reporting only the final peer's tally would undercount — sometimes to zero.
+        let mut account_entries = 0usize;
+        let mut content_entries = 0usize;
+        let mut reached: Option<(String, bool)> = None;
         for peer_id in &peers {
             let addr = match rag_rat_sync::peer_addr(peer_id, &relay) {
                 Ok(addr) => addr,
@@ -737,6 +741,7 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
             // incomplete. Content acceptance re-derives authority from that log, so proceeding
             // would silently leave valid entries unaccepted — and a cross-account pull has no
             // automatic retry to repair it later. Treat the peer as unusable and try the next.
+            account_entries += account_report.entries_newly_stored;
             if !account_report.converged {
                 last_error = Some(format!(
                     "{peer_id}: the account log did not converge before the round limit; its \
@@ -762,16 +767,12 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
                     continue;
                 },
             };
-            reached = Some((
-                peer_id.clone(),
-                account_report.entries_newly_stored,
-                content_report.entries_newly_stored,
-                content_report.converged,
-            ));
+            content_entries += content_report.entries_newly_stored;
+            reached = Some((peer_id.clone(), content_report.converged));
             break;
         }
 
-        let Some((peer_id, account_entries, content_entries, converged)) = reached else {
+        let Some((peer_id, converged)) = reached else {
             bail!(
                 "could not pull account {} from any configured peer: {}",
                 hash::hex_lower(&target.to_bytes()),
@@ -785,24 +786,14 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
         // pulling its owner, and an owner pulling a contributor (whose entries sit on the owner's
         // own stream). A standalone reader pulling some third account it neither owns nor
         // contributes to has nowhere to put the content, and must not be told otherwise.
-        let repo_id = db.active_repo_id.clone();
-        let count_memories = |conn: &rusqlite::Connection| -> anyhow::Result<i64> {
-            Ok(conn.query_row(
-                "SELECT COUNT(*) FROM repo_memories WHERE repo_id = ?1",
-                [&repo_id],
-                |row| row.get(0),
-            )?)
-        };
-        let before = count_memories(conn)?;
-        rag_rat_core::drain_synced_memory(conn)?;
+        let effects = rag_rat_core::drain_synced_memory(conn)?;
         rag_rat_core::resolve_synced_distill_anchors(conn)?;
-        let materialized = count_memories(conn)? - before;
         db.fold_wal();
 
         let note = if !converged {
             "the round limit was reached before this account converged — re-run to finish; what \
              arrived is durable"
-        } else if materialized > 0 {
+        } else if !effects.is_empty() {
             "these memories are searchable locally; their code anchors do not cross an account \
              boundary, so they will not attach as drive-by context"
         } else if content_entries > 0 {
@@ -818,7 +809,10 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
             "peer": peer_id,
             "account_entries_stored": account_entries,
             "content_entries_stored": content_entries,
-            "memories_materialized": materialized,
+            "memories_written": effects.nodes_written,
+            "memories_removed": effects.nodes_removed,
+            "edges_written": effects.edges_written,
+            "edges_removed": effects.edges_removed,
             "converged": converged,
             "note": note,
         }))?;
