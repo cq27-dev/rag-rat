@@ -536,6 +536,7 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             entries_newly_stored: 0,
             entries_sent: 0,
             converged: false,
+            peer_capability: PeerCapability::ReadOnly,
         };
         for pass in 0..3 {
             let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
@@ -742,6 +743,22 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
             // would silently leave valid entries unaccepted — and a cross-account pull has no
             // automatic retry to repair it later. Treat the peer as unusable and try the next.
             account_entries += account_report.entries_newly_stored;
+            // A pull exists to RECEIVE. If this side granted the peer only `ReadOnly`, its entries
+            // are rejected on arrival, so an all-quiet round means "structurally unable to receive"
+            // rather than "in sync" — and `converged` would report success on an incomplete
+            // account. This is the resumed-bootstrap wedge: once a partial pull leaves
+            // `account_effective_count > 0` for the target, a serving device whose `DeviceAdd` has
+            // not arrived folds `Rejected` (not `Unavailable`), which loses the bootstrap fallback.
+            if account_report.peer_capability != PeerCapability::ReadWrite {
+                last_error = Some(format!(
+                    "{peer_id}: this store holds a PARTIAL roster for that account, so it could \
+                     not authorize this peer to serve — the peer was admitted read-only and sent \
+                     nothing. Pull from the peer whose device is already in the roster you hold \
+                     (usually the account's own host), or start from a store with no entries for \
+                     it"
+                ));
+                continue;
+            }
             if !account_report.converged {
                 last_error = Some(format!(
                     "{peer_id}: the account log did not converge before the round limit; its \
@@ -768,7 +785,15 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
                 },
             };
             content_entries += content_report.entries_newly_stored;
-            reached = Some((peer_id.clone(), content_report.converged));
+            if !content_report.converged {
+                // Same treatment as the account leg: a healthy later peer may finish the job, and
+                // breaking here would pin every re-run on the same non-converging first peer. The
+                // entries this peer did store are durable and stay counted.
+                last_error =
+                    Some(format!("{peer_id}: content did not converge before the round limit"));
+                continue;
+            }
+            reached = Some((peer_id.clone(), true));
             break;
         }
 
@@ -793,9 +818,12 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
         let note = if !converged {
             "the round limit was reached before this account converged — re-run to finish; what \
              arrived is durable"
-        } else if !effects.is_empty() {
+        } else if effects.nodes_written > 0 || effects.edges_written > 0 {
             "these memories are searchable locally; their code anchors do not cross an account \
              boundary, so they will not attach as drive-by context"
+        } else if !effects.is_empty() {
+            "the authority this pull brought RETRACTED memories here — the drain removed what the \
+             owner's log no longer accepts; nothing new was added"
         } else if content_entries > 0 {
             "content arrived but nothing materialized into this repo's memories: a repo mirrors \
              ONE stream — its own, or a configured contribution owner's. Run `sync contribute \
@@ -1111,18 +1139,21 @@ mod tests {
             entries_newly_stored: 3,
             entries_sent: 5,
             converged: false,
+            peer_capability: rag_rat_sync::PeerCapability::ReadWrite,
         };
         accumulate_reconcile_report(&mut total, rag_rat_sync::ReconcileReport {
             rounds: 7,
             entries_newly_stored: 11,
             entries_sent: 13,
             converged: true,
+            peer_capability: rag_rat_sync::PeerCapability::ReadWrite,
         });
         assert_eq!(total, rag_rat_sync::ReconcileReport {
             rounds: 9,
             entries_newly_stored: 14,
             entries_sent: 18,
             converged: true,
+            peer_capability: rag_rat_sync::PeerCapability::ReadWrite,
         });
     }
 

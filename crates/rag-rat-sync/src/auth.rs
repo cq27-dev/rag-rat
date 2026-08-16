@@ -82,8 +82,10 @@ pub enum AuthRole {
 /// capability, not proof that the peer authored those entries: under [`AuthPolicy::Open`], a dialer
 /// permits its explicitly selected server to send the snapshot needed to restore roster state.
 /// Every received entry still passes the store's cryptographic and authority checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum PeerCapability {
+    /// The least-privilege default: a capability is granted, never assumed.
+    #[default]
     ReadOnly,
     ReadWrite,
 }

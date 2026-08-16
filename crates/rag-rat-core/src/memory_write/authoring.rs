@@ -315,6 +315,25 @@ pub(crate) fn set_contribution_owner(
         "cannot contribute to your own account — the owner is a SEPARATE identity (its id from \
          the owner's `sync whoami`)"
     );
+    // A contributor is reachable only while its account is publicly servable: content is served by
+    // its AUTHOR account and the owner is not enrolled here, so if this account holds ANY private
+    // stream the owner can never pull what this store authors — the contributions would be
+    // authored, accepted on the owner's stream, and permanently unreachable.
+    //
+    // Refuse at configure time rather than let it fail invisibly later. A control log cannot be
+    // served as a subset (it is one hash chain), so there is no way to expose the roster while
+    // withholding the private stream metadata; a dedicated store is the only correct answer.
+    // `sync publish` guards the same property for OWNERS, but a contributor never publishes, so
+    // that check never runs on this path.
+    anyhow::ensure!(
+        rag_rat_oplog::account_is_fully_public(conn, local)?,
+        "this account owns private memory streams (from other repos in this index), so a granted \
+         owner could never fetch what you contribute — an account is servable to a peer only when \
+         all of its streams are public, and a control log cannot be served in part. Contribute \
+         from a dedicated index instead: `rag-rat init --database <path-to-a-fresh-index>` in \
+         this checkout, then run `sync contribute` there"
+    );
+
     let canonical = rag_rat_base::hash::hex_lower(&owner.to_bytes());
 
     let _durability = AuthoredDurability::begin(conn)?;

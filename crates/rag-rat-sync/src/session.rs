@@ -110,6 +110,10 @@ pub struct SessionReport {
     pub entries_sent: usize,
     pub entries_received: usize,
     pub entries_newly_stored: usize,
+    /// What this side granted the REMOTE. When `ReadOnly`, receive rejects the peer's entries, so
+    /// a session that exists to RECEIVE (a pull) transferred nothing and its all-quiet round
+    /// means "structurally unable to receive", not "in sync".
+    pub peer_capability: crate::auth::PeerCapability,
 }
 
 /// A session that could not complete.
@@ -361,7 +365,12 @@ where
     let ((mut send, entries_sent), (mut recv, entries_received, entries_newly_stored)) =
         tokio::try_join!(sender, receiver)?;
     complete_session(&mut send, &mut recv, role, idle_timeout).await?;
-    Ok(SessionReport { entries_sent, entries_received, entries_newly_stored })
+    Ok(SessionReport {
+        entries_sent,
+        entries_received,
+        entries_newly_stored,
+        peer_capability: capabilities.peer,
+    })
 }
 
 /// Prove both data streams were consumed before the dialer may close the connection. The ordering

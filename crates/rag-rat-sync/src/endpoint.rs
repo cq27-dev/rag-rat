@@ -534,6 +534,10 @@ pub struct ReconcileReport {
     pub entries_newly_stored: usize,
     pub entries_sent: usize,
     pub converged: bool,
+    /// What this side granted the remote in the LAST round — see
+    /// [`SessionReport::peer_capability`]. `ReadOnly` here means the peer was never allowed to
+    /// send, so `converged` says only that nothing moved, not that the stores agree.
+    pub peer_capability: crate::auth::PeerCapability,
 }
 
 /// Whether reconciliation should run another round, given the round just completed (#878). A single
@@ -598,7 +602,13 @@ pub async fn connect_and_reconcile<S: SyncStore + NodeAuth>(
         entries_newly_stored += report.entries_newly_stored;
         entries_sent += report.entries_sent;
         if let ReconcileStep::Stop { converged } = reconcile_step(&report, rounds, max_rounds) {
-            return Ok(ReconcileReport { rounds, entries_newly_stored, entries_sent, converged });
+            return Ok(ReconcileReport {
+                rounds,
+                entries_newly_stored,
+                entries_sent,
+                converged,
+                peer_capability: report.peer_capability,
+            });
         }
     }
 }
@@ -623,6 +633,8 @@ pub async fn connect_and_table_reconcile<S: TableSyncStore + NodeAuth>(
             entries_sent: report.entries_sent,
             entries_received: report.entries_received,
             entries_newly_stored: report.entries_newly_stored,
+            // `/5` is pinned `Closed`, so a session that ran at all was roster-authorized.
+            peer_capability: crate::auth::PeerCapability::ReadWrite,
         };
         let step = if report.continuation_pending {
             if rounds >= max_rounds {
@@ -634,7 +646,13 @@ pub async fn connect_and_table_reconcile<S: TableSyncStore + NodeAuth>(
             reconcile_step(&session, rounds, max_rounds)
         };
         if let ReconcileStep::Stop { converged } = step {
-            return Ok(ReconcileReport { rounds, entries_newly_stored, entries_sent, converged });
+            return Ok(ReconcileReport {
+                rounds,
+                entries_newly_stored,
+                entries_sent,
+                converged,
+                peer_capability: crate::auth::PeerCapability::ReadWrite,
+            });
         }
     }
 }
@@ -1037,6 +1055,7 @@ where
             entries_sent: table.entries_sent,
             entries_received: table.entries_received,
             entries_newly_stored: table.entries_newly_stored,
+            peer_capability: capabilities.peer,
         }
     };
     // Keep the acceptor alive until the dialer reads its final acknowledgement and closes.
@@ -1205,6 +1224,7 @@ pub async fn dispatch_connection_multi(
             entries_sent: table.entries_sent,
             entries_received: table.entries_received,
             entries_newly_stored: table.entries_newly_stored,
+            peer_capability: capabilities.peer,
         }
     };
     let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
@@ -1297,11 +1317,24 @@ mod tests {
         // Each direction of movement, on its own, keeps the loop going under the cap: `stored`
         // (local promotion), `received` (peer still has data), and `sent` (our push may have made
         // the acceptor evict — a quiet confirmation round must prove the re-push landed).
-        let stored =
-            SessionReport { entries_sent: 0, entries_received: 0, entries_newly_stored: 2 };
-        let received =
-            SessionReport { entries_sent: 0, entries_received: 5, entries_newly_stored: 0 };
-        let sent = SessionReport { entries_sent: 3, entries_received: 0, entries_newly_stored: 0 };
+        let stored = SessionReport {
+            entries_sent: 0,
+            entries_received: 0,
+            entries_newly_stored: 2,
+            peer_capability: crate::auth::PeerCapability::ReadWrite,
+        };
+        let received = SessionReport {
+            entries_sent: 0,
+            entries_received: 5,
+            entries_newly_stored: 0,
+            peer_capability: crate::auth::PeerCapability::ReadWrite,
+        };
+        let sent = SessionReport {
+            entries_sent: 3,
+            entries_received: 0,
+            entries_newly_stored: 0,
+            peer_capability: crate::auth::PeerCapability::ReadWrite,
+        };
         for report in [&stored, &received, &sent] {
             assert_eq!(reconcile_step(report, 1, 8), ReconcileStep::Continue);
         }
