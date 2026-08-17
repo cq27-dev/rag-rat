@@ -861,10 +861,17 @@ pub fn redeem_writer_invite(
     let Some(invite) = stored_invite(conn, request.nonce)? else {
         return Err(InviteError::Unknown);
     };
+    // The replay window is bounded exactly as enrollment's: past the retention period a consumed
+    // nonce answers Used and the row is pruned, never a receipt.
+    let arrival_ms = now_ms();
+    if receipt_replay_expired(&invite, arrival_ms) {
+        prune_expired_invites(conn, arrival_ms)?;
+        return Err(InviteError::Used);
+    }
     if let Some(receipt) = writer_replay_receipt(conn, &invite, request)? {
         return Ok(receipt);
     }
-    writer_redeem_preflight(&invite, request, now_ms())?;
+    writer_redeem_preflight(&invite, request, arrival_ms)?;
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| InviteError::Storage(error.into()))?;
@@ -872,6 +879,11 @@ pub fn redeem_writer_invite(
     let Some(invite) = stored_invite(&tx, request.nonce)? else {
         return Err(InviteError::Unknown);
     };
+    if receipt_replay_expired(&invite, commit_ms) {
+        prune_expired_invites_in_tx(&tx, commit_ms)?;
+        tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
+        return Err(InviteError::Used);
+    }
     if let Some(receipt) = writer_replay_receipt(&tx, &invite, request)? {
         return Ok(receipt);
     }
@@ -2759,12 +2771,28 @@ mod tests {
         // ...while ANY other contributor finds the nonce spent.
         let other = WriterGrantRequest {
             contributor_account: AccountId::from_bytes([0x88; 32]),
-            ..request
+            ..request.clone()
         };
         assert!(matches!(
             redeem_writer_invite(&conn, &other, [9; 32], &|| NOW + 2),
             Err(InviteError::Used)
         ));
+
+        // Past the retention window even the SAME contributor gets Used, and the consumed row is
+        // pruned rather than retained indefinitely — the same bound enrollment replays honor.
+        let past_retention = NOW + 2 + RECEIPT_REPLAY_RETENTION_MS;
+        assert!(matches!(
+            redeem_writer_invite(&conn, &request, [9; 32], &|| past_retention),
+            Err(InviteError::Used)
+        ));
+        let retained: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_invites WHERE nonce = ?1",
+                [ticket.nonce.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 0, "the replay-expired row is pruned");
     }
 
     #[tokio::test]

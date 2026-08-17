@@ -498,6 +498,9 @@ fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::R
 fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
     let ticket = rag_rat_sync::InviteTicket::from_ticket_string(ticket)
         .map_err(|e| anyhow!("invalid enrollment ticket: {e}"))?;
+    // Diagnose a wrong-kind paste by name BEFORE any local setup or network activity — a writer
+    // invite reaching the pairing redemption would only fail deep in the owner's role handling.
+    ticket.expect_kind(rag_rat_sync::InviteTicketKind::Pairing)?;
     // Bind over the INVITER's relay (the ticket's), not the local `[sync] relay_url`: both peers
     // must share a relay to meet, and the ticket names where the inviter is reachable. `sync init`
     // minted the ticket with the relay IT is serving on.
