@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 116;
+pub const LATEST_SCHEMA_VERSION: u32 = 117;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -848,6 +848,12 @@ const MIGRATION_113_DESCRIPTION: &str =
 const MIGRATION_114_ID: &str = "114_content_entries_lamport_column";
 const MIGRATION_115_ID: &str = "115_refold_account_authority_projections";
 const MIGRATION_116_ID: &str = "116_writer_invites";
+const MIGRATION_117_ID: &str = "117_content_author_stream_index";
+const MIGRATION_117_CHECKSUM: &str = "sha256:rag-rat-content-author-stream-index-v117";
+const MIGRATION_117_DESCRIPTION: &str =
+    "Index /3 content entries by (author_account_id, stream_id) over accepted rows, so the \
+     pre-authentication servability probe can enumerate the streams an account has actually \
+     authored onto as an indexed scan instead of a per-dial table walk (#1185)";
 const MIGRATION_116_CHECKSUM: &str = "sha256:rag-rat-writer-invites-v116";
 const MIGRATION_116_DESCRIPTION: &str =
     "Rebuild sync_invites so an invite can be a cross-account WRITER invite (#1179): the role \
@@ -1822,6 +1828,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_116_CHECKSUM,
         description: MIGRATION_116_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_writer_invites),
+    },
+    Migration {
+        id: MIGRATION_117_ID,
+        checksum: MIGRATION_117_CHECKSUM,
+        description: MIGRATION_117_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_content_author_stream_index),
     },
 ];
 

@@ -2092,6 +2092,29 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
     Ok(())
 }
 
+/// The distinct streams `account` holds ACCEPTED self-authored `/3` entries on, excluding the
+/// ones it owns — durable evidence of past contribution, which outlives the mutable
+/// configuration that produced it. The servability probe (`account_is_public_kb`) reads this per
+/// inbound connection BEFORE authentication, so it rides the V117 author-leading partial index;
+/// the ownership exclusion is an indexed subquery.
+pub fn authored_foreign_streams(
+    conn: &Connection,
+    account: AccountId,
+) -> anyhow::Result<Vec<StreamId>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT stream_id FROM content_entries
+         WHERE author_account_id = ?1 AND accepted = 1
+           AND stream_id NOT IN (
+               SELECT stream_id FROM account_stream_ownership WHERE account_id = ?1
+           )
+         ORDER BY stream_id",
+    )?;
+    let rows = stmt
+        .query_map([account.to_bytes().as_slice()], |row| row.get::<_, [u8; 32]>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().map(StreamId::from_bytes).collect())
+}
+
 /// The V114 backfill hook: fill the denormalized `content_entries.lamport` column from each
 /// stored signed envelope, once. Insert sites write the column from then on; an undecodable blob
 /// keeps NULL, which `MAX` ignores — the same treatment the decoding scan gave it. Idempotent

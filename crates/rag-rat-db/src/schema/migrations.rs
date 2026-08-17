@@ -8511,6 +8511,17 @@ pub(crate) fn apply_writer_invites(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// V117 (#1185): the author-leading `/3` index. `account_is_public_kb` runs per inbound
+/// connection BEFORE authentication, and its authored-streams evidence ("which streams has this
+/// account actually contributed to?") must therefore be an indexed scan — the existing content
+/// indexes all lead with `stream_id`.
+pub(crate) fn apply_content_author_stream_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_content_entries_author_stream
+             ON content_entries(author_account_id, stream_id) WHERE accepted = 1;",
+    )
+}
+
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
     let mut stmt =
         conn.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?;

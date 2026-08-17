@@ -385,6 +385,45 @@ fn keep_until_carves_an_accepted_prefix_back_into_a_compromised_revoke() {
     );
 }
 
+/// Re-pointing `sync contribute` at another owner must not strand contributions already authored
+/// (#1185): servability rests on EVIDENCE of past authorship, not on the mutable configuration,
+/// so the previous owner can still pull what this store wrote — and a revoked grant withdraws
+/// the exposure again.
+#[test]
+fn re_pointing_contribution_keeps_the_authored_account_servable() {
+    let (owner, contributor, _owner_account, contributor_account) = revocable_pair();
+    assert!(
+        crate::sync_driver::account_is_public_kb(&contributor, contributor_account).unwrap(),
+        "a configured, granted contributor serves its log",
+    );
+
+    // The re-point (typo, or a deliberate second contribution before its grant exists): the
+    // configured target no longer verifies, but the authored entries on the previous owner's
+    // stream are durable evidence.
+    crate::memory_write::set_contribution_owner(&contributor, &"ab".repeat(32), NOW).unwrap();
+    assert!(
+        crate::sync_driver::account_is_public_kb(&contributor, contributor_account).unwrap(),
+        "authored evidence keeps the log servable after a re-point",
+    );
+
+    // Revoking the grant withdraws the exposure: evidence of authorship alone is not enough
+    // without a LIVE grant on the target stream.
+    let contributor_hex = rag_rat_base::hash::hex_lower(&contributor_account.to_bytes());
+    revoke_repo_writer(
+        &owner,
+        &contributor_hex,
+        rag_rat_oplog::RevokeReason::Compromised,
+        None,
+        NOW,
+    )
+    .unwrap();
+    sync_account_into(&contributor, &owner, local_account(&owner, NOW).unwrap());
+    assert!(
+        !crate::sync_driver::account_is_public_kb(&contributor, contributor_account).unwrap(),
+        "a revoked grant withdraws the authored-evidence exposure",
+    );
+}
+
 #[test]
 fn contributing_without_a_synced_grant_fails_loud() {
     // Configure contribution to an owner whose grant was never synced: authoring must error with a

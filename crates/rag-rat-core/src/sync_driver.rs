@@ -391,16 +391,46 @@ pub fn account_is_public_kb(
             owner,
             rag_rat_oplog::AccessMode::PublicRead,
         )?;
-        if rag_rat_oplog::stream_access_mode(conn, owner, stream)?
-            != rag_rat_oplog::AccessMode::PublicRead
-        {
-            continue;
+        if contribution_stream_is_servable(conn, owner, stream, account)? {
+            return Ok(true);
         }
-        if rag_rat_oplog::effective_writer_grant(conn, owner, stream, account)?.is_some() {
+    }
+    // Evidence of PAST authorship, not just current configuration (#1185): re-pointing `sync
+    // contribute` at another owner must not strand contributions already authored onto the
+    // previous owner's stream — that owner's pull would fall back to `Closed` against this store
+    // even though its grant is still effective and the entries sit on its PublicRead stream. The
+    // streams this account has actually authored accepted entries onto are durable facts the
+    // config cannot erase; each is verified exactly like a configured target (ownership fact
+    // synced, PublicRead, live writer grant), so a stale or revoked authorship exposes nothing.
+    // The enumeration rides the V117 author-leading partial index — this still runs per dial,
+    // before authentication.
+    for stream in rag_rat_oplog::authored_foreign_streams(conn, account)? {
+        let Some(owner) = rag_rat_oplog::stream_owner_account(conn, stream)? else {
+            continue;
+        };
+        if contribution_stream_is_servable(conn, owner, stream, account)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// One contribution stream's servability check, identical for a CONFIGURED target and an
+/// AUTHORED-evidence one: the owner's ownership fact must be synced and declare `PublicRead`
+/// (`stream_access_mode` fails closed to `Private` when it is not), and the grant must still be
+/// effective.
+fn contribution_stream_is_servable(
+    conn: &Connection,
+    owner: rag_rat_oplog::AccountId,
+    stream: rag_rat_oplog::StreamId,
+    account: rag_rat_oplog::AccountId,
+) -> anyhow::Result<bool> {
+    if rag_rat_oplog::stream_access_mode(conn, owner, stream)?
+        != rag_rat_oplog::AccessMode::PublicRead
+    {
+        return Ok(false);
+    }
+    Ok(rag_rat_oplog::effective_writer_grant(conn, owner, stream, account)?.is_some())
 }
 
 /// Maintain a serving host's discovery announcement independently of its inbound session loop.
