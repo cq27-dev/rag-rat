@@ -1739,11 +1739,24 @@ fn lamport_advance_clamped(
         .filter(|r| accepted.contains(&r.entry_hash))
         .map(|r| (r.entry_hash, &r.header))
         .collect();
+    let cut = bounded_advance_cuts(&entries, monotonicity_cuts(&entries));
+    let parked = chain_cut_demotions(&entries, &cut);
+    accepted.retain(|hash| !parked.contains(hash));
+    (accepted, parked)
+}
+
+/// Pass 1 of the `/3` lamport clamp: each chain's cut at its first non-increasing lamport step.
+/// The input must hold at most ONE entry per `(chain, seq)` — the accepted population, where
+/// branch selection (or the `content_accepted_slot` index, for stored legacy rows) has already
+/// resolved forks — or a same-seq fork sibling would misread as a backwards tick.
+fn monotonicity_cuts(
+    entries: &[(EntryHash, &ContentEntryHeader)],
+) -> HashMap<ChainCoordinate, u64> {
     let mut chains: HashMap<ChainCoordinate, Vec<&ContentEntryHeader>> = HashMap::new();
-    for (_, header) in &entries {
+    for (_, header) in entries {
         chains.entry(ChainCoordinate::of(header)).or_default().push(header);
     }
-    let mut cut: HashMap<ChainCoordinate, u64> = HashMap::new();
+    let mut cut = HashMap::new();
     for (coordinate, mut members) in chains {
         members.sort_by_key(|header| header.seq);
         for pair in members.windows(2) {
@@ -1753,10 +1766,7 @@ fn lamport_advance_clamped(
             }
         }
     }
-    let cut = bounded_advance_cuts(&entries, cut);
-    let parked = chain_cut_demotions(&entries, &cut);
-    accepted.retain(|hash| !parked.contains(hash));
-    (accepted, parked)
+    cut
 }
 
 /// The bounded-advance walk of the `/3` lamport clamp: one ascending `(lamport, entry_hash)` pass
@@ -1818,20 +1828,25 @@ fn chain_cut_demotions(
 /// `content_pre_verify` rows are dropped for the same reason — ingest and promotion refuse them
 /// now, but a legacy row would sit there unpromotable indefinitely.
 ///
-/// The walk's clock is derived from the ACCEPTED rows only — the same population the pre-clamp
-/// fold admitted — and the resulting chain cuts are then applied to every stored row of those
-/// chains. Judging the clock over the full candidate set would let junk the fold never accepted
-/// (an ungranted author's high-lamport candidate) advance the running max and shield a genuinely
-/// accepted poison from deletion; the queued refold would then park the poison but leave it
-/// stored as a wedging chain tail.
+/// The judgment mirrors the fold exactly, on the ACCEPTED rows only — monotonicity cuts (safe
+/// there: the `content_accepted_slot` index guarantees one accepted row per `(chain, seq)`, so no
+/// fork sibling can misread as a backwards tick, and without this pass a poisoned ancestor whose
+/// backwards descendant sorts first in the walk would shield itself), then the bounded-advance
+/// walk. Judging the clock over the full candidate set instead would let junk the fold never
+/// accepted (an ungranted author's high-lamport candidate) advance the running max and shield a
+/// genuinely accepted poison from deletion; the queued refold would then park the poison but
+/// leave it stored as a wedging chain tail.
+///
+/// Deletion then follows HASH branches, never seq ranges: the demoted accepted rows plus every
+/// over-ceiling row (any acceptance state), closed over stored `prev_hash` descendants. A
+/// seq-keyed sweep would also delete a VALID sibling that shares a violating fork loser's
+/// `(chain, seq)` — irreversible loss of accepted content — while the hash closure retires
+/// exactly the poisoned branch and keeps each surviving branch dense.
 ///
 /// Runtime folds keep PARKING rather than deleting. Deletion at this seam stays stable because
 /// the ingest-time bounded-advance gate refuses the purged envelopes if a not-yet-upgraded peer
 /// re-offers them — without that gate, one resend would re-park the tail and re-wedge the chain.
-/// Undecodable envelopes are left alone (the refold declassifies them). The monotonicity
-/// pre-filter is deliberately NOT primed: accepted rows from a pre-clamp fold can, in principle,
-/// hold shapes that filter would misread, and anything it would have caught still parks at the
-/// queued refold.
+/// Undecodable envelopes are left alone (the refold declassifies them).
 pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()> {
     let tables_exist = conn
         .query_row(
@@ -1868,22 +1883,36 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
             .filter(|(_, _, accepted)| *accepted)
             .map(|(hash, header, _)| (*hash, header))
             .collect();
-        let all: Vec<(EntryHash, &ContentEntryHeader)> =
-            members.iter().map(|(hash, header, _)| (*hash, header)).collect();
-        // An over-ceiling row is protocol-invalid regardless of its acceptance state — upgraded
-        // peers refuse the envelope before storage, so a rejected/forked/parked one left behind
-        // would still be advertised and resent on every reconciliation forever. Prime it as a
-        // chain cut (rather than a bare delete) so its same-chain suffix retires with it and the
-        // stored chain stays dense.
-        let mut cut: HashMap<ChainCoordinate, u64> = HashMap::new();
-        for (_, header) in &all {
+        // The fold-mirroring judgment over the accepted rows: what would park under the clamp is
+        // what deletes here.
+        let cut = bounded_advance_cuts(&accepted, monotonicity_cuts(&accepted));
+        let mut doomed = chain_cut_demotions(&accepted, &cut);
+        // Over-ceiling rows are protocol-invalid regardless of acceptance state — upgraded peers
+        // refuse the envelope before storage, so a rejected/forked/parked one left behind would
+        // still be advertised and resent on every reconciliation forever.
+        for (hash, header, _) in &members {
             if header.lamport >= crate::entry::MAX_ENTRY_LAMPORT {
-                let seq = cut.entry(ChainCoordinate::of(header)).or_insert(header.seq);
-                *seq = (*seq).min(header.seq);
+                doomed.insert(*hash);
             }
         }
-        let cut = bounded_advance_cuts(&accepted, cut);
-        for hash in chain_cut_demotions(&all, &cut) {
+        // Close over stored hash descendants: a row chained onto a doomed row can never regain a
+        // stored predecessor, so it retires too — but ONLY the doomed branch; a valid sibling at
+        // the same (chain, seq) is untouched.
+        let mut children: HashMap<[u8; 32], Vec<EntryHash>> = HashMap::new();
+        for (hash, header, _) in &members {
+            if let Some(previous) = header.prev_hash {
+                children.entry(previous).or_default().push(*hash);
+            }
+        }
+        let mut frontier: Vec<EntryHash> = doomed.iter().copied().collect();
+        while let Some(parent) = frontier.pop() {
+            for child in children.get(&parent).into_iter().flatten() {
+                if doomed.insert(*child) {
+                    frontier.push(*child);
+                }
+            }
+        }
+        for hash in doomed {
             conn.execute("DELETE FROM content_entries WHERE entry_hash = ?1", [hash.as_slice()])?;
             conn.execute("DELETE FROM content_entry_status WHERE entry_hash = ?1", [
                 hash.as_slice()
@@ -4197,6 +4226,89 @@ mod tests {
             vec![honest.entry_hash.to_vec()],
             "the never-accepted over-ceiling row and its chain suffix are purged"
         );
+    }
+
+    #[test]
+    fn a_valid_fork_sibling_survives_the_purge_of_its_violating_rival() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0x21; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        // A fork at seq 1: the ACCEPTED winner is honest; the loser is over-ceiling and carries a
+        // stored child. Deletion keyed by (chain, seq) would sweep the honest winner with the
+        // loser — irreversible accepted-content loss — so the purge must follow the loser's hash
+        // branch only.
+        let root = authored(&secret, owner, genesis, ContentSpec::default());
+        let winner = authored(&secret, owner, genesis, ContentSpec {
+            seq: 1,
+            previous: Some(root.entry_hash),
+            ..ContentSpec::default()
+        });
+        let loser = authored(&secret, owner, genesis, ContentSpec {
+            seq: 1,
+            previous: Some(root.entry_hash),
+            lamport: Some(u64::MAX),
+            ..ContentSpec::default()
+        });
+        let loser_child = authored(&secret, owner, genesis, ContentSpec {
+            seq: 2,
+            previous: Some(loser.entry_hash),
+            lamport: Some(3),
+            ..ContentSpec::default()
+        });
+        plant_legacy_candidate(&conn, &root, true);
+        plant_legacy_candidate(&conn, &winner, true);
+        plant_legacy_candidate(&conn, &loser, false);
+        plant_legacy_candidate(&conn, &loser_child, false);
+
+        purge_legacy_lamport_violators(&conn).unwrap();
+        let mut remaining: Vec<Vec<u8>> = conn
+            .prepare("SELECT entry_hash FROM content_entries")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        remaining.sort();
+        let mut expected = vec![root.entry_hash.to_vec(), winner.entry_hash.to_vec()];
+        expected.sort();
+        assert_eq!(
+            remaining, expected,
+            "the violating fork branch retires; the accepted winner at the same seq survives"
+        );
+    }
+
+    #[test]
+    fn a_backwards_descendant_cannot_shield_its_poisoned_ancestor_from_the_purge() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0x21; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        // A crafted pre-clamp accepted chain whose descendant ticks BACKWARDS: the ascending
+        // walk meets the descendant first, and without the monotonicity cuts its lamport would
+        // advance the running max far enough to make the poisoned ancestor look in-bounds —
+        // leaving the whole chain stored, parked at refold, and wedging future authoring.
+        let poison = authored(&secret, owner, genesis, ContentSpec {
+            lamport: Some(2 * crate::entry::MAX_LAMPORT_ADVANCE),
+            ..ContentSpec::default()
+        });
+        let backwards = authored(&secret, owner, genesis, ContentSpec {
+            seq: 1,
+            previous: Some(poison.entry_hash),
+            lamport: Some(crate::entry::MAX_LAMPORT_ADVANCE),
+            ..ContentSpec::default()
+        });
+        plant_legacy_candidate(&conn, &poison, true);
+        plant_legacy_candidate(&conn, &backwards, true);
+
+        purge_legacy_lamport_violators(&conn).unwrap();
+        let remaining: i64 =
+            conn.query_row("SELECT count(*) FROM content_entries", [], |row| row.get(0)).unwrap();
+        assert_eq!(remaining, 0, "the poisoned chain retires whole; nothing shields it");
     }
 
     #[test]
