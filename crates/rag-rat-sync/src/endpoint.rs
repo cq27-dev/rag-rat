@@ -113,6 +113,16 @@ pub fn node_id_from_secret(secret_key: [u8; 32]) -> [u8; 32] {
     *SecretKey::from_bytes(&secret_key).public().as_bytes()
 }
 
+/// Parse a peer's node id from any supported spelling (64-char lowercase hex or standard base32)
+/// into its raw 32 bytes — the canonical comparison identity. Callers holding node-id STRINGS
+/// must compare through here, never literally: three distinct strings can name one node (see
+/// [`discover_peers`]), so a string comparison silently treats one peer as several.
+pub fn parse_node_id(node_id: &str) -> Result<[u8; 32], EndpointError> {
+    let id =
+        EndpointId::from_str(node_id.trim()).map_err(|e| EndpointError::PeerId(e.to_string()))?;
+    Ok(*id.as_bytes())
+}
+
 /// Build a dialable [`EndpointAddr`] from a peer's node id (the 64-char lowercase hex form
 /// `endpoint.id()` prints; standard base32 is also accepted) and the shared relay URL. The
 /// device-side sync driver configures server peers by node id and reaches each through the pinned

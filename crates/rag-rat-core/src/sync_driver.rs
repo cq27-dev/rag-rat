@@ -789,8 +789,11 @@ async fn reconcile(
     // first successful foreign pull memoizes a host it is still dialed once per pass; that
     // warmup noise is bounded and self-healing, unlike the permanent false alarm it replaces.
     let foreign_hosts = foreign_pull_hosts(conn)?;
-    let device_peers: Vec<(String, rag_rat_sync::EndpointAddr)> =
-        resolved.peers.into_iter().filter(|(peer, _)| !foreign_hosts.contains(peer)).collect();
+    let device_peers: Vec<(String, rag_rat_sync::EndpointAddr)> = resolved
+        .peers
+        .into_iter()
+        .filter(|(_, address)| !foreign_hosts.contains(&Ok(*address.id.as_bytes())))
+        .collect();
     let mut reached = vec![false; device_peers.len()];
     for (index, (peer, address)) in device_peers.iter().enumerate() {
         let mut store = OplogSyncStore::new(conn, account, time::now_ms);
@@ -911,29 +914,46 @@ fn foreign_pull_targets(
 /// re-probing (and re-warning about) every configured peer that does not hold the account.
 const PULL_PEER_MEMO_PREFIX: &str = "sync_pull_peer:";
 
-/// Peers memoized as FOREIGN-account hosts. A production host serves only its OWN account, so
-/// the local-account (device sync) phase can never succeed against one of these — dialing them
-/// there fails the account-scope handshake and reads as a broken device sync every cadence.
-fn foreign_pull_hosts(conn: &Connection) -> anyhow::Result<Vec<String>> {
-    rag_rat_db::meta::meta_values_with_prefix(conn, PULL_PEER_MEMO_PREFIX)
+/// The identity a peer STRING names, for comparing peers across spellings: the parsed 32-byte
+/// node id when the string parses (hex and base32 spellings of one node compare equal), or the
+/// trimmed literal otherwise (an unparseable entry still compares as itself). Node-id strings
+/// must never be compared literally — `[sync] server_peers` accepts several spellings of one
+/// node, and the memo stores whichever spelling answered.
+fn peer_identity(peer: &str) -> Result<[u8; 32], String> {
+    rag_rat_sync::parse_node_id(peer).map_err(|_| peer.trim().to_string())
+}
+
+/// Peers memoized as FOREIGN-account hosts, as [`peer_identity`] values. A production host serves
+/// only its OWN account, so the local-account (device sync) phase can never succeed against one of
+/// these — dialing them there fails the account-scope handshake and reads as a broken device sync
+/// every cadence.
+fn foreign_pull_hosts(conn: &Connection) -> anyhow::Result<Vec<Result<[u8; 32], String>>> {
+    Ok(rag_rat_db::meta::meta_values_with_prefix(conn, PULL_PEER_MEMO_PREFIX)?
+        .iter()
+        .map(|peer| peer_identity(peer))
+        .collect())
 }
 
 /// The peers to dial for one foreign account, memoized answerer first. The memo ORDERS the
 /// configured peer set, never extends it: a host removed from `[sync] server_peers` must stop
 /// being dialed, so a memo that is no longer configured is cleared rather than honored.
+/// Membership is decided by [`peer_identity`], so a memo still counts as configured when the
+/// config spells the same node differently.
 fn ordered_pull_peers(
     conn: &Connection,
     memo_key: &str,
     peers: &[String],
 ) -> anyhow::Result<Vec<String>> {
-    let memo = rag_rat_db::meta::read_meta(conn, memo_key)?.filter(|peer| peers.contains(peer));
+    let memo = rag_rat_db::meta::read_meta(conn, memo_key)?
+        .filter(|memo| peers.iter().any(|peer| peer_identity(peer) == peer_identity(memo)));
     if memo.is_none() {
         // Clears a decommissioned host's memo; a no-op when nothing was stored.
         rag_rat_db::meta::delete_meta(conn, memo_key)?;
     }
+    let memo_identity = memo.as_deref().map(peer_identity);
     Ok(memo
         .iter()
-        .chain(peers.iter().filter(|peer| Some(*peer) != memo.as_ref()))
+        .chain(peers.iter().filter(|peer| Some(peer_identity(peer)) != memo_identity))
         .cloned()
         .collect())
 }
@@ -1232,8 +1252,8 @@ mod tests {
         DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PULL_PEER_MEMO_PREFIX, PerPeerSessionLimiter,
         PersistedAdvertisement, RESIDENT_NUDGE, RefusedPublication, account_is_public_kb, can_host,
         can_sync, device_sync_run, foreign_pull_hosts, foreign_pull_targets, nudge_resident_host,
-        ordered_pull_peers, pull_account_via_peers, read_advertisement, refused_publication_is_due,
-        retry_is_due, write_advertisement,
+        ordered_pull_peers, peer_identity, pull_account_via_peers, read_advertisement,
+        refused_publication_is_due, retry_is_due, write_advertisement,
     };
 
     fn schema_conn() -> Connection {
@@ -1668,7 +1688,53 @@ mod tests {
         // Unrelated meta keys — including other sync keys — never mark a device-sync peer.
         rag_rat_db::meta::set_meta(&conn, RESIDENT_NUDGE, "5").unwrap();
         rag_rat_db::meta::set_meta(&conn, "sync_pull_peerless", "node-x").unwrap();
-        assert_eq!(foreign_pull_hosts(&conn).unwrap(), vec!["node-f".to_string()]);
+        assert_eq!(foreign_pull_hosts(&conn).unwrap(), vec![peer_identity("node-f")]);
+    }
+
+    /// Standard base32, no padding — an alternate spelling `parse_node_id` accepts for the node a
+    /// 64-char lowercase hex string names.
+    fn base32_nopad(bytes: &[u8; 32]) -> String {
+        const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let mut out = String::with_capacity(52);
+        let (mut acc, mut bits) = (0u32, 0u32);
+        for &byte in bytes {
+            acc = (acc << 8) | u32::from(byte);
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out.push(ALPHABET[((acc >> bits) & 0x1f) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(ALPHABET[((acc << (5 - bits)) & 0x1f) as usize] as char);
+        }
+        out
+    }
+
+    #[test]
+    fn peer_comparisons_recognize_alternate_spellings_of_one_node() {
+        let conn = schema_conn();
+        let bytes = rag_rat_sync::node_id_from_secret([7; 32]);
+        let hex = rag_rat_sync::node_id_to_string(&bytes).unwrap();
+        let base32 = base32_nopad(&bytes);
+        assert_ne!(hex, base32);
+
+        // The memo holds the spelling that answered while the config spells the same node
+        // differently: the memo still counts as configured (kept and fronted), and the
+        // equivalent configured spelling is not dialed a second time.
+        let key = format!("{PULL_PEER_MEMO_PREFIX}bb");
+        rag_rat_db::meta::set_meta(&conn, &key, &base32).unwrap();
+        let peers = vec![hex.clone(), "node-a".to_string()];
+        assert_eq!(ordered_pull_peers(&conn, &key, &peers).unwrap(), vec![
+            base32.clone(),
+            "node-a".to_string()
+        ]);
+        assert!(rag_rat_db::meta::read_meta(&conn, &key).unwrap().is_some(), "memo kept");
+
+        // Device sync excludes a memoized foreign host by parsed identity — the bytes a
+        // resolved `EndpointAddr` carries — never by spelling.
+        assert!(foreign_pull_hosts(&conn).unwrap().contains(&Ok(bytes)));
+        assert_eq!(peer_identity(&hex), Ok(bytes));
     }
 
     /// A relay-free endpoint pair for exercising the pull helper over a real wire.

@@ -38,7 +38,8 @@ pub use endpoint::{
     accept_connection, accept_connection_within_rate, accept_enrollment, build_endpoint,
     connect_and_enroll, connect_and_reconcile, connect_and_sync, connect_and_table_reconcile,
     connect_and_table_sync, discover_peers, dispatch_connection, dispatch_connection_multi,
-    endpoint_addr, node_id_from_secret, node_id_to_string, peer_addr, peer_addr_from_bytes,
+    endpoint_addr, node_id_from_secret, node_id_to_string, parse_node_id, peer_addr,
+    peer_addr_from_bytes,
 };
 pub use enrollment::{
     ENROLL_ALPN, EnrollmentReceipt, EnrollmentRequest, EnrollmentTicket, InviteError, InviteSpec,
