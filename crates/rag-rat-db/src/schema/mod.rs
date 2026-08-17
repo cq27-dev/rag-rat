@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 114;
+pub const LATEST_SCHEMA_VERSION: u32 = 115;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -846,6 +846,14 @@ const MIGRATION_113_DESCRIPTION: &str =
      otherwise keep dominating LWW and blocking authoring on an upgraded store while a fresh \
      replica parks the same entry and diverges (#1176)";
 const MIGRATION_114_ID: &str = "114_content_entries_lamport_column";
+const MIGRATION_115_ID: &str = "115_refold_account_authority_projections";
+const MIGRATION_115_CHECKSUM: &str = "sha256:rag-rat-refold-account-authority-projections-v115";
+const MIGRATION_115_DESCRIPTION: &str =
+    "Rebuild every account's persisted authority projection from its candidate DAG, so a grant a \
+     pre-gate binary folded effective on a private stream is re-judged under the fold's \
+     grants-require-PublicRead rule at upgrade time — the projected account_stream_grants row \
+     would otherwise keep answering Effective until some unrelated ingest happened to refold that \
+     account (#1178)";
 const MIGRATION_114_CHECKSUM: &str = "sha256:rag-rat-content-entries-lamport-column-v114";
 const MIGRATION_114_DESCRIPTION: &str =
     "Denormalize the /3 header lamport into a content_entries column (backfilled from the signed \
@@ -1088,6 +1096,7 @@ const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[
     MIGRATION_112_ID,
     MIGRATION_113_ID,
     MIGRATION_114_ID,
+    MIGRATION_115_ID,
 ];
 
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
@@ -1107,7 +1116,8 @@ fn apply_and_record_migration(
     // The account refold is the projection migrations' own requirement, not the ledger's: it
     // rebuilds what V064 creates/V065 bounds and projects V099's newly-known secrets artifact, off
     // a domain builder this crate cannot link.
-    if matches!(step.id, MIGRATION_064_ID | MIGRATION_065_ID | MIGRATION_099_ID) {
+    if matches!(step.id, MIGRATION_064_ID | MIGRATION_065_ID | MIGRATION_099_ID | MIGRATION_115_ID)
+    {
         (hooks.backfill_authority_projection)(&tx)?;
     }
     migrations::record_migration(&tx, step.id, step.checksum, step.description)?;
@@ -1793,6 +1803,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_114_DESCRIPTION,
         apply: MigrationFn::WithHooks(migrations::apply_content_entries_lamport_column),
     },
+    Migration {
+        id: MIGRATION_115_ID,
+        checksum: MIGRATION_115_CHECKSUM,
+        description: MIGRATION_115_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_refold_account_authority_projections),
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -2027,6 +2043,7 @@ mod ledger_atomicity {
         MIGRATION_112_ID,
         MIGRATION_113_ID,
         MIGRATION_114_ID,
+        MIGRATION_115_ID,
     ];
 
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.

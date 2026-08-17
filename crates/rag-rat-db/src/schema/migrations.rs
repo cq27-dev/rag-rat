@@ -8406,6 +8406,23 @@ pub(crate) fn apply_content_entries_lamport_column(
     (hooks.backfill_content_lamport)(conn)
 }
 
+/// V115 (#1178): re-judge every account's persisted authority projection under the fold's
+/// grants-require-PublicRead rule.
+///
+/// The fold change alone only affects accounts that happen to refold after the upgrade; a
+/// projected `account_stream_grants` row from a grant a pre-gate binary folded effective on a
+/// private stream keeps answering `grant_effective` = Effective until then — leaving exactly the
+/// hostile entries the gate targets authorized. The body is intentionally empty: the whole
+/// migration IS the ledger-atomic `backfill_authority_projection` hook (the all-account refold),
+/// which `apply_and_record_migration` fires for this id the same way it does for V064/V065/V099.
+/// The refold also queues affected content streams, so content accepted under a now-rejected
+/// grant is re-judged at the next settle.
+pub(crate) fn apply_refold_account_authority_projections(
+    _conn: &Connection,
+) -> rusqlite::Result<()> {
+    Ok(())
+}
+
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
     let mut stmt =
         conn.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?;
