@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
 use globset::GlobBuilder;
-use regex::bytes::Regex;
+use regex::bytes::{Regex, RegexBuilder};
 
 /// Compiled matchers keyed by the pattern text, so a pattern is turned into a regex once per
 /// process instead of once per file.
@@ -97,12 +97,14 @@ fn compile(pattern: &str) -> Option<Regex> {
                 return None;
             },
         };
-    match Regex::new(glob.regex()) {
+    // `dot_matches_new_line` is a BUILDER flag in globset (not part of the emitted pattern), so it
+    // must be re-applied here or a file whose NAME contains a newline escapes every `**`.
+    match RegexBuilder::new(glob.regex()).dot_matches_new_line(true).build() {
         Ok(re) => Some(re),
         Err(error) => {
-            // globset guarantees its emitted regex is valid for the regex crate's bytes API, so
-            // this arm is unreachable short of a globset bug; claim nothing rather than panic.
-            tracing::warn!(pattern, %error, "compiled glob regex did not parse; it claims no files");
+            // The emitted pattern is always valid, but a huge (still legal) brace alternation can
+            // exceed the regex crate's compiled-size limit; claim nothing rather than panic.
+            tracing::warn!(pattern, %error, "glob regex did not compile; it claims no files");
             None
         },
     }
@@ -126,6 +128,14 @@ mod tests {
         // otherwise claim different files on Unix and Windows. Pinned ON: `\\` is one literal `\`.
         assert!(pattern_claims("drafts\\secret.md", "drafts\\\\secret.md"));
         assert!(!pattern_claims("drafts/secret.md", "drafts\\\\secret.md"));
+    }
+
+    #[test]
+    fn a_newline_in_a_name_does_not_escape_a_subtree_glob() {
+        // `**` compiles to `.*`; without `dot_matches_new_line` re-applied at regex build, a
+        // newline-bearing name would slip past every subtree exclude.
+        assert!(pattern_claims("src/a\nb.rs", "src/**"));
+        assert!(pattern_claims("src/a\nb.rs", "src/"));
     }
 
     #[test]
