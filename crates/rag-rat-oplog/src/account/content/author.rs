@@ -807,16 +807,30 @@ fn content_chain_tail(
 /// the `(lamport, device)` projection LWW causal across authors; a per-author chain-tail lamport
 /// would let a short-chain writer's later edit lose.
 ///
-/// An indexed `MAX` over the V114 denormalized column (`idx_content_entries_stream_accepted_
-/// lamport`), NOT a decode of every accepted envelope: the ingest-time bounded-advance gate reads
-/// this clock for any authenticated envelope claiming a high lamport, so a per-read O(stream)
-/// decode was a remote CPU/writer-lock burn for a hostile roster device re-sending one envelope.
-/// A NULL column value (an undecodable legacy blob the backfill skipped) is invisible to `MAX`,
-/// exactly as the decoding scan treated rows it could not decode.
+/// The primary read is the refold-persisted `content_stream_clocks` floor, which also counts the
+/// in-bound CONDEMNED basis — so a writer's revocation does not deflate the clock below what
+/// honest dependents already minted against (the wedge that would defeat revocation as the repair
+/// path). A stream the refold has not yet clocked falls back to an indexed `MAX` over the V114
+/// denormalized column (`idx_content_entries_stream_accepted_lamport`). Neither path decodes an
+/// envelope: the ingest-time bounded-advance gate reads this clock for any authenticated envelope
+/// claiming a high lamport, so a per-read O(stream) decode was a remote CPU/writer-lock burn for
+/// a hostile roster device re-sending one envelope. A NULL column value (an undecodable legacy
+/// blob the backfill skipped) is invisible to `MAX`, exactly as the decoding scan treated rows it
+/// could not decode.
 pub(super) fn stream_max_content_lamport(
     conn: &Connection,
     stream_id: StreamId,
 ) -> anyhow::Result<Option<u64>> {
+    let clock: Option<i64> = conn
+        .query_row(
+            "SELECT clock FROM content_stream_clocks WHERE stream_id = ?1",
+            params![stream_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(clock) = clock {
+        return Ok(Some(u64::try_from(clock).unwrap_or(0)));
+    }
     let max: Option<i64> = conn.query_row(
         "SELECT MAX(lamport) FROM content_entries WHERE stream_id = ?1 AND accepted = 1",
         params![stream_id.to_bytes().as_slice()],

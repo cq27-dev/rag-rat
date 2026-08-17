@@ -6746,6 +6746,15 @@ mod syncable_overlay_migration_tests {
             )
             .unwrap();
         assert_eq!(has_index, 1, "the partial accepted-rows lamport index exists");
+        let has_clocks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+                 AND name = 'content_stream_clocks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_clocks, 1, "the refold-persisted stream clock table exists");
     }
 
     /// The full ladder re-keys anchors onto the natural key, drops the AUTOINCREMENT id, and is
@@ -8382,7 +8391,17 @@ pub(crate) fn apply_content_entries_lamport_column(
     }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_content_entries_stream_accepted_lamport
-             ON content_entries(stream_id, lamport) WHERE accepted = 1;",
+             ON content_entries(stream_id, lamport) WHERE accepted = 1;
+         -- The refold-persisted lamport clock floor per /3 stream: max over the accepted lamports
+         -- AND the in-bound condemned basis, so revoking a writer cannot deflate the clock below
+         -- what honest dependents minted against. Invariant: only positive floors are stored
+         -- (absence = no clock yet, readers fall back to the accepted-rows MAX); written only by
+         -- the acceptance refold. V113 queues every content stream, so the first settle after
+         -- this upgrade populates it.
+         CREATE TABLE IF NOT EXISTS content_stream_clocks(
+             stream_id BLOB PRIMARY KEY CHECK(length(stream_id) = 32),
+             clock     INTEGER NOT NULL CHECK(clock > 0)
+         ) STRICT;",
     )?;
     (hooks.backfill_content_lamport)(conn)
 }

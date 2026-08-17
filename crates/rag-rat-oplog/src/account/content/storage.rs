@@ -815,6 +815,7 @@ pub(super) fn refold_content_stream(
     // or it would stay live with no current authority basis.
     let Some(owner_account_id) = account_storage::stream_owner_account(tx, stream_id)? else {
         declassify_stream_to_structural(tx, stream_id)?;
+        store_stream_clock(tx, stream_id, 0)?;
         return Ok(());
     };
 
@@ -830,6 +831,7 @@ pub(super) fn refold_content_stream(
     let handled: HashSet<EntryHash> = resolved.iter().map(|r| r.entry_hash).collect();
     declassify_rows_absent_from(tx, stream_id, &handled)?;
     if resolved.is_empty() {
+        store_stream_clock(tx, stream_id, 0)?;
         return Ok(());
     }
     let view: HashMap<EntryHash, ContentEntryHeader> =
@@ -873,7 +875,19 @@ pub(super) fn refold_content_stream(
         raw.insert(r.entry_hash, verdict);
     }
     let accepted = prefix_closed_accepted(&resolved, &selection, &raw);
-    let (accepted, lamport_parked) = lamport_advance_clamped(&resolved, accepted);
+    // The condemned rows form the CLOCK BASIS alongside the accepted set (see
+    // [`bounded_advance_walk`]): a revoked writer's condemned entries stop projecting, but an
+    // honest dependent that minted against them while they were accepted must not park — or
+    // revocation, the designed repair path, would itself wedge the dependent chain.
+    let condemned: Vec<(EntryHash, &ContentEntryHeader)> = resolved
+        .iter()
+        .filter(|r| matches!(raw.get(&r.entry_hash), Some(ContentAcceptance::Condemned(_))))
+        .map(|r| (r.entry_hash, &r.header))
+        .collect();
+    let (accepted, lamport_parked, clock) =
+        lamport_advance_clamped(&resolved, accepted, &condemned);
+    // Persist the floor for the O(1) ingest-gate and authoring-mint clock reads.
+    store_stream_clock(tx, stream_id, clock)?;
     for r in &resolved {
         let hash = r.entry_hash;
         let verdict = if accepted.contains(&hash) {
@@ -1733,16 +1747,17 @@ fn prefix_closed_accepted(
 fn lamport_advance_clamped(
     resolved: &[ResolvedEntry],
     mut accepted: HashSet<EntryHash>,
-) -> (HashSet<EntryHash>, HashSet<EntryHash>) {
+    condemned: &[(EntryHash, &ContentEntryHeader)],
+) -> (HashSet<EntryHash>, HashSet<EntryHash>, u64) {
     let entries: Vec<(EntryHash, &ContentEntryHeader)> = resolved
         .iter()
         .filter(|r| accepted.contains(&r.entry_hash))
         .map(|r| (r.entry_hash, &r.header))
         .collect();
-    let cut = bounded_advance_cuts(&entries, monotonicity_cuts(&entries));
+    let (cut, clock) = bounded_advance_walk(&entries, condemned, monotonicity_cuts(&entries));
     let parked = chain_cut_demotions(&entries, &cut);
     accepted.retain(|hash| !parked.contains(hash));
-    (accepted, parked)
+    (accepted, parked, clock)
 }
 
 /// Pass 1 of the `/3` lamport clamp: each chain's cut at its first non-increasing lamport step.
@@ -1775,30 +1790,74 @@ fn monotonicity_cuts(
 /// the next one) and cuts its chain at its seq, so the surviving set stays a dense prefix per
 /// chain. `cut` primes chain truncations the caller already knows (the fold's monotonicity cuts).
 ///
+/// `floor` rows are the CONDEMNED clock basis: they prop the running max when themselves within
+/// bound, but are never cut and never demoted. This is what keeps revocation from wedging a
+/// dependent chain — an honest writer that minted `basis + 1` while the basis was accepted must
+/// not park when that basis is later condemned (condemnation already evicts the basis's LWW
+/// damage; its lamport magnitude is not damage). A condemned entry whose own lamport jumps the
+/// bound props nothing, so a straight poison cannot inflate the floor, and an in-bound condemned
+/// ladder inflates it only rung by rung — bounded by the candidate caps, with the ceiling far
+/// out of reach.
+///
 /// Shared by the fold ([`lamport_advance_clamped`]) and the V113 upgrade purge
-/// ([`purge_legacy_lamport_violators`]). Returns the chain cuts; apply them with
-/// [`chain_cut_demotions`] — the two are separate so the purge can derive its clock from one set
-/// (the accepted entries) and apply the cuts to a wider one (every stored row of those chains).
-fn bounded_advance_cuts(
+/// ([`purge_legacy_lamport_violators`]). Returns the chain cuts (apply with
+/// [`chain_cut_demotions`]) and the final running max — the stream's clock floor, which the fold
+/// persists for the O(1) ingest-gate and authoring-mint reads.
+fn bounded_advance_walk(
     entries: &[(EntryHash, &ContentEntryHeader)],
+    floor: &[(EntryHash, &ContentEntryHeader)],
     mut cut: HashMap<ChainCoordinate, u64>,
-) -> HashMap<ChainCoordinate, u64> {
-    let mut rows: Vec<&(EntryHash, &ContentEntryHeader)> = entries.iter().collect();
-    rows.sort_by_key(|(hash, header)| (header.lamport, *hash));
+) -> (HashMap<ChainCoordinate, u64>, u64) {
+    let mut rows: Vec<(u64, EntryHash, &ContentEntryHeader, bool)> = entries
+        .iter()
+        .map(|(hash, header)| (header.lamport, *hash, *header, true))
+        .chain(floor.iter().map(|(hash, header)| (header.lamport, *hash, *header, false)))
+        .collect();
+    rows.sort_by_key(|(lamport, hash, _, _)| (*lamport, *hash));
     let mut running_max = 0u64;
-    for (_, header) in rows {
+    for (lamport, _, header, demotable) in rows {
+        if !demotable {
+            if lamport <= running_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
+                running_max = running_max.max(lamport);
+            }
+            continue;
+        }
         let coordinate = ChainCoordinate::of(header);
         if cut.get(&coordinate).is_some_and(|&seq| header.seq >= seq) {
             continue; // demoted below a cut this walk already discovered
         }
-        if header.lamport > running_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
+        if lamport > running_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
             let seq = cut.entry(coordinate).or_insert(header.seq);
             *seq = (*seq).min(header.seq);
         } else {
-            running_max = running_max.max(header.lamport);
+            running_max = running_max.max(lamport);
         }
     }
-    cut
+    (cut, running_max)
+}
+
+/// Persist (or clear) one stream's lamport clock floor, as derived by the refold's
+/// [`bounded_advance_walk`]. Only positive floors are stored — a zero floor (an empty or
+/// entirely-unaccepted stream) deletes the row, so the clock readers' `None` keeps meaning "no
+/// clock yet" and a fresh mint still starts at lamport 0. The row is refold-owned state: written
+/// only here, read by the ingest gate and the authoring mint.
+fn store_stream_clock(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    clock: u64,
+) -> rusqlite::Result<()> {
+    if clock == 0 {
+        tx.execute("DELETE FROM content_stream_clocks WHERE stream_id = ?1", [stream_id
+            .to_bytes()
+            .as_slice()])?;
+    } else {
+        tx.execute(
+            "INSERT INTO content_stream_clocks(stream_id, clock) VALUES(?1, ?2)
+             ON CONFLICT(stream_id) DO UPDATE SET clock = excluded.clock",
+            params![stream_id.to_bytes().as_slice(), stored_lamport(clock)],
+        )?;
+    }
+    Ok(())
 }
 
 /// Every entry of `entries` sitting at or above its chain's cut.
@@ -1859,49 +1918,72 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
     if !tables_exist {
         return Ok(());
     }
-    let mut streams: HashMap<[u8; 32], Vec<(EntryHash, ContentEntryHeader, bool)>> = HashMap::new();
+    struct LegacyRow {
+        entry_hash: EntryHash,
+        header: ContentEntryHeader,
+        accepted: bool,
+        condemned: bool,
+    }
+    let mut streams: HashMap<[u8; 32], Vec<LegacyRow>> = HashMap::new();
     {
-        let mut stmt =
-            conn.prepare("SELECT entry_hash, signed_bytes, accepted FROM content_entries")?;
+        let mut stmt = conn.prepare(
+            "SELECT e.entry_hash, e.signed_bytes, e.accepted, COALESCE(s.status, '')
+             FROM content_entries e
+             LEFT JOIN content_entry_status s ON s.entry_hash = e.entry_hash",
+        )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, [u8; 32]>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, bool>(2)?))
+            Ok((
+                row.get::<_, [u8; 32]>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, String>(3)?,
+            ))
         })?;
         for row in rows {
-            let (entry_hash, signed_bytes, accepted) = row?;
+            let (entry_hash, signed_bytes, accepted, status) = row?;
             if let Ok(signed) = envelope::decode_content_signed(&signed_bytes) {
-                streams.entry(signed.header.stream_id.to_bytes()).or_default().push((
+                streams.entry(signed.header.stream_id.to_bytes()).or_default().push(LegacyRow {
                     entry_hash,
-                    signed.header,
+                    header: signed.header,
                     accepted,
-                ));
+                    condemned: status.starts_with("condemned"),
+                });
             }
         }
     }
     for members in streams.into_values() {
         let accepted: Vec<(EntryHash, &ContentEntryHeader)> = members
             .iter()
-            .filter(|(_, _, accepted)| *accepted)
-            .map(|(hash, header, _)| (*hash, header))
+            .filter(|row| row.accepted)
+            .map(|row| (row.entry_hash, &row.header))
+            .collect();
+        // Condemned rows prop the clock exactly as they do at the fold (see
+        // [`bounded_advance_walk`]): without them, a store whose poison basis was already
+        // condemned would purge the honest dependents that minted against it.
+        let condemned: Vec<(EntryHash, &ContentEntryHeader)> = members
+            .iter()
+            .filter(|row| row.condemned)
+            .map(|row| (row.entry_hash, &row.header))
             .collect();
         // The fold-mirroring judgment over the accepted rows: what would park under the clamp is
         // what deletes here.
-        let cut = bounded_advance_cuts(&accepted, monotonicity_cuts(&accepted));
+        let (cut, _) = bounded_advance_walk(&accepted, &condemned, monotonicity_cuts(&accepted));
         let mut doomed = chain_cut_demotions(&accepted, &cut);
         // Over-ceiling rows are protocol-invalid regardless of acceptance state — upgraded peers
         // refuse the envelope before storage, so a rejected/forked/parked one left behind would
         // still be advertised and resent on every reconciliation forever.
-        for (hash, header, _) in &members {
-            if header.lamport >= crate::entry::MAX_ENTRY_LAMPORT {
-                doomed.insert(*hash);
+        for row in &members {
+            if row.header.lamport >= crate::entry::MAX_ENTRY_LAMPORT {
+                doomed.insert(row.entry_hash);
             }
         }
         // Close over stored hash descendants: a row chained onto a doomed row can never regain a
         // stored predecessor, so it retires too — but ONLY the doomed branch; a valid sibling at
         // the same (chain, seq) is untouched.
         let mut children: HashMap<[u8; 32], Vec<EntryHash>> = HashMap::new();
-        for (hash, header, _) in &members {
-            if let Some(previous) = header.prev_hash {
-                children.entry(previous).or_default().push(*hash);
+        for row in &members {
+            if let Some(previous) = row.header.prev_hash {
+                children.entry(previous).or_default().push(row.entry_hash);
             }
         }
         let mut frontier: Vec<EntryHash> = doomed.iter().copied().collect();
@@ -4226,6 +4308,75 @@ mod tests {
             vec![honest.entry_hash.to_vec()],
             "the never-accepted over-ceiling row and its chain suffix are purged"
         );
+    }
+
+    #[test]
+    fn revoking_the_writer_that_set_the_clock_basis_does_not_wedge_the_owners_chain() {
+        let conn = db();
+        let owner_secret = DeviceSecret::from_seed(&[0x31; 32]);
+        let author_secret = DeviceSecret::from_seed(&[0x32; 32]);
+        let (owner, owner_genesis) = roster(&conn, &owner_secret);
+        let (author, author_genesis) = roster(&conn, &author_secret);
+        let grant_id = [0x67; 32];
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, owner_genesis, owner, &owner_secret, "owner");
+        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
+        seed_grant(&conn, grant_id, owner, author, "writer");
+
+        // The granted writer legitimately pushes the clock to the edge of the bound, and the
+        // owner then honestly ticks past it.
+        let advance = crate::entry::MAX_LAMPORT_ADVANCE;
+        let g0 = authored(&author_secret, author, author_genesis, ContentSpec {
+            grant_id: Some(grant_id),
+            ..ContentSpec::default()
+        });
+        let basis = authored(&author_secret, author, author_genesis, ContentSpec {
+            grant_id: Some(grant_id),
+            seq: 1,
+            previous: Some(g0.entry_hash),
+            lamport: Some(advance + 1),
+            ..ContentSpec::default()
+        });
+        assert_eq!(verdict_after_ingest(&conn, &g0), ("accepted".into(), 1));
+        assert_eq!(verdict_after_ingest(&conn, &basis), ("accepted".into(), 1));
+        let dependent = authored(&owner_secret, owner, owner_genesis, ContentSpec {
+            lamport: Some(advance + 2),
+            ..ContentSpec::default()
+        });
+        assert_eq!(verdict_after_ingest(&conn, &dependent), ("accepted".into(), 1));
+
+        // Revoke the writer: close the grant with a chain cut below the basis, condemning it.
+        conn.execute("UPDATE account_stream_grants SET closed_at = 2 WHERE grant_id = ?1", [
+            grant_id.as_slice(),
+        ])
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_stream_grant_cuts(
+                 grant_id, owner_account_id, device_fingerprint, seq, entry_hash)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![
+                grant_id.as_slice(),
+                owner.to_bytes().as_slice(),
+                author_secret.public().fingerprint().to_bytes().as_slice(),
+                0_u64.to_be_bytes().as_slice(),
+                g0.entry_hash.as_slice(),
+            ],
+        )
+        .unwrap();
+
+        // The owner keeps authoring after the revocation: the condemned basis props the clock
+        // floor, so the dependent tick stays accepted and its continuation folds accepted —
+        // revocation repairs the stream, it must not wedge it.
+        let continuation = authored(&owner_secret, owner, owner_genesis, ContentSpec {
+            seq: 1,
+            previous: Some(dependent.entry_hash),
+            lamport: Some(advance + 3),
+            ..ContentSpec::default()
+        });
+        assert_eq!(verdict_after_ingest(&conn, &continuation), ("accepted".into(), 1));
+        assert_eq!(verdict(&conn, &basis.entry_hash), ("condemned{beyond_cut}".into(), 0));
+        assert_eq!(verdict(&conn, &g0.entry_hash), ("accepted".into(), 1));
+        assert_eq!(verdict(&conn, &dependent.entry_hash), ("accepted".into(), 1));
     }
 
     #[test]
