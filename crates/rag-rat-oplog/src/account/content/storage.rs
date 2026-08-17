@@ -101,6 +101,18 @@ pub fn content_ingest(
         Ok(signed) => signed,
         Err(error) => return Ok(ContentIngestOutcome::Rejected(error.to_string())),
     };
+    // Reserve the protocol lamport ceiling BEFORE anything is stored — including the pre-verify
+    // park below. `promote_pre_verify_for_account` re-inserts parked bytes without re-entering
+    // this function, so a check any later is bypassed by parking a near-ceiling entry behind a
+    // withheld roster. The rejection is a drop, never durable: nothing is written, so a later
+    // session may re-offer the envelope. Authoring caps at the same ceiling, so no honest peer's
+    // entry can ever trip this.
+    if signed.header.lamport >= crate::entry::MAX_ENTRY_LAMPORT {
+        return Ok(ContentIngestOutcome::Rejected(format!(
+            "entry lamport {} exceeds the protocol ceiling",
+            signed.header.lamport
+        )));
+    }
     if let Some(status) = stored_status_for_exact_envelope(conn, &signed, signed_bytes)? {
         return Ok(ContentIngestOutcome::Ingested { status });
     }
@@ -795,10 +807,13 @@ pub(super) fn refold_content_stream(
         raw.insert(r.entry_hash, verdict);
     }
     let accepted = prefix_closed_accepted(&resolved, &selection, &raw);
+    let (accepted, lamport_parked) = lamport_advance_clamped(&resolved, accepted);
     for r in &resolved {
         let hash = r.entry_hash;
         let verdict = if accepted.contains(&hash) {
             ContentAcceptance::Accepted
+        } else if lamport_parked.contains(&hash) {
+            ContentAcceptance::Parked(ContentParkReason::LamportAhead)
         } else if selection.forked.contains(&hash) {
             ContentAcceptance::Forked
         } else {
@@ -1626,6 +1641,63 @@ fn prefix_closed_accepted(
         }
     }
     accepted
+}
+
+/// Bounded lamport advance at the acceptance seam: demote any would-be-accepted entry whose
+/// lamport jumps more than [`MAX_LAMPORT_ADVANCE`] past the highest lamport the accepted set
+/// below it establishes. The header lamport is attacker-controlled and decides projection LWW
+/// `(lamport, device)`, so without this one granted writer's entry near the ceiling wins every
+/// register permanently AND bricks authoring (the next mint overflows the ceiling). Enforcing at
+/// the fold rather than at ingest inherits the predecessor gate for free — parked entries never
+/// fold, so an honest partitioned writer's chain folds in order and each step stays within the
+/// bound — and the verdict is re-derived every refold, so a demotion is never durable.
+///
+/// The walk runs in ascending `(lamport, entry_hash)` order with a running max that violators do
+/// NOT advance (a poison entry must not legitimize the next one). A violator's chain is truncated
+/// at the violating seq (accepted stays a dense prefix), and the walk repeats until stable:
+/// truncation can remove an entry whose lamport had already advanced the running max for others.
+/// Bounded by the candidate caps and reached only under attack — honest folds exit on pass one.
+fn lamport_advance_clamped(
+    resolved: &[ResolvedEntry],
+    mut accepted: HashSet<EntryHash>,
+) -> (HashSet<EntryHash>, HashSet<EntryHash>) {
+    let mut parked = HashSet::new();
+    loop {
+        let mut rows: Vec<&ResolvedEntry> =
+            resolved.iter().filter(|r| accepted.contains(&r.entry_hash)).collect();
+        rows.sort_by_key(|r| (r.header.lamport, r.entry_hash));
+        let mut running_max = 0u64;
+        let mut cut: HashMap<ChainCoordinate, u64> = HashMap::new();
+        for r in rows {
+            if r.header.lamport > running_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
+                let coordinate = ChainCoordinate {
+                    stream_id: r.header.stream_id,
+                    author_account_id: r.header.author_account_id,
+                    device_fingerprint: r.header.device_fingerprint,
+                };
+                let seq = cut.entry(coordinate).or_insert(r.header.seq);
+                *seq = (*seq).min(r.header.seq);
+            } else {
+                running_max = running_max.max(r.header.lamport);
+            }
+        }
+        if cut.is_empty() {
+            return (accepted, parked);
+        }
+        for r in resolved {
+            let coordinate = ChainCoordinate {
+                stream_id: r.header.stream_id,
+                author_account_id: r.header.author_account_id,
+                device_fingerprint: r.header.device_fingerprint,
+            };
+            if let Some(&seq) = cut.get(&coordinate)
+                && r.header.seq >= seq
+                && accepted.remove(&r.entry_hash)
+            {
+                parked.insert(r.entry_hash);
+            }
+        }
+    }
 }
 
 /// Reset the status of every stream row NOT in `handled` to the unclassified baseline. Those rows
@@ -3042,7 +3114,15 @@ mod tests {
         let conn = db();
         let secret = DeviceSecret::from_seed(&[11; 32]);
         let (account, roster_ref) = roster(&conn, &secret);
-        let signed = content(&secret, account, roster_ref, u64::MAX, Some([0xaa; 32]));
+        // An explicit in-ceiling lamport: the `content` helper's `seq + 1` mint would saturate to
+        // `u64::MAX` here and trip the ingest ceiling — this test is about SEQ overflow, not the
+        // lamport clamp.
+        let signed = authored(&secret, account, roster_ref, ContentSpec {
+            seq: u64::MAX,
+            previous: Some([0xaa; 32]),
+            lamport: Some(1),
+            ..ContentSpec::default()
+        });
         assert_eq!(
             content_ingest(&conn, &signed.signed_bytes, 1).unwrap(),
             ContentIngestOutcome::Ingested { status: "parked{missing_predecessor}".into() }
@@ -3275,11 +3355,14 @@ mod tests {
         previous: Option<EntryHash>,
         auth_len: u64,
         body: u8,
+        /// `None` mints the honest clock (`seq + 1`); `Some` forges an arbitrary header lamport,
+        /// the attacker-controlled input the `/3` lamport clamp exists for.
+        lamport: Option<u64>,
     }
 
     impl Default for ContentSpec {
         fn default() -> Self {
-            Self { grant_id: None, seq: 0, previous: None, auth_len: 0, body: 0xf6 }
+            Self { grant_id: None, seq: 0, previous: None, auth_len: 0, body: 0xf6, lamport: None }
         }
     }
 
@@ -3296,7 +3379,7 @@ mod tests {
             author_account_id: author,
             device_fingerprint: secret.public().fingerprint(),
             seq: spec.seq,
-            lamport: spec.seq.saturating_add(1),
+            lamport: spec.lamport.unwrap_or(spec.seq.saturating_add(1)),
             prev_hash: spec.previous,
             grant_id: spec.grant_id,
             roster_ref,
@@ -3322,7 +3405,7 @@ mod tests {
             author_account_id: author,
             device_fingerprint: secret.public().fingerprint(),
             seq: spec.seq,
-            lamport: spec.seq.saturating_add(1),
+            lamport: spec.lamport.unwrap_or(spec.seq.saturating_add(1)),
             prev_hash: spec.previous,
             grant_id: spec.grant_id,
             roster_ref,
@@ -3546,6 +3629,157 @@ mod tests {
             ..ContentSpec::default()
         });
         assert_eq!(verdict_after_ingest(&conn, &entry), ("accepted".into(), 1));
+    }
+
+    // ---- the /3 lamport clamp: protocol ceiling at ingest, bounded advance at the fold ----
+
+    #[test]
+    fn a_ceiling_lamport_is_rejected_at_ingest_before_the_pre_verify_park() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0x21; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        // At the ceiling, a resolvable author is rejected outright.
+        let poison = authored(&secret, owner, genesis, ContentSpec {
+            lamport: Some(crate::entry::MAX_ENTRY_LAMPORT),
+            ..ContentSpec::default()
+        });
+        let ContentIngestOutcome::Rejected(reason) =
+            content_ingest(&conn, &poison.signed_bytes, 1).unwrap()
+        else {
+            panic!("a ceiling lamport must reject at ingest");
+        };
+        assert!(reason.contains("protocol ceiling"), "{reason}");
+
+        // The park bypass: an UNKNOWN author would normally park pre-verify, and promotion
+        // re-inserts parked bytes without re-entering `content_ingest` — so the ceiling must
+        // reject BEFORE parking, or an attacker parks a poison entry behind a withheld roster.
+        let stranger = DeviceSecret::from_seed(&[0x99; 32]);
+        let strange_account = AccountId::from_bytes([0x99; 32]);
+        let parked_poison = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
+            lamport: Some(u64::MAX),
+            ..ContentSpec::default()
+        });
+        assert!(matches!(
+            content_ingest(&conn, &parked_poison.signed_bytes, 1).unwrap(),
+            ContentIngestOutcome::Rejected(_)
+        ));
+        let pre_verify: i64 = conn
+            .query_row("SELECT count(*) FROM content_pre_verify", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pre_verify, 0, "a ceiling entry never reaches the pre-verify park");
+    }
+
+    #[test]
+    fn a_lamport_jump_past_the_bounded_advance_parks_instead_of_winning_lww() {
+        let conn = db();
+        let owner_secret = DeviceSecret::from_seed(&[0x31; 32]);
+        let author_secret = DeviceSecret::from_seed(&[0x32; 32]);
+        let (owner, owner_genesis) = roster(&conn, &owner_secret);
+        let (author, author_genesis) = roster(&conn, &author_secret);
+        let grant_id = [0x67; 32];
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, owner_genesis, owner, &owner_secret, "owner");
+        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
+        seed_grant(&conn, grant_id, owner, author, "writer");
+
+        let honest = authored_op(
+            &owner_secret,
+            owner,
+            owner_genesis,
+            ContentSpec::default(),
+            &node_create("honest"),
+        );
+        assert_eq!(verdict_after_ingest(&conn, &honest), ("accepted".into(), 1));
+
+        // Below the protocol ceiling (so ingest admits it) but jumping the accepted stream
+        // clock by more than the bounded advance: the fold parks it instead of letting it
+        // dominate LWW and poison the authoring clock.
+        let poison = authored_op(
+            &author_secret,
+            author,
+            author_genesis,
+            ContentSpec {
+                grant_id: Some(grant_id),
+                lamport: Some(2 + crate::entry::MAX_LAMPORT_ADVANCE),
+                ..ContentSpec::default()
+            },
+            &node_create("poison"),
+        );
+        assert_eq!(verdict_after_ingest(&conn, &poison), ("parked{lamport_ahead}".into(), 0));
+        assert_eq!(projected_node_ids(&conn), vec!["honest".to_string()]);
+
+        // The stream is not bricked: the accepted clock ignored the parked jump, so the owner's
+        // next honest tick still folds accepted.
+        let next = authored_op(
+            &owner_secret,
+            owner,
+            owner_genesis,
+            ContentSpec { seq: 1, previous: Some(honest.entry_hash), ..ContentSpec::default() },
+            &node_create("next"),
+        );
+        assert_eq!(verdict_after_ingest(&conn, &next), ("accepted".into(), 1));
+    }
+
+    #[test]
+    fn a_lamport_violators_chain_descendants_park_with_it() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0x21; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        // seq 0 jumps past the bound; seq 1 carries a modest lamport of its own. Accepting the
+        // descendant over its parked ancestor would break the dense-prefix invariant, so the
+        // chain truncates at the violation.
+        let violator = authored(&secret, owner, genesis, ContentSpec {
+            lamport: Some(2 * crate::entry::MAX_LAMPORT_ADVANCE),
+            ..ContentSpec::default()
+        });
+        let descendant = authored(&secret, owner, genesis, ContentSpec {
+            seq: 1,
+            previous: Some(violator.entry_hash),
+            lamport: Some(2),
+            ..ContentSpec::default()
+        });
+        content_ingest(&conn, &violator.signed_bytes, 1).unwrap();
+        content_ingest(&conn, &descendant.signed_bytes, 1).unwrap();
+        settle_all(&conn);
+        assert_eq!(verdict(&conn, &violator.entry_hash), ("parked{lamport_ahead}".into(), 0));
+        assert_eq!(verdict(&conn, &descendant.entry_hash), ("parked{lamport_ahead}".into(), 0));
+    }
+
+    #[test]
+    fn an_honest_partitioned_backlog_folds_accepted_in_one_settle() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0x21; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        // A partition's worth of catch-up: each entry ticks the clock by one, so every step stays
+        // inside the bounded advance and the whole backlog accepts in a single fold — the clamp
+        // must never falsely reject an honest writer that was merely offline.
+        let mut previous = None;
+        let mut entries = Vec::new();
+        for seq in 0..5_u64 {
+            let entry = authored(&secret, owner, genesis, ContentSpec {
+                seq,
+                previous,
+                ..ContentSpec::default()
+            });
+            previous = Some(entry.entry_hash);
+            entries.push(entry);
+        }
+        for entry in &entries {
+            content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
+        }
+        settle_all(&conn);
+        for entry in &entries {
+            assert_eq!(verdict(&conn, &entry.entry_hash), ("accepted".into(), 1));
+        }
     }
 
     fn seed_auth_state_live(conn: &Connection, account: AccountId, effective_count: i64) {

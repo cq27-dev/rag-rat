@@ -90,6 +90,12 @@ pub enum ContentParkReason {
     IncompleteCutAncestry,
     UnknownCutTarget,
     ContestedSubject,
+    /// The entry's lamport jumps implausibly far past the accepted stream clock (bounded advance,
+    /// the fold-seam half of the `/3` lamport clamp). Assigned by the refold, not this evaluator —
+    /// the bound needs the whole accepted set, which a per-entry pass cannot see. Recoverable by
+    /// construction: verdicts are re-derived every refold, so the entry accepts if the stream's
+    /// accepted clock ever legitimately catches up.
+    LamportAhead,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +147,7 @@ impl ContentAcceptance {
                 "parked{incomplete_cut_ancestry}",
             Self::Parked(ContentParkReason::UnknownCutTarget) => "parked{unknown_cut_target}",
             Self::Parked(ContentParkReason::ContestedSubject) => "parked{contested_subject}",
+            Self::Parked(ContentParkReason::LamportAhead) => "parked{lamport_ahead}",
             Self::Condemned(ContentCondemnReason::BeyondCut) => "condemned{beyond_cut}",
             Self::Condemned(ContentCondemnReason::OffBranch) => "condemned{off_branch}",
             Self::Condemned(ContentCondemnReason::ClosedIncarnation) =>
@@ -1469,6 +1476,7 @@ mod tests {
                 ContentAcceptance::Parked(ContentParkReason::ContestedSubject),
                 "parked{contested_subject}",
             ),
+            (ContentAcceptance::Parked(ContentParkReason::LamportAhead), "parked{lamport_ahead}"),
             (
                 ContentAcceptance::Condemned(ContentCondemnReason::BeyondCut),
                 "condemned{beyond_cut}",

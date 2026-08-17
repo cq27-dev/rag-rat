@@ -181,8 +181,7 @@ pub fn author_content_batch_in_tx(
             ),
             None => (0, None),
         };
-        let lamport =
-            lamport_base.checked_add(index as u64).context("/3 stream lamport clock overflow")?;
+        let lamport = batch_lamport(lamport_base, index)?;
         let header = ContentEntryHeader {
             stream_id,
             author_account_id: account_id,
@@ -287,8 +286,7 @@ pub fn author_grantee_content_batch_in_tx(
             ),
             None => (0, None),
         };
-        let lamport =
-            lamport_base.checked_add(index as u64).context("/3 stream lamport clock overflow")?;
+        let lamport = batch_lamport(lamport_base, index)?;
         let header = ContentEntryHeader {
             stream_id,
             author_account_id: account_id,
@@ -652,8 +650,7 @@ fn seal_and_author_in_tx(
             ),
             None => (0, None),
         };
-        let lamport =
-            lamport_base.checked_add(index as u64).context("/3 stream lamport clock overflow")?;
+        let lamport = batch_lamport(lamport_base, index)?;
         // `crypto_suite`/`key_id` stay 0/None here — `seal_and_sign_content_entry` finalizes them
         // to suite 1 + the key's id, so a suite-1-over-plaintext header is unconstructible.
         let header = ContentEntryHeader {
@@ -829,6 +826,18 @@ fn stream_max_content_lamport(
         max = Some(max.map_or(signed.header.lamport, |m| m.max(signed.header.lamport)));
     }
     Ok(max)
+}
+
+/// The lamport for the `index`-th entry of an authoring batch: `base + index`, kept strictly
+/// below the protocol ceiling. Reserving the ceiling on the authoring side (as `/5`'s
+/// `next_stream_lamport` does) means no locally authored entry can ever trip a peer's
+/// ingest-time ceiling reject — the honest path never approaches it, so hitting this means the
+/// stream's accepted clock was poisoned and needs the offending entry retro-condemned.
+fn batch_lamport(lamport_base: u64, index: usize) -> anyhow::Result<u64> {
+    let lamport =
+        lamport_base.checked_add(index as u64).context("/3 stream lamport clock overflow")?;
+    anyhow::ensure!(lamport < crate::entry::MAX_ENTRY_LAMPORT, "/3 stream lamport ceiling reached");
+    Ok(lamport)
 }
 
 /// The current `/3` status of one entry, or `None` if the refold wrote no status row for it.

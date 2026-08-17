@@ -30,22 +30,12 @@ use super::row_op::{self, DecodedRowOp, RowOp};
 use crate::AccountId;
 use crate::account::device_is_effective_writer;
 use crate::device::{DevicePublic, DeviceSecret};
-use crate::entry::{self, SignedEntry, VerifiedEntry};
+// The lamport ceiling + bounded-advance constants live in `crate::entry` — shared with the
+// `/3` content clamp so both sync layers enforce one reviewed number. (A peer griefing WITHIN
+// the bound is the auth/roster milestone's job — device removal.)
+use crate::entry::{self, MAX_ENTRY_LAMPORT, MAX_LAMPORT_ADVANCE, SignedEntry, VerifiedEntry};
 use crate::op::{DeviceFingerprint, OpMeta};
 use crate::stream::StreamId;
-
-/// Upper bound on an entry's lamport, far below `i64::MAX`. A Lamport clock increments by one per
-/// op, so a legitimate value never approaches this; a larger one is malformed or a wedging attack.
-const MAX_ENTRY_LAMPORT: u64 = 1 << 62;
-
-/// The most a single accepted entry may advance the stream's Lamport clock. A Lamport clock ticks
-/// by one per op, so a legitimate entry is at most a partition's worth of ops ahead of the highest
-/// lamport already stored — never billions. This bound (far above any real causal gap, far below
-/// the ceiling) refuses a griefing entry that jumps toward `MAX_ENTRY_LAMPORT`: such an entry would
-/// dominate every row's whole-row LWW AND, once `next_stream_lamport` reaches the ceiling, halt all
-/// local authoring on the scope. With the bound, reaching the ceiling needs ~2^30 chained entries,
-/// not one. (A peer griefing WITHIN the bound is the auth/roster milestone's job — device removal.)
-const MAX_LAMPORT_ADVANCE: u64 = 1 << 32;
 
 /// Why a retained entry is NOT projected into its table — persisted per entry so a later binary
 /// that understands the payload replays exactly the outstanding set (#1001). Without a durable

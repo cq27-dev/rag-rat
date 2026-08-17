@@ -52,6 +52,22 @@ const SIGNED_DOMAIN: &str = "rag-rat/signed-entry/1";
 /// `.expect`s this — mirrors `super::op`.
 const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
+/// Upper bound on an entry's lamport, far below `i64::MAX`. A Lamport clock increments by one per
+/// op, so a legitimate value never approaches this; a larger one is malformed or a wedging attack.
+/// Shared by every lamport-carrying sync layer (`/3` content, `/5` table sync) — one reviewed
+/// number, not one per layer.
+pub(crate) const MAX_ENTRY_LAMPORT: u64 = 1 << 62;
+
+/// The most a single accepted entry may advance a stream's Lamport clock. A Lamport clock ticks
+/// by one per op, so a legitimate entry is at most a partition's worth of ops ahead of the highest
+/// lamport already stored — never billions. This bound (far above any real causal gap, far below
+/// the ceiling) refuses a griefing entry that jumps toward `MAX_ENTRY_LAMPORT`: such an entry
+/// would dominate LWW AND, once the next-lamport mint reaches the ceiling, halt all local
+/// authoring on the scope. With the bound, reaching the ceiling needs ~2^30 chained entries, not
+/// one. Do not tighten without re-deriving from the largest legitimate disconnected backlog — a
+/// smaller "safer" bound falsely rejects honest partitioned writers.
+pub(crate) const MAX_LAMPORT_ADVANCE: u64 = 1 << 32;
+
 /// The decoded, structurally-validated contents of an entry BODY. The op is carried as opaque
 /// `op_bytes`, so an UNKNOWN op still verifies + chains; decode it with `op::decode` only when the
 /// projection actually needs it.
