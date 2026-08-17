@@ -19,20 +19,25 @@
 //!    Unix, *false* on Windows. Left unpinned, one `rag-rat.toml` would claim different files on
 //!    different platforms. Pinned on, `\` escapes the next character everywhere, so a pattern
 //!    reaches a Unix file whose NAME contains a backslash by spelling it `\\`.
-//! 3. **The candidate is built from the rendered BYTES**, never re-derived through a [`Path`]. The
-//!    caller already holds the `/`-separated rendering `files.path` is stored with
-//!    ([`crate::paths::path_string`]); round-tripping it through `Path` would re-run
-//!    platform-specific separator handling over a string that is already canonical.
+//! 3. **The match runs the compiled glob's regex over the rendered BYTES**, never through
+//!    [`globset`]'s `Candidate`. The caller already holds the `/`-separated rendering `files.path`
+//!    is stored with ([`crate::paths::path_string`]); `Candidate` re-runs platform-specific
+//!    separator handling over that already-canonical string (on Windows it rewrites `\` to `/`,
+//!    turning a Unix file NAMED `drafts\secret.md` into a child of `drafts/`), so one config would
+//!    again claim different files on different platforms. [`Glob::regex`] is `globset`'s documented
+//!    escape hatch for exactly this: the emitted pattern is built for the [`regex`] crate's bytes
+//!    API.
 //!
 //! One shape is normalized before compiling rather than pinned as an option: a trailing `/` names a
 //! subtree, so `src/` compiles as `src/**` (see [`compile`]).
 //!
-//! [`Path`]: std::path::Path
+//! [`Glob::regex`]: globset::Glob::regex
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
-use globset::{Candidate, GlobBuilder, GlobMatcher};
+use globset::GlobBuilder;
+use regex::bytes::Regex;
 
 /// Compiled matchers keyed by the pattern text, so a pattern is turned into a regex once per
 /// process instead of once per file.
@@ -42,7 +47,7 @@ use globset::{Candidate, GlobBuilder, GlobMatcher};
 /// must not sit on that path. The pattern set is bounded by the config file, so the map needs no
 /// eviction. A pattern that fails to compile is memoized as [`None`] — the compile error is
 /// reported once, not once per file.
-static COMPILED: LazyLock<RwLock<HashMap<String, Option<GlobMatcher>>>> =
+static COMPILED: LazyLock<RwLock<HashMap<String, Option<Regex>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Whether one config glob claims `path`, a `/`-separated repo-relative rendering.
@@ -51,17 +56,16 @@ static COMPILED: LazyLock<RwLock<HashMap<String, Option<GlobMatcher>>>> =
 /// reported once. Config load does not reject such a pattern today, so the matcher has to answer
 /// something; claiming nothing keeps a typo from silently widening an `include`.
 pub(crate) fn pattern_claims(path: &str, pattern: &str) -> bool {
-    let candidate = Candidate::from_bytes(path.as_bytes());
     let cached = COMPILED.read().ok().and_then(|compiled| {
         compiled
             .get(pattern)
-            .map(|matcher| matcher.as_ref().is_some_and(|m| m.is_match_candidate(&candidate)))
+            .map(|matcher| matcher.as_ref().is_some_and(|re| re.is_match(path.as_bytes())))
     });
     if let Some(claims) = cached {
         return claims;
     }
     let matcher = compile(pattern);
-    let claims = matcher.as_ref().is_some_and(|m| m.is_match_candidate(&candidate));
+    let claims = matcher.as_ref().is_some_and(|re| re.is_match(path.as_bytes()));
     if let Ok(mut compiled) = COMPILED.write() {
         compiled.entry(pattern.to_string()).or_insert(matcher);
     }
@@ -78,17 +82,27 @@ pub(crate) fn pattern_claims(path: &str, pattern: &str) -> bool {
 /// match `a/src/`). Here `src/` is the ROOT `src/`, matching what the old substring fallback got
 /// *approximately* right — it matched `src/` by containment, but also claimed `a/src/lib.rs`.
 /// Normalizing to `src/**` keeps the intent and adds the anchor the fallback lacked.
-fn compile(pattern: &str) -> Option<GlobMatcher> {
+fn compile(pattern: &str) -> Option<Regex> {
     let subtree = pattern.strip_suffix('/').map(|dir| format!("{dir}/**"));
     let pattern = subtree.as_deref().unwrap_or(pattern);
-    match GlobBuilder::new(pattern).literal_separator(true).backslash_escape(true).build() {
-        Ok(glob) => Some(glob.compile_matcher()),
+    let glob =
+        match GlobBuilder::new(pattern).literal_separator(true).backslash_escape(true).build() {
+            Ok(glob) => glob,
+            Err(error) => {
+                tracing::warn!(
+                    pattern,
+                    %error,
+                    "target include/exclude pattern is not a valid glob; it claims no files",
+                );
+                return None;
+            },
+        };
+    match Regex::new(glob.regex()) {
+        Ok(re) => Some(re),
         Err(error) => {
-            tracing::warn!(
-                pattern,
-                %error,
-                "target include/exclude pattern is not a valid glob; it claims no files",
-            );
+            // globset guarantees its emitted regex is valid for the regex crate's bytes API, so
+            // this arm is unreachable short of a globset bug; claim nothing rather than panic.
+            tracing::warn!(pattern, %error, "compiled glob regex did not parse; it claims no files");
             None
         },
     }

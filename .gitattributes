@@ -1,0 +1,5 @@
+# Check text files out with LF everywhere, overriding the Windows runners' core.autocrlf=true.
+# Byte-identical checkouts are load-bearing: crates/rag-rat-db/src/schema/end_state.sql is
+# include_str!-embedded and compared byte-wise against ladder-generated DDL, so a CRLF checkout
+# fails `end_state_matches_the_ladder` on windows-latest.
+* text=auto eol=lf

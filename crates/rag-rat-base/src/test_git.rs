@@ -116,18 +116,19 @@ mod tests {
         std::fs::create_dir_all(&hooks).unwrap();
         let marker = root.join("hook-ran.marker");
         let pre_commit = hooks.join("pre-commit");
-        std::fs::write(&pre_commit, format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()))
+        // Forward-slash the paths handed to git: a `\` in a gitconfig VALUE is an escape character
+        // (git rejects `C:\Users\…` as a bad config line, the commit dies before the hook runs),
+        // and the hook body runs under sh, where a Windows path only survives spelled with `/`.
+        let slash = |p: &Path| crate::paths::path_string(p);
+        std::fs::write(&pre_commit, format!("#!/bin/sh\ntouch '{}'\nexit 1\n", slash(&marker)))
             .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&pre_commit, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        std::fs::write(
-            root.join("gitconfig"),
-            format!("[core]\nhooksPath = {}\n", hooks.display()),
-        )
-        .unwrap();
+        std::fs::write(root.join("gitconfig"), format!("[core]\nhooksPath = {}\n", slash(&hooks)))
+            .unwrap();
         run(&root, &["init", "-q"]);
         std::fs::write(root.join("f.txt"), "x\n").unwrap();
         run(&root, &["add", "."]);
