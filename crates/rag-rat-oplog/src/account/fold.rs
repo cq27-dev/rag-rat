@@ -742,6 +742,11 @@ struct FoldState {
     next_auth_epoch: u64,
     /// Effective immutable stream ownership roots, keyed by owner-bound stream id.
     stream_ownership: HashMap<StreamId, [u8; 32]>,
+    /// The owned streams whose effective `StreamOwn` spec declares `PublicRead` — the only
+    /// streams a `StreamGrant` may fold on (see the grant gate). A subset of
+    /// `stream_ownership`; the access mode is committed into the stream id, so membership is
+    /// as immutable as ownership itself.
+    public_streams: HashSet<StreamId>,
     /// Effective grant incarnations. A revoke closes exactly one id; a later grant gets a fresh
     /// hash and remains independent.
     grants: HashMap<[u8; 32], LiveGrant>,
@@ -1727,11 +1732,16 @@ fn close_final_authority_dependencies(
                 _ => None,
             })
             .collect();
-        let effective_ownership: HashSet<StreamId> = candidates
+        // PublicRead-scoped, mirroring the primary grant gate: a grant surviving closure must
+        // cite an effective PUBLIC ownership root, not merely an effective one.
+        let effective_public_ownership: HashSet<StreamId> = candidates
             .iter()
             .filter(|candidate| outcomes.get(&candidate.hash()).is_some_and(Outcome::is_effective))
-            .filter_map(|candidate| match candidate.op {
-                AccountOp::StreamOwn { stream_id, .. } => Some(stream_id),
+            .filter_map(|candidate| match &candidate.op {
+                AccountOp::StreamOwn { stream_id, stream_spec_bytes } =>
+                    stream::decode_spec_v2(stream_spec_bytes)
+                        .is_ok_and(|spec| spec.access_mode == stream::AccessMode::PublicRead)
+                        .then_some(*stream_id),
                 _ => None,
             })
             .collect();
@@ -1765,7 +1775,7 @@ fn close_final_authority_dependencies(
                         if !effective_roster.contains(device_fingerprint) =>
                         Some(Outcome::Rejected(RejectReason::Ineffective)),
                     AccountOp::StreamGrant { stream_id, .. }
-                        if !effective_ownership.contains(stream_id) =>
+                        if !effective_public_ownership.contains(stream_id) =>
                         Some(Outcome::Rejected(RejectReason::Ineffective)),
                     AccountOp::StreamRevoke { stream_id, grantee_account_id, grant_id, .. }
                         if effective_grants.get(grant_id)
@@ -2181,7 +2191,15 @@ fn classify_effect(
                     && grant.grantee_account_id == *grantee_account_id
                     && grant.role == *grant_role
             });
-            if !state.stream_ownership.contains_key(stream_id)
+            // A grant folds ONLY on an owned `PublicRead` stream (`public_streams` ⊆
+            // `stream_ownership`, so this subsumes the ownership check). This is a CONSENSUS
+            // rule, not a convenience: every consumer relies on "a contribution is always on a
+            // public stream", and holding it in the fold — not just in the authoring crate —
+            // means a hand-crafted entry from a hostile owner cannot smuggle a grant onto a
+            // private stream. Relaxing it later (private grants need key wraps) is a protocol
+            // version bump: an old binary would fold such a grant Effective where a new one
+            // Rejects it.
+            if !state.public_streams.contains(stream_id)
                 || *grantee_account_id == c.header().account_id
                 || duplicate
             {
@@ -2256,8 +2274,15 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
             state.owners.insert(*device_fingerprint, c.hash());
             state.live.insert(c.hash());
         },
-        AccountOp::StreamOwn { stream_id, .. } => {
+        AccountOp::StreamOwn { stream_id, stream_spec_bytes } => {
             state.stream_ownership.insert(*stream_id, c.hash());
+            // Admission already validated the spec decodes and derives this id; re-decode for
+            // the access mode, which the id commits to.
+            if stream::decode_spec_v2(stream_spec_bytes)
+                .is_ok_and(|spec| spec.access_mode == stream::AccessMode::PublicRead)
+            {
+                state.public_streams.insert(*stream_id);
+            }
         },
         AccountOp::StreamGrant { stream_id, grantee_account_id, grant_role } => {
             state.grants.insert(c.hash(), LiveGrant {
@@ -2750,9 +2775,13 @@ mod tests {
     #[test]
     fn golden_projection_pins_the_canonical_encoding() {
         let hash = snapshot::projection::folded_state_hash(&projection_fixture().fold());
+        // Recomputed when the fixture's `stream_own` moved to `PublicRead` (grants fold only on
+        // public streams): the ENCODING is unchanged — the fixture's stream id and spec bytes
+        // are what moved. A change to what `folded_state_hash` covers is still a
+        // `SNAPSHOT_STATE_FORMAT_V1` bump.
         assert_eq!(
             hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            "f6cace33757ebd07c34e076bc6078233321e857292c422e3b2b16940cbe7cb52",
+            "5c8aee143bb180044289c4aeee5ad8279a7cb66e51091120d57614e7545604b0",
         );
     }
 
@@ -2885,7 +2914,20 @@ mod tests {
         AccountOp::AccountReRoot { successor_account_id: successor, note: None }
     }
 
+    /// A `PublicRead` StreamOwn — the mode grants require, so the grant/revoke tests default to
+    /// it; [`stream_own_private`] exercises the mode gate itself.
     fn stream_own(account_id: AccountId) -> (StreamId, AccountOp) {
+        stream_own_mode(account_id, crate::stream::AccessMode::PublicRead)
+    }
+
+    fn stream_own_private(account_id: AccountId) -> (StreamId, AccountOp) {
+        stream_own_mode(account_id, crate::stream::AccessMode::Private)
+    }
+
+    fn stream_own_mode(
+        account_id: AccountId,
+        access_mode: crate::stream::AccessMode,
+    ) -> (StreamId, AccountOp) {
         let spec = StreamSpecV2 {
             owner_account_id: account_id,
             policy: StreamSpec {
@@ -2894,7 +2936,7 @@ mod tests {
                 relation_policy: None,
                 node_overrides: Vec::new(),
             },
-            access_mode: crate::stream::AccessMode::Private,
+            access_mode,
         };
         let stream_id = stream::derive_v2(&spec).unwrap();
         let stream_spec_bytes = stream::canonical_spec_v2_bytes(&spec).unwrap();
@@ -3623,6 +3665,27 @@ mod tests {
             h.outcome(&extend),
             Some(Outcome::Parked(ParkReason::UnknownCutTarget)),
             "a bare extend parks until a creating cut exists",
+        );
+    }
+
+    #[test]
+    fn a_grant_on_a_private_stream_folds_rejected() {
+        // "grants ⇒ public" is a CONSENSUS rule held by the fold itself, not just by the
+        // authoring crate's check — a hand-crafted grant on a private stream must reject even
+        // though the ownership is effective.
+        let fdr = Dev::new(1);
+        let grantee = AccountId::from_bytes([0x44; 32]);
+        let mut f = Fixture::genesis(&fdr);
+        let (stream, own_op) = stream_own_private(f.account_id);
+        let own = f.author(&fdr, Some(f.genesis_hash), &own_op);
+        let grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
+
+        let h = f.fold();
+        assert!(h.is_effective(&own), "private ownership itself is effective");
+        assert_eq!(
+            h.outcome(&grant),
+            Some(Outcome::Rejected(RejectReason::Ineffective)),
+            "a grant on a private stream never folds effective",
         );
     }
 

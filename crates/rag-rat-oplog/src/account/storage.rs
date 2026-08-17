@@ -4050,8 +4050,12 @@ mod tests {
     fn adopt_local_account_adopts_an_accepted_genesis_and_refuses_conflicts() {
         let fixture = interleaved_promoted_device_bootstrap();
         let conn = db();
-        // Ingest the genesis as an ordinary accepted candidate, then adopt it directly.
-        account_ingest(&conn, &fixture.account_entries[0], NOW).unwrap();
+        // Ingest the bootstrap as ordinary candidates (the genesis folds accepted among them —
+        // `account_entries` is (seq, hash)-sorted, so no fixed index names the genesis), then
+        // adopt it directly.
+        for bytes in &fixture.account_entries {
+            account_ingest(&conn, bytes, NOW).unwrap();
+        }
         super::super::bootstrap::adopt_local_account(
             &conn,
             fixture.account,
@@ -4268,7 +4272,9 @@ mod tests {
     }
 
     fn stream_own(account_id: AccountId) -> (crate::stream::StreamId, AccountOp) {
-        stream_own_mode(account_id, crate::stream::AccessMode::Private, "repo-a")
+        // Grants fold only on PublicRead streams, so the grant-exercising tests default to it;
+        // the access-mode reader test picks its modes explicitly.
+        stream_own_mode(account_id, crate::stream::AccessMode::PublicRead, "repo-a")
     }
 
     fn stream_own_mode(

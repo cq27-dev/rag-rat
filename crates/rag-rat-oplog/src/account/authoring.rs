@@ -765,6 +765,21 @@ mod tests {
         stream_id
     }
 
+    /// The PublicRead ensure the grant/revoke tests need: grants fold only on public streams
+    /// (the production grant path requires a published repo for the same reason).
+    fn ensure_public_committed(conn: &Connection, repo_id: &str) -> StreamId {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let stream_id = ensure_owned_stream_v2_with_mode_in_tx(
+            &tx,
+            repo_id,
+            stream::AccessMode::PublicRead,
+            NOW,
+        )
+        .expect("ensure public");
+        tx.commit().unwrap();
+        stream_id
+    }
+
     fn node_create(id: &str, title: &str) -> MemoryOp {
         MemoryOp::NodeCreate {
             node_id: NodeId::from(id),
@@ -784,7 +799,7 @@ mod tests {
     fn author_stream_grant_makes_the_grantee_an_effective_writer() {
         let conn = db();
         let account = bootstrap::local_account(&conn, NOW).expect("mint local account");
-        let stream = ensure_committed(&conn, "repo-x");
+        let stream = ensure_public_committed(&conn, "repo-x");
         let grantee = AccountId::from_bytes([0x77; 32]);
         assert_ne!(grantee, account, "the grantee is a separate identity");
 
@@ -816,7 +831,7 @@ mod tests {
     fn a_revoke_closes_the_grant_and_the_listing_shows_it() {
         let conn = db();
         let account = bootstrap::local_account(&conn, NOW).expect("mint local account");
-        let stream = ensure_committed(&conn, "repo-x");
+        let stream = ensure_public_committed(&conn, "repo-x");
         let grantee = AccountId::from_bytes([0x77; 32]);
         let grant_id = {
             let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
@@ -867,7 +882,7 @@ mod tests {
     fn a_revoke_targets_the_writer_grants_and_spares_a_reader_grant() {
         let conn = db();
         let account = bootstrap::local_account(&conn, NOW).expect("mint local account");
-        let stream = ensure_committed(&conn, "repo-x");
+        let stream = ensure_public_committed(&conn, "repo-x");
         let grantee = AccountId::from_bytes([0x77; 32]);
         // The grantee holds BOTH roles, the reader granted LAST. Revoking write access must
         // target the writer grant: closing the newest row regardless of role would close the
@@ -908,7 +923,7 @@ mod tests {
     fn keep_until_is_refused_outside_a_compromised_revoke() {
         let conn = db();
         bootstrap::local_account(&conn, NOW).expect("mint local account");
-        let stream = ensure_committed(&conn, "repo-x");
+        let stream = ensure_public_committed(&conn, "repo-x");
         let grantee = AccountId::from_bytes([0x77; 32]);
         {
             let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
