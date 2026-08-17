@@ -6704,8 +6704,9 @@ mod syncable_overlay_migration_tests {
             [[0x41_u8; 32].as_slice()],
         )
         .unwrap();
-        super::apply_refold_content_streams_for_lamport_clamp(&conn).unwrap();
-        super::apply_refold_content_streams_for_lamport_clamp(&conn).unwrap();
+        let hooks = crate::hooks::MigrationHooks::noop();
+        super::apply_refold_content_streams_for_lamport_clamp(&conn, &hooks).unwrap();
+        super::apply_refold_content_streams_for_lamport_clamp(&conn, &hooks).unwrap();
         let rows: Vec<(Vec<u8>, i64, i64)> = conn
             .prepare(
                 "SELECT stream_id, reason_mask, first_enqueued_at_ms
@@ -8289,7 +8290,8 @@ pub fn apply_syncable_distill_anchors(conn: &Connection) -> rusqlite::Result<()>
     )
 }
 
-/// V113 (#1176): re-judge already-accepted `/3` content under the lamport clamp.
+/// V113 (#1176): re-judge already-accepted `/3` content under the lamport clamp, and purge what
+/// the clamp can never re-admit.
 ///
 /// The `/3` acceptance verdict is only re-derived while a stream sits in the refold queue, so a
 /// store that accepted a near-ceiling lamport under a binary predating the clamp would keep the
@@ -8298,11 +8300,20 @@ pub fn apply_syncable_distill_anchors(conn: &Connection) -> rusqlite::Result<()>
 /// stream that holds content; the next settle (every index pass and sync drain runs one) re-folds
 /// it under the current rules and reprojects.
 ///
+/// Queueing alone is not enough: the hook then DELETES the violating candidates outright, because
+/// (a) a merely-parked local chain tail wedges all future authoring on that chain, and (b) a
+/// merely-parked over-ceiling envelope is re-advertised to peers that refuse it before storage,
+/// retransmitting forever. The lamport sits inside the signed CBOR envelope, which SQL cannot
+/// decode — hence the hook. Queue BEFORE purging, so a stream whose every entry is deleted still
+/// refolds and clears its stale projection.
+///
 /// Reason mask 1 is the content-candidate refold bit; the zero timestamps sort these oldest, so
 /// they settle ahead of newly-dirtied streams. The upsert ORs into an existing queue row, and a
-/// replay is idempotent by the same shape.
+/// replay is idempotent by the same shape (the hook is idempotent too — a purged store has
+/// nothing left to purge).
 pub(crate) fn apply_refold_content_streams_for_lamport_clamp(
     conn: &Connection,
+    hooks: &crate::hooks::MigrationHooks,
 ) -> rusqlite::Result<()> {
     conn.execute_batch(
         "INSERT INTO content_streams_pending_refold(
@@ -8310,7 +8321,8 @@ pub(crate) fn apply_refold_content_streams_for_lamport_clamp(
          SELECT DISTINCT stream_id, 1, 0, 0 FROM content_entries WHERE true
          ON CONFLICT(stream_id) DO UPDATE SET
              reason_mask = content_streams_pending_refold.reason_mask | 1;",
-    )
+    )?;
+    (hooks.purge_legacy_lamport_violators)(conn)
 }
 
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {

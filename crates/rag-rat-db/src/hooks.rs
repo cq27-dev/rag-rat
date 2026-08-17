@@ -26,6 +26,11 @@ pub struct MigrationHooks {
     pub backfill_authority_projection: fn(&Transaction<'_>) -> rusqlite::Result<()>,
     /// Rebuild the papertrail FTS mirror (papertrail's `rebuild_fts`).
     pub rebuild_papertrail_fts: fn(&Connection) -> rusqlite::Result<()>,
+    /// One-time V113 purge of `/3` candidates violating the lamport clamp, plus their dependent
+    /// chain tails and over-ceiling pre-verify rows (oplog's `purge_legacy_lamport_violators`).
+    /// Lives behind a hook because the lamport sits inside the signed CBOR envelope, which the
+    /// migration ladder's SQL cannot decode.
+    pub purge_legacy_lamport_violators: fn(&Connection) -> rusqlite::Result<()>,
     /// Re-align logical-symbol ids after adoption re-points repo-scoped rows
     /// (graph_index's `realign_logical_symbol_ids`). Returns the realigned-row count.
     pub realign_logical_symbol_ids: fn(&Connection) -> rusqlite::Result<usize>,
@@ -42,6 +47,7 @@ impl MigrationHooks {
             rederive_dream_finding_ids: |_| Ok(()),
             backfill_authority_projection: |_| Ok(()),
             rebuild_papertrail_fts: |_| Ok(()),
+            purge_legacy_lamport_violators: |_| Ok(()),
             realign_logical_symbol_ids: |_| Ok(0),
         }
     }

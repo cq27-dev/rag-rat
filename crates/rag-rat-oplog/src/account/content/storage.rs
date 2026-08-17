@@ -1653,15 +1653,6 @@ fn prefix_closed_accepted(
     accepted
 }
 
-/// The chain a `/3` entry extends — the same identity [`prefix_closed_accepted`] groups by.
-fn chain_coordinate(r: &ResolvedEntry) -> ChainCoordinate {
-    ChainCoordinate {
-        stream_id: r.header.stream_id,
-        author_account_id: r.header.author_account_id,
-        device_fingerprint: r.header.device_fingerprint,
-    }
-}
-
 /// The lamport discipline at the acceptance seam: demote any would-be-accepted entry whose
 /// lamport jumps more than [`MAX_LAMPORT_ADVANCE`] past the highest lamport the accepted set
 /// below it establishes, or whose chain's lamport fails to strictly increase. The header lamport
@@ -1677,57 +1668,153 @@ fn chain_coordinate(r: &ResolvedEntry) -> ChainCoordinate {
 ///
 /// 1. **Per-chain monotonicity.** Honest authoring mints a strictly increasing lamport along a
 ///    chain (`max accepted + 1` per entry), so a chain that ticks backwards is forged; it truncates
-///    at the first non-increase. This is also what makes the single walk below exact: within a
-///    monotone chain, ascending-lamport order IS seq order, so an entry's chain cut is always
-///    discovered before the entries it demotes — no fixed-point restart for an attacker to inflate.
-/// 2. **Bounded advance, one ascending `(lamport, entry_hash)` walk.** A demoted entry — beyond the
-///    bound, or at/above its chain's cut — never advances the running max (a poison entry must not
-///    legitimize the next one) and cuts its chain at its seq, keeping accepted a dense prefix.
+///    at the first non-increase. Sound here because the accepted set holds at most one entry per
+///    `(chain, seq)` (branch selection already resolved forks), and it is what makes the single
+///    walk below exact: within a monotone chain, ascending-lamport order IS seq order, so an
+///    entry's chain cut is always discovered before the entries it demotes — no fixed-point restart
+///    for an attacker to inflate.
+/// 2. **Bounded advance** — [`bounded_advance_demotions`].
 fn lamport_advance_clamped(
     resolved: &[ResolvedEntry],
     mut accepted: HashSet<EntryHash>,
 ) -> (HashSet<EntryHash>, HashSet<EntryHash>) {
-    let mut chains: HashMap<ChainCoordinate, Vec<&ResolvedEntry>> = HashMap::new();
-    for r in resolved.iter().filter(|r| accepted.contains(&r.entry_hash)) {
-        chains.entry(chain_coordinate(r)).or_default().push(r);
+    let entries: Vec<(EntryHash, &ContentEntryHeader)> = resolved
+        .iter()
+        .filter(|r| accepted.contains(&r.entry_hash))
+        .map(|r| (r.entry_hash, &r.header))
+        .collect();
+    let mut chains: HashMap<ChainCoordinate, Vec<&ContentEntryHeader>> = HashMap::new();
+    for (_, header) in &entries {
+        chains.entry(ChainCoordinate::of(header)).or_default().push(header);
     }
     let mut cut: HashMap<ChainCoordinate, u64> = HashMap::new();
     for (coordinate, mut members) in chains {
-        members.sort_by_key(|r| r.header.seq);
+        members.sort_by_key(|header| header.seq);
         for pair in members.windows(2) {
-            if pair[1].header.lamport <= pair[0].header.lamport {
-                cut.insert(coordinate, pair[1].header.seq);
+            if pair[1].lamport <= pair[0].lamport {
+                cut.insert(coordinate, pair[1].seq);
                 break;
             }
         }
     }
+    let parked = bounded_advance_demotions(&entries, cut);
+    accepted.retain(|hash| !parked.contains(hash));
+    (accepted, parked)
+}
 
-    let mut rows: Vec<&ResolvedEntry> =
-        resolved.iter().filter(|r| accepted.contains(&r.entry_hash)).collect();
-    rows.sort_by_key(|r| (r.header.lamport, r.entry_hash));
+/// The bounded-advance walk of the `/3` lamport clamp: one ascending `(lamport, entry_hash)` pass
+/// over `entries` with a running max. A demoted entry — jumping past the bound, or sitting
+/// at/above its chain's cut — never advances the running max (a poison entry must not legitimize
+/// the next one) and cuts its chain at its seq, so the surviving set stays a dense prefix per
+/// chain. `cut` primes chain truncations the caller already knows (the fold's monotonicity cuts).
+///
+/// Shared by the fold ([`lamport_advance_clamped`]) and the V113 upgrade purge
+/// ([`purge_legacy_lamport_violators`]). Returns every demoted entry.
+fn bounded_advance_demotions(
+    entries: &[(EntryHash, &ContentEntryHeader)],
+    mut cut: HashMap<ChainCoordinate, u64>,
+) -> HashSet<EntryHash> {
+    let mut rows: Vec<&(EntryHash, &ContentEntryHeader)> = entries.iter().collect();
+    rows.sort_by_key(|(hash, header)| (header.lamport, *hash));
     let mut running_max = 0u64;
-    for r in rows {
-        let coordinate = chain_coordinate(r);
-        if cut.get(&coordinate).is_some_and(|&seq| r.header.seq >= seq) {
+    for (_, header) in rows {
+        let coordinate = ChainCoordinate::of(header);
+        if cut.get(&coordinate).is_some_and(|&seq| header.seq >= seq) {
             continue; // demoted below a cut this walk already discovered
         }
-        if r.header.lamport > running_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
-            let seq = cut.entry(coordinate).or_insert(r.header.seq);
-            *seq = (*seq).min(r.header.seq);
+        if header.lamport > running_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
+            let seq = cut.entry(coordinate).or_insert(header.seq);
+            *seq = (*seq).min(header.seq);
         } else {
-            running_max = running_max.max(r.header.lamport);
+            running_max = running_max.max(header.lamport);
         }
     }
+    let mut demoted = HashSet::new();
+    for (hash, header) in entries {
+        if cut.get(&ChainCoordinate::of(header)).is_some_and(|&seq| header.seq >= seq) {
+            demoted.insert(*hash);
+        }
+    }
+    demoted
+}
 
-    let mut parked = HashSet::new();
-    for r in resolved {
-        if cut.get(&chain_coordinate(r)).is_some_and(|&seq| r.header.seq >= seq)
-            && accepted.remove(&r.entry_hash)
-        {
-            parked.insert(r.entry_hash);
+/// One-time upgrade repair, run as the V113 migration hook: DELETE every stored `/3` candidate
+/// the bounded-advance walk demotes, judged over the FULL candidate set of each stream — so a
+/// pre-clamp poison AND every same-chain dependent above it (an honest tail minted at
+/// `poison + 1` while the poison was still accepted) retire together, re-rooting the author's
+/// chain at the surviving prefix. Parking alone cannot repair this: a parked candidate stays the
+/// chain tail, every continuation mints a lower lamport from the (now sane) accepted clock, and
+/// the monotonicity rule parks each one — the stream would be permanently unauthorable. Deleting
+/// also stops the store re-advertising envelopes upgraded peers refuse before storage (an
+/// over-ceiling lamport falls out of the walk as an ordinary violator), which would otherwise
+/// retransmit on every sync forever. Over-ceiling `content_pre_verify` rows are dropped for the
+/// same reason — ingest and promotion refuse them now, but a legacy row would sit there
+/// unpromotable indefinitely.
+///
+/// Runtime folds keep PARKING rather than deleting; deletion is sound here only because every
+/// replica runs this same purge when it upgrades, so upgraded peers stop offering the deleted
+/// envelopes too. Undecodable envelopes are left alone (the refold declassifies them). The
+/// monotonicity pre-filter is deliberately NOT primed: the full candidate set can hold same-seq
+/// fork siblings, which that filter would misread as a backwards tick and over-delete. Without it
+/// the walk can leave a borderline violator stored — safe, the queued refold parks it.
+pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()> {
+    let tables_exist = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'content_entries'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !tables_exist {
+        return Ok(());
+    }
+    let mut streams: HashMap<[u8; 32], Vec<(EntryHash, ContentEntryHeader)>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT entry_hash, signed_bytes FROM content_entries")?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, [u8; 32]>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+        for row in rows {
+            let (entry_hash, signed_bytes) = row?;
+            if let Ok(signed) = envelope::decode_content_signed(&signed_bytes) {
+                streams
+                    .entry(signed.header.stream_id.to_bytes())
+                    .or_default()
+                    .push((entry_hash, signed.header));
+            }
         }
     }
-    (accepted, parked)
+    for members in streams.into_values() {
+        let entries: Vec<(EntryHash, &ContentEntryHeader)> =
+            members.iter().map(|(hash, header)| (*hash, header)).collect();
+        for hash in bounded_advance_demotions(&entries, HashMap::new()) {
+            conn.execute("DELETE FROM content_entries WHERE entry_hash = ?1", [hash.as_slice()])?;
+            conn.execute("DELETE FROM content_entry_status WHERE entry_hash = ?1", [
+                hash.as_slice()
+            ])?;
+        }
+    }
+    let legacy_ceiling_rows: Vec<Vec<u8>> = {
+        let mut stmt = conn.prepare("SELECT signed_hash, raw_bytes FROM content_pre_verify")?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+        let mut over_ceiling = Vec::new();
+        for row in rows {
+            let (signed_hash, raw) = row?;
+            if envelope::decode_content_signed(&raw)
+                .is_ok_and(|signed| signed.header.lamport >= crate::entry::MAX_ENTRY_LAMPORT)
+            {
+                over_ceiling.push(signed_hash);
+            }
+        }
+        over_ceiling
+    };
+    for signed_hash in legacy_ceiling_rows {
+        conn.execute("DELETE FROM content_pre_verify WHERE signed_hash = ?1", [
+            signed_hash.as_slice()
+        ])?;
+    }
+    Ok(())
 }
 
 /// Reset the status of every stream row NOT in `handled` to the unclassified baseline. Those rows
@@ -3744,6 +3831,110 @@ mod tests {
             .query_row("SELECT count(*) FROM content_pre_verify", [], |row| row.get(0))
             .unwrap();
         assert_eq!(parked, 0, "the over-ceiling row is dropped, not retried forever");
+    }
+
+    #[test]
+    fn the_upgrade_purge_retires_a_poisoned_clock_and_unwedges_the_dependent_tail() {
+        let conn = db();
+        let owner_secret = DeviceSecret::from_seed(&[0x31; 32]);
+        let author_secret = DeviceSecret::from_seed(&[0x32; 32]);
+        let (owner, owner_genesis) = roster(&conn, &owner_secret);
+        let (author, author_genesis) = roster(&conn, &author_secret);
+        let grant_id = [0x67; 32];
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, owner_genesis, owner, &owner_secret, "owner");
+        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
+        seed_grant(&conn, grant_id, owner, author, "writer");
+
+        // The pre-clamp wreck: the grantee's poison was accepted, and the owner then honestly
+        // minted `poison + 1` — both over-advance now, and the owner's high entry is its chain
+        // tail, so merely parking them wedges every future owner write (each continuation ticks
+        // backwards from the parked tail).
+        let honest = authored(&owner_secret, owner, owner_genesis, ContentSpec::default());
+        let poison = authored(&author_secret, author, author_genesis, ContentSpec {
+            grant_id: Some(grant_id),
+            lamport: Some(1 << 33),
+            ..ContentSpec::default()
+        });
+        let inherited = authored(&owner_secret, owner, owner_genesis, ContentSpec {
+            seq: 1,
+            previous: Some(honest.entry_hash),
+            lamport: Some((1 << 33) + 1),
+            ..ContentSpec::default()
+        });
+        for entry in [&honest, &poison, &inherited] {
+            content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
+        }
+        settle_all(&conn);
+
+        purge_legacy_lamport_violators(&conn).unwrap();
+        let remaining: Vec<Vec<u8>> = conn
+            .prepare("SELECT entry_hash FROM content_entries")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining, vec![honest.entry_hash.to_vec()], "only the sane prefix survives");
+        let orphaned_status: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM content_entry_status WHERE entry_hash != ?1",
+                [honest.entry_hash.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphaned_status, 0, "deleted candidates leave no status rows behind");
+
+        // The repair the purge exists for: with the chain re-rooted at the surviving prefix, an
+        // honestly-clocked continuation folds ACCEPTED — parked-in-place tails would have forced
+        // this to park as a backwards tick forever.
+        let continuation = authored(&owner_secret, owner, owner_genesis, ContentSpec {
+            seq: 1,
+            previous: Some(honest.entry_hash),
+            lamport: Some(2),
+            ..ContentSpec::default()
+        });
+        assert_eq!(verdict_after_ingest(&conn, &continuation), ("accepted".into(), 1));
+    }
+
+    #[test]
+    fn the_upgrade_purge_drops_over_ceiling_pre_verify_rows_and_keeps_sane_ones() {
+        let conn = db();
+        let stranger = DeviceSecret::from_seed(&[0x99; 32]);
+        let strange_account = AccountId::from_bytes([0x99; 32]);
+        // Both rows have an unresolvable roster (the legacy park state); only the lamport differs.
+        let over_ceiling = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
+            lamport: Some(u64::MAX),
+            ..ContentSpec::default()
+        });
+        let sane = authored(&stranger, strange_account, [0x98; 32], ContentSpec::default());
+        for entry in [&over_ceiling, &sane] {
+            conn.execute(
+                "INSERT INTO content_pre_verify(
+                     signed_hash, entry_hash, claimed_stream_id, claimed_author_account_id,
+                     claimed_fingerprint, roster_ref, raw_bytes, received_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+                params![
+                    cbor::sha256(&entry.signed_bytes).as_slice(),
+                    entry.entry_hash.as_slice(),
+                    STREAM.as_slice(),
+                    strange_account.to_bytes().as_slice(),
+                    stranger.public().fingerprint().to_bytes().as_slice(),
+                    [0x98_u8; 32].as_slice(),
+                    entry.signed_bytes.as_slice(),
+                ],
+            )
+            .unwrap();
+        }
+        purge_legacy_lamport_violators(&conn).unwrap();
+        let kept: Vec<Vec<u8>> = conn
+            .prepare("SELECT entry_hash FROM content_pre_verify")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(kept, vec![sane.entry_hash.to_vec()], "only the over-ceiling row is dropped");
     }
 
     #[test]

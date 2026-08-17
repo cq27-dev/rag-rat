@@ -43,7 +43,7 @@ pub(super) struct ChainCoordinate {
 }
 
 impl ChainCoordinate {
-    fn of(header: &ContentEntryHeader) -> Self {
+    pub(super) fn of(header: &ContentEntryHeader) -> Self {
         Self {
             stream_id: header.stream_id,
             author_account_id: header.author_account_id,

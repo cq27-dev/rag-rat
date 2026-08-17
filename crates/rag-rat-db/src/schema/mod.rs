@@ -1776,7 +1776,7 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         id: MIGRATION_113_ID,
         checksum: MIGRATION_113_CHECKSUM,
         description: MIGRATION_113_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_refold_content_streams_for_lamport_clamp),
+        apply: MigrationFn::WithHooks(migrations::apply_refold_content_streams_for_lamport_clamp),
     },
 ];
 

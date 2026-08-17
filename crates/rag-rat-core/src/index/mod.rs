@@ -58,6 +58,7 @@ pub fn migration_hooks() -> rag_rat_db::MigrationHooks {
         rederive_dream_finding_ids: rag_rat_dream::rederive_finding_ids,
         backfill_authority_projection: rag_rat_oplog::backfill_authority_projection,
         rebuild_papertrail_fts: rag_rat_papertrail::rebuild_fts,
+        purge_legacy_lamport_violators: rag_rat_oplog::purge_legacy_lamport_violators,
         realign_logical_symbol_ids: graph_index::realign_logical_symbol_ids,
     }
 }

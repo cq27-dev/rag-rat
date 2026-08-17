@@ -47,6 +47,7 @@
 pub(crate) fn test_hooks() -> rag_rat_db::MigrationHooks {
     rag_rat_db::MigrationHooks {
         backfill_authority_projection: account::backfill_authority_projection,
+        purge_legacy_lamport_violators: account::purge_legacy_lamport_violators,
         ..rag_rat_db::MigrationHooks::noop()
     }
 }
@@ -124,13 +125,14 @@ pub use account::{
     local_account, mint_and_author_stream_key_wrap_in_tx, owned_stream_v2_id,
     owned_stream_v2_id_with_mode, owned_streams_for_account, owner_control_authority,
     owner_control_authority_in_snapshot, owner_secrets_authority, owner_stream_v2_id_for_account,
-    prepare_content_authoring, prune_account_candidate_reservations_in_tx, read_local_account,
-    read_local_account_genesis, release_account_candidate_reservation_in_tx,
-    repo_incarnation_state, retry_enrollment_pre_verify, roster_content_authority,
-    rotate_stream_key_in_tx, select_current_sealing_wrap,
-    settle_pending_content_refold_for_stream_in_tx, settle_pending_content_refolds,
-    sign_local_node_binding, stream_access_mode, stream_key_rotation_needed, stream_owner_account,
-    stream_owner_effective, upsert_account_candidate_reservation_in_tx, validate_device_add_label,
+    prepare_content_authoring, prune_account_candidate_reservations_in_tx,
+    purge_legacy_lamport_violators, read_local_account, read_local_account_genesis,
+    release_account_candidate_reservation_in_tx, repo_incarnation_state,
+    retry_enrollment_pre_verify, roster_content_authority, rotate_stream_key_in_tx,
+    select_current_sealing_wrap, settle_pending_content_refold_for_stream_in_tx,
+    settle_pending_content_refolds, sign_local_node_binding, stream_access_mode,
+    stream_key_rotation_needed, stream_owner_account, stream_owner_effective,
+    upsert_account_candidate_reservation_in_tx, validate_device_add_label,
     verify_enrollment_device_add, verify_node_binding,
 };
 // The `/3` content projection's store-global upgrade re-fold (#688): wired into the index
