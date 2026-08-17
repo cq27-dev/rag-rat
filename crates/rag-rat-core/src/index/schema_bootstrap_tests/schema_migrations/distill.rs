@@ -920,9 +920,16 @@ fn migration_082_accounts_for_content_refold_work() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
+    // Stream 0x22 holds content but had no legacy queue row: V082 leaves it alone, and the later
+    // V113 (replayed in the same forward pass) queues every content-bearing stream for the
+    // lamport-clamp re-judgment — so it appears here with V113's zero timestamps.
     assert_eq!(
         queued,
-        vec![(vec![0x11u8; 32], 1, 100, 300), (vec![0x33u8; 32], 1, 0, 0)],
+        vec![
+            (vec![0x11u8; 32], 1, 100, 300),
+            (vec![0x22u8; 32], 1, 0, 0),
+            (vec![0x33u8; 32], 1, 0, 0)
+        ],
         "legacy rows become content-candidate work with deterministic source-derived times",
     );
 

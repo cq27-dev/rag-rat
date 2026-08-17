@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 112;
+pub const LATEST_SCHEMA_VERSION: u32 = 113;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -838,6 +838,13 @@ const MIGRATION_112_DESCRIPTION: &str =
      device-local AUTOINCREMENT id and its Lens revision triggers, so the distill anchors child \
      replicates on the distill/1 table-sync scope under whole-row LWW; logical_symbol_id and \
      resolved stay checkout-local and never replicate (#1139)";
+const MIGRATION_113_ID: &str = "113_refold_content_streams_for_lamport_clamp";
+const MIGRATION_113_CHECKSUM: &str = "sha256:rag-rat-refold-content-streams-for-lamport-clamp-v113";
+const MIGRATION_113_DESCRIPTION: &str =
+    "Queue every /3 content stream for an acceptance refold so entries accepted before the \
+     lamport clamp existed are re-judged under it; a stale accepted near-ceiling lamport would \
+     otherwise keep dominating LWW and blocking authoring on an upgraded store while a fresh \
+     replica parks the same entry and diverges (#1176)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1764,6 +1771,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_112_CHECKSUM,
         description: MIGRATION_112_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_syncable_distill_anchors),
+    },
+    Migration {
+        id: MIGRATION_113_ID,
+        checksum: MIGRATION_113_CHECKSUM,
+        description: MIGRATION_113_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_refold_content_streams_for_lamport_clamp),
     },
 ];
 

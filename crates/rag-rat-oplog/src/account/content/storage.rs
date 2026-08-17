@@ -388,6 +388,16 @@ pub(in crate::account) fn promote_pre_verify_for_account(
                     continue;
                 },
             };
+            // The ingest-time lamport ceiling, re-applied here because promotion inserts
+            // candidates WITHOUT re-entering `content_ingest`: a pre-verify row stored by a
+            // binary that predates the ceiling can carry an over-ceiling lamport, and promoting
+            // it would make the poison durable and relayable. Dropping the row keeps the
+            // drop-before-storage contract.
+            if signed.header.lamport >= crate::entry::MAX_ENTRY_LAMPORT {
+                delete_pre_verify(tx, &signed_hash)?;
+                progressed = true;
+                continue;
+            }
             let public = match resolve_roster_key(tx, &signed) {
                 Ok(Some(public)) => public,
                 Ok(None) => continue,
@@ -3670,6 +3680,50 @@ mod tests {
             .query_row("SELECT count(*) FROM content_pre_verify", [], |row| row.get(0))
             .unwrap();
         assert_eq!(pre_verify, 0, "a ceiling entry never reaches the pre-verify park");
+    }
+
+    #[test]
+    fn promotion_drops_a_pre_verify_row_whose_lamport_exceeds_the_ceiling() {
+        // A pre-verify row parked by a binary predating the ingest ceiling: promotion inserts
+        // candidates without re-entering `content_ingest`, so it must re-apply the ceiling or the
+        // legacy poison becomes a durable, relayable candidate. The author's roster is present,
+        // proving the ceiling gate — not an unresolvable key — is what drops the row.
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0x21; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        let poison = authored(&secret, owner, genesis, ContentSpec {
+            lamport: Some(u64::MAX),
+            ..ContentSpec::default()
+        });
+        conn.execute(
+            "INSERT INTO content_pre_verify(
+                 signed_hash, entry_hash, claimed_stream_id, claimed_author_account_id,
+                 claimed_fingerprint, roster_ref, raw_bytes, received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+            params![
+                cbor::sha256(&poison.signed_bytes).as_slice(),
+                poison.entry_hash.as_slice(),
+                STREAM.as_slice(),
+                owner.to_bytes().as_slice(),
+                secret.public().fingerprint().to_bytes().as_slice(),
+                genesis.as_slice(),
+                poison.signed_bytes.as_slice(),
+            ],
+        )
+        .unwrap();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        promote_pre_verify_for_account(&tx, owner, 1).unwrap();
+        tx.commit().unwrap();
+        let candidates: i64 =
+            conn.query_row("SELECT count(*) FROM content_entries", [], |row| row.get(0)).unwrap();
+        assert_eq!(candidates, 0, "the over-ceiling row is never promoted to a candidate");
+        let parked: i64 = conn
+            .query_row("SELECT count(*) FROM content_pre_verify", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(parked, 0, "the over-ceiling row is dropped, not retried forever");
     }
 
     #[test]

@@ -6670,6 +6670,55 @@ mod syncable_overlay_migration_tests {
         assert_eq!(rows, vec![(0, "first".to_string()), (1, "second".to_string())]);
     }
 
+    /// V113 queues every stream holding `/3` content for a refold (so pre-clamp accepted lamports
+    /// get re-judged), merges into an existing queue row instead of clobbering it, and is
+    /// idempotent on replay.
+    #[test]
+    fn v113_queues_every_content_stream_for_refold_and_merges_existing_queue_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        for (stream, entry) in [([0x41_u8; 32], [0x01_u8; 32]), ([0x42; 32], [0x02; 32])] {
+            conn.execute(
+                "INSERT INTO content_entries(
+                     entry_hash, stream_id, author_account_id, device_fingerprint, seq,
+                     prev_hash, grant_id, roster_ref, owner_auth_len, author_auth_len,
+                     accepted, signed_bytes, received_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?5, ?5, 1, x'00', 0)",
+                rusqlite::params![
+                    entry.as_slice(),
+                    stream.as_slice(),
+                    [0x11_u8; 32].as_slice(),
+                    [0x12_u8; 32].as_slice(),
+                    0_u64.to_be_bytes().as_slice(),
+                    [0x13_u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+        }
+        // Stream 0x41 is already queued for an account change (mask 2) with live timestamps: the
+        // migration must OR the content bit in, not replace the row.
+        conn.execute(
+            "INSERT INTO content_streams_pending_refold(
+                 stream_id, reason_mask, first_enqueued_at_ms, last_enqueued_at_ms)
+             VALUES(?1, 2, 7, 7)",
+            [[0x41_u8; 32].as_slice()],
+        )
+        .unwrap();
+        super::apply_refold_content_streams_for_lamport_clamp(&conn).unwrap();
+        super::apply_refold_content_streams_for_lamport_clamp(&conn).unwrap();
+        let rows: Vec<(Vec<u8>, i64, i64)> = conn
+            .prepare(
+                "SELECT stream_id, reason_mask, first_enqueued_at_ms
+                 FROM content_streams_pending_refold ORDER BY stream_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![(vec![0x41; 32], 3, 7), (vec![0x42; 32], 1, 0)]);
+    }
+
     /// The full ladder re-keys anchors onto the natural key, drops the AUTOINCREMENT id, and is
     /// idempotent on a second apply. V078's index names survive (non-unique) so its replay guard
     /// and the drive-by `selected = 1` lookups stay indexed.
@@ -8237,6 +8286,30 @@ pub fn apply_syncable_distill_anchors(conn: &Connection) -> rusqlite::Result<()>
          CREATE INDEX IF NOT EXISTS idx_papertrail_distill_anchors_selected
              ON papertrail_distill_anchors(repo_id, tracker, project, item_kind, item_key,
                                            candidate_ordinal) WHERE selected = 1;",
+    )
+}
+
+/// V113 (#1176): re-judge already-accepted `/3` content under the lamport clamp.
+///
+/// The `/3` acceptance verdict is only re-derived while a stream sits in the refold queue, so a
+/// store that accepted a near-ceiling lamport under a binary predating the clamp would keep the
+/// stale accepted bit — and the poisoned projection LWW, and the blocked authoring clock —
+/// forever, while a freshly-synced replica parks the same entry and the two diverge. Queue every
+/// stream that holds content; the next settle (every index pass and sync drain runs one) re-folds
+/// it under the current rules and reprojects.
+///
+/// Reason mask 1 is the content-candidate refold bit; the zero timestamps sort these oldest, so
+/// they settle ahead of newly-dirtied streams. The upsert ORs into an existing queue row, and a
+/// replay is idempotent by the same shape.
+pub(crate) fn apply_refold_content_streams_for_lamport_clamp(
+    conn: &Connection,
+) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "INSERT INTO content_streams_pending_refold(
+             stream_id, reason_mask, first_enqueued_at_ms, last_enqueued_at_ms)
+         SELECT DISTINCT stream_id, 1, 0, 0 FROM content_entries WHERE true
+         ON CONFLICT(stream_id) DO UPDATE SET
+             reason_mask = content_streams_pending_refold.reason_mask | 1;",
     )
 }
 
