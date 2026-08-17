@@ -31,6 +31,9 @@ pub struct MigrationHooks {
     /// Lives behind a hook because the lamport sits inside the signed CBOR envelope, which the
     /// migration ladder's SQL cannot decode.
     pub purge_legacy_lamport_violators: fn(&Connection) -> rusqlite::Result<()>,
+    /// V114 backfill of the denormalized `content_entries.lamport` column from the stored signed
+    /// envelopes (oplog's `backfill_content_lamport`) — a hook for the same reason as the purge.
+    pub backfill_content_lamport: fn(&Connection) -> rusqlite::Result<()>,
     /// Re-align logical-symbol ids after adoption re-points repo-scoped rows
     /// (graph_index's `realign_logical_symbol_ids`). Returns the realigned-row count.
     pub realign_logical_symbol_ids: fn(&Connection) -> rusqlite::Result<usize>,
@@ -48,6 +51,7 @@ impl MigrationHooks {
             backfill_authority_projection: |_| Ok(()),
             rebuild_papertrail_fts: |_| Ok(()),
             purge_legacy_lamport_violators: |_| Ok(()),
+            backfill_content_lamport: |_| Ok(()),
             realign_logical_symbol_ids: |_| Ok(0),
         }
     }

@@ -48,6 +48,7 @@ pub(crate) fn test_hooks() -> rag_rat_db::MigrationHooks {
     rag_rat_db::MigrationHooks {
         backfill_authority_projection: account::backfill_authority_projection,
         purge_legacy_lamport_violators: account::purge_legacy_lamport_violators,
+        backfill_content_lamport: account::backfill_content_lamport,
         ..rag_rat_db::MigrationHooks::noop()
     }
 }
@@ -111,7 +112,7 @@ pub use account::{
     auth_len_freshness, author_content_batch, author_content_batch_in_tx, author_device_add_in_tx,
     author_enrollment_device_add_in_tx, author_grantee_content_batch_in_tx,
     author_prepared_content_batch_in_tx, author_snapshot_in_tx, author_stream_grant_in_tx,
-    backfill_authority_projection, catch_up_stream_keys_for_device_in_tx,
+    backfill_authority_projection, backfill_content_lamport, catch_up_stream_keys_for_device_in_tx,
     content_entries_for_public_sync, content_entries_for_sync, content_entry_ref, content_ingest,
     content_op_is_authorable, content_op_is_sealed_authorable, content_signed_entry_exists,
     content_signed_hash, content_stream_has_pending_refold, content_stream_has_sealed_ratchet,

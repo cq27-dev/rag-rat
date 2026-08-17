@@ -6720,6 +6720,34 @@ mod syncable_overlay_migration_tests {
         assert_eq!(rows, vec![(vec![0x41; 32], 3, 7), (vec![0x42; 32], 1, 0)]);
     }
 
+    /// V114 adds the nullable denormalized lamport column and its partial accepted-rows index,
+    /// and is idempotent on replay. The backfill itself is a hook (the lamport lives in the
+    /// signed CBOR envelope), exercised in the op-log crate; with noop hooks the column simply
+    /// stays NULL.
+    #[test]
+    fn v114_adds_the_lamport_column_and_its_accepted_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        let has_column: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('content_entries') WHERE name = 'lamport'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1, "content_entries carries the lamport column");
+        let has_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                 AND name = 'idx_content_entries_stream_accepted_lamport'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1, "the partial accepted-rows lamport index exists");
+    }
+
     /// The full ladder re-keys anchors onto the natural key, drops the AUTOINCREMENT id, and is
     /// idempotent on a second apply. V078's index names survive (non-unique) so its replay guard
     /// and the drive-by `selected = 1` lookups stay indexed.
@@ -8328,6 +8356,35 @@ pub(crate) fn apply_refold_content_streams_for_lamport_clamp(
              reason_mask = content_streams_pending_refold.reason_mask | 1;",
     )?;
     (hooks.purge_legacy_lamport_violators)(conn)
+}
+
+/// V114 (#1176): denormalize the `/3` header lamport into a `content_entries` column.
+///
+/// The accepted stream clock (`MAX(lamport)` over a stream's accepted rows) used to be derived by
+/// decoding every accepted envelope — O(stream) per read. That was tolerable for the authoring
+/// mint's cadence, but the ingest-time bounded-advance gate reads the clock for any authenticated
+/// envelope claiming a high lamport, and a hostile roster device re-sending one such envelope
+/// bought the full scan under the writer lock every time, with nothing stored for the candidate
+/// budgets to throttle. The column plus the partial accepted-rows index make the clock an indexed
+/// `MAX`.
+///
+/// The lamport is part of the signed envelope, so the column is immutable per row and written at
+/// every insert site; the hook backfills existing rows by decoding them once. The column stays
+/// nullable: a NULL (an undecodable legacy blob) is simply invisible to `MAX`, which is the same
+/// treatment the decoding scan gave rows it could not decode. Guarded on the shape so a
+/// full-ladder replay over an already-migrated store is a no-op.
+pub(crate) fn apply_content_entries_lamport_column(
+    conn: &Connection,
+    hooks: &crate::hooks::MigrationHooks,
+) -> rusqlite::Result<()> {
+    if !column_exists(conn, "content_entries", "lamport")? {
+        conn.execute_batch("ALTER TABLE content_entries ADD COLUMN lamport INTEGER;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_content_entries_stream_accepted_lamport
+             ON content_entries(stream_id, lamport) WHERE accepted = 1;",
+    )?;
+    (hooks.backfill_content_lamport)(conn)
 }
 
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {

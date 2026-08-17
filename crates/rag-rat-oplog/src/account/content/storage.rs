@@ -565,9 +565,9 @@ pub(super) fn insert_candidate(
     tx.execute(
         "INSERT OR IGNORE INTO content_entries(
              entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
-             grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
-             received_at_ms)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12)",
+             grant_id, roster_ref, owner_auth_len, author_auth_len, lamport, accepted,
+             signed_bytes, received_at_ms)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, ?13)",
         params![
             entry.entry_hash.as_slice(),
             entry.header.stream_id.to_bytes().as_slice(),
@@ -579,11 +579,20 @@ pub(super) fn insert_candidate(
             entry.header.roster_ref.as_slice(),
             entry.header.owner_auth_len.to_be_bytes().as_slice(),
             entry.header.author_auth_len.to_be_bytes().as_slice(),
+            stored_lamport(entry.header.lamport),
             signed_bytes,
             now_ms,
         ],
     )?;
     Ok(())
+}
+
+/// The `content_entries.lamport` column value for a header lamport. The ingest ceiling keeps
+/// every gated value below `1 << 62`, so the clamp to `i64::MAX` only ever fires for legacy junk
+/// written around the gates — rows that can never be accepted and so never reach the accepted
+/// `MAX` the column exists to serve.
+fn stored_lamport(lamport: u64) -> i64 {
+    i64::try_from(lamport).unwrap_or(i64::MAX)
 }
 
 fn reclassify_chain(tx: &Transaction<'_>, entry: &VerifiedContentEntry) -> anyhow::Result<()> {
@@ -1887,6 +1896,30 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
         conn.execute("DELETE FROM content_pre_verify WHERE signed_hash = ?1", [
             signed_hash.as_slice()
         ])?;
+    }
+    Ok(())
+}
+
+/// The V114 backfill hook: fill the denormalized `content_entries.lamport` column from each
+/// stored signed envelope, once. Insert sites write the column from then on; an undecodable blob
+/// keeps NULL, which `MAX` ignores — the same treatment the decoding scan gave it. Idempotent
+/// (`WHERE lamport IS NULL`), so a ladder replay re-decodes nothing already filled.
+pub fn backfill_content_lamport(conn: &Connection) -> rusqlite::Result<()> {
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT entry_hash, signed_bytes FROM content_entries WHERE lamport IS NULL",
+        )?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (entry_hash, signed_bytes) in rows {
+        if let Ok(signed) = envelope::decode_content_signed(&signed_bytes) {
+            conn.execute(
+                "UPDATE content_entries SET lamport = ?1 WHERE entry_hash = ?2",
+                params![stored_lamport(signed.header.lamport), entry_hash.as_slice(),],
+            )?;
+        }
     }
     Ok(())
 }
@@ -3922,9 +3955,9 @@ mod tests {
         conn.execute(
             "INSERT INTO content_entries(
                  entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
-                 grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
-                 received_at_ms)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)",
+                 grant_id, roster_ref, owner_auth_len, author_auth_len, lamport, accepted,
+                 signed_bytes, received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)",
             params![
                 entry.entry_hash.as_slice(),
                 entry.header.stream_id.to_bytes().as_slice(),
@@ -3936,6 +3969,7 @@ mod tests {
                 entry.header.roster_ref.as_slice(),
                 entry.header.owner_auth_len.to_be_bytes().as_slice(),
                 entry.header.author_auth_len.to_be_bytes().as_slice(),
+                stored_lamport(entry.header.lamport),
                 accepted,
                 entry.signed_bytes.as_slice(),
             ],
@@ -4091,6 +4125,71 @@ mod tests {
             ..ContentSpec::default()
         });
         assert_eq!(verdict_after_ingest(&conn, &continuation), ("accepted".into(), 1));
+    }
+
+    #[test]
+    fn the_lamport_backfill_fills_null_columns_from_the_envelopes_and_skips_junk() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0x21; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        // A legacy row: stored without the denormalized column (as a pre-V114 binary left it).
+        let entry = authored(&secret, owner, genesis, ContentSpec {
+            lamport: Some(7),
+            ..ContentSpec::default()
+        });
+        conn.execute(
+            "INSERT INTO content_entries(
+                 entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
+                 grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
+                 received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?7, 1, ?8, 1)",
+            params![
+                entry.entry_hash.as_slice(),
+                STREAM.as_slice(),
+                owner.to_bytes().as_slice(),
+                secret.public().fingerprint().to_bytes().as_slice(),
+                0_u64.to_be_bytes().as_slice(),
+                genesis.as_slice(),
+                0_u64.to_be_bytes().as_slice(),
+                entry.signed_bytes.as_slice(),
+            ],
+        )
+        .unwrap();
+        // An undecodable blob keeps NULL — invisible to MAX, as the decoding scan treated it.
+        conn.execute(
+            "INSERT INTO content_entries(
+                 entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
+                 grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
+                 received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?7, 1, x'00', 1)",
+            params![
+                [0xEE_u8; 32].as_slice(),
+                STREAM.as_slice(),
+                owner.to_bytes().as_slice(),
+                secret.public().fingerprint().to_bytes().as_slice(),
+                1_u64.to_be_bytes().as_slice(),
+                genesis.as_slice(),
+                0_u64.to_be_bytes().as_slice(),
+            ],
+        )
+        .unwrap();
+        backfill_content_lamport(&conn).unwrap();
+        let filled: Option<i64> = conn
+            .query_row(
+                "SELECT lamport FROM content_entries WHERE entry_hash = ?1",
+                [entry.entry_hash.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(filled, Some(7), "the decodable row is backfilled from its envelope");
+        let junk: Option<i64> = conn
+            .query_row(
+                "SELECT lamport FROM content_entries WHERE entry_hash = ?1",
+                [[0xEE_u8; 32].as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(junk, None, "an undecodable blob stays NULL");
     }
 
     #[test]

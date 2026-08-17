@@ -62,9 +62,9 @@ pub use bootstrap::{
 pub use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, ContentRefoldBudget,
     ContentSettleReport, ContentStreamSettleFailure, SignedContentEntry, VerifiedContentEntry,
-    content_ingest, content_stream_has_pending_refold, decode_content_signed,
-    purge_legacy_lamport_violators, settle_pending_content_refold_for_stream_in_tx,
-    settle_pending_content_refolds,
+    backfill_content_lamport, content_ingest, content_stream_has_pending_refold,
+    decode_content_signed, purge_legacy_lamport_violators,
+    settle_pending_content_refold_for_stream_in_tx, settle_pending_content_refolds,
 };
 // The envelope sign/verify primitives take `&DeviceSecret`/`&DevicePublic` (`pub(crate)`
 // types), so they stay off the crate-root glob — account-internal consumers reach them through

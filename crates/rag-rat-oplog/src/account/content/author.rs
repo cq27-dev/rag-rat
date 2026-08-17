@@ -807,25 +807,22 @@ fn content_chain_tail(
 /// the `(lamport, device)` projection LWW causal across authors; a per-author chain-tail lamport
 /// would let a short-chain writer's later edit lose.
 ///
-/// ponytail: O(accepted entries) — `lamport` lives only in the signed envelope (not a
-/// `content_entries` column), so this decodes each. Fine at the current authoring cadence; if a
-/// large stream's per-write latency ever matters, denormalize `content_entries.lamport` and read
-/// `MAX(lamport)` (the `/5` table-sync layer already stores it that way).
+/// An indexed `MAX` over the V114 denormalized column (`idx_content_entries_stream_accepted_
+/// lamport`), NOT a decode of every accepted envelope: the ingest-time bounded-advance gate reads
+/// this clock for any authenticated envelope claiming a high lamport, so a per-read O(stream)
+/// decode was a remote CPU/writer-lock burn for a hostile roster device re-sending one envelope.
+/// A NULL column value (an undecodable legacy blob the backfill skipped) is invisible to `MAX`,
+/// exactly as the decoding scan treated rows it could not decode.
 pub(super) fn stream_max_content_lamport(
     conn: &Connection,
     stream_id: StreamId,
 ) -> anyhow::Result<Option<u64>> {
-    let mut stmt = conn.prepare(
-        "SELECT signed_bytes FROM content_entries WHERE stream_id = ?1 AND accepted = 1",
+    let max: Option<i64> = conn.query_row(
+        "SELECT MAX(lamport) FROM content_entries WHERE stream_id = ?1 AND accepted = 1",
+        params![stream_id.to_bytes().as_slice()],
+        |row| row.get(0),
     )?;
-    let rows =
-        stmt.query_map(params![stream_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
-    let mut max: Option<u64> = None;
-    for row in rows {
-        let signed = envelope::decode_content_signed(&row?)?;
-        max = Some(max.map_or(signed.header.lamport, |m| m.max(signed.header.lamport)));
-    }
-    Ok(max)
+    Ok(max.map(|value| u64::try_from(value).unwrap_or(0)))
 }
 
 /// The lamport for the `index`-th entry of an authoring batch: `base + index`, kept strictly
@@ -1144,9 +1141,9 @@ mod tests {
         conn.execute(
             "INSERT INTO content_entries(
                  entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
-                 grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
-                 received_at_ms)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, 0)",
+                 grant_id, roster_ref, owner_auth_len, author_auth_len, lamport, accepted,
+                 signed_bytes, received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, 0)",
             params![
                 signed.entry_hash.as_slice(),
                 header.stream_id.to_bytes().as_slice(),
@@ -1158,6 +1155,7 @@ mod tests {
                 header.roster_ref.as_slice(),
                 header.owner_auth_len.to_be_bytes().as_slice(),
                 header.author_auth_len.to_be_bytes().as_slice(),
+                i64::try_from(header.lamport).unwrap_or(i64::MAX),
                 signed.signed_bytes.as_slice(),
             ],
         )
