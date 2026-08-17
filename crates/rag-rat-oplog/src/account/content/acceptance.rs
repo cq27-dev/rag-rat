@@ -90,11 +90,13 @@ pub enum ContentParkReason {
     IncompleteCutAncestry,
     UnknownCutTarget,
     ContestedSubject,
-    /// The entry's lamport jumps implausibly far past the accepted stream clock (bounded advance,
-    /// the fold-seam half of the `/3` lamport clamp). Assigned by the refold, not this evaluator —
-    /// the bound needs the whole accepted set, which a per-entry pass cannot see. Recoverable by
-    /// construction: verdicts are re-derived every refold, so the entry accepts if the stream's
-    /// accepted clock ever legitimately catches up.
+    /// The entry violates the lamport discipline the fold enforces (the fold-seam half of the
+    /// `/3` lamport clamp): its lamport jumps implausibly far past the accepted stream clock
+    /// (bounded advance), or its chain's lamport fails to strictly increase (honest authoring
+    /// mints `max accepted + 1` per entry). Assigned by the refold, not this evaluator — both
+    /// rules need the whole accepted set, which a per-entry pass cannot see. Recoverable by
+    /// construction: verdicts are re-derived every refold, so a bounded-advance park accepts if
+    /// the stream's accepted clock ever legitimately catches up.
     LamportAhead,
 }
 

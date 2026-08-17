@@ -1653,61 +1653,81 @@ fn prefix_closed_accepted(
     accepted
 }
 
-/// Bounded lamport advance at the acceptance seam: demote any would-be-accepted entry whose
+/// The chain a `/3` entry extends — the same identity [`prefix_closed_accepted`] groups by.
+fn chain_coordinate(r: &ResolvedEntry) -> ChainCoordinate {
+    ChainCoordinate {
+        stream_id: r.header.stream_id,
+        author_account_id: r.header.author_account_id,
+        device_fingerprint: r.header.device_fingerprint,
+    }
+}
+
+/// The lamport discipline at the acceptance seam: demote any would-be-accepted entry whose
 /// lamport jumps more than [`MAX_LAMPORT_ADVANCE`] past the highest lamport the accepted set
-/// below it establishes. The header lamport is attacker-controlled and decides projection LWW
-/// `(lamport, device)`, so without this one granted writer's entry near the ceiling wins every
-/// register permanently AND bricks authoring (the next mint overflows the ceiling). Enforcing at
-/// the fold rather than at ingest inherits the predecessor gate for free — parked entries never
-/// fold, so an honest partitioned writer's chain folds in order and each step stays within the
-/// bound — and the verdict is re-derived every refold, so a demotion is never durable.
+/// below it establishes, or whose chain's lamport fails to strictly increase. The header lamport
+/// is attacker-controlled and decides projection LWW `(lamport, device)`, so without the bound
+/// one granted writer's entry near the ceiling wins every register permanently AND bricks
+/// authoring (the next mint overflows the ceiling). Enforcing at the fold rather than at ingest
+/// inherits the predecessor gate for free — parked entries never fold, so an honest partitioned
+/// writer's chain folds in order and each step stays within the bound — and the verdict is
+/// re-derived every refold, so a demotion is never durable.
 ///
-/// The walk runs in ascending `(lamport, entry_hash)` order with a running max that violators do
-/// NOT advance (a poison entry must not legitimize the next one). A violator's chain is truncated
-/// at the violating seq (accepted stays a dense prefix), and the walk repeats until stable:
-/// truncation can remove an entry whose lamport had already advanced the running max for others.
-/// Bounded by the candidate caps and reached only under attack — honest folds exit on pass one.
+/// Two passes, O(n log n) total — the work is bounded even against an adversarial chain shape,
+/// because this runs inside the stream's IMMEDIATE writer transaction:
+///
+/// 1. **Per-chain monotonicity.** Honest authoring mints a strictly increasing lamport along a
+///    chain (`max accepted + 1` per entry), so a chain that ticks backwards is forged; it truncates
+///    at the first non-increase. This is also what makes the single walk below exact: within a
+///    monotone chain, ascending-lamport order IS seq order, so an entry's chain cut is always
+///    discovered before the entries it demotes — no fixed-point restart for an attacker to inflate.
+/// 2. **Bounded advance, one ascending `(lamport, entry_hash)` walk.** A demoted entry — beyond the
+///    bound, or at/above its chain's cut — never advances the running max (a poison entry must not
+///    legitimize the next one) and cuts its chain at its seq, keeping accepted a dense prefix.
 fn lamport_advance_clamped(
     resolved: &[ResolvedEntry],
     mut accepted: HashSet<EntryHash>,
 ) -> (HashSet<EntryHash>, HashSet<EntryHash>) {
-    let mut parked = HashSet::new();
-    loop {
-        let mut rows: Vec<&ResolvedEntry> =
-            resolved.iter().filter(|r| accepted.contains(&r.entry_hash)).collect();
-        rows.sort_by_key(|r| (r.header.lamport, r.entry_hash));
-        let mut running_max = 0u64;
-        let mut cut: HashMap<ChainCoordinate, u64> = HashMap::new();
-        for r in rows {
-            if r.header.lamport > running_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
-                let coordinate = ChainCoordinate {
-                    stream_id: r.header.stream_id,
-                    author_account_id: r.header.author_account_id,
-                    device_fingerprint: r.header.device_fingerprint,
-                };
-                let seq = cut.entry(coordinate).or_insert(r.header.seq);
-                *seq = (*seq).min(r.header.seq);
-            } else {
-                running_max = running_max.max(r.header.lamport);
-            }
-        }
-        if cut.is_empty() {
-            return (accepted, parked);
-        }
-        for r in resolved {
-            let coordinate = ChainCoordinate {
-                stream_id: r.header.stream_id,
-                author_account_id: r.header.author_account_id,
-                device_fingerprint: r.header.device_fingerprint,
-            };
-            if let Some(&seq) = cut.get(&coordinate)
-                && r.header.seq >= seq
-                && accepted.remove(&r.entry_hash)
-            {
-                parked.insert(r.entry_hash);
+    let mut chains: HashMap<ChainCoordinate, Vec<&ResolvedEntry>> = HashMap::new();
+    for r in resolved.iter().filter(|r| accepted.contains(&r.entry_hash)) {
+        chains.entry(chain_coordinate(r)).or_default().push(r);
+    }
+    let mut cut: HashMap<ChainCoordinate, u64> = HashMap::new();
+    for (coordinate, mut members) in chains {
+        members.sort_by_key(|r| r.header.seq);
+        for pair in members.windows(2) {
+            if pair[1].header.lamport <= pair[0].header.lamport {
+                cut.insert(coordinate, pair[1].header.seq);
+                break;
             }
         }
     }
+
+    let mut rows: Vec<&ResolvedEntry> =
+        resolved.iter().filter(|r| accepted.contains(&r.entry_hash)).collect();
+    rows.sort_by_key(|r| (r.header.lamport, r.entry_hash));
+    let mut running_max = 0u64;
+    for r in rows {
+        let coordinate = chain_coordinate(r);
+        if cut.get(&coordinate).is_some_and(|&seq| r.header.seq >= seq) {
+            continue; // demoted below a cut this walk already discovered
+        }
+        if r.header.lamport > running_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
+            let seq = cut.entry(coordinate).or_insert(r.header.seq);
+            *seq = (*seq).min(r.header.seq);
+        } else {
+            running_max = running_max.max(r.header.lamport);
+        }
+    }
+
+    let mut parked = HashSet::new();
+    for r in resolved {
+        if cut.get(&chain_coordinate(r)).is_some_and(|&seq| r.header.seq >= seq)
+            && accepted.remove(&r.entry_hash)
+        {
+            parked.insert(r.entry_hash);
+        }
+    }
+    (accepted, parked)
 }
 
 /// Reset the status of every stream row NOT in `handled` to the unclassified baseline. Those rows
@@ -3803,6 +3823,34 @@ mod tests {
         settle_all(&conn);
         assert_eq!(verdict(&conn, &violator.entry_hash), ("parked{lamport_ahead}".into(), 0));
         assert_eq!(verdict(&conn, &descendant.entry_hash), ("parked{lamport_ahead}".into(), 0));
+    }
+
+    #[test]
+    fn a_chain_whose_lamport_ticks_backwards_truncates_at_the_first_non_increase() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0x21; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+
+        // Both lamports sit comfortably inside the bounded advance — what demotes seq 1 is the
+        // chain ticking backwards, which honest authoring (`max accepted + 1` per entry) never
+        // produces. The prefix below the violation keeps its verdict.
+        let first = authored(&secret, owner, genesis, ContentSpec {
+            lamport: Some(5),
+            ..ContentSpec::default()
+        });
+        let backwards = authored(&secret, owner, genesis, ContentSpec {
+            seq: 1,
+            previous: Some(first.entry_hash),
+            lamport: Some(3),
+            ..ContentSpec::default()
+        });
+        content_ingest(&conn, &first.signed_bytes, 1).unwrap();
+        content_ingest(&conn, &backwards.signed_bytes, 1).unwrap();
+        settle_all(&conn);
+        assert_eq!(verdict(&conn, &first.entry_hash), ("accepted".into(), 1));
+        assert_eq!(verdict(&conn, &backwards.entry_hash), ("parked{lamport_ahead}".into(), 0));
     }
 
     #[test]
