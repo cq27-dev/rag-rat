@@ -875,31 +875,39 @@ pub fn effective_writer_grant(
     grant_id.map(|bytes| fixed(&bytes)).transpose()
 }
 
-/// The OPEN (not-closed) grant `owner_account_id` holds for `grantee_account_id` on `stream_id`,
-/// any role — the owner-side resolver behind `sync revoke`, which names the grantee while the
-/// wire op names the grant. The newest wins if re-granting ever produces several open rows, so a
-/// revoke always targets the most recent authorization first.
-pub fn open_stream_grant(
+/// Every OPEN (not-closed) WRITER grant `owner_account_id` holds for `grantee_account_id` on
+/// `stream_id`, newest first — the owner-side resolver behind `sync revoke`, which names the
+/// grantee while the wire op names a grant. Writer-scoped on purpose: revoking write access must
+/// target the grants that CONFER writing — a grantee also holding a Reader grant would otherwise
+/// have the reader row closed while it keeps authoring. Plural on purpose: double-granting
+/// authors two effective grant ids, and closing only one would leave the grantee writing while
+/// the command reports success.
+pub fn open_writer_grants(
     conn: &Connection,
     owner_account_id: AccountId,
     stream_id: StreamId,
     grantee_account_id: AccountId,
-) -> anyhow::Result<Option<EntryHash>> {
-    let grant_id: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT grant_id FROM account_stream_grants
-             WHERE owner_account_id = ?1 AND stream_id = ?2 AND grantee_account_id = ?3
-               AND closed_at IS NULL
-             ORDER BY effective_at DESC LIMIT 1",
-            params![
-                owner_account_id.to_bytes().as_slice(),
-                stream_id.to_bytes().as_slice(),
-                grantee_account_id.to_bytes().as_slice(),
-            ],
-            |row| row.get(0),
-        )
-        .optional()?;
-    grant_id.map(|bytes| fixed(&bytes)).transpose()
+) -> anyhow::Result<Vec<EntryHash>> {
+    let mut stmt = conn.prepare(
+        "SELECT grant_id FROM account_stream_grants
+         WHERE owner_account_id = ?1 AND stream_id = ?2 AND grantee_account_id = ?3
+           AND role = ?4 AND closed_at IS NULL
+         ORDER BY effective_at DESC, grant_id",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            owner_account_id.to_bytes().as_slice(),
+            stream_id.to_bytes().as_slice(),
+            grantee_account_id.to_bytes().as_slice(),
+            GrantRole::Writer.as_db_str(),
+        ],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut grants = Vec::new();
+    for row in rows {
+        grants.push(fixed(&row?)?);
+    }
+    Ok(grants)
 }
 
 /// One row of the owner-facing grant listing (`sync grants`).

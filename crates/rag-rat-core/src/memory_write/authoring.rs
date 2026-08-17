@@ -1105,8 +1105,8 @@ pub(crate) fn list_repo_grants(conn: &Connection) -> anyhow::Result<Vec<RepoGran
 #[derive(Debug, Clone)]
 pub struct RepoRevokeReport {
     pub grantee_account_id: String,
-    pub grant_id: String,
-    pub revoke_id: String,
+    pub grant_ids: Vec<String>,
+    pub revoke_ids: Vec<String>,
     pub reason: String,
     /// `(device_fingerprint_hex, kept_through_seq)` — the chain prefixes that stay valid.
     pub cuts: Vec<(String, u64)>,
@@ -1144,8 +1144,16 @@ pub(crate) fn revoke_repo_writer(
     tx.commit()?;
     Ok(RepoRevokeReport {
         grantee_account_id: rag_rat_base::hash::hex_lower(&grantee.to_bytes()),
-        grant_id: rag_rat_base::hash::hex_lower(&revocation.grant_id),
-        revoke_id: rag_rat_base::hash::hex_lower(&revocation.revoke_id),
+        grant_ids: revocation
+            .grant_ids
+            .iter()
+            .map(|id| rag_rat_base::hash::hex_lower(id))
+            .collect(),
+        revoke_ids: revocation
+            .revoke_ids
+            .iter()
+            .map(|id| rag_rat_base::hash::hex_lower(id))
+            .collect(),
         reason: reason.as_db_str().to_string(),
         cuts: revocation
             .cuts
@@ -1155,7 +1163,7 @@ pub(crate) fn revoke_repo_writer(
     })
 }
 
-/// Resolve a full 64-hex account id, or an unambiguous hex prefix of an OPEN grantee on the
+/// Resolve a full 64-hex account id, or an unambiguous hex prefix of an open WRITER grantee on the
 /// stream. Prefixes shorter than 4 characters are refused outright — with one grantee even a
 /// single character would match, and an id that short in an operator's history is more likely a
 /// typo than an intent.
@@ -1177,7 +1185,7 @@ fn resolve_grantee_ref(
     let mut matches: Vec<rag_rat_oplog::AccountId> =
         rag_rat_oplog::stream_grants_for_owner(conn, owner, stream)?
             .into_iter()
-            .filter(|grant| grant.open)
+            .filter(|grant| grant.open && grant.role == "writer")
             .map(|grant| grant.grantee_account_id)
             .filter(|grantee| {
                 rag_rat_base::hash::hex_lower(&grantee.to_bytes()).starts_with(&reference)
@@ -1187,10 +1195,11 @@ fn resolve_grantee_ref(
     match matches.as_slice() {
         [grantee] => Ok(*grantee),
         [] => anyhow::bail!(
-            "no open grant matches `{reference}` on this repo's stream — `sync grants` lists them"
+            "no open writer grant matches `{reference}` on this repo's stream — `sync grants` \
+             lists them"
         ),
         _ => anyhow::bail!(
-            "`{reference}` is ambiguous between {} open grantees — give more characters",
+            "`{reference}` is ambiguous between {} open writer grantees — give more characters",
             matches.len()
         ),
     }

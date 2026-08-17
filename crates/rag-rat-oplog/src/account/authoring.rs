@@ -575,11 +575,12 @@ impl RevokeReason {
 /// The authored revocation `author_stream_revoke_in_tx` reports back to the operator.
 #[derive(Debug, Clone)]
 pub struct StreamRevocation {
-    /// The grant this revoke closed.
-    pub grant_id: EntryHash,
-    /// The authored `StreamRevoke` entry.
-    pub revoke_id: EntryHash,
-    /// The chain cuts the revoke carries — what prior work stays valid.
+    /// The WRITER grants this revoke closed — plural, because double-granting authors two
+    /// effective grant ids and leaving either open would leave the grantee writing.
+    pub grant_ids: Vec<EntryHash>,
+    /// The authored `StreamRevoke` entries, one per closed grant.
+    pub revoke_ids: Vec<EntryHash>,
+    /// The chain cuts each revoke carries — what prior work stays valid.
     pub cuts: Vec<ops::DeviceCut>,
 }
 
@@ -611,12 +612,11 @@ pub fn author_stream_revoke_in_tx(
          local_account first)",
     )?;
     let device = local_device(tx, now_ms)?;
-    let Some(grant_id) = storage::open_stream_grant(tx, account_id, stream_id, grantee_account_id)?
-    else {
-        anyhow::bail!(
-            "no open grant to that account on this repo's stream — `sync grants` lists them"
-        );
-    };
+    let grant_ids = storage::open_writer_grants(tx, account_id, stream_id, grantee_account_id)?;
+    anyhow::ensure!(
+        !grant_ids.is_empty(),
+        "no open writer grant to that account on this repo's stream — `sync grants` lists them"
+    );
     let cuts = match (reason.is_hard(), keep_until) {
         (false, None) => super::content::accepted_chain_tails(tx, stream_id, grantee_account_id)?,
         (false, Some(_)) => anyhow::bail!(
@@ -639,21 +639,32 @@ pub fn author_stream_revoke_in_tx(
             vec![ops::DeviceCut { device_fingerprint, seq, hash }]
         },
     };
-    let op = AccountOp::StreamRevoke {
-        stream_id,
-        grantee_account_id,
-        grant_id,
-        device_cuts: cuts.clone(),
-        reason: reason.as_db_str().to_string(),
-    };
-    let revoke_id = author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, now_ms)?;
+    let mut revoke_ids = Vec::with_capacity(grant_ids.len());
+    for grant_id in &grant_ids {
+        let op = AccountOp::StreamRevoke {
+            stream_id,
+            grantee_account_id,
+            grant_id: *grant_id,
+            device_cuts: cuts.clone(),
+            reason: reason.as_db_str().to_string(),
+        };
+        revoke_ids.push(author_account_op_in_tx(
+            tx,
+            &device,
+            account_id,
+            genesis_hash,
+            &op,
+            now_ms,
+        )?);
+    }
+    // Verify the FACT: no open writer grant remains — closing one of several would leave the
+    // grantee writing while the command reports success.
     anyhow::ensure!(
-        storage::open_stream_grant(tx, account_id, stream_id, grantee_account_id)?
-            .is_none_or(|open| open != grant_id),
-        "the stream revoke did not close the grant — the local device lacks effective owner \
-         authority on this account, or a concurrent op won the fold",
+        storage::open_writer_grants(tx, account_id, stream_id, grantee_account_id)?.is_empty(),
+        "the stream revoke did not close every writer grant — the local device lacks effective \
+         owner authority on this account, or a concurrent op won the fold",
     );
-    Ok(StreamRevocation { grant_id, revoke_id, cuts })
+    Ok(StreamRevocation { grant_ids, revoke_ids, cuts })
 }
 
 /// Retry pre-verify rows unlocked by a committed enrollment in a separate maintenance transaction.
@@ -815,9 +826,9 @@ mod tests {
             g
         };
         assert_eq!(
-            storage::open_stream_grant(&conn, account, stream, grantee).unwrap(),
-            Some(grant_id),
-            "the open grant resolves by grantee"
+            storage::open_writer_grants(&conn, account, stream, grantee).unwrap(),
+            vec![grant_id],
+            "the open writer grant resolves by grantee"
         );
 
         let revocation = {
@@ -828,14 +839,13 @@ mod tests {
             tx.commit().unwrap();
             r
         };
-        assert_eq!(revocation.grant_id, grant_id);
+        assert_eq!(revocation.grant_ids, vec![grant_id]);
         assert!(
             revocation.cuts.is_empty(),
             "no accepted grantee content means nothing to vouch for"
         );
-        assert_eq!(
-            storage::open_stream_grant(&conn, account, stream, grantee).unwrap(),
-            None,
+        assert!(
+            storage::open_writer_grants(&conn, account, stream, grantee).unwrap().is_empty(),
             "the grant is closed"
         );
         let listing = storage::stream_grants_for_owner(&conn, account, stream).unwrap();
@@ -850,7 +860,48 @@ mod tests {
             author_stream_revoke_in_tx(&tx, stream, grantee, RevokeReason::Departed, None, NOW)
                 .unwrap_err()
                 .to_string();
-        assert!(err.contains("no open grant"), "{err}");
+        assert!(err.contains("no open writer grant"), "{err}");
+    }
+
+    #[test]
+    fn a_revoke_targets_the_writer_grants_and_spares_a_reader_grant() {
+        let conn = db();
+        let account = bootstrap::local_account(&conn, NOW).expect("mint local account");
+        let stream = ensure_committed(&conn, "repo-x");
+        let grantee = AccountId::from_bytes([0x77; 32]);
+        // The grantee holds BOTH roles, the reader granted LAST. Revoking write access must
+        // target the writer grant: closing the newest row regardless of role would close the
+        // reader while the grantee keeps authoring, and the command would still report success.
+        let writer = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let writer =
+                author_stream_grant_in_tx(&tx, stream, grantee, ops::GrantRole::Writer, NOW)
+                    .unwrap();
+            author_stream_grant_in_tx(&tx, stream, grantee, ops::GrantRole::Reader, NOW).unwrap();
+            tx.commit().unwrap();
+            writer
+        };
+
+        let revocation = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let r =
+                author_stream_revoke_in_tx(&tx, stream, grantee, RevokeReason::Departed, None, NOW)
+                    .unwrap();
+            tx.commit().unwrap();
+            r
+        };
+        assert_eq!(revocation.grant_ids, vec![writer], "the writer grant is what closes");
+        assert!(
+            storage::open_writer_grants(&conn, account, stream, grantee).unwrap().is_empty(),
+            "no writer grant remains"
+        );
+        let open_readers = storage::stream_grants_for_owner(&conn, account, stream)
+            .unwrap()
+            .into_iter()
+            .filter(|grant| grant.open)
+            .map(|grant| grant.role)
+            .collect::<Vec<_>>();
+        assert_eq!(open_readers, vec!["reader".to_string()], "the reader grant is untouched");
     }
 
     #[test]

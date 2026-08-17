@@ -129,8 +129,8 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "status": "revoked",
                 "repo_id": db.active_repo_id,
                 "grantee_account_id": report.grantee_account_id,
-                "grant_id": report.grant_id,
-                "revoke_id": report.revoke_id,
+                "grant_ids": report.grant_ids,
+                "revoke_ids": report.revoke_ids,
                 "reason": report.reason,
                 "kept": report.cuts.iter().map(|(device, seq)| serde_json::json!({
                     "device": device,

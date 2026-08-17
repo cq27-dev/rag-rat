@@ -135,7 +135,7 @@ pub use storage::{
     account_holds_effective_public_writer_grant, account_ingest, account_is_fully_public,
     account_signed_entry_exists, account_signed_hash, auth_len_freshness,
     backfill_authority_projection, effective_writer_grant, effective_writer_grantees,
-    grant_effective_for_device, grant_effective_in_snapshot, open_stream_grant,
+    grant_effective_for_device, grant_effective_in_snapshot, open_writer_grants,
     owned_streams_for_account, owner_control_authority, owner_control_authority_in_snapshot,
     owner_secrets_authority, roster_content_authority, stream_access_mode, stream_grants_for_owner,
     stream_owner_account, stream_owner_effective, verify_enrollment_device_add,

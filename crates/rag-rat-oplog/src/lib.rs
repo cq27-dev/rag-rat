@@ -125,7 +125,7 @@ pub use account::{
     ensure_stream_key_current_in_tx, established_owned_stream_v2,
     established_owned_stream_v2_with_mode, grant_effective_for_device, grant_effective_in_snapshot,
     held_account_entry_hashes, historical_content_keyring, live_stream_key_targets_for_device,
-    local_account, mint_and_author_stream_key_wrap_in_tx, open_stream_grant, owned_stream_v2_id,
+    local_account, mint_and_author_stream_key_wrap_in_tx, open_writer_grants, owned_stream_v2_id,
     owned_stream_v2_id_with_mode, owned_streams_for_account, owner_control_authority,
     owner_control_authority_in_snapshot, owner_secrets_authority, owner_stream_v2_id_for_account,
     prepare_content_authoring, prune_account_candidate_reservations_in_tx,
