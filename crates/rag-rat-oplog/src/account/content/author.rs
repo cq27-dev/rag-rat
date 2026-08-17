@@ -811,11 +811,11 @@ fn content_chain_tail(
 /// `content_entries` column), so this decodes each. Fine at the current authoring cadence; if a
 /// large stream's per-write latency ever matters, denormalize `content_entries.lamport` and read
 /// `MAX(lamport)` (the `/5` table-sync layer already stores it that way).
-fn stream_max_content_lamport(
-    tx: &Transaction<'_>,
+pub(super) fn stream_max_content_lamport(
+    conn: &Connection,
     stream_id: StreamId,
 ) -> anyhow::Result<Option<u64>> {
-    let mut stmt = tx.prepare(
+    let mut stmt = conn.prepare(
         "SELECT signed_bytes FROM content_entries WHERE stream_id = ?1 AND accepted = 1",
     )?;
     let rows =

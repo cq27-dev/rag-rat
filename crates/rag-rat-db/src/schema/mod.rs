@@ -1079,6 +1079,7 @@ const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[
     MIGRATION_110_ID,
     MIGRATION_111_ID,
     MIGRATION_112_ID,
+    MIGRATION_113_ID,
 ];
 
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
@@ -2010,6 +2011,7 @@ mod ledger_atomicity {
         MIGRATION_110_ID,
         MIGRATION_111_ID,
         MIGRATION_112_ID,
+        MIGRATION_113_ID,
     ];
 
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.

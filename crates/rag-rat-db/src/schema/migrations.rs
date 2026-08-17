@@ -8311,6 +8311,11 @@ pub fn apply_syncable_distill_anchors(conn: &Connection) -> rusqlite::Result<()>
 /// they settle ahead of newly-dirtied streams. The upsert ORs into an existing queue row, and a
 /// replay is idempotent by the same shape (the hook is idempotent too — a purged store has
 /// nothing left to purge).
+///
+/// Listed in `LEDGER_ATOMIC_MIGRATIONS`: the queue rows, the deletions, and the ledger stamp
+/// commit together, so an old writer racing the upgrade cannot slip poison into a half-purged
+/// store that still answers V112-compatible, and a crash cannot leave a partial purge behind an
+/// unstamped ledger. Neither statement below opens a transaction of its own — the ladder owns it.
 pub(crate) fn apply_refold_content_streams_for_lamport_clamp(
     conn: &Connection,
     hooks: &crate::hooks::MigrationHooks,

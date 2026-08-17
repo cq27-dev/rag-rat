@@ -113,6 +113,29 @@ pub fn content_ingest(
             signed.header.lamport
         )));
     }
+    // Bounded advance at ingest, as a DROP — nothing is stored, so a stale-max race or a stream
+    // whose accepted clock later catches up is repaired by the next session re-offering the
+    // envelope. This is what keeps the V113 upgrade repair stable: without it, a not-yet-purged
+    // replica re-sends a purged poison (or the honest tail that inherited its clock), the entry
+    // re-parks as its author's candidate chain tail, and local authoring wedges again. The
+    // `MAX_LAMPORT_ADVANCE` pre-check keeps the accepted-clock read off the honest path entirely:
+    // a legitimate lamport counts real ops and cannot approach 2^32 under the candidate caps, so
+    // only suspicious entries pay the O(accepted) decode — and they are dropped, not stored. The
+    // catch-up trap (rejecting an honest writer against a stale max) is unreachable at these
+    // constants: it would take a >4-billion-entry backlog against a 16k candidate cap. The fold's
+    // clamp stays authoritative for whatever is already stored; this gate is advisory and only
+    // ever refuses what the fold would park anyway.
+    if signed.header.lamport > crate::entry::MAX_LAMPORT_ADVANCE {
+        let stream_max =
+            super::author::stream_max_content_lamport(conn, signed.header.stream_id)?.unwrap_or(0);
+        if signed.header.lamport > stream_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
+            return Ok(ContentIngestOutcome::Rejected(format!(
+                "entry lamport {} jumps more than {} past the accepted stream clock {stream_max}",
+                signed.header.lamport,
+                crate::entry::MAX_LAMPORT_ADVANCE
+            )));
+        }
+    }
     if let Some(status) = stored_status_for_exact_envelope(conn, &signed, signed_bytes)? {
         return Ok(ContentIngestOutcome::Ingested { status });
     }
@@ -388,15 +411,28 @@ pub(in crate::account) fn promote_pre_verify_for_account(
                     continue;
                 },
             };
-            // The ingest-time lamport ceiling, re-applied here because promotion inserts
-            // candidates WITHOUT re-entering `content_ingest`: a pre-verify row stored by a
-            // binary that predates the ceiling can carry an over-ceiling lamport, and promoting
-            // it would make the poison durable and relayable. Dropping the row keeps the
-            // drop-before-storage contract.
+            // The ingest-time lamport gates (ceiling + bounded advance), re-applied here because
+            // promotion inserts candidates WITHOUT re-entering `content_ingest`: a pre-verify row
+            // stored by a binary that predates the gates can violate either, and promoting it
+            // would make the poison durable and relayable. Dropping the row keeps the
+            // drop-before-storage contract; a legitimately re-offered envelope re-parks and gets
+            // re-judged with a fresher clock.
             if signed.header.lamport >= crate::entry::MAX_ENTRY_LAMPORT {
                 delete_pre_verify(tx, &signed_hash)?;
                 progressed = true;
                 continue;
+            }
+            if signed.header.lamport > crate::entry::MAX_LAMPORT_ADVANCE {
+                let stream_max =
+                    super::author::stream_max_content_lamport(tx, signed.header.stream_id)?
+                        .unwrap_or(0);
+                if signed.header.lamport
+                    > stream_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE)
+                {
+                    delete_pre_verify(tx, &signed_hash)?;
+                    progressed = true;
+                    continue;
+                }
             }
             let public = match resolve_roster_key(tx, &signed) {
                 Ok(Some(public)) => public,
@@ -1697,7 +1733,8 @@ fn lamport_advance_clamped(
             }
         }
     }
-    let parked = bounded_advance_demotions(&entries, cut);
+    let cut = bounded_advance_cuts(&entries, cut);
+    let parked = chain_cut_demotions(&entries, &cut);
     accepted.retain(|hash| !parked.contains(hash));
     (accepted, parked)
 }
@@ -1709,11 +1746,13 @@ fn lamport_advance_clamped(
 /// chain. `cut` primes chain truncations the caller already knows (the fold's monotonicity cuts).
 ///
 /// Shared by the fold ([`lamport_advance_clamped`]) and the V113 upgrade purge
-/// ([`purge_legacy_lamport_violators`]). Returns every demoted entry.
-fn bounded_advance_demotions(
+/// ([`purge_legacy_lamport_violators`]). Returns the chain cuts; apply them with
+/// [`chain_cut_demotions`] — the two are separate so the purge can derive its clock from one set
+/// (the accepted entries) and apply the cuts to a wider one (every stored row of those chains).
+fn bounded_advance_cuts(
     entries: &[(EntryHash, &ContentEntryHeader)],
     mut cut: HashMap<ChainCoordinate, u64>,
-) -> HashSet<EntryHash> {
+) -> HashMap<ChainCoordinate, u64> {
     let mut rows: Vec<&(EntryHash, &ContentEntryHeader)> = entries.iter().collect();
     rows.sort_by_key(|(hash, header)| (header.lamport, *hash));
     let mut running_max = 0u64;
@@ -1729,6 +1768,14 @@ fn bounded_advance_demotions(
             running_max = running_max.max(header.lamport);
         }
     }
+    cut
+}
+
+/// Every entry of `entries` sitting at or above its chain's cut.
+fn chain_cut_demotions(
+    entries: &[(EntryHash, &ContentEntryHeader)],
+    cut: &HashMap<ChainCoordinate, u64>,
+) -> HashSet<EntryHash> {
     let mut demoted = HashSet::new();
     for (hash, header) in entries {
         if cut.get(&ChainCoordinate::of(header)).is_some_and(|&seq| header.seq >= seq) {
@@ -1739,24 +1786,31 @@ fn bounded_advance_demotions(
 }
 
 /// One-time upgrade repair, run as the V113 migration hook: DELETE every stored `/3` candidate
-/// the bounded-advance walk demotes, judged over the FULL candidate set of each stream — so a
-/// pre-clamp poison AND every same-chain dependent above it (an honest tail minted at
-/// `poison + 1` while the poison was still accepted) retire together, re-rooting the author's
-/// chain at the surviving prefix. Parking alone cannot repair this: a parked candidate stays the
-/// chain tail, every continuation mints a lower lamport from the (now sane) accepted clock, and
-/// the monotonicity rule parks each one — the stream would be permanently unauthorable. Deleting
-/// also stops the store re-advertising envelopes upgraded peers refuse before storage (an
-/// over-ceiling lamport falls out of the walk as an ordinary violator), which would otherwise
-/// retransmit on every sync forever. Over-ceiling `content_pre_verify` rows are dropped for the
-/// same reason — ingest and promotion refuse them now, but a legacy row would sit there
-/// unpromotable indefinitely.
+/// the bounded-advance walk demotes — so a pre-clamp poison AND every same-chain dependent above
+/// it (an honest tail minted at `poison + 1` while the poison was still accepted) retire
+/// together, re-rooting the author's chain at the surviving prefix. Parking alone cannot repair
+/// this: a parked candidate stays the chain tail, every continuation mints a lower lamport from
+/// the (now sane) accepted clock, and the monotonicity rule parks each one — the stream would be
+/// permanently unauthorable. Deleting also stops the store re-advertising envelopes upgraded
+/// peers refuse before storage (an over-ceiling lamport falls out of the walk as an ordinary
+/// violator), which would otherwise retransmit on every sync forever. Over-ceiling
+/// `content_pre_verify` rows are dropped for the same reason — ingest and promotion refuse them
+/// now, but a legacy row would sit there unpromotable indefinitely.
 ///
-/// Runtime folds keep PARKING rather than deleting; deletion is sound here only because every
-/// replica runs this same purge when it upgrades, so upgraded peers stop offering the deleted
-/// envelopes too. Undecodable envelopes are left alone (the refold declassifies them). The
-/// monotonicity pre-filter is deliberately NOT primed: the full candidate set can hold same-seq
-/// fork siblings, which that filter would misread as a backwards tick and over-delete. Without it
-/// the walk can leave a borderline violator stored — safe, the queued refold parks it.
+/// The walk's clock is derived from the ACCEPTED rows only — the same population the pre-clamp
+/// fold admitted — and the resulting chain cuts are then applied to every stored row of those
+/// chains. Judging the clock over the full candidate set would let junk the fold never accepted
+/// (an ungranted author's high-lamport candidate) advance the running max and shield a genuinely
+/// accepted poison from deletion; the queued refold would then park the poison but leave it
+/// stored as a wedging chain tail.
+///
+/// Runtime folds keep PARKING rather than deleting. Deletion at this seam stays stable because
+/// the ingest-time bounded-advance gate refuses the purged envelopes if a not-yet-upgraded peer
+/// re-offers them — without that gate, one resend would re-park the tail and re-wedge the chain.
+/// Undecodable envelopes are left alone (the refold declassifies them). The monotonicity
+/// pre-filter is deliberately NOT primed: accepted rows from a pre-clamp fold can, in principle,
+/// hold shapes that filter would misread, and anything it would have caught still parks at the
+/// queued refold.
 pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()> {
     let tables_exist = conn
         .query_row(
@@ -1769,25 +1823,34 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
     if !tables_exist {
         return Ok(());
     }
-    let mut streams: HashMap<[u8; 32], Vec<(EntryHash, ContentEntryHeader)>> = HashMap::new();
+    let mut streams: HashMap<[u8; 32], Vec<(EntryHash, ContentEntryHeader, bool)>> = HashMap::new();
     {
-        let mut stmt = conn.prepare("SELECT entry_hash, signed_bytes FROM content_entries")?;
-        let rows =
-            stmt.query_map([], |row| Ok((row.get::<_, [u8; 32]>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+        let mut stmt =
+            conn.prepare("SELECT entry_hash, signed_bytes, accepted FROM content_entries")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, [u8; 32]>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, bool>(2)?))
+        })?;
         for row in rows {
-            let (entry_hash, signed_bytes) = row?;
+            let (entry_hash, signed_bytes, accepted) = row?;
             if let Ok(signed) = envelope::decode_content_signed(&signed_bytes) {
-                streams
-                    .entry(signed.header.stream_id.to_bytes())
-                    .or_default()
-                    .push((entry_hash, signed.header));
+                streams.entry(signed.header.stream_id.to_bytes()).or_default().push((
+                    entry_hash,
+                    signed.header,
+                    accepted,
+                ));
             }
         }
     }
     for members in streams.into_values() {
-        let entries: Vec<(EntryHash, &ContentEntryHeader)> =
-            members.iter().map(|(hash, header)| (*hash, header)).collect();
-        for hash in bounded_advance_demotions(&entries, HashMap::new()) {
+        let accepted: Vec<(EntryHash, &ContentEntryHeader)> = members
+            .iter()
+            .filter(|(_, _, accepted)| *accepted)
+            .map(|(hash, header, _)| (*hash, header))
+            .collect();
+        let all: Vec<(EntryHash, &ContentEntryHeader)> =
+            members.iter().map(|(hash, header, _)| (*hash, header)).collect();
+        let cut = bounded_advance_cuts(&accepted, HashMap::new());
+        for hash in chain_cut_demotions(&all, &cut) {
             conn.execute("DELETE FROM content_entries WHERE entry_hash = ?1", [hash.as_slice()])?;
             conn.execute("DELETE FROM content_entry_status WHERE entry_hash = ?1", [
                 hash.as_slice()
@@ -3790,47 +3853,150 @@ mod tests {
     }
 
     #[test]
-    fn promotion_drops_a_pre_verify_row_whose_lamport_exceeds_the_ceiling() {
-        // A pre-verify row parked by a binary predating the ingest ceiling: promotion inserts
-        // candidates without re-entering `content_ingest`, so it must re-apply the ceiling or the
-        // legacy poison becomes a durable, relayable candidate. The author's roster is present,
-        // proving the ceiling gate — not an unresolvable key — is what drops the row.
+    fn promotion_drops_pre_verify_rows_that_violate_the_lamport_gates() {
+        // Pre-verify rows parked by a binary predating the ingest gates: promotion inserts
+        // candidates without re-entering `content_ingest`, so it must re-apply both the ceiling
+        // and the bounded advance, or the legacy poison becomes a durable, relayable candidate.
+        // The author's roster is present, proving the gates — not an unresolvable key — are what
+        // drop the rows.
         let conn = db();
         let secret = DeviceSecret::from_seed(&[0x21; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
         seed_roster_fact(&conn, genesis, owner, &secret, "owner");
-        let poison = authored(&secret, owner, genesis, ContentSpec {
+        let over_ceiling = authored(&secret, owner, genesis, ContentSpec {
             lamport: Some(u64::MAX),
             ..ContentSpec::default()
         });
-        conn.execute(
-            "INSERT INTO content_pre_verify(
-                 signed_hash, entry_hash, claimed_stream_id, claimed_author_account_id,
-                 claimed_fingerprint, roster_ref, raw_bytes, received_at_ms)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
-            params![
-                cbor::sha256(&poison.signed_bytes).as_slice(),
-                poison.entry_hash.as_slice(),
-                STREAM.as_slice(),
-                owner.to_bytes().as_slice(),
-                secret.public().fingerprint().to_bytes().as_slice(),
-                genesis.as_slice(),
-                poison.signed_bytes.as_slice(),
-            ],
-        )
-        .unwrap();
+        let over_advance = authored(&secret, owner, genesis, ContentSpec {
+            lamport: Some(1 << 33),
+            ..ContentSpec::default()
+        });
+        for poison in [&over_ceiling, &over_advance] {
+            conn.execute(
+                "INSERT INTO content_pre_verify(
+                     signed_hash, entry_hash, claimed_stream_id, claimed_author_account_id,
+                     claimed_fingerprint, roster_ref, raw_bytes, received_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+                params![
+                    cbor::sha256(&poison.signed_bytes).as_slice(),
+                    poison.entry_hash.as_slice(),
+                    STREAM.as_slice(),
+                    owner.to_bytes().as_slice(),
+                    secret.public().fingerprint().to_bytes().as_slice(),
+                    genesis.as_slice(),
+                    poison.signed_bytes.as_slice(),
+                ],
+            )
+            .unwrap();
+        }
 
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
         promote_pre_verify_for_account(&tx, owner, 1).unwrap();
         tx.commit().unwrap();
         let candidates: i64 =
             conn.query_row("SELECT count(*) FROM content_entries", [], |row| row.get(0)).unwrap();
-        assert_eq!(candidates, 0, "the over-ceiling row is never promoted to a candidate");
+        assert_eq!(candidates, 0, "neither violating row is promoted to a candidate");
         let parked: i64 = conn
             .query_row("SELECT count(*) FROM content_pre_verify", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(parked, 0, "the over-ceiling row is dropped, not retried forever");
+        assert_eq!(parked, 0, "the violating rows are dropped, not retried forever");
+    }
+
+    /// Store a candidate row directly, as a pre-clamp binary would have stored (and possibly
+    /// accepted) it, and queue its stream for a refold. The ingest gates refuse these envelopes
+    /// now, so tests of the fold clamp's and the upgrade purge's handling of LEGACY state cannot
+    /// route them through `content_ingest`.
+    fn plant_legacy_candidate(conn: &Connection, entry: &SignedContentEntry, accepted: bool) {
+        conn.execute(
+            "INSERT INTO content_entries(
+                 entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
+                 grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
+                 received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)",
+            params![
+                entry.entry_hash.as_slice(),
+                entry.header.stream_id.to_bytes().as_slice(),
+                entry.header.author_account_id.to_bytes().as_slice(),
+                entry.header.device_fingerprint.to_bytes().as_slice(),
+                entry.header.seq.to_be_bytes().as_slice(),
+                entry.header.prev_hash.as_ref().map(<[u8; 32]>::as_slice),
+                entry.header.grant_id.as_ref().map(<[u8; 32]>::as_slice),
+                entry.header.roster_ref.as_slice(),
+                entry.header.owner_auth_len.to_be_bytes().as_slice(),
+                entry.header.author_auth_len.to_be_bytes().as_slice(),
+                accepted,
+                entry.signed_bytes.as_slice(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content_streams_pending_refold(
+                 stream_id, reason_mask, first_enqueued_at_ms, last_enqueued_at_ms)
+             VALUES(?1, 1, 0, 0)
+             ON CONFLICT(stream_id) DO UPDATE SET
+                 reason_mask = content_streams_pending_refold.reason_mask | 1",
+            [entry.header.stream_id.to_bytes().as_slice()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_bounded_advance_jump_is_dropped_at_ingest_before_storage() {
+        let conn = db();
+        let owner_secret = DeviceSecret::from_seed(&[0x31; 32]);
+        let author_secret = DeviceSecret::from_seed(&[0x32; 32]);
+        let (owner, owner_genesis) = roster(&conn, &owner_secret);
+        let (author, author_genesis) = roster(&conn, &author_secret);
+        let grant_id = [0x67; 32];
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, owner_genesis, owner, &owner_secret, "owner");
+        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
+        seed_grant(&conn, grant_id, owner, author, "writer");
+
+        let honest = authored_op(
+            &owner_secret,
+            owner,
+            owner_genesis,
+            ContentSpec::default(),
+            &node_create("honest"),
+        );
+        assert_eq!(verdict_after_ingest(&conn, &honest), ("accepted".into(), 1));
+
+        // Sub-ceiling, but jumping the accepted stream clock past the bounded advance: dropped
+        // BEFORE storage. This is the resend gate — a not-yet-upgraded peer re-offering a purged
+        // poison (or a purged honest tail) must not re-park it as a wedging candidate chain tail.
+        let poison = authored_op(
+            &author_secret,
+            author,
+            author_genesis,
+            ContentSpec {
+                grant_id: Some(grant_id),
+                lamport: Some(2 + crate::entry::MAX_LAMPORT_ADVANCE),
+                ..ContentSpec::default()
+            },
+            &node_create("poison"),
+        );
+        let ContentIngestOutcome::Rejected(reason) =
+            content_ingest(&conn, &poison.signed_bytes, 1).unwrap()
+        else {
+            panic!("a bounded-advance jump must be dropped at ingest");
+        };
+        assert!(reason.contains("past the accepted stream clock"), "{reason}");
+        let stored: i64 =
+            conn.query_row("SELECT count(*) FROM content_entries", [], |row| row.get(0)).unwrap();
+        assert_eq!(stored, 1, "the drop stores nothing");
+        assert_eq!(projected_node_ids(&conn), vec!["honest".to_string()]);
+
+        // The stream is untouched: the owner's next honest tick still folds accepted.
+        let next = authored_op(
+            &owner_secret,
+            owner,
+            owner_genesis,
+            ContentSpec { seq: 1, previous: Some(honest.entry_hash), ..ContentSpec::default() },
+            &node_create("next"),
+        );
+        assert_eq!(verdict_after_ingest(&conn, &next), ("accepted".into(), 1));
     }
 
     #[test]
@@ -3846,11 +4012,12 @@ mod tests {
         seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
         seed_grant(&conn, grant_id, owner, author, "writer");
 
-        // The pre-clamp wreck: the grantee's poison was accepted, and the owner then honestly
-        // minted `poison + 1` — both over-advance now, and the owner's high entry is its chain
-        // tail, so merely parking them wedges every future owner write (each continuation ticks
-        // backwards from the parked tail).
+        // The pre-clamp wreck, planted as the old binary left it: the grantee's poison was
+        // ACCEPTED, and the owner then honestly minted `poison + 1` — both over-advance now, and
+        // the owner's high entry is its chain tail, so merely parking them wedges every future
+        // owner write (each continuation ticks backwards from the parked tail).
         let honest = authored(&owner_secret, owner, owner_genesis, ContentSpec::default());
+        assert_eq!(verdict_after_ingest(&conn, &honest), ("accepted".into(), 1));
         let poison = authored(&author_secret, author, author_genesis, ContentSpec {
             grant_id: Some(grant_id),
             lamport: Some(1 << 33),
@@ -3862,10 +4029,8 @@ mod tests {
             lamport: Some((1 << 33) + 1),
             ..ContentSpec::default()
         });
-        for entry in [&honest, &poison, &inherited] {
-            content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
-        }
-        settle_all(&conn);
+        plant_legacy_candidate(&conn, &poison, true);
+        plant_legacy_candidate(&conn, &inherited, true);
 
         purge_legacy_lamport_violators(&conn).unwrap();
         let remaining: Vec<Vec<u8>> = conn
@@ -3959,9 +4124,9 @@ mod tests {
         );
         assert_eq!(verdict_after_ingest(&conn, &honest), ("accepted".into(), 1));
 
-        // Below the protocol ceiling (so ingest admits it) but jumping the accepted stream
-        // clock by more than the bounded advance: the fold parks it instead of letting it
-        // dominate LWW and poison the authoring clock.
+        // A stored jump past the bounded advance — legacy state, or an entry that slipped the
+        // advisory ingest gate through a clock race: the authoritative fold parks it instead of
+        // letting it dominate LWW and poison the authoring clock.
         let poison = authored_op(
             &author_secret,
             author,
@@ -3973,7 +4138,9 @@ mod tests {
             },
             &node_create("poison"),
         );
-        assert_eq!(verdict_after_ingest(&conn, &poison), ("parked{lamport_ahead}".into(), 0));
+        plant_legacy_candidate(&conn, &poison, false);
+        settle_all(&conn);
+        assert_eq!(verdict(&conn, &poison.entry_hash), ("parked{lamport_ahead}".into(), 0));
         assert_eq!(projected_node_ids(&conn), vec!["honest".to_string()]);
 
         // The stream is not bricked: the accepted clock ignored the parked jump, so the owner's
@@ -3998,7 +4165,7 @@ mod tests {
 
         // seq 0 jumps past the bound; seq 1 carries a modest lamport of its own. Accepting the
         // descendant over its parked ancestor would break the dense-prefix invariant, so the
-        // chain truncates at the violation.
+        // chain truncates at the violation. Planted, since ingest refuses the jump outright.
         let violator = authored(&secret, owner, genesis, ContentSpec {
             lamport: Some(2 * crate::entry::MAX_LAMPORT_ADVANCE),
             ..ContentSpec::default()
@@ -4009,11 +4176,69 @@ mod tests {
             lamport: Some(2),
             ..ContentSpec::default()
         });
-        content_ingest(&conn, &violator.signed_bytes, 1).unwrap();
-        content_ingest(&conn, &descendant.signed_bytes, 1).unwrap();
+        plant_legacy_candidate(&conn, &violator, false);
+        plant_legacy_candidate(&conn, &descendant, false);
         settle_all(&conn);
         assert_eq!(verdict(&conn, &violator.entry_hash), ("parked{lamport_ahead}".into(), 0));
         assert_eq!(verdict(&conn, &descendant.entry_hash), ("parked{lamport_ahead}".into(), 0));
+    }
+
+    #[test]
+    fn junk_the_fold_never_accepted_cannot_shield_a_poison_from_the_purge() {
+        let conn = db();
+        let owner_secret = DeviceSecret::from_seed(&[0x31; 32]);
+        let author_secret = DeviceSecret::from_seed(&[0x32; 32]);
+        let stranger = DeviceSecret::from_seed(&[0x99; 32]);
+        let strange_account = AccountId::from_bytes([0x99; 32]);
+        let (owner, owner_genesis) = roster(&conn, &owner_secret);
+        let (author, author_genesis) = roster(&conn, &author_secret);
+        let grant_id = [0x67; 32];
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, owner_genesis, owner, &owner_secret, "owner");
+        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
+        seed_grant(&conn, grant_id, owner, author, "writer");
+
+        let honest = authored(&owner_secret, owner, owner_genesis, ContentSpec::default());
+        assert_eq!(verdict_after_ingest(&conn, &honest), ("accepted".into(), 1));
+        // An UNGRANTED author's stored-but-never-accepted candidate, its lamport sitting exactly
+        // one bound above zero. If the purge clock ranged over every stored row, this row would
+        // advance the running max far enough to legitimize the accepted poison below — which the
+        // queued refold (judging accepted work only) would then park as a wedging chain tail.
+        let shield = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
+            lamport: Some(crate::entry::MAX_LAMPORT_ADVANCE),
+            ..ContentSpec::default()
+        });
+        let poison = authored(&author_secret, author, author_genesis, ContentSpec {
+            grant_id: Some(grant_id),
+            lamport: Some(2 * crate::entry::MAX_LAMPORT_ADVANCE),
+            ..ContentSpec::default()
+        });
+        let inherited = authored(&owner_secret, owner, owner_genesis, ContentSpec {
+            seq: 1,
+            previous: Some(honest.entry_hash),
+            lamport: Some(2 * crate::entry::MAX_LAMPORT_ADVANCE + 1),
+            ..ContentSpec::default()
+        });
+        plant_legacy_candidate(&conn, &shield, false);
+        plant_legacy_candidate(&conn, &poison, true);
+        plant_legacy_candidate(&conn, &inherited, true);
+
+        purge_legacy_lamport_violators(&conn).unwrap();
+        let mut remaining: Vec<Vec<u8>> = conn
+            .prepare("SELECT entry_hash FROM content_entries")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        remaining.sort();
+        let mut expected = vec![honest.entry_hash.to_vec(), shield.entry_hash.to_vec()];
+        expected.sort();
+        assert_eq!(
+            remaining, expected,
+            "the accepted poison and its dependent tail are deleted; the never-accepted shield \
+             neither survives them nor is itself purged"
+        );
     }
 
     #[test]
