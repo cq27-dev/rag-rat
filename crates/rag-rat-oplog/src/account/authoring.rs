@@ -527,6 +527,135 @@ pub fn author_stream_grant_in_tx(
     Ok(grant_id)
 }
 
+/// Why a writer grant is revoked — the machine-readable token that DRIVES the cut semantics
+/// (OpenPGP's hard/soft split, the only prior art that exposes the choice at all): a compromised
+/// key's own timeline cannot be trusted — its holder can backdate forged entries to sit before
+/// any watermark the device itself reported — so only `Compromised` quarantines everything. The
+/// departing reasons keep prior accepted work valid via chain-tail cuts taken from the OWNER's
+/// own store, which the revoked device cannot rewrite. The token is the frozen wire `reason`
+/// string; tests pin the exact spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeReason {
+    Departed,
+    Rotated,
+    Superseded,
+    Compromised,
+}
+
+impl RevokeReason {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Departed => "departed",
+            Self::Rotated => "rotated",
+            Self::Superseded => "superseded",
+            Self::Compromised => "compromised",
+        }
+    }
+
+    pub fn from_db_str(token: &str) -> anyhow::Result<Self> {
+        match token {
+            "departed" => Ok(Self::Departed),
+            "rotated" => Ok(Self::Rotated),
+            "superseded" => Ok(Self::Superseded),
+            "compromised" => Ok(Self::Compromised),
+            other => anyhow::bail!(
+                "unknown revoke reason `{other}` — one of: departed, rotated, superseded, \
+                 compromised"
+            ),
+        }
+    }
+
+    /// Hard revocation: no self-reported boundary is trusted, everything from the grantee is
+    /// quarantined unless the owner explicitly vouches via `--keep-until`.
+    fn is_hard(self) -> bool {
+        matches!(self, Self::Compromised)
+    }
+}
+
+/// The authored revocation `author_stream_revoke_in_tx` reports back to the operator.
+#[derive(Debug, Clone)]
+pub struct StreamRevocation {
+    /// The grant this revoke closed.
+    pub grant_id: EntryHash,
+    /// The authored `StreamRevoke` entry.
+    pub revoke_id: EntryHash,
+    /// The chain cuts the revoke carries — what prior work stays valid.
+    pub cuts: Vec<ops::DeviceCut>,
+}
+
+/// Author a `StreamRevoke` closing the local account's open grant to `grantee_account_id` on
+/// `stream_id`, then verify the fact under the same snapshot (the sibling of
+/// [`author_stream_grant_in_tx`]'s author-then-verify discipline). The cut plan follows `reason`:
+///
+/// * soft (`departed`/`rotated`/`superseded`): one chain-tail cut per grantee device at the highest
+///   entry THIS store has accepted — the owner's local copy predates the revocation and the revoked
+///   device cannot rewrite it, so the owner is the independent witness and prior work stays valid
+///   exactly as far as it vouches. A device this store never accepted work from gets no cut (there
+///   is nothing to vouch for) and the fold quarantines it.
+/// * hard (`compromised`): empty cuts — everything from the grantee is quarantined. `keep_until`
+///   `(device, seq)` may carve one chain back in, but only up to an entry this store already holds
+///   ACCEPTED for that chain; it refuses to vouch past what the owner holds.
+///
+/// `keep_until` with a soft reason is refused: the departing reasons already keep all prior
+/// accepted work. Runs entirely in the caller's IMMEDIATE txn.
+pub fn author_stream_revoke_in_tx(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    grantee_account_id: AccountId,
+    reason: RevokeReason,
+    keep_until: Option<(DeviceFingerprint, u64)>,
+    now_ms: i64,
+) -> anyhow::Result<StreamRevocation> {
+    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
+        "cannot author a stream revoke before the store's local account is minted (call \
+         local_account first)",
+    )?;
+    let device = local_device(tx, now_ms)?;
+    let Some(grant_id) = storage::open_stream_grant(tx, account_id, stream_id, grantee_account_id)?
+    else {
+        anyhow::bail!(
+            "no open grant to that account on this repo's stream — `sync grants` lists them"
+        );
+    };
+    let cuts = match (reason.is_hard(), keep_until) {
+        (false, None) => super::content::accepted_chain_tails(tx, stream_id, grantee_account_id)?,
+        (false, Some(_)) => anyhow::bail!(
+            "--keep-until only applies to --reason compromised — the departing reasons already \
+             keep all prior accepted work"
+        ),
+        (true, None) => Vec::new(),
+        (true, Some((device_fingerprint, seq))) => {
+            let hash = super::content::accepted_entry_at(
+                tx,
+                stream_id,
+                grantee_account_id,
+                device_fingerprint,
+                seq,
+            )?
+            .context(
+                "--keep-until names an entry this store has not accepted — the owner's own store \
+                 is the witness, and it cannot vouch past what it holds",
+            )?;
+            vec![ops::DeviceCut { device_fingerprint, seq, hash }]
+        },
+    };
+    let op = AccountOp::StreamRevoke {
+        stream_id,
+        grantee_account_id,
+        grant_id,
+        device_cuts: cuts.clone(),
+        reason: reason.as_db_str().to_string(),
+    };
+    let revoke_id = author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, now_ms)?;
+    anyhow::ensure!(
+        storage::open_stream_grant(tx, account_id, stream_id, grantee_account_id)?
+            .is_none_or(|open| open != grant_id),
+        "the stream revoke did not close the grant — the local device lacks effective owner \
+         authority on this account, or a concurrent op won the fold",
+    );
+    Ok(StreamRevocation { grant_id, revoke_id, cuts })
+}
+
 /// Retry pre-verify rows unlocked by a committed enrollment in a separate maintenance transaction.
 pub fn retry_enrollment_pre_verify(
     conn: &Connection,
@@ -670,6 +799,114 @@ mod tests {
             ),
             "the grant binds to its named grantee, not any account",
         );
+    }
+
+    #[test]
+    fn a_revoke_closes_the_grant_and_the_listing_shows_it() {
+        let conn = db();
+        let account = bootstrap::local_account(&conn, NOW).expect("mint local account");
+        let stream = ensure_committed(&conn, "repo-x");
+        let grantee = AccountId::from_bytes([0x77; 32]);
+        let grant_id = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let g = author_stream_grant_in_tx(&tx, stream, grantee, ops::GrantRole::Writer, NOW)
+                .unwrap();
+            tx.commit().unwrap();
+            g
+        };
+        assert_eq!(
+            storage::open_stream_grant(&conn, account, stream, grantee).unwrap(),
+            Some(grant_id),
+            "the open grant resolves by grantee"
+        );
+
+        let revocation = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let r =
+                author_stream_revoke_in_tx(&tx, stream, grantee, RevokeReason::Departed, None, NOW)
+                    .expect("the owner revokes its own grant");
+            tx.commit().unwrap();
+            r
+        };
+        assert_eq!(revocation.grant_id, grant_id);
+        assert!(
+            revocation.cuts.is_empty(),
+            "no accepted grantee content means nothing to vouch for"
+        );
+        assert_eq!(
+            storage::open_stream_grant(&conn, account, stream, grantee).unwrap(),
+            None,
+            "the grant is closed"
+        );
+        let listing = storage::stream_grants_for_owner(&conn, account, stream).unwrap();
+        assert_eq!(listing.len(), 1);
+        assert!(!listing[0].open, "the listing shows the grant revoked");
+        assert_eq!(listing[0].grantee_account_id, grantee);
+        assert_eq!(listing[0].role, "writer");
+
+        // A second revoke has nothing to close.
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err =
+            author_stream_revoke_in_tx(&tx, stream, grantee, RevokeReason::Departed, None, NOW)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("no open grant"), "{err}");
+    }
+
+    #[test]
+    fn keep_until_is_refused_outside_a_compromised_revoke() {
+        let conn = db();
+        bootstrap::local_account(&conn, NOW).expect("mint local account");
+        let stream = ensure_committed(&conn, "repo-x");
+        let grantee = AccountId::from_bytes([0x77; 32]);
+        {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            author_stream_grant_in_tx(&tx, stream, grantee, ops::GrantRole::Writer, NOW).unwrap();
+            tx.commit().unwrap();
+        }
+        let device = DeviceFingerprint::from_bytes([0x11; 32]);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = author_stream_revoke_in_tx(
+            &tx,
+            stream,
+            grantee,
+            RevokeReason::Departed,
+            Some((device, 0)),
+            NOW,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--keep-until only applies to --reason compromised"), "{err}");
+
+        // And a compromised keep-until cannot vouch past what this store holds accepted.
+        let err = author_stream_revoke_in_tx(
+            &tx,
+            stream,
+            grantee,
+            RevokeReason::Compromised,
+            Some((device, 0)),
+            NOW,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("has not accepted"), "{err}");
+    }
+
+    #[test]
+    fn revoke_reason_tokens_are_frozen() {
+        // The token is the frozen wire `reason` string — pin the exact spellings and the round
+        // trip, and that an unknown token names the alternatives.
+        for (reason, token) in [
+            (RevokeReason::Departed, "departed"),
+            (RevokeReason::Rotated, "rotated"),
+            (RevokeReason::Superseded, "superseded"),
+            (RevokeReason::Compromised, "compromised"),
+        ] {
+            assert_eq!(reason.as_db_str(), token);
+            assert_eq!(RevokeReason::from_db_str(token).unwrap(), reason);
+        }
+        let err = RevokeReason::from_db_str("fired").unwrap_err().to_string();
+        assert!(err.contains("departed, rotated, superseded, compromised"), "{err}");
     }
 
     #[test]

@@ -1069,6 +1069,133 @@ pub(crate) fn grant_repo_writer(
     Ok(grant_id)
 }
 
+/// One row of the owner-facing grant listing (`sync grants`), hex-rendered for display.
+#[derive(Debug, Clone)]
+pub struct RepoGrantListing {
+    pub grantee_account_id: String,
+    pub role: String,
+    pub open: bool,
+    pub grant_id: String,
+}
+
+/// Every grant the local account has authored on the active repo's owner stream, open and
+/// revoked, newest first — an owner otherwise has no way to see who holds access. Empty (not an
+/// error) when the repo has no owner stream or the store has no account yet.
+pub(crate) fn list_repo_grants(conn: &Connection) -> anyhow::Result<Vec<RepoGrantListing>> {
+    let repo_id = memory_repo_scope(conn)?.context("sync grants requires an active repo scope")?;
+    let Some(owner) = rag_rat_oplog::read_local_account(conn)? else {
+        return Ok(Vec::new());
+    };
+    let mode = owner_stream_access_mode(conn, &repo_id)?;
+    let Some(stream) = rag_rat_oplog::owned_stream_v2_id_with_mode(conn, &repo_id, mode)? else {
+        return Ok(Vec::new());
+    };
+    Ok(rag_rat_oplog::stream_grants_for_owner(conn, owner, stream)?
+        .into_iter()
+        .map(|grant| RepoGrantListing {
+            grantee_account_id: rag_rat_base::hash::hex_lower(&grant.grantee_account_id.to_bytes()),
+            role: grant.role,
+            open: grant.open,
+            grant_id: rag_rat_base::hash::hex_lower(&grant.grant_id),
+        })
+        .collect())
+}
+
+/// The authored revocation, hex-rendered for the CLI report.
+#[derive(Debug, Clone)]
+pub struct RepoRevokeReport {
+    pub grantee_account_id: String,
+    pub grant_id: String,
+    pub revoke_id: String,
+    pub reason: String,
+    /// `(device_fingerprint_hex, kept_through_seq)` — the chain prefixes that stay valid.
+    pub cuts: Vec<(String, u64)>,
+}
+
+/// Revoke the active repo's open grant to `grantee_ref` — a full 64-hex account id or an
+/// unambiguous prefix of one, matched against the stream's OPEN grantees (git-style, so the
+/// operator can name who they see in `sync grants`). The cut semantics follow `reason`; see
+/// [`rag_rat_oplog::author_stream_revoke_in_tx`]. Mirrors [`grant_repo_writer`]'s
+/// resolve-then-re-check-under-lock discipline.
+pub(crate) fn revoke_repo_writer(
+    conn: &Connection,
+    grantee_ref: &str,
+    reason: rag_rat_oplog::RevokeReason,
+    keep_until: Option<(rag_rat_oplog::DeviceFingerprint, u64)>,
+    now_ms: i64,
+) -> anyhow::Result<RepoRevokeReport> {
+    let repo_id = memory_repo_scope(conn)?.context("sync revoke requires an active repo scope")?;
+    let owner = rag_rat_oplog::read_local_account(conn)?
+        .context("sync revoke requires this store's account — nothing has been granted yet")?;
+    let mode = owner_stream_access_mode(conn, &repo_id)?;
+    let stream = rag_rat_oplog::owned_stream_v2_id_with_mode(conn, &repo_id, mode)?
+        .context("sync revoke requires the repo's owner stream")?;
+    let grantee = resolve_grantee_ref(conn, owner, stream, grantee_ref)?;
+
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        memory_repo_scope(&tx)?.as_deref() == Some(repo_id.as_str()),
+        "active repo scope changed while starting sync revoke; retry"
+    );
+    let revocation = rag_rat_oplog::author_stream_revoke_in_tx(
+        &tx, stream, grantee, reason, keep_until, now_ms,
+    )?;
+    tx.commit()?;
+    Ok(RepoRevokeReport {
+        grantee_account_id: rag_rat_base::hash::hex_lower(&grantee.to_bytes()),
+        grant_id: rag_rat_base::hash::hex_lower(&revocation.grant_id),
+        revoke_id: rag_rat_base::hash::hex_lower(&revocation.revoke_id),
+        reason: reason.as_db_str().to_string(),
+        cuts: revocation
+            .cuts
+            .iter()
+            .map(|cut| (rag_rat_base::hash::hex_lower(&cut.device_fingerprint.to_bytes()), cut.seq))
+            .collect(),
+    })
+}
+
+/// Resolve a full 64-hex account id, or an unambiguous hex prefix of an OPEN grantee on the
+/// stream. Prefixes shorter than 4 characters are refused outright — with one grantee even a
+/// single character would match, and an id that short in an operator's history is more likely a
+/// typo than an intent.
+fn resolve_grantee_ref(
+    conn: &Connection,
+    owner: rag_rat_oplog::AccountId,
+    stream: rag_rat_oplog::StreamId,
+    grantee_ref: &str,
+) -> anyhow::Result<rag_rat_oplog::AccountId> {
+    let reference = grantee_ref.trim();
+    if reference.len() == 64 {
+        return rag_rat_oplog::AccountId::from_hex(reference);
+    }
+    anyhow::ensure!(
+        reference.len() >= 4 && reference.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "`{reference}` is not an account id or a hex prefix of at least 4 characters"
+    );
+    let reference = reference.to_ascii_lowercase();
+    let mut matches: Vec<rag_rat_oplog::AccountId> =
+        rag_rat_oplog::stream_grants_for_owner(conn, owner, stream)?
+            .into_iter()
+            .filter(|grant| grant.open)
+            .map(|grant| grant.grantee_account_id)
+            .filter(|grantee| {
+                rag_rat_base::hash::hex_lower(&grantee.to_bytes()).starts_with(&reference)
+            })
+            .collect();
+    matches.dedup();
+    match matches.as_slice() {
+        [grantee] => Ok(*grantee),
+        [] => anyhow::bail!(
+            "no open grant matches `{reference}` on this repo's stream — `sync grants` lists them"
+        ),
+        _ => anyhow::bail!(
+            "`{reference}` is ambiguous between {} open grantees — give more characters",
+            matches.len()
+        ),
+    }
+}
+
 /// Reconcile the ACTIVE repo's owner stream (scope read from the connection) — the idempotent call
 /// every live memory/edge mutation makes before authoring (#532), now self-healing per node/edge (a
 /// ghost row is authored on the next mutation, so no later lifecycle op on it is inert). A no-op on

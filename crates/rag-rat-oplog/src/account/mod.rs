@@ -44,12 +44,12 @@ mod storage;
 // `established_owned_stream_v2` (derivation + effective-ownership fact — the reconcile's fast-path
 // probe). #664 wires all three into `query::memory`, so they are plain re-exports.
 pub use authoring::{
-    EnrollingDevice, author_device_add_in_tx, author_enrollment_device_add_in_tx,
-    author_stream_grant_in_tx, enrollment_authoring_fits, enrollment_authoring_requirements,
-    ensure_owned_stream_v2_in_tx, ensure_owned_stream_v2_with_mode_in_tx,
-    established_owned_stream_v2, established_owned_stream_v2_with_mode, owned_stream_v2_id,
-    owned_stream_v2_id_with_mode, owner_stream_v2_id_for_account, retry_enrollment_pre_verify,
-    validate_device_add_label,
+    EnrollingDevice, RevokeReason, StreamRevocation, author_device_add_in_tx,
+    author_enrollment_device_add_in_tx, author_stream_grant_in_tx, author_stream_revoke_in_tx,
+    enrollment_authoring_fits, enrollment_authoring_requirements, ensure_owned_stream_v2_in_tx,
+    ensure_owned_stream_v2_with_mode_in_tx, established_owned_stream_v2,
+    established_owned_stream_v2_with_mode, owned_stream_v2_id, owned_stream_v2_id_with_mode,
+    owner_stream_v2_id_for_account, retry_enrollment_pre_verify, validate_device_add_label,
 };
 pub use bootstrap::{
     AuthoredDurability, ENROLLMENT_HELD_ENTRY_HASHES_MAX, EnrollmentBootstrap, EnrollmentBudget,
@@ -130,14 +130,14 @@ pub use secrets::{
 #[allow(unused_imports, reason = "C6 authoring seam is frozen before transport wiring lands")]
 pub use snapshot::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub use storage::{
-    CapacityScope, IngestOutcome, SyncAccountEntry, account_effective_count,
+    CapacityScope, IngestOutcome, StreamGrantListing, SyncAccountEntry, account_effective_count,
     account_entries_for_enrollment, account_entries_for_sync, account_entry_ref,
     account_holds_effective_public_writer_grant, account_ingest, account_is_fully_public,
     account_signed_entry_exists, account_signed_hash, auth_len_freshness,
     backfill_authority_projection, effective_writer_grant, effective_writer_grantees,
-    grant_effective_for_device, grant_effective_in_snapshot, owned_streams_for_account,
-    owner_control_authority, owner_control_authority_in_snapshot, owner_secrets_authority,
-    roster_content_authority, stream_access_mode, stream_owner_account, stream_owner_effective,
-    verify_enrollment_device_add,
+    grant_effective_for_device, grant_effective_in_snapshot, open_stream_grant,
+    owned_streams_for_account, owner_control_authority, owner_control_authority_in_snapshot,
+    owner_secrets_authority, roster_content_authority, stream_access_mode, stream_grants_for_owner,
+    stream_owner_account, stream_owner_effective, verify_enrollment_device_add,
 };
 pub(crate) use storage::{device_is_effective_writer, stored_device_pubkeys};

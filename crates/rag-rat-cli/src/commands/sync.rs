@@ -41,6 +41,8 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         | SyncCommand::CatchUp { .. }
         | SyncCommand::Whoami
         | SyncCommand::Grant { .. }
+        | SyncCommand::Revoke { .. }
+        | SyncCommand::Grants
         | SyncCommand::Contribute { .. } => {},
     }
     let lock_repo = locks::write_lock_repo_id(config);
@@ -105,7 +107,49 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "grantee_account_id": account,
                 "grant_id": grant_id,
                 "role": "writer",
-                "note": "the grantee may now author memories into this repo once it holds this account's log — its automatic sync pulls it when this host is in its [sync] server_peers; revoke is a separate command (not yet available)",
+                "note": "the grantee may now author memories into this repo once it holds this account's log — its automatic sync pulls it when this host is in its [sync] server_peers; `sync revoke` closes it",
+            }))
+        },
+        SyncCommand::Revoke { account, reason, keep_until } => {
+            let keep_until = keep_until
+                .as_deref()
+                .map(|value| -> anyhow::Result<(&str, u64)> {
+                    let (seq, device) = value.split_once('@').context(
+                        "--keep-until takes <seq>@<device-hex> — the seq, an @, then the 64-hex \
+                         device fingerprint",
+                    )?;
+                    Ok((
+                        device,
+                        seq.trim().parse::<u64>().context("--keep-until's seq is a number")?,
+                    ))
+                })
+                .transpose()?;
+            let (report, nodes_removed) = db.sync_revoke(account, reason, keep_until)?;
+            print_output(&serde_json::json!({
+                "status": "revoked",
+                "repo_id": db.active_repo_id,
+                "grantee_account_id": report.grantee_account_id,
+                "grant_id": report.grant_id,
+                "revoke_id": report.revoke_id,
+                "reason": report.reason,
+                "kept": report.cuts.iter().map(|(device, seq)| serde_json::json!({
+                    "device": device,
+                    "through_seq": seq,
+                })).collect::<Vec<_>>(),
+                "nodes_removed": nodes_removed,
+                "note": "the grantee can no longer author onto this repo; its entries beyond the kept prefixes are condemned, and peers learn the revocation as they sync this account's log",
+            }))
+        },
+        SyncCommand::Grants => {
+            let grants = db.sync_grants()?;
+            print_output(&serde_json::json!({
+                "repo_id": db.active_repo_id,
+                "grants": grants.iter().map(|grant| serde_json::json!({
+                    "grantee_account_id": grant.grantee_account_id,
+                    "role": grant.role,
+                    "status": if grant.open { "open" } else { "revoked" },
+                    "grant_id": grant.grant_id,
+                })).collect::<Vec<_>>(),
             }))
         },
         SyncCommand::Contribute { account } => {

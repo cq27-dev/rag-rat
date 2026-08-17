@@ -875,6 +875,81 @@ pub fn effective_writer_grant(
     grant_id.map(|bytes| fixed(&bytes)).transpose()
 }
 
+/// The OPEN (not-closed) grant `owner_account_id` holds for `grantee_account_id` on `stream_id`,
+/// any role — the owner-side resolver behind `sync revoke`, which names the grantee while the
+/// wire op names the grant. The newest wins if re-granting ever produces several open rows, so a
+/// revoke always targets the most recent authorization first.
+pub fn open_stream_grant(
+    conn: &Connection,
+    owner_account_id: AccountId,
+    stream_id: StreamId,
+    grantee_account_id: AccountId,
+) -> anyhow::Result<Option<EntryHash>> {
+    let grant_id: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT grant_id FROM account_stream_grants
+             WHERE owner_account_id = ?1 AND stream_id = ?2 AND grantee_account_id = ?3
+               AND closed_at IS NULL
+             ORDER BY effective_at DESC LIMIT 1",
+            params![
+                owner_account_id.to_bytes().as_slice(),
+                stream_id.to_bytes().as_slice(),
+                grantee_account_id.to_bytes().as_slice(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    grant_id.map(|bytes| fixed(&bytes)).transpose()
+}
+
+/// One row of the owner-facing grant listing (`sync grants`).
+#[derive(Debug, Clone)]
+pub struct StreamGrantListing {
+    pub grant_id: EntryHash,
+    pub grantee_account_id: AccountId,
+    /// The projected role token (`reader`/`writer`).
+    pub role: String,
+    /// Still effective — not revoked.
+    pub open: bool,
+}
+
+/// Every grant `owner_account_id` has authored on `stream_id`, open and revoked, newest first —
+/// what `sync grants` shows an owner, who otherwise has no way to see who holds access.
+pub fn stream_grants_for_owner(
+    conn: &Connection,
+    owner_account_id: AccountId,
+    stream_id: StreamId,
+) -> anyhow::Result<Vec<StreamGrantListing>> {
+    let mut stmt = conn.prepare(
+        "SELECT grant_id, grantee_account_id, role, closed_at IS NULL
+         FROM account_stream_grants
+         WHERE owner_account_id = ?1 AND stream_id = ?2
+         ORDER BY effective_at DESC, grant_id",
+    )?;
+    let rows = stmt.query_map(
+        params![owner_account_id.to_bytes().as_slice(), stream_id.to_bytes().as_slice()],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        },
+    )?;
+    let mut listings = Vec::new();
+    for row in rows {
+        let (grant_id, grantee, role, open) = row?;
+        listings.push(StreamGrantListing {
+            grant_id: fixed(&grant_id)?,
+            grantee_account_id: AccountId::from_bytes(fixed(&grantee)?),
+            role,
+            open,
+        });
+    }
+    Ok(listings)
+}
+
 /// The distinct accounts holding an effective (not-closed) Writer grant on any stream owned by
 /// `owner_account_id`. Automatic cross-account sync (#1175) pulls each grantee's own account —
 /// content is offered by AUTHOR, so a contributor's entries on the owner's stream travel only when

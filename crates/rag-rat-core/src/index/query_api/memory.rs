@@ -95,6 +95,47 @@ impl IndexDatabase {
         Ok(rag_rat_base::hash::hex_lower(&grant_id))
     }
 
+    /// The active repo's grant listing (`sync grants`): every grant this owner has authored on
+    /// the repo's stream, open and revoked, newest first.
+    pub fn sync_grants(&self) -> anyhow::Result<Vec<crate::memory_write::RepoGrantListing>> {
+        crate::memory_write::list_repo_grants(self.storage.connection())
+    }
+
+    /// Revoke the active repo's open grant to `grantee_ref` (a 64-hex account id or an
+    /// unambiguous prefix of an open grantee), with reason-driven cut semantics (#1177), then
+    /// settle the resulting re-judgment so the revocation's effect on materialized memories lands
+    /// in the same command. Returns the report plus how many projected nodes the eviction
+    /// removed.
+    pub fn sync_revoke(
+        &self,
+        grantee_ref: &str,
+        reason: &str,
+        keep_until: Option<(&str, u64)>,
+    ) -> anyhow::Result<(crate::memory_write::RepoRevokeReport, u32)> {
+        let reason = rag_rat_oplog::RevokeReason::from_db_str(reason)?;
+        let keep_until = keep_until
+            .map(|(device_hex, seq)| {
+                let fingerprint = device_hex
+                    .trim()
+                    .parse::<rag_rat_oplog::DeviceFingerprint>()
+                    .context("--keep-until takes <seq>@<64-hex device fingerprint>")?;
+                anyhow::Ok((fingerprint, seq))
+            })
+            .transpose()?;
+        let report = crate::memory_write::revoke_repo_writer(
+            self.storage.connection(),
+            grantee_ref,
+            reason,
+            keep_until,
+            rag_rat_base::time::now_ms(),
+        )?;
+        // The account refold queued the stream; settling here means the operator sees the
+        // eviction (retro-condemned entries un-projecting) as part of the revoke, not at some
+        // later maintenance pass.
+        let effects = crate::drain_synced_memory(self.storage.connection())?;
+        Ok((report, effects.nodes_removed))
+    }
+
     /// Configure the active repo to contribute memories to `owner_account_hex` (paste flow, #1164):
     /// subsequent memory authoring targets that owner's stream via this account's Writer grant. The
     /// owner must `sync grant` this account (its id from `sync whoami`) and this store must sync

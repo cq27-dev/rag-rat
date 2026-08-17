@@ -1836,6 +1836,74 @@ fn bounded_advance_walk(
     (cut, running_max)
 }
 
+/// The accepted chain tails a SOFT revoke cuts at: for each of `author`'s devices holding
+/// entries this store has ACCEPTED on `stream`, the highest such `(seq, entry_hash)`. The owner's
+/// own store is the witness — prior work stays valid exactly as far as the owner has accepted it,
+/// which the revoked device cannot rewrite — and a device this store never accepted work from
+/// gets no cut (nothing to vouch for; the fold quarantines it). Sorted by fingerprint, the wire's
+/// canonical cut order.
+pub(in crate::account) fn accepted_chain_tails(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    author_account_id: AccountId,
+) -> anyhow::Result<Vec<ops::DeviceCut>> {
+    let mut stmt = tx.prepare(
+        "SELECT device_fingerprint, seq, entry_hash FROM content_entries
+         WHERE stream_id = ?1 AND author_account_id = ?2 AND accepted = 1",
+    )?;
+    let rows = stmt.query_map(
+        params![stream_id.to_bytes().as_slice(), author_account_id.to_bytes().as_slice()],
+        |row| {
+            Ok((row.get::<_, [u8; 32]>(0)?, row.get::<_, [u8; 8]>(1)?, row.get::<_, [u8; 32]>(2)?))
+        },
+    )?;
+    let mut tails: HashMap<[u8; 32], (u64, [u8; 32])> = HashMap::new();
+    for row in rows {
+        let (fingerprint, seq, entry_hash) = row?;
+        let seq = u64::from_be_bytes(seq);
+        let tail = tails.entry(fingerprint).or_insert((seq, entry_hash));
+        if seq >= tail.0 {
+            *tail = (seq, entry_hash);
+        }
+    }
+    let mut cuts: Vec<ops::DeviceCut> = tails
+        .into_iter()
+        .map(|(fingerprint, (seq, hash))| ops::DeviceCut {
+            device_fingerprint: DeviceFingerprint::from_bytes(fingerprint),
+            seq,
+            hash,
+        })
+        .collect();
+    cuts.sort_by_key(|cut| cut.device_fingerprint.to_bytes());
+    Ok(cuts)
+}
+
+/// The entry hash this store holds ACCEPTED at exactly `(stream, author, device, seq)`, or `None`
+/// — the `--keep-until` witness check: a hard revoke may vouch for a prefix only as far as the
+/// owner's own store has accepted it.
+pub(in crate::account) fn accepted_entry_at(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    author_account_id: AccountId,
+    device_fingerprint: DeviceFingerprint,
+    seq: u64,
+) -> anyhow::Result<Option<[u8; 32]>> {
+    Ok(tx
+        .query_row(
+            "SELECT entry_hash FROM content_entries
+             WHERE stream_id = ?1 AND author_account_id = ?2 AND device_fingerprint = ?3
+               AND seq = ?4 AND accepted = 1",
+            params![
+                stream_id.to_bytes().as_slice(),
+                author_account_id.to_bytes().as_slice(),
+                device_fingerprint.to_bytes().as_slice(),
+                seq.to_be_bytes().as_slice(),
+            ],
+            |row| row.get::<_, [u8; 32]>(0),
+        )
+        .optional()?)
+}
+
 /// Persist (or clear) one stream's lamport clock floor, as derived by the refold's
 /// [`bounded_advance_walk`]. Only positive floors are stored — a zero floor (an empty or
 /// entirely-unaccepted stream) deletes the row, so the clock readers' `None` keeps meaning "no

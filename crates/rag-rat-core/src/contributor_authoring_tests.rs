@@ -12,7 +12,9 @@ use rag_rat_oplog::{
 use rag_rat_query::memory::RepoMemoryCreate;
 use rusqlite::{Connection, params};
 
-use crate::memory_write::{create_memory, enable_public_authoring, grant_repo_writer};
+use crate::memory_write::{
+    create_memory, enable_public_authoring, grant_repo_writer, revoke_repo_writer,
+};
 
 const NOW: i64 = 1_700_000_000_000;
 const REPO: &str = "repo-a";
@@ -269,6 +271,117 @@ fn an_unsynced_or_mistyped_owner_never_becomes_removal_authority() {
     assert!(
         titles.contains(&"owner-note".to_string()),
         "an unverified owner stream removes nothing: {titles:?}",
+    );
+}
+
+/// Fixture for the revoke tests: a contribution pair where the contributor has authored one
+/// accepted memory and the OWNER has collected it (synced the contributor's account and drained).
+fn revocable_pair() -> (Connection, Connection, rag_rat_oplog::AccountId, rag_rat_oplog::AccountId)
+{
+    let (owner, contributor, owner_account) = contribution_pair();
+    let contributor_account = local_account(&contributor, NOW).unwrap();
+    create_memory(&contributor, concept("contributor-note")).unwrap();
+    sync_account_into(&owner, &contributor, contributor_account);
+    crate::drain_synced_memory(&owner).unwrap();
+    assert!(
+        memory_titles(&owner).contains(&"contributor-note".to_string()),
+        "the owner collected the contribution before the revoke",
+    );
+    (owner, contributor, owner_account, contributor_account)
+}
+
+#[test]
+fn a_departed_revoke_keeps_accepted_contributions_and_condemns_later_ones() {
+    let (owner, contributor, owner_account, contributor_account) = revocable_pair();
+
+    // Soft revoke, addressed by an unambiguous PREFIX of the grantee id (what the operator sees
+    // in `sync grants`). The chain-tail cut vouches for what this store has accepted.
+    let contributor_hex = rag_rat_base::hash::hex_lower(&contributor_account.to_bytes());
+    let report = revoke_repo_writer(
+        &owner,
+        &contributor_hex[..8],
+        rag_rat_oplog::RevokeReason::Departed,
+        None,
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(report.grantee_account_id, contributor_hex, "the prefix resolved");
+    assert_eq!(report.cuts.len(), 1, "one grantee device tail is vouched");
+    crate::drain_synced_memory(&owner).unwrap();
+    assert!(
+        memory_titles(&owner).contains(&"contributor-note".to_string()),
+        "prior accepted work survives a departed revoke",
+    );
+
+    // Work the contributor authors AFTER the cut (it has not yet learned of the revoke) folds
+    // condemned at the owner — collected but never materialized.
+    create_memory(&contributor, concept("late-note")).unwrap();
+    sync_account_into(&owner, &contributor, contributor_account);
+    crate::drain_synced_memory(&owner).unwrap();
+    let titles = memory_titles(&owner);
+    assert!(!titles.contains(&"late-note".to_string()), "beyond-cut work is condemned: {titles:?}");
+    assert!(titles.contains(&"contributor-note".to_string()), "the vouched prefix stays");
+
+    // Once the revocation syncs back, the contributor's authoring fails loud.
+    sync_account_into(&contributor, &owner, owner_account);
+    let err = create_memory(&contributor, concept("post-revoke")).unwrap_err().to_string();
+    assert!(err.contains("grant"), "authoring after a synced revoke names the cause: {err}");
+}
+
+#[test]
+fn a_compromised_revoke_evicts_everything_the_grantee_authored() {
+    let (owner, _contributor, _owner_account, contributor_account) = revocable_pair();
+
+    let contributor_hex = rag_rat_base::hash::hex_lower(&contributor_account.to_bytes());
+    let report = revoke_repo_writer(
+        &owner,
+        &contributor_hex,
+        rag_rat_oplog::RevokeReason::Compromised,
+        None,
+        NOW,
+    )
+    .unwrap();
+    assert!(report.cuts.is_empty(), "a compromised key's own timeline is not trusted");
+    crate::drain_synced_memory(&owner).unwrap();
+    let titles = memory_titles(&owner);
+    assert!(
+        !titles.contains(&"contributor-note".to_string()),
+        "everything from the grantee is quarantined: {titles:?}",
+    );
+    assert!(titles.contains(&"owner-note".to_string()), "the owner's own work is untouched");
+}
+
+#[test]
+fn keep_until_carves_an_accepted_prefix_back_into_a_compromised_revoke() {
+    let (owner, _contributor, _owner_account, contributor_account) = revocable_pair();
+
+    // The vouched (device, seq) comes from the OWNER's own accepted copy — the witness the
+    // revoked side cannot rewrite.
+    let (device, seq): (Vec<u8>, Vec<u8>) = owner
+        .query_row(
+            "SELECT device_fingerprint, seq FROM content_entries
+             WHERE author_account_id = ?1 AND accepted = 1",
+            [contributor_account.to_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let device = rag_rat_oplog::DeviceFingerprint::from_bytes(device.try_into().unwrap());
+    let seq = u64::from_be_bytes(seq.try_into().unwrap());
+
+    let contributor_hex = rag_rat_base::hash::hex_lower(&contributor_account.to_bytes());
+    let report = revoke_repo_writer(
+        &owner,
+        &contributor_hex,
+        rag_rat_oplog::RevokeReason::Compromised,
+        Some((device, seq)),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(report.cuts, vec![(rag_rat_base::hash::hex_lower(&device.to_bytes()), seq)]);
+    crate::drain_synced_memory(&owner).unwrap();
+    assert!(
+        memory_titles(&owner).contains(&"contributor-note".to_string()),
+        "the carved-back prefix survives the hard revoke",
     );
 }
 

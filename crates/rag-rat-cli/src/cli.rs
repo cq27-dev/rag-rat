@@ -336,6 +336,32 @@ pub(crate) enum SyncCommand {
         #[arg(value_name = "ACCOUNT_ID")]
         account: String,
     },
+    /// Revoke another identity's write access to this repo's shared memories.
+    #[command(long_about = "Closes the open grant to an account and retro-judges its authored \
+                            content. The --reason drives what prior work survives: departed, \
+                            rotated, or superseded keep everything this store has ACCEPTED from \
+                            the grantee (chain-tail cuts vouched by this store's own copy, which \
+                            the revoked side cannot rewrite); compromised quarantines \
+                            everything, because a compromised key's own timeline cannot be \
+                            trusted — its holder can backdate forgeries behind any watermark. \
+                            --keep-until carves one device's prefix back into a compromised \
+                            revoke, but only as far as this store has accepted.")]
+    Revoke {
+        /// The grantee's 64-hex account id, or an unambiguous prefix of an open grantee
+        /// (see `sync grants`).
+        #[arg(value_name = "ACCOUNT_ID")]
+        account: String,
+        /// Why: departed | rotated | superseded (soft — prior accepted work stays) or
+        /// compromised (hard — everything quarantined).
+        #[arg(long)]
+        reason: String,
+        /// With --reason compromised only: keep one device's prefix, `<seq>@<device-hex>`,
+        /// bounded by what this store has accepted.
+        #[arg(long, value_name = "SEQ@DEVICE")]
+        keep_until: Option<String>,
+    },
+    /// List who holds access to this repo's shared memories.
+    Grants,
     /// Contribute this repo's memories to another identity's shared knowledge base.
     #[command(long_about = "Configures this repo to author its memories onto ANOTHER account's \
                             owner stream (the paste flow): subsequent memory changes target that \
@@ -1075,6 +1101,35 @@ mod tests {
                 assert_eq!(account, "ab".repeat(32)),
             other => panic!("expected sync grant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sync_revoke_and_grants_parse() {
+        let revoke = Cli::try_parse_from([
+            "rag-rat",
+            "sync",
+            "revoke",
+            "abcd1234",
+            "--reason",
+            "compromised",
+            "--keep-until",
+            &format!("3@{}", "cd".repeat(32)),
+        ])
+        .expect("parse");
+        match revoke.command {
+            Command::Sync(SyncArgs {
+                command: SyncCommand::Revoke { account, reason, keep_until },
+            }) => {
+                assert_eq!(account, "abcd1234");
+                assert_eq!(reason, "compromised");
+                assert_eq!(keep_until.as_deref(), Some(format!("3@{}", "cd".repeat(32)).as_str()));
+            },
+            other => panic!("expected sync revoke, got {other:?}"),
+        }
+        // --reason is required.
+        assert!(Cli::try_parse_from(["rag-rat", "sync", "revoke", "abcd1234"]).is_err());
+        let grants = Cli::try_parse_from(["rag-rat", "sync", "grants"]).expect("parse");
+        assert!(matches!(grants.command, Command::Sync(SyncArgs { command: SyncCommand::Grants })));
     }
 
     #[test]
