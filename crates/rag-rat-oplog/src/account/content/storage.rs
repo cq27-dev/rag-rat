@@ -1812,8 +1812,9 @@ fn chain_cut_demotions(
 /// this: a parked candidate stays the chain tail, every continuation mints a lower lamport from
 /// the (now sane) accepted clock, and the monotonicity rule parks each one — the stream would be
 /// permanently unauthorable. Deleting also stops the store re-advertising envelopes upgraded
-/// peers refuse before storage (an over-ceiling lamport falls out of the walk as an ordinary
-/// violator), which would otherwise retransmit on every sync forever. Over-ceiling
+/// peers refuse before storage (an over-ceiling lamport), which would otherwise retransmit on
+/// every sync forever — over-ceiling rows are cut REGARDLESS of acceptance state, since a
+/// rejected/forked/parked one is just as protocol-invalid and just as advertised. Over-ceiling
 /// `content_pre_verify` rows are dropped for the same reason — ingest and promotion refuse them
 /// now, but a legacy row would sit there unpromotable indefinitely.
 ///
@@ -1869,7 +1870,19 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
             .collect();
         let all: Vec<(EntryHash, &ContentEntryHeader)> =
             members.iter().map(|(hash, header, _)| (*hash, header)).collect();
-        let cut = bounded_advance_cuts(&accepted, HashMap::new());
+        // An over-ceiling row is protocol-invalid regardless of its acceptance state — upgraded
+        // peers refuse the envelope before storage, so a rejected/forked/parked one left behind
+        // would still be advertised and resent on every reconciliation forever. Prime it as a
+        // chain cut (rather than a bare delete) so its same-chain suffix retires with it and the
+        // stored chain stays dense.
+        let mut cut: HashMap<ChainCoordinate, u64> = HashMap::new();
+        for (_, header) in &all {
+            if header.lamport >= crate::entry::MAX_ENTRY_LAMPORT {
+                let seq = cut.entry(ChainCoordinate::of(header)).or_insert(header.seq);
+                *seq = (*seq).min(header.seq);
+            }
+        }
+        let cut = bounded_advance_cuts(&accepted, cut);
         for hash in chain_cut_demotions(&all, &cut) {
             conn.execute("DELETE FROM content_entries WHERE entry_hash = ?1", [hash.as_slice()])?;
             conn.execute("DELETE FROM content_entry_status WHERE entry_hash = ?1", [
@@ -1904,24 +1917,39 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
 /// stored signed envelope, once. Insert sites write the column from then on; an undecodable blob
 /// keeps NULL, which `MAX` ignores — the same treatment the decoding scan gave it. Idempotent
 /// (`WHERE lamport IS NULL`), so a ladder replay re-decodes nothing already filled.
+/// Paged by entry-hash keyset, never buffered whole: envelopes run up to 256 KiB and locally
+/// authored rows sit outside the remote candidate-byte ceilings, so collecting every
+/// `signed_bytes` first would scale peak heap with the entire content log during a required
+/// migration. The keyset (not a bare `LIMIT`) is what makes an undecodable row — which stays
+/// NULL — unable to pin the loop in place.
 pub fn backfill_content_lamport(conn: &Connection) -> rusqlite::Result<()> {
-    let rows: Vec<(Vec<u8>, Vec<u8>)> = {
-        let mut stmt = conn.prepare(
-            "SELECT entry_hash, signed_bytes FROM content_entries WHERE lamport IS NULL",
-        )?;
-        let rows =
-            stmt.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    for (entry_hash, signed_bytes) in rows {
-        if let Ok(signed) = envelope::decode_content_signed(&signed_bytes) {
-            conn.execute(
-                "UPDATE content_entries SET lamport = ?1 WHERE entry_hash = ?2",
-                params![stored_lamport(signed.header.lamport), entry_hash.as_slice(),],
+    const PAGE: i64 = 256;
+    let mut cursor: Vec<u8> = Vec::new();
+    loop {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT entry_hash, signed_bytes FROM content_entries
+                 WHERE lamport IS NULL AND entry_hash > ?1
+                 ORDER BY entry_hash LIMIT ?2",
             )?;
+            let rows = stmt.query_map(params![cursor.as_slice(), PAGE], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let Some((last, _)) = rows.last() else {
+            return Ok(());
+        };
+        cursor = last.clone();
+        for (entry_hash, signed_bytes) in &rows {
+            if let Ok(signed) = envelope::decode_content_signed(signed_bytes) {
+                conn.execute(
+                    "UPDATE content_entries SET lamport = ?1 WHERE entry_hash = ?2",
+                    params![stored_lamport(signed.header.lamport), entry_hash.as_slice()],
+                )?;
+            }
         }
     }
-    Ok(())
 }
 
 /// Reset the status of every stream row NOT in `handled` to the unclassified baseline. Those rows
@@ -4125,6 +4153,50 @@ mod tests {
             ..ContentSpec::default()
         });
         assert_eq!(verdict_after_ingest(&conn, &continuation), ("accepted".into(), 1));
+    }
+
+    #[test]
+    fn an_over_ceiling_candidate_is_purged_even_when_never_accepted() {
+        let conn = db();
+        let secret = DeviceSecret::from_seed(&[0x21; 32]);
+        let (owner, genesis) = roster(&conn, &secret);
+        seed_ownership(&conn, owner);
+        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        let honest = authored(&secret, owner, genesis, ContentSpec::default());
+        assert_eq!(verdict_after_ingest(&conn, &honest), ("accepted".into(), 1));
+
+        // A pre-clamp over-ceiling envelope the old fold REJECTED (never accepted): excluded from
+        // the purge's clock basis, but still protocol-invalid and still advertised to peers that
+        // refuse it before storage — it must be purged unconditionally, and its stored chain
+        // suffix with it (density).
+        let stranger = DeviceSecret::from_seed(&[0x99; 32]);
+        let strange_account = AccountId::from_bytes([0x99; 32]);
+        let over_ceiling = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
+            lamport: Some(u64::MAX),
+            ..ContentSpec::default()
+        });
+        let suffix = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
+            seq: 1,
+            previous: Some(over_ceiling.entry_hash),
+            lamport: Some(3),
+            ..ContentSpec::default()
+        });
+        plant_legacy_candidate(&conn, &over_ceiling, false);
+        plant_legacy_candidate(&conn, &suffix, false);
+
+        purge_legacy_lamport_violators(&conn).unwrap();
+        let remaining: Vec<Vec<u8>> = conn
+            .prepare("SELECT entry_hash FROM content_entries")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![honest.entry_hash.to_vec()],
+            "the never-accepted over-ceiling row and its chain suffix are purged"
+        );
     }
 
     #[test]
