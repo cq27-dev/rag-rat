@@ -113,29 +113,6 @@ pub fn content_ingest(
             signed.header.lamport
         )));
     }
-    // Bounded advance at ingest, as a DROP — nothing is stored, so a stale-max race or a stream
-    // whose accepted clock later catches up is repaired by the next session re-offering the
-    // envelope. This is what keeps the V113 upgrade repair stable: without it, a not-yet-purged
-    // replica re-sends a purged poison (or the honest tail that inherited its clock), the entry
-    // re-parks as its author's candidate chain tail, and local authoring wedges again. The
-    // `MAX_LAMPORT_ADVANCE` pre-check keeps the accepted-clock read off the honest path entirely:
-    // a legitimate lamport counts real ops and cannot approach 2^32 under the candidate caps, so
-    // only suspicious entries pay the O(accepted) decode — and they are dropped, not stored. The
-    // catch-up trap (rejecting an honest writer against a stale max) is unreachable at these
-    // constants: it would take a >4-billion-entry backlog against a 16k candidate cap. The fold's
-    // clamp stays authoritative for whatever is already stored; this gate is advisory and only
-    // ever refuses what the fold would park anyway.
-    if signed.header.lamport > crate::entry::MAX_LAMPORT_ADVANCE {
-        let stream_max =
-            super::author::stream_max_content_lamport(conn, signed.header.stream_id)?.unwrap_or(0);
-        if signed.header.lamport > stream_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
-            return Ok(ContentIngestOutcome::Rejected(format!(
-                "entry lamport {} jumps more than {} past the accepted stream clock {stream_max}",
-                signed.header.lamport,
-                crate::entry::MAX_LAMPORT_ADVANCE
-            )));
-        }
-    }
     if let Some(status) = stored_status_for_exact_envelope(conn, &signed, signed_bytes)? {
         return Ok(ContentIngestOutcome::Ingested { status });
     }
@@ -154,6 +131,36 @@ pub fn content_ingest(
         Ok(verified) => verified,
         Err(error) => return Ok(ContentIngestOutcome::Rejected(error.to_string())),
     };
+    // Bounded advance at ingest, as a DROP — nothing is stored, so a stale-max race or a stream
+    // whose accepted clock later catches up is repaired by the next session re-offering the
+    // envelope. This is what keeps the V113 upgrade repair stable: without it, a not-yet-purged
+    // replica re-sends a purged poison (or the honest tail that inherited its clock), the entry
+    // re-parks as its author's candidate chain tail, and local authoring wedges again.
+    //
+    // The check runs only AFTER signature verification: the accepted-clock read decodes every
+    // accepted envelope, and pre-verification placement would hand any peer able to spray forged
+    // high-lamport envelopes a repeatable O(stream) scan that no capacity budget throttles
+    // (nothing gets stored). The O(1) ceiling check above stays pre-verification; an
+    // unknown-roster envelope parks pre-verify UNSCANNED (bounded by the pre-verify budgets) and
+    // promotion re-applies this gate before it can become a candidate. The `MAX_LAMPORT_ADVANCE`
+    // pre-check keeps the scan off the honest path entirely: a legitimate lamport counts real ops
+    // and cannot approach 2^32 under the candidate caps, so only an authenticated writer's
+    // suspicious entries pay it — and they are dropped, not stored. The catch-up trap (rejecting
+    // an honest writer against a stale max) is unreachable at these constants: it would take a
+    // >4-billion-entry backlog against a 16k candidate cap. The fold's clamp stays authoritative
+    // for whatever is already stored; this gate is advisory and only ever refuses what the fold
+    // would park anyway.
+    if verified.header.lamport > crate::entry::MAX_LAMPORT_ADVANCE {
+        let stream_max =
+            super::author::stream_max_content_lamport(&tx, verified.header.stream_id)?.unwrap_or(0);
+        if verified.header.lamport > stream_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
+            return Ok(ContentIngestOutcome::Rejected(format!(
+                "entry lamport {} jumps more than {} past the accepted stream clock {stream_max}",
+                verified.header.lamport,
+                crate::entry::MAX_LAMPORT_ADVANCE
+            )));
+        }
+    }
     match stored_candidate_bytes(&tx, &verified.entry_hash)? {
         Some(stored) if stored != signed_bytes => {
             return Ok(ContentIngestOutcome::Rejected(
@@ -411,28 +418,16 @@ pub(in crate::account) fn promote_pre_verify_for_account(
                     continue;
                 },
             };
-            // The ingest-time lamport gates (ceiling + bounded advance), re-applied here because
-            // promotion inserts candidates WITHOUT re-entering `content_ingest`: a pre-verify row
-            // stored by a binary that predates the gates can violate either, and promoting it
-            // would make the poison durable and relayable. Dropping the row keeps the
-            // drop-before-storage contract; a legitimately re-offered envelope re-parks and gets
-            // re-judged with a fresher clock.
+            // The ingest-time lamport gates (ceiling here, bounded advance below), re-applied
+            // because promotion inserts candidates WITHOUT re-entering `content_ingest`: a
+            // pre-verify row stored by a binary that predates the gates can violate either, and
+            // promoting it would make the poison durable and relayable. Dropping the row keeps
+            // the drop-before-storage contract; a legitimately re-offered envelope re-parks and
+            // gets re-judged with a fresher clock.
             if signed.header.lamport >= crate::entry::MAX_ENTRY_LAMPORT {
                 delete_pre_verify(tx, &signed_hash)?;
                 progressed = true;
                 continue;
-            }
-            if signed.header.lamport > crate::entry::MAX_LAMPORT_ADVANCE {
-                let stream_max =
-                    super::author::stream_max_content_lamport(tx, signed.header.stream_id)?
-                        .unwrap_or(0);
-                if signed.header.lamport
-                    > stream_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE)
-                {
-                    delete_pre_verify(tx, &signed_hash)?;
-                    progressed = true;
-                    continue;
-                }
             }
             let public = match resolve_roster_key(tx, &signed) {
                 Ok(Some(public)) => public,
@@ -451,6 +446,22 @@ pub(in crate::account) fn promote_pre_verify_for_account(
                     continue;
                 },
             };
+            // The bounded-advance gate, AFTER signature verification for the same reason as at
+            // ingest: the accepted-clock read is O(stream), so only an authenticated envelope may
+            // trigger it. Rows here are already capacity-bounded, but the ordering discipline is
+            // one rule, not two.
+            if verified.header.lamport > crate::entry::MAX_LAMPORT_ADVANCE {
+                let stream_max =
+                    super::author::stream_max_content_lamport(tx, verified.header.stream_id)?
+                        .unwrap_or(0);
+                if verified.header.lamport
+                    > stream_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE)
+                {
+                    delete_pre_verify(tx, &signed_hash)?;
+                    progressed = true;
+                    continue;
+                }
+            }
             match stored_candidate_bytes(tx, &verified.entry_hash)? {
                 Some(stored) if stored != raw => {
                     delete_pre_verify(tx, &signed_hash)?;
@@ -3997,6 +4008,26 @@ mod tests {
             &node_create("next"),
         );
         assert_eq!(verdict_after_ingest(&conn, &next), ("accepted".into(), 1));
+    }
+
+    #[test]
+    fn an_unauthenticated_high_lamport_envelope_parks_pre_verify_instead_of_rejecting() {
+        // The bounded-advance gate runs only AFTER signature verification, so an envelope whose
+        // roster is unknown — the unauthenticated case — parks pre-verify like any other, capacity
+        // bounded, without buying the O(stream) accepted-clock scan. Promotion re-applies the
+        // gate when the roster arrives (`promotion_drops_pre_verify_rows_that_violate_the_lamport
+        // _gates`), so parking is not admission.
+        let conn = db();
+        let stranger = DeviceSecret::from_seed(&[0x99; 32]);
+        let strange_account = AccountId::from_bytes([0x99; 32]);
+        let jump = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
+            lamport: Some(1 << 33),
+            ..ContentSpec::default()
+        });
+        assert_eq!(
+            content_ingest(&conn, &jump.signed_bytes, 1).unwrap(),
+            ContentIngestOutcome::PreVerify
+        );
     }
 
     #[test]
