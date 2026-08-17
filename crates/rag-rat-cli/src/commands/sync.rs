@@ -35,6 +35,13 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 ttl: Duration::from_secs(*ttl_secs),
             }),
         SyncCommand::Join { ticket } => return join(config, ticket),
+        SyncCommand::InviteWriter { ttl_secs } =>
+            return invite_writer(config, Duration::from_secs(*ttl_secs)),
+        // A pasted TICKET routes contribution through the network redemption; the bare owner-id
+        // form stays the local configure-only path below.
+        SyncCommand::Contribute { account }
+            if rag_rat_sync::InviteTicket::from_ticket_string(account).is_ok() =>
+            return contribute_with_ticket(config, account),
         SyncCommand::Pull { account, peer } => return pull(config, account, peer.as_deref()),
         SyncCommand::Enable
         | SyncCommand::Publish { .. }
@@ -164,6 +171,7 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         SyncCommand::Serve { .. }
         | SyncCommand::Init { .. }
         | SyncCommand::Join { .. }
+        | SyncCommand::InviteWriter { .. }
         | SyncCommand::Pull { .. } =>
             unreachable!("the network commands are dispatched before the write lock"),
     }
@@ -185,6 +193,14 @@ struct InviteMint {
     ttl: Duration,
 }
 
+/// What a mint-then-serve command mints: a device-pairing invite (`sync init`) or a writer invite
+/// (`sync invite-writer`). One serve loop redeems both — the enrollment ALPN dispatches on the
+/// request's domain.
+enum ServeMint {
+    Pairing(InviteMint),
+    Writer { ttl: Duration },
+}
+
 /// Run a headless store-and-forward peer for this account's op log: bind the sync endpoint over the
 /// configured relay and replicate with peers the roster authorizes. Serves every stream a peer may
 /// negotiate — the account log (`SYNC_ALPN`), `/3` content (`CONTENT_SYNC_ALPN`), and repo-scoped
@@ -201,7 +217,14 @@ fn serve(config: &Config, once: bool) -> anyhow::Result<()> {
 /// against the owner's database — so `init` is simply "mint, then serve". Never `--once`: a joiner
 /// needs the enrollment connection plus two sync connections.
 fn init(config: &Config, mint: InviteMint) -> anyhow::Result<()> {
-    serve_with(config, false, Some(mint))
+    serve_with(config, false, Some(ServeMint::Pairing(mint)))
+}
+
+/// Owner-side writer invite (`sync invite-writer`): mint the one-time ticket for the active
+/// repo's published stream, print it, then host the redemption AND the contributor's follow-up
+/// log pull until interrupted — the same mint-then-serve shape as `sync init`.
+fn invite_writer(config: &Config, ttl: Duration) -> anyhow::Result<()> {
+    serve_with(config, false, Some(ServeMint::Writer { ttl }))
 }
 
 /// Shared machinery behind [`serve`] and [`init`]: acquire the session lock, open the index, bind
@@ -209,7 +232,7 @@ fn init(config: &Config, mint: InviteMint) -> anyhow::Result<()> {
 /// one-time invite is minted AFTER the endpoint binds and the roster gate passes — so a bind
 /// failure never strands the candidate reservation the mint makes — and its ticket is printed on
 /// the startup line. Minting enforces founder/owner authority, so a non-owner `init` fails there.
-fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::Result<()> {
+fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::Result<()> {
     let relay = effective_relay_url(config);
     // Hold a database-scoped session lock for the SERVER'S WHOLE LIFETIME. `sync_node_secret` is
     // store-global, so a second `serve` (or a colocated device-side sync) on the same database
@@ -274,8 +297,8 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
         // SQLite against any watcher write (the same lock-free posture as the accept loop's
         // ingests below), so it needs no repo write lock. Minting enforces founder/owner
         // authority; a non-owner `init` fails here.
-        let invite = match mint {
-            Some(mint) => {
+        let invite = match &mint {
+            Some(ServeMint::Pairing(mint)) => {
                 let ticket = rag_rat_sync::mint_invite(conn, rag_rat_sync::InviteSpec {
                     account_id,
                     inviter_node_id: local_node,
@@ -286,7 +309,23 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
                     ttl: mint.ttl,
                 })
                 .map_err(|e| anyhow!("minting the enrollment invite failed: {e}"))?;
-                Some((ticket, mint.role))
+                Some((ticket, mint.role.as_db_str()))
+            },
+            Some(ServeMint::Writer { ttl }) => {
+                // Resolve the grant target NOW, under the repo scope this command runs in — the
+                // redeeming acceptor serves the whole store and has no repo scope of its own.
+                let stream_id = rag_rat_core::writer_invite_stream_target(conn)?;
+                let ticket =
+                    rag_rat_sync::mint_writer_invite(conn, rag_rat_sync::WriterInviteSpec {
+                        account_id,
+                        stream_id,
+                        inviter_node_id: local_node,
+                        relay_url: relay.clone(),
+                        now_ms: &|| time::now_ms(),
+                        ttl: *ttl,
+                    })
+                    .map_err(|e| anyhow!("minting the writer invite failed: {e}"))?;
+                Some((ticket, "writer"))
             },
             None => None,
         };
@@ -318,7 +357,7 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
         });
         if let Some((ticket, role)) = &invite {
             listening["invite"] = serde_json::json!(ticket.to_ticket_string());
-            listening["invite_role"] = serde_json::json!(role.as_db_str());
+            listening["invite_role"] = serde_json::json!(role);
             listening["invite_expires_at_ms"] = serde_json::json!(ticket.expires_at_ms);
         }
         crate::print_output(&listening)?;
@@ -457,7 +496,7 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
 /// capacity, which must be serialized against any colocated `serve`/device sync (the requirement
 /// `connect_and_enroll` documents).
 fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
-    let ticket = rag_rat_sync::EnrollmentTicket::from_ticket_string(ticket)
+    let ticket = rag_rat_sync::InviteTicket::from_ticket_string(ticket)
         .map_err(|e| anyhow!("invalid enrollment ticket: {e}"))?;
     // Bind over the INVITER's relay (the ticket's), not the local `[sync] relay_url`: both peers
     // must share a relay to meet, and the ticket names where the inviter is reachable. `sync init`
@@ -676,6 +715,132 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
 ///
 /// Deliberately NOT a `sync join`: no enrollment, no `/5` table restore (foreign table streams are
 /// private account data, pinned `Closed`), and no founder-incarnation repair.
+/// Redeem a writer invite (`sync contribute <ticket>`): dial the owner named by the ticket, have
+/// it author the grant for THIS store's account, pull the owner's log over the same route so the
+/// grant fact folds locally, verify it, and configure contribution — the whole flow the two-paste
+/// era ended in a dead end ("now sync the owner's log", with no command that did).
+fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
+    let ticket = rag_rat_sync::InviteTicket::from_ticket_string(ticket)?;
+    ticket.expect_kind(rag_rat_sync::InviteTicketKind::Writer)?;
+    let owner = ticket.account_id;
+
+    // Same endpoint discipline as `pull`: the session lock keeps this database's node identity
+    // singular for the whole exchange.
+    let _session = locks::WriteLock::acquire_sync_session_timeout(
+        &config.database,
+        SERVE_SESSION_LOCK_TIMEOUT,
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "another sync session already holds this database's node identity (a resident MCP \
+             host, a `serve` peer, or a device sync is running); stop it and retry"
+        )
+    })?;
+    let lock_repo = locks::write_lock_repo_id(config);
+    let repo_lock = locks::WriteLock::acquire_timeout(
+        &config.database,
+        &lock_repo,
+        SERVE_SESSION_LOCK_TIMEOUT,
+    )?
+    .ok_or_else(|| anyhow!("the index write lock is busy (another writer is mid-pass); retry"))?;
+    let db = crate::open_index(config)?;
+    let (node_key, contributor) = {
+        let conn = db.connection();
+        // Mint the contributor identity if absent — a fresh store can redeem an invite as its
+        // first sync action, exactly like `sync whoami` would have minted it.
+        let contributor = rag_rat_oplog::local_account(conn, time::now_ms())?;
+        if contributor == owner {
+            bail!(
+                "this store IS the inviting account — a writer invite is for a teammate's \
+                 separate identity, not for the owner's own devices (those pair with `sync init` \
+                 / `sync join`)"
+            );
+        }
+        rag_rat_oplog::local_device(conn, time::now_ms())?;
+        (node_secret(conn)?, contributor)
+    };
+    drop(repo_lock);
+
+    // The ticket IS the route: its relay and node id name the owner's serving endpoint, so the
+    // redemption works before any [sync] configuration exists on this side.
+    let peer_hex = hash::hex_lower(&ticket.inviter_node_id);
+    let peer_addr = rag_rat_sync::peer_addr_from_bytes(&ticket.inviter_node_id, &ticket.relay_url)?;
+    let relay = ticket.relay_url.clone();
+
+    let runtime =
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    runtime.block_on(async move {
+        let conn = db.connection();
+        let endpoint = rag_rat_sync::build_endpoint(*node_key, &relay)
+            .await
+            .with_context(|| format!("binding the sync endpoint over relay {relay}"))?;
+        let receipt = rag_rat_sync::connect_and_redeem_writer(
+            &endpoint,
+            peer_addr.clone(),
+            &ticket,
+            contributor,
+        )
+        .await
+        .map_err(|error| anyhow!("redeeming the writer invite failed: {error}"))?;
+
+        // The invite was minted under the OWNER's repo scope; refuse before configuring if this
+        // checkout is a different repository. A re-run of the same ticket replays the same
+        // receipt within its retention window, so nothing is burned by stopping here.
+        let expected = rag_rat_oplog::owner_stream_v2_id_for_account(
+            &db.active_repo_id,
+            owner,
+            rag_rat_oplog::AccessMode::PublicRead,
+        )?;
+        if receipt.stream_id != expected.to_bytes() {
+            bail!(
+                "this invite grants on a different repository's stream — run `sync contribute` in \
+                 the checkout of the repo the owner minted it for"
+            );
+        }
+
+        // Pull the owner's log over the ticket's route: the grant lives in the OWNER's control
+        // log, and authoring here needs the folded fact.
+        let peers = vec![(peer_hex.clone(), peer_addr)];
+        let outcome =
+            rag_rat_core::sync_driver::pull_account_via_peers(conn, &endpoint, owner, &peers)
+                .await?;
+        if outcome.peer.is_none() {
+            bail!(
+                "the grant was authored, but pulling the owner's log failed: {} — re-run this \
+                 command (the same ticket replays the grant) once the owner's host is reachable",
+                outcome.last_error.unwrap_or_else(|| "no peer reachable".to_string())
+            );
+        }
+        let grant = rag_rat_oplog::effective_writer_grant(
+            conn,
+            owner,
+            rag_rat_oplog::StreamId::from_bytes(receipt.stream_id),
+            contributor,
+        )?;
+        anyhow::ensure!(
+            grant == Some(receipt.grant_id),
+            "the owner's synced log does not fold the redeemed grant effective yet; re-run this \
+             command to retry the pull"
+        );
+
+        let owner_hex = hash::hex_lower(&owner.to_bytes());
+        db.sync_contribute(&owner_hex)?;
+        let effects = rag_rat_core::drain_synced_memory(conn)?;
+        db.fold_wal();
+        crate::print_output(&serde_json::json!({
+            "status": "contributing",
+            "repo_id": db.active_repo_id,
+            "owner_account_id": owner_hex,
+            "grant_id": hash::hex_lower(&receipt.grant_id),
+            "memories_pulled": effects.nodes_written,
+            "note": format!(
+                "memory changes for this repo now target the owner's stream. For automatic \
+                 ongoing sync, add the owner's host to [sync] server_peers: \"{peer_hex}\""
+            ),
+        }))
+    })
+}
+
 fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyhow::Result<()> {
     let target = rag_rat_oplog::AccountId::from_hex(account_hex)?;
     let relay = effective_relay_url(config);

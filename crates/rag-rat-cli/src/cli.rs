@@ -336,6 +336,20 @@ pub(crate) enum SyncCommand {
         #[arg(value_name = "ACCOUNT_ID")]
         account: String,
     },
+    /// Print a one-time ticket that grants write access to this repo's shared memories.
+    #[command(long_about = "Mints a single-use, TTL'd writer invite for the active repo's \
+                            published memory stream and stays online to redeem it — the one \
+                            ticket replaces the old two-paste flow (grantee sends its account \
+                            id, owner sends back its own). The teammate runs `rag-rat sync \
+                            contribute <ticket>`: the grant is authored at redemption, their \
+                            store pulls this account's log over the same connection route, and \
+                            contribution is configured in one step. Requires a published repo \
+                            (`sync publish`) and runs until interrupted, like `sync init`.")]
+    InviteWriter {
+        /// Invite lifetime in seconds before it expires (default 900 = 15 minutes).
+        #[arg(long, value_name = "SECS", default_value_t = 900)]
+        ttl_secs: u64,
+    },
     /// Revoke another identity's write access to this repo's shared memories.
     #[command(long_about = "Closes the open grant to an account and retro-judges its authored \
                             content. The --reason drives what prior work survives: departed, \
@@ -369,8 +383,10 @@ pub(crate) enum SyncCommand {
                             grant` this account (its id from `sync whoami`) and this store must \
                             sync the owner's log; contributing targets a published (public) repo.")]
     Contribute {
-        /// The 64-hex owner account id to contribute to, from the owner's `rag-rat sync whoami`.
-        #[arg(value_name = "OWNER_ACCOUNT_ID")]
+        /// A writer invite ticket from the owner's `rag-rat sync invite-writer` (the one-step
+        /// flow), or the owner's 64-hex account id from `rag-rat sync whoami` (the manual flow —
+        /// the owner must separately `sync grant` this account, from `sync whoami` here).
+        #[arg(value_name = "TICKET_OR_OWNER_ACCOUNT_ID")]
         account: String,
     },
     /// Fetch ANOTHER account's memories from a peer that serves them.
@@ -1100,6 +1116,25 @@ mod tests {
             Command::Sync(SyncArgs { command: SyncCommand::Grant { account } }) =>
                 assert_eq!(account, "ab".repeat(32)),
             other => panic!("expected sync grant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_invite_writer_and_ticket_contribute_parse() {
+        let invite = Cli::try_parse_from(["rag-rat", "sync", "invite-writer", "--ttl-secs", "300"])
+            .expect("parse");
+        match invite.command {
+            Command::Sync(SyncArgs { command: SyncCommand::InviteWriter { ttl_secs } }) =>
+                assert_eq!(ttl_secs, 300),
+            other => panic!("expected sync invite-writer, got {other:?}"),
+        }
+        // Contribute takes a ticket or an owner id through the same positional.
+        let contribute = Cli::try_parse_from(["rag-rat", "sync", "contribute", "ragratinviteabcd"])
+            .expect("parse");
+        match contribute.command {
+            Command::Sync(SyncArgs { command: SyncCommand::Contribute { account } }) =>
+                assert_eq!(account, "ragratinviteabcd"),
+            other => panic!("expected sync contribute, got {other:?}"),
         }
     }
 

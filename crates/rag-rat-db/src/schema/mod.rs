@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 115;
+pub const LATEST_SCHEMA_VERSION: u32 = 116;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -847,6 +847,14 @@ const MIGRATION_113_DESCRIPTION: &str =
      replica parks the same entry and diverges (#1176)";
 const MIGRATION_114_ID: &str = "114_content_entries_lamport_column";
 const MIGRATION_115_ID: &str = "115_refold_account_authority_projections";
+const MIGRATION_116_ID: &str = "116_writer_invites";
+const MIGRATION_116_CHECKSUM: &str = "sha256:rag-rat-writer-invites-v116";
+const MIGRATION_116_DESCRIPTION: &str =
+    "Rebuild sync_invites so an invite can be a cross-account WRITER invite (#1179): the role \
+     gains the writer marker, a writer row carries the target stream_id (the grant is authored at \
+     redemption, when the contributor account is first known), and the used-columns check \
+     branches by role — a writer redemption records the dialing node and the authored grant id, \
+     never device enrollment keys";
 const MIGRATION_115_CHECKSUM: &str = "sha256:rag-rat-refold-account-authority-projections-v115";
 const MIGRATION_115_DESCRIPTION: &str =
     "Rebuild every account's persisted authority projection from its candidate DAG, so a grant a \
@@ -1808,6 +1816,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_115_CHECKSUM,
         description: MIGRATION_115_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_refold_account_authority_projections),
+    },
+    Migration {
+        id: MIGRATION_116_ID,
+        checksum: MIGRATION_116_CHECKSUM,
+        description: MIGRATION_116_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_writer_invites),
     },
 ];
 

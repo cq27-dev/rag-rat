@@ -136,7 +136,7 @@ pub fn peer_addr(node_id: &str, relay_url: &str) -> Result<EndpointAddr, Endpoin
 }
 
 /// Build a dialable [`EndpointAddr`] from a peer's node id BYTES — the form an
-/// [`crate::EnrollmentTicket`] carries — and the shared relay URL. The byte-oriented sibling of
+/// [`crate::InviteTicket`] carries — and the shared relay URL. The byte-oriented sibling of
 /// [`peer_addr`], so the enrollment CLI can dial a ticket's inviter without naming an iroh type.
 pub fn peer_addr_from_bytes(
     node_id: &[u8; 32],
@@ -348,6 +348,35 @@ pub async fn connect_and_enroll(
     Ok(receipt)
 }
 
+/// Dial the ticket's inviter and redeem a WRITER invite: the owner authors the grant naming
+/// `contributor_account` and the receipt comes back with the grant id and target stream. The
+/// contributor still has to pull the owner's log afterwards (the grant lives in the OWNER's
+/// control log); the redeeming CLI does that inline over the same route.
+pub async fn connect_and_redeem_writer(
+    endpoint: &Endpoint,
+    peer: impl Into<EndpointAddr>,
+    ticket: &crate::InviteTicket,
+    contributor_account: AccountId,
+) -> Result<crate::WriterGrantReceipt, InviteError> {
+    let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, ENROLL_ALPN))
+        .await
+        .map_err(|_| InviteError::Storage(anyhow::anyhow!("writer invite dial timed out")))?
+        .map_err(|error| InviteError::Storage(error.into()))?;
+    let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.open_bi())
+        .await
+        .map_err(|_| InviteError::Storage(anyhow::anyhow!("opening invite stream timed out")))?
+        .map_err(|error| InviteError::Storage(error.into()))?;
+    let receipt = crate::enrollment::run_writer_grant_dialer(
+        &mut recv,
+        &mut send,
+        ticket,
+        contributor_account,
+    )
+    .await?;
+    conn.close(0u32.into(), b"done");
+    Ok(receipt)
+}
+
 /// Refuse a request assembled for a different store before making network contact: redemption is
 /// one-shot, and adopting a receipt whose device keys are not locally held would leave Closed sync
 /// unable to authenticate or decrypt the delivered stream-key wraps.
@@ -424,10 +453,16 @@ pub async fn accept_enrollment(
         .map_err(|error| InviteError::Storage(error.into()))?;
     let outcome =
         run_enrollment_acceptor(&mut recv, &mut send, database, remote_node, now_ms).await?;
-    let enrolled = matches!(outcome, EnrollmentAcceptorOutcome::Enrolled(..));
-    close_enrollment_connection(conn, &mut recv, enrolled).await;
+    let served = matches!(
+        outcome,
+        EnrollmentAcceptorOutcome::Enrolled(..) | EnrollmentAcceptorOutcome::WriterGranted(..)
+    );
+    close_enrollment_connection(conn, &mut recv, served).await;
     match outcome {
         EnrollmentAcceptorOutcome::Enrolled(receipt, _) => Ok(receipt),
+        EnrollmentAcceptorOutcome::WriterGranted(_) => Err(InviteError::Malformed(
+            "the connection redeemed a writer invite, not a pairing enrollment".into(),
+        )),
         EnrollmentAcceptorOutcome::Refused(error) => Err(error),
     }
 }
@@ -988,10 +1023,14 @@ where
             run_enrollment_acceptor(&mut recv, &mut send, enrollment_database, remote_node, now_ms)
                 .await
                 .map_err(SyncFailure::Enrollment)?;
-        let enrolled = matches!(outcome, EnrollmentAcceptorOutcome::Enrolled(..));
-        close_enrollment_connection(conn, &mut recv, enrolled).await;
+        let served = matches!(
+            outcome,
+            EnrollmentAcceptorOutcome::Enrolled(..) | EnrollmentAcceptorOutcome::WriterGranted(..)
+        );
+        close_enrollment_connection(conn, &mut recv, served).await;
         return match outcome {
-            EnrollmentAcceptorOutcome::Enrolled(_, _) => Ok((alpn, SessionReport::default())),
+            EnrollmentAcceptorOutcome::Enrolled(_, _)
+            | EnrollmentAcceptorOutcome::WriterGranted(_) => Ok((alpn, SessionReport::default())),
             EnrollmentAcceptorOutcome::Refused(error) => Err(SyncFailure::Enrollment(error)),
         };
     }

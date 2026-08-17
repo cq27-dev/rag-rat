@@ -24,7 +24,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const ENROLL_ALPN: &[u8] = b"rag-rat/enroll/1";
-const TICKET_DOMAIN: &str = "rag-rat/enrollment-ticket/1";
+// `/2` added the kind discriminator (arity 6 -> 7) when the pairing ticket and the writer
+// invite merged into one struct; a `/1` binary rejects the new domain legibly.
+const TICKET_DOMAIN: &str = "rag-rat/invite-ticket/2";
 const REQUEST_DOMAIN: &str = "rag-rat/enrollment-request/1";
 const RECEIPT_DOMAIN: &str = "rag-rat/enrollment-receipt/1";
 const RESPONSE_DOMAIN: &str = "rag-rat/enrollment-response/1";
@@ -55,8 +57,42 @@ pub(crate) const RESPONSE_ACK: u8 = 0x01;
 /// best-effort after the response is decoded, so a stalled reverse stream cannot mask the result.
 pub(crate) const RESPONSE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// What an invite ticket is FOR — a kind discriminator only, never authority. The server-side
+/// `sync_invites` row bound to the nonce carries the authoritative role (an enrollment
+/// `DeviceRole`, or the writer-grant marker), exactly as before: a tampered kind changes which
+/// command accepts the paste, not what the owner authors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteTicketKind {
+    /// Device pairing (`sync init` mints, `sync join` redeems).
+    Pairing,
+    /// A cross-account Writer grant (`sync invite-writer` mints, `sync contribute` redeems).
+    Writer,
+}
+
+impl InviteTicketKind {
+    fn wire_tag(self) -> u8 {
+        match self {
+            Self::Pairing => 0,
+            Self::Writer => 1,
+        }
+    }
+
+    fn from_wire_tag(tag: u8) -> Result<Self, InviteError> {
+        match tag {
+            0 => Ok(Self::Pairing),
+            1 => Ok(Self::Writer),
+            other => Err(InviteError::Malformed(format!("unknown invite ticket kind {other}"))),
+        }
+    }
+}
+
+/// The one human-transferable ticket both invite flows print and redeem: pairing and writer
+/// invites share the struct (and the `ragratinvite` string prefix), split by [`InviteTicketKind`]
+/// — so pasting the wrong kind is diagnosed from the DECODED ticket ("that is a pairing ticket —
+/// use `sync join`"), not three layers down.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnrollmentTicket {
+pub struct InviteTicket {
+    pub kind: InviteTicketKind,
     pub account_id: AccountId,
     pub inviter_node_id: [u8; 32],
     pub relay_url: String,
@@ -64,12 +100,13 @@ pub struct EnrollmentTicket {
     pub expires_at_ms: i64,
 }
 
-impl EnrollmentTicket {
+impl InviteTicket {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut enc = Encoder::new(&mut out);
-        enc.array(6).expect("owned Vec");
+        enc.array(7).expect("owned Vec");
         enc.str(TICKET_DOMAIN).expect("owned Vec");
+        enc.u8(self.kind.wire_tag()).expect("owned Vec");
         enc.bytes(&self.account_id.to_bytes()).expect("owned Vec");
         enc.bytes(&self.inviter_node_id).expect("owned Vec");
         enc.str(&self.relay_url).expect("owned Vec");
@@ -80,8 +117,9 @@ impl EnrollmentTicket {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, InviteError> {
         let mut dec = Decoder::new(bytes);
-        exact_array(&mut dec, 6, "ticket")?;
+        exact_array(&mut dec, 7, "ticket")?;
         exact_str(&mut dec, TICKET_DOMAIN, "ticket domain")?;
+        let kind = InviteTicketKind::from_wire_tag(dec.u8().map_err(decode)?)?;
         let account_id = AccountId::from_bytes(fixed32(dec.bytes().map_err(decode)?, "account")?);
         let inviter_node_id = fixed32(dec.bytes().map_err(decode)?, "node id")?;
         let relay_url = dec.str().map_err(decode)?.to_owned();
@@ -89,52 +127,64 @@ impl EnrollmentTicket {
         let nonce = fixed32(dec.bytes().map_err(decode)?, "nonce")?;
         let expires_at_ms = dec.i64().map_err(decode)?;
         ensure_consumed(&dec, bytes)?;
-        let ticket = Self { account_id, inviter_node_id, relay_url, nonce, expires_at_ms };
+        let ticket = Self { kind, account_id, inviter_node_id, relay_url, nonce, expires_at_ms };
         if ticket.encode() != bytes {
             return Err(InviteError::Malformed("ticket is not canonical CBOR".into()));
         }
         Ok(ticket)
     }
 
-    /// The human-transferable ticket string an owner prints and a joiner pastes: a scheme tag plus
-    /// the lower-hex of the canonical CBOR. Hex (not base32) needs no new dependency and matches
-    /// the node-secret encoding already persisted by the CLI; the tag makes a wrong paste fail
-    /// with a clear message instead of an opaque CBOR error.
+    /// The human-transferable ticket string — [`iroh_tickets::Ticket`]'s canonical form: the
+    /// `ragratinvite` kind prefix plus lowercase base32 of the canonical CBOR.
     pub fn to_ticket_string(&self) -> String {
-        format!("{TICKET_STRING_PREFIX}{}", rag_rat_base::hash::hex_lower(&self.encode()))
+        iroh_tickets::Ticket::encode_string(self)
     }
 
-    /// Parse a ticket string produced by [`to_ticket_string`]. Surrounding whitespace is tolerated
-    /// (a pasted line often carries it); the scheme tag, hex, and canonical-CBOR shape are all
-    /// validated, so a mistyped or truncated ticket is rejected rather than half-decoded.
+    /// Parse a ticket string produced by [`to_ticket_string`]. Surrounding whitespace is
+    /// tolerated (a pasted line often carries it); the prefix, base32, and canonical-CBOR shape
+    /// are all validated, so a mistyped or truncated ticket is rejected rather than half-decoded.
     pub fn from_ticket_string(s: &str) -> Result<Self, InviteError> {
-        let body = s.trim().strip_prefix(TICKET_STRING_PREFIX).ok_or_else(|| {
-            InviteError::Malformed(format!(
-                "enrollment ticket must start with `{TICKET_STRING_PREFIX}`"
-            ))
-        })?;
-        Self::decode(&decode_ticket_hex(body)?)
+        match iroh_tickets::Ticket::decode_string(s.trim()) {
+            Ok(ticket) => Ok(ticket),
+            Err(iroh_tickets::ParseError::Kind { .. }) => Err(InviteError::Malformed(format!(
+                "an invite ticket starts with `{TICKET_KIND_PREFIX}`"
+            ))),
+            Err(error) => Err(InviteError::Malformed(format!("invalid invite ticket: {error}"))),
+        }
+    }
+
+    /// Redeem-side kind check: the wrong paste names the command that accepts it.
+    pub fn expect_kind(&self, expected: InviteTicketKind) -> Result<(), InviteError> {
+        if self.kind == expected {
+            return Ok(());
+        }
+        Err(InviteError::Malformed(match self.kind {
+            InviteTicketKind::Pairing =>
+                "that is a device-pairing ticket — redeem it with `rag-rat sync join`".into(),
+            InviteTicketKind::Writer =>
+                "that is a writer invite — redeem it with `rag-rat sync contribute`".into(),
+        }))
     }
 }
 
-/// Scheme tag prefixing every ticket string — see [`EnrollmentTicket::to_ticket_string`].
-const TICKET_STRING_PREFIX: &str = "ragrat-invite-";
+/// The [`iroh_tickets::Ticket`] string prefix. One prefix for both kinds on purpose: the kind is
+/// in the payload, so a wrong-kind paste decodes far enough to say which command wants it.
+const TICKET_KIND_PREFIX: &str = "ragratinvite";
 
-/// Decode the lower-hex body of a ticket string. A wrong length or non-hex character is a corrupt
-/// paste, surfaced as [`InviteError::Malformed`] rather than silently coerced.
-fn decode_ticket_hex(hex: &str) -> Result<Vec<u8>, InviteError> {
-    let hex = hex.trim();
-    if !hex.len().is_multiple_of(2) {
-        return Err(InviteError::Malformed("enrollment ticket hex has an odd length".into()));
+impl iroh_tickets::Ticket for InviteTicket {
+    const KIND: &'static str = TICKET_KIND_PREFIX;
+
+    fn encode_bytes(&self) -> Vec<u8> {
+        self.encode()
     }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_bytes().chunks_exact(2) {
-        match ((pair[0] as char).to_digit(16), (pair[1] as char).to_digit(16)) {
-            (Some(hi), Some(lo)) => out.push(((hi << 4) | lo) as u8),
-            _ => return Err(InviteError::Malformed("enrollment ticket is not valid hex".into())),
-        }
+
+    fn decode_bytes(bytes: &[u8]) -> Result<Self, iroh_tickets::ParseError> {
+        Self::decode(bytes).map_err(|_| {
+            iroh_tickets::ParseError::verification_failed(
+                "ticket bytes are not a canonical rag-rat invite",
+            )
+        })
     }
-    Ok(out)
 }
 
 fn validate_enrollment_route(
@@ -269,6 +319,8 @@ pub struct InviteSpec<'a> {
 struct StoredInvite {
     account_bytes: Vec<u8>,
     role: String,
+    /// The stream a WRITER invite grants on (`Some` exactly for `role = 'writer'` rows).
+    stream_id: Option<Vec<u8>>,
     label: Option<String>,
     expires_at_ms: i64,
     used_at_ms: Option<i64>,
@@ -288,6 +340,8 @@ struct StoredInvite {
 /// semantic error from the joiner.
 pub enum EnrollmentAcceptorOutcome {
     Enrolled(EnrollmentReceipt, CatchUpReport),
+    /// A WRITER invite was redeemed over the enrollment ALPN: the owner authored the grant.
+    WriterGranted(WriterGrantReceipt),
     Refused(InviteError),
 }
 
@@ -492,10 +546,7 @@ impl From<std::io::Error> for InviteError {
     }
 }
 
-pub fn mint_invite(
-    conn: &Connection,
-    spec: InviteSpec<'_>,
-) -> Result<EnrollmentTicket, InviteError> {
+pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTicket, InviteError> {
     let InviteSpec { account_id, inviter_node_id, relay_url, role, label, now_ms, ttl } = spec;
     validate_enrollment_route(&inviter_node_id, &relay_url)?;
     validate_device_add_label(label).map_err(|error| InviteError::Malformed(error.to_string()))?;
@@ -560,7 +611,14 @@ pub fn mint_invite(
     )
     .map_err(|error| InviteError::Storage(error.into()))?;
     tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
-    Ok(EnrollmentTicket { account_id, inviter_node_id, relay_url, nonce, expires_at_ms })
+    Ok(InviteTicket {
+        kind: InviteTicketKind::Pairing,
+        account_id,
+        inviter_node_id,
+        relay_url,
+        nonce,
+        expires_at_ms,
+    })
 }
 
 fn require_founder_enrollment_authority(
@@ -605,6 +663,355 @@ fn require_founder_enrollment_authority(
         )));
     }
     Ok(())
+}
+
+/// Wire domains for the WRITER invite exchange, carried over the enrollment ALPN: the acceptor
+/// branches on the request's leading domain string, so one serve loop redeems both kinds and a
+/// pre-writer binary refuses the new domain with a legible malformed-request error.
+const GRANT_REQUEST_DOMAIN: &str = "rag-rat/grant-request/1";
+const GRANT_RESPONSE_DOMAIN: &str = "rag-rat/grant-response/1";
+
+/// A contributor's writer-invite redemption: the nonce authorizes, and `contributor_account` is
+/// what the owner's `StreamGrant` will name — the piece of the old paste flow that had to travel
+/// owner-ward by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterGrantRequest {
+    pub nonce: [u8; 32],
+    /// The owner account the ticket names; compared against the nonce's persisted account.
+    pub expected_account: AccountId,
+    pub contributor_account: AccountId,
+}
+
+impl WriterGrantRequest {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = Encoder::new(&mut out);
+        enc.array(4).expect("owned Vec");
+        enc.str(GRANT_REQUEST_DOMAIN).expect("owned Vec");
+        enc.bytes(&self.nonce).expect("owned Vec");
+        enc.bytes(&self.expected_account.to_bytes()).expect("owned Vec");
+        enc.bytes(&self.contributor_account.to_bytes()).expect("owned Vec");
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, InviteError> {
+        let mut dec = Decoder::new(bytes);
+        exact_array(&mut dec, 4, "grant request")?;
+        exact_str(&mut dec, GRANT_REQUEST_DOMAIN, "grant request domain")?;
+        let request = Self {
+            nonce: fixed32(dec.bytes().map_err(decode)?, "nonce")?,
+            expected_account: AccountId::from_bytes(fixed32(
+                dec.bytes().map_err(decode)?,
+                "expected account",
+            )?),
+            contributor_account: AccountId::from_bytes(fixed32(
+                dec.bytes().map_err(decode)?,
+                "contributor account",
+            )?),
+        };
+        ensure_consumed(&dec, bytes)?;
+        if request.encode() != bytes {
+            return Err(InviteError::Malformed("grant request is not canonical CBOR".into()));
+        }
+        Ok(request)
+    }
+}
+
+/// What a redeemed writer invite hands back: the authored grant and the stream it grants on, so
+/// the contributor can verify the folded fact against the stream its own repo derives — a
+/// mismatch means the invite was minted for a different repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterGrantReceipt {
+    pub grant_id: [u8; 32],
+    pub stream_id: [u8; 32],
+}
+
+enum WriterGrantResponse {
+    Granted(WriterGrantReceipt),
+    Refused(RefusalCode),
+}
+
+impl WriterGrantResponse {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = Encoder::new(&mut out);
+        enc.array(3).expect("owned Vec");
+        enc.str(GRANT_RESPONSE_DOMAIN).expect("owned Vec");
+        match self {
+            Self::Granted(receipt) => {
+                enc.str("granted").expect("owned Vec");
+                enc.array(2).expect("owned Vec");
+                enc.bytes(&receipt.grant_id).expect("owned Vec");
+                enc.bytes(&receipt.stream_id).expect("owned Vec");
+            },
+            Self::Refused(code) => {
+                enc.str("refused").expect("owned Vec");
+                enc.str(code.as_str()).expect("owned Vec");
+            },
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, InviteError> {
+        let mut dec = Decoder::new(bytes);
+        exact_array(&mut dec, 3, "grant response")?;
+        exact_str(&mut dec, GRANT_RESPONSE_DOMAIN, "grant response domain")?;
+        let response = match dec.str().map_err(decode)? {
+            "granted" => {
+                exact_array(&mut dec, 2, "grant receipt")?;
+                Self::Granted(WriterGrantReceipt {
+                    grant_id: fixed32(dec.bytes().map_err(decode)?, "grant id")?,
+                    stream_id: fixed32(dec.bytes().map_err(decode)?, "stream id")?,
+                })
+            },
+            "refused" => Self::Refused(RefusalCode::from_str(dec.str().map_err(decode)?)?),
+            other =>
+                return Err(InviteError::Malformed(format!("unknown grant response `{other}`"))),
+        };
+        ensure_consumed(&dec, bytes)?;
+        if response.encode() != bytes {
+            return Err(InviteError::Malformed("grant response is not canonical CBOR".into()));
+        }
+        Ok(response)
+    }
+}
+
+/// Everything the owner needs to mint a WRITER invite (`sync invite-writer`). Unlike enrollment,
+/// no candidate capacity is reserved at mint: redemption authors ONE small account entry inside
+/// the same transaction that consumes the nonce, so a capacity failure rolls the whole redemption
+/// back with the nonce intact — a deterministic retry, not a stranded ticket.
+pub struct WriterInviteSpec<'a> {
+    pub account_id: AccountId,
+    /// The `PublicRead` stream the redeemed grant targets, resolved at mint — the serving
+    /// acceptor has no repo scope at redemption.
+    pub stream_id: [u8; 32],
+    pub inviter_node_id: [u8; 32],
+    pub relay_url: String,
+    /// Mint clock; read once after the writer transaction is acquired (see [`InviteSpec`]).
+    pub now_ms: &'a dyn Fn() -> i64,
+    pub ttl: Duration,
+}
+
+/// Mint a one-time WRITER invite and return its ticket. The grant itself is authored at
+/// redemption — the grantee account is not known yet; that is the whole point of the ticket.
+pub fn mint_writer_invite(
+    conn: &Connection,
+    spec: WriterInviteSpec<'_>,
+) -> Result<InviteTicket, InviteError> {
+    let WriterInviteSpec { account_id, stream_id, inviter_node_id, relay_url, now_ms, ttl } = spec;
+    validate_enrollment_route(&inviter_node_id, &relay_url)?;
+    let ttl_ms = i64::try_from(ttl.as_millis())
+        .map_err(|_| InviteError::Malformed("invite TTL is too large".into()))?;
+    if ttl_ms == 0 {
+        return Err(InviteError::Malformed("invite TTL must be at least one millisecond".into()));
+    }
+    let mut nonce_bytes = [MaybeUninit::uninit(); 32];
+    let nonce = getrandom::fill_uninit(&mut nonce_bytes)
+        .map_err(|error| InviteError::Storage(anyhow::anyhow!("invite entropy: {error}")))?
+        .try_into()
+        .map(|nonce: &mut [u8; 32]| *nonce)
+        .expect("the fixed-size destination preserves its length");
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| InviteError::Storage(error.into()))?;
+    // Post-lock clock, as in [`mint_invite`]: a ticket minted after a long lock wait must not be
+    // born expired.
+    let now_ms = now_ms();
+    let expires_at_ms = now_ms
+        .checked_add(ttl_ms)
+        .ok_or_else(|| InviteError::Malformed("invite expiry overflows i64".into()))?;
+    require_founder_enrollment_authority(&tx, account_id)?;
+    prune_expired_invites_in_tx(&tx, now_ms)?;
+    tx.execute(
+        "INSERT INTO sync_invites(
+             nonce, account_id, role, stream_id, expires_at_ms, created_at_ms, used_at_ms
+         ) VALUES (?1, ?2, 'writer', ?3, ?4, ?5, NULL)",
+        params![
+            nonce.as_slice(),
+            account_id.to_bytes().as_slice(),
+            stream_id.as_slice(),
+            expires_at_ms,
+            now_ms,
+        ],
+    )
+    .map_err(|error| InviteError::Storage(error.into()))?;
+    tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
+    Ok(InviteTicket {
+        kind: InviteTicketKind::Writer,
+        account_id,
+        inviter_node_id,
+        relay_url,
+        nonce,
+        expires_at_ms,
+    })
+}
+
+/// Redeem a WRITER invite on the owner side: author the `StreamGrant` naming the contributor and
+/// consume the nonce, atomically — a failed authoring rolls back with the nonce intact. A replay
+/// of the SAME redemption (nonce + contributor) inside the retention window returns the same
+/// receipt, so a dialer that lost the response can retry; any other reuse refuses `Used`.
+pub fn redeem_writer_invite(
+    conn: &Connection,
+    request: &WriterGrantRequest,
+    authenticated_remote_node: [u8; 32],
+    now_ms: &dyn Fn() -> i64,
+) -> Result<WriterGrantReceipt, InviteError> {
+    // Reject random unauthenticated nonces without the database-wide writer reservation; a valid
+    // candidate is re-read after BEGIN IMMEDIATE below (mirrors [`redeem_invite`]).
+    let Some(invite) = stored_invite(conn, request.nonce)? else {
+        return Err(InviteError::Unknown);
+    };
+    if let Some(receipt) = writer_replay_receipt(conn, &invite, request)? {
+        return Ok(receipt);
+    }
+    writer_redeem_preflight(&invite, request, now_ms())?;
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| InviteError::Storage(error.into()))?;
+    let commit_ms = now_ms();
+    let Some(invite) = stored_invite(&tx, request.nonce)? else {
+        return Err(InviteError::Unknown);
+    };
+    if let Some(receipt) = writer_replay_receipt(&tx, &invite, request)? {
+        return Ok(receipt);
+    }
+    writer_redeem_preflight(&invite, request, commit_ms)?;
+    prune_expired_invites_in_tx(&tx, commit_ms)?;
+    let account_id = stored_invite_account(&invite)?;
+    if read_local_account(&tx)
+        .map_err(InviteError::from)?
+        .filter(|local| *local == account_id)
+        .is_none()
+    {
+        return Err(InviteError::Storage(anyhow::anyhow!(
+            "invite account is not the local account"
+        )));
+    }
+    let stream_id = writer_invite_stream(&invite)?;
+    let grant_id = rag_rat_oplog::author_stream_grant_in_tx(
+        &tx,
+        rag_rat_oplog::StreamId::from_bytes(stream_id),
+        request.contributor_account,
+        rag_rat_oplog::GrantRole::Writer,
+        commit_ms,
+    )
+    .map_err(|error| InviteError::Storage(anyhow::anyhow!("authoring the grant: {error:#}")))?;
+    tx.execute(
+        "UPDATE sync_invites SET used_at_ms = ?2, used_transport_node = ?3, receipt_hash = ?4
+         WHERE nonce = ?1",
+        params![
+            request.nonce.as_slice(),
+            commit_ms,
+            authenticated_remote_node.as_slice(),
+            grant_id.as_slice(),
+        ],
+    )
+    .map_err(|error| InviteError::Storage(error.into()))?;
+    tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
+    Ok(WriterGrantReceipt { grant_id, stream_id })
+}
+
+/// The deterministic writer-redemption refusals, evaluated identically before and inside the
+/// writer transaction: role/account binding, self-grant, and expiry. Replay is handled
+/// separately — a used nonce reaches here only when it is NOT a same-redemption replay.
+fn writer_redeem_preflight(
+    invite: &StoredInvite,
+    request: &WriterGrantRequest,
+    now_ms: i64,
+) -> Result<(), InviteError> {
+    // An enrollment nonce presented to the grant flow is as unknown as a random one — do not
+    // leak which flow a guessed nonce belongs to.
+    if invite.role != "writer" {
+        return Err(InviteError::Unknown);
+    }
+    if request.expected_account != stored_invite_account(invite)? {
+        return Err(InviteError::AccountMismatch);
+    }
+    // The fold rejects a self-grant as ineffective; refusing it here keeps the nonce alive
+    // instead of burning the exchange on an authoring failure.
+    if request.contributor_account == stored_invite_account(invite)? {
+        return Err(InviteError::AccountMismatch);
+    }
+    if invite.used_at_ms.is_some() {
+        return Err(InviteError::Used);
+    }
+    if now_ms >= invite.expires_at_ms {
+        return Err(InviteError::Expired);
+    }
+    Ok(())
+}
+
+/// The stream a writer invite grants on — `Some` exactly for writer rows by the V116 CHECK.
+fn writer_invite_stream(invite: &StoredInvite) -> Result<[u8; 32], InviteError> {
+    invite
+        .stream_id
+        .as_deref()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| InviteError::Storage(anyhow::anyhow!("writer invite has no stream id")))
+}
+
+/// Same-redemption replay: the nonce was consumed, and the grant it authored names exactly this
+/// contributor — return the original receipt so a dialer that lost the response can retry within
+/// the retention window. Any other contributor gets `Used` from the preflight.
+fn writer_replay_receipt(
+    conn: &Connection,
+    invite: &StoredInvite,
+    request: &WriterGrantRequest,
+) -> Result<Option<WriterGrantReceipt>, InviteError> {
+    if invite.role != "writer" || invite.used_at_ms.is_none() {
+        return Ok(None);
+    }
+    let Some(grant_id) =
+        invite.receipt_hash.as_deref().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+    else {
+        return Ok(None);
+    };
+    let grantee: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT grantee_account_id FROM account_stream_grants WHERE grant_id = ?1",
+            [grant_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| InviteError::Storage(error.into()))?;
+    if grantee.as_deref() != Some(request.contributor_account.to_bytes().as_slice()) {
+        return Ok(None);
+    }
+    Ok(Some(WriterGrantReceipt { grant_id, stream_id: writer_invite_stream(invite)? }))
+}
+
+/// The contributor half of the writer exchange, over an open enrollment-ALPN stream.
+pub async fn run_writer_grant_dialer<R, W>(
+    recv: &mut R,
+    send: &mut W,
+    ticket: &InviteTicket,
+    contributor_account: AccountId,
+) -> Result<WriterGrantReceipt, InviteError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    ticket.expect_kind(InviteTicketKind::Writer)?;
+    let request = WriterGrantRequest {
+        nonce: ticket.nonce,
+        expected_account: ticket.account_id,
+        contributor_account,
+    };
+    let progress = ENROLL_UNAUTH_PROGRESS_TIMEOUT;
+    write_blob(send, &request.encode(), MAX_ENROLL_REQUEST_FRAME, "grant request", progress)
+        .await?;
+    let response = WriterGrantResponse::decode(
+        &read_blob(recv, MAX_ENROLL_RESPONSE_FRAME, "grant response", progress).await?,
+    )?;
+    // Ack before post-processing, exactly as enrollment does, so the acceptor can close.
+    let ack_window = progress.min(RESPONSE_ACK_TIMEOUT);
+    if write_within(send, &[RESPONSE_ACK], ack_window).await.is_ok() {
+        let _ = flush_within(send, ack_window).await;
+    }
+    match response {
+        WriterGrantResponse::Granted(receipt) => Ok(receipt),
+        WriterGrantResponse::Refused(code) => Err(code.into_error()),
+    }
 }
 
 pub fn redeem_invite(
@@ -793,7 +1200,7 @@ pub fn redeem_invite(
 
 fn stored_invite(conn: &Connection, nonce: [u8; 32]) -> Result<Option<StoredInvite>, InviteError> {
     conn.query_row(
-        "SELECT account_id, role, label, expires_at_ms, used_at_ms,
+        "SELECT account_id, role, stream_id, label, expires_at_ms, used_at_ms,
                 used_transport_node, used_ed25519_pubkey, used_x25519_pubkey,
                 receipt_hash, receipt_signed, receipt_entries, receipt_bytes
            FROM sync_invites WHERE nonce = ?1",
@@ -802,16 +1209,17 @@ fn stored_invite(conn: &Connection, nonce: [u8; 32]) -> Result<Option<StoredInvi
             Ok(StoredInvite {
                 account_bytes: row.get(0)?,
                 role: row.get(1)?,
-                label: row.get(2)?,
-                expires_at_ms: row.get(3)?,
-                used_at_ms: row.get(4)?,
-                used_transport_node: row.get(5)?,
-                used_ed25519_pubkey: row.get(6)?,
-                used_x25519_pubkey: row.get(7)?,
-                receipt_hash: row.get(8)?,
-                receipt_signed: row.get(9)?,
-                receipt_entries: row.get(10)?,
-                receipt_bytes: row.get(11)?,
+                stream_id: row.get(2)?,
+                label: row.get(3)?,
+                expires_at_ms: row.get(4)?,
+                used_at_ms: row.get(5)?,
+                used_transport_node: row.get(6)?,
+                used_ed25519_pubkey: row.get(7)?,
+                used_x25519_pubkey: row.get(8)?,
+                receipt_hash: row.get(9)?,
+                receipt_signed: row.get(10)?,
+                receipt_entries: row.get(11)?,
+                receipt_bytes: row.get(12)?,
             })
         },
     )
@@ -999,9 +1407,39 @@ where
     // accept loop stays in seconds. The enrolled receipt — gated on a valid nonce — gets the
     // full progress window.
     let unauth = progress.min(ENROLL_UNAUTH_PROGRESS_TIMEOUT);
-    let request = EnrollmentRequest::decode(
-        &read_blob(recv, MAX_ENROLL_REQUEST_FRAME, "request", unauth).await?,
-    )?;
+    let blob = read_blob(recv, MAX_ENROLL_REQUEST_FRAME, "request", unauth).await?;
+    // The enrollment ALPN carries BOTH redemption kinds; the request's leading domain string
+    // picks the flow, so one serve loop redeems pairings and writer invites alike.
+    if request_blob_domain(&blob) == Some(GRANT_REQUEST_DOMAIN) {
+        let request = WriterGrantRequest::decode(&blob)?;
+        return match redeem_writer_invite(conn, &request, authenticated_remote_node, &now_ms) {
+            Ok(receipt) => {
+                write_blob(
+                    send,
+                    &WriterGrantResponse::Granted(receipt.clone()).encode(),
+                    MAX_ENROLL_RESPONSE_FRAME,
+                    "grant response",
+                    unauth,
+                )
+                .await?;
+                Ok(EnrollmentAcceptorOutcome::WriterGranted(receipt))
+            },
+            Err(error) if refusal_code(&error).is_some() => {
+                let code = refusal_code(&error).expect("guarded above");
+                write_blob(
+                    send,
+                    &WriterGrantResponse::Refused(code).encode(),
+                    MAX_ENROLL_RESPONSE_FRAME,
+                    "grant response",
+                    unauth,
+                )
+                .await?;
+                Ok(EnrollmentAcceptorOutcome::Refused(error))
+            },
+            Err(error) => Err(error),
+        };
+    }
+    let request = EnrollmentRequest::decode(&blob)?;
     // Evaluate expiry only after the complete peer-controlled request arrives. A timestamp read
     // before this await would let a peer hold the stream open past expiry and still redeem.
     match redeem_invite(conn, request, authenticated_remote_node, &now_ms) {
@@ -1094,6 +1532,14 @@ where
         },
         EnrollmentResponse::Refused(code) => Err(code.into_error()),
     }
+}
+
+/// The leading domain string of a request blob, if it parses far enough to have one — the
+/// acceptor's flow dispatch. Full validation stays with each request's own decoder.
+fn request_blob_domain(bytes: &[u8]) -> Option<&str> {
+    let mut dec = Decoder::new(bytes);
+    dec.array().ok()??;
+    dec.str().ok()
 }
 
 fn refusal_code(error: &InviteError) -> Option<RefusalCode> {
@@ -1290,7 +1736,7 @@ mod tests {
         .unwrap()
     }
 
-    fn ticket(conn: &Connection, account: AccountId, role: DeviceRole) -> EnrollmentTicket {
+    fn ticket(conn: &Connection, account: AccountId, role: DeviceRole) -> InviteTicket {
         mint_invite(conn, InviteSpec {
             account_id: account,
             inviter_node_id: crate::endpoint::node_id_from_secret([2; 32]),
@@ -1310,8 +1756,9 @@ mod tests {
             .expect("random-looking bytes include an invalid compressed Edwards point")
     }
 
-    fn sample_ticket() -> EnrollmentTicket {
-        EnrollmentTicket {
+    fn sample_ticket() -> InviteTicket {
+        InviteTicket {
+            kind: InviteTicketKind::Pairing,
             account_id: AccountId::from_bytes([9u8; 32]),
             inviter_node_id: crate::endpoint::node_id_from_secret([7u8; 32]),
             relay_url: "https://relay.example".into(),
@@ -1324,44 +1771,47 @@ mod tests {
     fn ticket_string_round_trips_through_the_scheme_tag() {
         let ticket = sample_ticket();
         let s = ticket.to_ticket_string();
-        assert!(s.starts_with("ragrat-invite-"), "the scheme tag prefixes the string: {s}");
-        assert_eq!(EnrollmentTicket::from_ticket_string(&s).unwrap(), ticket);
+        assert!(s.starts_with("ragratinvite"), "the kind prefix opens the string: {s}");
+        assert!(
+            s[..].chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "the canonical form is lowercase base32 after the prefix: {s}",
+        );
+        assert_eq!(InviteTicket::from_ticket_string(&s).unwrap(), ticket);
         assert_eq!(
-            EnrollmentTicket::from_ticket_string(&format!("  {s}\n")).unwrap(),
+            InviteTicket::from_ticket_string(&format!("  {s}\n")).unwrap(),
             ticket,
             "surrounding whitespace on a pasted line is tolerated",
         );
     }
 
     #[test]
-    fn ticket_string_rejects_a_missing_tag_and_corrupt_hex() {
+    fn ticket_string_rejects_a_missing_tag_and_corrupt_body() {
         let ticket = sample_ticket();
         let s = ticket.to_ticket_string();
-        let hex = s.strip_prefix("ragrat-invite-").unwrap();
+        let body = s.strip_prefix("ragratinvite").unwrap();
         assert!(
-            matches!(EnrollmentTicket::from_ticket_string(hex), Err(InviteError::Malformed(_))),
-            "the bare hex without the scheme tag is refused",
+            matches!(InviteTicket::from_ticket_string(body), Err(InviteError::Malformed(_))),
+            "the bare base32 without the kind prefix is refused",
         );
         assert!(
             matches!(
-                EnrollmentTicket::from_ticket_string("ragrat-invite-abc"),
+                InviteTicket::from_ticket_string("ragratinvite0189"),
                 Err(InviteError::Malformed(_))
             ),
-            "an odd-length hex body is refused",
-        );
-        assert!(
-            matches!(
-                EnrollmentTicket::from_ticket_string("ragrat-invite-zz"),
-                Err(InviteError::Malformed(_))
-            ),
-            "a non-hex body is refused",
+            "a non-base32 body is refused",
         );
         let mut truncated = s.clone();
         truncated.truncate(s.len() - 2);
         assert!(
-            EnrollmentTicket::from_ticket_string(&truncated).is_err(),
-            "dropping a CBOR byte fails the canonical-shape check",
+            InviteTicket::from_ticket_string(&truncated).is_err(),
+            "dropping bytes fails the canonical-shape check",
         );
+        // The wrong-kind diagnosis names the command that accepts the paste.
+        let writer = InviteTicket { kind: InviteTicketKind::Writer, ..sample_ticket() };
+        let err = writer.expect_kind(InviteTicketKind::Pairing).unwrap_err().to_string();
+        assert!(err.contains("sync contribute"), "{err}");
+        let err = sample_ticket().expect_kind(InviteTicketKind::Writer).unwrap_err().to_string();
+        assert!(err.contains("sync join"), "{err}");
     }
 
     /// A budget no honest redemption can exceed, for tests that are not exercising the capacity
@@ -1441,21 +1891,21 @@ mod tests {
         let account = rag_rat_oplog::local_account(&conn, NOW).unwrap();
         let ticket = ticket(&conn, account, DeviceRole::ReadOnly);
         let bytes = ticket.encode();
-        assert_eq!(EnrollmentTicket::decode(&bytes).unwrap(), ticket);
+        assert_eq!(InviteTicket::decode(&bytes).unwrap(), ticket);
 
         let mut trailing = bytes;
         trailing.push(0);
-        assert!(matches!(EnrollmentTicket::decode(&trailing), Err(InviteError::Malformed(_))));
+        assert!(matches!(InviteTicket::decode(&trailing), Err(InviteError::Malformed(_))));
 
         let invalid_node =
-            EnrollmentTicket { inviter_node_id: invalid_endpoint_id(), ..ticket.clone() };
+            InviteTicket { inviter_node_id: invalid_endpoint_id(), ..ticket.clone() };
         assert!(matches!(
-            EnrollmentTicket::decode(&invalid_node.encode()),
+            InviteTicket::decode(&invalid_node.encode()),
             Err(InviteError::Malformed(message)) if message.contains("node id")
         ));
-        let invalid_relay = EnrollmentTicket { relay_url: "not a relay URL".into(), ..ticket };
+        let invalid_relay = InviteTicket { relay_url: "not a relay URL".into(), ..ticket };
         assert!(matches!(
-            EnrollmentTicket::decode(&invalid_relay.encode()),
+            InviteTicket::decode(&invalid_relay.encode()),
             Err(InviteError::Malformed(message)) if message.contains("relay URL")
         ));
     }
@@ -2226,6 +2676,167 @@ mod tests {
         };
         let (replayed, _) = redeem_invite(&conn, request, [9; 32], &|| NOW + 2).unwrap();
         assert_eq!(replayed, receipt);
+    }
+
+    /// An owner store holding a published PublicRead stream, with a minted writer invite — the
+    /// state `sync invite-writer` leaves behind while it serves.
+    fn writer_fixture() -> (Connection, AccountId, [u8; 32], InviteTicket) {
+        let conn = db();
+        let account = rag_rat_oplog::local_account(&conn, NOW).unwrap();
+        let stream = {
+            let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            let stream = rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(
+                &tx,
+                "repo-w",
+                rag_rat_oplog::AccessMode::PublicRead,
+                NOW,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            stream.to_bytes()
+        };
+        let ticket = mint_writer_invite(&conn, WriterInviteSpec {
+            account_id: account,
+            stream_id: stream,
+            inviter_node_id: crate::endpoint::node_id_from_secret([2; 32]),
+            relay_url: "https://relay.example".into(),
+            now_ms: &|| NOW,
+            ttl: Duration::from_secs(60),
+        })
+        .unwrap();
+        (conn, account, stream, ticket)
+    }
+
+    #[tokio::test]
+    async fn a_writer_invite_redeems_over_the_wire_and_replays_for_the_same_contributor() {
+        let (conn, account, stream, ticket) = writer_fixture();
+        assert_eq!(ticket.kind, InviteTicketKind::Writer);
+        let contributor = AccountId::from_bytes([0x77; 32]);
+
+        let (mut dial_send, mut accept_recv) = tokio::io::duplex(4096);
+        let (mut accept_send, mut dial_recv) = tokio::io::duplex(4096);
+        let (dial, accept) = tokio::join!(
+            run_writer_grant_dialer(&mut dial_recv, &mut dial_send, &ticket, contributor),
+            run_enrollment_acceptor(&mut accept_recv, &mut accept_send, &conn, [9; 32], || NOW + 1,),
+        );
+        let receipt = dial.expect("the redemption grants");
+        assert_eq!(receipt.stream_id, stream, "the receipt names the granted stream");
+        assert!(matches!(accept, Ok(EnrollmentAcceptorOutcome::WriterGranted(_))));
+        assert_eq!(
+            rag_rat_oplog::effective_writer_grant(
+                &conn,
+                account,
+                rag_rat_oplog::StreamId::from_bytes(stream),
+                contributor,
+            )
+            .unwrap(),
+            Some(receipt.grant_id),
+            "the grant folds effective for the contributor",
+        );
+
+        // The SAME redemption replays (a dialer that lost the response can retry) without a
+        // second grant...
+        let request = WriterGrantRequest {
+            nonce: ticket.nonce,
+            expected_account: account,
+            contributor_account: contributor,
+        };
+        let replayed = redeem_writer_invite(&conn, &request, [9; 32], &|| NOW + 2).unwrap();
+        assert_eq!(replayed.grant_id, receipt.grant_id);
+        assert_eq!(
+            rag_rat_oplog::open_writer_grants(
+                &conn,
+                account,
+                rag_rat_oplog::StreamId::from_bytes(stream),
+                contributor,
+            )
+            .unwrap()
+            .len(),
+            1,
+            "replay authors nothing new",
+        );
+        // ...while ANY other contributor finds the nonce spent.
+        let other = WriterGrantRequest {
+            contributor_account: AccountId::from_bytes([0x88; 32]),
+            ..request
+        };
+        assert!(matches!(
+            redeem_writer_invite(&conn, &other, [9; 32], &|| NOW + 2),
+            Err(InviteError::Used)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_writer_dialer_refuses_a_pairing_ticket_by_name() {
+        let conn = db();
+        let account = rag_rat_oplog::local_account(&conn, NOW).unwrap();
+        let pairing = ticket(&conn, account, DeviceRole::Member);
+        let (mut dial_send, _accept_recv) = tokio::io::duplex(1024);
+        let (_accept_send, mut dial_recv) = tokio::io::duplex(1024);
+        let err = run_writer_grant_dialer(
+            &mut dial_recv,
+            &mut dial_send,
+            &pairing,
+            AccountId::from_bytes([0x77; 32]),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sync join"), "the wrong kind names its command: {err}");
+    }
+
+    #[test]
+    fn writer_redemption_preflight_refusals_are_deterministic() {
+        let (conn, account, _stream, writer_ticket) = writer_fixture();
+        let contributor = AccountId::from_bytes([0x77; 32]);
+
+        // An enrollment nonce presented to the grant flow is as unknown as a random one.
+        let pairing = ticket(&conn, account, DeviceRole::Member);
+        let cross_flow = WriterGrantRequest {
+            nonce: pairing.nonce,
+            expected_account: account,
+            contributor_account: contributor,
+        };
+        assert!(matches!(
+            redeem_writer_invite(&conn, &cross_flow, [9; 32], &|| NOW + 1),
+            Err(InviteError::Unknown)
+        ));
+
+        // A self-grant is refused before the nonce is consumed.
+        let self_grant = WriterGrantRequest {
+            nonce: writer_ticket.nonce,
+            expected_account: account,
+            contributor_account: account,
+        };
+        assert!(matches!(
+            redeem_writer_invite(&conn, &self_grant, [9; 32], &|| NOW + 1),
+            Err(InviteError::AccountMismatch)
+        ));
+
+        // A wrong expected account is refused.
+        let wrong_owner = WriterGrantRequest {
+            nonce: writer_ticket.nonce,
+            expected_account: AccountId::from_bytes([0x55; 32]),
+            contributor_account: contributor,
+        };
+        assert!(matches!(
+            redeem_writer_invite(&conn, &wrong_owner, [9; 32], &|| NOW + 1),
+            Err(InviteError::AccountMismatch)
+        ));
+
+        // Expiry, evaluated at redemption time — and the unburned nonce still redeems within TTL.
+        let request = WriterGrantRequest {
+            nonce: writer_ticket.nonce,
+            expected_account: account,
+            contributor_account: contributor,
+        };
+        assert!(matches!(
+            redeem_writer_invite(&conn, &request, [9; 32], &|| NOW + 120_000),
+            Err(InviteError::Expired)
+        ));
+        redeem_writer_invite(&conn, &request, [9; 32], &|| NOW + 1)
+            .expect("the refusals above consumed nothing");
     }
 
     #[tokio::test]

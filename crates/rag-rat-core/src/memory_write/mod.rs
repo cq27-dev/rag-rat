@@ -24,8 +24,8 @@ pub(crate) use api::{create_memory, mark_obsolete, rebind_memory, update_memory}
 pub(crate) use authoring::backfill_memory_oplog;
 pub(crate) use authoring::{
     RepoGrantListing, RepoRevokeReport, catch_up_enrolled_device_keys, enable_public_authoring,
-    enable_sealed_authoring, grant_repo_writer, list_repo_grants, revoke_repo_writer,
-    set_contribution_owner,
+    enable_sealed_authoring, grant_repo_writer, list_repo_grants, published_grant_target,
+    revoke_repo_writer, set_contribution_owner,
 };
 // The scope-explicit reconcile entry (#541): `authoring` is a PRIVATE module, so
 // `index::consolidate` names this through this re-export (Task 5 of #541).

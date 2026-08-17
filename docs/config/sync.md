@@ -163,6 +163,43 @@ its own device sync (a host serves only its own account, so dialing it there cou
 succeed). Removing a host from `server_peers` stops all dialing to it, including remembered
 cross-account pulls.
 
+## Sharing a repo's memories across accounts
+
+Everything above replicates ONE account between its own devices. Sharing a repo's memories with a
+**teammate** — a separate identity, on a machine you do not control — is a different arrangement:
+the repo has one **owner** account whose stream holds the shared set, and any number of granted
+**contributors** whose memory writes target that stream.
+
+The short version, one ticket end to end:
+
+```bash
+# Owner, once: make the repo's memory stream public, then stay online with a one-time invite
+rag-rat sync publish
+rag-rat sync invite-writer          # prints ragratinvite… and keeps serving
+
+# Teammate, in a checkout of the same repo:
+rag-rat sync contribute <ticket>
+```
+
+Redeeming the ticket does the whole exchange the old two-paste flow left half-finished: the owner
+authors the Writer grant naming the teammate's account at redemption (no account ids change
+hands by chat), the teammate's store pulls the owner's log over the same route so the grant takes
+effect locally, and contribution is configured — subsequent `memory_create`/`memory_update` in
+that checkout author onto the owner's stream. The ticket is single-use and expires (15 minutes by
+default); pasting it into the wrong command says so by name, exactly like a pairing ticket.
+
+For ongoing automatic sync in both directions, each side pins the other's serving host in
+`[sync] server_peers` (memories travel by AUTHOR: the owner collects a contributor's entries by
+syncing the CONTRIBUTOR's account, and vice versa — see the cross-account note under
+`server_peers`). The pieces are also available separately when a ticket exchange is impractical:
+`sync whoami` (the id to grant), `sync grant <id>` (owner side), `sync contribute <owner-id>` +
+`sync pull <owner-id>` (teammate side).
+
+The owner stays in charge afterwards: `sync grants` lists who holds access, open and revoked, and
+`sync revoke <account> --reason …` closes it — `departed`/`rotated`/`superseded` keep the work
+this store has already accepted, `compromised` quarantines everything the grantee authored
+(`--keep-until <seq>@<device>` can carve one vouched prefix back in).
+
 ## What each service learns
 
 - **The relay** forwards opaque encrypted QUIC traffic between peers.

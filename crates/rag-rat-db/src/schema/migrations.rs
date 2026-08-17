@@ -8423,6 +8423,94 @@ pub(crate) fn apply_refold_account_authority_projections(
     Ok(())
 }
 
+/// V116 (#1179): rebuild `sync_invites` for cross-account WRITER invites.
+///
+/// A writer invite mints before the grantee account is known — the `StreamGrant` is authored at
+/// redemption — so the row carries the target `stream_id` instead of enrollment state, and the
+/// used-columns invariant branches by role: an enrollment redemption records the joining device's
+/// keys and its receipt, a writer redemption records the dialing transport node and the authored
+/// grant id (in `receipt_hash`). Invites are ephemeral (nonce + expiry), so the copy is
+/// best-effort continuity, not a compatibility surface.
+pub(crate) fn apply_writer_invites(conn: &Connection) -> rusqlite::Result<()> {
+    if column_exists(conn, "sync_invites", "stream_id")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS sync_invites_v116;
+         CREATE TABLE sync_invites_v116(
+             nonce         BLOB    NOT NULL PRIMARY KEY CHECK(length(nonce) = 32),
+             account_id    BLOB    NOT NULL CHECK(length(account_id) = 32),
+             role          TEXT    NOT NULL CHECK(role IN ('read_only', 'member', 'owner',
+                                                           'writer')),
+             -- The stream a WRITER invite grants on, resolved at mint (the acceptor serves the
+             -- whole store and has no repo scope at redemption). Exactly the writer rows carry
+             -- it.
+             stream_id     BLOB    CHECK(stream_id IS NULL OR length(stream_id) = 32),
+             label         TEXT,
+             expires_at_ms INTEGER NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             used_at_ms    INTEGER,
+             used_transport_node BLOB CHECK(
+                 used_transport_node IS NULL OR length(used_transport_node) = 32
+             ),
+             used_ed25519_pubkey BLOB CHECK(
+                 used_ed25519_pubkey IS NULL OR length(used_ed25519_pubkey) = 32
+             ),
+             used_x25519_pubkey BLOB CHECK(
+                 used_x25519_pubkey IS NULL OR length(used_x25519_pubkey) = 32
+             ),
+             receipt_hash BLOB CHECK(receipt_hash IS NULL OR length(receipt_hash) = 32),
+             receipt_signed BLOB,
+             receipt_entries BLOB CHECK(
+                 receipt_entries IS NULL OR length(receipt_entries) % 32 = 0
+             ),
+             receipt_bytes BLOB,
+             CHECK((role = 'writer') = (stream_id IS NOT NULL)),
+             CHECK(
+                 (used_at_ms IS NULL
+                  AND used_transport_node IS NULL
+                  AND used_ed25519_pubkey IS NULL
+                  AND used_x25519_pubkey IS NULL
+                  AND receipt_hash IS NULL
+                  AND receipt_signed IS NULL
+                  AND receipt_entries IS NULL
+                  AND receipt_bytes IS NULL)
+                 OR
+                 (role = 'writer'
+                  AND used_at_ms IS NOT NULL
+                  AND used_transport_node IS NOT NULL
+                  AND used_ed25519_pubkey IS NULL
+                  AND used_x25519_pubkey IS NULL
+                  AND receipt_hash IS NOT NULL
+                  AND receipt_signed IS NULL
+                  AND receipt_entries IS NULL
+                  AND receipt_bytes IS NULL)
+                 OR
+                 (role != 'writer'
+                  AND used_at_ms IS NOT NULL
+                  AND used_transport_node IS NOT NULL
+                  AND used_ed25519_pubkey IS NOT NULL
+                  AND used_x25519_pubkey IS NOT NULL
+                  AND receipt_hash IS NOT NULL
+                  AND receipt_signed IS NOT NULL
+                  AND (receipt_entries IS NOT NULL OR receipt_bytes IS NOT NULL))
+              )
+         ) STRICT;
+         INSERT INTO sync_invites_v116(
+             nonce, account_id, role, stream_id, label, expires_at_ms, created_at_ms,
+             used_at_ms, used_transport_node, used_ed25519_pubkey, used_x25519_pubkey,
+             receipt_hash, receipt_signed, receipt_entries, receipt_bytes)
+         SELECT nonce, account_id, role, NULL, label, expires_at_ms, created_at_ms,
+             used_at_ms, used_transport_node, used_ed25519_pubkey, used_x25519_pubkey,
+             receipt_hash, receipt_signed, receipt_entries, receipt_bytes
+         FROM sync_invites;
+         DROP TABLE sync_invites;
+         ALTER TABLE sync_invites_v116 RENAME TO sync_invites;
+         CREATE INDEX IF NOT EXISTS sync_invites_account_expiry
+             ON sync_invites(account_id, expires_at_ms);",
+    )
+}
+
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
     let mut stmt =
         conn.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?;

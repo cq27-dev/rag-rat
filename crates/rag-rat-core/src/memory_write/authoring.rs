@@ -1026,27 +1026,40 @@ pub(crate) fn catch_up_enrolled_device_keys(
 /// requires a PUBLISHED (public_read) repo — a grant on a private stream would need stream-key
 /// wraps to the grantee, which is out of scope. Returns the grant id. Mirrors the catch-up seam's
 /// resolve-then- re-check-under-lock discipline.
+/// Resolve the active repo's published grant target — the checks every grant-shaped operation
+/// (`sync grant`, `sync invite-writer`) shares: a stable repo identity, the publish ratchet
+/// flipped, and an established `PublicRead` owner stream.
+pub(crate) fn published_grant_target(
+    conn: &Connection,
+    operation: &str,
+) -> anyhow::Result<(String, rag_rat_oplog::StreamId)> {
+    let repo_id = memory_repo_scope(conn)?
+        .with_context(|| format!("{operation} requires an active repo scope"))?;
+    if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
+        || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
+    {
+        anyhow::bail!("{operation} requires a stable repo identity (not legacy or local-only)");
+    }
+    let mode = owner_stream_access_mode(conn, &repo_id)?;
+    anyhow::ensure!(
+        mode == rag_rat_oplog::AccessMode::PublicRead,
+        "{operation} requires a published repo — run `sync publish` first (granting a writer on a \
+         private stream is not yet supported: the grantee would need stream-key wraps)"
+    );
+    let stream = rag_rat_oplog::established_owned_stream_v2_with_mode(conn, &repo_id, mode)?
+        .with_context(|| {
+            format!("{operation} requires an established owner stream for active repo `{repo_id}`")
+        })?;
+    Ok((repo_id, stream))
+}
+
 pub(crate) fn grant_repo_writer(
     conn: &Connection,
     grantee_account_id: rag_rat_oplog::AccountId,
     now_ms: i64,
 ) -> anyhow::Result<[u8; 32]> {
-    let repo_id = memory_repo_scope(conn)?.context("sync grant requires an active repo scope")?;
-    if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
-        || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
-    {
-        anyhow::bail!("sync grant requires a stable repo identity (not legacy or local-only)");
-    }
+    let (repo_id, stream) = published_grant_target(conn, "sync grant")?;
     let mode = owner_stream_access_mode(conn, &repo_id)?;
-    anyhow::ensure!(
-        mode == rag_rat_oplog::AccessMode::PublicRead,
-        "sync grant requires a published repo — run `sync publish` first (granting a writer on a \
-         private stream is not yet supported: the grantee would need stream-key wraps)"
-    );
-    let stream = rag_rat_oplog::established_owned_stream_v2_with_mode(conn, &repo_id, mode)?
-        .with_context(|| {
-            format!("sync grant requires an established owner stream for active repo `{repo_id}`")
-        })?;
 
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;

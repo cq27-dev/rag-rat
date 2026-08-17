@@ -37,6 +37,14 @@ impl MemoryDrainEffects {
     }
 }
 
+/// The active repo's published `PublicRead` owner stream — the target a WRITER invite grants on,
+/// resolved at MINT time (the serving acceptor has no repo scope at redemption). Shares the
+/// grant path's checks: stable repo identity, publish ratchet flipped, stream established.
+pub fn writer_invite_stream_target(conn: &rusqlite::Connection) -> anyhow::Result<[u8; 32]> {
+    let (_, stream) = memory_write::published_grant_target(conn, "sync invite-writer")?;
+    Ok(stream.to_bytes())
+}
+
 pub fn drain_synced_memory(conn: &rusqlite::Connection) -> anyhow::Result<MemoryDrainEffects> {
     let now = rag_rat_base::time::now_ms();
     rag_rat_oplog::settle_pending_content_refolds(
