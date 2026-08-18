@@ -1325,6 +1325,12 @@ fn reject_unauthorable_content_op(op: &MemoryOp, policy: StreamSealPolicy) -> an
              signed-entry cap — shorten the target anchor / target repo id",
             edge.source_node_id.as_str()
         ),
+        MemoryOp::NodeAnchors { node_id, anchors } => anyhow::bail!(
+            "memory `{}` has too many or too large anchors to store: its {} bindings exceed the \
+             256 KiB signed-entry cap — reduce the number of bindings, or shorten their paths",
+            node_id.as_str(),
+            anchors.len()
+        ),
         // NodeStatus / EdgeRemove / Rebind carry no unbounded free-form field and cannot exceed the
         // cap; this arm keeps the guard total over the op vocabulary.
         _ => anyhow::bail!(

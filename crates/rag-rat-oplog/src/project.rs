@@ -129,6 +129,11 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                 // Re-resolves the local anchor only — never presence, never the key.
                 edges.entry(edge_key.clone()).or_default().resolved = Some(resolved.clone());
             },
+            // Inert here: this fold projects the node/edge registers, and an anchor set is a
+            // separate dimension whose projection lands with the column that stores it (#1209).
+            // Retaining the op without projecting it is the same posture an unknown kind gets, so
+            // a later binary re-folds the stream and picks the anchors up.
+            MemoryOp::NodeAnchors { .. } => {},
             // Inert boundary marker this increment (§5.4/C4).
             MemoryOp::Snapshot => {},
         }

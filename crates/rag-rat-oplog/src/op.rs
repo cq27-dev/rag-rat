@@ -259,6 +259,51 @@ pub struct ResolvedAnchor {
     pub anchor_status: String,
 }
 
+/// The portable half of one `repo_memory_bindings` row: the PK tail plus every column the
+/// `anchors/1` table scope replicates, and nothing checkout-local. The `(repo_id, memory_id)` half
+/// of that PK is context rather than payload — the repo being drained, and the op's own `node_id` —
+/// so it is not carried per anchor.
+///
+/// Field order mirrors the `anchors/1` spec: the PK tail, then its synced columns. Keeping the two
+/// readable against each other is the point; a column added to that scope has to be added here as a
+/// new op kind, since widening this one would break the byte-canonical identity below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortableAnchor {
+    pub binding_kind: String,
+    pub binding_id: String,
+    pub path: Option<String>,
+    pub start_line: Option<i64>,
+    pub end_line: Option<i64>,
+    pub commit_hash: Option<String>,
+    pub tracker: Option<String>,
+    pub project: Option<String>,
+    pub item_key: Option<String>,
+    pub created_at_ms: i64,
+    pub symbol_kind: Option<String>,
+    pub signature_hash: Option<String>,
+    pub moniker_tool: Option<String>,
+    pub moniker_tool_version: Option<String>,
+}
+
+impl PortableAnchor {
+    /// The row this anchor names — the half of the binding PK an anchor set is ordered and
+    /// deduplicated by. Deliberately NOT a derived `Ord` over the whole struct: two anchors sharing
+    /// an identity are a conflict to reject, not two distinct members to order by their payloads.
+    fn identity(&self) -> (&str, &str) {
+        (self.binding_kind.as_str(), self.binding_id.as_str())
+    }
+}
+
+/// The most anchors one `node_anchors` op may carry. A memory holds a handful of bindings in
+/// practice (its own, plus an auto-moniker), so this is a generous structural bound rather than a
+/// budget.
+///
+/// RAISING IT IS A FORMAT CHANGE. A binary that knows `node_anchors` hard-rejects an over-cap op,
+/// so an older peer would refuse an entry a newer one authored — the chain wedges rather than
+/// degrading. A larger limit ships as a NEW op kind, the same discipline `snapshot` documents for
+/// its payload.
+pub const MAX_ANCHORS_PER_OP: usize = 64;
+
 /// The frozen op set (§5.4 / §6.3). Each op mutates exactly one LWW register of one node/edge (see
 /// the fold), except `NodeCreate`, which also establishes existence.
 #[derive(Debug, Clone, PartialEq)]
@@ -275,6 +320,8 @@ pub enum MemoryOp {
     EdgeRemove { edge_key: EdgeKey },
     /// Re-resolve an edge's local anchor; NEVER mutates the `edge_key` or presence.
     Rebind { edge_key: EdgeKey, resolved: ResolvedAnchor },
+    /// A node's portable anchor set — a FULL-SET snapshot, never a delta.
+    NodeAnchors { node_id: NodeId, anchors: Vec<PortableAnchor> },
     /// A converged-state boundary marker; inert in the fold this increment (§5.4/C4).
     Snapshot,
 }
@@ -289,6 +336,7 @@ impl MemoryOp {
             Self::EdgeAdd { .. } => "edge_add",
             Self::EdgeRemove { .. } => "edge_remove",
             Self::Rebind { .. } => "rebind",
+            Self::NodeAnchors { .. } => "node_anchors",
             Self::Snapshot => "snapshot",
         }
     }
@@ -359,6 +407,11 @@ fn encode_payload(enc: &mut VecEncoder<'_>, op: &MemoryOp) {
             enc.str(edge_key.as_str()).expect(INFALLIBLE);
             encode_resolved(enc, resolved);
         },
+        MemoryOp::NodeAnchors { node_id, anchors } => {
+            enc.array(2).expect(INFALLIBLE);
+            enc.str(node_id.as_str()).expect(INFALLIBLE);
+            encode_anchors(enc, anchors);
+        },
         MemoryOp::Snapshot => {
             // Inert boundary marker: a strictly-null payload. A future snapshot that carries a
             // coverage manifest (§5.4/C4) is a NEW op kind — NOT a non-null payload under this kind
@@ -406,6 +459,49 @@ fn encode_resolved(enc: &mut VecEncoder<'_>, resolved: &ResolvedAnchor) {
     enc.str(&resolved.anchor_status).expect(INFALLIBLE);
 }
 
+/// Encode the anchor SET, ordered by identity so neither the caller's insertion sequence nor the
+/// query that produced it perturbs the canonical bytes — the rule `tags` already follows.
+///
+/// Duplicates are deliberately NOT deduped here. Two anchors sharing `(binding_kind, binding_id)`
+/// name one row twice, and the payload cannot say which of them wins; `decode` rejects that
+/// outright, and because these bytes then fail the `encode == bytes` identity check, a
+/// duplicate-carrying op can never round-trip through the wire.
+fn encode_anchors(enc: &mut VecEncoder<'_>, anchors: &[PortableAnchor]) {
+    let mut ordered: Vec<&PortableAnchor> = anchors.iter().collect();
+    ordered.sort_by(|a, b| a.identity().cmp(&b.identity()));
+    enc.array(ordered.len() as u64).expect(INFALLIBLE);
+    for anchor in ordered {
+        encode_anchor(enc, anchor);
+    }
+}
+
+fn encode_anchor(enc: &mut VecEncoder<'_>, anchor: &PortableAnchor) {
+    enc.array(14).expect(INFALLIBLE);
+    enc.str(&anchor.binding_kind).expect(INFALLIBLE);
+    enc.str(&anchor.binding_id).expect(INFALLIBLE);
+    encode_opt_str(enc, anchor.path.as_deref());
+    encode_opt_i64(enc, anchor.start_line);
+    encode_opt_i64(enc, anchor.end_line);
+    encode_opt_str(enc, anchor.commit_hash.as_deref());
+    encode_opt_str(enc, anchor.tracker.as_deref());
+    encode_opt_str(enc, anchor.project.as_deref());
+    encode_opt_str(enc, anchor.item_key.as_deref());
+    enc.i64(anchor.created_at_ms).expect(INFALLIBLE);
+    encode_opt_str(enc, anchor.symbol_kind.as_deref());
+    encode_opt_str(enc, anchor.signature_hash.as_deref());
+    encode_opt_str(enc, anchor.moniker_tool.as_deref());
+    encode_opt_str(enc, anchor.moniker_tool_version.as_deref());
+}
+
+/// Encode an optional integer as an integer item or CBOR `null` — the `encode_opt_str` rule for the
+/// nullable INTEGER columns (`start_line` / `end_line`), which a tracker binding leaves unset.
+fn encode_opt_i64(enc: &mut VecEncoder<'_>, value: Option<i64>) {
+    match value {
+        Some(number) => enc.i64(number).expect(INFALLIBLE),
+        None => enc.null().expect(INFALLIBLE),
+    };
+}
+
 /// Encode an optional string as a text item or CBOR `null` — a distinct, unambiguous absent marker.
 fn encode_opt_str(enc: &mut VecEncoder<'_>, value: Option<&str>) {
     match value {
@@ -449,6 +545,10 @@ fn decode_envelope(bytes: &[u8]) -> Result<DecodedOp, CborError> {
         "rebind" => {
             let (edge_key, resolved) = decode_rebind(&mut d)?;
             Some(MemoryOp::Rebind { edge_key, resolved })
+        },
+        "node_anchors" => {
+            let (node_id, anchors) = decode_node_anchors(&mut d)?;
+            Some(MemoryOp::NodeAnchors { node_id, anchors })
         },
         "snapshot" => {
             d.null()?;
@@ -541,6 +641,72 @@ fn decode_rebind(d: &mut Decoder<'_>) -> Result<(EdgeKey, ResolvedAnchor), CborE
     let edge_key = EdgeKey::from(d.str()?);
     let resolved = decode_resolved(d)?;
     Ok((edge_key, resolved))
+}
+
+fn decode_node_anchors(d: &mut Decoder<'_>) -> Result<(NodeId, Vec<PortableAnchor>), CborError> {
+    cbor::expect_array(d, 2)?;
+    let node_id = NodeId::from(d.str()?);
+    let anchors = decode_anchors(d)?;
+    Ok((node_id, anchors))
+}
+
+fn decode_anchors(d: &mut Decoder<'_>) -> Result<Vec<PortableAnchor>, CborError> {
+    let len = cbor::expect_definite_len(d)?;
+    // Judge the COUNT from the header before decoding a single element. The length is
+    // attacker-controlled, so this both bounds the work and stays clear of trusting it enough to
+    // preallocate — the `decode_str_array` rule.
+    if len > MAX_ANCHORS_PER_OP as u64 {
+        return Err(CborError::message(format!(
+            "node_anchors carries {len} anchors, over the {MAX_ANCHORS_PER_OP} limit"
+        )));
+    }
+    let mut out: Vec<PortableAnchor> = Vec::new();
+    for _ in 0..len {
+        let anchor = decode_anchor(d)?;
+        // Canonical SET order: strictly increasing by identity. One comparison rejects both an
+        // unsorted payload and a duplicated row identity — the latter names one row twice, and
+        // nothing in the op says which of the two should win.
+        if let Some(previous) = out.last()
+            && previous.identity() >= anchor.identity()
+        {
+            return Err(CborError::message(
+                "node_anchors must be strictly increasing by (binding_kind, binding_id)",
+            ));
+        }
+        out.push(anchor);
+    }
+    Ok(out)
+}
+
+fn decode_anchor(d: &mut Decoder<'_>) -> Result<PortableAnchor, CborError> {
+    cbor::expect_array(d, 14)?;
+    // Field order is the wire order; struct-literal fields evaluate top to bottom, so this reads
+    // the array in the sequence `encode_anchor` wrote it.
+    Ok(PortableAnchor {
+        binding_kind: d.str()?.to_string(),
+        binding_id: d.str()?.to_string(),
+        path: decode_opt_str(d)?,
+        start_line: decode_opt_i64(d)?,
+        end_line: decode_opt_i64(d)?,
+        commit_hash: decode_opt_str(d)?,
+        tracker: decode_opt_str(d)?,
+        project: decode_opt_str(d)?,
+        item_key: decode_opt_str(d)?,
+        created_at_ms: d.i64()?,
+        symbol_kind: decode_opt_str(d)?,
+        signature_hash: decode_opt_str(d)?,
+        moniker_tool: decode_opt_str(d)?,
+        moniker_tool_version: decode_opt_str(d)?,
+    })
+}
+
+fn decode_opt_i64(d: &mut Decoder<'_>) -> Result<Option<i64>, CborError> {
+    if d.datatype()? == Type::Null {
+        d.null()?;
+        Ok(None)
+    } else {
+        Ok(Some(d.i64()?))
+    }
 }
 
 fn decode_resolved(d: &mut Decoder<'_>) -> Result<ResolvedAnchor, CborError> {
@@ -636,6 +802,66 @@ mod tests {
         }
     }
 
+    /// A symbol binding and a tracker binding: between them every nullable column is exercised in
+    /// both states, since neither shape populates the other's columns. Already in identity order —
+    /// encode canonicalizes, so a round-trip yields the sorted set.
+    fn anchors() -> Vec<PortableAnchor> {
+        vec![
+            PortableAnchor {
+                binding_kind: "symbol".to_string(),
+                binding_id: "crates/x/src/lib.rs::run".to_string(),
+                path: Some("crates/x/src/lib.rs".to_string()),
+                start_line: Some(10),
+                end_line: Some(20),
+                commit_hash: Some("c0ffee".to_string()),
+                tracker: None,
+                project: None,
+                item_key: None,
+                created_at_ms: 1_700_000_000_000,
+                symbol_kind: Some("function".to_string()),
+                signature_hash: Some("5ig".to_string()),
+                moniker_tool: Some("scip-rust".to_string()),
+                moniker_tool_version: Some("0.3".to_string()),
+            },
+            PortableAnchor {
+                binding_kind: "tracker".to_string(),
+                binding_id: "github:owner/repo#7".to_string(),
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                tracker: Some("github".to_string()),
+                project: Some("owner/repo".to_string()),
+                item_key: Some("7".to_string()),
+                created_at_ms: 1_700_000_000_001,
+                symbol_kind: None,
+                signature_hash: None,
+                moniker_tool: None,
+                moniker_tool_version: None,
+            },
+        ]
+    }
+
+    /// Write one anchor into a hand-rolled envelope — the fixture builder for the canonical-order
+    /// and cap rejections, which need wire forms `encode` would never produce.
+    fn raw_anchor(enc: &mut VecEncoder<'_>, kind: &str, id: &str) {
+        enc.array(14).unwrap();
+        enc.str(kind).unwrap();
+        enc.str(id).unwrap();
+        enc.null().unwrap(); // path
+        enc.null().unwrap(); // start_line
+        enc.null().unwrap(); // end_line
+        enc.null().unwrap(); // commit_hash
+        enc.null().unwrap(); // tracker
+        enc.null().unwrap(); // project
+        enc.null().unwrap(); // item_key
+        enc.i64(1).unwrap(); // created_at_ms
+        enc.null().unwrap(); // symbol_kind
+        enc.null().unwrap(); // signature_hash
+        enc.null().unwrap(); // moniker_tool
+        enc.null().unwrap(); // moniker_tool_version
+    }
+
     /// One representative op per variant — the golden + round-trip fixtures.
     fn every_variant() -> Vec<(&'static str, MemoryOp)> {
         vec![
@@ -656,6 +882,10 @@ mod tests {
             ("rebind", MemoryOp::Rebind {
                 edge_key: EdgeKey::from("edgekey_1"),
                 resolved: resolved(),
+            }),
+            ("node_anchors", MemoryOp::NodeAnchors {
+                node_id: NodeId::from("mem_1"),
+                anchors: anchors(),
             }),
             ("snapshot", MemoryOp::Snapshot),
         ]
@@ -687,6 +917,10 @@ mod tests {
                 "rebind",
                 "836c7261672d7261742f6f702f3166726562696e648269656467656b65795f3183667265706f5f74676d656d5f6473746763757272656e74",
             ),
+            (
+                "node_anchors",
+                "836c7261672d7261742f6f702f316c6e6f64655f616e63686f727382656d656d5f31828e6673796d626f6c78186372617465732f782f7372632f6c69622e72733a3a72756e736372617465732f782f7372632f6c69622e72730a1466633066666565f6f6f61b0000018bcfe568006866756e6374696f6e6335696769736369702d7275737463302e338e67747261636b6572736769746875623a6f776e65722f7265706f2337f6f6f6f6666769746875626a6f776e65722f7265706f61371b0000018bcfe56801f6f6f6f6",
+            ),
             ("snapshot", "836c7261672d7261742f6f702f3168736e617073686f74f6"),
         ];
         let got_refs: Vec<(&str, &str)> =
@@ -707,6 +941,111 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// An anchor set is a SET: the wire bytes must not depend on the order the caller assembled it
+    /// in, or two devices holding the same bindings would author byte-different ops.
+    #[test]
+    fn node_anchors_encodes_in_identity_order_whatever_the_input_order() {
+        let sorted = MemoryOp::NodeAnchors { node_id: NodeId::from("mem_1"), anchors: anchors() };
+        let mut reversed_anchors = anchors();
+        reversed_anchors.reverse();
+        let reversed =
+            MemoryOp::NodeAnchors { node_id: NodeId::from("mem_1"), anchors: reversed_anchors };
+        assert_eq!(encode(&sorted), encode(&reversed));
+    }
+
+    /// Two anchors naming ONE row: the op cannot say which wins, so it is rejected outright rather
+    /// than silently deduped. Encode does not dedup either, so such an op cannot round-trip.
+    #[test]
+    fn node_anchors_rejects_a_duplicate_row_identity() {
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("node_anchors").unwrap();
+            enc.array(2).unwrap();
+            enc.str("mem_1").unwrap();
+            enc.array(2).unwrap();
+            raw_anchor(enc, "symbol", "same");
+            raw_anchor(enc, "symbol", "same");
+        });
+
+        let err = decode(&buf).unwrap_err().to_string();
+        assert!(err.contains("strictly increasing"), "{err}");
+    }
+
+    #[test]
+    fn node_anchors_rejects_an_unsorted_set() {
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("node_anchors").unwrap();
+            enc.array(2).unwrap();
+            enc.str("mem_1").unwrap();
+            enc.array(2).unwrap();
+            raw_anchor(enc, "tracker", "b");
+            raw_anchor(enc, "symbol", "a");
+        });
+
+        let err = decode(&buf).unwrap_err().to_string();
+        assert!(err.contains("strictly increasing"), "{err}");
+    }
+
+    /// The cap is judged from the array HEADER, before a single element is decoded — an
+    /// attacker-controlled count must not buy work (or an allocation) proportional to itself. The
+    /// envelope below declares an over-cap count and then carries NOTHING, so only a header-first
+    /// check can produce the cap error rather than a truncation error.
+    #[test]
+    fn node_anchors_rejects_an_over_cap_count_from_the_header() {
+        let buf = raw_envelope(|enc| {
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("node_anchors").unwrap();
+            enc.array(2).unwrap();
+            enc.str("mem_1").unwrap();
+            enc.array(MAX_ANCHORS_PER_OP as u64 + 1).unwrap();
+        });
+
+        let err = decode(&buf).unwrap_err().to_string();
+        assert!(err.contains(&format!("over the {MAX_ANCHORS_PER_OP} limit")), "{err}");
+    }
+
+    /// The off-by-one guard the sibling `row_op` cap carries: a set exactly AT the limit is legal,
+    /// so the cap can never be read as "fewer than".
+    #[test]
+    fn an_anchor_count_at_the_cap_is_not_refused_by_the_cap() {
+        let anchors: Vec<PortableAnchor> = (0..MAX_ANCHORS_PER_OP)
+            .map(|index| PortableAnchor {
+                binding_kind: "symbol".to_string(),
+                // Zero-padded so identity order matches numeric order — an unpadded `10` would sort
+                // before `9` and trip the strictly-increasing check for reasons unrelated to the
+                // cap.
+                binding_id: format!("id_{index:03}"),
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                tracker: None,
+                project: None,
+                item_key: None,
+                created_at_ms: 1,
+                symbol_kind: None,
+                signature_hash: None,
+                moniker_tool: None,
+                moniker_tool_version: None,
+            })
+            .collect();
+        let op = MemoryOp::NodeAnchors { node_id: NodeId::from("mem_1"), anchors };
+        assert_eq!(decode(&encode(&op)).unwrap(), DecodedOp::Known(op));
+    }
+
+    /// An anchor set is legitimately empty for an unanchored memory; that must be a valid op, not a
+    /// degenerate one, so the drain can distinguish "no bindings" from "no snapshot".
+    #[test]
+    fn node_anchors_accepts_an_empty_set() {
+        let op = MemoryOp::NodeAnchors { node_id: NodeId::from("mem_1"), anchors: Vec::new() };
+        let decoded = decode(&encode(&op)).unwrap();
+        assert_eq!(decoded, DecodedOp::Known(op));
     }
 
     #[test]
