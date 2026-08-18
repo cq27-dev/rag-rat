@@ -27,7 +27,7 @@ use super::entry::{self, VerifiedEntry};
 use super::identity::LocalDevice;
 use super::op::{
     self, DecodedOp, DeviceFingerprint, EdgeKey, EdgeSpec, Entry, MemoryOp, NodeContent, NodeId,
-    NodeStatus, OpMeta, ResolvedAnchor,
+    NodeStatus, OpMeta, PortableAnchor, ResolvedAnchor,
 };
 use super::project::{self, ProjectedEdge, ProjectedNode, ProjectedState};
 use super::stream::StreamId;
@@ -672,6 +672,12 @@ pub fn load_projection(conn: &Connection, stream: StreamId) -> anyhow::Result<Pr
             state.nodes.insert(NodeId::from(node_id.as_str()), ProjectedNode {
                 content: NodeContent::from(content),
                 status,
+                // The `/1` shadow tables carry no anchor column and deliberately gain none: this
+                // path is frozen scaffolding, and anchors exist to cross an account boundary, which
+                // only `/3` does. A `NodeAnchors` op folded through here therefore round-trips
+                // lossily — if `/1` ever needs them, that is an explicit schema change, not a
+                // silent assumption.
+                anchors: None,
             });
         }
     }
@@ -771,6 +777,69 @@ impl From<NodeContentRow> for NodeContent {
             source: row.source,
             tags: row.tags,
             payload: row.payload,
+        }
+    }
+}
+
+/// One anchor of a node's projected anchor set. Mirrors `op::PortableAnchor` field for field; the
+/// op type stays serde-free because its wire is minicbor, and this row shape is local and rebuilt
+/// wholesale like its siblings.
+#[derive(Serialize, Deserialize)]
+pub(super) struct PortableAnchorRow {
+    binding_kind: String,
+    binding_id: String,
+    path: Option<String>,
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+    commit_hash: Option<String>,
+    tracker: Option<String>,
+    project: Option<String>,
+    item_key: Option<String>,
+    created_at_ms: i64,
+    symbol_kind: Option<String>,
+    signature_hash: Option<String>,
+    moniker_tool: Option<String>,
+    moniker_tool_version: Option<String>,
+}
+
+impl From<&PortableAnchor> for PortableAnchorRow {
+    fn from(anchor: &PortableAnchor) -> Self {
+        Self {
+            binding_kind: anchor.binding_kind.clone(),
+            binding_id: anchor.binding_id.clone(),
+            path: anchor.path.clone(),
+            start_line: anchor.start_line,
+            end_line: anchor.end_line,
+            commit_hash: anchor.commit_hash.clone(),
+            tracker: anchor.tracker.clone(),
+            project: anchor.project.clone(),
+            item_key: anchor.item_key.clone(),
+            created_at_ms: anchor.created_at_ms,
+            symbol_kind: anchor.symbol_kind.clone(),
+            signature_hash: anchor.signature_hash.clone(),
+            moniker_tool: anchor.moniker_tool.clone(),
+            moniker_tool_version: anchor.moniker_tool_version.clone(),
+        }
+    }
+}
+
+impl From<PortableAnchorRow> for PortableAnchor {
+    fn from(row: PortableAnchorRow) -> Self {
+        Self {
+            binding_kind: row.binding_kind,
+            binding_id: row.binding_id,
+            path: row.path,
+            start_line: row.start_line,
+            end_line: row.end_line,
+            commit_hash: row.commit_hash,
+            tracker: row.tracker,
+            project: row.project,
+            item_key: row.item_key,
+            created_at_ms: row.created_at_ms,
+            symbol_kind: row.symbol_kind,
+            signature_hash: row.signature_hash,
+            moniker_tool: row.moniker_tool,
+            moniker_tool_version: row.moniker_tool_version,
         }
     }
 }

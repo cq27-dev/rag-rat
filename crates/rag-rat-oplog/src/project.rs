@@ -10,6 +10,8 @@
 //!   flip to `obsolete`, so a tombstoned node is still a projected row).
 //! - node **content** — the last-in-order `NodeCreate`/`NodeUpdate` (full replacement).
 //! - node **status** — the last-in-order `NodeStatus`; default `active`.
+//! - node **anchors** — the last-in-order `NodeAnchors`, a FULL-SET replacement; `None` until one
+//!   is folded, which is distinct from an empty set (nobody has said, versus said "no bindings").
 //! - edge **presence** — the last-in-order `EdgeAdd`/`EdgeRemove`; present iff the winner is an
 //!   add.
 //! - edge **resolved anchor** — the last-in-order `Rebind`; rides along iff the edge is present,
@@ -21,7 +23,8 @@
 use std::collections::BTreeMap;
 
 use super::op::{
-    self, EdgeKey, EdgeSpec, Entry, MemoryOp, NodeContent, NodeId, NodeStatus, ResolvedAnchor,
+    self, EdgeKey, EdgeSpec, Entry, MemoryOp, NodeContent, NodeId, NodeStatus, PortableAnchor,
+    ResolvedAnchor,
 };
 
 /// The converged projection: existing nodes (content + status) and present edges (spec + resolved
@@ -46,6 +49,10 @@ pub struct ProjectedState {
 pub struct ProjectedNode {
     pub content: NodeContent,
     pub status: NodeStatus,
+    /// The node's portable anchor set, or `None` when no `NodeAnchors` op has been folded. The
+    /// distinction is load-bearing downstream: `None` means nobody has published this memory's
+    /// bindings, while `Some(vec![])` means its author said it has none.
+    pub anchors: Option<Vec<PortableAnchor>>,
 }
 
 /// A projected edge: its winning spec (from the last add) and its last resolved anchor, if any.
@@ -62,6 +69,7 @@ struct NodeAccum {
     exists: bool,
     content: Option<NodeContent>,
     status: Option<NodeStatus>,
+    anchors: Option<Vec<PortableAnchor>>,
 }
 
 /// Per-edge LWW accumulators, resolved into a [`ProjectedEdge`] only if the edge is present.
@@ -79,6 +87,17 @@ fn canonical_content(content: &NodeContent) -> NodeContent {
     let mut content = content.clone();
     content.canonicalize();
     content
+}
+
+/// Clone the anchor set in the SAME identity order the wire encoder writes, so a directly-folded op
+/// and one round-tripped through the wire project identically. Duplicates are left alone: `decode`
+/// refuses them and `within_wire_limits` keeps them from being authored, so a set reaching the fold
+/// with two anchors for one binding was built in-process and is a caller bug, not a state to
+/// silently repair here.
+fn canonical_anchors(anchors: &[PortableAnchor]) -> Vec<PortableAnchor> {
+    let mut anchors = anchors.to_vec();
+    anchors.sort_by(|a, b| (&a.binding_kind, &a.binding_id).cmp(&(&b.binding_kind, &b.binding_id)));
+    anchors
 }
 
 /// Fold entries into the converged [`ProjectedState`]. Pure, deterministic, idempotent.
@@ -129,11 +148,13 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                 // Re-resolves the local anchor only — never presence, never the key.
                 edges.entry(edge_key.clone()).or_default().resolved = Some(resolved.clone());
             },
-            // Inert here: this fold projects the node/edge registers, and an anchor set is a
-            // separate dimension whose projection lands with the column that stores it (#1209).
-            // Retaining the op without projecting it is the same posture an unknown kind gets, so
-            // a later binary re-folds the stream and picks the anchors up.
-            MemoryOp::NodeAnchors { .. } => {},
+            MemoryOp::NodeAnchors { node_id, anchors } => {
+                // Full-set replacement, like content — an anchor set is one register, not a
+                // per-binding merge, so a later op saying "these two" retires a binding the
+                // earlier one named.
+                nodes.entry(node_id.clone()).or_default().anchors =
+                    Some(canonical_anchors(anchors));
+            },
             // Inert boundary marker this increment (§5.4/C4).
             MemoryOp::Snapshot => {},
         }
@@ -162,7 +183,11 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
             .filter_map(|(id, acc)| {
                 // Exists iff a create was seen; existence guarantees a content register.
                 let content = acc.exists.then_some(acc.content).flatten()?;
-                Some((id, ProjectedNode { content, status: acc.status.unwrap_or_default() }))
+                Some((id, ProjectedNode {
+                    content,
+                    status: acc.status.unwrap_or_default(),
+                    anchors: acc.anchors,
+                }))
             })
             .collect(),
         edges: live_edges,
@@ -207,6 +232,76 @@ mod tests {
 
     fn status(id: &str, status: NodeStatus) -> MemoryOp {
         MemoryOp::NodeStatus { node_id: NodeId::from(id), status }
+    }
+
+    fn anchor(binding_id: &str) -> PortableAnchor {
+        PortableAnchor {
+            binding_kind: "symbol".to_string(),
+            binding_id: binding_id.to_string(),
+            path: Some("src/lib.rs".to_string()),
+            start_line: Some(1),
+            end_line: Some(2),
+            commit_hash: None,
+            tracker: None,
+            project: None,
+            item_key: None,
+            created_at_ms: 7,
+            symbol_kind: None,
+            signature_hash: None,
+            moniker_tool: None,
+            moniker_tool_version: None,
+        }
+    }
+
+    fn anchors_op(id: &str, binding_ids: &[&str]) -> MemoryOp {
+        MemoryOp::NodeAnchors {
+            node_id: NodeId::from(id),
+            anchors: binding_ids.iter().map(|binding_id| anchor(binding_id)).collect(),
+        }
+    }
+
+    /// The anchor register is LWW and a FULL-SET replacement, exactly like content: the later op
+    /// wins outright, so a binding the earlier one named is retired rather than merged forward.
+    #[test]
+    fn the_anchor_register_is_last_writer_wins_over_the_whole_set() {
+        let state = project(&[
+            at(1, 1, create("mem_1", "t")),
+            at(2, 1, anchors_op("mem_1", &["a", "b"])),
+            at(3, 1, anchors_op("mem_1", &["c"])),
+        ]);
+        let anchors = state.nodes[&NodeId::from("mem_1")].anchors.as_ref().unwrap();
+        assert_eq!(
+            anchors.iter().map(|a| a.binding_id.as_str()).collect::<Vec<_>>(),
+            vec!["c"],
+            "the later set replaces the earlier one whole",
+        );
+    }
+
+    /// `None` and `Some(vec![])` are different facts downstream — nobody has published this
+    /// memory's bindings, versus its author saying it has none — so the fold must not collapse
+    /// them.
+    #[test]
+    fn an_unanchored_node_is_none_and_an_empty_set_is_some_empty() {
+        let untouched = project(&[at(1, 1, create("mem_1", "t"))]);
+        assert_eq!(untouched.nodes[&NodeId::from("mem_1")].anchors, None);
+
+        let emptied =
+            project(&[at(1, 1, create("mem_1", "t")), at(2, 1, anchors_op("mem_1", &[]))]);
+        assert_eq!(emptied.nodes[&NodeId::from("mem_1")].anchors, Some(Vec::new()));
+    }
+
+    /// Anchors ride the node's EXISTENCE register like content does: a set folded for a node no
+    /// create ever established projects no row at all, so an orphan snapshot cannot conjure a
+    /// memory. Order-independence is the same property the other registers have.
+    #[test]
+    fn anchors_for_a_node_that_was_never_created_project_no_row() {
+        let state = project(&[at(1, 1, anchors_op("mem_ghost", &["a"]))]);
+        assert!(state.nodes.is_empty(), "an orphan anchor set establishes nothing");
+
+        // ...and once the create arrives out of order, the earlier set is still there.
+        let late_create =
+            project(&[at(2, 1, anchors_op("mem_1", &["a"])), at(1, 1, create("mem_1", "t"))]);
+        assert!(late_create.nodes[&NodeId::from("mem_1")].anchors.is_some());
     }
 
     fn spec(source: &str, target: &str) -> EdgeSpec {

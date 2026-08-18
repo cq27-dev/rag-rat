@@ -629,5 +629,8 @@ fn consolidate_rebuilds_stale_content_projection_before_reconcile() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(stamp, "3", "consolidate upgraded the store-global projector stamp");
+    // Pinned as a literal because the constant is oplog-internal and exporting it would make a
+    // projector detail a public commitment for one assertion's sake. Move this with the next
+    // CONTENT_PROJECTOR_VERSION bump.
+    assert_eq!(stamp, "4", "consolidate upgraded the store-global projector stamp");
 }

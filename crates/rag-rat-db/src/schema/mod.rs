@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 117;
+pub const LATEST_SCHEMA_VERSION: u32 = 118;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -849,6 +849,14 @@ const MIGRATION_114_ID: &str = "114_content_entries_lamport_column";
 const MIGRATION_115_ID: &str = "115_refold_account_authority_projections";
 const MIGRATION_116_ID: &str = "116_writer_invites";
 const MIGRATION_117_ID: &str = "117_content_author_stream_index";
+const MIGRATION_118_ID: &str = "118_content_projected_node_anchors";
+const MIGRATION_118_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-v118";
+const MIGRATION_118_DESCRIPTION: &str =
+    "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
+     node's portable anchor set (#1209). NULL means no node_anchors op has been folded for that \
+     node, which is distinct from an author publishing an empty set; existing rows stay NULL \
+     until the accompanying content-projector bump re-folds their stream from the accepted \
+     entries it already retains";
 const MIGRATION_117_CHECKSUM: &str = "sha256:rag-rat-content-author-stream-index-v117";
 const MIGRATION_117_DESCRIPTION: &str =
     "Index /3 content entries by (author_account_id, stream_id) over accepted rows, so the \
@@ -1834,6 +1842,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_117_CHECKSUM,
         description: MIGRATION_117_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_content_author_stream_index),
+    },
+    Migration {
+        id: MIGRATION_118_ID,
+        checksum: MIGRATION_118_CHECKSUM,
+        description: MIGRATION_118_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_content_projected_node_anchors),
     },
 ];
 

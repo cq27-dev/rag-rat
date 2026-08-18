@@ -8522,6 +8522,18 @@ pub(crate) fn apply_content_author_stream_index(conn: &Connection) -> rusqlite::
     )
 }
 
+/// The `/3` projection gains a node's portable anchor set. NULL is a meaningful value here and the
+/// reason the column is nullable rather than defaulted to `'[]'`: it means no `node_anchors` op has
+/// been folded for the node, which is distinct from an author saying the memory has no bindings.
+/// Every existing row starts NULL and stays NULL until the content-projector rebuild re-folds its
+/// stream, which the accompanying projector bump forces.
+///
+/// Guarded on the shape, so a full-ladder replay over a store already provisioned from the
+/// end-state snapshot is a no-op rather than a duplicate-column failure.
+pub(crate) fn apply_content_projected_node_anchors(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "content_projected_nodes", "anchors_json", "TEXT")
+}
+
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
     let mut stmt =
         conn.prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")?;

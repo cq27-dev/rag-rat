@@ -1466,6 +1466,13 @@ mod tests {
     // ── #688: the /3 projector-version two-part discipline ──
 
     /// The stored `/3` content-projector stamp, as the raw string `oplog_meta` holds.
+    /// The stamp these tests expect after an upgrade: the CURRENT projector version, not a literal.
+    /// The property under test is "the store became current", so a projector bump should not have
+    /// to touch them.
+    fn current_stamp() -> String {
+        content_projection::CONTENT_PROJECTOR_VERSION.to_string()
+    }
+
     fn stored_stamp(conn: &Connection) -> Option<String> {
         conn.query_row(
             "SELECT value FROM oplog_meta WHERE key = 'content_projector_version'",
@@ -1523,7 +1530,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ghost, 0, "the wholesale clear dropped the row with no accepted content");
-        assert_eq!(stored_stamp(&conn).as_deref(), Some("3"), "the store-global stamp upgraded");
+        assert_eq!(stored_stamp(&conn), Some(current_stamp()), "the store-global stamp upgraded");
 
         assert!(
             !content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap(),
@@ -1566,9 +1573,9 @@ mod tests {
         // The upgrade re-fold makes the store current; from then on per-stream reprojects
         // maintain the stamp.
         assert!(content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap());
-        assert_eq!(stored_stamp(&conn).as_deref(), Some("3"));
+        assert_eq!(stored_stamp(&conn), Some(current_stamp()));
         author_committed(&conn, stream, &[node_create("n2", "second")]);
-        assert_eq!(stored_stamp(&conn).as_deref(), Some("3"), "a current store stays current");
+        assert_eq!(stored_stamp(&conn), Some(current_stamp()), "a current store stays current");
         assert_eq!(projected_node_count(&conn, stream), 2);
     }
 
@@ -1640,6 +1647,94 @@ mod tests {
     /// (`ensure_owned_stream_v2_in_tx`) — the sealed mint needs a genuine effective `StreamOwn`,
     /// not the direct-seeded `account_stream_ownership` shortcut the plaintext acceptance tests
     /// use.
+    /// Author a create plus its anchor snapshot, then read the projection back through the public
+    /// reader — the real path (`author_content_batch` → acceptance → reproject), not a hand-built
+    /// `ProjectedState`, so this covers the fold, the serializer, the column and the decoder.
+    #[test]
+    fn an_authored_anchor_snapshot_projects_onto_its_node() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        let anchors = vec![op::PortableAnchor {
+            binding_kind: "symbol".to_string(),
+            binding_id: "src/lib.rs::run".to_string(),
+            path: Some("src/lib.rs".to_string()),
+            start_line: Some(3),
+            end_line: Some(9),
+            commit_hash: Some("c0ffee".to_string()),
+            tracker: None,
+            project: None,
+            item_key: None,
+            created_at_ms: 42,
+            symbol_kind: Some("function".to_string()),
+            signature_hash: None,
+            moniker_tool: None,
+            moniker_tool_version: None,
+        }];
+        author_content_batch(
+            &conn,
+            stream,
+            &[node_create("n1", "first"), MemoryOp::NodeAnchors {
+                node_id: NodeId::from("n1"),
+                anchors: anchors.clone(),
+            }],
+            SealPolicy::Plaintext,
+            NOW,
+        )
+        .expect("author the create and its anchors");
+
+        let nodes = crate::content_projection::list_projected_content_nodes(&conn, stream)
+            .expect("read the projection");
+        let node = nodes.iter().find(|node| node.node_id == "n1").expect("the node projects");
+        assert_eq!(node.anchors.as_deref(), Some(anchors.as_slice()), "every field survives");
+
+        // A projector rebuild re-derives the anchors from the RETAINED accepted entries rather than
+        // from the projection rows it just cleared — the path an older binary's opaquely-retained
+        // `node_anchors` entry takes when this binary first opens the store.
+        conn.execute(
+            "UPDATE content_projected_nodes SET anchors_json = NULL WHERE stream_id = ?1",
+            params![stream.to_bytes().as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oplog_meta(key, value) VALUES ('content_projector_version', '0')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+        assert!(
+            crate::content_projection::rebuild_all_content_projections_if_stale(&conn).unwrap(),
+            "the aged stamp triggers a rebuild",
+        );
+        let rebuilt = crate::content_projection::list_projected_content_nodes(&conn, stream)
+            .expect("read the rebuilt projection");
+        let node =
+            rebuilt.iter().find(|node| node.node_id == "n1").expect("the node still projects");
+        assert_eq!(
+            node.anchors.as_deref(),
+            Some(anchors.as_slice()),
+            "the rebuild recovers anchors from the accepted entries",
+        );
+    }
+
+    /// A node whose author never published an anchor set stays `None` — the projection must not
+    /// coerce "nobody said" into an empty set, since the drain reads that difference.
+    #[test]
+    fn a_node_with_no_anchor_op_projects_none() {
+        let conn = db();
+        let (_account, stream) = owned_v2(&conn);
+        author_content_batch(
+            &conn,
+            stream,
+            &[node_create("n1", "first")],
+            SealPolicy::Plaintext,
+            NOW,
+        )
+        .expect("author the create");
+
+        let nodes = crate::content_projection::list_projected_content_nodes(&conn, stream).unwrap();
+        assert_eq!(nodes.iter().find(|node| node.node_id == "n1").unwrap().anchors, None);
+    }
+
     fn owned_v2(conn: &Connection) -> (AccountId, StreamId) {
         let account = local_account(conn, NOW).expect("mint local account");
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();

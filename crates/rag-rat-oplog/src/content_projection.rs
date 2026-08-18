@@ -30,11 +30,12 @@ use super::account::{
 };
 use super::identity::load_local_device;
 use super::op::{
-    self, DecodedOp, EdgeSpec, Entry, NodeContent, NodeStatus, OpMeta, ResolvedAnchor,
+    self, DecodedOp, EdgeSpec, Entry, NodeContent, NodeStatus, OpMeta, PortableAnchor,
+    ResolvedAnchor,
 };
 use super::project;
 use super::project::ProjectedState;
-use super::store::{EdgeSpecRow, NodeContentRow, ResolvedAnchorRow};
+use super::store::{EdgeSpecRow, NodeContentRow, PortableAnchorRow, ResolvedAnchorRow};
 use super::stream::StreamId;
 
 /// Bump when the accepted-`/3` → memory fold's projectable set or LWW semantics change (a new op
@@ -47,7 +48,10 @@ use super::stream::StreamId;
 // dropping removed edges. The bump forces a rebuild so existing stores materialize tombstones for
 // already-removed edges (else a foreign EdgeRemove folded before the upgrade would never
 // tombstone).
-const CONTENT_PROJECTOR_VERSION: i64 = 3;
+// v4 (#1209): the node fold gains an anchors register, so `content_projected_nodes.anchors_json`
+// is a new projected output. The bump re-folds every stream from the entries it already retains —
+// including `node_anchors` ops an older binary kept opaque through the unknown-kind seam.
+pub(crate) const CONTENT_PROJECTOR_VERSION: i64 = 4;
 
 /// The `oplog_meta` key holding the `/3` projector version the content projection was last folded
 /// by. DISTINCT from the `/1` `projector_version` (they evolve independently and share one meta
@@ -344,14 +348,28 @@ fn write_projection(
     for (node_id, node) in &state.nodes {
         let content_json = serde_json::to_string(&NodeContentRow::from(&node.content))
             .context("serialize projected /3 node content")?;
+        // NULL when no `node_anchors` op has been folded — distinct from `Some(vec![])`, which is
+        // an author stating the memory has no bindings. The drain reads that difference.
+        let anchors_json = node
+            .anchors
+            .as_ref()
+            .map(|anchors| {
+                let rows: Vec<PortableAnchorRow> =
+                    anchors.iter().map(PortableAnchorRow::from).collect();
+                serde_json::to_string(&rows)
+            })
+            .transpose()
+            .context("serialize projected /3 node anchors")?;
         tx.execute(
-            "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status, \
+             anchors_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 stream_bytes.as_slice(),
                 node_id.as_str(),
                 content_json,
-                node.status.as_db_str()
+                node.status.as_db_str(),
+                anchors_json
             ],
         )?;
     }
@@ -483,6 +501,10 @@ pub struct ProjectedContentNode {
     pub node_id: String,
     pub content: NodeContent,
     pub status: NodeStatus,
+    /// The node's portable anchor set, or `None` when no `node_anchors` op has been folded for it.
+    /// The drain (#1210) reads that difference: `None` is "nobody published this memory's
+    /// bindings", `Some(vec![])` is "its author says it has none".
+    pub anchors: Option<Vec<PortableAnchor>>,
 }
 
 /// One projected `/3` edge, decoded for a projection consumer: the stable key, the folded spec (the
@@ -503,21 +525,39 @@ pub fn list_projected_content_nodes(
     stream_id: StreamId,
 ) -> anyhow::Result<Vec<ProjectedContentNode>> {
     let mut stmt = conn.prepare(
-        "SELECT node_id, content_json, status FROM content_projected_nodes
+        "SELECT node_id, content_json, status, anchors_json FROM content_projected_nodes
          WHERE stream_id = ?1 ORDER BY node_id",
     )?;
     let rows = stmt.query_map(params![stream_id.to_bytes().as_slice()], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
     })?;
     let mut nodes = Vec::new();
     for row in rows {
-        let (node_id, content_json, status) = row?;
+        let (node_id, content_json, status, anchors_json) = row?;
         let content: NodeContentRow = serde_json::from_str(&content_json)
             .with_context(|| format!("decode projected /3 node content for `{node_id}`"))?;
         let status = NodeStatus::from_db_str(&status).with_context(|| {
             format!("projected /3 node `{node_id}` carries unknown status `{status}`")
         })?;
-        nodes.push(ProjectedContentNode { node_id, content: NodeContent::from(content), status });
+        let anchors = anchors_json
+            .map(|json| {
+                serde_json::from_str::<Vec<PortableAnchorRow>>(&json).map(|rows| {
+                    rows.into_iter().map(PortableAnchor::from).collect::<Vec<PortableAnchor>>()
+                })
+            })
+            .transpose()
+            .with_context(|| format!("decode projected /3 node anchors for `{node_id}`"))?;
+        nodes.push(ProjectedContentNode {
+            node_id,
+            content: NodeContent::from(content),
+            status,
+            anchors,
+        });
     }
     Ok(nodes)
 }
