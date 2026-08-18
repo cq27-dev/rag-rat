@@ -394,7 +394,20 @@ pub fn apply_memory_surface(
 /// lossy rewrite. `rag-rat memory get <id>` is the CLI equivalent; naming one path keeps the marker
 /// cheap, since it is paid per memory on every attachment under the default surface.
 fn body_elision_marker(memory_id: &str) -> String {
-    format!("[body elided — full text: memory_show {memory_id}]")
+    format!("{BODY_ELISION_PREFIX} — full text: memory_show {memory_id}]")
+}
+
+/// The opening of every [`body_elision_marker`] — the marker's memory id makes the whole line
+/// unmatchable, so recognition anchors on this instead.
+const BODY_ELISION_PREFIX: &str = "[body elided";
+
+/// Whether a surfaced body is the elision marker rather than prose. A renderer with ONE prose slot
+/// (the grep/read hook digest, which shows a memory as a single line) has to tell the two apart:
+/// the marker is a pointer, and rendering it as the memory's gist spends that line's whole prose
+/// budget saying nothing. Stored bodies never start this way — the marker is applied only by
+/// [`apply_memory_surface`], downstream of every write path.
+pub fn body_is_elided(body: &str) -> bool {
+    body.starts_with(BODY_ELISION_PREFIX)
 }
 
 /// The body of a note compaction skips as already inside the summary envelope, to stand in for the
@@ -417,10 +430,11 @@ pub struct CompactRepoMemoryEvidence {
 
 /// A one-line-scannable projection of a [`RepoMemory`] for `impact_surface`'s default output (#37):
 /// what the memory says (kind/title/confidence/status) and where its *primary* binding
-/// (`bindings.first()`) is anchored — without the full body, the remaining bindings, or call paths.
-/// Full detail stays available via `memory_for_symbol` / `memory_for_path` /
-/// `memory_for_call_path`, or `impact_surface` full mode (`include` unaffected; `full_memories:
-/// true`).
+/// (`bindings.first()`) is anchored — without the remaining bindings or call paths, and with prose
+/// bounded by the summary envelope (a compacted summary, or the note's own body when it already
+/// fits — see [`Self::summary`]). Full detail stays available via `memory_for_symbol` /
+/// `memory_for_path` / `memory_for_call_path`, or `impact_surface` full mode (`include` unaffected;
+/// `full_memories: true`).
 ///
 /// Future direction: this header could carry a short LLM-generated `summary` of the full body,
 /// produced by an out-of-process local model (Ollama) rather than truncating the title — see the
@@ -741,6 +755,16 @@ mod tests {
         vec!["word"; evidence::SUMMARY_MAX_WORDS + 1].join(" ")
     }
 
+    /// A body WELL under the word ceiling but over the character one — the shape a word count
+    /// alone misreads: long tokens (absolute paths, URLs, a quoted stack line).
+    fn wide_token_body() -> String {
+        let path = "/home/dev/src/repo/crates/rag-rat-core/src/index/query_api/memory.rs";
+        let body = vec![path; 20].join(" ");
+        assert!(body.split_whitespace().count() <= evidence::SUMMARY_MAX_WORDS);
+        assert!(body.chars().count() > evidence::SUMMARY_MAX_CHARS);
+        body
+    }
+
     fn seed_summary(c: &Connection, id: &str, body: &str, summary: &str) {
         // Stamp the current content_hash (title `"t"`, matching `memory_with_body`) + the current
         // COMPACT_PROMPT_VERSION — the hydrator gates the summary read on both (like the compaction
@@ -1026,7 +1050,15 @@ mod tests {
         // surface dumps every full body the moment COMPACT_PROMPT_VERSION is bumped.
         let c = summary_conn();
         let long = over_envelope_body();
-        let mut memories = vec![memory_with_body("m1", "some body"), memory_with_body("m2", &long)];
+        // Few words, many characters — paths, URLs, a quoted stack line. The envelope is a cost
+        // bound, so the character ceiling has to hold on its own: a body the word count alone would
+        // wave through is skipped by compaction forever and then dumped whole on every attachment.
+        let wide = wide_token_body();
+        let mut memories = vec![
+            memory_with_body("m1", "some body"),
+            memory_with_body("m2", &long),
+            memory_with_body("m3", &wide),
+        ];
         apply_memory_surface(&c, &mut memories, rag_rat_base::config::MemorySurface::Summary)
             .unwrap();
         assert_eq!(
@@ -1038,8 +1070,14 @@ mod tests {
             body_elision_marker("m2"),
             "an over-envelope note with no summary row still defers its body"
         );
+        assert_eq!(
+            memories[2].body,
+            body_elision_marker("m3"),
+            "over the character ceiling defers too, however few words the body has"
+        );
         assert_eq!(memories[0].summary, None);
         assert_eq!(memories[1].summary, None);
+        assert_eq!(memories[2].summary, None);
         assert_eq!(memories[0].verdict, None);
     }
 

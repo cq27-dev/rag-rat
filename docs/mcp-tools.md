@@ -152,7 +152,10 @@ real array, so the surface works even from clients that serialize array params a
 **Compact vs full memories.** `impact_surface`'s `repo_memories` payload is **compact by default**
 (#37): each memory is summarized to a scannable header — `memory_id`, `kind`, `title`, `confidence`,
 `status`, and its primary binding's `anchor_status` / `binding_kind` / `path` / `span` / `id` — so an
-agent skims the high-signal facts without scrolling full bodies. The lane shape is unchanged
+agent skims the high-signal facts without scrolling long bodies. Under the default
+[`[memory] surface`](config/memory.md) the header also carries the memory's prose bounded by the
+summary envelope: its dream-compacted summary, or the note's own body when that already fits. The
+lane shape is unchanged
 (`direct` / `path_crossed` / `call_path_crossed` / `stale`). Pass `"full_memories": true` for the
 full bodies + every binding + call paths, or fetch full detail per-anchor via
 `memory_for_symbol` / `memory_for_path` / `memory_for_call_path`. (`full_memories` is orthogonal to

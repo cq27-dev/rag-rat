@@ -100,13 +100,21 @@ pub const COMPACT_PROMPT_VERSION: &str = "compact-v2";
 /// could come back no shorter while dropping a condition or the reason behind it.
 pub const SUMMARY_MAX_WORDS: usize = 150;
 
+/// Character ceiling on the same envelope — roughly the width [`SUMMARY_MAX_WORDS`] of ordinary
+/// prose occupies. The word count alone does not bound the cost the surfaces are paying: 150 tokens
+/// of absolute paths, URLs, a quoted stack line, or base64 run to kilobytes while a body cap of
+/// 8000 chars lets them through. Without this bound such a note is skipped by compaction forever
+/// and then emitted WHOLE on every attachment, which is what the summary surface exists to prevent.
+pub const SUMMARY_MAX_CHARS: usize = 1200;
+
 /// Whether compaction skips this body for already fitting the summary envelope — the ONE predicate
 /// the compaction queue and both summary surfaces share. A skipped note never gets a
 /// `memory_summaries` row and never will, so the summary surfaces must show it WHOLE (bounded by
-/// [`SUMMARY_MAX_WORDS`]); letting the two sides disagree strands a note in the gap, where it
-/// surfaces as a bare title forever.
+/// [`SUMMARY_MAX_WORDS`] and [`SUMMARY_MAX_CHARS`]); letting the two sides disagree strands a note
+/// in the gap, where it surfaces as a bare title forever.
 pub fn note_is_shown_whole(body: &str) -> bool {
     body.split_whitespace().count() <= SUMMARY_MAX_WORDS
+        && body.chars().count() <= SUMMARY_MAX_CHARS
 }
 
 /// Why a memory is in the verification queue. Not persisted (a transient queue reason), so it

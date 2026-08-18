@@ -964,19 +964,29 @@ mod tests {
         let short = vec!["word"; evidence::SUMMARY_MAX_WORDS].join(" ");
         seed_memory(&c, "m1", "note", &short, "r");
         seed_memory(&c, "m2", "note", &long_body("long enough to compact"), "r");
+        // Twenty words, over a kilobyte: the envelope is a cost bound, and a word count alone
+        // misreads a body of paths, URLs, or a quoted stack line. It queues like any other
+        // over-envelope note — the surfaces defer it on the SAME predicate, so a memory the queue
+        // skipped but a surface deferred would be stranded with a bare title forever.
+        let wide = vec!["/home/dev/src/repo/crates/rag-rat-core/src/index/query_api/memory.rs"; 20]
+            .join(" ");
+        assert!(wide.split_whitespace().count() <= evidence::SUMMARY_MAX_WORDS);
+        assert!(wide.chars().count() > evidence::SUMMARY_MAX_CHARS);
+        seed_memory(&c, "m3", "note", &wide, "r");
 
         let queue = compaction_queue(&c, 10).unwrap();
         assert_eq!(
             queue.iter().map(|e| e.memory_id.as_str()).collect::<Vec<_>>(),
-            vec!["m2"],
-            "only the over-envelope memory queues"
+            vec!["m2", "m3"],
+            "every over-envelope memory queues, by words or by characters"
         );
 
-        let model = MockChatModel::new([GOOD_SUMMARY]);
+        let model = MockChatModel::new([GOOD_SUMMARY, GOOD_SUMMARY]);
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
-        assert_eq!(model.calls(), 1, "the short memory never reaches the model");
+        assert_eq!(model.calls(), 2, "the short memory never reaches the model");
         assert!(summary_rows(&c, "m1").is_empty(), "the short memory keeps no summary row");
         assert_eq!(summary_rows(&c, "m2").len(), 1, "the long memory is summarized");
+        assert_eq!(summary_rows(&c, "m3").len(), 1, "the wide-token memory is summarized");
     }
 
     // ── poison-sibling: repo scoping ─────────────────────────────────────────────

@@ -20,7 +20,8 @@ const MAX_LEXICAL_HITS: u32 = 3;
 /// Lexical hits below this fraction of the best hit's score are dropped as low-relevance noise.
 const LEXICAL_RELATIVE_FLOOR: f64 = 0.6;
 
-/// Maximum body length in a rendered memory digest line; longer bodies are truncated with `…`.
+/// Maximum gist length in a rendered memory digest line — body or dream summary alike; longer text
+/// is truncated with `…`.
 const MAX_MEMORY_BODY_CHARS: usize = 240;
 
 /// Strip regex syntax from a grep pattern, leaving plain query text. Metacharacters become
@@ -364,10 +365,13 @@ pub(crate) struct Section {
 
 /// Build the shared memory `RenderItem` (`- [Kind | status] title — gist verdict (rag-rat:
 /// memory_search)`), so grep- and read-augment render bound memories identically. The gist is the
-/// dream summary under `surface = "summary"`, else the clamped body; both empty → title-only.
+/// dream summary under `surface = "summary"`, else the body; a body the summary surface withheld is
+/// a pointer rather than prose, so it renders title-only. Every source is clamped to the same
+/// per-line budget: a digest line costs the same whichever slot its prose arrived in.
 pub(crate) fn memory_render_item(m: memory::RepoMemory) -> RenderItem {
     let gist = match &m.summary {
-        Some(summary) => summary.clone(),
+        Some(summary) => clamp_body(summary),
+        None if memory::body_is_elided(&m.body) => String::new(),
         None => clamp_body(&m.body),
     };
     let gist_part = if gist.is_empty() { String::new() } else { format!(" — {gist}") };
@@ -817,6 +821,107 @@ mod tests {
         );
         assert!(out.context.contains("diverged"), "the verdict marker renders: {}", out.context);
         assert!(out.context.contains(title), "the title still renders: {}", out.context);
+    }
+
+    /// The default surface with NO summary rows — dream disabled (the default), never run, or every
+    /// summary invalidated by a prompt-version bump. The digest gives a memory ONE line, so it has
+    /// one prose slot: a body the surface withheld is a pointer to `memory_show`, and spending that
+    /// slot on the marker costs the budget of a real gist to say nothing.
+    #[test]
+    fn compose_summary_surface_shows_a_short_body_and_renders_a_deferred_one_title_only() {
+        let conn = seeded_conn();
+        // A second memory on the same symbol, one word OVER the summary envelope, so the surface
+        // defers its body instead of showing it whole.
+        let long_body =
+            vec!["padding"; rag_rat_query::memory::evidence::SUMMARY_MAX_WORDS + 1].join(" ");
+        crate::memory_write::create_memory(&conn, RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Deferred until compaction runs".to_string(),
+            body: long_body,
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: None,
+            tags: vec![],
+            payload_json: None,
+            bind: RepoMemoryBindTarget { symbol_id: Some(1), ..Default::default() },
+        })
+        .unwrap();
+
+        let out = compose(
+            &conn,
+            r"watcher_main\b",
+            None,
+            &DedupeFilter::default(),
+            rag_rat_base::config::MemorySurface::Summary,
+        )
+        .unwrap()
+        .expect("payload expected");
+        assert!(
+            out.context.contains("The election lock guarantees a single watcher"),
+            "a note inside the envelope will never be summarized, so its body is its gist: {}",
+            out.context
+        );
+        assert!(
+            out.context.contains("Deferred until compaction runs"),
+            "the deferred memory still renders its title: {}",
+            out.context
+        );
+        assert!(
+            !out.context.contains("body elided"),
+            "the elision marker is a pointer, never a gist: {}",
+            out.context
+        );
+        assert!(
+            !out.context.contains("padding"),
+            "the deferred body itself never renders: {}",
+            out.context
+        );
+    }
+
+    /// A summary is bounded in WORDS (150), which is worth ~1 kB — six times the per-line gist
+    /// budget the hook renders bodies under. Both sources are prose in the same slot, so both are
+    /// clamped: the digest costs the same whichever one filled it.
+    #[test]
+    fn compose_summary_surface_clamps_a_long_summary_to_the_line_budget() {
+        let conn = seeded_conn();
+        let (id, repo_id): (String, String) = conn
+            .query_row("SELECT id, repo_id FROM repo_memories LIMIT 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let title = "One watcher per worktree";
+        let body = "The election lock guarantees a single watcher; never bind without it.";
+        let long_summary = format!("Election lock first. {} Tailmarker.", "filler ".repeat(60));
+        assert!(long_summary.chars().count() > MAX_MEMORY_BODY_CHARS, "the clamp must engage");
+        conn.execute(
+            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+             prompt_version, generated_at_ms) VALUES (?1,?2,?3,?4,?5,0)",
+            rusqlite::params![
+                id,
+                repo_id,
+                rag_rat_query::memory::evidence::note_content_hash(title, body),
+                long_summary,
+                rag_rat_query::memory::evidence::COMPACT_PROMPT_VERSION
+            ],
+        )
+        .unwrap();
+
+        let out = compose(
+            &conn,
+            r"watcher_main\b",
+            None,
+            &DedupeFilter::default(),
+            rag_rat_base::config::MemorySurface::Summary,
+        )
+        .unwrap()
+        .expect("payload expected");
+        assert!(out.context.contains("Election lock first."), "the head renders: {}", out.context);
+        assert!(
+            !out.context.contains("Tailmarker"),
+            "the tail past the clamp does not: {}",
+            out.context
+        );
+        assert!(out.context.contains('…'), "the truncation is marked: {}", out.context);
     }
 
     #[test]

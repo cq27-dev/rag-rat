@@ -281,7 +281,10 @@ def papertrail_records(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=pathlib.Path, required=True)
-    parser.add_argument("--verdict-prompt-version", default="verify-pack-v3")
+    # Must track VERDICT_PROMPT_VERSION in crates/rag-rat-query/src/memory/evidence.rs: this one
+    # sits in a WHERE clause over an INNER join, so a stale value drops every verified memory from
+    # the export rather than nulling a column.
+    parser.add_argument("--verdict-prompt-version", default="verify-pack-v6")
     # Must track COMPACT_PROMPT_VERSION in crates/rag-rat-query/src/memory/evidence.rs: the summary
     # join is a LEFT JOIN, so a stale value yields NULL summaries silently instead of erroring.
     parser.add_argument("--compact-prompt-version", default="compact-v2")
