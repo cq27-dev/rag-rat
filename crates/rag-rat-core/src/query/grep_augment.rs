@@ -411,7 +411,7 @@ pub(crate) struct Section {
 pub(crate) fn memory_render_item(m: memory::RepoMemory) -> RenderItem {
     let gist = match &m.summary {
         Some(summary) => clamp_body(summary),
-        None if memory::body_is_elided(&m.body) => String::new(),
+        None if memory::body_is_elided(&m) => String::new(),
         None => clamp_body(&m.body),
     };
     let gist_part = if gist.is_empty() { String::new() } else { format!(" — {gist}") };

@@ -397,17 +397,21 @@ fn body_elision_marker(memory_id: &str) -> String {
     format!("{BODY_ELISION_PREFIX} — full text: memory_show {memory_id}]")
 }
 
-/// The opening of every [`body_elision_marker`] — the marker's memory id makes the whole line
-/// unmatchable, so recognition anchors on this instead.
+/// The opening of every [`body_elision_marker`].
 const BODY_ELISION_PREFIX: &str = "[body elided";
 
 /// Whether a surfaced body is the elision marker rather than prose. A renderer with ONE prose slot
 /// (the grep/read hook digest, which shows a memory as a single line) has to tell the two apart:
 /// the marker is a pointer, and rendering it as the memory's gist spends that line's whole prose
-/// budget saying nothing. Stored bodies never start this way — the marker is applied only by
-/// [`apply_memory_surface`], downstream of every write path.
-pub fn body_is_elided(body: &str) -> bool {
-    body.starts_with(BODY_ELISION_PREFIX)
+/// budget saying nothing.
+///
+/// Matching on the marker's opening text alone would misread a memory that documents the marker —
+/// prose is free to quote it, and under `Full` no marker is ever applied. So the test is equality
+/// with the marker [`apply_memory_surface`] would have written for THIS memory. The marker is
+/// written in exactly one place and carries the memory's own id, so prose describing the marker no
+/// longer reads as one: an author writing about it cannot be writing the id it would carry here.
+pub fn body_is_elided(memory: &RepoMemory) -> bool {
+    memory.body == body_elision_marker(&memory.memory_id)
 }
 
 /// The body of a note compaction skips as already inside the summary envelope, to stand in for the
@@ -1079,6 +1083,35 @@ mod tests {
         assert_eq!(memories[1].summary, None);
         assert_eq!(memories[2].summary, None);
         assert_eq!(memories[0].verdict, None);
+    }
+
+    #[test]
+    fn body_is_elided_reads_the_memory_own_marker_not_prose_quoting_it() {
+        // A memory ABOUT the elision marker quotes the marker, so its prose opens with the marker
+        // text — and under `Full` no marker is ever applied, so that body is prose and has to
+        // render as prose. Only the marker this memory's own id would produce counts as elision.
+        let c = summary_conn();
+        let prose = format!(
+            "{BODY_ELISION_PREFIX} …] is what a deferred body renders as. {}",
+            over_envelope_body()
+        );
+        let mut memories = vec![memory_with_body("m1", &prose)];
+        assert!(
+            !body_is_elided(&memories[0]),
+            "prose that merely opens with the marker text is not elided: {}",
+            memories[0].body
+        );
+        assert!(
+            !body_is_elided(&memory_with_body("m2", &body_elision_marker("m1"))),
+            "another memory's marker, quoted verbatim, is not this memory's elision"
+        );
+        apply_memory_surface(&c, &mut memories, rag_rat_base::config::MemorySurface::Summary)
+            .unwrap();
+        assert!(
+            body_is_elided(&memories[0]),
+            "a body the summary surface actually deferred still reads as elided: {}",
+            memories[0].body
+        );
     }
 
     #[test]
