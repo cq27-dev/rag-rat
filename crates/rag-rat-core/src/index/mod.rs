@@ -220,6 +220,12 @@ pub struct IndexDatabase {
     /// connection, so batch tests can assert the once-per-pass rebuild cardinality.
     #[cfg(test)]
     pub(crate) logical_symbol_rebuilds: AtomicUsize,
+    /// Test-only #63 observability: how many in-transaction `git status` walks
+    /// [`Self::heal_stale_overlay_rows`] ran on this connection. The walk-free idle pass is an
+    /// invariant a comment cannot hold on its own — a candidate set that quietly grows a
+    /// permanent member puts a status walk inside `BEGIN IMMEDIATE` on every pass forever.
+    #[cfg(test)]
+    pub(crate) overlay_status_walks: AtomicUsize,
     /// #216 lens: a bounded set of filtered clone edge sets + components keyed by generation,
     /// scope, content, and theta. Treemap and file-clone requests commonly use different theta
     /// values, so retaining several immutable variants avoids alternating repository-wide scans.

@@ -41,10 +41,19 @@ struct PreparedIncrementalPass {
 }
 
 impl PreparedIncrementalPass {
-    /// The repo-relative paths this pass INDEXES — discovery's own verdict that the checkout
-    /// claims them (walked, in-target, not ignored, on disk). The overlay heal uses it as the only
-    /// admissible proof that a deletion tombstone is an orphan; re-deriving that rule from the
-    /// target set would be a second copy of discovery's inclusion logic, free to drift from it.
+    /// The repo-relative paths this pass INDEXES. Every mode builds it the same way — the pass's
+    /// own file set, whatever produced it (a Discover walk, the git-dirty set in Changed, the
+    /// caller's list in Paths) — which is what makes it usable as proof: a path here is one this
+    /// pass just derived and wrote, so a deletion tombstone shadowing it contradicts that write.
+    /// A path absent from the set is simply not proven, and the overlay heal leaves its tombstone
+    /// alone. Re-deriving that claim from the target set plus the ignore rules would be a second
+    /// copy of discovery's inclusion logic, free to drift from it.
+    ///
+    /// The set is derived off the write lock with everything else the pass prepared, so it can be
+    /// one editor-keystroke stale (a `.gitignore` edit landing before `BEGIN IMMEDIATE` makes a
+    /// tracked path ignored without moving its git status). The cost is bounded and self-healing:
+    /// the same stale plan already wrote the committed row, and the next discover pass
+    /// re-tombstones the path — one extra pass of churn, never a lost row.
     fn reindexed_base_paths(&self) -> BTreeSet<String> {
         self.prepared_files
             .iter()
@@ -969,6 +978,14 @@ impl IndexDatabase {
     ///   the next discover pass reindexes the path at the commit scope (sha mismatch), and the pass
     ///   after that takes the first branch.
     ///
+    /// A DELETION TOMBSTONE (`kind = 'deleted'`) is healed only when this pass re-indexed its path
+    /// (#1217): it then shadows a file the checkout demonstrably has, and the committed row takes
+    /// over as above. Absent that proof the tombstone stands — it is the index's record that the
+    /// checkout does not serve the path, and git status cannot tell the two apart (it is silent
+    /// about a gitignored-but-tracked path, one a target `exclude` drops, and one inside a
+    /// submodule). Such a tombstone is permanent by design, so it is filtered out of the candidate
+    /// set rather than carried into the walk. A tombstone is never re-stamped to the commit scope.
+    ///
     /// Returns the number of rows healed. Purely a read when nothing is stale, so an idle pass
     /// stays write-free (#63). Non-git contexts (`active_commit_sha` empty) are untouched —
     /// overlay rows ARE their canonical scope.
@@ -980,7 +997,7 @@ impl IndexDatabase {
         if self.active_commit_sha.is_empty() {
             return Ok(0);
         }
-        let overlays: Vec<(i64, String, String, String)> = {
+        let mut overlays: Vec<(i64, String, String, String)> = {
             let conn = self.storage.connection();
             // Direct `main.files` probes bypass the repo-scoped `files` view, so they carry the
             // `repo_id` predicate explicitly (A3): in a consolidated DB two forks at the same
@@ -1007,11 +1024,21 @@ impl IndexDatabase {
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        // Drop the tombstones this pass could not heal anyway BEFORE the walk-free check below.
+        // The deliberate outcome of the tombstone rule is that some tombstones are PERMANENT — a
+        // gitignored-but-tracked path, one a target `exclude` drops, one inside a submodule —
+        // and a permanent candidate would be a permanent reason to walk: every pass of every repo
+        // holding one would run a `git status` inside `BEGIN IMMEDIATE`, forever, which is the
+        // idle-pass cost #63 exists to keep at zero. Filtering here also keeps the rule in ONE
+        // place: below, a surviving tombstone is healable by construction.
+        overlays.retain(|(_, path, _, kind)| kind != "deleted" || reindexed.contains(path));
         // No overlay candidates → nothing to heal and NO walk under the lock (the common clean-tree
         // / idle pass pays nothing).
         if overlays.is_empty() {
             return Ok(0);
         }
+        #[cfg(test)]
+        self.overlay_status_walks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Authoritative dirty set, walked INSIDE the write txn (#561). The off-lock discovery
         // snapshot CANNOT soundly pre-filter these: the flock excludes rag-rat writers but NOT the
         // user's editor, so between prepare and now a file dirty-at-prepare may have been restored
@@ -1035,26 +1062,18 @@ impl IndexDatabase {
                 // deleted (#561).
                 continue;
             }
-            // A TOMBSTONE IS ONLY AN ORPHAN IF THIS PASS INDEXED THE PATH (#1217 review). A quiet
-            // git status is NOT that proof: it says nothing about a path that is gitignored while
-            // still tracked, that a target config now excludes, or that lives inside a submodule
-            // — and for all three the tombstone is CORRECT while the committed row survives, so
-            // healing on silence alone un-hides content the checkout does not serve and starts a
-            // re-tombstone/re-heal loop of its own. `reindexed` names the paths discovery walked
-            // and this pass wrote into the commit scope; a tombstone shadowing one of them
-            // contradicts a write that just happened, which is the whole orphan case. A path
-            // discovery did NOT claim is absent from that set and its tombstone stands.
+            // Every surviving tombstone is one this pass re-indexed (the `retain` above), so it
+            // contradicts a derivation that just happened — the orphan case. `reindexed` proves
+            // the path was claimed, not where its row landed (a dirty path's write goes to the
+            // overlay scope), so the committed-row probe is what establishes there is something
+            // to hand the path back to; with none, the tombstone shadows nothing. It is never
+            // re-stamped into the commit scope below: that would publish a deletion marker as the
+            // file's committed row.
             if kind == "deleted" {
-                if !reindexed.contains(&path) {
-                    continue;
-                }
                 if self.committed_row_exists(&path)? {
                     self.remove_file_in_scope(Path::new(&path), "", &self.active_worktree_id)?;
                     healed += 1;
                 }
-                // With no committed row to take over, the tombstone shadows nothing. It is never
-                // re-stamped into the commit scope below: that would publish a deletion marker as
-                // the file's committed row.
                 continue;
             }
             if self.committed_row_exists(&path)? {

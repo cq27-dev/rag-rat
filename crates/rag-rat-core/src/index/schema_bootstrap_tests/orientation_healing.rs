@@ -1203,3 +1203,35 @@ fn a_heal_keeps_the_tombstone_of_a_target_excluded_file() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// #63 + #1217: a permanent tombstone must not become a permanent reason to walk. The tombstones
+/// this fix deliberately keeps forever — gitignored, target-excluded, submodule-internal — are
+/// unhealable by construction, so they are filtered out of the heal's candidate set before the
+/// walk-free check. Otherwise every pass of every repo holding one pays a `git status` inside the
+/// write transaction, which is the idle-pass cost the whole issue is about.
+#[test]
+fn a_permanent_tombstone_does_not_make_every_idle_pass_walk_git_status() {
+    let walks =
+        |db: &IndexDatabase| db.overlay_status_walks.load(std::sync::atomic::Ordering::Relaxed);
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    drop(db);
+    fs::write(root.join(".gitignore"), "src/extra.rs\n").unwrap();
+
+    let (db, _) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert_eq!(walks(&db), 0, "tombstoning a path that left the walk needs no status walk");
+    drop(db);
+    let (db, _) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert_eq!(walks(&db), 0, "and the idle pass that follows stays walk-free, forever");
+    drop(db);
+
+    // Control: a real content overlay is a healable candidate, so the walk DOES run — without
+    // this the assertions above would also pass if the heal never ran at all.
+    fs::write(root.join("src/lib.rs"), "pub fn dirty() -> i32 { 9 }\n").unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    drop(db);
+    let (db, _) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert_eq!(walks(&db), 1, "a dirty file's overlay row is healable, so its pass walks");
+
+    let _ = fs::remove_dir_all(&root);
+}
