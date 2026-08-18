@@ -211,8 +211,10 @@ fn an_ambiguous_short_name_does_not_absorb_unrelated_unresolved_calls() {
 
     let options = syntactic(target);
     let hops = callers(&conn, "a.rs::target", &options);
-    let summary =
-        traversal_summary(&conn, "a.rs::target", true, 100, &options, hops.len()).unwrap();
+    // The summary limit sits BETWEEN the gated candidate count (1) and the ungated one (4):
+    // `truncated` is `total_matching_edges > limit`, so only a limit the absorbed candidates
+    // would overrun tells the two apart. At a limit above both, the assertion holds either way.
+    let summary = traversal_summary(&conn, "a.rs::target", true, 2, &options, hops.len()).unwrap();
 
     assert_eq!(hops.len(), 1, "the one bound call site is still the only caller");
     assert_eq!(summary.unresolved, 0, "an ambiguous short name claims no unresolved candidate");

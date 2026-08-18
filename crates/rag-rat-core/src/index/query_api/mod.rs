@@ -65,6 +65,10 @@ pub use search::SearchRequest;
 /// Volume cap on the memories `read_chunk` attaches as drive-by context. The binding is
 /// structural, so every hit is relevant; the cap is purely about how much of a reader's attention
 /// one chunk read may spend (the grep-augment hook lanes budget 4).
+///
+/// A cap this tight makes the ordering load-bearing: `memories_for_chunk` returns chunk-bound
+/// memories ahead of the file's path-bound ones, so a recently-touched file-level note cannot
+/// spend the last slot the chunk's own memory needed.
 const DRIVE_BY_CHUNK_MEMORY_LIMIT: u32 = 6;
 
 impl IndexDatabase {
@@ -775,17 +779,16 @@ mod oracle_surfacing_tests;
 mod drive_by_memory_cap_tests {
     use rag_rat_query::graph_meta::GraphMetaMode;
     use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
 
     use crate::index::IndexDatabase;
 
-    /// A store holding one chunk with `n` memories bound to it — the shape `read_chunk` attaches
-    /// drive-by context to. Seeded through a bare connection first so the opened
-    /// [`IndexDatabase`] scopes to the seeded repo.
-    fn db_with_chunk_memories(n: usize) -> (tempfile::TempDir, IndexDatabase, i64) {
+    /// A store holding one chunk of `src/a.rs` and the bare connection to seed memories through —
+    /// the shape `read_chunk` attaches drive-by context to. Seeding happens before the
+    /// [`IndexDatabase`] opens so it scopes to the seeded repo.
+    fn store_with_one_chunk() -> (tempfile::TempDir, Connection, i64) {
         let dir = tempfile::tempdir().unwrap();
-        let database = dir.path().join("index.sqlite");
-        let conn = Connection::open(&database).unwrap();
+        let conn = Connection::open(dir.path().join("index.sqlite")).unwrap();
         rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
         conn.execute(
             "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
@@ -808,25 +811,55 @@ mod drive_by_memory_cap_tests {
         .unwrap();
         let chunk_id = conn.last_insert_rowid();
         rag_rat_db::chunk_text_store::seed_chunk_text(&conn, chunk_id, "fn foo() {}").unwrap();
-        for i in 0..n {
-            crate::memory_write::create_memory(&conn, RepoMemoryCreate {
-                kind: "Invariant".to_string(),
-                title: format!("Drive-by memory {i}"),
-                body: format!("Body of drive-by memory {i}."),
-                confidence: "high".to_string(),
-                created_by: Some("test".to_string()),
-                source: None,
-                tags: vec![],
-                payload_json: None,
-                bind: RepoMemoryBindTarget {
-                    chunk_id: Some(chunk_id),
-                    ..RepoMemoryBindTarget::default()
-                },
-            })
-            .unwrap();
-        }
+        (dir, conn, chunk_id)
+    }
+
+    /// Opens the seeded store, releasing the seeding connection first.
+    fn open_seeded(dir: &tempfile::TempDir, conn: Connection) -> IndexDatabase {
         drop(conn);
-        let db = IndexDatabase::open(&database).unwrap();
+        IndexDatabase::open(&dir.path().join("index.sqlite")).unwrap()
+    }
+
+    fn create_memory_bound_to(
+        conn: &Connection,
+        title: &str,
+        bind: RepoMemoryBindTarget,
+    ) -> String {
+        crate::memory_write::create_memory(conn, RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: title.to_string(),
+            body: format!("Body of {title}."),
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: None,
+            tags: vec![],
+            payload_json: None,
+            bind,
+        })
+        .unwrap()
+        .memory
+        .memory_id
+    }
+
+    /// `create_memory` stamps the wall clock, so a test that ranks on recency sets the timestamps
+    /// itself rather than relying on creation order landing in distinct milliseconds.
+    fn stamp_updated_at(conn: &Connection, memory_id: &str, updated_at_ms: i64) {
+        conn.execute("UPDATE repo_memories SET updated_at_ms = ?2 WHERE id = ?1", params![
+            memory_id,
+            updated_at_ms
+        ])
+        .unwrap();
+    }
+
+    fn db_with_chunk_memories(n: usize) -> (tempfile::TempDir, IndexDatabase, i64) {
+        let (dir, conn, chunk_id) = store_with_one_chunk();
+        for i in 0..n {
+            create_memory_bound_to(&conn, &format!("Drive-by memory {i}"), RepoMemoryBindTarget {
+                chunk_id: Some(chunk_id),
+                ..RepoMemoryBindTarget::default()
+            });
+        }
+        let db = open_seeded(&dir, conn);
         (dir, db, chunk_id)
     }
 
@@ -851,6 +884,53 @@ mod drive_by_memory_cap_tests {
             chunk.memories.len(),
             usize::try_from(super::DRIVE_BY_CHUNK_MEMORY_LIMIT).unwrap(),
             "9 bound memories, capped to the drive-by limit"
+        );
+    }
+
+    /// The cap makes the ranking load-bearing. A chunk binding names THIS code; a path binding
+    /// names the whole file, and a file accrues far more of them. Ranked on recency alone, file
+    /// notes touched after the chunk's own memory take every slot, and the read that exists to
+    /// surface the specific anchor never shows it.
+    #[test]
+    fn a_chunk_bound_memory_outranks_the_files_newer_path_bound_ones() {
+        let (dir, conn, chunk_id) = store_with_one_chunk();
+        let chunk_bound =
+            create_memory_bound_to(&conn, "The chunk's own invariant", RepoMemoryBindTarget {
+                chunk_id: Some(chunk_id),
+                ..RepoMemoryBindTarget::default()
+            });
+        stamp_updated_at(&conn, &chunk_bound, 0);
+        // More than the cap, every one of them newer than the chunk-bound memory.
+        for i in 0..8i64 {
+            let path_bound = create_memory_bound_to(
+                &conn,
+                &format!("File-level note {i}"),
+                RepoMemoryBindTarget {
+                    path: Some("src/a.rs".to_string()),
+                    ..RepoMemoryBindTarget::default()
+                },
+            );
+            stamp_updated_at(&conn, &path_bound, 1_000 + i);
+        }
+        let db = open_seeded(&dir, conn);
+
+        let chunk = db
+            .read_chunk_with_graph_and_memories(
+                chunk_id,
+                GraphMetaMode::Full,
+                20,
+                true,
+                rag_rat_base::config::MemorySurface::Full,
+            )
+            .unwrap()
+            .expect("chunk");
+
+        let ids: Vec<&str> = chunk.memories.iter().map(|m| m.memory_id.as_str()).collect();
+        assert_eq!(ids.len(), usize::try_from(super::DRIVE_BY_CHUNK_MEMORY_LIMIT).unwrap());
+        assert_eq!(
+            ids.first().copied(),
+            Some(chunk_bound.as_str()),
+            "the chunk's own binding leads eight newer path-bound notes: {ids:?}"
         );
     }
 }

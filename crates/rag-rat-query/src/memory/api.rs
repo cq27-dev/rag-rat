@@ -76,9 +76,23 @@ pub fn memories_for_chunk(
 ) -> anyhow::Result<Vec<RepoMemory>> {
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
+    // Two binding kinds answer for one chunk, and they are not equally specific: a chunk binding
+    // names THIS code, a path binding names the whole file. The caller's `limit` is a volume cap,
+    // so under a shared ranking a file-level note touched today evicts the memory an author
+    // anchored to this exact chunk — the more specific binding, and the reason the attachment
+    // exists. Specificity leads, recency breaks the tie within each tier.
+    //
+    // GROUP BY, not DISTINCT: the tier is a PER-ROW expression, so a memory holding BOTH a chunk
+    // and a path binding joins twice and DISTINCT would key on (id, tier, updated_at_ms) and return
+    // it once per binding. The aggregate is what folds the two rows into one tier value — DISTINCT
+    // over the id alone would have collapsed them, but it cannot carry the tier. `IS` (not `=`)
+    // keeps a path binding's NULL `chunk_id` scoring 0 rather than NULL, so the tiers stay
+    // comparable.
     let mut stmt = conn.prepare(&format!(
         "
-        SELECT DISTINCT repo_memories.id AS memory_id
+        SELECT repo_memories.id AS memory_id,
+               MAX(repo_memory_bindings.chunk_id IS ?1) AS binds_this_chunk,
+               repo_memories.updated_at_ms AS updated_at_ms
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
          AND repo_memory_bindings.repo_id = repo_memories.repo_id
@@ -89,7 +103,8 @@ pub fn memories_for_chunk(
               repo_memory_bindings.chunk_id = ?1
               OR (files.path IS NOT NULL AND repo_memory_bindings.path = files.path)
           )
-        ORDER BY repo_memories.updated_at_ms DESC
+        GROUP BY repo_memories.id
+        ORDER BY binds_this_chunk DESC, updated_at_ms DESC
         LIMIT ?2
         "
     ))?;
@@ -486,11 +501,17 @@ mod memory_search_dedup_tests {
 
     /// The duplicate must not eat a result slot: `limit` counts distinct memories, so it has to be
     /// applied AFTER the duplicate rows collapse, not to the raw FTS row set.
+    ///
+    /// The DISTINCTNESS of the ids is the whole claim — a row count of 3 alone is exactly what the
+    /// rejected `DISTINCT (memory_id, bm25)` shape returns, with `m` twice and one memory pushed
+    /// out.
     #[test]
     fn a_duplicate_fts_row_does_not_consume_a_limit_slot() {
         let conn = conn_with_duplicated_fts_row();
         let hits = memory_search(&conn, "quokkaform", 3).unwrap();
-        assert_eq!(hits.len(), 3, "limit counts distinct memories, not FTS rows: {hits:?}");
+        let ids: BTreeSet<&str> = hits.iter().map(|hit| hit.memory_id.as_str()).collect();
+        assert_eq!(hits.len(), 3, "the limit is spent in full: {hits:?}");
+        assert_eq!(ids.len(), 3, "limit counts distinct memories, not FTS rows: {hits:?}");
     }
 }
 
