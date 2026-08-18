@@ -1059,16 +1059,16 @@ fn incremental_pass_heals_an_orphaned_overlay_tombstone() {
     );
     drop(db);
 
-    // Convergence is the point: without it a pass that re-indexes the same file forever looks
-    // exactly like a pass doing real work.
-    let mut discovered = usize::MAX;
-    let _db = IndexDatabase::index_discover_with_progress(&config, |progress| {
-        if let IndexProgress::Discovered { files } = progress {
-            discovered = files;
-        }
-    })
-    .unwrap();
-    assert_eq!(discovered, 0, "the follow-up pass indexes nothing — the loop is closed");
+    // Convergence is the point: without it a pass that rewrites the same rows forever looks
+    // exactly like a pass doing real work. `content_changed` is the instrument, not the
+    // discovered-file count — a re-tombstone/re-heal cycle writes rows while discovering nothing.
+    let (_db, report) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(!report.content_changed, "the follow-up pass is idle — the loop is closed");
+    assert_eq!(
+        report.clone_delta_hint,
+        Some(std::collections::BTreeSet::new()),
+        "and it touched no base path, so the clone delta needs no full scan"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -1107,6 +1107,98 @@ fn a_heal_keeps_the_tombstone_of_a_file_deleted_in_the_working_tree() {
             .unwrap(),
         0,
         "and the deleted file stays out of the scoped view"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #1217 review: a quiet `git status` does not prove a tombstone is an orphan. A tracked file that
+/// becomes gitignored leaves the walk, so discovery tombstones it while its committed row lives on
+/// — and git reports nothing about it, ever. Healing on silence would un-hide content this
+/// checkout no longer serves and would re-tombstone/re-heal it on every pass.
+#[test]
+fn a_heal_keeps_the_tombstone_of_a_tracked_file_that_became_gitignored() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    drop(db);
+    fs::write(root.join(".gitignore"), "src/extra.rs\n").unwrap();
+
+    let (db, _) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE path = 'src/extra.rs' AND kind = 'deleted'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "leaving the walk tombstones the path"
+    );
+    drop(db);
+
+    let (db, report) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(!report.content_changed, "the follow-up pass is idle — no re-tombstone/re-heal churn");
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE path = 'src/extra.rs' AND kind = 'deleted'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "the tombstone of an ignored-but-tracked file is load-bearing and stands"
+    );
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'src/extra.rs'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "and the ignored file stays out of the scoped view"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #1217 review, the same class through the target config: a path an `exclude` glob drops is off
+/// the walk while present on disk and clean in git. Its tombstone is the index's record of that
+/// exclusion, not a leftover.
+#[test]
+fn a_heal_keeps_the_tombstone_of_a_target_excluded_file() {
+    let (root, mut config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    drop(db);
+    config.targets[0].exclude = vec!["src/extra.rs".to_string()];
+
+    let (db, _) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    drop(db);
+    let (db, report) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(!report.content_changed, "the follow-up pass is idle");
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE path = 'src/extra.rs' AND kind = 'deleted'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "an excluded path's tombstone stands"
+    );
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'src/extra.rs'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "and the excluded file stays out of the scoped view"
     );
 
     let _ = fs::remove_dir_all(&root);
