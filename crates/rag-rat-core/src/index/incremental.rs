@@ -44,7 +44,9 @@ impl PreparedIncrementalPass {
     /// The repo-relative paths this pass INDEXES. Every mode builds it the same way — the pass's
     /// own file set, whatever produced it (a Discover walk, the git-dirty set in Changed, the
     /// caller's list in Paths) — which is what makes it usable as proof: a path here is one this
-    /// pass just derived and wrote, so a deletion tombstone shadowing it contradicts that write.
+    /// pass DERIVED, so a deletion tombstone shadowing it contradicts a derivation that just
+    /// happened. Derived, not written: a file whose parse failed is listed here and records a
+    /// parser failure instead of a `files` row, so a caller that needs a row must probe for one.
     /// A path absent from the set is simply not proven, and the overlay heal leaves its tombstone
     /// alone. Re-deriving that claim from the target set plus the ignore rules would be a second
     /// copy of discovery's inclusion logic, free to drift from it.

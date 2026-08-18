@@ -1208,9 +1208,10 @@ fn a_heal_keeps_the_tombstone_of_a_target_excluded_file() {
 /// this fix deliberately keeps forever — gitignored, target-excluded, submodule-internal — are
 /// unhealable by construction, so they are filtered out of the heal's candidate set before the
 /// walk-free check. Otherwise every pass of every repo holding one pays a `git status` inside the
-/// write transaction, which is the idle-pass cost the whole issue is about.
+/// write transaction, which is the idle-pass cost the whole issue is about. The counter is the
+/// IN-TRANSACTION walk only; a Discover pass always walks once off the lock at prepare.
 #[test]
-fn a_permanent_tombstone_does_not_make_every_idle_pass_walk_git_status() {
+fn a_permanent_tombstone_keeps_the_idle_passs_write_txn_walk_free() {
     let walks =
         |db: &IndexDatabase| db.overlay_status_walks.load(std::sync::atomic::Ordering::Relaxed);
     let (root, config) = git_fixture_for_overlay_tests();
