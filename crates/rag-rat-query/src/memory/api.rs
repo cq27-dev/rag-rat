@@ -366,6 +366,21 @@ pub fn memory_search(
     query: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<RepoMemory>> {
+    Ok(memory_search_scored(conn, query, limit)?.into_iter().map(|(memory, _)| memory).collect())
+}
+
+/// Keyword search over active+stale memories, best match first, carrying each hit's raw
+/// `bm25(repo_memory_fts)` rank so a caller can gate on RELATIVE relevance (the plain
+/// [`memory_search`] drops it).
+///
+/// INVARIANT: the returned score is SQLite's bm25, which is NEGATIVE and lower-is-better — a
+/// stronger match is MORE negative. Callers comparing scores must invert first; treating the
+/// raw value as a higher-is-better strength inverts the ranking.
+pub fn memory_search_scored(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<(RepoMemory, f64)>> {
     let query = fts_query(query);
     if query.is_empty() {
         return Ok(Vec::new());
@@ -376,21 +391,107 @@ pub fn memory_search(
     // never surface here.
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
+    // GROUP BY, not DISTINCT: selecting the score alongside the id makes the DISTINCT key the
+    // (memory_id, bm25) PAIR, so a stray duplicate FTS row for one memory — an interrupted heal, an
+    // import that inserts before its scoped DELETE — scores differently and survives it, and then
+    // consumes a LIMIT slot that a distinct memory should have had. Grouping collapses the
+    // duplicates BEFORE the LIMIT, so `limit` still means `limit` distinct memories, and MIN takes
+    // the best of the duplicate rows (bm25 is negative, lower is better). The bm25 call must be
+    // scored in a MATERIALIZED CTE: fts5 rejects its auxiliary functions inside an aggregate, and
+    // an inline subquery gets flattened back into the aggregate query and rejected the same way.
     let mut stmt = conn.prepare(&format!(
         "
-        SELECT DISTINCT repo_memory_fts.memory_id
-        FROM repo_memory_fts
-        JOIN repo_memories ON repo_memories.id = repo_memory_fts.memory_id
-        WHERE repo_memory_fts MATCH ?1
-          AND repo_memories.status IN ('active', 'stale'){repo_clause}
-        ORDER BY bm25(repo_memory_fts)
+        WITH scored AS MATERIALIZED (
+            SELECT repo_memory_fts.memory_id AS memory_id,
+                   bm25(repo_memory_fts) AS bm25_rank
+            FROM repo_memory_fts
+            JOIN repo_memories ON repo_memories.id = repo_memory_fts.memory_id
+            WHERE repo_memory_fts MATCH ?1
+              AND repo_memories.status IN ('active', 'stale'){repo_clause}
+        )
+        SELECT memory_id, MIN(bm25_rank) AS bm25_rank
+        FROM scored
+        GROUP BY memory_id
+        ORDER BY bm25_rank
         LIMIT ?2
         "
     ))?;
-    ids_to_memories(
-        conn,
-        stmt.query_map(params![query, i64::from(limit)], |row| row.get("memory_id"))?,
-    )
+    let ranked = stmt
+        .query_map(params![query, i64::from(limit)], |row| {
+            Ok((row.get::<_, String>("memory_id")?, row.get::<_, f64>("bm25_rank")?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut hits = Vec::with_capacity(ranked.len());
+    for (memory_id, rank) in ranked {
+        if let Some(memory) = memory_by_id(conn, &memory_id)? {
+            hits.push((memory, rank));
+        }
+    }
+    Ok(hits)
+}
+
+#[cfg(test)]
+mod memory_search_dedup_tests {
+    use super::*;
+
+    /// A corpus where one memory's FTS mirror carries a stray SECOND row — what an interrupted
+    /// heal, or an import that inserts before its scoped DELETE, leaves behind. The bodies differ,
+    /// so the two rows score differently and a `DISTINCT` keyed on the id + score pair keeps both.
+    fn conn_with_duplicated_fts_row() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
+            [],
+        )
+        .unwrap();
+        let insert_memory = |id: &str, body: &str| {
+            conn.execute(
+                "INSERT INTO repo_memories(id, kind, title, body, confidence, status,
+                        created_at_ms, updated_at_ms, source, memory_version, repo_id)
+                 VALUES (?1, 'Invariant', 'Quokkaform routing', ?2, 'high', 'active', 0, 0,
+                         'agent', 'v1', 'r')",
+                [id, body],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO repo_memory_fts(repo_id, memory_id, title, body, kind, tags)
+                 VALUES ('r', ?1, 'Quokkaform routing', ?2, 'Invariant', '')",
+                [id, body],
+            )
+            .unwrap();
+        };
+        // `m` is the strongest match by term frequency, so BOTH of its rows outrank the others.
+        insert_memory("m", "quokkaform quokkaform quokkaform");
+        for other in ["m2", "m3", "m4"] {
+            insert_memory(other, "quokkaform is pinned by the router on every rebuild");
+        }
+        // The stray duplicate mirror row for `m`, scoring differently from its real one.
+        conn.execute(
+            "INSERT INTO repo_memory_fts(repo_id, memory_id, title, body, kind, tags)
+             VALUES ('r', 'm', 'Quokkaform routing', 'quokkaform quokkaform quokkaform rebuild',
+                     'Invariant', '')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn duplicate_fts_rows_collapse_to_one_hit_per_memory() {
+        let conn = conn_with_duplicated_fts_row();
+        let hits = memory_search(&conn, "quokkaform", 10).unwrap();
+        assert_eq!(hits.len(), 4, "one hit per memory, not one per FTS row: {hits:?}");
+    }
+
+    /// The duplicate must not eat a result slot: `limit` counts distinct memories, so it has to be
+    /// applied AFTER the duplicate rows collapse, not to the raw FTS row set.
+    #[test]
+    fn a_duplicate_fts_row_does_not_consume_a_limit_slot() {
+        let conn = conn_with_duplicated_fts_row();
+        let hits = memory_search(&conn, "quokkaform", 3).unwrap();
+        assert_eq!(hits.len(), 3, "limit counts distinct memories, not FTS rows: {hits:?}");
+    }
 }
 
 /// Flat summary of one repo memory — boundary DTO for the CLI `memory list` surface.

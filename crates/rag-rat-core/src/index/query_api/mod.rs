@@ -62,6 +62,11 @@ pub use memory::SyncCatchUpReport;
 pub use oracle_runs::OracleShaSnapshots;
 pub use search::SearchRequest;
 
+/// Volume cap on the memories `read_chunk` attaches as drive-by context. The binding is
+/// structural, so every hit is relevant; the cap is purely about how much of a reader's attention
+/// one chunk read may spend (the grep-augment hook lanes budget 4).
+const DRIVE_BY_CHUNK_MEMORY_LIMIT: u32 = 6;
+
 impl IndexDatabase {
     pub fn status(&self, database: &Path) -> anyhow::Result<IndexStatus> {
         let mut counts = BTreeMap::new();
@@ -483,8 +488,11 @@ impl IndexDatabase {
             // heal-and-retry.
             chunk.memories = crate::index::retry_once_on_fts_corruption(
                 || {
-                    let mut memories =
-                        rag_rat_query::memory::memories_for_chunk(conn, chunk_id, 20)?;
+                    let mut memories = rag_rat_query::memory::memories_for_chunk(
+                        conn,
+                        chunk_id,
+                        DRIVE_BY_CHUNK_MEMORY_LIMIT,
+                    )?;
                     rag_rat_query::memory::apply_memory_surface(conn, &mut memories, surface)?;
                     Ok(memories)
                 },
@@ -762,6 +770,90 @@ fn annotate_completeness_with_externals(
 
 #[cfg(test)]
 mod oracle_surfacing_tests;
+
+#[cfg(test)]
+mod drive_by_memory_cap_tests {
+    use rag_rat_query::graph_meta::GraphMetaMode;
+    use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
+    use rusqlite::Connection;
+
+    use crate::index::IndexDatabase;
+
+    /// A store holding one chunk with `n` memories bound to it — the shape `read_chunk` attaches
+    /// drive-by context to. Seeded through a bare connection first so the opened
+    /// [`IndexDatabase`] scopes to the seeded repo.
+    fn db_with_chunk_memories(n: usize) -> (tempfile::TempDir, IndexDatabase, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("index.sqlite");
+        let conn = Connection::open(&database).unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms,
+                               commit_sha, worktree_id, repo_id, generation)
+             VALUES ('src/a.rs', 'rust', 'source', 'h', 0, 0, '', '', 'r', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte,
+                                start_line, end_line, text_hash)
+             VALUES (1, 'symbol', 'a::foo', 0, 10, 1, 2, 'h1')",
+            [],
+        )
+        .unwrap();
+        let chunk_id = conn.last_insert_rowid();
+        rag_rat_db::chunk_text_store::seed_chunk_text(&conn, chunk_id, "fn foo() {}").unwrap();
+        for i in 0..n {
+            crate::memory_write::create_memory(&conn, RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: format!("Drive-by memory {i}"),
+                body: format!("Body of drive-by memory {i}."),
+                confidence: "high".to_string(),
+                created_by: Some("test".to_string()),
+                source: None,
+                tags: vec![],
+                payload_json: None,
+                bind: RepoMemoryBindTarget {
+                    chunk_id: Some(chunk_id),
+                    ..RepoMemoryBindTarget::default()
+                },
+            })
+            .unwrap();
+        }
+        drop(conn);
+        let db = IndexDatabase::open(&database).unwrap();
+        (dir, db, chunk_id)
+    }
+
+    /// #1200: `read_chunk` used to attach up to 20 memories per chunk — enough to bury the chunk
+    /// itself. The bindings are structural, so this is a volume cap, not a relevance gate, and it
+    /// belongs to the read path: the test drives the real `read_chunk` call so raising the literal
+    /// back at the call site fails it.
+    #[test]
+    fn read_chunk_attaches_at_most_the_drive_by_cap() {
+        let (_dir, db, chunk_id) = db_with_chunk_memories(9);
+        let chunk = db
+            .read_chunk_with_graph_and_memories(
+                chunk_id,
+                GraphMetaMode::Full,
+                20,
+                true,
+                rag_rat_base::config::MemorySurface::Full,
+            )
+            .unwrap()
+            .expect("chunk");
+        assert_eq!(
+            chunk.memories.len(),
+            usize::try_from(super::DRIVE_BY_CHUNK_MEMORY_LIMIT).unwrap(),
+            "9 bound memories, capped to the drive-by limit"
+        );
+    }
+}
 
 #[cfg(test)]
 mod name_based_tests {

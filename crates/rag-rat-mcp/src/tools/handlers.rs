@@ -297,6 +297,11 @@ pub(crate) fn call_tool_with_db(
     Ok(result)
 }
 
+/// Volume cap on the memories `symbol_lookup` attaches per candidate. The binding is structural,
+/// so every hit is relevant; the cap is purely about how much of a reader's attention one lookup
+/// may spend, and it is paid once PER CANDIDATE (the grep-augment hook lanes budget 4 in total).
+const SYMBOL_LOOKUP_MEMORY_LIMIT: u32 = 5;
+
 pub(crate) fn symbol_lookup_tool(
     db: &IndexDatabase,
     args: SymbolArgs,
@@ -316,7 +321,7 @@ pub(crate) fn symbol_lookup_tool(
     // serialized candidates no longer expose it (#149), so the old read of `candidate["symbol_id"]`
     // found nothing and dropped every memory — zip by position against the source hits instead.
     for (candidate, hit) in candidates.iter_mut().zip(&lookup.candidates) {
-        let memories = db.memory_for_symbol(hit, 10, memory_surface)?;
+        let memories = db.memory_for_symbol(hit, SYMBOL_LOOKUP_MEMORY_LIMIT, memory_surface)?;
         if !memories.is_empty() {
             candidate["memories"] = json!(memories);
         }
@@ -762,4 +767,98 @@ pub(crate) fn clones_for_symbol_tool(
 ) -> anyhow::Result<Value> {
     let selector = args.into_selector()?;
     Ok(json!(db.clones_for_symbol(selector)?))
+}
+
+#[cfg(test)]
+mod symbol_lookup_memory_cap_tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
+    use rag_rat_base::language::Language;
+    use rag_rat_base::test_scratch::{self, ScratchDir};
+    use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
+
+    use super::*;
+
+    /// An indexed one-symbol repo carrying `n` memories bound to that symbol — more than
+    /// `symbol_lookup` is willing to attach.
+    fn db_with_symbol_memories(n: usize) -> (ScratchDir, IndexDatabase) {
+        let scratch = ScratchDir::new("rag-rat-symbol-memory-cap");
+        let root = test_scratch::canonical_config_root(scratch.path());
+        let mut config = Config::minimal_for_database(root.join("index.sqlite"), root.clone());
+        config.database_key_pinned = true;
+        config.targets = vec![ResolvedTarget {
+            name: "rust".into(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("src")],
+            include: vec!["**/*.rs".into()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }];
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn target() {}\n").unwrap();
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let hit = db
+            .symbol_candidates(
+                &rag_rat_query::symbol::SymbolSelector {
+                    logical_symbol_id: None,
+                    symbol_id: None,
+                    symbol_path: None,
+                    symbol: Some("target".to_string()),
+                    language: None,
+                    allow_ambiguous: false,
+                    limit: 10,
+                },
+                false,
+            )
+            .unwrap()
+            .candidates
+            .remove(0);
+        for i in 0..n {
+            db.memory_create(RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: format!("Bound memory {i}"),
+                body: format!("Body of bound memory {i}."),
+                confidence: "high".to_string(),
+                created_by: Some("test".to_string()),
+                source: None,
+                tags: vec![],
+                payload_json: None,
+                bind: RepoMemoryBindTarget {
+                    logical_symbol_id: hit.logical_symbol_id,
+                    ..RepoMemoryBindTarget::default()
+                },
+            })
+            .unwrap();
+        }
+        (scratch, db)
+    }
+
+    fn lookup_args() -> SymbolArgs {
+        SymbolArgs {
+            symbol: Some("target".to_string()),
+            symbol_path: None,
+            logical_symbol_id: None,
+            language: None,
+            allow_ambiguous: false,
+            limit: 10,
+            include: None,
+            worktree: None,
+        }
+    }
+
+    /// #1200: `symbol_lookup` used to attach up to 10 memories PER CANDIDATE, so an ambiguous
+    /// lookup spent most of its response on drive-by memories.
+    #[test]
+    fn symbol_lookup_attaches_at_most_the_per_candidate_cap() {
+        let (_scratch, db) = db_with_symbol_memories(8);
+        let value = symbol_lookup_tool(&db, lookup_args(), MemorySurface::Full).unwrap();
+        let attached = value["candidates"][0]["memories"].as_array().expect("memories attached");
+        assert_eq!(
+            attached.len(),
+            usize::try_from(SYMBOL_LOOKUP_MEMORY_LIMIT).unwrap(),
+            "8 bound memories, capped to the per-candidate limit"
+        );
+    }
 }
