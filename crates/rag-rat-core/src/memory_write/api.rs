@@ -1,5 +1,5 @@
-//! The four AUTHORED memory mutations. Each one authors its op-log entry (or takes the authored
-//! durability posture) inside the same transaction as the row write — an authoring error rolls
+//! The AUTHORED memory mutations. Each one authors its op-log entry inside the same transaction as
+//! the row write — an authoring error rolls
 //! the mutation back. Read-side machinery (validation of kinds/confidence, binding resolution,
 //! hydration) comes from `rag_rat_query::memory`.
 
@@ -275,9 +275,16 @@ pub(crate) fn rebind_memory(
     // Authored write (#560): a rebind is an explicit, non-reconstructable choice of a new anchor,
     // and now mints a signed op for it. NORMAL restored on drop.
     let _durability = authoring::AuthoredDurability::begin(conn)?;
+    let now = now_ms();
+    // Backfill BEFORE preparing, like the create and update paths. This is what mints the local
+    // account and establishes the owner stream; without it a store whose account has never been
+    // minted — a memory authored under a `local:` shallow-clone id, or by a pre-#532 binary —
+    // prepares `None` and `author_in_owner_stream` returns Ok having written nothing. That was
+    // harmless while a rebind authored no op, and silently drops the snapshot now that it does.
+    authoring::backfill_memory_oplog(conn, now)?;
     // Prepared BEFORE the txn, like the create path: minting the account self-transacts and cannot
     // nest inside the one opened below.
-    let prepared = authoring::prepare_live_content_authoring(conn, now_ms())?;
+    let prepared = authoring::prepare_live_content_authoring(conn, now)?;
     // IMMEDIATE for the same reason as `create_memory`: `resolve_binding` READS before the writes
     // below, and a deferred read→write upgrade racing a foreign repo's rebuild dies with
     // SQLITE_BUSY_SNAPSHOT, which the busy handler never sees.
@@ -297,7 +304,6 @@ pub(crate) fn rebind_memory(
         [memory_id],
     )?;
     conn.execute("DELETE FROM repo_memory_call_paths WHERE memory_id = ?1", [memory_id])?;
-    let now = now_ms();
     insert_binding(conn, memory_id, &binding, now)?;
     insert_auto_moniker_binding(conn, memory_id, &binding, now)?;
     // Re-stamp the freshly re-inserted bindings from the parent memory's repo (the create path does
@@ -413,6 +419,40 @@ mod anchor_authoring_tests {
         .memory_id;
 
         assert_eq!(projected_anchors(&conn, &memory_id), None);
+    }
+
+    /// The backfill leg must publish anchors too. A memory whose bindings predate the anchor op —
+    /// every memory in an existing store, and everything `sync publish --seed` reconciles onto a
+    /// public stream — is authored by the reconcile anti-join, not by `create_memory`. If that leg
+    /// skipped the snapshot, those memories would replicate with no anchors permanently, since the
+    /// anti-join never revisits a node once it exists.
+    #[test]
+    fn the_reconcile_backfill_publishes_anchors_for_a_memory_that_predates_the_op() {
+        let conn = scoped_conn();
+        // A memory + binding written the way a pre-anchor store holds them: rows only, no op.
+        conn.execute(
+            "INSERT INTO repo_memories(
+                 id, kind, title, body, confidence, status, created_at_ms, updated_at_ms, source,
+                 memory_version, repo_id, origin)
+             VALUES ('mem_old', 'Invariant', 't', 'b', 'high', 'active', 1, 1, 'agent', 'v1', ?1,
+                 'local')",
+            [REPO],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, anchor_status, created_at_ms)
+             VALUES (?1, 'mem_old', 'path', 'src/old.rs', 'src/old.rs', 'current', 1)",
+            [REPO],
+        )
+        .unwrap();
+
+        // Any authored write drives the backfill, which reconciles the un-authored node.
+        bound_create(&conn, "src/lib.rs");
+
+        let anchors =
+            projected_anchors(&conn, "mem_old").expect("the backfill published the old anchors");
+        assert!(anchors.contains(&"src/old.rs".to_string()));
     }
 
     /// A rebind is an explicit choice of a new anchor and now mints a signed op for it — the

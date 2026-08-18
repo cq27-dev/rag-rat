@@ -2237,7 +2237,9 @@ mod tests {
     }
 
     /// The point of the whole train (#1180): a memory created WITH a binding reaches a peer over
-    /// `/3` alone and drive-by surfaces there — no `/5` anchors leg, no shared account.
+    /// `/3` alone and drive-by surfaces there, with no `/5` anchors leg. (Both stores adopt the
+    /// same account here, as its sibling does — what this isolates is the transport, not the
+    /// account boundary.)
     ///
     /// Its sibling above pins the complementary case: a binding written directly to the table,
     /// bypassing the authoring seam, publishes nothing and so surfaces nothing until `/5` carries
@@ -2287,10 +2289,12 @@ mod tests {
         assert_eq!(surfaced[0].memory_id, memory_id);
     }
 
-    /// The relocation loop must never author. It re-keys `binding_id` per checkout, so authoring
-    /// there would mint a signed op per mechanical drift and put every device in a rebind war over
-    /// the same memory. `rag-rat-query` cannot reach the authoring path at all, and this pins that
-    /// nobody wires one in later.
+    /// The validate pass must never author. Relocation re-keys `binding_id` per checkout, so a
+    /// signed op per mechanical drift would put every device in a rebind war over one memory.
+    ///
+    /// What actually guarantees this is the crate graph — `rag-rat-query`, where the loop lives,
+    /// cannot reach core's authoring path — so treat this as documentation of the intent rather
+    /// than a trap that would catch someone adding authoring on the core side of the call.
     #[test]
     fn a_relocation_pass_authors_no_content_op() {
         let conn = scoped_conn();

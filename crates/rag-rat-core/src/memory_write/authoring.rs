@@ -475,6 +475,7 @@ fn edge_add_op(edge: &NodeEdge, owner_repo_id: &str) -> anyhow::Result<MemoryOp>
 /// CASCADE` on `source_node_id` rules out an orphan edge), so the final pass is empty and each
 /// memory's edges follow its `NodeCreate`/`NodeStatus` in `edge_key` order.
 fn build_reconcile_ops(
+    conn: &Connection,
     missing_nodes: &[MemoryRow],
     missing_edges: &[NodeEdge],
     owner_repo_id: &str,
@@ -488,6 +489,25 @@ fn build_reconcile_ops(
     let mut ops = Vec::new();
     for row in missing_nodes {
         ops.extend(node_ops(row, elide_active_status)?);
+        // The backfill leg has to publish anchors too, or every memory that predates the anchor op
+        // replicates with none and a peer seeds nothing for it — permanently, since this anti-join
+        // never revisits a node once it exists. That covers the existing corpus on every upgraded
+        // store, and `sync publish --seed`, which reconciles a whole index onto a public stream.
+        //
+        // An unpublishable set is dropped rather than quarantining the node: anchors are
+        // decoration, and losing them must never cost a peer the memory itself.
+        if let Some(op) = anchors_op(conn, &row.memory_id)?
+            && content_op_is_authorable(&op, StreamSealPolicy::Sealed)
+        {
+            ops.push(op);
+        }
+        // The backfill leg has to publish anchors too, or every memory that predates the anchor op
+        // replicates with none and a peer seeds nothing for it — permanently, since this anti-join
+        // never revisits a node once it exists. That covers the existing corpus on every upgraded
+        // store, and `sync publish --seed`, which reconciles a whole index onto a public stream.
+        //
+        // An unpublishable set is dropped rather than quarantining the node: anchors are
+        // decoration, and losing them must never cost a peer the memory itself.
         if let Some(group) = by_source.remove(row.memory_id.as_str()) {
             for edge in group {
                 ops.push(edge_add_op(edge, owner_repo_id)?);
@@ -695,6 +715,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
             return Ok(());
         }
         let ops = build_reconcile_ops(
+            conn,
             &work.authorable_nodes,
             &work.live_edges,
             repo_id,
@@ -726,7 +747,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     // for the public API to shrink or delete.
     let work = read_reconcile_work(&tx, repo_id, stream, policy)?;
     work.warn_quarantined(repo_id);
-    let ops = build_reconcile_ops(&work.authorable_nodes, &work.live_edges, repo_id, genesis)?;
+    let ops = build_reconcile_ops(&tx, &work.authorable_nodes, &work.live_edges, repo_id, genesis)?;
     // Skip the author when there is nothing to author: a fresh repo whose anti-join was empty only
     // needed ownership established (done above), and authoring an empty batch would still refold +
     // reproject for no change.
@@ -918,6 +939,7 @@ pub(crate) fn enable_sealed_authoring(conn: &Connection, now_ms: i64) -> anyhow:
     let work = read_reconcile_work(&tx, &repo_id, stream, StreamSealPolicy::Sealed)?;
     work.warn_quarantined(&repo_id);
     let ops = build_reconcile_ops(
+        &tx,
         &work.authorable_nodes,
         &work.live_edges,
         &repo_id,
@@ -1373,7 +1395,8 @@ fn author_in_owner_stream(
     now_ms: i64,
 ) -> anyhow::Result<()> {
     // Whole-op write-boundary guard (#680): every live mutation
-    // (`create_memory`/`update_memory`/`add_edge`/`remove_edge`) funnels its authored ops through
+    // (`create_memory`/`update_memory`/`rebind_memory`/`add_edge`/`remove_edge`) funnels its
+    // authored ops through
     // this ONE seam, so rejecting an un-authorable op here — before it is signed — is the single
     // authoritative catch-all for the aggregate no per-field cap sees (e.g. thousands of
     // individually-valid tags) and any future uncapped field. Runs BEFORE the scope gate so an
@@ -1471,8 +1494,8 @@ pub(crate) fn author_anchors(
 /// Deliberately unfiltered: the author publishes every portable fact it holds, including kinds this
 /// binary's own drain declines to seed. Which anchors are usable is the receiver's judgment, and
 /// filtering here would destroy information a later receiver could use.
-fn anchors_op(tx: &Transaction<'_>, memory_id: &str) -> anyhow::Result<Option<MemoryOp>> {
-    let anchors = portable_anchors_of(tx, memory_id)?;
+fn anchors_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<MemoryOp>> {
+    let anchors = portable_anchors_of(conn, memory_id)?;
     if anchors.is_empty() {
         return Ok(None);
     }
@@ -1491,6 +1514,7 @@ fn portable_anchors_of(
                 moniker_tool_version
          FROM repo_memory_bindings
          WHERE memory_id = ?1
+           AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
          ORDER BY binding_kind, binding_id",
     )?;
     let rows = stmt.query_map(params![memory_id], |row| {
