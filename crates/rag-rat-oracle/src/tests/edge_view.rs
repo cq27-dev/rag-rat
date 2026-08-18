@@ -251,7 +251,10 @@ fn graph_traversal_seed_predicates_use_edge_id_indexes() {
         .unwrap();
     assert_eq!(idx_count, 1, "V071 idx_edges_target_qname on edges_data");
 
-    // Reverse (find_callers) Syntactic seed shape — mirror of predicates::reverse_predicate.
+    // Reverse (find_callers) Syntactic seed shape — mirror of predicates::reverse_predicate. The
+    // trailing `id IN (...)` arm is the oracle-seeded rowid list that predicate splices in
+    // whenever a verdict names the seed: an uncorrelated rowid list, so it joins the multi-index OR
+    // as another INTEGER PRIMARY KEY lookup rather than defeating it (#1197).
     let reverse = plan(
         "SELECT id FROM edges
          WHERE edge_kind IN ('calls_name', 'constructs')
@@ -260,7 +263,8 @@ fn graph_traversal_seed_predicates_use_edge_id_indexes() {
                    SELECT id FROM symbols
                    WHERE qualified_name_id = (SELECT id FROM name_strings WHERE value = 'x'))
                 OR ('true' = 'true' AND to_symbol_id IN (SELECT id FROM symbols WHERE name = 'y'))
-                OR target_qualified_name_id = (SELECT id FROM name_strings WHERE value = 'x'))",
+                OR target_qualified_name_id = (SELECT id FROM name_strings WHERE value = 'x')
+                OR id IN (11, 22, 33))",
     );
     assert!(
         reverse.contains("idx_edges_to_symbol"),

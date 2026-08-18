@@ -1,4 +1,6 @@
 mod predicates;
+#[cfg(test)]
+mod tests;
 mod traverse;
 use std::collections::BTreeSet;
 
@@ -99,6 +101,12 @@ pub struct GraphTraversalSummary {
     pub syntactic: u64,
     pub name_only: u64,
     pub ambiguous: u64,
+    /// Matching edges the COMPILER bound to this symbol while the heuristic left `to_symbol_id`
+    /// NULL — the oracle-seeded reverse rows, which the read-side enrichment promotes to the
+    /// `compiler` tier. Counted here rather than under `unresolved` / the confidence buckets,
+    /// which report what tree-sitter alone concluded. Always 0 for a forward traversal, which has
+    /// no oracle seed.
+    pub compiler_verified: u64,
     pub unresolved: u64,
     pub false_positive_risk: String,
     pub completeness_risk: String,

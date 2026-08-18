@@ -1485,6 +1485,13 @@ pub(crate) fn edge_oracle_current_predicate() -> String {
 /// spelling of the gate rather than re-deriving it. The inner `symbols`/`files` names shadow any
 /// outer join of the same tables (SQLite resolves the subquery scope first), exactly as when
 /// appended after [`edge_oracle_scope_join`].
+///
+/// A second consumer lives outside this crate: the reverse-traversal seed arm in
+/// `rag_rat_query::graph::predicates` admits edges by their verdict's `resolved_symbol_id`, and
+/// reaches the same def-drift gate by routing its seed subqueries through the connection's scoped
+/// `files` view instead of embedding this predicate. Seeding a verdict this gate would refuse
+/// asserts a caller the display path then declines to show — so a change to what counts as current
+/// here belongs there too.
 pub(crate) fn edge_oracle_def_current_predicate(commit_slot: &str, worktree_slot: &str) -> String {
     format!(
         " AND (edge_oracle.resolved_symbol_id IS NULL OR EXISTS (SELECT 1 FROM symbols JOIN files \
