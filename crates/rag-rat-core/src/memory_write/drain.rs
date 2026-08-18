@@ -432,9 +432,24 @@ fn drain_node(
         },
     };
     // Seed AFTER materialization, and only for a node that belongs to THIS repo — the sibling-repo
-    // arm above must not touch that repo's bindings any more than it touches its content.
-    if node_in_repo(tx, &node.node_id, repo_id)? {
-        seed_node_anchors(tx, repo_id, node)?;
+    // arm above must not touch that repo's bindings any more than it touches its content. The
+    // snapshot check comes first because it is free: until anchors are authored, every node answers
+    // `None` and this costs no query at all.
+    if node.anchors.is_some() && node_in_repo(tx, &node.node_id, repo_id)? {
+        let seeded = seed_node_anchors(tx, repo_id, node)?;
+        if seeded > 0 {
+            // `anchors/1` declares that a write to this table advances these lanes, and the `/5`
+            // applier bumps them for exactly this reason. The seed is a second writer to the same
+            // table, and on the converged path no `repo_memories` row is touched — so the row
+            // triggers that normally carry the lanes never fire, and without this a reader's Lens
+            // view keeps serving a revision that predates the bindings.
+            if rag_rat_db::schema::repo_id_is_registered(tx, repo_id)? {
+                rag_rat_db::meta::bump_lens_revisions(tx, repo_id, &[
+                    rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
+                    rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
+                ])?;
+            }
+        }
     }
     Ok(effect)
 }
@@ -443,20 +458,19 @@ fn drain_node(
 /// from a peer's snapshot. An unknown kind is a newer peer's vocabulary: it means nothing here, so
 /// it is skipped row-wise rather than quarantining the node over its decoration.
 ///
-/// `call_path` is deliberately absent even though the local path produces it: its supporting
-/// `repo_memory_call_paths` / `_edges` rows are in NO replication scope, so a seeded call-path
-/// binding could never resolve here — it would sit unverifiable forever.
-const SEEDABLE_BINDING_KINDS: &[&str] = &[
-    "logical_symbol",
-    "symbol",
-    "chunk",
-    "edge",
-    "scip_moniker",
-    "path",
-    "dir",
-    "commit",
-    "tracker",
-];
+/// Two kinds the local path DOES produce are deliberately absent, both because a seeded row could
+/// never resolve here and would sit `unverified` forever:
+/// - `call_path`, whose supporting `repo_memory_call_paths` / `_edges` rows are in no replication
+///   scope, so the path it names does not exist locally.
+/// - `chunk`, whose `binding_id` IS a checkout-local rowid — reassigned on every re-chunk, so a
+///   peer's integer is meaningless here. Its validator also short-circuits `unverified` whenever
+///   the local `chunk_id` column is NULL, which is exactly what a seeded row leaves it as, so the
+///   hash-relocation fallback that might have rescued it is unreachable.
+///
+/// Everything remaining is portable by construction: qualified names with name-based relocation,
+/// an edge fingerprint, or a plain string.
+const SEEDABLE_BINDING_KINDS: &[&str] =
+    &["logical_symbol", "symbol", "edge", "scip_moniker", "path", "dir", "commit", "tracker"];
 
 /// Seed a synced memory's bindings from the anchor snapshot its author published — ONLY when this
 /// store holds none for it.
@@ -484,15 +498,25 @@ fn seed_node_anchors(
     }
     let mut seeded = 0;
     for anchor in anchors {
-        if !SEEDABLE_BINDING_KINDS.contains(&anchor.binding_kind.as_str())
-            || anchor.binding_id.is_empty()
-        {
+        if !SEEDABLE_BINDING_KINDS.contains(&anchor.binding_kind.as_str()) {
+            // A deliberately-excluded kind is the ordinary case, not an anomaly — a call-path-bound
+            // memory reaching a peer is normal — and the projection re-offers it on every pass, so
+            // warning here would repeat forever for a decision this store already made.
+            tracing::debug!(
+                repo_id,
+                node_id = %node.node_id,
+                binding_kind = %anchor.binding_kind,
+                "not seeding an anchor of a kind this store cannot resolve",
+            );
+            continue;
+        }
+        if anchor.binding_id.is_empty() {
             tracing::warn!(
                 repo_id,
                 node_id = %node.node_id,
                 binding_kind = %anchor.binding_kind,
-                "skipping an anchor this store cannot seed: unknown binding kind, or an empty \
-                 binding id that would make a degenerate primary key",
+                "skipping an anchor with an empty binding id: it would make a degenerate primary \
+                 key",
             );
             continue;
         }
@@ -946,6 +970,13 @@ mod tests {
         node_id: &str,
         anchors: Option<&[(&str, &str)]>,
     ) {
+        // Idempotent in the node row, so a test can re-run this to add a snapshot to content it
+        // already seeded — the "the snapshot arrived in a later entry" shape.
+        conn.execute(
+            "DELETE FROM content_projected_nodes WHERE stream_id = ?1 AND node_id = ?2",
+            params![stream.to_bytes().as_slice(), node_id],
+        )
+        .unwrap();
         seed_projected_node(conn, stream, node_id, "Invariant", "t", "b", "active", &[]);
         let anchors_json = anchors.map(|anchors| {
             let rows: Vec<serde_json::Value> = anchors
@@ -1046,18 +1077,10 @@ mod tests {
         )
         .unwrap();
 
-        // Forget the drain watermark so the next pass genuinely re-examines this node — otherwise
-        // the drain short-circuits as caught-up and this test would pass with the gate removed.
-        conn.execute("DELETE FROM oplog_meta WHERE key = 'content:drain-wm:' || hex(?1)", params![
-            stream.to_bytes().as_slice()
-        ])
-        .unwrap();
-        assert!(
-            rag_rat_oplog::content_drain_needed(&conn, stream).unwrap(),
-            "the second pass must actually run, or this test proves nothing",
-        );
-
-        // A later drain must not put the original identity back beside the relocated row.
+        // `drain_worker` calls the in-transaction drain directly, so there is no caught-up
+        // short-circuit to defeat here — the second pass re-walks every projected node
+        // unconditionally. A later drain must not put the original identity back beside the
+        // relocated row.
         drain_worker(&conn, stream, 2_000);
         assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
             "symbol".to_string(),
@@ -1065,19 +1088,65 @@ mod tests {
         )]);
     }
 
-    /// An author publishing an EMPTY set is a statement that the memory has no bindings; it must
-    /// seed nothing, and must not be confused with the `None` of nobody having published.
+    /// The reason `drain_node` computes an effect and then seeds, instead of returning early: an
+    /// anchor snapshot can arrive in a LATER entry than the content it describes. On that second
+    /// pass the content has already converged, so the node takes the `unchanged` arm — and if that
+    /// arm returned, the memory would never get its bindings.
+    ///
+    /// Restoring the early return must fail this test; nothing else in the suite reaches that arm
+    /// with a seed pending.
     #[test]
-    fn neither_an_empty_snapshot_nor_an_absent_one_seeds_anything() {
+    fn a_snapshot_arriving_after_its_content_still_seeds() {
         let conn = scoped_conn();
         let stream = StreamId::from_bytes([0x44; 32]);
-        seed_projected_node_with_anchors(&conn, stream, "mem_empty", Some(&[]));
-        seed_projected_node_with_anchors(&conn, stream, "mem_absent", None);
-
+        // Pass one: content only, no snapshot yet.
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", None);
         drain_worker(&conn, stream, 1_000);
+        assert!(
+            bindings_of(&conn, "mem_peer").is_empty(),
+            "nobody has published this memory's bindings yet",
+        );
 
-        assert!(bindings_of(&conn, "mem_empty").is_empty());
-        assert!(bindings_of(&conn, "mem_absent").is_empty());
+        // Pass two: the snapshot lands with the content byte-identical, so the node converges and
+        // takes the `unchanged` arm.
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        let outcome = drain_worker(&conn, stream, 2_000);
+        assert_eq!(outcome.nodes_written, 0, "the content did not change on this pass");
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::run".to_string()
+        )]);
+    }
+
+    /// An author publishing an EMPTY set states the memory has no bindings, which is not the `None`
+    /// of nobody having published — but neither seeds, and crucially neither ARMS the gate: a later
+    /// real snapshot must still be able to seed, which an over-eager "we have seen a snapshot" gate
+    /// would prevent.
+    #[test]
+    fn an_empty_snapshot_seeds_nothing_and_does_not_arm_the_gate() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", Some(&[]));
+        drain_worker(&conn, stream, 1_000);
+        assert!(bindings_of(&conn, "mem_peer").is_empty(), "an empty set seeds nothing");
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        drain_worker(&conn, stream, 2_000);
+        assert_eq!(
+            bindings_of(&conn, "mem_peer").len(),
+            1,
+            "the earlier empty set did not consume this memory's one chance to be seeded",
+        );
     }
 
     /// A binding kind this store cannot produce is a newer peer's vocabulary: skipped row-wise,
