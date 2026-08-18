@@ -165,7 +165,7 @@ pub use content_projection::{
 pub use identity::{LocalDevice, load_local_device, local_device};
 pub use op::{
     DeviceFingerprint, EdgeKey, EdgeSpec, MAX_ANCHORS_PER_OP, MemoryOp, NodeContent, NodeId,
-    NodeStatus, ParseDeviceFingerprintError, PortableAnchor, ResolvedAnchor,
+    NodeStatus, ParseDeviceFingerprintError, PortableAnchor, ResolvedAnchor, within_wire_limits,
 };
 // The `/1` shadow-projection read seams (`ProjectedState` / `load_projection`) and the
 // standalone (own-txn) `/1` authoring wrappers (`author_batch` / `author_op`) — test-only

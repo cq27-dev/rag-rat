@@ -298,11 +298,54 @@ impl PortableAnchor {
 /// practice (its own, plus an auto-moniker), so this is a generous structural bound rather than a
 /// budget.
 ///
-/// RAISING IT IS A FORMAT CHANGE. A binary that knows `node_anchors` hard-rejects an over-cap op,
-/// so an older peer would refuse an entry a newer one authored — the chain wedges rather than
-/// degrading. A larger limit ships as a NEW op kind, the same discipline `snapshot` documents for
-/// its payload.
+/// RAISING IT IS A FORMAT CHANGE, and the failure it causes is SILENT. `/3` ingest never decodes op
+/// bytes (they may be sealed), so an over-cap op from a newer peer is accepted, retained, and
+/// forwarded; the projection then treats an undecodable body as a local skip, not an acceptance
+/// failure, so the memory's anchors simply never appear on the older peer and nothing reports it. A
+/// larger limit ships as a NEW op kind, the same discipline `snapshot` documents for its payload.
 pub const MAX_ANCHORS_PER_OP: usize = 64;
+
+/// The `PortableAnchor` fields, in wire order. Pinned against the `anchors/1` spec by a test in
+/// that scope's own module, so adding a column there fails loudly instead of silently seeding NULL
+/// across the account boundary.
+pub(crate) const PORTABLE_ANCHOR_FIELDS: &[&str] = &[
+    "binding_kind",
+    "binding_id",
+    "path",
+    "start_line",
+    "end_line",
+    "commit_hash",
+    "tracker",
+    "project",
+    "item_key",
+    "created_at_ms",
+    "symbol_kind",
+    "signature_hash",
+    "moniker_tool",
+    "moniker_tool_version",
+];
+
+/// Whether `op` satisfies the structural limits `decode` enforces — the guard that keeps an op from
+/// being signed and replicated in a shape NO binary can read back, its author included.
+///
+/// Byte size is bounded separately, by the content-entry caps. What this catches is the shapes that
+/// are *small* and still undecodable: an over-cap anchor count, and a duplicated row identity. Both
+/// encode happily, and `/3` would accept, retain and forward them, so without this gate they become
+/// permanent entries whose anchors every peer silently drops at projection.
+pub fn within_wire_limits(op: &MemoryOp) -> bool {
+    match op {
+        MemoryOp::NodeAnchors { anchors, .. } => {
+            if anchors.len() > MAX_ANCHORS_PER_OP {
+                return false;
+            }
+            let mut identities: Vec<(&str, &str)> =
+                anchors.iter().map(PortableAnchor::identity).collect();
+            identities.sort_unstable();
+            identities.windows(2).all(|pair| pair[0] != pair[1])
+        },
+        _ => true,
+    }
+}
 
 /// The frozen op set (§5.4 / §6.3). Each op mutates exactly one LWW register of one node/edge (see
 /// the fold), except `NodeCreate`, which also establishes existence.
@@ -463,9 +506,13 @@ fn encode_resolved(enc: &mut VecEncoder<'_>, resolved: &ResolvedAnchor) {
 /// query that produced it perturbs the canonical bytes — the rule `tags` already follows.
 ///
 /// Duplicates are deliberately NOT deduped here. Two anchors sharing `(binding_kind, binding_id)`
-/// name one row twice, and the payload cannot say which of them wins; `decode` rejects that
-/// outright, and because these bytes then fail the `encode == bytes` identity check, a
-/// duplicate-carrying op can never round-trip through the wire.
+/// name one row twice, and the payload cannot say which of them wins, so `decode`'s
+/// strictly-increasing check rejects them.
+///
+/// That check is the SOLE rejector — the `encode == bytes` identity check is not a second net here,
+/// and must not be mistaken for one. It is unreachable (decode errors first), and it would pass
+/// anyway: this sort is stable, so a duplicate-carrying payload re-encodes to the bytes it came
+/// from. Relaxing the `>=` to `>` would let duplicates straight through.
 fn encode_anchors(enc: &mut VecEncoder<'_>, anchors: &[PortableAnchor]) {
     let mut ordered: Vec<&PortableAnchor> = anchors.iter().collect();
     ordered.sort_by(|a, b| a.identity().cmp(&b.identity()));
@@ -843,7 +890,7 @@ mod tests {
     }
 
     /// Write one anchor into a hand-rolled envelope — the fixture builder for the canonical-order
-    /// and cap rejections, which need wire forms `encode` would never produce.
+    /// rejections, which need wire forms `encode` would never produce.
     fn raw_anchor(enc: &mut VecEncoder<'_>, kind: &str, id: &str) {
         enc.array(14).unwrap();
         enc.str(kind).unwrap();
@@ -972,6 +1019,49 @@ mod tests {
 
         let err = decode(&buf).unwrap_err().to_string();
         assert!(err.contains("strictly increasing"), "{err}");
+    }
+
+    /// The round-trip direction the hand-rolled duplicate test cannot reach: an op BUILT with two
+    /// anchors for one row must not survive its own encode. Pins that `decode`'s strict ordering is
+    /// what rejects it — the `encode == bytes` check cannot, since the stable sort re-encodes such
+    /// a payload to the very bytes it came from.
+    #[test]
+    fn an_op_carrying_a_duplicate_identity_cannot_round_trip() {
+        let mut duplicated = anchors();
+        duplicated.push(duplicated[0].clone());
+        let op = MemoryOp::NodeAnchors { node_id: NodeId::from("mem_1"), anchors: duplicated };
+
+        let err = decode(&encode(&op)).unwrap_err().to_string();
+        assert!(err.contains("strictly increasing"), "{err}");
+    }
+
+    /// The authoring-side twin: such an op is refused BEFORE it is signed, so it never becomes a
+    /// permanent entry whose anchors every peer silently drops at projection.
+    #[test]
+    fn wire_limits_reject_what_decode_cannot_read_back() {
+        let mut duplicated = anchors();
+        duplicated.push(duplicated[0].clone());
+        assert!(!within_wire_limits(&MemoryOp::NodeAnchors {
+            node_id: NodeId::from("mem_1"),
+            anchors: duplicated,
+        }));
+
+        let over_cap: Vec<PortableAnchor> = (0..=MAX_ANCHORS_PER_OP)
+            .map(|index| PortableAnchor {
+                binding_id: format!("id_{index:03}"),
+                ..anchors()[0].clone()
+            })
+            .collect();
+        assert!(!within_wire_limits(&MemoryOp::NodeAnchors {
+            node_id: NodeId::from("mem_1"),
+            anchors: over_cap,
+        }));
+
+        assert!(within_wire_limits(&MemoryOp::NodeAnchors {
+            node_id: NodeId::from("mem_1"),
+            anchors: anchors(),
+        }));
+        assert!(every_variant().iter().all(|(_, op)| within_wire_limits(op)));
     }
 
     #[test]

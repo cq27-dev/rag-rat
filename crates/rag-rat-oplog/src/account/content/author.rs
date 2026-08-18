@@ -98,8 +98,12 @@ const CONTENT_OP_BODY_MAX_BYTES: usize =
 /// the create/update boundary to reject oversized input before the row is persisted (#680). Checks
 /// the encoded body only; the header + signature are the fixed overhead `CONTENT_OP_BODY_MAX_BYTES`
 /// already reserves for.
+/// Also gates the STRUCTURAL limits `op::decode` enforces, not just size: an op can be small and
+/// still unreadable (an over-cap or duplicate-carrying anchor set). `/3` ingest never decodes op
+/// bytes, so such an entry would be signed, accepted and forwarded, then silently skipped at
+/// projection by every peer including its author — a shape worth refusing before it is durable.
 pub fn content_op_is_authorable(op: &MemoryOp) -> bool {
-    op::encode(op).len() <= CONTENT_OP_BODY_MAX_BYTES
+    op::within_wire_limits(op) && op::encode(op).len() <= CONTENT_OP_BODY_MAX_BYTES
 }
 
 /// The AEAD expansion a suite-1 seal adds to the op body on the wire: the 24-byte XChaCha nonce +
@@ -121,7 +125,7 @@ const CONTENT_SEALED_OP_BODY_MAX_BYTES: usize =
 /// this to QUARANTINE an un-authorable op on a sealed stream — exactly as the suite-0 predicate
 /// does on a plaintext one — instead of `bail!`ing the whole batch at sign time.
 pub fn content_op_is_sealed_authorable(op: &MemoryOp) -> bool {
-    op::encode(op).len() <= CONTENT_SEALED_OP_BODY_MAX_BYTES
+    op::within_wire_limits(op) && op::encode(op).len() <= CONTENT_SEALED_OP_BODY_MAX_BYTES
 }
 
 /// The `/3` chain tail for one `(stream, author, device)` coordinate: its highest-`seq` entry.

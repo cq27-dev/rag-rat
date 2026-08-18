@@ -1835,6 +1835,27 @@ fn default_matches_sql(declared: DefaultValue, physical: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    /// The `anchors/1` columns and `op::PortableAnchor` are ONE fact in two places: the `/3`
+    /// `node_anchors` op carries these columns across the account boundary, and the drain seeds
+    /// binding rows from them. A column added here without a matching op field would not fail to
+    /// compile — it would seed as NULL on every peer, discovered long after the fact — so this
+    /// fails at the edit instead.
+    ///
+    /// Widening the op is a wire-format change, so the fix when this breaks is a new op kind, never
+    /// an extra field on the existing one.
+    #[test]
+    fn the_anchors_scope_columns_match_the_portable_anchor_op_fields() {
+        let spec = SYNCABLE_TABLES
+            .iter()
+            .find(|spec| spec.scope_id == "anchors/1")
+            .expect("the anchors/1 scope is registered");
+        // The op omits the `(repo_id, memory_id)` head of the pk: the repo is the drain's context
+        // and the memory is the op's own node id, so neither is repeated per anchor.
+        let carried: Vec<&str> =
+            spec.pk[2..].iter().chain(spec.columns.iter()).map(|column| column.name).collect();
+        assert_eq!(carried, crate::op::PORTABLE_ANCHOR_FIELDS);
+    }
+
     const DEMO_PK: &[ColumnSpec] = &[ColumnSpec::required("id", ValueType::Text)];
     const DEMO_COLUMNS: &[ColumnSpec] = &[
         ColumnSpec::required("title", ValueType::Text),
