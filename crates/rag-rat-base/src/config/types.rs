@@ -155,14 +155,16 @@ pub struct MemoryConfig {
 }
 
 /// `[memory] surface` — the memory rendering mode. `Summary` (default) renders the dream-compacted
-/// summary (when one exists for the memory's current body) plus a plain-text verdict marker,
-/// falling back to the mechanical compact header (title-only) when no summary row exists; `Full`
-/// keeps whole bodies. Persisted only in config, so a closed enum with a stable `as_str` round-trip
-/// is enough (no DB column).
+/// summary for the memory's current body plus a plain-text verdict marker; `Full` keeps whole
+/// bodies. With no summary row the body's own size decides: a note already inside the summary
+/// envelope (≤150 words and ≤1200 characters) is one compaction skips and will never have a row, so
+/// it surfaces WHOLE rather than as a bare title, while a longer uncompacted body is deferred
+/// behind a one-line marker naming the expand call. Persisted only in config, so a closed enum with
+/// a stable `as_str` round-trip is enough (no DB column).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MemorySurface {
-    /// Title + compacted summary + verdict marker, falling back to title-only when no summary row
-    /// exists for the current body. The default — bodies are deferred to `memory show`.
+    /// Title + compacted summary + verdict marker. The default — a body over the summary envelope
+    /// is deferred to `memory show`, one already inside it is shown whole.
     #[default]
     Summary,
     /// The full body (plus the mechanical compact header where a compact projection is emitted) —

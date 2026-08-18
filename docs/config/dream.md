@@ -65,11 +65,12 @@ It is a churn-skip queue too — a memory is (re)compacted only when it has no s
 summary envelope. A note already short enough to show whole is never queued: summarizing it could
 only make it longer, so the summary surface shows its body verbatim instead. The summary is
 generated from the note body alone (no code context, no tools — measured to give the highest
-fidelity), and it must pass deterministic acceptance guards (3–5 sentences, ≤150 words, no
-paragraph breaks, and every tracker reference it cites must resolve in the indexed papertrail); a
-failing summary is retried once, then dropped. No row is stored, so an over-envelope memory keeps
-deferring its body behind the one-line expand marker until a later run succeeds. The pass **never**
-writes a `repo_memories` column.
+fidelity), and it must pass deterministic acceptance guards (3–5 sentences, the same ≤150 words and
+≤1200 characters that define the envelope, no paragraph breaks, and every tracker reference it cites
+must resolve in the indexed papertrail); a failing summary is retried once, then dropped. No summary
+row is stored — the rejection is recorded instead, and it suppresses further compaction of that note
+until its title/body, the prompt version, or the model changes, so the memory keeps deferring its
+body behind the one-line expand marker. The pass **never** writes a `repo_memories` column.
 
 ## Scheduling the passes (nightly systemd timer / cron)
 
