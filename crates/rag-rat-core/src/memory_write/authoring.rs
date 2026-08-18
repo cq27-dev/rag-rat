@@ -1441,11 +1441,77 @@ pub(crate) fn author_create(
     prepared: Option<&PreparedOwnerAuthoring>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let op = MemoryOp::NodeCreate {
-        node_id: NodeId::from(memory.memory_id.as_str()),
-        content: content_of(memory),
-    };
-    author_in_owner_stream(tx, &[op], prepared, now_ms)
+    let node_id = NodeId::from(memory.memory_id.as_str());
+    let mut ops =
+        vec![MemoryOp::NodeCreate { node_id: node_id.clone(), content: content_of(memory) }];
+    ops.extend(anchors_op(tx, &memory.memory_id)?);
+    author_in_owner_stream(tx, &ops, prepared, now_ms)
+}
+
+/// Author the memory's CURRENT anchor set, for a caller that just changed which code it points at.
+/// A full-set snapshot, so the op says what the bindings are now rather than how they got there.
+pub(crate) fn author_anchors(
+    tx: &Transaction<'_>,
+    memory_id: &str,
+    prepared: Option<&PreparedOwnerAuthoring>,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    let ops: Vec<MemoryOp> = anchors_op(tx, memory_id)?.into_iter().collect();
+    author_in_owner_stream(tx, &ops, prepared, now_ms)
+}
+
+/// The `NodeAnchors` op for a memory's current bindings, or `None` when it has none.
+///
+/// An unanchored memory authors NOTHING rather than an empty set. The two are different facts to a
+/// receiver — nobody published bindings, versus the author saying there are none — but neither
+/// seeds anything, so publishing the empty case would cost a signed entry per unanchored memory to
+/// tell a peer something it cannot act on. The projection keeps the distinction because a future op
+/// that RETRACTS a binding set will need it.
+///
+/// Deliberately unfiltered: the author publishes every portable fact it holds, including kinds this
+/// binary's own drain declines to seed. Which anchors are usable is the receiver's judgment, and
+/// filtering here would destroy information a later receiver could use.
+fn anchors_op(tx: &Transaction<'_>, memory_id: &str) -> anyhow::Result<Option<MemoryOp>> {
+    let anchors = portable_anchors_of(tx, memory_id)?;
+    if anchors.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(MemoryOp::NodeAnchors { node_id: NodeId::from(memory_id), anchors }))
+}
+
+/// Read a memory's bindings as the portable facts the wire carries — every replicated column, and
+/// no checkout-local resolution state.
+fn portable_anchors_of(
+    conn: &Connection,
+    memory_id: &str,
+) -> anyhow::Result<Vec<rag_rat_oplog::PortableAnchor>> {
+    let mut stmt = conn.prepare(
+        "SELECT binding_kind, binding_id, path, start_line, end_line, commit_hash, tracker,
+                project, item_key, created_at_ms, symbol_kind, signature_hash, moniker_tool,
+                moniker_tool_version
+         FROM repo_memory_bindings
+         WHERE memory_id = ?1
+         ORDER BY binding_kind, binding_id",
+    )?;
+    let rows = stmt.query_map(params![memory_id], |row| {
+        Ok(rag_rat_oplog::PortableAnchor {
+            binding_kind: row.get(0)?,
+            binding_id: row.get(1)?,
+            path: row.get(2)?,
+            start_line: row.get(3)?,
+            end_line: row.get(4)?,
+            commit_hash: row.get(5)?,
+            tracker: row.get(6)?,
+            project: row.get(7)?,
+            item_key: row.get(8)?,
+            created_at_ms: row.get(9)?,
+            symbol_kind: row.get(10)?,
+            signature_hash: row.get(11)?,
+            moniker_tool: row.get(12)?,
+            moniker_tool_version: row.get(13)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Author a live memory UPDATE inside the caller's mutation txn: a `NodeUpdate` ONLY when the

@@ -2236,6 +2236,94 @@ mod tests {
         assert_eq!(surfaced[0].memory_id, memory_id);
     }
 
+    /// The point of the whole train (#1180): a memory created WITH a binding reaches a peer over
+    /// `/3` alone and drive-by surfaces there — no `/5` anchors leg, no shared account.
+    ///
+    /// Its sibling above pins the complementary case: a binding written directly to the table,
+    /// bypassing the authoring seam, publishes nothing and so surfaces nothing until `/5` carries
+    /// it. The difference between the two tests is entirely whether the binding was AUTHORED.
+    #[test]
+    fn an_authored_anchor_set_surfaces_a_synced_memory_over_content_alone() {
+        let source = scoped_conn();
+        let memory_id = crate::memory_write::create_memory(&source, RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "portable anchor".to_string(),
+            body: "body".to_string(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget {
+                path: Some("src/lib.rs".to_string()),
+                ..RepoMemoryBindTarget::default()
+            },
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+        let account = rag_rat_oplog::local_account(&source, 1).unwrap();
+
+        let destination = scoped_conn();
+        rag_rat_oplog::local_device(&destination, 0).unwrap();
+        for entry in rag_rat_oplog::account_entries_for_sync(&source, account).unwrap() {
+            rag_rat_oplog::account_ingest(&destination, &entry.signed_bytes, 0).unwrap();
+        }
+        rag_rat_oplog::adopt_local_account(
+            &destination,
+            account,
+            rag_rat_oplog::read_local_account_genesis(&source).unwrap().unwrap(),
+            0,
+        )
+        .unwrap();
+        // Content ONLY — the `/5` anchors leg is deliberately never run.
+        for entry in rag_rat_oplog::content_entries_for_sync(&source, account).unwrap() {
+            rag_rat_oplog::content_ingest(&destination, &entry.signed_bytes, 1).unwrap();
+        }
+        crate::drain_synced_memory(&destination).unwrap();
+
+        let surfaced = memory::memories_for_path(&destination, "src/lib.rs", 10).unwrap();
+        assert_eq!(surfaced.len(), 1, "the authored anchor set seeded a usable binding");
+        assert_eq!(surfaced[0].memory_id, memory_id);
+    }
+
+    /// The relocation loop must never author. It re-keys `binding_id` per checkout, so authoring
+    /// there would mint a signed op per mechanical drift and put every device in a rebind war over
+    /// the same memory. `rag-rat-query` cannot reach the authoring path at all, and this pins that
+    /// nobody wires one in later.
+    #[test]
+    fn a_relocation_pass_authors_no_content_op() {
+        let conn = scoped_conn();
+        let memory_id = crate::memory_write::create_memory(&conn, RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "relocating".to_string(),
+            body: "body".to_string(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget {
+                path: Some("src/lib.rs".to_string()),
+                ..RepoMemoryBindTarget::default()
+            },
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+        let account = rag_rat_oplog::local_account(&conn, 1).unwrap();
+        let before = rag_rat_oplog::content_entries_for_sync(&conn, account).unwrap().len();
+
+        memory::validate_memories(&conn, None).unwrap();
+
+        assert_eq!(
+            rag_rat_oplog::content_entries_for_sync(&conn, account).unwrap().len(),
+            before,
+            "a validate/relocate pass authored a content entry",
+        );
+        assert!(memory_by_id(&conn, &memory_id).unwrap().is_some());
+    }
+
     /// Advance a stream's projection epoch WITHOUT rewriting the projection — the way to simulate
     /// "the projection changed" while keeping directly-seeded poison rows in place (a real
     /// reproject would rebuild them away). Mutates the internal `oplog_meta` epoch key by hand

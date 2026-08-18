@@ -273,9 +273,11 @@ pub(crate) fn rebind_memory(
     // Resolve inside the transaction so the stamped source_text_hash is consistent with the
     // bindings written in the same atomic unit.
     // Authored write (#560): a rebind is an explicit, non-reconstructable choice of a new anchor,
-    // so it commits durably even though it does not yet mint a signed op (it will ride the FULL
-    // path for free once it does). NORMAL restored on drop.
+    // and now mints a signed op for it. NORMAL restored on drop.
     let _durability = authoring::AuthoredDurability::begin(conn)?;
+    // Prepared BEFORE the txn, like the create path: minting the account self-transacts and cannot
+    // nest inside the one opened below.
+    let prepared = authoring::prepare_live_content_authoring(conn, now_ms())?;
     // IMMEDIATE for the same reason as `create_memory`: `resolve_binding` READS before the writes
     // below, and a deferred read→write upgrade racing a foreign repo's rebuild dies with
     // SQLITE_BUSY_SNAPSHOT, which the busy handler never sees.
@@ -306,9 +308,132 @@ pub(crate) fn rebind_memory(
         "UPDATE repo_memories SET source_text_hash = ?2, updated_at_ms = ?3 WHERE id = ?1",
         params![memory_id, binding.source_text_hash, now],
     )?;
+    // Author the new anchor set in the SAME txn; an authoring error drops `tx` → the rebind rolls
+    // back. A rebind always leaves at least one binding (it refuses an empty target above), so this
+    // always emits an op — unlike the create path, where an unanchored memory authors none.
+    authoring::author_anchors(&tx, memory_id, prepared.as_ref(), now)?;
     tx.commit()?;
     memory_by_id(conn, memory_id)?
         .ok_or_else(|| anyhow::anyhow!("rebound memory `{memory_id}` could not be read back"))
+}
+
+#[cfg(test)]
+mod anchor_authoring_tests {
+    use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
+    use rusqlite::Connection;
+
+    use super::{create_memory, rebind_memory};
+
+    const REPO: &str = "repo-a";
+
+    fn scoped_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        conn.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
+            [REPO],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', ?1)",
+            [REPO],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn bound_create(conn: &Connection, path: &str) -> String {
+        create_memory(conn, RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget {
+                path: Some(path.to_string()),
+                ..RepoMemoryBindTarget::default()
+            },
+        })
+        .unwrap()
+        .memory
+        .memory_id
+    }
+
+    /// The anchor set the PROJECTION holds for `memory_id` — the authored op as a peer would see
+    /// it, after acceptance and the fold, rather than as raw entry bytes. `None` means no
+    /// `node_anchors` op was authored for it at all.
+    fn projected_anchors(conn: &Connection, memory_id: &str) -> Option<Vec<String>> {
+        let stream = rag_rat_oplog::owned_stream_v2_id(conn, REPO).unwrap().unwrap();
+        rag_rat_oplog::list_projected_content_nodes(conn, stream)
+            .unwrap()
+            .into_iter()
+            .find(|node| node.node_id == memory_id)
+            .expect("the memory projects as a node")
+            .anchors
+            .map(|anchors| anchors.into_iter().map(|anchor| anchor.binding_id).collect())
+    }
+
+    /// A bound create publishes its anchors beside the node, so a peer can seed them.
+    #[test]
+    fn a_bound_create_authors_its_anchor_set() {
+        let conn = scoped_conn();
+        let memory_id = bound_create(&conn, "src/lib.rs");
+
+        let anchors = projected_anchors(&conn, &memory_id).expect("the create published a set");
+        assert!(anchors.contains(&"src/lib.rs".to_string()), "the path binding is published");
+    }
+
+    /// An unanchored memory authors NO anchor op. The empty set is a different fact from "nobody
+    /// published", but neither seeds anything, so spending a signed entry to say it would buy a
+    /// peer nothing it can act on.
+    #[test]
+    fn an_unanchored_create_authors_no_anchor_op() {
+        let conn = scoped_conn();
+        let memory_id = create_memory(&conn, RepoMemoryCreate {
+            kind: "Concept".to_string(),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget::default(),
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+
+        assert_eq!(projected_anchors(&conn, &memory_id), None);
+    }
+
+    /// A rebind is an explicit choice of a new anchor and now mints a signed op for it — the
+    /// full-set snapshot names where the memory points NOW, not how it got there.
+    #[test]
+    fn a_rebind_authors_the_new_anchor_set() {
+        let conn = scoped_conn();
+        let memory_id = bound_create(&conn, "src/lib.rs");
+        rebind_memory(&conn, &memory_id, RepoMemoryBindTarget {
+            path: Some("src/other.rs".to_string()),
+            ..RepoMemoryBindTarget::default()
+        })
+        .unwrap();
+
+        let anchors = projected_anchors(&conn, &memory_id).expect("the rebind published a set");
+        assert!(anchors.contains(&"src/other.rs".to_string()), "the new anchor is published");
+        assert!(
+            !anchors.contains(&"src/lib.rs".to_string()),
+            "a full-set snapshot retires the anchor the memory no longer points at",
+        );
+    }
 }
 
 #[cfg(test)]
