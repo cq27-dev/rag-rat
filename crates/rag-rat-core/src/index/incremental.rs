@@ -964,7 +964,7 @@ impl IndexDatabase {
         if self.active_commit_sha.is_empty() {
             return Ok(0);
         }
-        let overlays: Vec<(i64, String, String)> = {
+        let overlays: Vec<(i64, String, String, String)> = {
             let conn = self.storage.connection();
             // Direct `main.files` probes bypass the repo-scoped `files` view, so they carry the
             // `repo_id` predicate explicitly (A3): in a consolidated DB two forks at the same
@@ -974,14 +974,20 @@ impl IndexDatabase {
             // Also generation-qualified (A6): the heal operates on THIS connection's live
             // generation only — a staged or superseded generation's overlay rows are the
             // rebuild's / gc's business.
+            // DELETION TOMBSTONES ARE CANDIDATES TOO (#1217). A `kind = 'deleted'` overlay row
+            // shadows its committed counterpart out of the scoped view, so once the path is back
+            // on disk and clean the row is an orphan that hides a file the checkout HAS —
+            // discovery then re-indexes that path into the commit scope on EVERY pass while the
+            // view keeps hiding it. Nothing else reaps it: the overlay refresh prunes only the
+            // scopes it visits, and it skips the active checkout. Excluding tombstones here left
+            // that loop with no owner.
             let mut stmt = conn.prepare(
-                "SELECT id, path, sha256 FROM main.files
-                 WHERE repo_id = ?1 AND worktree_id = ?2 AND worktree_id != '' AND kind != \
-                 'deleted' AND generation = ?3",
+                "SELECT id, path, sha256, kind FROM main.files
+                 WHERE repo_id = ?1 AND worktree_id = ?2 AND worktree_id != '' AND generation = ?3",
             )?;
             let rows = stmt.query_map(
                 params![self.active_repo_id, self.active_worktree_id, self.active_generation],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
@@ -1004,7 +1010,7 @@ impl IndexDatabase {
             Err(_) => return Ok(0),
         };
         let mut healed = 0usize;
-        for (file_id, path, sha) in overlays {
+        for (file_id, path, sha, kind) in overlays {
             let p = Path::new(&path);
             if changes.changed.contains(p) || changes.deleted.contains(p) {
                 // Dirtied OR deleted since the snapshot — the overlay is NOT stale-clean. Skipping
@@ -1026,6 +1032,13 @@ impl IndexDatabase {
             if committed_exists {
                 self.remove_file_in_scope(Path::new(&path), "", &self.active_worktree_id)?;
                 healed += 1;
+                continue;
+            }
+            // A tombstone stands for the ABSENCE of content, so the re-stamp below — which hands
+            // the row to the commit scope — must never see one: it would replace the committed
+            // file with a deletion marker. With no committed row to take over, an unowned
+            // tombstone shadows nothing and can wait for the next full overlay refresh.
+            if kind == "deleted" {
                 continue;
             }
             let disk_matches = self

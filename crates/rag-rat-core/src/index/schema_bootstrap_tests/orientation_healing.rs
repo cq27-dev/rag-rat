@@ -1010,3 +1010,104 @@ fn clone_substrate_has_token_bag_blob_and_no_postings_on_fresh_and_migrated_dbs(
         .expect("query3");
     assert_eq!(df, 1, "clone_token_df must exist after migrate_forward");
 }
+
+/// #1217: an overlay tombstone for a path that is present on disk is an orphan — the scoped view
+/// hides the path (the worktree leg drops `kind = 'deleted'` rows, and the base leg's shadow
+/// sub-select does not), so every pass rediscovers the file, re-indexes it into the commit scope,
+/// and the next pass sees the same hole. The heal owns the repair: the tombstone falls exactly
+/// like a stale content overlay, and the pass converges.
+#[test]
+fn incremental_pass_heals_an_orphaned_overlay_tombstone() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let worktree_id = db.active_worktree_id.clone();
+    insert_overlay_tombstone_row(&db, "src/lib.rs", &worktree_id);
+    // The orphan's signature: the committed row is shadowed out of the scoped view even though
+    // the file is on disk and unchanged.
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'src/lib.rs'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "fixture precondition: the tombstone hides the committed row"
+    );
+    drop(db);
+
+    let db = IndexDatabase::index_discover_with_progress(&config, |_| {}).unwrap();
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE path = 'src/lib.rs' AND kind = 'deleted'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0,
+        "the orphaned tombstone is healed away"
+    );
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'src/lib.rs'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "the committed row is visible again"
+    );
+    drop(db);
+
+    // Convergence is the point: without it a pass that re-indexes the same file forever looks
+    // exactly like a pass doing real work.
+    let mut discovered = usize::MAX;
+    let _db = IndexDatabase::index_discover_with_progress(&config, |progress| {
+        if let IndexProgress::Discovered { files } = progress {
+            discovered = files;
+        }
+    })
+    .unwrap();
+    assert_eq!(discovered, 0, "the follow-up pass indexes nothing — the loop is closed");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #1217 counterpart: a tombstone for a file the working tree has ACTUALLY deleted is doing its
+/// job — the heal must leave it alone, or the pass resurrects the committed version the checkout
+/// just removed.
+#[test]
+fn a_heal_keeps_the_tombstone_of_a_file_deleted_in_the_working_tree() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let worktree_id = db.active_worktree_id.clone();
+    insert_overlay_tombstone_row(&db, "src/lib.rs", &worktree_id);
+    drop(db);
+    fs::remove_file(root.join("src/lib.rs")).unwrap();
+
+    let db = IndexDatabase::index_discover_with_progress(&config, |_| {}).unwrap();
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE path = 'src/lib.rs' AND kind = 'deleted' \
+                 AND worktree_id = ?1",
+                [&worktree_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "the tombstone of a genuinely deleted file survives"
+    );
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'src/lib.rs'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "and the deleted file stays out of the scoped view"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

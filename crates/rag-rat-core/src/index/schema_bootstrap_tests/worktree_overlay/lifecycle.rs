@@ -1189,3 +1189,60 @@ fn worktree_overlay_gc_prunes_a_removed_worktrees_refresh_basis() {
     let _ = fs::remove_dir_all(&removed);
     let _ = fs::remove_dir_all(&kept);
 }
+
+/// #1217: the active checkout's stale-overlay heal reaps deletion tombstones, and that reach stops
+/// at its own scope. A linked worktree that deleted a file owns a tombstone recording it; a pass
+/// driven from the MAIN checkout — where the same path is present and clean — must heal nothing
+/// there, or the sibling's branch view resurrects a file its branch removed.
+#[test]
+fn an_active_checkout_heal_leaves_a_linked_worktrees_deletion_tombstone_standing() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/a.rs"), "pub fn base_a() {}\n").unwrap();
+    fs::write(main.join("src/b.rs"), "pub fn base_b() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat-drop", linked.to_str().unwrap()]);
+    fs::remove_file(linked.join("src/a.rs")).unwrap();
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    let linked_id = crate::watch::enclosing_worktree_id(&linked);
+    let tombstones = |db: &IndexDatabase| -> i64 {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE path = 'src/a.rs' AND kind = 'deleted' AND \
+                 worktree_id = ?1",
+                [&linked_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(tombstones(&db), 1, "the linked worktree's deletion is recorded as a tombstone");
+    drop(db);
+
+    // A full pass from the main checkout, where src/a.rs is present and clean.
+    let db = IndexDatabase::index_discover_with_progress(&config, |_| {}).unwrap();
+    assert_eq!(tombstones(&db), 1, "the sibling's tombstone is not this checkout's to heal");
+
+    let mut db = db;
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    assert!(
+        names_in_scope(&db, "src/a.rs").is_empty(),
+        "the branch that deleted the file still sees it gone"
+    );
+
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&main);
+}

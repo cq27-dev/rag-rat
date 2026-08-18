@@ -853,6 +853,22 @@ fn insert_stale_overlay_row(db: &IndexDatabase, path: &str, worktree_id: &str) -
     db.storage.connection().last_insert_rowid()
 }
 
+/// Insert an overlay DELETION TOMBSTONE for a path that is present on disk and committed — the
+/// orphan a pass leaves when it records "deleted in this checkout" and the file later comes back
+/// (#1217). It shadows the committed row out of the scoped view without standing in for it.
+fn insert_overlay_tombstone_row(db: &IndexDatabase, path: &str, worktree_id: &str) -> i64 {
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id, repo_id, generation) VALUES (?1, 'unknown', 'deleted', '', \
+             0, 0, '', ?2, ?3, ?4)",
+            rusqlite::params![path, worktree_id, db.active_repo_id, db.active_generation],
+        )
+        .unwrap();
+    db.storage.connection().last_insert_rowid()
+}
+
 /// Every `ON DELETE CASCADE`/`RESTRICT` FK to a reindex-volatile parent, as
 /// `(child_table, parent_table, on_delete)`, scanned from a FULLY-MIGRATED DB. Enumerates EVERY
 /// table in `sqlite_master` (not a hand-maintained list) so a new offender is caught automatically.
