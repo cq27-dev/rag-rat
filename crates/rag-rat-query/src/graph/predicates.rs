@@ -132,12 +132,18 @@ const ORACLE_SEED_EDGE_CAP: usize = 5000;
 /// the gap means moving this seed behind that crate, not adding a fourth spelling of a table this
 /// crate cannot see (#1215).
 ///
-/// SCOPE is reverse `traverse_with_options` / `traversal_summary` — which is also what the
-/// SYMBOL-SELECTED `impact_surface` report traverses (`impact_surface_report_for_symbol` →
-/// `oracle_ranked_neighbors`), so its `direct_semantic_callers` carry the seeded rows too. The FLAT
-/// `Vec<ImpactItem>` lane — a free-text query, or the `allow_ambiguous` fallback — instead runs
-/// `impact::neighbors::graph_neighbors`, whose own reverse predicate has no oracle arm and which
-/// gets no enrichment pass either, so that lane still answers the pre-seed caller count (#1214).
+/// SCOPE is the two reverse caller lanes of this crate. `traverse_with_options` /
+/// `traversal_summary` — which is also what the SYMBOL-SELECTED `impact_surface` report traverses
+/// (`impact_surface_report_for_symbol` → `oracle_ranked_neighbors`), so its
+/// `direct_semantic_callers` carry the seeded rows. And the FLAT `Vec<ImpactItem>` lane — a
+/// free-text query, or the `allow_ambiguous` fallback — which calls this itself per target from
+/// `impact::neighbors::graph_neighbors`, splices the ids into its own reverse predicate, and,
+/// having no enrichment pass, marks the seeded rows from that same id list.
+/// `rag_rat_core::query::grep_augment::edge_counts` is the reverse caller lane this does NOT reach:
+/// its `{N} callers` line still answers the pre-seed count. It lives in `rag-rat-core`, so covering
+/// it means exporting this seed across that crate boundary rather than growing a fourth spelling of
+/// the query — the same call as the #1215 note above. FORWARD traversal never seeds: a verdict
+/// names the edge's target, which is what a reverse lookup matches on.
 pub(crate) fn reverse_oracle_seeded_edge_ids(
     conn: &Connection,
     symbol: &str,

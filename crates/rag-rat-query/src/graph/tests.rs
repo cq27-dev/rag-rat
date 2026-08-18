@@ -294,7 +294,7 @@ fn oracle_verdicts_seed_the_call_sites_the_resolver_left_unbound() {
 
 /// The symbol-selected `impact_surface` report traverses through `traverse_with_options`, so it
 /// answers with the same seeded callers `find_callers` does. Its flat `Vec<ImpactItem>` sibling
-/// has its own reverse SQL and does not (#1214).
+/// keeps its own reverse SQL and seeds separately; `impact::neighbors` covers that lane.
 #[test]
 fn the_symbol_selected_impact_report_carries_an_oracle_seeded_caller() {
     let conn = scoped_conn();
