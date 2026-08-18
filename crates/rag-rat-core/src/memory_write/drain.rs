@@ -357,9 +357,9 @@ fn drain_node(
         return Ok(if removed { NodeEffect::Removed } else { NodeEffect::Unchanged });
     }
     let projected_status = node.status.as_db_str();
-    match read_existing_node(tx, &node.node_id)? {
+    let effect = match read_existing_node(tx, &node.node_id)? {
         // A row with this id already belongs to ANOTHER repo — never touch a sibling's content.
-        Some(existing) if existing.repo_id != repo_id => Ok(NodeEffect::Unchanged),
+        Some(existing) if existing.repo_id != repo_id => NodeEffect::Unchanged,
         Some(existing) => {
             let current_tags = memory::tags_for_memory(tx, &node.node_id)?;
             let want_tags = memory::normalize_tags(&node.content.tags);
@@ -372,30 +372,34 @@ fn drain_node(
                 && existing.status == projected_status
                 && current_tags == want_tags;
             if unchanged {
-                return Ok(NodeEffect::Unchanged);
+                // Content converged, but the anchor snapshot may have arrived in a later entry, so
+                // fall through to the seed rather than returning here.
+                NodeEffect::Unchanged
+            } else {
+                // Converge to the account-wide LWW value; `origin` is intentionally NOT in the SET,
+                // so whatever the row was (local or synced) is preserved — a
+                // projected local row carries a peer's accepted edit, not an echo
+                // to ignore.
+                tx.execute(
+                    "UPDATE repo_memories
+                     SET kind = ?2, title = ?3, body = ?4, confidence = ?5, source = ?6,
+                         payload_json = ?7, status = ?8, updated_at_ms = ?9
+                     WHERE id = ?1",
+                    params![
+                        node.node_id,
+                        node.content.kind,
+                        node.content.title,
+                        node.content.body,
+                        node.content.confidence,
+                        node.content.source,
+                        node.content.payload,
+                        projected_status,
+                        now_ms,
+                    ],
+                )?;
+                write_node_children(tx, &node.node_id, &node.content.tags)?;
+                NodeEffect::Written
             }
-            // Converge to the account-wide LWW value; `origin` is intentionally NOT in the SET, so
-            // whatever the row was (local or synced) is preserved — a projected local row carries a
-            // peer's accepted edit, not an echo to ignore.
-            tx.execute(
-                "UPDATE repo_memories
-                 SET kind = ?2, title = ?3, body = ?4, confidence = ?5, source = ?6,
-                     payload_json = ?7, status = ?8, updated_at_ms = ?9
-                 WHERE id = ?1",
-                params![
-                    node.node_id,
-                    node.content.kind,
-                    node.content.title,
-                    node.content.body,
-                    node.content.confidence,
-                    node.content.source,
-                    node.content.payload,
-                    projected_status,
-                    now_ms,
-                ],
-            )?;
-            write_node_children(tx, &node.node_id, &node.content.tags)?;
-            Ok(NodeEffect::Written)
         },
         None => {
             // First sight of this node — received from a peer. `created_by` / `source_text_hash` /
@@ -424,9 +428,121 @@ fn drain_node(
                 ],
             )?;
             write_node_children(tx, &node.node_id, &node.content.tags)?;
-            Ok(NodeEffect::Written)
+            NodeEffect::Written
         },
+    };
+    // Seed AFTER materialization, and only for a node that belongs to THIS repo — the sibling-repo
+    // arm above must not touch that repo's bindings any more than it touches its content.
+    if node_in_repo(tx, &node.node_id, repo_id)? {
+        seed_node_anchors(tx, repo_id, node)?;
     }
+    Ok(effect)
+}
+
+/// The binding kinds the local write path can produce, and therefore the only ones worth seeding
+/// from a peer's snapshot. An unknown kind is a newer peer's vocabulary: it means nothing here, so
+/// it is skipped row-wise rather than quarantining the node over its decoration.
+///
+/// `call_path` is deliberately absent even though the local path produces it: its supporting
+/// `repo_memory_call_paths` / `_edges` rows are in NO replication scope, so a seeded call-path
+/// binding could never resolve here — it would sit unverifiable forever.
+const SEEDABLE_BINDING_KINDS: &[&str] = &[
+    "logical_symbol",
+    "symbol",
+    "chunk",
+    "edge",
+    "scip_moniker",
+    "path",
+    "dir",
+    "commit",
+    "tracker",
+];
+
+/// Seed a synced memory's bindings from the anchor snapshot its author published — ONLY when this
+/// store holds none for it.
+///
+/// The gate is what keeps this a fallback rather than a second writer. `anchors/1` remains the
+/// carrier of ongoing rebinds and relocations within an account; this writes into vacuum exactly
+/// once, so the two never contend for a live row and there is no clock to arbitrate.
+///
+/// It is per-MEMORY, not per-row: the validate/relocate loop re-keys `binding_id`, a PK column, so
+/// a per-row gate would look at a row the loop had moved, find its old identity absent, and
+/// resurrect it as a duplicate sibling — forever.
+///
+/// `None` anchors means nobody published this memory's bindings, which is NOT the same as an author
+/// publishing an empty set; only the latter is a statement, and neither seeds anything.
+fn seed_node_anchors(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    node: &ProjectedContentNode,
+) -> anyhow::Result<usize> {
+    let Some(anchors) = node.anchors.as_deref() else {
+        return Ok(0);
+    };
+    if anchors.is_empty() || memory_has_any_binding(tx, repo_id, &node.node_id)? {
+        return Ok(0);
+    }
+    let mut seeded = 0;
+    for anchor in anchors {
+        if !SEEDABLE_BINDING_KINDS.contains(&anchor.binding_kind.as_str())
+            || anchor.binding_id.is_empty()
+        {
+            tracing::warn!(
+                repo_id,
+                node_id = %node.node_id,
+                binding_kind = %anchor.binding_kind,
+                "skipping an anchor this store cannot seed: unknown binding kind, or an empty \
+                 binding id that would make a degenerate primary key",
+            );
+            continue;
+        }
+        // Portable columns only. Every checkout-local column — `anchor_status`, the resolved ids,
+        // the relocation bookkeeping — is left at its schema default, which is exactly the row
+        // state a `/5` apply produces, so the validate/relocate loop takes it from here with
+        // nothing special-cased for a seeded row.
+        tx.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                 commit_hash, tracker, project, item_key, created_at_ms, symbol_kind,
+                 signature_hash, moniker_tool, moniker_tool_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                repo_id,
+                node.node_id,
+                anchor.binding_kind,
+                anchor.binding_id,
+                anchor.path,
+                anchor.start_line,
+                anchor.end_line,
+                anchor.commit_hash,
+                anchor.tracker,
+                anchor.project,
+                anchor.item_key,
+                anchor.created_at_ms,
+                anchor.symbol_kind,
+                anchor.signature_hash,
+                anchor.moniker_tool,
+                anchor.moniker_tool_version,
+            ],
+        )?;
+        seeded += 1;
+    }
+    Ok(seeded)
+}
+
+/// Whether this store holds ANY binding for `(repo_id, memory_id)` — the per-memory seed gate.
+fn memory_has_any_binding(
+    conn: &Connection,
+    repo_id: &str,
+    memory_id: &str,
+) -> anyhow::Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM repo_memory_bindings WHERE repo_id = ?1 AND memory_id = ?2
+         )",
+        params![repo_id, memory_id],
+        |row| row.get::<_, i64>(0),
+    )? == 1)
 }
 
 /// Whether a `repo_memories` row with this id exists UNDER `repo_id`. The edge-drain source guard
@@ -820,6 +936,175 @@ mod tests {
             params![stream.to_bytes().as_slice(), node_id, content_json, status],
         )
         .unwrap();
+    }
+
+    /// Seed a projected node carrying an anchor snapshot. `anchors` is `(binding_kind, binding_id)`
+    /// per row; `None` writes SQL NULL, the "nobody published bindings" state.
+    fn seed_projected_node_with_anchors(
+        conn: &Connection,
+        stream: StreamId,
+        node_id: &str,
+        anchors: Option<&[(&str, &str)]>,
+    ) {
+        seed_projected_node(conn, stream, node_id, "Invariant", "t", "b", "active", &[]);
+        let anchors_json = anchors.map(|anchors| {
+            let rows: Vec<serde_json::Value> = anchors
+                .iter()
+                .map(|(kind, id)| {
+                    serde_json::json!({
+                        "binding_kind": kind,
+                        "binding_id": id,
+                        "path": "src/lib.rs",
+                        "start_line": 1,
+                        "end_line": 2,
+                        "commit_hash": null,
+                        "tracker": null,
+                        "project": null,
+                        "item_key": null,
+                        "created_at_ms": 7,
+                        "symbol_kind": null,
+                        "signature_hash": null,
+                        "moniker_tool": null,
+                        "moniker_tool_version": null,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&rows).unwrap()
+        });
+        conn.execute(
+            "UPDATE content_projected_nodes SET anchors_json = ?3
+             WHERE stream_id = ?1 AND node_id = ?2",
+            params![stream.to_bytes().as_slice(), node_id, anchors_json],
+        )
+        .unwrap();
+    }
+
+    fn bindings_of(conn: &Connection, memory_id: &str) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT binding_kind, binding_id FROM repo_memory_bindings
+                 WHERE repo_id = ?1 AND memory_id = ?2 ORDER BY binding_kind, binding_id",
+            )
+            .unwrap();
+        let rows =
+            stmt.query_map(params![REPO, memory_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// The happy path: a synced memory arrives with no bindings here, so its author's snapshot
+    /// seeds them — portable columns carried, every checkout-local column left at its default,
+    /// which is the row state a `/5` apply produces.
+    #[test]
+    fn a_synced_memory_with_no_bindings_is_seeded_from_its_snapshot() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run"), ("path", "src/lib.rs")]),
+        );
+
+        drain_worker(&conn, stream, 1_000);
+
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![
+            ("path".to_string(), "src/lib.rs".to_string()),
+            ("symbol".to_string(), "src/lib.rs::run".to_string()),
+        ]);
+        let (status, symbol_id): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT anchor_status, symbol_id FROM repo_memory_bindings
+                 WHERE memory_id = 'mem_peer' AND binding_kind = 'symbol'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "unverified", "local resolution state starts at its default");
+        assert_eq!(symbol_id, None, "no checkout-local id is carried across the wire");
+    }
+
+    /// The gate, and the reason it is per-MEMORY rather than per-row: the validate/relocate loop
+    /// re-keys `binding_id`, a PK column, so a per-row gate would find the pre-relocation identity
+    /// absent and resurrect it beside the row the loop had moved.
+    #[test]
+    fn a_memory_that_already_holds_a_binding_is_never_seeded() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        drain_worker(&conn, stream, 1_000);
+
+        // Stand in for the relocation loop: the row moves to a new identity.
+        conn.execute(
+            "UPDATE repo_memory_bindings SET binding_id = 'src/lib.rs::run_renamed'
+             WHERE memory_id = 'mem_peer'",
+            [],
+        )
+        .unwrap();
+
+        // Forget the drain watermark so the next pass genuinely re-examines this node — otherwise
+        // the drain short-circuits as caught-up and this test would pass with the gate removed.
+        conn.execute("DELETE FROM oplog_meta WHERE key = 'content:drain-wm:' || hex(?1)", params![
+            stream.to_bytes().as_slice()
+        ])
+        .unwrap();
+        assert!(
+            rag_rat_oplog::content_drain_needed(&conn, stream).unwrap(),
+            "the second pass must actually run, or this test proves nothing",
+        );
+
+        // A later drain must not put the original identity back beside the relocated row.
+        drain_worker(&conn, stream, 2_000);
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::run_renamed".to_string()
+        )]);
+    }
+
+    /// An author publishing an EMPTY set is a statement that the memory has no bindings; it must
+    /// seed nothing, and must not be confused with the `None` of nobody having published.
+    #[test]
+    fn neither_an_empty_snapshot_nor_an_absent_one_seeds_anything() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(&conn, stream, "mem_empty", Some(&[]));
+        seed_projected_node_with_anchors(&conn, stream, "mem_absent", None);
+
+        drain_worker(&conn, stream, 1_000);
+
+        assert!(bindings_of(&conn, "mem_empty").is_empty());
+        assert!(bindings_of(&conn, "mem_absent").is_empty());
+    }
+
+    /// A binding kind this store cannot produce is a newer peer's vocabulary: skipped row-wise,
+    /// with the rest of the snapshot still seeded. `call_path` is skipped for a different
+    /// reason — its supporting tables are in no replication scope, so it could never resolve
+    /// here.
+    #[test]
+    fn an_unseedable_kind_is_skipped_without_losing_the_rest() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[
+                ("symbol", "src/lib.rs::run"),
+                ("call_path", "abc123"),
+                ("from_the_future", "whatever"),
+            ]),
+        );
+
+        drain_worker(&conn, stream, 1_000);
+
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::run".to_string()
+        )]);
     }
 
     /// Seed one row into `content_projected_edges`. `resolved` is `(target_repo, target_node,
