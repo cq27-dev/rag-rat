@@ -851,9 +851,12 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
 
 #[test]
 fn memory_search_defers_the_body_under_the_summary_surface() {
-    // #5: `memory_search` now honors `[memory] surface` (summary by default). Under `Summary` the
-    // full body is deferred to `memory show` (title-only when no dream summary row exists yet);
-    // under `Full` the whole body is returned.
+    // #5: `memory_search` honors `[memory] surface` (summary by default). Under `Summary` a note
+    // that HAS a compacted summary defers its body behind the elision marker; under `Full` the
+    // whole body is returned. With NO summary row the size gate decides: a note inside the summary
+    // envelope keeps its body (compaction skips it, so nothing will ever summarize it), while a
+    // longer one still defers — it is merely uncompacted, and dumping those full bodies is what
+    // this surface exists to prevent.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -892,19 +895,81 @@ fn memory_search_defers_the_body_under_the_summary_surface() {
     })
     .unwrap();
 
+    // A second, LONGER note under the same query term: over the compaction size gate, so it is
+    // queued rather than skipped and a missing summary means "not compacted yet".
+    let long_body = format!(
+        "surfaceprobe {}",
+        vec!["word"; rag_rat_query::memory::evidence::SUMMARY_MAX_WORDS].join(" ")
+    );
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: "surfaceprobe long note".to_string(),
+        body: long_body.clone(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        payload_json: None,
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
+            path: Some("src/lib.rs".to_string()),
+            ..Default::default()
+        },
+    })
+    .unwrap();
+
+    let body = "The surfaceprobe body is load-bearing and worth compacting.";
+    let unsummarized =
+        db.memory_search("surfaceprobe", 10, rag_rat_base::config::MemorySurface::Summary).unwrap();
+    assert_eq!(unsummarized.len(), 2, "both memories are found");
+    let short_hit = unsummarized.iter().find(|m| m.title == "surfaceprobe invariant").unwrap();
+    let long_hit = unsummarized.iter().find(|m| m.title == "surfaceprobe long note").unwrap();
+    assert_eq!(
+        short_hit.body, body,
+        "inside the summary envelope the note surfaces whole rather than as a bare title"
+    );
+    assert!(
+        long_hit.body.contains("body elided") && long_hit.body.contains(&long_hit.memory_id),
+        "over the envelope an uncompacted body still defers: {}",
+        long_hit.body
+    );
+
+    // Seed the compacted summary the dream pass would stamp, keyed on the current note hash.
+    let conn = db.storage.connection();
+    let memory_id = short_hit.memory_id.clone();
+    let repo_id: String = conn
+        .query_row("SELECT repo_id FROM repo_memories WHERE id = ?1", [&memory_id], |r| r.get(0))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, prompt_version, \
+         generated_at_ms) VALUES (?1,?2,?3,?4,?5,0)",
+        rusqlite::params![
+            memory_id,
+            repo_id,
+            rag_rat_query::memory::evidence::note_content_hash("surfaceprobe invariant", body),
+            "Surfaceprobe gist.",
+            rag_rat_query::memory::evidence::COMPACT_PROMPT_VERSION
+        ],
+    )
+    .unwrap();
+
     let full =
         db.memory_search("surfaceprobe", 10, rag_rat_base::config::MemorySurface::Full).unwrap();
-    assert_eq!(full.len(), 1, "the memory is found");
-    assert!(!full[0].body.is_empty(), "the `full` surface returns the whole body");
+    let full_short = full.iter().find(|m| m.memory_id == memory_id).expect("the memory is found");
+    assert_eq!(full_short.body, body, "the `full` surface returns the whole body");
+    assert_eq!(full_short.summary, None, "`full` hydrates no summary");
+    assert!(
+        full.iter().all(|m| !m.body.contains("body elided")),
+        "`full` never elides, over the envelope or under it"
+    );
 
     let summary =
         db.memory_search("surfaceprobe", 10, rag_rat_base::config::MemorySurface::Summary).unwrap();
-    assert_eq!(summary.len(), 1, "the same hit under the default surface");
-    assert_eq!(summary[0].memory_id, full[0].memory_id);
+    let summarized = summary.iter().find(|m| m.memory_id == memory_id).expect("the same hit");
+    assert_eq!(summarized.summary.as_deref(), Some("Surfaceprobe gist."));
     assert!(
-        summary[0].body.is_empty(),
-        "the `summary` surface defers the body to `memory show` (title-only with no summary row \
-         yet)"
+        summarized.body.contains("body elided") && summarized.body.contains(&memory_id),
+        "once a summary exists the body defers behind the elision marker: {}",
+        summarized.body
     );
 
     let _ = fs::remove_dir_all(&root);

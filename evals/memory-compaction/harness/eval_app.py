@@ -1,7 +1,7 @@
 """Memory-compaction model eval on Modal.
 
 Candidates summarize the same 35-memory corpus (30 real rag-rat memories + 5 synthetic
-negation-trap memories) into 3-4 sentence compactions. Scoring:
+negation-trap memories) into 3-5 sentence compactions. Scoring:
   - probe judge (non-candidate Qwen3-14B): TRUE/FALSE/ABSENT per hand-authored claim,
     negation-flips = critical failures
   - HHEM-2.1-open (vectara) windowed max-pool consistency score vs the source
@@ -66,7 +66,7 @@ JUDGE_MODEL = "Qwen/Qwen3-14B"  # deliberately NOT a candidate
 
 SUMMARIZE_PROMPT = """You compact engineering memory notes into high-signal summaries for a code-intelligence index.
 
-Rewrite the note below as exactly 3-4 sentences (at most 90 words) that a coding agent can act on. Preserve with exact polarity: the core claim, its conditions and exceptions (words like ONLY, NEVER, NOT, UNLESS, EXCEPT must keep their meaning), and the load-bearing identifiers (function/table/config names, issue numbers). Do not add facts that are not in the note. Do not soften, generalize, or invert any conditional. Output only the summary text.
+Rewrite the note below as 3-5 sentences (at most 130 words) that a coding agent can act on. Preserve with exact polarity: the core claim, its conditions and exceptions (words like ONLY, NEVER, NOT, UNLESS, EXCEPT must keep their meaning), the REASON the constraint exists — what breaks, or what was tried and failed, when it is ignored — and the load-bearing identifiers (function/table/config names). A rule without its reason is an incomplete summary: whenever the note gives a why, spend a sentence on it. Do not add facts that are not in the note. Do not soften, generalize, or invert any conditional. Output only the summary text.
 
 TITLE: {title}
 NOTE:

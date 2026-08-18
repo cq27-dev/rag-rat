@@ -12,6 +12,11 @@ by_id = {it["id"]: it for it in items}
 LINE_RE = re.compile(r"^\s*(\d+)\s*[:.)]\s*(TRUE|FALSE|ABSENT)\s*$", re.I | re.M)
 # external refs: issue/PR numbers, phase/round labels, bare review-round tokens (not V-migrations)
 LEAK_RE = re.compile(r"#\d+|\bPR\b|\bphase\s+[A-Z0-9]|\bround[- ]?\d|\b(?!V\d)[APR]\d{1,2}\b")
+# causal/consequence connectives — the surface form of "why this rule exists"
+WHY_RE = re.compile(
+    r"\b(because|otherwise|so that|which (?:would|could|breaks|prevents|avoids|keeps)"
+    r"|the reason|to avoid|to prevent|or else|would (?:break|fail|hang|corrupt|leak|drop|lose))\b",
+    re.I)
 
 
 def parse_verdict(raw, n):
@@ -50,15 +55,23 @@ def score_run(vs, summaries):
                 if a == "TRUE":
                     trap_flip += 1
                     flips.append((v["item"], "trap-inverted", p["claim"][:70]))
-    fmt_ok = leak = 0
+    fmt_ok = leak = why = 0
     wlist = []
     for s in summaries.values():
         w = len(s.split())
         wlist.append(w)
-        fmt_ok += (3 <= sentence_count(s) <= 4) and w <= 110 and "\n\n" not in s
+        # Mirrors the shipped acceptance guards (dream/compact.rs `mod guards`): 3-5 sentences, no
+        # paragraph break, and the SUMMARY_MAX_WORDS ceiling the compaction size gate also reads.
+        fmt_ok += (3 <= sentence_count(s) <= 5) and w <= 150 and "\n\n" not in s
+        why += bool(WHY_RE.search(s))
     leak = sum(1 for s in summaries.values() if LEAK_RE.search(s))
     n = len(summaries)
     return {
+        # Deterministic proxy for rationale retention, NOT a gate: the fraction of summaries that
+        # state a reason at all. It exists because every earlier prompt iteration was scored only on
+        # fidelity and brevity, which rewards flattening a note into bare imperatives; a run whose
+        # why% collapses has compressed the reasoning out even when the trap and coverage axes hold.
+        "why_pct": round(100 * why / n, 1),
         "trap_flip_pct": round(100 * trap_flip / trap_n, 1),
         "false_assert_pct": round(100 * true_flip / true_n, 1),
         "core_cov_pct": round(100 * core_hit / core_n, 1),
@@ -96,13 +109,13 @@ for key in sorted(runs):
     rows.append({"model": model, "variant": variant, **s})
 
 (BASE / "results" / "scoreboard-v2.json").write_text(json.dumps(rows, indent=1))
-hdr = f"{'model':34s} {'var':>4} {'trapflip%':>9} {'flsassert%':>10} {'corecov%':>8} {'cov%':>5} {'fmt%':>6} {'leak%':>6} {'med.w':>6}"
+hdr = f"{'model':34s} {'var':>4} {'trapflip%':>9} {'flsassert%':>10} {'corecov%':>8} {'cov%':>5} {'why%':>6} {'fmt%':>6} {'leak%':>6} {'med.w':>6}"
 print(hdr)
 print("-" * len(hdr))
 for r in rows:
     print(f"{r['model'].split('/')[-1]:34s} {r['variant']:>4} {r['trap_flip_pct']:>9} "
           f"{r['false_assert_pct']:>10} {r['core_cov_pct']:>8} {r['cov_pct']:>5} "
-          f"{r['fmt_pct']:>6} {r['leak_pct']:>6} {r['median_words']:>6}")
+          f"{r['why_pct']:>6} {r['fmt_pct']:>6} {r['leak_pct']:>6} {r['median_words']:>6}")
 for r in rows:
     if r["flips"]:
         print(f"\n{r['model'].split('/')[-1]} {r['variant']} critical:")

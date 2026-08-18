@@ -123,6 +123,7 @@ def verified_memories(
     repo_id: str,
     index_commit: str,
     prompt_version: str,
+    compact_prompt_version: str,
     bound_paths: list[str],
     input_hashes: dict[str, str],
 ) -> list[dict]:
@@ -141,7 +142,7 @@ def verified_memories(
           ON mr.repo_id = m.repo_id AND mr.memory_id = m.id
         LEFT JOIN memory_summaries AS ms
           ON ms.repo_id = m.repo_id AND ms.memory_id = m.id
-         AND ms.content_hash = mr.content_hash AND ms.prompt_version = 'compact-v1'
+         AND ms.content_hash = mr.content_hash AND ms.prompt_version = ?
         WHERE rb.repo_id = ?
           AND rb.path IN ({path_params})
           AND rb.anchor_status IN ('current', 'relocated')
@@ -158,7 +159,8 @@ def verified_memories(
           )
         ORDER BY m.id, rb.path
         """,
-        (repo_id, *bound_paths, case["memory_id"], prompt_version, index_commit),
+        # `?` params are POSITIONAL: the LEFT JOIN placeholder is the first in the SQL text.
+        (compact_prompt_version, repo_id, *bound_paths, case["memory_id"], prompt_version, index_commit),
     ).fetchall()
     selected = []
     seen = set()
@@ -280,6 +282,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=pathlib.Path, required=True)
     parser.add_argument("--verdict-prompt-version", default="verify-pack-v3")
+    # Must track COMPACT_PROMPT_VERSION in crates/rag-rat-query/src/memory/evidence.rs: the summary
+    # join is a LEFT JOIN, so a stale value yields NULL summaries silently instead of erroring.
+    parser.add_argument("--compact-prompt-version", default="compact-v2")
     parser.add_argument(
         "--bin",
         type=pathlib.Path,
@@ -311,6 +316,7 @@ def main() -> None:
                     repo_id,
                     index_commit,
                     args.verdict_prompt_version,
+                    args.compact_prompt_version,
                     bound_paths,
                     input_hashes,
                 ),
@@ -322,6 +328,7 @@ def main() -> None:
         "context_index_commit": index_commit,
         "context_repo_id": repo_id,
         "verdict_prompt_version": args.verdict_prompt_version,
+        "compact_prompt_version": args.compact_prompt_version,
         "limits": {
             "verified_memories": VERIFIED_MEMORY_LIMIT,
             "papertrail": PAPERTRAIL_LIMIT,

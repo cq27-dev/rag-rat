@@ -43,15 +43,17 @@ pub struct RepoMemory {
     pub memory_id: String,
     pub kind: String,
     pub title: String,
-    // Skipped when EMPTY so the `[memory] surface = "summary"` view can defer the full prose to
-    // `memory show` (the summary-first renderers empty this and populate `summary` instead).
-    // Stored bodies are never empty, so `full` surface and `memory_show` always serialize it.
+    // Under `[memory] surface = "summary"` this carries the elision marker instead of the prose
+    // (see `apply_memory_surface`); a note inside the summary envelope keeps its full body, since
+    // nothing will ever summarize it. Skipped when EMPTY, which stored bodies never are, so `full`
+    // surface and `memory_show` always serialize it.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub body: String,
     /// The dream-compacted summary of the CURRENT body, populated ONLY by the summary-first
     /// renderers under `[memory] surface = "summary"` when a `memory_summaries` row exists for the
-    /// current content_hash. `None` under `full` (and for every non-surfacing tool). Title-only
-    /// fallback when absent — the full body is one `memory show` away.
+    /// current content_hash. `None` under `full` (and for every non-surfacing tool), and for a
+    /// note short enough that compaction skips it — that note surfaces whole in `body`
+    /// instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     /// Plain-text verdict marker from the memory's `memory_reality` row (e.g. `[verdict:
@@ -295,9 +297,12 @@ impl RepoMemoryEvidence {
     /// [`Self::compact`] plus the dream summary + verdict marker for each memory's CURRENT body
     /// (the `[memory] surface = "summary"` view). Each header is hydrated from the derived
     /// `memory_summaries` / `memory_reality` siblings (repo-scoped, keyed on the current
-    /// content_hash), so a memory with no summary row falls back to the mechanical header
-    /// (title-only in practice). The full body is never included — `memory show` remains the
-    /// expand path.
+    /// content_hash). A memory compaction SKIPS for already fitting the summary envelope
+    /// ([`evidence::note_is_shown_whole`]) has no summary row and never will, so its body stands in
+    /// as its own summary — it is inside the envelope by construction, so the header costs no more
+    /// than a generated summary would, and without it `impact_surface` would render that memory
+    /// title-only permanently. A LONGER body with no summary row still falls back to the mechanical
+    /// title-only header; `memory show` remains the expand path.
     pub fn compact_summary_first(
         &self,
         conn: &Connection,
@@ -313,7 +318,7 @@ impl RepoMemoryEvidence {
                         &memory.title,
                         &memory.body,
                     )?;
-                    compact.summary = summary;
+                    compact.summary = summary.or_else(|| shown_whole_body(&memory.body));
                     compact.verdict = verdict;
                     Ok(compact)
                 })
@@ -346,13 +351,19 @@ impl RepoMemoryEvidence {
 }
 
 /// Apply the `[memory] surface` view to a hydrated FULL memory list IN PLACE (the direct-query
-/// counterpart to [`RepoMemoryEvidence::compact_summary_first`]). Under `Summary` each memory's
-/// full body is DEFERRED to `memory show`: the current-body summary + verdict marker are hydrated
-/// from the derived `memory_summaries` / `memory_reality` siblings (repo-scoped, keyed on the
-/// current content_hash, prompt-version-gated), the body is emptied, and a memory with no summary
-/// falls back to title-only. Unlike the compact projection this KEEPS the full binding/call-path
-/// structure a direct `memory_for_symbol` / `memory_for_path` query relies on — only the prose is
-/// compacted. Under `Full` the list is untouched (byte-identical output).
+/// counterpart to [`RepoMemoryEvidence::compact_summary_first`]). Under `Summary` a memory's body
+/// is DEFERRED behind [`body_elision_marker`] — the reader gets a signal that prose was withheld
+/// and the one call that expands it — while the summary + verdict marker are hydrated from the
+/// derived `memory_summaries` / `memory_reality` siblings (repo-scoped, keyed on the current
+/// content_hash, prompt-version-gated). The ONE exception is an UNSUMMARIZED body compaction skips
+/// for already fitting the summary envelope ([`evidence::note_is_shown_whole`]): nothing will ever
+/// summarize it, so deferring would leave a bare title, and showing it whole costs no more than the
+/// summary it stands in for. An over-envelope memory with no summary row — dream disabled (the
+/// default), never run, or waiting behind a [`evidence::COMPACT_PROMPT_VERSION`] bump — still
+/// defers; dumping full bodies is the outcome this surface exists to prevent. Unlike the compact
+/// projection this KEEPS the full binding/call-path structure a direct `memory_for_symbol` /
+/// `memory_for_path` query relies on — only the prose is compacted. Under `Full` the list is
+/// untouched (byte-identical output).
 pub fn apply_memory_surface(
     conn: &Connection,
     memories: &mut [RepoMemory],
@@ -368,11 +379,29 @@ pub fn apply_memory_surface(
             &memory.title,
             &memory.body,
         )?;
+        if summary.is_some() || !evidence::note_is_shown_whole(&memory.body) {
+            memory.body = body_elision_marker(&memory.memory_id);
+        }
         memory.summary = summary;
         memory.verdict = verdict;
-        memory.body = String::new();
     }
     Ok(())
+}
+
+/// The one-line stand-in for a body the summary surface withheld. The stored body is NEVER deleted
+/// (`memory_summaries` is a separate derived table), so the marker names the expand path — the
+/// reader would otherwise have no signal that prose is missing, or that a `summary` beside it is a
+/// lossy rewrite. `rag-rat memory get <id>` is the CLI equivalent; naming one path keeps the marker
+/// cheap, since it is paid per memory on every attachment under the default surface.
+fn body_elision_marker(memory_id: &str) -> String {
+    format!("[body elided — full text: memory_show {memory_id}]")
+}
+
+/// The body of a note compaction skips as already inside the summary envelope, to stand in for the
+/// `memory_summaries` row it will never have — the body-less compact projection has nowhere else to
+/// put prose. `None` for a longer body (that one defers) or an empty one (nothing to show).
+fn shown_whole_body(body: &str) -> Option<String> {
+    (evidence::note_is_shown_whole(body) && !body.trim().is_empty()).then(|| body.to_string())
 }
 
 /// Compact (default) view of `RepoMemoryEvidence` for `impact_surface` (#37) — same lane layout,
@@ -424,9 +453,10 @@ pub struct CompactRepoMemory {
     pub logical_symbol_id: Option<i64>,
     /// The dream-compacted summary of the memory's CURRENT body, populated ONLY under `[memory]
     /// surface = "summary"` when a `memory_summaries` row exists for the current content_hash
-    /// (dream v2 pass 2). `None` under the `full` surface, or when no summary has been generated —
-    /// the title then stands alone (the title-only fallback). The full body is always one lookup
-    /// away via `memory show` / `memory_show`.
+    /// (dream v2 pass 2) — or, for a note compaction skips as already inside the summary envelope,
+    /// that note's verbatim body. `None` under the `full` surface, and for a long body no summary
+    /// has been generated for yet; the title then stands alone (the title-only fallback). The full
+    /// body is always one lookup away via `memory show` / `memory_show`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     /// A plain-text verdict marker from the memory's `memory_reality` row (dream v2 pass 1), e.g.
@@ -705,6 +735,12 @@ mod tests {
         }
     }
 
+    /// A body one word OVER the compaction size gate — the queue takes it, so a missing summary
+    /// means "not compacted YET", not "never will be", and the summary surfaces must defer it.
+    fn over_envelope_body() -> String {
+        vec!["word"; evidence::SUMMARY_MAX_WORDS + 1].join(" ")
+    }
+
     fn seed_summary(c: &Connection, id: &str, body: &str, summary: &str) {
         // Stamp the current content_hash (title `"t"`, matching `memory_with_body`) + the current
         // COMPACT_PROMPT_VERSION — the hydrator gates the summary read on both (like the compaction
@@ -785,9 +821,11 @@ mod tests {
     #[test]
     fn summary_surface_falls_back_to_title_only_without_a_summary_row() {
         let c = summary_conn();
-        // No memory_summaries / memory_reality rows → summary + verdict stay None (title-only).
-        let compact =
-            evidence(vec![memory_with_body("m1", "body")]).compact_summary_first(&c).unwrap();
+        // No memory_summaries / memory_reality rows, and a body too long to stand in for the
+        // missing summary → summary + verdict stay None (title-only).
+        let compact = evidence(vec![memory_with_body("m1", &over_envelope_body())])
+            .compact_summary_first(&c)
+            .unwrap();
         let header = &compact.direct[0];
         assert_eq!(header.summary, None, "no summary row → the title stands alone");
         assert_eq!(header.verdict, None, "no reality row → no verdict marker");
@@ -798,16 +836,17 @@ mod tests {
     fn summary_surface_misses_a_stale_summary_after_a_body_edit() {
         let c = summary_conn();
         // A summary exists, but for the OLD body — the current content_hash differs, so the LEFT
-        // JOIN misses and the header falls back to title-only (the summary
-        // self-invalidated).
+        // JOIN misses and the header falls back to title-only (the summary self-invalidated). The
+        // new body is over the envelope so the fallback is title-only rather than the body itself.
         seed_summary(
             &c,
             "m1",
             "old body",
             "A stale summary from before. It no longer applies. Ignore.",
         );
-        let compact =
-            evidence(vec![memory_with_body("m1", "new body")]).compact_summary_first(&c).unwrap();
+        let compact = evidence(vec![memory_with_body("m1", &over_envelope_body())])
+            .compact_summary_first(&c)
+            .unwrap();
         assert_eq!(
             compact.direct[0].summary, None,
             "a summary keyed on a stale content_hash is not surfaced"
@@ -867,7 +906,10 @@ mod tests {
         // prompt or a verdict from an obsolete verdict prompt must not keep showing while the
         // memory waits behind the budget (or a model failure) for a fresh one.
         let c = summary_conn();
-        let body = "b";
+        // Over the summary envelope, so the obsolete-prompt drop leaves title-only and is not
+        // masked by the show-it-whole fallback.
+        let body = over_envelope_body();
+        let body = body.as_str();
         let content_hash = crate::memory::evidence::note_content_hash("t", body);
         c.execute(
             "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
@@ -954,7 +996,16 @@ mod tests {
         let mut memories = vec![memory_with_body("m1", body)];
         apply_memory_surface(&c, &mut memories, rag_rat_base::config::MemorySurface::Summary)
             .unwrap();
-        assert_eq!(memories[0].body, "", "the full body is deferred under summary");
+        assert_eq!(
+            memories[0].body,
+            body_elision_marker("m1"),
+            "the deferred body is replaced by the elision marker, not blanked silently"
+        );
+        assert!(
+            memories[0].body.contains("memory_show m1"),
+            "the marker names the expand path: {}",
+            memories[0].body
+        );
         assert_eq!(
             memories[0].summary.as_deref(),
             Some("A compacted summary in place of the body.")
@@ -967,16 +1018,55 @@ mod tests {
     }
 
     #[test]
-    fn apply_memory_surface_summary_falls_back_to_title_only_without_a_summary_row() {
-        // No `memory_summaries` / `memory_reality` rows → summary + verdict stay None, but the body
-        // is still deferred: the reader sees the title (+ structure) and expands via `memory show`.
+    fn apply_memory_surface_summary_shows_an_under_envelope_body_whole_and_defers_a_longer_one() {
+        // The size gate, on both sides. A note compaction SKIPS (inside the envelope) never gets a
+        // summary row, so deferring it would leave a permanent bare title — it surfaces whole. A
+        // LONGER note with no summary row is merely uncompacted (dream disabled, never run, or
+        // behind a prompt-version bump) and must still defer: without this half, the default
+        // surface dumps every full body the moment COMPACT_PROMPT_VERSION is bumped.
         let c = summary_conn();
-        let mut memories = vec![memory_with_body("m1", "some body")];
+        let long = over_envelope_body();
+        let mut memories = vec![memory_with_body("m1", "some body"), memory_with_body("m2", &long)];
         apply_memory_surface(&c, &mut memories, rag_rat_base::config::MemorySurface::Summary)
             .unwrap();
-        assert_eq!(memories[0].body, "", "body deferred even without a summary (title-only)");
+        assert_eq!(
+            memories[0].body, "some body",
+            "a note inside the summary envelope keeps its full body"
+        );
+        assert_eq!(
+            memories[1].body,
+            body_elision_marker("m2"),
+            "an over-envelope note with no summary row still defers its body"
+        );
         assert_eq!(memories[0].summary, None);
+        assert_eq!(memories[1].summary, None);
         assert_eq!(memories[0].verdict, None);
+    }
+
+    #[test]
+    fn compact_summary_first_stands_an_under_envelope_body_in_for_the_missing_summary() {
+        // `CompactRepoMemory` (impact_surface) carries no body field, so a memory compaction skips
+        // would render title-only FOREVER without this fallback. Its body is inside the envelope by
+        // construction, so it costs no more than the summary it replaces. An over-envelope note
+        // with no summary row still falls back to title-only — it is waiting for a summary, not
+        // ineligible for one.
+        let c = summary_conn();
+        let long = over_envelope_body();
+        let compact = evidence(vec![
+            memory_with_body("m1", "a short note worth showing"),
+            memory_with_body("m2", &long),
+        ])
+        .compact_summary_first(&c)
+        .unwrap();
+        assert_eq!(
+            compact.direct[0].summary.as_deref(),
+            Some("a short note worth showing"),
+            "an unsummarizable note stands in its own body"
+        );
+        assert_eq!(
+            compact.direct[1].summary, None,
+            "an over-envelope note with no summary row stays title-only"
+        );
     }
 
     #[test]

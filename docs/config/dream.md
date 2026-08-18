@@ -53,7 +53,7 @@ review flow. The model **proposes**; it never changes a memory's status. Leaving
 skips the model turn entirely — no network calls, deterministic findings only.
 
 `--compact` (independent of `--verify`, and gated the same way on `[llm.dream] enabled = true`)
-runs the **compaction pass**, which rewrites each un-summarized memory into a 3–4 sentence,
+runs the **compaction pass**, which rewrites each un-summarized memory into a 3–5 sentence,
 self-contained summary and stores it in the derived `memory_summaries` table:
 
 ```bash
@@ -61,12 +61,15 @@ rag-rat dream --compact --max-memories 20
 ```
 
 It is a churn-skip queue too — a memory is (re)compacted only when it has no summary for its
-**current** body (a body edit self-invalidates the old one). The summary is generated from the note
-body alone (no code context, no tools — measured to give the highest fidelity), and it must pass
-deterministic acceptance guards (3–4 sentences, ≤110 words, no paragraph breaks, and every tracker
-reference it cites must resolve in the indexed papertrail); a failing summary is retried once, then
-dropped (no row is stored, so the surface falls back to the title). The pass **never** writes a
-`repo_memories` column.
+**current** body (a body edit self-invalidates the old one) **and** that body is longer than the
+summary envelope. A note already short enough to show whole is never queued: summarizing it could
+only make it longer, so the summary surface shows its body verbatim instead. The summary is
+generated from the note body alone (no code context, no tools — measured to give the highest
+fidelity), and it must pass deterministic acceptance guards (3–5 sentences, ≤150 words, no
+paragraph breaks, and every tracker reference it cites must resolve in the indexed papertrail); a
+failing summary is retried once, then dropped. No row is stored, so an over-envelope memory keeps
+deferring its body behind the one-line expand marker until a later run succeeds. The pass **never**
+writes a `repo_memories` column.
 
 ## Scheduling the passes (nightly systemd timer / cron)
 

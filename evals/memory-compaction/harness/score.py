@@ -79,7 +79,9 @@ for model, vs in sorted(models.items()):
         w = len(s.split())
         wlist.append(w)
         sc = sentence_count(s)
-        fmt_ok += (3 <= sc <= 4) and w <= 110 and "\n\n" not in s
+        # Mirrors the shipped acceptance guards (dream/compact.rs `mod guards`): 3-5 sentences, no
+        # paragraph break, and the SUMMARY_MAX_WORDS ceiling the compaction size gate also reads.
+        fmt_ok += (3 <= sc <= 5) and w <= 150 and "\n\n" not in s
     h = hhem.get(model, [])
     rows.append({
         "model": model,

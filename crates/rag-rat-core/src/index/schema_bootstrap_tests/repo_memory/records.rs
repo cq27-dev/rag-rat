@@ -155,7 +155,11 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
     // memory_for_symbol: body deferred, summary + verdict present, structure kept.
     let by_symbol = db.memory_for_symbol(&symbol, 10, MemorySurface::Summary).unwrap();
     let m = by_symbol.iter().find(|m| m.memory_id == sym_mem.memory_id).expect("symbol memory");
-    assert_eq!(m.body, "", "body deferred under summary");
+    assert!(
+        m.body.contains("body elided") && m.body.contains(&m.memory_id),
+        "a summarized body is deferred behind the elision marker, not blanked: {}",
+        m.body
+    );
     assert_eq!(m.summary.as_deref(), Some("Keep target's invariant."));
     assert!(
         m.verdict.as_deref().unwrap_or_default().contains("diverged"),
@@ -174,7 +178,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
     // memory_for_path: the path-bound note defers its body too.
     let by_path = db.memory_for_path("src/lib.rs", 10, MemorySurface::Summary).unwrap();
     let mp = by_path.iter().find(|m| m.memory_id == path_id).expect("path memory");
-    assert_eq!(mp.body, "");
+    assert!(mp.body.contains("body elided"), "{}", mp.body);
     assert_eq!(mp.summary.as_deref(), Some("File-level note gist."));
 
     // read_chunk memory attachments (and the include_memories=false wrapper stays exercised).
@@ -190,7 +194,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
         .expect("chunk");
     let cm =
         chunk.memories.iter().find(|m| m.memory_id == sym_mem.memory_id).expect("chunk memory");
-    assert_eq!(cm.body, "");
+    assert!(cm.body.contains("body elided"), "{}", cm.body);
     assert_eq!(cm.summary.as_deref(), Some("Keep target's invariant."));
     assert!(db.read_chunk_with_graph(chunk_id, GraphMetaMode::Full, 20).unwrap().is_some());
 
@@ -200,7 +204,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
         .unwrap();
     let em =
         evidence.direct.iter().find(|m| m.memory_id == sym_mem.memory_id).expect("evidence memory");
-    assert_eq!(em.body, "");
+    assert!(em.body.contains("body elided"), "{}", em.body);
     assert_eq!(em.summary.as_deref(), Some("Keep target's invariant."));
 
     let _ = fs::remove_dir_all(&root);

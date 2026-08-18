@@ -1,8 +1,10 @@
 //! Dream v2 pass 2 — the MODEL compaction pass (the second generative-model dependency, #122).
 //!
 //! Where pass 1 (`verdict`) audits a note against the code, this pass REWRITES the note body into a
-//! 3–4 sentence, self-contained summary a drive-by surface can show instead of the full body. It is
-//! deliberately spartan: one model turn per memory, NO tools, NO code context, NO evidence pack —
+//! 3–5 sentence, self-contained summary a drive-by surface can show instead of the full body. A
+//! note whose body already fits that envelope is left alone — the summary surfaces show it whole.
+//! The pass is deliberately spartan: one model turn per memory, NO tools, NO code context, NO
+//! evidence pack —
 //! the note body is the whole input (the offline eval measured that code context DEGRADES
 //! compaction fidelity). Accepted summaries land in `memory_summaries` (PK `(repo_id, memory_id,
 //! content_hash)`, so a title/body edit self-invalidates and re-queues); a rejected one records a
@@ -21,6 +23,7 @@
 
 use rag_rat_db::schema;
 use rag_rat_llm::chat::ChatModel;
+use rag_rat_query::memory::evidence;
 /// The compaction prompt version, stamped into `memory_summaries.prompt_version`. Bump on any
 /// change to [`COMPACT_PROMPT_HEAD`] so a stale-prompt summary is distinguishable (and can be
 /// regenerated).
@@ -40,8 +43,9 @@ pub struct CompactPass<'a> {
     pub budget: usize,
 }
 
-/// One memory that needs (re)compaction — an active memory with no `memory_summaries` row for its
-/// CURRENT note (title+body). Ordered by `memory_id`, capped by the pass budget.
+/// One memory that needs (re)compaction — an active memory LONGER than the summary envelope with no
+/// `memory_summaries` row for its CURRENT note (title+body). Ordered by `memory_id`, capped by the
+/// pass budget.
 struct CompactionEntry {
     memory_id: String,
     title: String,
@@ -129,10 +133,10 @@ pub(super) fn run_compact_pass(
     Ok(())
 }
 
-/// Active memories that still need a summary — no `memory_summaries` row keyed on their CURRENT
-/// `content_hash`. A title or body edit changes the key and re-enqueues (the summary
-/// self-invalidates); an unchanged, already-summarized memory churn-skips, so re-running is cheap.
-/// Repo-scoped, ordered by `memory_id`, capped at `budget`.
+/// Active memories that still need a summary — longer than [`evidence::SUMMARY_MAX_WORDS`] and no
+/// `memory_summaries` row keyed on their CURRENT `content_hash`. A title or body edit changes the
+/// key and re-enqueues (the summary self-invalidates); an unchanged, already-summarized memory
+/// churn-skips, so re-running is cheap. Repo-scoped, ordered by `memory_id`, capped at `budget`.
 fn compaction_queue(conn: &Connection, budget: usize) -> rusqlite::Result<Vec<CompactionEntry>> {
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
     let mem_clause = schema::periphery_repo_scope_clause(&scope, "repo_memories");
@@ -147,6 +151,16 @@ fn compaction_queue(conn: &Connection, budget: usize) -> rusqlite::Result<Vec<Co
 
     let mut queue = Vec::new();
     for (memory_id, title, body) in mems {
+        // A note whose body already fits the summary envelope is never compacted: the guards would
+        // accept a rewrite no shorter than the note itself, and every rewrite risks losing a
+        // condition or the reason behind it. No `memory_summaries` row is ever written for it, so
+        // the summary surfaces show it whole — they gate on this SAME predicate, and a note
+        // stranded in a gap between the two would surface as a bare title forever. A row left over
+        // from before the note fell under the gate is inert, not stale-visible: every read gates on
+        // the current `COMPACT_PROMPT_VERSION`, and no rewrite adds more.
+        if evidence::note_is_shown_whole(&body) {
+            continue;
+        }
         // The current content hash keys the summary; a stored summary under a DIFFERENT hash is
         // stale (a TITLE or body edit — the compaction prompt frames both) and does NOT count as
         // covered, so the memory re-queues. The `prompt_version` predicate does the same for a
@@ -249,8 +263,10 @@ fn strip_think(raw: &str) -> &str {
 // ── Prompt rendering ──────────────────────────────────────────────────────────────────────────
 
 /// The compaction prompt head — the v2 self-containment prompt from the memory-compaction eval. It
-/// pins the shape (exactly 3–4 sentences, ≤90 words), the polarity guard (ONLY / NEVER / NOT /
-/// UNLESS / EXCEPT keep their meaning), the no-added-facts rule, and the SELF-CONTAINMENT rule: the
+/// pins the shape (3–5 sentences, ≤130 words — deliberately under the [`guards`] ceiling so a
+/// faithful summary has room), the polarity guard (ONLY / NEVER / NOT / UNLESS / EXCEPT keep their
+/// meaning), the RATIONALE rule (preserve the reason the constraint exists — what breaks when it is
+/// ignored — not only the constraint), the no-added-facts rule, and the SELF-CONTAINMENT rule: the
 /// reader sees the codebase but NOT issue trackers or review threads, so state the fact a tracker /
 /// phase / review-round label stands for rather than citing it — while KEEPING in-code identifiers
 /// (function / table / config names, migration names like `V042`). A bug-and-fix note states the
@@ -259,8 +275,8 @@ fn strip_think(raw: &str) -> &str {
 /// model's job, measured offline. Authored as markdown in `prompts/compact_head.md` and embedded
 /// at compile time via [`include_str!`] (no runtime IO or install-path lookup — the file ships
 /// inside the binary); edits live in that `.md`, and [`COMPACT_PROMPT_VERSION`] is bumped when they
-/// change. Trimmed at the render
-/// site so a trailing newline in the file cannot perturb the rendered prompt.
+/// change. Trimmed at the render site so a trailing newline in the file cannot perturb the rendered
+/// prompt.
 const COMPACT_PROMPT_HEAD: &str = include_str!("prompts/compact_head.md");
 
 /// Render the full single-turn compaction prompt for one memory. Built by concatenation (not
@@ -338,12 +354,16 @@ pub(super) mod guards {
     use regex::Regex;
     use rusqlite::{Connection, OptionalExtension};
 
-    /// Word-count ceiling — headroom over the prompt's "at most 90 words" so a slightly-long but
-    /// otherwise faithful summary is not thrown away.
-    const MAX_WORDS: usize = 110;
-    /// A summary is exactly 3–4 sentences (the prompt's shape).
+    /// Word-count ceiling, with headroom over the ≤130 words the prompt asks for so a slightly-long
+    /// but otherwise faithful summary is not thrown away. The guards must never be stricter than
+    /// the prompt: a summary that spends a sentence on WHY the constraint exists is the shape the
+    /// prompt asks for, and rejecting it drops the memory to its title. This is the SAME value
+    /// [`super::compaction_queue`] skips a body at — a note the guards would accept verbatim is
+    /// already a summary, and queueing it would spend a model call to get back something longer.
+    const MAX_WORDS: usize = super::evidence::SUMMARY_MAX_WORDS;
+    /// A summary is 3–5 sentences (the prompt's shape — the fifth carries the rationale).
     const MIN_SENTENCES: usize = 3;
-    const MAX_SENTENCES: usize = 4;
+    const MAX_SENTENCES: usize = 5;
 
     /// `#123` — the tracker shorthand.
     static HASH_REF_RE: LazyLock<Regex> =
@@ -516,10 +536,10 @@ pub(super) mod guards {
                 !guards_ok(&c, "One sentence. Two sentences."),
                 "under 3 sentences is rejected"
             );
-            // Five sentences — above the ceiling.
+            // Six sentences — above the ceiling.
             assert!(
-                !guards_ok(&c, "A. B thing. C thing. D thing. E thing."),
-                "over 4 sentences is rejected"
+                !guards_ok(&c, "A. B thing. C thing. D thing. E thing. F thing."),
+                "over 5 sentences is rejected"
             );
             // Empty.
             assert!(!guards_ok(&c, "   "), "an empty/whitespace summary is rejected");
@@ -533,14 +553,41 @@ pub(super) mod guards {
                 !guards_ok(&c, "First sentence here. Second one.\n\nA second paragraph. Third."),
                 "a paragraph break is rejected"
             );
-            // 120 words across three sentences (capitalized openers so the identifier-tolerant
-            // counter sees the boundaries) — over the 110 cap.
+            // 160 words across four sentences (capitalized openers so the identifier-tolerant
+            // counter sees the boundaries) — over the cap.
             let sentence = |lead: &str| format!("{lead} {}", vec!["word"; 39].join(" "));
-            let long =
-                format!("{}. {}. {}.", sentence("Alpha"), sentence("Beta"), sentence("Gamma"));
-            assert_eq!(count_sentences(&long), 3, "the fixture is 3 sentences");
-            assert_eq!(long.split_whitespace().count(), 120, "the fixture is 120 words");
+            let long = format!(
+                "{}. {}. {}. {}.",
+                sentence("Alpha"),
+                sentence("Beta"),
+                sentence("Gamma"),
+                sentence("Delta")
+            );
+            assert_eq!(count_sentences(&long), 4, "the fixture is 4 sentences");
+            assert_eq!(long.split_whitespace().count(), 160, "the fixture is 160 words");
+            assert!(long.split_whitespace().count() > MAX_WORDS, "the fixture is over the cap");
             assert!(!guards_ok(&c, &long), "over the word cap is rejected");
+        }
+
+        #[test]
+        fn guards_accept_a_five_sentence_summary_that_spends_one_on_the_rationale() {
+            // The prompt asks for 3–5 sentences within the envelope so a summary can carry WHY the
+            // constraint exists. The guards must accept exactly that shape — a rejection would drop
+            // the memory to its title, which is the outcome the rationale sentence exists to avoid.
+            let c = mem_db();
+            set_repo(&c, "r");
+            let sentence = |lead: &str| format!("{lead} {}", vec!["word"; 25].join(" "));
+            let five = format!(
+                "{}. {}. {}. {}. {}.",
+                sentence("Alpha"),
+                sentence("Beta"),
+                sentence("Gamma"),
+                sentence("Delta"),
+                sentence("Otherwise")
+            );
+            assert_eq!(count_sentences(&five), 5, "the fixture is 5 sentences");
+            assert_eq!(five.split_whitespace().count(), 130, "the fixture is 130 words");
+            assert!(guards_ok(&c, &five), "a 5-sentence, 130-word summary is accepted");
         }
 
         fn guards_ok(c: &Connection, s: &str) -> bool {
@@ -568,6 +615,12 @@ mod tests {
     /// A well-formed 3-sentence summary that passes every guard (no tracker refs).
     const GOOD_SUMMARY: &str = "The queue enqueues an active memory with no summary. It skips a \
                                 memory whose body is unchanged. A body edit re-queues it.";
+
+    /// A body LONGER than [`evidence::SUMMARY_MAX_WORDS`], so the size gate queues it for
+    /// compaction. `tag` leads the body, keeping distinct fixtures (and their hashes) distinct.
+    fn long_body(tag: &str) -> String {
+        format!("{tag} {}", vec!["padding"; evidence::SUMMARY_MAX_WORDS].join(" "))
+    }
 
     fn summary_rows(c: &Connection, memory_id: &str) -> Vec<(String, String)> {
         c.prepare(
@@ -635,7 +688,7 @@ mod tests {
     fn bad_then_good_writes_a_row_on_two_calls() {
         let c = mem_db();
         set_repo(&c, "r");
-        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
+        seed_memory(&c, "m1", "note", &long_body("worth compacting"), "r");
         // First completion is malformed (one sentence → guard rejects); the retry is well-formed.
         let model = MockChatModel::new(["just one sentence", GOOD_SUMMARY]);
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 5000).unwrap();
@@ -649,7 +702,7 @@ mod tests {
     fn bad_then_bad_writes_nothing() {
         let c = mem_db();
         set_repo(&c, "r");
-        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
+        seed_memory(&c, "m1", "note", &long_body("worth compacting"), "r");
         // Both completions are malformed (one sentence each) → rejected twice → nothing stored.
         let model = MockChatModel::new(["one sentence only", "still one sentence"]);
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 5000).unwrap();
@@ -671,7 +724,7 @@ mod tests {
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 6000).unwrap();
         assert_eq!(model.calls(), 2, "the current deterministic failure suppresses another retry");
 
-        c.execute("UPDATE repo_memories SET body='edited body' WHERE id='m1'", []).unwrap();
+        c.execute("UPDATE repo_memories SET body=?1 WHERE id='m1'", [long_body("edited")]).unwrap();
         let good = MockChatModel::new([GOOD_SUMMARY]);
         run_compact_pass(&c, CompactPass { model: &good, budget: 10 }, 7000).unwrap();
         assert_eq!(good.calls(), 1, "a content change invalidates the failure row");
@@ -690,7 +743,7 @@ mod tests {
     fn zero_budget_does_not_call_model_or_report_pending_compaction() {
         let c = mem_db();
         set_repo(&c, "r");
-        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
+        seed_memory(&c, "m1", "note", &long_body("worth compacting"), "r");
         let model = MockChatModel::new([GOOD_SUMMARY]);
 
         run_compact_pass(&c, CompactPass { model: &model, budget: 0 }, 1000).unwrap();
@@ -707,9 +760,11 @@ mod tests {
     fn current_compact_failure_suppresses_pending_compaction() {
         let c = mem_db();
         set_repo(&c, "r");
-        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
-        let content_hash =
-            rag_rat_query::memory::evidence::note_content_hash("note", "a body worth compacting");
+        seed_memory(&c, "m1", "note", &long_body("worth compacting"), "r");
+        let content_hash = rag_rat_query::memory::evidence::note_content_hash(
+            "note",
+            &long_body("worth compacting"),
+        );
         let stamp = FailureStamp {
             memory_id: "m1",
             repo_id: "r",
@@ -732,7 +787,7 @@ mod tests {
     fn model_error_records_retryable_compact_failure() {
         let c = mem_db();
         set_repo(&c, "r");
-        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
+        seed_memory(&c, "m1", "note", &long_body("worth compacting"), "r");
         let model = MockChatModel::new(Vec::<String>::new());
 
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
@@ -759,7 +814,7 @@ mod tests {
     fn accepted_summary_upserts_all_stamps() {
         let c = mem_db();
         set_repo(&c, "r");
-        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
+        seed_memory(&c, "m1", "note", &long_body("worth compacting"), "r");
         let model = MockChatModel::new([GOOD_SUMMARY]);
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 7000).unwrap();
         let row: (String, String, String, String, i64) = c
@@ -775,7 +830,10 @@ mod tests {
         assert_eq!(row.2, COMPACT_PROMPT_VERSION);
         assert_eq!(
             row.3,
-            rag_rat_query::memory::evidence::note_content_hash("note", "a body worth compacting")
+            rag_rat_query::memory::evidence::note_content_hash(
+                "note",
+                &long_body("worth compacting")
+            )
         );
         assert_eq!(row.4, 7000);
     }
@@ -792,7 +850,7 @@ mod tests {
             [],
         )
         .unwrap();
-        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
+        seed_memory(&c, "m1", "note", &long_body("worth compacting"), "r");
         let lane = || -> i64 {
             c.query_row(
                 "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM repo_meta
@@ -814,7 +872,7 @@ mod tests {
         // content_hash covers the title — a title-only edit re-queues for a fresh summary.
         let c = mem_db();
         set_repo(&c, "r");
-        seed_memory(&c, "m1", "original title", "a stable body", "r");
+        seed_memory(&c, "m1", "original title", &long_body("a stable body"), "r");
         let model = MockChatModel::new([GOOD_SUMMARY, GOOD_SUMMARY]);
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
         assert_eq!(model.calls(), 1, "the un-summarized memory is compacted once");
@@ -831,7 +889,7 @@ mod tests {
     fn second_run_churn_skips_and_body_edit_recompacts_and_prunes() {
         let c = mem_db();
         set_repo(&c, "r");
-        seed_memory(&c, "m1", "note", "original body", "r");
+        seed_memory(&c, "m1", "note", &long_body("original"), "r");
         let model = MockChatModel::new([GOOD_SUMMARY, GOOD_SUMMARY]);
 
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
@@ -843,14 +901,14 @@ mod tests {
 
         // A body edit changes content_hash → re-enqueued → the model runs again and the OLD summary
         // row (under the previous content_hash) is pruned, leaving exactly one row.
-        c.execute("UPDATE repo_memories SET body='edited body' WHERE id='m1'", []).unwrap();
+        c.execute("UPDATE repo_memories SET body=?1 WHERE id='m1'", [long_body("edited")]).unwrap();
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 3000).unwrap();
         assert_eq!(model.calls(), 2, "a body edit re-invokes the model");
         let rows = summary_rows(&c, "m1");
         assert_eq!(rows.len(), 1, "steady state is one summary row per memory (old body pruned)");
         assert_eq!(
             rows[0].0,
-            rag_rat_query::memory::evidence::note_content_hash("note", "edited body"),
+            rag_rat_query::memory::evidence::note_content_hash("note", &long_body("edited")),
             "the row is the new note's"
         );
     }
@@ -859,7 +917,7 @@ mod tests {
     fn compact_pass_never_mutates_a_repo_memories_column() {
         let c = mem_db();
         set_repo(&c, "r");
-        seed_memory(&c, "m1", "note", "a body worth compacting", "r");
+        seed_memory(&c, "m1", "note", &long_body("worth compacting"), "r");
         let snap = |c: &Connection| -> (String, String, String) {
             c.query_row("SELECT body, status, title FROM repo_memories WHERE id='m1'", [], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -884,7 +942,7 @@ mod tests {
         let c = mem_db();
         set_repo(&c, "r");
         for id in ["m4", "m1", "m3", "m2"] {
-            seed_memory(&c, id, "note", "body", "r");
+            seed_memory(&c, id, "note", &long_body("body"), "r");
         }
         let queue = compaction_queue(&c, 2).unwrap();
         assert_eq!(
@@ -892,6 +950,33 @@ mod tests {
             vec!["m1", "m2"],
             "the queue is ordered by memory_id and capped at the budget"
         );
+    }
+
+    #[test]
+    fn queue_skips_a_body_already_within_the_summary_envelope() {
+        // Compacting a note that already fits the envelope can only lose information (a condition,
+        // or the reason behind it) while making it no shorter, so it is never queued and never
+        // calls the model. The fixture sits EXACTLY at the ceiling the acceptance guards enforce:
+        // one more word and the rewrite could genuinely shorten it. The long sibling still queues,
+        // proving the gate is a size test and not a blanket skip.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let short = vec!["word"; evidence::SUMMARY_MAX_WORDS].join(" ");
+        seed_memory(&c, "m1", "note", &short, "r");
+        seed_memory(&c, "m2", "note", &long_body("long enough to compact"), "r");
+
+        let queue = compaction_queue(&c, 10).unwrap();
+        assert_eq!(
+            queue.iter().map(|e| e.memory_id.as_str()).collect::<Vec<_>>(),
+            vec!["m2"],
+            "only the over-envelope memory queues"
+        );
+
+        let model = MockChatModel::new([GOOD_SUMMARY]);
+        run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
+        assert_eq!(model.calls(), 1, "the short memory never reaches the model");
+        assert!(summary_rows(&c, "m1").is_empty(), "the short memory keeps no summary row");
+        assert_eq!(summary_rows(&c, "m2").len(), 1, "the long memory is summarized");
     }
 
     // ── poison-sibling: repo scoping ─────────────────────────────────────────────
@@ -903,8 +988,8 @@ mod tests {
         // ONLY r1's memory and write ONLY under r1.
         let c = mem_db();
         set_repo(&c, "r1");
-        seed_memory(&c, "m1", "note", "repo one body", "r1");
-        seed_memory(&c, "m2", "note", "repo two body", "r2");
+        seed_memory(&c, "m1", "note", &long_body("repo one body"), "r1");
+        seed_memory(&c, "m2", "note", &long_body("repo two body"), "r2");
 
         // The queue under r1 holds only r1's memory.
         let queue = compaction_queue(&c, 10).unwrap();

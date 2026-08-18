@@ -1255,8 +1255,14 @@ mod evidence_dream_tests {
         );
 
         // An UNCITABLE prose-only memory (no identifiers, no bindings): verify is NOT model work,
-        // but compaction WILL summarize it.
-        seed_memory(&c, "m1", "t", "a prose note with no identifiers", "r");
+        // but compaction WILL summarize it. The body must clear the compaction size gate — a note
+        // already inside the summary envelope is skipped by BOTH passes, which would make the
+        // asymmetry below vacuous rather than test it.
+        let uncitable = format!(
+            "a prose note with no identifiers {}",
+            vec!["padding"; rag_rat_query::memory::evidence::SUMMARY_MAX_WORDS].join(" ")
+        );
+        seed_memory(&c, "m1", "t", &uncitable, "r");
         assert!(
             !crate::model_work_pending(&c, opts, 10, true, false, "mock-chat-model").unwrap(),
             "an all-uncitable verify queue is NOT model work — never cold-start a box for it"

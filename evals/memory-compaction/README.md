@@ -51,6 +51,14 @@ The zero-trap-flip bar is absolute: a single inverted negation is a correctness 
 coverage trade-off. Coverage (how many `gold: true` claims survive) is a *quality* number to
 watch, not a hard gate — compression legitimately drops secondary facts.
 
+`why%` (in `score_v2.py`) is the third number to watch, also non-gating: the fraction of summaries
+that state a *reason* at all, matched deterministically on causal connectives. It exists because
+scoring only fidelity and brevity rewards flattening a note into bare imperatives — a summary that
+says `ONLY do X, NEVER do Y` and drops what breaks otherwise reads as a clean win on every other
+axis while sending the reader back to the source. The prompt asks for the why inside a 130-word,
+3-5 sentence envelope; the `fmt%` check mirrors the shipped acceptance guards (`SUMMARY_MAX_WORDS`,
+which the compaction size gate also reads), so a prompt change must move both.
+
 ### The verification manifest
 
 `VERIFY_MANIFEST` in `harness/eval_app.py` is the compact labeled ground truth for the verdict
@@ -324,7 +332,10 @@ identifiers. The eval is the check for the ref classes the runtime deliberately 
 These prompts are LIVE in rag-rat, versioned so a change is traceable:
 
 - `dream/verdict.rs` — `PROMPT_VERSION = "verify-pack-v6"` (the evidence-pack verdict prompt).
-- `dream/compact.rs` — `COMPACT_PROMPT_VERSION = "compact-v1"` (the self-containment compact prompt).
+- `query/memory/evidence.rs` — `COMPACT_PROMPT_VERSION = "compact-v2"` (the self-containment compact
+  prompt, rendered from `dream/prompts/compact_head.md`). `export-reviewed-intent-context.py`'s
+  `--compact-prompt-version` must track it: the summary join is a LEFT JOIN, so a stale value
+  exports NULL summaries with no error.
 
 The harness's `VERIFY_PACK_PROMPT` mirrors the shipped verdict prompt (`dream/verdict.rs`'s
 `VERDICT_PROMPT_HEAD` + the NOTE/PACK tail) at `PROMPT_VERSION = "verify-pack-v6"`. **Re-sync

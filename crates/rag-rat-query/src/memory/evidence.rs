@@ -92,7 +92,22 @@ const TEXT_PRESENCE_SCAN_CAP: usize = 2000;
 /// (which is why prompt-observable changes ride version bumps backfill-free).
 pub const VERDICT_PROMPT_VERSION: &str = "verify-pack-v6";
 /// Version stamp of the compaction prompt, gating `memory_summaries` reuse the same way.
-pub const COMPACT_PROMPT_VERSION: &str = "compact-v1";
+pub const COMPACT_PROMPT_VERSION: &str = "compact-v2";
+
+/// Word ceiling on a compacted summary — the compaction acceptance guards accept nothing longer
+/// (the prompt asks for well under it, leaving headroom for a rationale sentence). A note whose
+/// body already fits IS a summary by that standard, so compaction never queues it: the rewrite
+/// could come back no shorter while dropping a condition or the reason behind it.
+pub const SUMMARY_MAX_WORDS: usize = 150;
+
+/// Whether compaction skips this body for already fitting the summary envelope — the ONE predicate
+/// the compaction queue and both summary surfaces share. A skipped note never gets a
+/// `memory_summaries` row and never will, so the summary surfaces must show it WHOLE (bounded by
+/// [`SUMMARY_MAX_WORDS`]); letting the two sides disagree strands a note in the gap, where it
+/// surfaces as a bare title forever.
+pub fn note_is_shown_whole(body: &str) -> bool {
+    body.split_whitespace().count() <= SUMMARY_MAX_WORDS
+}
 
 /// Why a memory is in the verification queue. Not persisted (a transient queue reason), so it
 /// carries no `as_db_str`; the [`Self::rank`] priority orders the queue.
