@@ -96,7 +96,10 @@ fn canonical_content(content: &NodeContent) -> NodeContent {
 /// silently repair here.
 fn canonical_anchors(anchors: &[PortableAnchor]) -> Vec<PortableAnchor> {
     let mut anchors = anchors.to_vec();
-    anchors.sort_by(|a, b| (&a.binding_kind, &a.binding_id).cmp(&(&b.binding_kind, &b.binding_id)));
+    // Delegates to the op type's own identity, the way `canonical_content` delegates to
+    // `NodeContent::canonicalize`: re-spelling the key here would let the fold and the wire encoder
+    // drift apart silently.
+    anchors.sort_by(|a, b| a.identity().cmp(&b.identity()));
     anchors
 }
 
@@ -277,6 +280,21 @@ mod tests {
         );
     }
 
+    /// The fold orders the set by identity, so two devices that assembled the same bindings in
+    /// different orders project byte-identical state. Deleting the sort must fail here.
+    #[test]
+    fn the_fold_orders_an_anchor_set_by_identity() {
+        let state = project(&[
+            at(1, 1, create("mem_1", "t")),
+            at(2, 1, anchors_op("mem_1", &["c", "a", "b"])),
+        ]);
+        let anchors = state.nodes[&NodeId::from("mem_1")].anchors.as_ref().unwrap();
+        assert_eq!(
+            anchors.iter().map(|anchor| anchor.binding_id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"],
+        );
+    }
+
     /// `None` and `Some(vec![])` are different facts downstream — nobody has published this
     /// memory's bindings, versus its author saying it has none — so the fold must not collapse
     /// them.
@@ -298,9 +316,11 @@ mod tests {
         let state = project(&[at(1, 1, anchors_op("mem_ghost", &["a"]))]);
         assert!(state.nodes.is_empty(), "an orphan anchor set establishes nothing");
 
-        // ...and once the create arrives out of order, the earlier set is still there.
+        // ...and a create landing AFTER the set in the total order does not reset it: existence
+        // and anchors are independent registers, so the create establishes the node without
+        // touching what the earlier op already published.
         let late_create =
-            project(&[at(2, 1, anchors_op("mem_1", &["a"])), at(1, 1, create("mem_1", "t"))]);
+            project(&[at(1, 1, anchors_op("mem_1", &["a"])), at(2, 1, create("mem_1", "t"))]);
         assert!(late_create.nodes[&NodeId::from("mem_1")].anchors.is_some());
     }
 

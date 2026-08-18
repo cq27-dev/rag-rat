@@ -1465,7 +1465,6 @@ mod tests {
 
     // ── #688: the /3 projector-version two-part discipline ──
 
-    /// The stored `/3` content-projector stamp, as the raw string `oplog_meta` holds.
     /// The stamp these tests expect after an upgrade: the CURRENT projector version, not a literal.
     /// The property under test is "the store became current", so a projector bump should not have
     /// to touch them.
@@ -1473,6 +1472,7 @@ mod tests {
         content_projection::CONTENT_PROJECTOR_VERSION.to_string()
     }
 
+    /// The stored `/3` content-projector stamp, as the raw string `oplog_meta` holds.
     fn stored_stamp(conn: &Connection) -> Option<String> {
         conn.query_row(
             "SELECT value FROM oplog_meta WHERE key = 'content_projector_version'",
@@ -1691,11 +1691,6 @@ mod tests {
         // from the projection rows it just cleared — the path an older binary's opaquely-retained
         // `node_anchors` entry takes when this binary first opens the store.
         conn.execute(
-            "UPDATE content_projected_nodes SET anchors_json = NULL WHERE stream_id = ?1",
-            params![stream.to_bytes().as_slice()],
-        )
-        .unwrap();
-        conn.execute(
             "INSERT INTO oplog_meta(key, value) VALUES ('content_projector_version', '0')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
@@ -1713,6 +1708,27 @@ mod tests {
             node.anchors.as_deref(),
             Some(anchors.as_slice()),
             "the rebuild recovers anchors from the accepted entries",
+        );
+
+        // The other half of the truth table the nullable column exists for: an author publishing an
+        // EMPTY set must read back as `Some(vec![])`, never NULL. Without this, normalizing an
+        // empty vec to NULL in the writer — or a `skip_serializing_if` on the row DTO —
+        // would pass the whole suite while collapsing the distinction the drain's seed rule
+        // depends on.
+        author_content_batch(
+            &conn,
+            stream,
+            &[MemoryOp::NodeAnchors { node_id: NodeId::from("n1"), anchors: Vec::new() }],
+            SealPolicy::Plaintext,
+            NOW,
+        )
+        .expect("author an empty anchor set");
+        let emptied =
+            crate::content_projection::list_projected_content_nodes(&conn, stream).unwrap();
+        assert_eq!(
+            emptied.iter().find(|node| node.node_id == "n1").unwrap().anchors,
+            Some(Vec::new()),
+            "an empty set survives SQLite as Some(vec![]), never NULL",
         );
     }
 

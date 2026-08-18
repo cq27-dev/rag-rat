@@ -289,7 +289,7 @@ impl PortableAnchor {
     /// The row this anchor names — the half of the binding PK an anchor set is ordered and
     /// deduplicated by. Deliberately NOT a derived `Ord` over the whole struct: two anchors sharing
     /// an identity are a conflict to reject, not two distinct members to order by their payloads.
-    fn identity(&self) -> (&str, &str) {
+    pub(crate) fn identity(&self) -> (&str, &str) {
         (self.binding_kind.as_str(), self.binding_id.as_str())
     }
 }
