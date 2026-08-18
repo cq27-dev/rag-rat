@@ -55,9 +55,11 @@ To run from a checkout without installing, use a project-scoped server whose com
 ## Tools
 
 The MCP surface is **47 tools** in nine groups. The signatures are below; the prose sections that
-follow describe response shapes and per-tool behavior. Every symbol/search/read tool additionally
-accepts an optional `"worktree": string` — an absolute path to a linked git worktree, served as a
-branch overlay over the indexed checkout — omitted from the signatures below for brevity.
+follow describe response shapes and per-tool behavior. Every read tool additionally accepts an
+optional `"worktree": string` — an absolute path to a linked git worktree, served as a branch
+overlay over the indexed checkout — omitted from the signatures below for brevity. The write tools
+and `compare_graph_to_text` do not: they stay scoped to the indexed checkout, so they neither
+declare the parameter nor honor one.
 
 **Search & symbols**
 

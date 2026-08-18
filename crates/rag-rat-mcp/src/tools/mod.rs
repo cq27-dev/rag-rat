@@ -92,6 +92,22 @@ fn tool_compares_against_live_source(name: &str) -> bool {
     matches!(name, "compare_graph_to_text")
 }
 
+/// Whether `name`'s reads are scoped by the common `worktree` request field. The single gate for
+/// both halves of the contract: `call_tool_for_config` scopes the connection by it, and
+/// `catalog::schema` declares the parameter by it — so the advertised surface can't drift from the
+/// tools that honor it.
+///
+/// Deliberately every read tool, not a hand-curated "results actually differ per checkout" list:
+/// the two errors cost wildly different amounts. Declaring it where the scope happens to be inert
+/// changes nothing about the answer; withholding it from a tool that DOES read the per-connection
+/// `files` view leaves a strict client unable to scope that tool at all. The tools that look
+/// checkout-independent by name mostly aren't — `index_status` counts files per language,
+/// `llm_status` counts chunks, and `memory_doctor`'s re-anchor candidates come from live symbols,
+/// all through that view.
+pub(crate) fn tool_honors_worktree_scope(name: &str) -> bool {
+    is_read_only_tool(name) && !tool_compares_against_live_source(name)
+}
+
 pub fn call_tool_for_config(
     config: &Config,
     name: &str,
@@ -106,7 +122,7 @@ pub fn call_tool_for_config(
     let worktree = worktree_arg(&arguments);
     // A tool that compares the graph against LIVE main-checkout text stays BASE-scoped even with a
     // `worktree` arg, so its graph and text sides come from the same checkout (#219 review).
-    let scope_worktree = if tool_compares_against_live_source(name) { None } else { worktree };
+    let scope_worktree = if tool_honors_worktree_scope(name) { worktree } else { None };
     // Read tools run on a lock-free read-only connection (#143). Two fall-backs to the read-write
     // open: (1) `try_open_config_read_only` returns `None` when the index still owes a heal/migrate
     // write; (2) a handful of read tools lazily WRITE on a cold path (`semantic_search` heals stale

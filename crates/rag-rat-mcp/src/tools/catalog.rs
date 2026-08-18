@@ -268,7 +268,45 @@ pub fn description(name: &str) -> &'static str {
     }
 }
 
+/// The `worktree` request field every worktree-scoped read honors, declared ONCE here rather than
+/// as a field on each arg struct: the dispatcher reads it as a COMMON field off the raw request
+/// (`worktree_arg`), so N per-struct copies would be N chances to drift from it.
+/// The silent-fallback warning is load-bearing: `resolve_worktree_scope` drops a path that isn't a
+/// linked worktree of this repo to the base scope without an error, so a typo reads as a plausible
+/// answer about the wrong checkout — the exact failure the parameter exists to prevent.
+const WORKTREE_PARAM_DESCRIPTION: &str =
+    "Absolute path of the checkout to scope reads to — pass a linked worktree to read its branch \
+     overlay. Defaults to the server's working directory. A path that is not a linked worktree of \
+     this repo is silently ignored: results then come from the indexed checkout, with no error.";
+
 pub fn schema(name: &str) -> Value {
+    let mut schema = arg_schema(name);
+    // Only advertise the parameter on the tools that actually honor it: a write tool and
+    // `compare_graph_to_text` stay base-scoped by contract, so declaring it there would promise a
+    // scoping the dispatcher deliberately ignores.
+    if tool_honors_worktree_scope(name) {
+        declare_worktree_property(&mut schema);
+    }
+    schema
+}
+
+/// Add the optional `worktree` property to a generated arg schema. Optional = absent from
+/// `required`, which the generated schema never lists it in. The insert OVERWRITES any property an
+/// arg struct generates under the same name, so an arg struct that grows a `worktree` field of its
+/// own cannot leave a divergent spec in the advertised schema.
+fn declare_worktree_property(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else { return };
+    // An `EmptyArgs` tool's generated schema carries no `properties` map at all.
+    let properties = object.entry("properties").or_insert_with(|| json!({}));
+    if let Some(properties) = properties.as_object_mut() {
+        properties.insert(
+            "worktree".to_string(),
+            json!({"type": "string", "description": WORKTREE_PARAM_DESCRIPTION}),
+        );
+    }
+}
+
+fn arg_schema(name: &str) -> Value {
     match name {
         "semantic_search"
         | "commit_search"
@@ -315,5 +353,68 @@ pub fn schema(name: &str) -> Value {
         "dream" => schema_for::<DreamArgs>(),
         "dream_review" => schema_for::<DreamReviewArgs>(),
         _ => json!({"type": "object"}),
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    /// The tools that must NOT advertise `worktree`: every write tool (writing under a linked
+    /// overlay scope would reindex the overlay with the main checkout's contents) plus the one read
+    /// tool that compares the graph against live main-checkout text. Spelled out rather than
+    /// derived from `tool_honors_worktree_scope`, which `schema` is implemented in terms of — a
+    /// derived expectation would agree with the code by construction and guard nothing.
+    const BASE_SCOPED_TOOLS: &[&str] = &[
+        "heal_index",
+        "memory_create",
+        "memory_rebind",
+        "memory_update",
+        "memory_edge_add",
+        "memory_edge_remove",
+        "memory_mark_obsolete",
+        "memory_validate",
+        "dream",
+        "dream_review",
+        "compare_graph_to_text",
+    ];
+
+    fn worktree_property(name: &str) -> Option<Value> {
+        schema(name).get("properties")?.get("worktree").cloned()
+    }
+
+    #[test]
+    fn every_read_tool_declares_the_worktree_param_and_the_base_scoped_ones_do_not() {
+        // Per-request worktree scoping is unusable if no schema mentions it: serde tolerates the
+        // field (no `deny_unknown_fields`), but a client can only pass what the catalog declares.
+        for name in TOOL_NAMES {
+            if BASE_SCOPED_TOOLS.contains(name) {
+                assert!(
+                    worktree_property(name).is_none(),
+                    "{name}: base-scoped by contract — advertising `worktree` would promise a \
+                     scoping the dispatcher discards",
+                );
+                continue;
+            }
+            // Covers the reads whose checkout-dependence isn't obvious from the name:
+            // `index_status`'s per-language counts, `llm_status`'s chunk counts and
+            // `memory_doctor`'s re-anchor candidates all read the per-connection `files` view.
+            // `index_status` is also the `EmptyArgs` case, whose generated schema carries no
+            // `properties` map of its own.
+            let declared =
+                worktree_property(name).unwrap_or_else(|| panic!("{name} declares `worktree`"));
+            assert_eq!(
+                declared,
+                json!({"type": "string", "description": WORKTREE_PARAM_DESCRIPTION}),
+                "{name}: every read tool advertises the ONE canonical spec — an arg struct that \
+                 also carries the field must not leave a divergent one behind",
+            );
+            assert!(
+                !schema(name)["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|field| field == "worktree")),
+                "{name}: `worktree` is optional — it must never be listed as required",
+            );
+        }
     }
 }

@@ -844,7 +844,6 @@ mod symbol_lookup_memory_cap_tests {
             allow_ambiguous: false,
             limit: 10,
             include: None,
-            worktree: None,
         }
     }
 

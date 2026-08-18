@@ -1217,6 +1217,85 @@ fn worktree_param_routes_query_to_branch_overlay() {
     );
 }
 
+/// Add a linked worktree on `branch` whose `src/a.rs` defines `symbol`, and index its overlay.
+fn linked_worktree_with(
+    config: &Config,
+    root: &Path,
+    branch: &str,
+    symbol: &str,
+) -> rag_rat_base::test_scratch::ScratchDir {
+    let linked = unique_temp_root();
+    git(root, &["worktree", "add", "-q", "-b", branch, linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), format!("pub fn {symbol}() {{}}\n")).unwrap();
+    git(&linked, &["add", "."]);
+    git(&linked, &["commit", "-q", "-m", branch]);
+    let mut db = IndexDatabase::open_config(config).unwrap();
+    db.index_worktree_overlay(config, &linked, &mut |_| {}).unwrap();
+    linked
+}
+
+/// The scoping field `name` ADVERTISES, read back out of the generated schema so the calls below
+/// drive the declared name. A client can only pass what the catalog declares, so an undeclared
+/// parameter is an unusable one however faithfully the dispatcher honors it (#1201).
+fn advertised_worktree_param(name: &str) -> String {
+    let schema = schema(name);
+    let (param, _) = schema["properties"]
+        .as_object()
+        .and_then(|properties| properties.get_key_value("worktree"))
+        .unwrap_or_else(|| panic!("{name} advertises the worktree parameter"));
+    param.clone()
+}
+
+#[test]
+fn the_advertised_worktree_param_serves_that_checkout_and_not_its_siblings() {
+    let param = advertised_worktree_param("symbol_lookup");
+    let root = unique_temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@e"]);
+    git(&root, &["config", "user.name", "t"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "base"]);
+    let config = rust_config(root.to_path_buf());
+    IndexDatabase::rebuild(&config).unwrap();
+
+    let first = linked_worktree_with(&config, &root, "feat-a", "first_fn");
+    let second = linked_worktree_with(&config, &root, "feat-b", "second_fn");
+    let (first, second) = (first.to_str().unwrap(), second.to_str().unwrap());
+    let call = |tool: &str, mut args: Value, worktree: Option<&str>| {
+        if let Some(worktree) = worktree {
+            args[param.as_str()] = json!(worktree);
+        }
+        call_tool_for_config(&config, tool, args).unwrap()
+    };
+    let found = |symbol: &str, worktree: Option<&str>| {
+        candidate_count(&call("symbol_lookup", json!({"symbol": symbol}), worktree)) > 0
+    };
+
+    // Active-checkout scope: the requested worktree's overlay shadows the base file.
+    assert!(found("first_fn", Some(first)), "the scoped checkout's own symbol");
+    assert!(!found("base_fn", Some(first)), "the overlay shadows the base file");
+    // Sibling isolation: the OTHER linked checkout's overlay must not leak into this scope.
+    assert!(!found("second_fn", Some(first)), "a sibling checkout's symbol must not");
+    assert!(found("second_fn", Some(second)), "each checkout serves its own overlay");
+
+    // Unscoped: the base scope, with neither overlay visible.
+    assert!(found("base_fn", None), "unscoped reads serve the base checkout");
+    assert!(!found("first_fn", None));
+    assert!(!found("second_fn", None));
+
+    // A tool a client could NOT scope until the catalog declared the parameter for it:
+    // `SymbolRefArgs` has no `worktree` field of its own. It resolves its symbol through the
+    // scoped views, answering `null` for a symbol absent from the requested checkout.
+    assert_eq!(advertised_worktree_param("git_history_for_symbol"), param);
+    let history = |symbol: &str, worktree: &str| {
+        call("git_history_for_symbol", json!({"symbol": symbol}), Some(worktree))
+    };
+    assert!(!history("first_fn", first).is_null(), "the scoped checkout resolves its symbol");
+    assert!(history("first_fn", second).is_null(), "a sibling checkout does not");
+}
+
 #[test]
 fn compare_graph_to_text_stays_base_scoped_under_a_worktree_param() {
     // #219 review (3440746678): `compare_graph_to_text` reads LIVE source text through
