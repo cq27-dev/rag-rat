@@ -98,6 +98,7 @@ const CONTENT_OP_BODY_MAX_BYTES: usize =
 /// the create/update boundary to reject oversized input before the row is persisted (#680). Checks
 /// the encoded body only; the header + signature are the fixed overhead `CONTENT_OP_BODY_MAX_BYTES`
 /// already reserves for.
+///
 /// Also gates the STRUCTURAL limits `op::decode` enforces, not just size: an op can be small and
 /// still unreadable (an over-cap or duplicate-carrying anchor set). `/3` ingest never decodes op
 /// bytes, so such an entry would be signed, accepted and forwarded, then silently skipped at
@@ -124,6 +125,9 @@ const CONTENT_SEALED_OP_BODY_MAX_BYTES: usize =
 /// entry once the AEAD nonce + tag are added to its body (S2, #608). The live reconcile uses
 /// this to QUARANTINE an un-authorable op on a sealed stream — exactly as the suite-0 predicate
 /// does on a plaintext one — instead of `bail!`ing the whole batch at sign time.
+///
+/// Gates the same structural limits as its twin: a shape `op::decode` refuses is unreadable whether
+/// or not it is sealed, so both predicates must agree on it.
 pub fn content_op_is_sealed_authorable(op: &MemoryOp) -> bool {
     op::within_wire_limits(op) && op::encode(op).len() <= CONTENT_SEALED_OP_BODY_MAX_BYTES
 }
@@ -992,6 +996,62 @@ mod tests {
             !content_op_is_authorable(&edge_add("mem_src", &"a".repeat(300 * 1024))),
             "an oversized edge anchor exceeds the /3 envelope",
         );
+    }
+
+    /// Both predicates must refuse a shape `op::decode` cannot read back, whatever its size — a
+    /// small unreadable op would otherwise be signed, accepted and forwarded, then silently skipped
+    /// at projection by every peer, its author included.
+    ///
+    /// This pins the WIRING, not the primitive: dropping `within_wire_limits` from either predicate
+    /// must fail here. The sealed twin is asserted separately because it is a separate line that a
+    /// refactor can drop on its own.
+    #[test]
+    fn both_authorable_predicates_refuse_a_structurally_unreadable_op() {
+        let anchor = |binding_id: &str| op::PortableAnchor {
+            binding_kind: "symbol".to_string(),
+            binding_id: binding_id.to_string(),
+            path: Some("src/lib.rs".to_string()),
+            start_line: Some(1),
+            end_line: Some(2),
+            commit_hash: None,
+            tracker: None,
+            project: None,
+            item_key: None,
+            created_at_ms: 1,
+            symbol_kind: None,
+            signature_hash: None,
+            moniker_tool: None,
+            moniker_tool_version: None,
+        };
+        let anchors_op = |anchors: Vec<op::PortableAnchor>| MemoryOp::NodeAnchors {
+            node_id: NodeId::from("mem_1"),
+            anchors,
+        };
+
+        // Two anchors naming ONE binding: tiny, so every size bound passes.
+        let duplicated = anchors_op(vec![anchor("src/lib.rs::run"), anchor("src/lib.rs::run")]);
+        assert!(
+            !content_op_is_authorable(&duplicated),
+            "a duplicate binding identity is unreadable"
+        );
+        assert!(
+            !content_op_is_sealed_authorable(&duplicated),
+            "sealing does not make a duplicate identity readable",
+        );
+
+        // One past the count cap, also far inside the byte bounds.
+        let over_cap = anchors_op(
+            (0..=op::MAX_ANCHORS_PER_OP).map(|index| anchor(&format!("id_{index:03}"))).collect(),
+        );
+        assert!(!content_op_is_authorable(&over_cap), "an over-cap anchor set is unreadable");
+        assert!(
+            !content_op_is_sealed_authorable(&over_cap),
+            "sealing does not raise the anchor cap",
+        );
+
+        let clean = anchors_op(vec![anchor("src/lib.rs::run"), anchor("src/lib.rs::walk")]);
+        assert!(content_op_is_authorable(&clean), "a well-formed anchor set is authorable");
+        assert!(content_op_is_sealed_authorable(&clean), "and authorable on a sealed stream");
     }
 
     /// A `NodeCreate` on `id` whose canonical-CBOR body (`op::encode`) is EXACTLY `encoded_len`

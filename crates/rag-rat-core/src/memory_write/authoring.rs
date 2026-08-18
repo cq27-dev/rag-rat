@@ -1295,8 +1295,9 @@ fn stable_owner_stream_for_repo(
     rag_rat_oplog::owned_stream_v2_id_with_mode(conn, repo_id, mode)
 }
 
-/// Reject a live content op whose ASSEMBLED signed `/3` envelope would exceed the §18a 256 KiB cap
-/// (#680) — the AUTHORITATIVE whole-op write-boundary guard. The cheap per-field caps
+/// Reject a live content op the `/3` log cannot carry — either a shape `op::decode` would refuse
+/// at any size, or an ASSEMBLED signed envelope over the §18a 256 KiB cap (#680). The
+/// AUTHORITATIVE whole-op write-boundary guard. The cheap per-field caps
 /// (`validate_payload`'s payload byte cap, `validate_edge_len`'s edge-anchor cap, the title/body
 /// char caps) fast-fail a single pathological field, but they cannot see an AGGREGATE — most
 /// reachably an arbitrary NUMBER of individually-valid tags on a `NodeCreate`/`NodeUpdate`, or a
@@ -1310,8 +1311,25 @@ fn reject_unauthorable_content_op(op: &MemoryOp, policy: StreamSealPolicy) -> an
     if content_op_is_authorable(op, policy) {
         return Ok(());
     }
-    // The per-field caps have already passed, so the culprit is an aggregate (or a future uncapped
-    // field): name what to shrink rather than surfacing a bare envelope-overflow rollback.
+    // Two different failures reach here and they want different remedies, so name the right one.
+    // A structural refusal is not a size problem: 65 tiny anchors are nowhere near the byte cap,
+    // and a binding named twice is a dedupe fix, not a "shorten it" one.
+    if !rag_rat_oplog::within_wire_limits(op) {
+        match op {
+            MemoryOp::NodeAnchors { node_id, anchors } => anyhow::bail!(
+                "memory `{}` cannot store its {} anchors: an anchor set holds at most {} bindings \
+                 and must not name one binding twice",
+                node_id.as_str(),
+                anchors.len(),
+                rag_rat_oplog::MAX_ANCHORS_PER_OP
+            ),
+            // No other op kind has a structural limit today; this arm keeps the branch total.
+            _ => anyhow::bail!("this memory operation has a shape the op log cannot encode"),
+        }
+    }
+    // Past the structural gate the culprit is size: an aggregate the per-field caps cannot see (or
+    // a future uncapped field). Name what to shrink rather than surfacing a bare envelope-overflow
+    // rollback.
     match op {
         MemoryOp::NodeCreate { node_id, .. } | MemoryOp::NodeUpdate { node_id, .. } =>
             anyhow::bail!(
@@ -1326,8 +1344,8 @@ fn reject_unauthorable_content_op(op: &MemoryOp, policy: StreamSealPolicy) -> an
             edge.source_node_id.as_str()
         ),
         MemoryOp::NodeAnchors { node_id, anchors } => anyhow::bail!(
-            "memory `{}` has too many or too large anchors to store: its {} bindings exceed the \
-             256 KiB signed-entry cap — reduce the number of bindings, or shorten their paths",
+            "memory `{}` is too large to store: its {} anchors exceed the 256 KiB signed-entry \
+             cap — shorten their paths, or bind the memory to fewer places",
             node_id.as_str(),
             anchors.len()
         ),

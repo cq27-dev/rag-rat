@@ -343,7 +343,17 @@ pub fn within_wire_limits(op: &MemoryOp) -> bool {
             identities.sort_unstable();
             identities.windows(2).all(|pair| pair[0] != pair[1])
         },
-        _ => true,
+        // Listed rather than wildcarded ON PURPOSE: this seam's contract is "reject exactly what
+        // `decode` rejects", so the next op kind that grows a count cap or an ordering rule must
+        // fail to compile here instead of silently answering `true` — the same under-approximation
+        // this function was added to close.
+        MemoryOp::NodeCreate { .. }
+        | MemoryOp::NodeUpdate { .. }
+        | MemoryOp::NodeStatus { .. }
+        | MemoryOp::EdgeAdd { .. }
+        | MemoryOp::EdgeRemove { .. }
+        | MemoryOp::Rebind { .. }
+        | MemoryOp::Snapshot => true,
     }
 }
 
