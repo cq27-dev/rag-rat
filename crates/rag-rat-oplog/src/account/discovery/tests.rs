@@ -132,8 +132,8 @@ fn a_sealed_announcement_opens_on_the_sealing_device() {
     assert_eq!(open_one(&conn, &TAG, &sealed.bytes), Some(NODE_ID));
 }
 
-/// The state an opener holds is fixed at load, so a fetch pass pays for the account read and the
-/// device load once however many announcements come back.
+/// The state an opener holds is fixed at load: opening reads nothing further from the store, so a
+/// pass pays for the account read and the device load once however many announcements come back.
 ///
 /// Pinned by emptying both single-row tables under a live opener: anything that reloaded them per
 /// announcement would stop opening here.

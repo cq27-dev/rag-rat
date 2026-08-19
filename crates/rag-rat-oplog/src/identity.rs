@@ -83,6 +83,13 @@ impl LocalDevice {
     pub(super) fn x25519_secret(&self) -> &DeviceX25519Secret {
         &self.x25519_secret
     }
+
+    /// Consume the identity for its X25519 secret alone, dropping the signing key with the rest.
+    /// For a caller that decrypts but never signs and outlives the load — holding the whole
+    /// identity there would keep the ed25519 secret alive for no reason.
+    pub(super) fn into_x25519_secret(self) -> DeviceX25519Secret {
+        self.x25519_secret
+    }
 }
 
 /// Read this store's local device fingerprint WITHOUT minting one — `None` when no identity has

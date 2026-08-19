@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 
 use super::keywrap::{self, ContentKey, SealedKeyWrap, WrapContext};
 use super::{bootstrap, storage};
-use crate::device::DeviceX25519Public;
-use crate::identity::{self, LocalDevice};
+use crate::device::{DeviceX25519Public, DeviceX25519Secret};
+use crate::identity;
 use crate::op::DeviceFingerprint;
 
 /// The envelope's leading byte. Bumping it is a wire break; the fetch side drops what it does not
@@ -151,10 +151,14 @@ fn stamp_of(recipients: &[(DeviceFingerprint, DeviceX25519Public)]) -> RosterSta
 /// context are the same answer each time, so they are paid for once and carried.
 ///
 /// It holds no connection, so a loaded opener cannot reach the database again. That is the point:
-/// hold one for the length of a fetch pass and drop it after, since a roster or identity change
-/// mid-pass is not something the pass is expected to observe.
+/// the sync pass that builds one holds it until the pass ends, and a roster or identity change
+/// while it is held is not something that pass is expected to observe.
+///
+/// It keeps the X25519 secret alone rather than the whole
+/// [`LocalDevice`](crate::identity::LocalDevice) it was loaded from, so the ed25519 signing key is
+/// not carried through the peer dials and sync sessions that outlive the opening itself.
 pub struct AnnouncementOpener {
-    device: LocalDevice,
+    x25519_secret: DeviceX25519Secret,
     ctx: WrapContext,
 }
 
@@ -169,7 +173,7 @@ impl AnnouncementOpener {
             return Ok(None);
         };
         let ctx = wrap_context(account, tag, &device.x25519_public().to_bytes());
-        Ok(Some(Self { device, ctx }))
+        Ok(Some(Self { x25519_secret: device.into_x25519_secret(), ctx }))
     }
 
     /// Recover the node id from an announcement sealed to this device, or `None`.
@@ -185,8 +189,7 @@ impl AnnouncementOpener {
         parse_wraps(envelope)?.iter().find_map(|wrap| {
             // Failure here is the expected case, not an error: this device matches at most one
             // wrap.
-            let opened =
-                keywrap::unwrap_content_key(wrap, self.device.x25519_secret(), &self.ctx).ok()?;
+            let opened = keywrap::unwrap_content_key(wrap, &self.x25519_secret, &self.ctx).ok()?;
             let mut node_id = [0u8; 32];
             node_id.copy_from_slice(opened.as_slice());
             Some(node_id)

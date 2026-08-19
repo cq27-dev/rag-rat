@@ -816,31 +816,27 @@ async fn reconcile(
     account: rag_rat_oplog::AccountId,
 ) -> anyhow::Result<(usize, usize, usize)> {
     let relay = relay_url(config);
-    let tag = rag_rat_sync::discovery::discovery_secret(conn)?
-        .map(|secret| rag_rat_sync::discovery::account_tag(&secret));
-    let discovery = discovery_addr(config, &relay);
-    // Built before the fetch, not inside the per-payload closure: the account and this device's key
-    // are the same for the whole pass. A failure to load them leaves discovery unopenable and falls
-    // back to the configured peers, the same as a payload that will not open.
-    let opener = tag.and_then(|tag| {
-        rag_rat_oplog::discovery::AnnouncementOpener::load(conn, &tag).ok().flatten()
-    });
-    let resolved = rag_rat_sync::discover_peers(
-        &config.sync.server_peers,
-        &relay,
-        tag.zip(discovery).map(|(tag, service)| rag_rat_sync::discovery::DiscoveryExchange {
-            endpoint,
-            service,
-            tag,
-            fetch: true,
-            publish: None,
-            ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
-                config.sync.push_interval_secs,
-            ),
-        }),
-        &|payload| opener.as_ref().and_then(|opener| opener.open(payload)),
-    )
-    .await;
+    let (exchange, opener) = match discovery_fetch(config, conn, &relay)? {
+        Some(fetch) => (
+            Some(rag_rat_sync::discovery::DiscoveryExchange {
+                endpoint,
+                service: fetch.service,
+                tag: fetch.tag,
+                fetch: true,
+                publish: None,
+                ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
+                    config.sync.push_interval_secs,
+                ),
+            }),
+            fetch.opener,
+        ),
+        None => (None, None),
+    };
+    let resolved =
+        rag_rat_sync::discover_peers(&config.sync.server_peers, &relay, exchange, &|payload| {
+            opener.as_ref().and_then(|opener| opener.open(payload))
+        })
+        .await;
     // Scope the DEVICE-sync phases to peers that can serve this account. A peer memoized as a
     // FOREIGN-account host serves only its own account by construction, so dialing it here would
     // fail the account-scope handshake, log a device-sync failure, and count an error on every
@@ -1216,6 +1212,49 @@ fn discovery_addr(config: &Config, relay: &str) -> Option<rag_rat_sync::Endpoint
     }).ok()
 }
 
+/// What one discovery fetch needs: where to ask, under which tag, and what opens the answers.
+struct DiscoveryFetch {
+    tag: [u8; 32],
+    service: rag_rat_sync::EndpointAddr,
+    /// `None` when this store cannot open announcements at all — no account, no local device, or a
+    /// failed read. Discovery then finds nothing and the pass falls back to the configured peers.
+    opener: Option<rag_rat_oplog::discovery::AnnouncementOpener>,
+}
+
+/// Resolve that state once, before the fetch, or `None` when there will be no fetch: discovery is
+/// off, or the configured service node id is unusable, or this store has no discovery secret.
+///
+/// The opener is loaded here rather than in the per-payload closure because the account and this
+/// device's key are the same for every announcement in a pass. **The service gate comes before
+/// every read** so a pass that will not fetch pays for none of them: the opener costs an account
+/// read plus a device load that re-derives and validates the stored keys, and with no exchange to
+/// pass on, `discover_peers` returns before it ever calls the opening closure.
+fn discovery_fetch(
+    config: &Config,
+    conn: &Connection,
+    relay: &str,
+) -> anyhow::Result<Option<DiscoveryFetch>> {
+    let Some(service) = discovery_addr(config, relay) else {
+        return Ok(None);
+    };
+    let Some(secret) = rag_rat_sync::discovery::discovery_secret(conn)? else {
+        return Ok(None);
+    };
+    let tag = rag_rat_sync::discovery::account_tag(&secret);
+    // A failed load leaves discovery unopenable and falls back to the configured peers, the same as
+    // a payload that will not open — the rest of the pass has work to do and should not fail with
+    // it. It is wider than the per-payload failure it stands in for, though: one bad read costs the
+    // whole pass rather than one announcement, so a persistent one would otherwise look like
+    // discovery quietly finding nobody. Log it.
+    let opener = rag_rat_oplog::discovery::AnnouncementOpener::load(conn, &tag)
+        .inspect_err(|error| {
+            tracing::warn!(%error, "discovery announcements are unopenable this pass");
+        })
+        .ok()
+        .flatten();
+    Ok(Some(DiscoveryFetch { tag, service, opener }))
+}
+
 fn sync_due(conn: &Connection, interval_secs: u64) -> anyhow::Result<bool> {
     if interval_secs == 0 {
         return Ok(true);
@@ -1313,9 +1352,10 @@ mod tests {
     use super::{
         DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PULL_PEER_MEMO_PREFIX, PerPeerSessionLimiter,
         PersistedAdvertisement, RESIDENT_NUDGE, RefusedPublication, account_is_public_kb, can_host,
-        can_sync, device_sync_run, foreign_pull_hosts, foreign_pull_targets, nudge_resident_host,
-        ordered_pull_peers, peer_identity, prepare_advertisement, pull_account_via_peers,
-        read_advertisement, refused_publication_is_due, retry_is_due, write_advertisement,
+        can_sync, device_sync_run, discovery_fetch, foreign_pull_hosts, foreign_pull_targets,
+        nudge_resident_host, ordered_pull_peers, peer_identity, prepare_advertisement,
+        pull_account_via_peers, read_advertisement, refused_publication_is_due, retry_is_due,
+        write_advertisement,
     };
 
     fn schema_conn() -> Connection {
@@ -1462,6 +1502,46 @@ mod tests {
         );
 
         assert_eq!(device_sync_run(&config, &conn).unwrap(), DeviceSyncOutcome::Disabled);
+    }
+
+    /// A pass that will not fetch reads nothing to fetch with. The opener costs an account read
+    /// plus a device load that re-derives and validates this device's keys, and with no
+    /// discovery service `discover_peers` returns before it ever calls the opening closure.
+    ///
+    /// Pinned by poisoning the reads so any of them fails loudly: with discovery off the call still
+    /// succeeds, and turning discovery back on surfaces the failure, so the silence is the gate and
+    /// not a store with nothing to read.
+    #[test]
+    fn discovery_off_reads_nothing_the_pass_cannot_use() {
+        let poisoned = schema_conn();
+        poisoned.execute("DROP TABLE oplog_local_account", []).unwrap();
+        let mut config = Config::minimal_for_database(
+            PathBuf::from("/nonexistent/sync.sqlite"),
+            PathBuf::from("/nonexistent"),
+        );
+
+        config.sync.discovery = false;
+        assert!(
+            discovery_fetch(&config, &poisoned, "https://relay.one").unwrap().is_none(),
+            "no service to fetch from, so nothing is read to open with"
+        );
+
+        config.sync.discovery = true;
+        assert!(
+            discovery_fetch(&config, &poisoned, "https://relay.one").is_err(),
+            "the reads do happen once there is a fetch to open for"
+        );
+
+        // A healthy store loads exactly one opener, carried for the whole pass.
+        let conn = schema_conn();
+        rag_rat_oplog::local_account(&conn, 1_000).unwrap();
+        let fetch = discovery_fetch(&config, &conn, "https://relay.one")
+            .unwrap()
+            .expect("an account plus a valid service node id is a fetch");
+        assert!(
+            fetch.opener.is_some(),
+            "a founder is a device that can open its own account's tag"
+        );
     }
 
     #[test]
