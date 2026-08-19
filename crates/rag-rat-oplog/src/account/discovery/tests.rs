@@ -265,26 +265,28 @@ fn the_wrap_context_carries_account_tag_epoch_and_recipient() {
 
 /// The size law an envelope obeys — and the reason the publish side has a recipient ceiling at all.
 ///
-/// `1 + 80n` is what makes roster size a WIRE constraint: the discovery service caps one publish,
-/// so this growth rate decides how many devices an account can have before its host can no longer
-/// seal an announcement it is able to send. The caller pins the resulting ceiling against its own
-/// limit; this pins the law that ceiling is computed from, so the two cannot drift apart silently.
+/// `1 + WRAP_LEN·n` is what makes roster size a WIRE constraint: the discovery service caps one
+/// publish, so this growth rate decides how many devices an account can have before its host can no
+/// longer seal an announcement it is able to send. The publish side derives its recipient ceiling
+/// from `WRAP_LEN`; this pins `WRAP_LEN` against what sealing actually emits, so a wrap layout that
+/// grew would fail here rather than at the service, where the refusal is indistinguishable from a
+/// transient error.
 #[test]
-fn the_envelope_is_a_version_byte_then_eighty_bytes_per_recipient() {
+fn the_envelope_is_a_version_byte_then_one_wrap_per_recipient() {
     let conn = db();
     let account = bootstrap::local_account(&conn, NOW).unwrap();
     add_member(&conn, account, &DeviceX25519Secret::from_seed(&[0x5c; 32]));
 
     let sealed = seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().unwrap();
     assert_eq!(sealed.bytes[0], ANNOUNCEMENT_VERSION);
-    assert_eq!(sealed.bytes.len(), 1 + 2 * 80, "one version byte, 80 per recipient");
+    assert_eq!(sealed.bytes.len(), 1 + 2 * WRAP_LEN, "one version byte, one wrap per recipient");
     assert_eq!(wraps_of(&sealed.bytes).len(), 2);
 }
 
 /// Anything that is not one of ours is refused at parse, individually and quietly.
 #[test]
 fn parsing_refuses_everything_that_is_not_an_envelope() {
-    let good = 1 + 80;
+    let good = 1 + WRAP_LEN;
     assert!(parse_wraps(&[]).is_none(), "empty");
     assert!(parse_wraps(&[ANNOUNCEMENT_VERSION]).is_none(), "version with no wraps");
     assert!(parse_wraps(&vec![9u8; good]).is_none(), "unknown version");

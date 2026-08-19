@@ -235,10 +235,10 @@ folded it, because they do not depend on anything the account can take back:
 
 - **The discovery tag**, which is derived from immutable account material already in that device's
   database. It can therefore keep watching the tag: how many hosts advertise and when they renew or
-  stop, and — because each sealed envelope is a version byte plus a fixed 80 bytes per recipient —
-  the exact number of devices on the account, `(len - 1) / 80`, tracked across enrollments and
-  removals without opening a single wrap. It can also publish junk under the tag, costing whoever
-  fetches it a wasted slot. What it can no longer do is read a host's node id out of any
+  stop, and — because each sealed envelope is a version byte plus one fixed-size wrap per recipient
+  (80 bytes at today's wrap layout) — the exact number of devices on the account, tracked across
+  enrollments and removals without opening a single wrap. It can also publish junk under the tag,
+  costing whoever fetches it a wasted slot. What it can no longer do is read a host's node id out of any
   announcement sealed after its removal. Rotating the tag itself is
   [#1081](https://github.com/cq27-dev/rag-rat/issues/1081); padding the envelope to hide device
   count is [#1087](https://github.com/cq27-dev/rag-rat/issues/1087).

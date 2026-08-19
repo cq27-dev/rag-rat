@@ -43,7 +43,12 @@ use crate::op::DeviceFingerprint;
 pub const ANNOUNCEMENT_VERSION: u8 = 1;
 
 /// One sealed wrap on the wire: the ephemeral public key then the tagged ciphertext.
-const WRAP_LEN: usize = 32 + 48;
+///
+/// Public because the envelope's size law — one version byte plus this per roster-effective device
+/// — is what the publish side's recipient ceiling is computed from. A publisher that spelled `80`
+/// beside its own byte limit would keep sealing envelopes the service refuses the moment the wrap
+/// layout changed here, and the refusal reads like any other transient publish error.
+pub const WRAP_LEN: usize = 32 + 48;
 
 /// The `key_epoch` slot of the wrap context. Discovery has no epochs — the whole point of sealing
 /// per recipient is that nothing rotates — so it is pinned at zero and covered by the golden vector

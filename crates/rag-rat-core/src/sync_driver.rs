@@ -606,11 +606,11 @@ fn seal_advertisement(
     if sealed.recipients <= 1 {
         return Ok(None);
     }
-    if sealed.bytes.len() > rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES {
+    if !rag_rat_sync::discovery::fits_publish(&sealed) {
         tracing::warn!(
             recipients = sealed.recipients,
             bytes = sealed.bytes.len(),
-            max_bytes = rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES,
+            max_recipients = rag_rat_sync::discovery::MAX_PUBLISHABLE_RECIPIENTS,
             "not advertising: this account's roster is too large to seal into one announcement"
         );
         return Ok(None);

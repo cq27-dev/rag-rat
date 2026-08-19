@@ -42,6 +42,7 @@ mod tests;
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr};
+use rag_rat_oplog::discovery::{SealedAnnouncement, WRAP_LEN};
 use sha2::{Digest, Sha256};
 
 use self::wire::{DiscoveryRequest, DiscoveryResponse, TAG_LEN};
@@ -106,11 +107,27 @@ pub const MAX_SEALED_ANNOUNCEMENTS: usize = 64;
 /// a diagnosable message, because the alternative failure is genuinely silent — the refusal looks
 /// like every other transient publish error and the host retries it forever.
 ///
-/// It binds at a smaller roster than it looks. An envelope is one version byte plus 80 bytes per
-/// roster-effective device, so this permits about **25 recipients**; the service's own frame budget
-/// would not bite until several hundred. An account past that ceiling cannot advertise until the
-/// envelope is split across announcements — see [`crate::discovery`] docs.
+/// It binds at a smaller roster than it looks — see [`MAX_PUBLISHABLE_RECIPIENTS`]; the service's
+/// own frame budget would not bite until several hundred.
 pub const MAX_ANNOUNCEMENT_BYTES: usize = 2048;
+
+/// Most roster-effective devices an account can have and still be advertised by one host.
+///
+/// Derived from the envelope's size law rather than written beside it: an envelope is one version
+/// byte plus [`WRAP_LEN`] per recipient, so this ceiling and the wrap layout cannot drift apart. An
+/// account past it cannot advertise at all until the envelope is split across announcements — see
+/// [`crate::discovery`] docs.
+pub const MAX_PUBLISHABLE_RECIPIENTS: usize = (MAX_ANNOUNCEMENT_BYTES - 1) / WRAP_LEN;
+
+/// Whether a sealed announcement fits one publish.
+///
+/// The single place the envelope's size law and the service's byte ceiling meet. It lives on this
+/// side of the crate boundary because the ceiling mirrors the service's limit and the op-log crate,
+/// which owns the sealing, cannot see it. Callers get the verdict rather than two constants to
+/// recombine — recombining them is how the pairing ended up restated per publisher.
+pub fn fits_publish(sealed: &SealedAnnouncement) -> bool {
+    sealed.bytes.len() <= MAX_ANNOUNCEMENT_BYTES
+}
 
 /// The tag an account publishes and fetches under.
 ///
@@ -146,7 +163,7 @@ pub fn account_tag(secret: &[u8; 32]) -> [u8; TAG_LEN] {
 /// This is still strictly better than the account id, which is broadcast to every dialed host by
 /// design, and it is a bounded exposure — routing advice and denial of service, never data. The fix
 /// is purpose-built discovery key material sealed to roster-effective devices and rotated on
-/// removal (#1080); routing every caller through this one function is what keeps that change from
+/// removal (#1081); routing every caller through this one function is what keeps that change from
 /// touching the wire, the tag domain, the client, or the driver.
 pub fn discovery_secret(conn: &rusqlite::Connection) -> anyhow::Result<Option<[u8; 32]>> {
     rag_rat_oplog::read_local_account_genesis(conn)

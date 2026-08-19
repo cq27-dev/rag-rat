@@ -6,7 +6,8 @@ use iroh::{Endpoint, RelayMode};
 use super::stub::{Behaviour, PER_TAG_CAP, StubService};
 use super::{
     DISCOVERY_TAG_DOMAIN, DISCOVERY_TIMEOUT, DiscoveryExchange, DiscoveryOutcome,
-    PEER_DISCOVERY_ALPN, PublishState, account_tag, exchange, publish_ttl_seconds,
+    MAX_ANNOUNCEMENT_BYTES, MAX_PUBLISHABLE_RECIPIENTS, PEER_DISCOVERY_ALPN, PublishState,
+    SealedAnnouncement, WRAP_LEN, account_tag, exchange, fits_publish, publish_ttl_seconds,
 };
 
 /// A fixed instant: the announcement arithmetic under test is about durations, and a real clock
@@ -479,7 +480,7 @@ async fn a_large_account_is_never_refused_and_its_fetches_fit_one_frame() {
 
     let service = StubService::start(NOW_MS, Behaviour::Serve).await;
     let tag = account_tag(&[13; 32]);
-    let realistic_envelope = |seed: u8| vec![seed.wrapping_add(100); 1 + 16 * 80];
+    let realistic_envelope = |seed: u8| vec![seed.wrapping_add(100); 1 + 16 * WRAP_LEN];
 
     let endpoint = client().await;
     for seed in 0..32u8 {
@@ -946,5 +947,29 @@ fn only_possibly_live_publishes_reset_the_renewal_clock() {
     assert!(
         !super::records_liveness(PublishState::NotAttempted),
         "nothing was published, so there is nothing to renew"
+    );
+}
+
+/// Whether a sealed announcement fits one publish is one question with one answer, and the
+/// recipient ceiling is that answer read backwards.
+///
+/// Both are computed from `WRAP_LEN`, so a wrap layout change moves the envelope, the ceiling, and
+/// this boundary together. A publisher holding its own copy of the size law moves only its copy,
+/// and the consequence is a service refusal that looks like every other transient publish error.
+/// The `+ 1` case is the one that matters: it is the first roster that cannot be advertised at all.
+#[test]
+fn the_recipient_ceiling_is_where_a_sealed_envelope_stops_fitting_one_publish() {
+    let announcement = |recipients: usize| SealedAnnouncement {
+        bytes: vec![0u8; 1 + recipients * WRAP_LEN],
+        recipients,
+    };
+
+    assert!(
+        fits_publish(&announcement(MAX_PUBLISHABLE_RECIPIENTS)),
+        "the ceiling itself must fit, or it is off by one against {MAX_ANNOUNCEMENT_BYTES} bytes"
+    );
+    assert!(
+        !fits_publish(&announcement(MAX_PUBLISHABLE_RECIPIENTS + 1)),
+        "one recipient past the ceiling must not claim to fit"
     );
 }
