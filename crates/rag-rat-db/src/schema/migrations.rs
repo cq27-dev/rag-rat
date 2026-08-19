@@ -8534,6 +8534,16 @@ pub(crate) fn apply_content_projected_node_anchors(conn: &Connection) -> rusqlit
     ensure_content_projection_shape(conn)
 }
 
+/// The `/3` projection gains the source hash its author anchored to. Nullable, and NULL is
+/// meaningful: no `node_source_hash` op has been folded for the node, which the drive-by surfaces
+/// treat as "no evidence of drift" and leave unmarked — never as evidence that there is none.
+///
+/// Delegates to [`ensure_content_projection_shape`] for the reason documented there: a projected
+/// column has two homes, and the refold steps need the projection's final shape.
+pub(crate) fn apply_content_projected_node_source_hash(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_content_projection_shape(conn)
+}
+
 /// Every column the CURRENT content projector writes, applied ahead of any migration that replays
 /// the fold.
 ///
@@ -8558,7 +8568,8 @@ pub(crate) fn ensure_content_projection_shape(conn: &Connection) -> rusqlite::Re
     if !projected_nodes_exist {
         return Ok(());
     }
-    add_column_if_missing(conn, "content_projected_nodes", "anchors_json", "TEXT")
+    add_column_if_missing(conn, "content_projected_nodes", "anchors_json", "TEXT")?;
+    add_column_if_missing(conn, "content_projected_nodes", "source_text_hash", "TEXT")
 }
 
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {

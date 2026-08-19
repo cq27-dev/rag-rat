@@ -678,6 +678,7 @@ pub fn load_projection(conn: &Connection, stream: StreamId) -> anyhow::Result<Pr
                 // lossily — if `/1` ever needs them, that is an explicit schema change, not a
                 // silent assumption.
                 anchors: None,
+                source_text_hash: None,
             });
         }
     }

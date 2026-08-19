@@ -402,16 +402,20 @@ fn drain_node(
             }
         },
         None => {
-            // First sight of this node — received from a peer. `created_by` / `source_text_hash` /
-            // `input_hash` have no op home and are nullable; `memory_version` is the author-side
-            // constant; the clock is bookkeeping only. `origin='synced'` is what the authoring gate
-            // keys off.
+            // First sight of this node — received from a peer. `created_by` / `input_hash` have no
+            // op home and are nullable; `memory_version` is the author-side constant; the clock is
+            // bookkeeping only. `origin='synced'` is what the authoring gate keys off.
+            //
+            // `source_text_hash` DOES have an op home (#1213): it is the text the author anchored
+            // to, and stamping it is what lets a drive-by surface tell that this checkout has
+            // drifted from what they meant. `None` when they published none, which surfaces
+            // unmarked — an absent hash is not evidence of drift.
             tx.execute(
                 "INSERT INTO repo_memories(
                      id, kind, title, body, confidence, status, created_by, created_at_ms,
                      updated_at_ms, source, payload_json, source_text_hash, input_hash,
                      memory_version, repo_id, origin)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7, ?8, ?9, NULL, NULL, ?10, ?11,
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7, ?8, ?9, ?10, NULL, ?11, ?12,
                      'synced')",
                 params![
                     node.node_id,
@@ -423,6 +427,7 @@ fn drain_node(
                     now_ms,
                     node.content.source,
                     node.content.payload,
+                    node.source_text_hash,
                     SYNCED_MEMORY_VERSION,
                     repo_id,
                 ],
@@ -435,6 +440,17 @@ fn drain_node(
     // arm above must not touch that repo's bindings any more than it touches its content. The
     // snapshot check comes first because it is free: until anchors are authored, every node answers
     // `None` and this costs no query at all.
+    // The published source hash can arrive in a later entry than the content it describes, exactly
+    // as an anchor snapshot can, so this runs on every same-repo path rather than only on insert.
+    // Scoped to synced rows: a local memory's hash is its own to stamp.
+    if let Some(hash) = node.source_text_hash.as_deref() {
+        tx.execute(
+            "UPDATE repo_memories SET source_text_hash = ?3
+             WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced'
+               AND (source_text_hash IS NULL OR source_text_hash != ?3)",
+            params![node.node_id, repo_id, hash],
+        )?;
+    }
     if node.anchors.is_some() && node_in_repo(tx, &node.node_id, repo_id)? {
         let seeded = seed_node_anchors(tx, repo_id, node)?;
         if seeded > 0 {

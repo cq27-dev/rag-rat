@@ -503,6 +503,11 @@ fn build_reconcile_ops(
         {
             ops.push(op);
         }
+        if let Some(op) = source_hash_op(conn, &row.memory_id)?
+            && content_op_is_authorable(&op, policy)
+        {
+            ops.push(op);
+        }
         if let Some(group) = by_source.remove(row.memory_id.as_str()) {
             for edge in group {
                 ops.push(edge_add_op(edge, owner_repo_id)?);
@@ -1584,6 +1589,7 @@ pub(crate) fn author_create(
     let mut ops =
         vec![MemoryOp::NodeCreate { node_id: node_id.clone(), content: content_of(memory) }];
     ops.extend(anchors_op(tx, &memory.memory_id)?);
+    ops.extend(source_hash_op(tx, &memory.memory_id)?);
     author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
 
@@ -1595,7 +1601,10 @@ pub(crate) fn author_anchors(
     prepared: Option<&PreparedOwnerAuthoring>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let ops: Vec<MemoryOp> = anchors_op(tx, memory_id)?.into_iter().collect();
+    let mut ops: Vec<MemoryOp> = anchors_op(tx, memory_id)?.into_iter().collect();
+    // A rebind re-stamps `source_text_hash` in the same transaction, so the published hash has to
+    // move with the anchors or a peer keeps comparing against the pre-rebind text.
+    ops.extend(source_hash_op(tx, memory_id)?);
     author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
 
@@ -1610,6 +1619,24 @@ pub(crate) fn author_anchors(
 /// Deliberately unfiltered: the author publishes every portable fact it holds, including kinds this
 /// binary's own drain declines to seed. Which anchors are usable is the receiver's judgment, and
 /// filtering here would destroy information a later receiver could use.
+/// The `NodeSourceHash` op for a memory's stamped source hash, or `None` when it has none.
+///
+/// Like the anchor snapshot, an absent hash authors NOTHING rather than a sentinel: a receiver
+/// treats "nobody published one" as no evidence of drift, so spending a signed entry to say it
+/// would tell that peer nothing it can act on.
+fn source_hash_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<MemoryOp>> {
+    let mut stmt = conn.prepare("SELECT source_text_hash FROM repo_memories WHERE id = ?1")?;
+    let hash: Option<String> = stmt
+        .query_map(params![memory_id], |row| row.get::<_, Option<String>>(0))?
+        .next()
+        .transpose()?
+        .flatten();
+    Ok(hash.map(|source_text_hash| MemoryOp::NodeSourceHash {
+        node_id: NodeId::from(memory_id),
+        source_text_hash,
+    }))
+}
+
 fn anchors_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<MemoryOp>> {
     let anchors = portable_anchors_of(conn, memory_id)?;
     if anchors.is_empty() {

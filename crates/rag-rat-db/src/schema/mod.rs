@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 118;
+pub const LATEST_SCHEMA_VERSION: u32 = 119;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -850,6 +850,13 @@ const MIGRATION_115_ID: &str = "115_refold_account_authority_projections";
 const MIGRATION_116_ID: &str = "116_writer_invites";
 const MIGRATION_117_ID: &str = "117_content_author_stream_index";
 const MIGRATION_118_ID: &str = "118_content_projected_node_anchors";
+const MIGRATION_119_ID: &str = "119_content_projected_node_source_hash";
+const MIGRATION_119_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-source-hash-v119";
+const MIGRATION_119_DESCRIPTION: &str =
+    "Add the nullable source_text_hash column to content_projected_nodes so the /3 fold can carry \
+     the text a memory's author anchored to (#1213). A receiver compares it against its own \
+     checkout to demote a drifted anchor; NULL means no node_source_hash op has been folded, \
+     which surfaces unmarked rather than as evidence of drift";
 const MIGRATION_118_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-v118";
 const MIGRATION_118_DESCRIPTION: &str =
     "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
@@ -1855,6 +1862,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_118_CHECKSUM,
         description: MIGRATION_118_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_content_projected_node_anchors),
+    },
+    Migration {
+        id: MIGRATION_119_ID,
+        checksum: MIGRATION_119_CHECKSUM,
+        description: MIGRATION_119_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_content_projected_node_source_hash),
     },
 ];
 

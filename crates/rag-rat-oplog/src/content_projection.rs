@@ -51,7 +51,9 @@ use super::stream::StreamId;
 // v4 (#1209): the node fold gains an anchors register, so `content_projected_nodes.anchors_json`
 // is a new projected output. The bump re-folds every stream from the entries it already retains —
 // including `node_anchors` ops an older binary kept opaque through the unknown-kind seam.
-pub(crate) const CONTENT_PROJECTOR_VERSION: i64 = 4;
+// v5 (#1213): the same, for the source-hash register that carries what a memory's author anchored
+// to, so a receiver can tell its own checkout has drifted from it.
+pub(crate) const CONTENT_PROJECTOR_VERSION: i64 = 5;
 
 /// The `oplog_meta` key holding the `/3` projector version the content projection was last folded
 /// by. DISTINCT from the `/1` `projector_version` (they evolve independently and share one meta
@@ -362,14 +364,15 @@ fn write_projection(
             .context("serialize projected /3 node anchors")?;
         tx.execute(
             "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status, \
-             anchors_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             anchors_json, source_text_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 stream_bytes.as_slice(),
                 node_id.as_str(),
                 content_json,
                 node.status.as_db_str(),
-                anchors_json
+                anchors_json,
+                node.source_text_hash
             ],
         )?;
     }
@@ -505,6 +508,11 @@ pub struct ProjectedContentNode {
     /// The drain (#1210) reads that difference: `None` is "nobody published this memory's
     /// bindings", `Some(vec![])` is "its author says it has none".
     pub anchors: Option<Vec<PortableAnchor>>,
+    /// The source text this node's author anchored to, or `None` when none was published. The
+    /// drain stamps it onto the synced memory so a drive-by surface can compare it against the
+    /// local checkout; `None` surfaces UNMARKED, since an absent hash is not evidence of
+    /// drift.
+    pub source_text_hash: Option<String>,
 }
 
 /// One projected `/3` edge, decoded for a projection consumer: the stable key, the folded spec (the
@@ -525,7 +533,8 @@ pub fn list_projected_content_nodes(
     stream_id: StreamId,
 ) -> anyhow::Result<Vec<ProjectedContentNode>> {
     let mut stmt = conn.prepare(
-        "SELECT node_id, content_json, status, anchors_json FROM content_projected_nodes
+        "SELECT node_id, content_json, status, anchors_json, source_text_hash
+         FROM content_projected_nodes
          WHERE stream_id = ?1 ORDER BY node_id",
     )?;
     let rows = stmt.query_map(params![stream_id.to_bytes().as_slice()], |row| {
@@ -534,11 +543,12 @@ pub fn list_projected_content_nodes(
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
         ))
     })?;
     let mut nodes = Vec::new();
     for row in rows {
-        let (node_id, content_json, status, anchors_json) = row?;
+        let (node_id, content_json, status, anchors_json, source_text_hash) = row?;
         let content: NodeContentRow = serde_json::from_str(&content_json)
             .with_context(|| format!("decode projected /3 node content for `{node_id}`"))?;
         let status = NodeStatus::from_db_str(&status).with_context(|| {
@@ -557,6 +567,7 @@ pub fn list_projected_content_nodes(
             content: NodeContent::from(content),
             status,
             anchors,
+            source_text_hash,
         });
     }
     Ok(nodes)

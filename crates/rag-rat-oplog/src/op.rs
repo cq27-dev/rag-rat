@@ -347,7 +347,8 @@ pub fn within_wire_limits(op: &MemoryOp) -> bool {
         // `decode` rejects", so the next op kind that grows a count cap or an ordering rule must
         // fail to compile here instead of silently answering `true` — the same under-approximation
         // this function was added to close.
-        MemoryOp::NodeCreate { .. }
+        MemoryOp::NodeSourceHash { .. }
+        | MemoryOp::NodeCreate { .. }
         | MemoryOp::NodeUpdate { .. }
         | MemoryOp::NodeStatus { .. }
         | MemoryOp::EdgeAdd { .. }
@@ -375,6 +376,14 @@ pub enum MemoryOp {
     Rebind { edge_key: EdgeKey, resolved: ResolvedAnchor },
     /// A node's portable anchor set — a FULL-SET snapshot, never a delta.
     NodeAnchors { node_id: NodeId, anchors: Vec<PortableAnchor> },
+    /// The hash of the source text a node's author anchored to, so a receiver can tell whether its
+    /// own checkout has drifted from what that author meant.
+    ///
+    /// A SIBLING of `node_anchors` rather than a field on it: `PortableAnchor` is a fixed-arity
+    /// byte-canonical array, so carrying this there would be a new op kind anyway — and an old
+    /// binary retains an unknown kind opaque, which under that shape would cost it the ANCHORS.
+    /// Split, the same binary keeps its anchors and loses only the staleness marking.
+    NodeSourceHash { node_id: NodeId, source_text_hash: String },
     /// A converged-state boundary marker; inert in the fold this increment (§5.4/C4).
     Snapshot,
 }
@@ -390,6 +399,7 @@ impl MemoryOp {
             Self::EdgeRemove { .. } => "edge_remove",
             Self::Rebind { .. } => "rebind",
             Self::NodeAnchors { .. } => "node_anchors",
+            Self::NodeSourceHash { .. } => "node_source_hash",
             Self::Snapshot => "snapshot",
         }
     }
@@ -464,6 +474,11 @@ fn encode_payload(enc: &mut VecEncoder<'_>, op: &MemoryOp) {
             enc.array(2).expect(INFALLIBLE);
             enc.str(node_id.as_str()).expect(INFALLIBLE);
             encode_anchors(enc, anchors);
+        },
+        MemoryOp::NodeSourceHash { node_id, source_text_hash } => {
+            enc.array(2).expect(INFALLIBLE);
+            enc.str(node_id.as_str()).expect(INFALLIBLE);
+            enc.str(source_text_hash).expect(INFALLIBLE);
         },
         MemoryOp::Snapshot => {
             // Inert boundary marker: a strictly-null payload. A future snapshot that carries a
@@ -606,6 +621,11 @@ fn decode_envelope(bytes: &[u8]) -> Result<DecodedOp, CborError> {
         "node_anchors" => {
             let (node_id, anchors) = decode_node_anchors(&mut d)?;
             Some(MemoryOp::NodeAnchors { node_id, anchors })
+        },
+        "node_source_hash" => {
+            cbor::expect_array(&mut d, 2)?;
+            let node_id = NodeId::from(d.str()?);
+            Some(MemoryOp::NodeSourceHash { node_id, source_text_hash: d.str()?.to_string() })
         },
         "snapshot" => {
             d.null()?;

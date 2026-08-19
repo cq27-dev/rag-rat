@@ -12,6 +12,8 @@
 //! - node **status** — the last-in-order `NodeStatus`; default `active`.
 //! - node **anchors** — the last-in-order `NodeAnchors`, a FULL-SET replacement; `None` until one
 //!   is folded, which is distinct from an empty set (nobody has said, versus said "no bindings").
+//! - node **source hash** — the last-in-order `NodeSourceHash`: the text its author anchored to, so
+//!   a receiver can tell its own checkout has drifted from what that author meant.
 //! - edge **presence** — the last-in-order `EdgeAdd`/`EdgeRemove`; present iff the winner is an
 //!   add.
 //! - edge **resolved anchor** — the last-in-order `Rebind`; rides along iff the edge is present,
@@ -53,6 +55,9 @@ pub struct ProjectedNode {
     /// distinction is load-bearing downstream: `None` means nobody has published this memory's
     /// bindings, while `Some(vec![])` means its author said it has none.
     pub anchors: Option<Vec<PortableAnchor>>,
+    /// The hash of the source text the author anchored to, or `None` when none was published.
+    /// `None` surfaces UNMARKED downstream — an absent hash is not evidence of drift.
+    pub source_text_hash: Option<String>,
 }
 
 /// A projected edge: its winning spec (from the last add) and its last resolved anchor, if any.
@@ -70,6 +75,7 @@ struct NodeAccum {
     content: Option<NodeContent>,
     status: Option<NodeStatus>,
     anchors: Option<Vec<PortableAnchor>>,
+    source_text_hash: Option<String>,
 }
 
 /// Per-edge LWW accumulators, resolved into a [`ProjectedEdge`] only if the edge is present.
@@ -151,6 +157,10 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                 // Re-resolves the local anchor only — never presence, never the key.
                 edges.entry(edge_key.clone()).or_default().resolved = Some(resolved.clone());
             },
+            MemoryOp::NodeSourceHash { node_id, source_text_hash } => {
+                nodes.entry(node_id.clone()).or_default().source_text_hash =
+                    Some(source_text_hash.clone());
+            },
             MemoryOp::NodeAnchors { node_id, anchors } => {
                 // Full-set replacement, like content — an anchor set is one register, not a
                 // per-binding merge, so a later op saying "these two" retires a binding the
@@ -190,6 +200,7 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                     content,
                     status: acc.status.unwrap_or_default(),
                     anchors: acc.anchors,
+                    source_text_hash: acc.source_text_hash,
                 }))
             })
             .collect(),
