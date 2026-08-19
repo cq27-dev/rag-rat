@@ -155,7 +155,7 @@ fn stamp_of(recipients: &[(DeviceFingerprint, DeviceX25519Public)]) -> RosterSta
 /// while it is held is not something that pass is expected to observe.
 ///
 /// It keeps the X25519 secret alone rather than the whole
-/// [`LocalDevice`](crate::identity::LocalDevice) it was loaded from, so the ed25519 signing key is
+/// [`LocalDevice`](crate::LocalDevice) it was loaded from, so the ed25519 signing key is
 /// not carried through the peer dials and sync sessions that outlive the opening itself.
 pub struct AnnouncementOpener {
     x25519_secret: DeviceX25519Secret,

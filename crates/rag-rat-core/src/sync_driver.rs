@@ -1508,13 +1508,16 @@ mod tests {
     /// plus a device load that re-derives and validates this device's keys, and with no
     /// discovery service `discover_peers` returns before it ever calls the opening closure.
     ///
-    /// Pinned by poisoning the reads so any of them fails loudly: with discovery off the call still
-    /// succeeds, and turning discovery back on surfaces the failure, so the silence is the gate and
-    /// not a store with nothing to read.
+    /// Pinned by dropping BOTH tables the opener reads, so either one fails loudly wherever it is
+    /// read from: with discovery off the call still succeeds, and turning discovery back on
+    /// surfaces the failure, so the silence is the gate and not a store with nothing to read.
+    /// Leaving `oplog_device_identity` present but empty would not pin the device load — it
+    /// answers `None` on an empty table, so a read hoisted above the gate would stay silent.
     #[test]
     fn discovery_off_reads_nothing_the_pass_cannot_use() {
         let poisoned = schema_conn();
         poisoned.execute("DROP TABLE oplog_local_account", []).unwrap();
+        poisoned.execute("DROP TABLE oplog_device_identity", []).unwrap();
         let mut config = Config::minimal_for_database(
             PathBuf::from("/nonexistent/sync.sqlite"),
             PathBuf::from("/nonexistent"),
@@ -1529,7 +1532,7 @@ mod tests {
         config.sync.discovery = true;
         assert!(
             discovery_fetch(&config, &poisoned, "https://relay.one").is_err(),
-            "the reads do happen once there is a fetch to open for"
+            "either read failing is enough — the reads do happen once there is a fetch to open for"
         );
 
         // A healthy store loads exactly one opener, carried for the whole pass.
