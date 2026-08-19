@@ -480,6 +480,7 @@ fn build_reconcile_ops(
     missing_edges: &[NodeEdge],
     anchor_backfill_ops: &[MemoryOp],
     owner_repo_id: &str,
+    policy: StreamSealPolicy,
     elide_active_status: bool,
 ) -> anyhow::Result<Vec<MemoryOp>> {
     use std::collections::BTreeMap;
@@ -498,17 +499,10 @@ fn build_reconcile_ops(
         // An unpublishable set is dropped rather than quarantining the node: anchors are
         // decoration, and losing them must never cost a peer the memory itself.
         if let Some(op) = anchors_op(conn, &row.memory_id)?
-            && content_op_is_authorable(&op, StreamSealPolicy::Sealed)
+            && content_op_is_authorable(&op, policy)
         {
             ops.push(op);
         }
-        // The backfill leg has to publish anchors too, or every memory that predates the anchor op
-        // replicates with none and a peer seeds nothing for it — permanently, since this anti-join
-        // never revisits a node once it exists. That covers the existing corpus on every upgraded
-        // store, and `sync publish --seed`, which reconciles a whole index onto a public stream.
-        //
-        // An unpublishable set is dropped rather than quarantining the node: anchors are
-        // decoration, and losing them must never cost a peer the memory itself.
         if let Some(group) = by_source.remove(row.memory_id.as_str()) {
             for edge in group {
                 ops.push(edge_add_op(edge, owner_repo_id)?);
@@ -598,8 +592,9 @@ impl ReconcileWork {
             || !self.anchor_backfill_ops.is_empty()
     }
 
-    /// Surface every quarantined node + edge as a warning naming the repo + the row's id — the
-    /// per-row failure the caller can act on, in place of the old fail-loud that wedged the store.
+    /// Surface every quarantined node, edge, and anchor set as a warning naming the repo + the
+    /// row's id — the per-row failure the caller can act on, in place of the old fail-loud that
+    /// wedged the store.
     fn warn_quarantined(&self, repo_id: &str) {
         for row in &self.quarantined_nodes {
             tracing::warn!(
@@ -653,10 +648,20 @@ fn settle_owner_stream_in_tx(
         .context("settling the owner stream's pending content refold before reading completeness")
 }
 
-/// How many already-authored memories one reconcile pass backfills anchors for. The pass rides
-/// every authored write, so an unbounded sweep would make the first write after an upgrade pay for
-/// the whole corpus; bounded, it converges over successive writes and each pass stays cheap.
-const ANCHOR_BACKFILL_PER_PASS: i64 = 64;
+/// How many anchor snapshots one reconcile pass PUBLISHES. The pass rides every authored write, so
+/// an unbounded sweep would make the first write after an upgrade pay for the whole corpus;
+/// bounded, it converges over successive writes and each pass stays cheap.
+const ANCHOR_BACKFILL_PER_PASS: usize = 64;
+
+/// How many candidates one pass EXAMINES to find that many publishable ones.
+///
+/// The two differ because a quarantined memory never leaves the match set — `anchors_json` stays
+/// NULL by design — and it sorts oldest-first, which is exactly where the window is: an over-cap
+/// set can only be a legacy row, since the live write path refuses one. Taking the window as the
+/// publish budget would let enough of them permanently occupy it and stall the backfill for the
+/// rest of the corpus. Examining wider and stopping at the publish budget means quarantined rows
+/// cost a slot in the scan, never one in the batch.
+const ANCHOR_BACKFILL_SCAN_PER_PASS: i64 = 512;
 
 /// Memories whose node is ALREADY authored but whose anchors were never published — the corpus
 /// that predates the anchor op on any store that was already syncing.
@@ -668,6 +673,11 @@ const ANCHOR_BACKFILL_PER_PASS: i64 = 64;
 /// Idempotent by construction: authoring the snapshot refolds the stream in the same transaction,
 /// so `anchors_json` stops being NULL and the row drops out of this query. A memory with no
 /// bindings never matches at all, so an unanchored memory is not re-examined forever.
+///
+/// Note what the column tracks: PRESENCE, not currency. This heals `none -> some` exactly once. It
+/// cannot heal `some -> different`, and the relocation engine does rewrite portable anchor identity
+/// outside any authoring path, so a renamed symbol leaves a peer holding the pre-rename set until
+/// an explicit rebind re-authors it. Republish-on-drift is a separate mechanism, not this one.
 fn read_anchor_backfill_ids(
     conn: &Connection,
     repo_id: &str,
@@ -690,7 +700,7 @@ fn read_anchor_backfill_ids(
     )?;
     let ids = stmt
         .query_map(
-            params![repo_id, stream.to_bytes().as_slice(), ANCHOR_BACKFILL_PER_PASS],
+            params![repo_id, stream.to_bytes().as_slice(), ANCHOR_BACKFILL_SCAN_PER_PASS],
             |row| row.get::<_, String>(0),
         )?
         .collect::<Result<Vec<_>, _>>()?;
@@ -740,6 +750,11 @@ fn read_reconcile_work(
     let mut anchor_backfill_ops = Vec::new();
     let mut quarantined_anchor_ids = Vec::new();
     for memory_id in read_anchor_backfill_ids(conn, repo_id, stream)? {
+        // Stop once the pass has its publish budget. Candidates past this point are simply not this
+        // pass's work — they are neither authored nor quarantined, and the next pass reaches them.
+        if anchor_backfill_ops.len() >= ANCHOR_BACKFILL_PER_PASS {
+            break;
+        }
         match anchors_op(conn, &memory_id)? {
             Some(op) if content_op_is_authorable(&op, policy) => anchor_backfill_ops.push(op),
             // `None` is unreachable (the query requires a binding), but counting it as quarantined
@@ -809,6 +824,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
             &work.live_edges,
             &work.anchor_backfill_ops,
             repo_id,
+            policy,
             rag_rat_oplog::content_stream_is_empty(conn, stream)?,
         )?;
         prepare_owner_authoring(conn, repo_id, stream, policy, &ops, now_ms)?
@@ -843,6 +859,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
         &work.live_edges,
         &work.anchor_backfill_ops,
         repo_id,
+        policy,
         genesis,
     )?;
     // Skip the author when there is nothing to author: a fresh repo whose anti-join was empty only
@@ -1041,6 +1058,7 @@ pub(crate) fn enable_sealed_authoring(conn: &Connection, now_ms: i64) -> anyhow:
         &work.live_edges,
         &work.anchor_backfill_ops,
         &repo_id,
+        StreamSealPolicy::Sealed,
         rag_rat_oplog::content_stream_is_empty(&tx, stream)?,
     )?;
     if !ops.is_empty() {
@@ -1893,6 +1911,49 @@ mod tests {
             !work.has_authorable_work(),
             "reporting it as work is what spins the slow path forever",
         );
+    }
+
+    /// A quarantined memory must not block the ones behind it. It never leaves the match set by
+    /// design, and it sorts oldest-first — an over-cap set can only be a legacy row — so if the
+    /// scan window doubled as the publish budget, enough of them at the head would stall the
+    /// backfill for the rest of the corpus.
+    #[test]
+    fn a_quarantined_memory_does_not_block_a_publishable_one_behind_it() {
+        let (conn, stream) = conn_with_stream();
+        // Oldest, and unpublishable: past the per-op anchor cap.
+        insert_memory(&conn, "mem_fat", "active", 1);
+        for index in 0..=rag_rat_oplog::MAX_ANCHORS_PER_OP {
+            conn.execute(
+                "INSERT INTO repo_memory_bindings(
+                     repo_id, memory_id, binding_kind, binding_id, path, anchor_status,
+                     created_at_ms)
+                 VALUES (?1, 'mem_fat', 'path', ?2, 'src/lib.rs', 'current', 1)",
+                params![REPO, format!("src/lib.rs:{index:04}")],
+            )
+            .unwrap();
+        }
+        // Newer, and perfectly publishable.
+        insert_memory(&conn, "mem_ok", "active", 2);
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, anchor_status, created_at_ms)
+             VALUES (?1, 'mem_ok', 'path', 'src/ok.rs', 'src/ok.rs', 'current', 1)",
+            [REPO],
+        )
+        .unwrap();
+        for id in ["mem_fat", "mem_ok"] {
+            conn.execute(
+                "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
+                 VALUES (?1, ?2, '{}', 'active')",
+                params![stream.to_bytes().as_slice(), id],
+            )
+            .unwrap();
+        }
+
+        let work = read_reconcile_work(&conn, REPO, stream, StreamSealPolicy::Plaintext).unwrap();
+        assert_eq!(work.quarantined_anchor_ids, vec!["mem_fat".to_string()]);
+        assert_eq!(work.anchor_backfill_ops.len(), 1, "the publishable one is still authored");
+        assert!(work.has_authorable_work(), "progress is available despite the quarantined head");
     }
 
     /// The positive control for both gates above: a LOCAL memory with a binding and no snapshot IS
