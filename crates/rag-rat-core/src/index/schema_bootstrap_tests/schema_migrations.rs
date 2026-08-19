@@ -2341,3 +2341,64 @@ fn migration_097_covers_every_worktree_id_column_in_the_schema() {
          and is deleted by the next GC as a checkout that no longer exists",
     );
 }
+
+/// A store older than the earliest refold step still reaches the tip.
+///
+/// The ladder attaches the all-account refold to V064/V065/V099/V115, and that hook runs the
+/// CURRENT projector — so it writes every column the projector writes TODAY, not the ones that
+/// existed when the step was written. `content_projected_nodes.anchors_json` arrives in V118, three
+/// steps AFTER the V115 refold, so a store replaying from below V115 folded into a table without it
+/// and failed to open, on a column its own migration body never mentions (#1229).
+///
+/// The fixture drops the column as well as truncating the ledger: the ledger decides which steps
+/// replay, but the SHAPE is what the fold hits, and a truncation alone leaves the column standing
+/// from the initial apply.
+///
+/// The real hook folds per account, so on an account-less scratch store it returns without writing
+/// anything and cannot observe the defect. The probe below stands in for it, asserting the shape at
+/// the moment the ladder hands it the transaction — which is the ordering under test.
+#[test]
+fn a_store_below_the_first_refold_step_migrates_to_the_tip() {
+    fn refold_probe(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('content_projected_nodes') WHERE name \
+             = 'anchors_json')",
+            [],
+            |row| row.get(0),
+        )?;
+        if present {
+            return Ok(());
+        }
+        Err(rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+            "the refold ran before content_projected_nodes.anchors_json existed",
+        ))))
+    }
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+
+    conn.execute_batch("ALTER TABLE content_projected_nodes DROP COLUMN anchors_json")
+        .expect("drop the projected-node anchors column");
+    assert!(
+        !conn_table_columns(&conn, "content_projected_nodes").contains(&"anchors_json".to_string()),
+        "the fixture starts without the column the refold needs",
+    );
+    truncate_schema_to(&conn, 114);
+
+    let hooks = rag_rat_db::MigrationHooks {
+        backfill_authority_projection: refold_probe,
+        ..crate::index::migration_hooks()
+    };
+    schema::migrate_forward(&conn, &hooks)
+        .expect("a store below the first refold step reaches the tip");
+
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "forward migrate reaches the tip",
+    );
+    assert!(
+        conn_table_columns(&conn, "content_projected_nodes").contains(&"anchors_json".to_string()),
+        "the refold's shape requirement is satisfied by the tip",
+    );
+}

@@ -8531,6 +8531,33 @@ pub(crate) fn apply_content_author_stream_index(conn: &Connection) -> rusqlite::
 /// Guarded on the shape, so a full-ladder replay over a store already provisioned from the
 /// end-state snapshot is a no-op rather than a duplicate-column failure.
 pub(crate) fn apply_content_projected_node_anchors(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_content_projection_shape(conn)
+}
+
+/// Every column the CURRENT content projector writes, applied ahead of any migration that replays
+/// the fold.
+///
+/// A refold migration runs today's projector against a store frozen at that migration's version, so
+/// it needs the projection's FINAL shape, not the shape that existed when it was written. Adding a
+/// projected-node column therefore has two obligations: the owning migration, and this function.
+/// Miss the second and every store older than the earliest refold step fails to open, on a column
+/// its own migration body never mentions.
+///
+/// Each step is guarded on the shape, so calling this before a refold and again from the owning
+/// migration is a no-op rather than a duplicate-column failure. The whole body is additionally
+/// guarded on the TABLE, because the refold steps start at V064 while the projection itself arrives
+/// later in the ladder — a store replaying from before it has nothing to widen yet, and reaches the
+/// column through the owning migration on the way to the tip.
+pub(crate) fn ensure_content_projection_shape(conn: &Connection) -> rusqlite::Result<()> {
+    let projected_nodes_exist: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
+         'content_projected_nodes')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !projected_nodes_exist {
+        return Ok(());
+    }
     add_column_if_missing(conn, "content_projected_nodes", "anchors_json", "TEXT")
 }
 

@@ -1140,6 +1140,13 @@ fn apply_and_record_migration(
     // a domain builder this crate cannot link.
     if matches!(step.id, MIGRATION_064_ID | MIGRATION_065_ID | MIGRATION_099_ID | MIGRATION_115_ID)
     {
+        // The hook runs the CURRENT fold, so it writes whatever columns today's projector writes —
+        // not the ones that existed when the migration was written. A refold step therefore depends
+        // on the projection's final shape even though its own body says nothing about it, and a
+        // column added by a LATER migration is missing when an older store replays this one. Bring
+        // the shape forward here, once, for every step that refolds: each helper is guarded on the
+        // shape, so the owning migration stays authoritative and re-running it is a no-op.
+        migrations::ensure_content_projection_shape(&tx)?;
         (hooks.backfill_authority_projection)(&tx)?;
     }
     migrations::record_migration(&tx, step.id, step.checksum, step.description)?;
