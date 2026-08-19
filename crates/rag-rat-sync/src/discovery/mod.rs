@@ -119,6 +119,15 @@ pub const MAX_ANNOUNCEMENT_BYTES: usize = 2048;
 /// [`crate::discovery`] docs. Today: 25.
 pub const MAX_PUBLISHABLE_RECIPIENTS: usize = (MAX_ANNOUNCEMENT_BYTES - 1) / WRAP_LEN;
 
+/// The ceiling is the LARGEST recipient count that fits, so one more must not.
+///
+/// Non-test code on purpose: a wrap layout that moved the ceiling off the bytes is a wire mistake,
+/// and it should stop `cargo build` rather than wait for whoever runs the tests.
+const _: () = assert!(
+    1 + (MAX_PUBLISHABLE_RECIPIENTS + 1) * WRAP_LEN > MAX_ANNOUNCEMENT_BYTES,
+    "one more recipient than the ceiling must not fit, or the ceiling leaves a wrap of room unused"
+);
+
 /// Whether an announcement fits one publish.
 ///
 /// The single place the envelope's size law and the service's byte ceiling meet. It lives on this
@@ -131,6 +140,17 @@ pub const MAX_PUBLISHABLE_RECIPIENTS: usize = (MAX_ANNOUNCEMENT_BYTES - 1) / WRA
 /// can ask is a verdict an envelope from anywhere else evades.
 pub fn fits_publish(announcement: &[u8]) -> bool {
     announcement.len() <= MAX_ANNOUNCEMENT_BYTES
+}
+
+/// Why an over-size announcement was not published, naming the size.
+///
+/// Written once because both refusal points report it: the pre-dial one and the publish stream a
+/// fetching caller still reaches. Two spellings of the same refusal would have an operator matching
+/// two log lines to one cause.
+fn oversize_reason(bytes: usize) -> String {
+    format!(
+        "publish skipped: {bytes} bytes over the {MAX_ANNOUNCEMENT_BYTES}-byte announcement limit"
+    )
 }
 
 /// The tag an account publishes and fetches under.
@@ -320,6 +340,24 @@ async fn exchange_inner(
     deadline: tokio::time::Instant,
 ) -> DiscoveryOutcome {
     let DiscoveryExchange { endpoint, service, tag, fetch, publish, ttl_seconds } = params;
+
+    // BEFORE the dial, because a publish-only pass with an unpublishable envelope has nothing else
+    // to do on that connection. Its caller is a serving host, which retries on a fraction of the
+    // TTL — as little as a few seconds — for as long as the roster stays too large, so dialing to
+    // reach a verdict already known here would spend a full connection against a shared service
+    // forever. A fetching caller still dials: the peers it came for do not depend on its own
+    // envelope, and the same refusal waits at the publish stream below.
+    let oversize = publish.filter(|envelope| !fits_publish(envelope));
+    if let Some(envelope) = oversize
+        && !*fetch
+    {
+        return DiscoveryOutcome {
+            publish: PublishState::Refused,
+            degraded: Some(oversize_reason(envelope.len())),
+            ..Default::default()
+        };
+    }
+
     let connecting = endpoint.connect(service.clone(), PEER_DISCOVERY_ALPN);
     let conn = match tokio::time::timeout_at(deadline, connecting).await {
         Ok(Ok(conn)) => conn,
@@ -370,13 +408,11 @@ async fn exchange_inner(
         // the service comes back as a refusal indistinguishable from a transient error, which the
         // advertiser then retries every tick forever. Refused rather than dropped silently, so the
         // caller sees the same "nothing is stored" state it would get from the service and the
-        // reason is named in `degraded` — and the round trip that could only fail is skipped.
+        // reason is named in `degraded`. The connection is already open — a fetching caller needed
+        // it — so what is skipped here is the publish stream, not the dial; the publish-only shape
+        // never gets this far.
         Some(envelope) if !fits_publish(envelope) => {
-            degraded.push(format!(
-                "publish skipped: {} bytes over the {MAX_ANNOUNCEMENT_BYTES}-byte announcement \
-                 limit",
-                envelope.len()
-            ));
+            degraded.push(oversize_reason(envelope.len()));
             PublishState::Refused
         },
         Some(envelope) => {

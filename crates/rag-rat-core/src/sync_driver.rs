@@ -557,14 +557,39 @@ fn prepare_advertisement(
     if record.live(now_ms) {
         return Ok(None);
     }
-    Ok(record.envelope.map(|envelope| Publication {
-        tag,
-        node: *node,
-        service: *service,
-        relay: relay.to_owned(),
-        envelope,
-        ttl_seconds,
+    // Applied to the persisted envelope, not only to a fresh seal: a record written before the
+    // ceiling or the wrap layout moved is over-size too, and it would otherwise reach the publish
+    // boundary — which spends a dial to learn what is known here, and reports a bare byte count
+    // where the operator needs the roster.
+    Ok(record.envelope.filter(|envelope| fits_one_announcement(envelope)).map(|envelope| {
+        Publication {
+            tag,
+            node: *node,
+            service: *service,
+            relay: relay.to_owned(),
+            envelope,
+            ttl_seconds,
+        }
     }))
+}
+
+/// Whether this envelope can be advertised at all, said in words an operator can act on.
+///
+/// The publish boundary refuses an over-size envelope too, but it sees bytes and not a roster, so
+/// its message names a byte count and no action. This one names the roster and its ceiling, which
+/// is the only thing an operator can change.
+fn fits_one_announcement(envelope: &[u8]) -> bool {
+    if rag_rat_sync::discovery::fits_publish(envelope) {
+        return true;
+    }
+    tracing::warn!(
+        // The envelope's size law: one version byte, then one fixed-size wrap per recipient.
+        recipients = (envelope.len() - 1) / rag_rat_oplog::discovery::WRAP_LEN,
+        bytes = envelope.len(),
+        max_recipients = rag_rat_sync::discovery::MAX_PUBLISHABLE_RECIPIENTS,
+        "not advertising: this account's roster is too large to seal into one announcement"
+    );
+    false
 }
 
 fn record_advertisement_liveness(
@@ -606,15 +631,9 @@ fn seal_advertisement(
     if sealed.recipients <= 1 {
         return Ok(None);
     }
-    if !rag_rat_sync::discovery::fits_publish(&sealed.bytes) {
-        tracing::warn!(
-            recipients = sealed.recipients,
-            bytes = sealed.bytes.len(),
-            max_recipients = rag_rat_sync::discovery::MAX_PUBLISHABLE_RECIPIENTS,
-            "not advertising: this account's roster is too large to seal into one announcement"
-        );
-        return Ok(None);
-    }
+    // Size is NOT judged here. A fresh seal and a persisted envelope are the same input to the
+    // question, and asking it once — see `fits_one_announcement` — is what keeps the two paths from
+    // giving an operator two different accounts of the same roster.
     Ok(Some(sealed.bytes))
 }
 
@@ -1282,8 +1301,8 @@ mod tests {
         DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PULL_PEER_MEMO_PREFIX, PerPeerSessionLimiter,
         PersistedAdvertisement, RESIDENT_NUDGE, RefusedPublication, account_is_public_kb, can_host,
         can_sync, device_sync_run, foreign_pull_hosts, foreign_pull_targets, nudge_resident_host,
-        ordered_pull_peers, peer_identity, pull_account_via_peers, read_advertisement,
-        refused_publication_is_due, retry_is_due, write_advertisement,
+        ordered_pull_peers, peer_identity, prepare_advertisement, pull_account_via_peers,
+        read_advertisement, refused_publication_is_due, retry_is_due, write_advertisement,
     };
 
     fn schema_conn() -> Connection {
@@ -1437,6 +1456,54 @@ mod tests {
         assert!(can_host(Some(rag_rat_sync::PeerCapability::ReadWrite)));
         assert!(!can_host(Some(rag_rat_sync::PeerCapability::ReadOnly)));
         assert!(can_sync(Some(rag_rat_sync::PeerCapability::ReadOnly)));
+    }
+
+    /// A persisted envelope is judged against the byte ceiling too, not just a fresh seal.
+    ///
+    /// The record is reused verbatim whenever the tag, endpoint, service, relay, and roster stamp
+    /// all still match, and none of those move when the ceiling or the wrap layout does — so an
+    /// envelope sealed under the old law would sail past the seal-time verdict, cost a dial, and be
+    /// reported at the publish boundary as a byte count with no roster in it. The under-size half
+    /// is what keeps this from passing for the wrong reason: the same record one byte smaller must
+    /// still be advertised.
+    #[test]
+    fn a_persisted_envelope_over_the_announcement_ceiling_is_not_advertised() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = dir.path().join("index.sqlite");
+        let node = [0x11; 32];
+        let service = [0x22; 32];
+        let relay = "https://relay.one";
+        let persist = |envelope: Vec<u8>| {
+            let storage = super::IndexConnection::open(&database).unwrap();
+            let conn = storage.connection();
+            rag_rat_db::schema::apply(conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+            rag_rat_oplog::local_account(conn, 1_000).unwrap();
+            let secret = rag_rat_sync::discovery::discovery_secret(conn).unwrap().unwrap();
+            write_advertisement(conn, &PersistedAdvertisement {
+                tag: rag_rat_sync::discovery::account_tag(&secret),
+                node,
+                service,
+                relay: relay.to_owned(),
+                roster_stamp: rag_rat_oplog::discovery::roster_stamp(conn).unwrap(),
+                envelope: Some(envelope),
+                published_at_ms: None,
+                ttl_seconds: 600,
+            })
+            .unwrap();
+        };
+        let ceiling = rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES;
+
+        persist(vec![0; ceiling + 1]);
+        assert!(
+            prepare_advertisement(&database, &node, &service, relay, 2_000, 600).unwrap().is_none(),
+            "an over-size persisted envelope must not be handed to the publish path"
+        );
+
+        persist(vec![0; ceiling]);
+        assert!(
+            prepare_advertisement(&database, &node, &service, relay, 2_000, 600).unwrap().is_some(),
+            "the ceiling itself fits, so the same record one byte smaller is still advertised"
+        );
     }
 
     #[test]

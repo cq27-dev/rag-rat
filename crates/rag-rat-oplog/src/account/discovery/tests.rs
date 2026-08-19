@@ -308,7 +308,12 @@ fn a_store_with_no_account_seals_nothing_and_opens_nothing() {
     let conn = db();
     assert!(seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().is_none());
     assert!(
-        open_discovery_announcement(&conn, &TAG, &[ANNOUNCEMENT_VERSION; 81]).unwrap().is_none()
+        // A WELL-FORMED one-wrap envelope, sized off `WRAP_LEN` so a wrap-layout change keeps it
+        // that way: a malformed envelope would be rejected by the parser and prove nothing about
+        // opening without an account.
+        open_discovery_announcement(&conn, &TAG, &[ANNOUNCEMENT_VERSION; 1 + WRAP_LEN])
+            .unwrap()
+            .is_none()
     );
 }
 

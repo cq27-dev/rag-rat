@@ -968,13 +968,15 @@ fn the_byte_ceiling_is_inclusive_and_the_next_byte_is_not() {
     );
 }
 
-/// An over-size announcement is refused HERE, without a round trip, whoever handed it over.
+/// An over-size announcement is refused HERE, without a publish stream, whoever handed it over.
 ///
 /// The stub stores whatever it is given, so a publish that got as far as the wire would land — the
 /// assertion that nothing is stored is what separates the local guard from a service that happened
 /// to accept it. The real service would refuse instead, and that refusal is indistinguishable from
-/// a transient error, so [`advertise`] would republish the same doomed envelope every tick forever
-/// with nothing in the log naming the size. Refusing locally names it.
+/// a transient error, so an advertiser would keep republishing the same doomed envelope with
+/// nothing in the log naming the size. This does not stop the retry loop — a refusal is not
+/// liveness, so the next tick tries again — it stops the bytes reaching the service and names the
+/// size in `degraded`.
 #[tokio::test]
 async fn an_announcement_past_the_byte_ceiling_never_reaches_the_service() {
     let service = StubService::start(NOW_MS, Behaviour::Serve).await;
@@ -994,12 +996,48 @@ async fn an_announcement_past_the_byte_ceiling_never_reaches_the_service() {
 
     assert_eq!(out.publish, PublishState::Refused, "nothing is stored, so the state is Refused");
     assert!(service.stored(&tag).is_empty(), "the over-size envelope reached the service anyway");
+    // Publish-only: the connection exists solely to carry this envelope, so opening one is pure
+    // cost. A host in this state retries on a fraction of its TTL for as long as the roster stays
+    // too large, and every one of those dials would be a full handshake against a shared service.
+    assert_eq!(service.dials(), 0, "a doomed publish-only pass must not dial the service");
     let degraded = out.degraded.expect("an unpublishable announcement must say so");
     assert!(
         degraded.contains(&MAX_ANNOUNCEMENT_BYTES.to_string()),
         "the reason must name the limit, or the operator cannot tell this from a transient \
          failure: {degraded}"
     );
+}
+
+/// A caller that also fetches still dials, and still gets its peers.
+///
+/// The pre-dial refusal is scoped to the publish-only shape on purpose: the peers a fetching caller
+/// came for do not depend on its own envelope, so skipping the connection would blind it to every
+/// reachable peer over a defect in what it wanted to advertise. Its publish is refused all the
+/// same, at the stream instead of before the dial.
+#[tokio::test]
+async fn a_fetching_caller_with_an_over_size_announcement_still_gets_its_peers() {
+    let service = StubService::start(NOW_MS, Behaviour::Serve).await;
+    let tag = account_tag(&[29; 32]);
+    let endpoint = client().await;
+    let peer = vec![9u8; 40];
+    let oversize = vec![7u8; MAX_ANNOUNCEMENT_BYTES + 1];
+    service.seed(tag, peer.clone(), NOW_MS + 60_000);
+
+    let out = exchange(DiscoveryExchange {
+        endpoint: &endpoint,
+        service: service.addr(),
+        tag,
+        fetch: true,
+        publish: Some(&oversize),
+        ttl_seconds: 600,
+    })
+    .await;
+
+    assert_eq!(out.announcements, vec![peer.clone()], "the fetch is owed regardless");
+    assert_eq!(out.publish, PublishState::Refused, "the envelope is still unpublishable");
+    assert_eq!(service.stored(&tag), vec![peer], "the seeded entry is all that is stored");
+    let degraded = out.degraded.expect("an unpublishable announcement must say so");
+    assert!(degraded.contains(&MAX_ANNOUNCEMENT_BYTES.to_string()), "{degraded}");
 }
 
 /// Whether a sealed announcement fits one publish is one question with one answer, and the
@@ -1025,13 +1063,4 @@ fn the_recipient_ceiling_is_where_a_sealed_envelope_stops_fitting_one_publish() 
         !fits_publish(&announcement(MAX_PUBLISHABLE_RECIPIENTS + 1)),
         "one recipient past the ceiling must not claim to fit"
     );
-    // The ceiling read forwards: it is the LARGEST recipient count that fits, so the derivation
-    // cannot quietly leave a wrap's worth of room on the table. Const-evaluated, so a wrap layout
-    // that moved the ceiling off the bytes fails the build rather than one test.
-    const {
-        assert!(
-            1 + (MAX_PUBLISHABLE_RECIPIENTS + 1) * WRAP_LEN > MAX_ANNOUNCEMENT_BYTES,
-            "one more recipient must not fit, or the ceiling is lower than the bytes allow"
-        );
-    }
 }

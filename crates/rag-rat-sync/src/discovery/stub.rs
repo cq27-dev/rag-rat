@@ -110,6 +110,12 @@ pub(crate) struct StubService {
     /// that quietly starts fetching is invisible to every assertion about stored
     /// announcements.
     fetches: Arc<AtomicUsize>,
+    /// Connections accepted, counted before any request is read.
+    ///
+    /// A dial the client then declines to use costs this service the whole handshake, and every
+    /// other assertion here is about what a connection carried — so a caller that dials and asks
+    /// nothing looks identical to one that never dialed at all.
+    dials: Arc<AtomicUsize>,
 }
 
 impl StubService {
@@ -126,19 +132,23 @@ impl StubService {
         let tags = Arc::new(Mutex::new(HashMap::new()));
         let now = Arc::new(AtomicI64::new(now_ms));
         let fetches = Arc::new(AtomicUsize::new(0));
+        let dials = Arc::new(AtomicUsize::new(0));
         let service = Self {
             endpoint: endpoint.clone(),
             tags: Arc::clone(&tags),
             now_ms: Arc::clone(&now),
             fetches: Arc::clone(&fetches),
+            dials: Arc::clone(&dials),
         };
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let tags = Arc::clone(&tags);
                 let now = Arc::clone(&now);
                 let fetches = Arc::clone(&fetches);
+                let dials = Arc::clone(&dials);
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else { return };
+                    dials.fetch_add(1, Ordering::Relaxed);
                     // Swallowed streams are PARKED, not dropped: dropping a send stream closes it,
                     // which the client sees as an immediate error — the opposite of a black hole,
                     // and enough to make the timeout test pass with the timeout deleted.
@@ -220,6 +230,11 @@ impl StubService {
     /// How many fetches this stub has answered.
     pub(crate) fn fetches(&self) -> usize {
         self.fetches.load(Ordering::Relaxed)
+    }
+
+    /// How many connections this stub has accepted.
+    pub(crate) fn dials(&self) -> usize {
+        self.dials.load(Ordering::Relaxed)
     }
 
     /// Seed an announcement directly, bypassing the wire — for setting up a tag's prior state.
