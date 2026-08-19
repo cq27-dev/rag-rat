@@ -2355,16 +2355,23 @@ fn migration_097_covers_every_worktree_id_column_in_the_schema() {
 /// the initial apply.
 ///
 /// Every projected-node column added after the refold step has the same exposure, so the fixture
-/// covers the whole set rather than the one column that first exhibited it — a new column pinned by
-/// only its own migration reintroduces the bug this test exists to catch.
+/// covers the whole set rather than the one column that first exhibited it. The set is DERIVED from
+/// the tip rather than trusted: a hand-kept list is exactly as blind to a new column as the
+/// migration body is, so the test asserts it equals the tip's columns minus the frozen pre-refold
+/// shape, and a column that skips the list fails here instead of passing silently.
 ///
 /// The real hook folds per account, so on an account-less scratch store it returns without writing
 /// anything and cannot observe the defect. The probe below stands in for it, asserting the shape at
 /// the moment the ladder hands it the transaction — which is the ordering under test.
 #[test]
 fn a_store_below_the_first_refold_step_migrates_to_the_tip() {
+    /// `content_projected_nodes` as V070 created it — the shape the last refold step (V115) could
+    /// rely on. Frozen history, not the current table.
+    const PRE_REFOLD_COLUMNS: &[&str] = &["stream_id", "node_id", "content_json", "status"];
+
     /// The `content_projected_nodes` columns that arrive AFTER the last refold step, and so are
-    /// the ones the refold can outrun. Add a column here when a migration adds one to the table.
+    /// the ones the refold can outrun. The probe below is a bare fn pointer, so it needs a const;
+    /// the assertion against the tip is what keeps the const honest.
     const POST_REFOLD_COLUMNS: &[&str] = &["anchors_json", "source_text_hash"];
 
     fn refold_probe(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
@@ -2388,6 +2395,20 @@ fn a_store_below_the_first_refold_step_migrates_to_the_tip() {
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+
+    let mut post_refold_at_tip: Vec<String> = conn_table_columns(&conn, "content_projected_nodes")
+        .into_iter()
+        .filter(|column| !PRE_REFOLD_COLUMNS.contains(&column.as_str()))
+        .collect();
+    post_refold_at_tip.sort();
+    let mut listed: Vec<String> = POST_REFOLD_COLUMNS.iter().map(|c| (*c).to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        post_refold_at_tip, listed,
+        "every `content_projected_nodes` column added after the V115 refold must be in \
+         POST_REFOLD_COLUMNS — one that is only pinned by its own migration is invisible to this \
+         fixture, and the refold runs the current projector against a table that lacks it",
+    );
 
     for column in POST_REFOLD_COLUMNS {
         conn.execute_batch(&format!("ALTER TABLE content_projected_nodes DROP COLUMN {column}"))

@@ -290,11 +290,16 @@ fn read_existing_node(conn: &Connection, node_id: &str) -> anyhow::Result<Option
 }
 
 /// Whether a projected node passes the SAME validity gates the local create/update path enforces —
-/// kind / confidence closed sets, title / body length caps, source, the kind↔payload rule
-/// (`validate_payload`), and the source-hash shape. Peer content crosses the wire only
-/// SHAPE-validated, and an older or compromised account device could author content that clears the
-/// §18a envelope cap yet violates these tighter local rules; such a node must not be persisted into
-/// the searchable tables.
+/// kind / confidence closed sets, title / body length caps, source, and the kind↔payload rule
+/// (`validate_payload`). Peer content crosses the wire only SHAPE-validated, and an older or
+/// compromised account device could author content that clears the §18a envelope cap yet violates
+/// these tighter local rules; such a node must not be persisted into the searchable tables.
+///
+/// The published source hash is deliberately NOT gated here. Failing this function quarantines the
+/// whole memory — deleting its row, bindings and FTS shadow — and the projection re-offers the same
+/// value forever, so a peer on a newer digest shape would cost every older peer the memory itself.
+/// Its shape is filtered at the one place that stores it (`stamp_seeded_source_hash`) instead: the
+/// same guarantee that nothing malformed is persisted, without the blast radius.
 fn projected_node_content_is_valid(node: &ProjectedContentNode) -> anyhow::Result<()> {
     memory::validate_kind(&node.content.kind)?;
     memory::validate_confidence(&node.content.confidence)?;
@@ -309,15 +314,6 @@ fn projected_node_content_is_valid(node: &ProjectedContentNode) -> anyhow::Resul
     // quarantined like any other field.
     for tag in memory::normalize_tags(&node.content.tags) {
         memory::validate_len("tag", &tag, 64)?;
-    }
-    // The published source hash crosses the same untrusted boundary and lands in a column the local
-    // write path only ever fills with a lowercase hex sha256 (`rag_rat_base::hash::hex_sha256`).
-    // Nothing downstream re-derives it, so an unchecked value would park arbitrary peer-supplied
-    // text on every device of the account.
-    if let Some(hash) = node.source_text_hash.as_deref()
-        && !is_hex_sha256(hash)
-    {
-        anyhow::bail!("source_text_hash must be a 64-character lowercase hex sha256");
     }
     Ok(())
 }
@@ -592,7 +588,13 @@ fn seed_node_anchors(
 /// before the op existed keeps a NULL hash — that is the honest state, since nothing here can say
 /// the published hash describes those rows, and an absent hash is not evidence of drift.
 ///
-/// Scoped to synced rows: a local memory's hash is its own to stamp.
+/// Scoped to synced rows: a local memory's hash is its own to stamp. That is the one case where the
+/// pair does NOT go stale together — an unbound LOCAL memory rebound on another device takes the
+/// peer's seeded bindings (`seed_node_anchors` has no origin filter) beside a NULL hash.
+///
+/// This is also the only place a peer-supplied hash is stored, so it is where the shape is checked:
+/// a value outside what `hex_sha256` produces is dropped and the memory is left unstamped. The
+/// content gate cannot do it — failing there quarantines the whole memory over a decoration.
 fn stamp_seeded_source_hash(
     tx: &Transaction<'_>,
     repo_id: &str,
@@ -601,6 +603,15 @@ fn stamp_seeded_source_hash(
     let Some(hash) = node.source_text_hash.as_deref() else {
         return Ok(());
     };
+    if !is_hex_sha256(hash) {
+        tracing::warn!(
+            repo_id,
+            node_id = %node.node_id,
+            "not stamping a published source hash outside the lowercase-hex-sha256 shape; the \
+             memory keeps its seeded bindings and an unstamped hash",
+        );
+        return Ok(());
+    }
     tx.execute(
         "UPDATE repo_memories SET source_text_hash = ?3
          WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced'",
@@ -1312,6 +1323,30 @@ mod tests {
         );
     }
 
+    /// The INSERT that materializes a node on first sight leaves `source_text_hash` NULL even when
+    /// the projection carries one, because a hash with no anchors beside it describes nothing.
+    /// Binding the projected hash in that INSERT — the obvious shortcut — must fail this test;
+    /// every other case in the suite reaches the column through the seed instead.
+    #[test]
+    fn a_first_sight_node_with_no_anchors_takes_no_source_hash() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", None);
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+
+        drain_worker(&conn, stream, 1_000);
+
+        assert!(
+            bindings_of(&conn, "mem_peer").is_empty(),
+            "nobody published this memory's bindings"
+        );
+        assert_eq!(
+            source_hash_of(&conn, "mem_peer"),
+            None,
+            "a hash with no anchor set beside it is a claim about nothing",
+        );
+    }
+
     /// The other direction of the same rule: a memory whose bindings this store already holds is
     /// never seeded, so it takes no hash either. Stamping one would assert that its author anchored
     /// to text hashing to X about bindings that never pointed there.
@@ -1351,10 +1386,12 @@ mod tests {
     }
 
     /// The published hash crosses the same untrusted boundary as the content and lands in a column
-    /// nothing downstream re-derives, so a value outside the shape `hex_sha256` produces is
-    /// quarantined rather than parked on every device of the account.
+    /// nothing downstream re-derives, so a value outside the shape `hex_sha256` produces is never
+    /// stored. It costs the memory NOTHING else: the projection re-offers the same bad value on
+    /// every pass, so quarantining over it would delete the row, its bindings and its FTS shadow
+    /// permanently the moment one peer published a different digest shape.
     #[test]
-    fn a_malformed_source_hash_quarantines_the_node() {
+    fn a_malformed_source_hash_leaves_the_memory_intact_and_unstamped() {
         let conn = scoped_conn();
         let stream = StreamId::from_bytes([0x44; 32]);
         seed_projected_node_with_anchors(
@@ -1374,7 +1411,16 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!exists, "an unparseable source hash is not persisted");
+        assert!(exists, "a bad hash must not cost the peer the memory itself");
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::run".to_string()
+        )]);
+        assert_eq!(
+            source_hash_of(&conn, "mem_peer"),
+            None,
+            "an unparseable source hash is not persisted",
+        );
     }
 
     /// Seed one row into `content_projected_edges`. `resolved` is `(target_repo, target_node,
