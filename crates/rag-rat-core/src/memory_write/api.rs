@@ -497,35 +497,6 @@ mod anchor_authoring_tests {
         assert!(anchors.contains(&"src/old.rs".to_string()));
     }
 
-    /// A memory with no bindings must not be swept forever. Its snapshot is legitimately absent, so
-    /// a sweep keyed only on "no snapshot" would re-examine it on every single authored write.
-    #[test]
-    fn an_unanchored_memory_is_not_swept_repeatedly() {
-        let conn = scoped_conn();
-        let unanchored = create_memory(&conn, RepoMemoryCreate {
-            kind: "Concept".to_string(),
-            title: "t".to_string(),
-            body: "b".to_string(),
-            confidence: "high".to_string(),
-            created_by: None,
-            source: None,
-            tags: Vec::new(),
-            payload_json: None,
-            bind: RepoMemoryBindTarget::default(),
-        })
-        .unwrap()
-        .memory
-        .memory_id;
-
-        bound_create(&conn, "src/lib.rs");
-
-        assert_eq!(
-            projected_anchors(&conn, &unanchored),
-            None,
-            "a memory with no bindings stays unsnapshotted rather than publishing an empty set",
-        );
-    }
-
     /// A rebind is an explicit choice of a new anchor and now mints a signed op for it — the
     /// full-set snapshot names where the memory points NOW, not how it got there.
     #[test]
