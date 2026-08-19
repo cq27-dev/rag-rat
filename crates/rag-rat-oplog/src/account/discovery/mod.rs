@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use super::keywrap::{self, ContentKey, SealedKeyWrap, WrapContext};
 use super::{bootstrap, storage};
 use crate::device::DeviceX25519Public;
-use crate::identity;
+use crate::identity::{self, LocalDevice};
 use crate::op::DeviceFingerprint;
 
 /// The envelope's leading byte. Bumping it is a wire break; the fetch side drops what it does not
@@ -141,42 +141,57 @@ fn stamp_of(recipients: &[(DeviceFingerprint, DeviceX25519Public)]) -> RosterSta
     hasher.finalize().into()
 }
 
-/// Recover the node id from an announcement sealed to this device, or `None`.
+/// Everything opening an announcement needs that does not vary with the announcement: this
+/// device's X25519 key and the wrap context the account and tag determine.
 ///
-/// `None` covers every "not for us, or not ours to read" case: no local account or device, an
-/// unrecognised version, a malformed length, and — the ordinary case — no wrap that opens under
-/// this device's key.
+/// **Why the state is loaded up front rather than per announcement.** One fetch returns up to the
+/// service's per-response cap of payloads, and a payload that does not open spends no peer budget,
+/// so the opening path runs for every one of them. Only the unwrap depends on the envelope; the
+/// account read, the device load — which re-derives and re-validates the stored keys — and the
+/// context are the same answer each time, so they are paid for once and carried.
 ///
-/// **Silent when a wrap fails its tag.** Every announcement carries one wrap per roster device, so
-/// all but one are expected to fail here. The content path records unwrap failures as security
-/// events; doing that here would write a security event per foreign wrap per announcement per
-/// discovery pass, burying the real ones.
-pub fn open_discovery_announcement(
-    conn: &Connection,
-    tag: &[u8; 32],
-    envelope: &[u8],
-) -> anyhow::Result<Option<[u8; 32]>> {
-    let Some(wraps) = parse_wraps(envelope) else {
-        return Ok(None);
-    };
-    let Some(account) = bootstrap::read_local_account(conn)? else {
-        return Ok(None);
-    };
-    let Some(device) = identity::load_local_device(conn)? else {
-        return Ok(None);
-    };
-    let secret = device.x25519_secret();
-    let ctx = wrap_context(account, tag, &device.x25519_public().to_bytes());
+/// It holds no connection, so a loaded opener cannot reach the database again. That is the point:
+/// hold one for the length of a fetch pass and drop it after, since a roster or identity change
+/// mid-pass is not something the pass is expected to observe.
+pub struct AnnouncementOpener {
+    device: LocalDevice,
+    ctx: WrapContext,
+}
 
-    for wrap in wraps {
-        // Failure here is the expected case, not an error: this device matches at most one wrap.
-        if let Ok(opened) = keywrap::unwrap_content_key(&wrap, secret, &ctx) {
+impl AnnouncementOpener {
+    /// Load the per-pass state, or `None` when this store has no account or no local device — in
+    /// which case nothing it fetches under `tag` is openable, for the whole pass.
+    pub fn load(conn: &Connection, tag: &[u8; 32]) -> anyhow::Result<Option<Self>> {
+        let Some(account) = bootstrap::read_local_account(conn)? else {
+            return Ok(None);
+        };
+        let Some(device) = identity::load_local_device(conn)? else {
+            return Ok(None);
+        };
+        let ctx = wrap_context(account, tag, &device.x25519_public().to_bytes());
+        Ok(Some(Self { device, ctx }))
+    }
+
+    /// Recover the node id from an announcement sealed to this device, or `None`.
+    ///
+    /// `None` covers every "not for us, or not ours to read" case: an unrecognised version, a
+    /// malformed length, and — the ordinary case — no wrap that opens under this device's key.
+    ///
+    /// **Silent when a wrap fails its tag.** Every announcement carries one wrap per roster device,
+    /// so all but one are expected to fail here. The content path records unwrap failures as
+    /// security events; doing that here would write a security event per foreign wrap per
+    /// announcement per discovery pass, burying the real ones.
+    pub fn open(&self, envelope: &[u8]) -> Option<[u8; 32]> {
+        parse_wraps(envelope)?.iter().find_map(|wrap| {
+            // Failure here is the expected case, not an error: this device matches at most one
+            // wrap.
+            let opened =
+                keywrap::unwrap_content_key(wrap, self.device.x25519_secret(), &self.ctx).ok()?;
             let mut node_id = [0u8; 32];
             node_id.copy_from_slice(opened.as_slice());
-            return Ok(Some(node_id));
-        }
+            Some(node_id)
+        })
     }
-    Ok(None)
 }
 
 /// The AAD every wrap is bound to.

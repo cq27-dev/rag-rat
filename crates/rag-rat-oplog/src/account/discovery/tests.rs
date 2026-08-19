@@ -110,6 +110,12 @@ fn wraps_of(envelope: &[u8]) -> Vec<SealedKeyWrap> {
     parse_wraps(envelope).expect("a sealed envelope parses")
 }
 
+/// Open a single announcement against freshly loaded state — `None` when there is no account or
+/// device to open it with, as well as when the envelope does not open.
+fn open_one(conn: &Connection, tag: &[u8; 32], envelope: &[u8]) -> Option<[u8; 32]> {
+    AnnouncementOpener::load(conn, tag).unwrap()?.open(envelope)
+}
+
 // ---------------------------------------------------------------- round trip
 
 /// The sealing device is among the recipients, so it opens its own announcement. A publisher is
@@ -123,8 +129,29 @@ fn a_sealed_announcement_opens_on_the_sealing_device() {
     let sealed = seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().unwrap();
     assert_eq!(sealed.recipients, 1, "a lone founder is the whole roster");
 
-    let opened = open_discovery_announcement(&conn, &TAG, &sealed.bytes).unwrap();
-    assert_eq!(opened, Some(NODE_ID));
+    assert_eq!(open_one(&conn, &TAG, &sealed.bytes), Some(NODE_ID));
+}
+
+/// The state an opener holds is fixed at load, so a fetch pass pays for the account read and the
+/// device load once however many announcements come back.
+///
+/// Pinned by emptying both single-row tables under a live opener: anything that reloaded them per
+/// announcement would stop opening here.
+#[test]
+fn a_loaded_opener_reads_nothing_further_from_the_store() {
+    let conn = db();
+    bootstrap::local_account(&conn, NOW).unwrap();
+    let sealed = seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().unwrap();
+    let opener = AnnouncementOpener::load(&conn, &TAG).unwrap().expect("a founder is a device");
+
+    conn.execute("DELETE FROM oplog_local_account", []).unwrap();
+    conn.execute("DELETE FROM oplog_device_identity", []).unwrap();
+
+    assert_eq!(opener.open(&sealed.bytes), Some(NODE_ID));
+    assert!(
+        AnnouncementOpener::load(&conn, &TAG).unwrap().is_none(),
+        "a fresh load sees the emptied store, so the open above used state loaded earlier"
+    );
 }
 
 /// Every roster-effective device is a recipient, not just the publisher.
@@ -239,9 +266,9 @@ fn a_wrap_does_not_open_under_another_tag() {
     bootstrap::local_account(&conn, NOW).unwrap();
     let sealed = seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().unwrap();
 
-    assert_eq!(open_discovery_announcement(&conn, &TAG, &sealed.bytes).unwrap(), Some(NODE_ID));
+    assert_eq!(open_one(&conn, &TAG, &sealed.bytes), Some(NODE_ID));
     assert_eq!(
-        open_discovery_announcement(&conn, &OTHER_TAG, &sealed.bytes).unwrap(),
+        open_one(&conn, &OTHER_TAG, &sealed.bytes),
         None,
         "the tag is AAD; a different tag must not open the wrap"
     );
@@ -307,14 +334,10 @@ fn parsing_refuses_everything_that_is_not_an_envelope() {
 fn a_store_with_no_account_seals_nothing_and_opens_nothing() {
     let conn = db();
     assert!(seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().is_none());
-    assert!(
-        // A WELL-FORMED one-wrap envelope, sized off `WRAP_LEN` so a wrap-layout change keeps it
-        // that way: a malformed envelope would be rejected by the parser and prove nothing about
-        // opening without an account.
-        open_discovery_announcement(&conn, &TAG, &[ANNOUNCEMENT_VERSION; 1 + WRAP_LEN])
-            .unwrap()
-            .is_none()
-    );
+    assert!(AnnouncementOpener::load(&conn, &TAG).unwrap().is_none());
+    // A well-formed one-wrap envelope, sized off `WRAP_LEN` so a wrap-layout change keeps it that
+    // way: the `None` must come from the absent account, not from a parser rejection.
+    assert!(open_one(&conn, &TAG, &[ANNOUNCEMENT_VERSION; 1 + WRAP_LEN]).is_none());
 }
 
 /// Opening is silent when a wrap is not ours — the ordinary case, once per foreign recipient per
@@ -334,7 +357,7 @@ fn opening_a_foreign_wrap_records_no_security_event() {
     envelope.extend_from_slice(&sealed.ephemeral_pubkey);
     envelope.extend_from_slice(&sealed.ciphertext);
 
-    assert_eq!(open_discovery_announcement(&conn, &TAG, &envelope).unwrap(), None);
+    assert_eq!(open_one(&conn, &TAG, &envelope), None);
 
     let events: i64 = conn
         .query_row("SELECT COUNT(*) FROM sync_security_events", [], |row| row.get(0))

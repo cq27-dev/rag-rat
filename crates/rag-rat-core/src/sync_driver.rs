@@ -819,6 +819,12 @@ async fn reconcile(
     let tag = rag_rat_sync::discovery::discovery_secret(conn)?
         .map(|secret| rag_rat_sync::discovery::account_tag(&secret));
     let discovery = discovery_addr(config, &relay);
+    // Built before the fetch, not inside the per-payload closure: the account and this device's key
+    // are the same for the whole pass. A failure to load them leaves discovery unopenable and falls
+    // back to the configured peers, the same as a payload that will not open.
+    let opener = tag.and_then(|tag| {
+        rag_rat_oplog::discovery::AnnouncementOpener::load(conn, &tag).ok().flatten()
+    });
     let resolved = rag_rat_sync::discover_peers(
         &config.sync.server_peers,
         &relay,
@@ -832,13 +838,7 @@ async fn reconcile(
                 config.sync.push_interval_secs,
             ),
         }),
-        &|payload| {
-            tag.and_then(|tag| {
-                rag_rat_oplog::discovery::open_discovery_announcement(conn, &tag, payload)
-                    .ok()
-                    .flatten()
-            })
-        },
+        &|payload| opener.as_ref().and_then(|opener| opener.open(payload)),
     )
     .await;
     // Scope the DEVICE-sync phases to peers that can serve this account. A peer memoized as a
