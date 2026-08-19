@@ -94,11 +94,12 @@ Devices cost nothing here; they only fetch. Past that, hosts evict each other an
 **flaps**: a host findable this hour may not be next hour. Pin those hosts in `server_peers` instead.
 
 **How many devices an account can have.** An announcement is sealed once per recipient, so it grows
-by 80 bytes per roster-effective device against a publish limit of 2048 bytes — a ceiling of about
-**25 devices**. Past it a host logs `roster is too large to seal into one announcement` and does not
-advertise; it serves normally, and every device that reaches it through `server_peers` is
-unaffected. The announcement is never truncated to fit, because which recipients got dropped would
-silently decide who can find that host.
+by one fixed-size wrap per roster-effective device against the service's publish limit — **a few
+dozen devices** at today's wrap layout. The exact figure is `MAX_PUBLISHABLE_RECIPIENTS`, which the
+code derives from those two rather than writing down. Past it a host logs `roster is too large to
+seal into one announcement` and does not advertise; it serves normally, and every device that
+reaches it through `server_peers` is unaffected. The announcement is never truncated to fit,
+because which recipients got dropped would silently decide who can find that host.
 
 A fetch is bounded the same way: the service answers with as much as fits one response frame, chosen
 at random, so a busy tag returns a **sample** rather than everything. A device therefore learns some
@@ -238,8 +239,8 @@ folded it, because they do not depend on anything the account can take back:
   stop, and — because each sealed envelope is a version byte plus one fixed-size wrap per recipient
   (80 bytes at today's wrap layout) — the exact number of devices on the account, tracked across
   enrollments and removals without opening a single wrap. It can also publish junk under the tag,
-  costing whoever fetches it a wasted slot. What it can no longer do is read a host's node id out of any
-  announcement sealed after its removal. Rotating the tag itself is
+  costing whoever fetches it a wasted slot. What it can no longer do is read a host's node id out
+  of any announcement sealed after its removal. Rotating the tag itself is
   [#1081](https://github.com/cq27-dev/rag-rat/issues/1081); padding the envelope to hide device
   count is [#1087](https://github.com/cq27-dev/rag-rat/issues/1087).
 - **Announcements sealed before it stops being a recipient**, which stay openable by it until they

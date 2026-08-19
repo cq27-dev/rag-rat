@@ -42,7 +42,7 @@ mod tests;
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr};
-use rag_rat_oplog::discovery::{SealedAnnouncement, WRAP_LEN};
+use rag_rat_oplog::discovery::WRAP_LEN;
 use sha2::{Digest, Sha256};
 
 use self::wire::{DiscoveryRequest, DiscoveryResponse, TAG_LEN};
@@ -116,17 +116,21 @@ pub const MAX_ANNOUNCEMENT_BYTES: usize = 2048;
 /// Derived from the envelope's size law rather than written beside it: an envelope is one version
 /// byte plus [`WRAP_LEN`] per recipient, so this ceiling and the wrap layout cannot drift apart. An
 /// account past it cannot advertise at all until the envelope is split across announcements — see
-/// [`crate::discovery`] docs.
+/// [`crate::discovery`] docs. Today: 25.
 pub const MAX_PUBLISHABLE_RECIPIENTS: usize = (MAX_ANNOUNCEMENT_BYTES - 1) / WRAP_LEN;
 
-/// Whether a sealed announcement fits one publish.
+/// Whether an announcement fits one publish.
 ///
 /// The single place the envelope's size law and the service's byte ceiling meet. It lives on this
 /// side of the crate boundary because the ceiling mirrors the service's limit and the op-log crate,
 /// which owns the sealing, cannot see it. Callers get the verdict rather than two constants to
 /// recombine — recombining them is how the pairing ended up restated per publisher.
-pub fn fits_publish(sealed: &SealedAnnouncement) -> bool {
-    sealed.bytes.len() <= MAX_ANNOUNCEMENT_BYTES
+///
+/// Takes BYTES rather than a sealed envelope so it can be asked at the publish boundary, where no
+/// envelope survives: both publish paths carry opaque bytes by then. A verdict only the seal site
+/// can ask is a verdict an envelope from anywhere else evades.
+pub fn fits_publish(announcement: &[u8]) -> bool {
+    announcement.len() <= MAX_ANNOUNCEMENT_BYTES
 }
 
 /// The tag an account publishes and fetches under.
@@ -361,6 +365,20 @@ async fn exchange_inner(
     // asked for is owed regardless of whether anyone answered the other question.
     let publish_state = match publish {
         None => PublishState::NotAttempted,
+        // Enforced HERE, at the boundary the bytes actually cross, and not only where they are
+        // sealed: the seal site is one publisher among several, and an over-size envelope reaching
+        // the service comes back as a refusal indistinguishable from a transient error, which the
+        // advertiser then retries every tick forever. Refused rather than dropped silently, so the
+        // caller sees the same "nothing is stored" state it would get from the service and the
+        // reason is named in `degraded` — and the round trip that could only fail is skipped.
+        Some(envelope) if !fits_publish(envelope) => {
+            degraded.push(format!(
+                "publish skipped: {} bytes over the {MAX_ANNOUNCEMENT_BYTES}-byte announcement \
+                 limit",
+                envelope.len()
+            ));
+            PublishState::Refused
+        },
         Some(envelope) => {
             let publish = DiscoveryRequest::Publish {
                 tag: *tag,

@@ -7,7 +7,7 @@ use super::stub::{Behaviour, PER_TAG_CAP, StubService};
 use super::{
     DISCOVERY_TAG_DOMAIN, DISCOVERY_TIMEOUT, DiscoveryExchange, DiscoveryOutcome,
     MAX_ANNOUNCEMENT_BYTES, MAX_PUBLISHABLE_RECIPIENTS, PEER_DISCOVERY_ALPN, PublishState,
-    SealedAnnouncement, WRAP_LEN, account_tag, exchange, fits_publish, publish_ttl_seconds,
+    WRAP_LEN, account_tag, exchange, fits_publish, publish_ttl_seconds,
 };
 
 /// A fixed instant: the announcement arithmetic under test is about durations, and a real clock
@@ -950,19 +950,72 @@ fn only_possibly_live_publishes_reset_the_renewal_clock() {
     );
 }
 
+/// The verdict flips between exactly [`MAX_ANNOUNCEMENT_BYTES`] and one byte past it.
+///
+/// Probing at the boundary byte rather than at envelope sizes, because no envelope has a length of
+/// exactly the limit — `1 + WRAP_LEN·n` never lands on it — so recipient-shaped inputs alone leave
+/// the comparator free to be `<` and never say so. The limit is inclusive: it mirrors the largest
+/// payload the service accepts, not the first one it rejects.
+#[test]
+fn the_byte_ceiling_is_inclusive_and_the_next_byte_is_not() {
+    assert!(
+        fits_publish(&vec![0u8; MAX_ANNOUNCEMENT_BYTES]),
+        "{MAX_ANNOUNCEMENT_BYTES} bytes is the limit, not one past it"
+    );
+    assert!(
+        !fits_publish(&vec![0u8; MAX_ANNOUNCEMENT_BYTES + 1]),
+        "one byte past the limit is refused by the service, so it must be refused here"
+    );
+}
+
+/// An over-size announcement is refused HERE, without a round trip, whoever handed it over.
+///
+/// The stub stores whatever it is given, so a publish that got as far as the wire would land — the
+/// assertion that nothing is stored is what separates the local guard from a service that happened
+/// to accept it. The real service would refuse instead, and that refusal is indistinguishable from
+/// a transient error, so [`advertise`] would republish the same doomed envelope every tick forever
+/// with nothing in the log naming the size. Refusing locally names it.
+#[tokio::test]
+async fn an_announcement_past_the_byte_ceiling_never_reaches_the_service() {
+    let service = StubService::start(NOW_MS, Behaviour::Serve).await;
+    let tag = account_tag(&[23; 32]);
+    let endpoint = client().await;
+    let oversize = vec![7u8; MAX_ANNOUNCEMENT_BYTES + 1];
+
+    let out = exchange(DiscoveryExchange {
+        endpoint: &endpoint,
+        service: service.addr(),
+        tag,
+        fetch: false,
+        publish: Some(&oversize),
+        ttl_seconds: 600,
+    })
+    .await;
+
+    assert_eq!(out.publish, PublishState::Refused, "nothing is stored, so the state is Refused");
+    assert!(service.stored(&tag).is_empty(), "the over-size envelope reached the service anyway");
+    let degraded = out.degraded.expect("an unpublishable announcement must say so");
+    assert!(
+        degraded.contains(&MAX_ANNOUNCEMENT_BYTES.to_string()),
+        "the reason must name the limit, or the operator cannot tell this from a transient \
+         failure: {degraded}"
+    );
+}
+
 /// Whether a sealed announcement fits one publish is one question with one answer, and the
 /// recipient ceiling is that answer read backwards.
 ///
 /// Both are computed from `WRAP_LEN`, so a wrap layout change moves the envelope, the ceiling, and
 /// this boundary together. A publisher holding its own copy of the size law moves only its copy,
 /// and the consequence is a service refusal that looks like every other transient publish error.
-/// The `+ 1` case is the one that matters: it is the first roster that cannot be advertised at all.
+///
+/// Catches an error of a whole wrap in either direction — the ceiling claiming a roster fits that
+/// the service would refuse, or stopping a roster short that it would have taken. The `+ 1` case is
+/// the one that matters in practice: it is the first roster that cannot be advertised at all.
 #[test]
 fn the_recipient_ceiling_is_where_a_sealed_envelope_stops_fitting_one_publish() {
-    let announcement = |recipients: usize| SealedAnnouncement {
-        bytes: vec![0u8; 1 + recipients * WRAP_LEN],
-        recipients,
-    };
+    // The envelope's size law: one version byte, then one fixed-size wrap per recipient.
+    let announcement = |recipients: usize| vec![0u8; 1 + recipients * WRAP_LEN];
 
     assert!(
         fits_publish(&announcement(MAX_PUBLISHABLE_RECIPIENTS)),
@@ -972,4 +1025,13 @@ fn the_recipient_ceiling_is_where_a_sealed_envelope_stops_fitting_one_publish() 
         !fits_publish(&announcement(MAX_PUBLISHABLE_RECIPIENTS + 1)),
         "one recipient past the ceiling must not claim to fit"
     );
+    // The ceiling read forwards: it is the LARGEST recipient count that fits, so the derivation
+    // cannot quietly leave a wrap's worth of room on the table. Const-evaluated, so a wrap layout
+    // that moved the ceiling off the bytes fails the build rather than one test.
+    const {
+        assert!(
+            1 + (MAX_PUBLISHABLE_RECIPIENTS + 1) * WRAP_LEN > MAX_ANNOUNCEMENT_BYTES,
+            "one more recipient must not fit, or the ceiling is lower than the bytes allow"
+        );
+    }
 }

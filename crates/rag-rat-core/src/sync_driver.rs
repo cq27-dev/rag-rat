@@ -606,7 +606,7 @@ fn seal_advertisement(
     if sealed.recipients <= 1 {
         return Ok(None);
     }
-    if !rag_rat_sync::discovery::fits_publish(&sealed) {
+    if !rag_rat_sync::discovery::fits_publish(&sealed.bytes) {
         tracing::warn!(
             recipients = sealed.recipients,
             bytes = sealed.bytes.len(),
