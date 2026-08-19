@@ -148,6 +148,25 @@ impl IndexDatabase {
         )
     }
 
+    /// Configure the active repo to MIRROR `owner_account_hex`'s published memories, read-only
+    /// (#1156): this repo's memory tables materialize from the owner's stream instead of its own.
+    /// No Writer grant is involved — a subscriber authors nothing onto the owner's stream — but the
+    /// owner's log must reach this store (automatic sync pulls it once the owner's host is in
+    /// `[sync] server_peers`, or `sync pull <owner>`) before anything materializes.
+    pub fn sync_subscribe(&self, owner_account_hex: &str) -> anyhow::Result<()> {
+        crate::memory_write::set_subscription_owner(
+            self.storage.connection(),
+            owner_account_hex,
+            rag_rat_base::time::now_ms(),
+        )
+    }
+
+    /// The active repo's configured foreign memory owner, if any — what `sync whoami` reports
+    /// alongside this store's account id.
+    pub fn sync_owner_config(&self) -> anyhow::Result<crate::memory_write::RepoOwnerConfig> {
+        crate::memory_write::repo_owner_config(self.storage.connection())
+    }
+
     /// Re-wrap the active repo stream's existing live keys to an already-effective enrolled device.
     /// This authors same-key siblings only; it does not enroll, pair, transport, or rotate keys.
     pub fn sync_catch_up(

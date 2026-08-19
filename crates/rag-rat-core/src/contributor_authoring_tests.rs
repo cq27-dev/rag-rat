@@ -3,6 +3,9 @@
 //! (modelled by ingesting the owner's account log + content); the contributor is configured with
 //! `set_contribution_owner`; and its live authoring folds accepted on the owner's `/2` stream — not
 //! on any stream of its own.
+//!
+//! Plus the read-only half (#1156): a SUBSCRIBER mirrors the same published owner's stream without
+//! a grant and without publishing itself, and keeps authoring its own memories onto its own stream.
 
 use rag_rat_oplog::{
     AccessMode, ContentRefoldBudget, account_entries_for_sync, account_ingest,
@@ -499,4 +502,146 @@ fn a_contributing_store_refuses_to_establish_a_private_stream_later() {
     assert!(err.contains("PRIVATE memory stream"), "the refusal names the conflict: {err}");
     assert!(err.contains("separate database"), "and hands over an escape: {err}");
     assert!(err.contains("sync publish"), "and the other escape: {err}");
+}
+
+/// A published owner plus a SUBSCRIBER of it: the owner's log + content are synced in, and the
+/// subscriber is configured read-only. Deliberately no grant and no `enable_public_authoring` on
+/// the subscriber — a read-only mirror needs neither. Returns `(owner, subscriber, owner_account)`.
+fn subscription_pair() -> (Connection, Connection, rag_rat_oplog::AccountId) {
+    let owner = scoped_conn();
+    let owner_account = local_account(&owner, NOW).unwrap();
+    assert!(enable_public_authoring(&owner, NOW).unwrap());
+    create_memory(&owner, concept("owner-note")).unwrap();
+
+    let subscriber = scoped_conn();
+    let subscriber_account = local_account(&subscriber, NOW).unwrap();
+    assert_ne!(owner_account, subscriber_account, "separate identities");
+    sync_account_into(&subscriber, &owner, owner_account);
+
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    crate::memory_write::set_subscription_owner(&subscriber, &owner_hex, NOW).unwrap();
+    (owner, subscriber, owner_account)
+}
+
+/// The read-only half of cross-account mirroring (#1156): the two guards `sync contribute` carries
+/// (an effective Writer grant, a fully-public local account) exist only because a contributor
+/// AUTHORS onto the owner's stream. A subscriber writes nothing there and is never pulled from, so
+/// it mirrors the same published stream with neither.
+#[test]
+fn a_subscriber_mirrors_a_published_owner_without_a_grant_or_a_public_account() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let subscriber_account = local_account(&subscriber, NOW).unwrap();
+    let owner_stream =
+        owner_stream_v2_id_for_account(REPO, owner_account, AccessMode::PublicRead).unwrap();
+    assert!(
+        rag_rat_oplog::effective_writer_grant(
+            &subscriber,
+            owner_account,
+            owner_stream,
+            subscriber_account,
+        )
+        .unwrap()
+        .is_none(),
+        "the subscriber holds no writer grant",
+    );
+
+    crate::drain_synced_memory(&subscriber).unwrap();
+    let titles = memory_titles(&subscriber);
+    assert!(
+        titles.contains(&"owner-note".to_string()),
+        "the owner's memories materialize here: {titles:?}",
+    );
+}
+
+/// The re-point is DRAIN-side only. A subscriber's own memories keep being authored onto its OWN
+/// stream (never the owner's — it holds no grant and would be rejected), and they stay
+/// `origin='local'`, which the drain's synced-only removal anti-joins spare even though they are
+/// absent from the mirrored owner's projection.
+#[test]
+fn a_subscribers_own_memories_go_to_its_own_stream_and_survive_the_mirror() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let subscriber_account = local_account(&subscriber, NOW).unwrap();
+    create_memory(&subscriber, concept("my-own-note")).unwrap();
+
+    // Authored on a stream the SUBSCRIBER owns, not on the owner's.
+    let owner_stream =
+        owner_stream_v2_id_for_account(REPO, owner_account, AccessMode::PublicRead).unwrap();
+    let on_owner_stream: i64 = subscriber
+        .query_row(
+            "SELECT COUNT(*) FROM content_entries WHERE stream_id = ?1 AND author_account_id = ?2",
+            params![owner_stream.to_bytes().as_slice(), subscriber_account.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(on_owner_stream, 0, "a subscriber authors nothing onto the owner's stream");
+    let owned: i64 = subscriber
+        .query_row(
+            "SELECT COUNT(*) FROM account_stream_ownership WHERE account_id = ?1",
+            [subscriber_account.to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owned, 1, "it established and authored a stream of its own");
+
+    // Draining the owner's stream must not condemn it: it is `origin='local'`, not synced.
+    crate::drain_synced_memory(&subscriber).unwrap();
+    let titles = memory_titles(&subscriber);
+    assert!(
+        titles.contains(&"my-own-note".to_string()),
+        "own work survives the mirror: {titles:?}"
+    );
+    assert!(titles.contains(&"owner-note".to_string()), "and the owner's arrived: {titles:?}");
+}
+
+/// A configured owner is not yet an AUTHORITY — the subscription twin of the contribution case.
+/// `sync subscribe` succeeds before the owner's log is synced, and a mistyped id derives a stream
+/// that never exists; both leave an EMPTY projection, and draining it would let the removal
+/// anti-joins condemn every synced row the repo currently reads.
+#[test]
+fn an_unsynced_or_mistyped_subscription_owner_never_becomes_removal_authority() {
+    let (_owner, subscriber, _owner_account) = subscription_pair();
+    crate::drain_synced_memory(&subscriber).unwrap();
+    assert!(memory_titles(&subscriber).contains(&"owner-note".to_string()));
+
+    // Re-point at an owner whose log was never synced. `set_subscription_owner` clears the incoming
+    // stream's watermark, so the next drain would otherwise make a FULL pass over an empty
+    // projection.
+    crate::memory_write::set_subscription_owner(&subscriber, &"ab".repeat(32), NOW).unwrap();
+    crate::drain_synced_memory(&subscriber).unwrap();
+    let titles = memory_titles(&subscriber);
+    assert!(
+        titles.contains(&"owner-note".to_string()),
+        "an unverified owner stream removes nothing: {titles:?}",
+    );
+}
+
+/// Contribution and subscription both RE-POINT the one stream that materializes a repo's memories,
+/// so configuring the second would make which one the drain honors ambiguous. Both setters refuse,
+/// rather than silently superseding the other's setup.
+#[test]
+fn subscription_and_contribution_refuse_to_coexist() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    let err = crate::memory_write::set_subscription_owner(&contributor, &"ab".repeat(32), NOW)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already contributes"), "subscribe names the conflict: {err}");
+
+    let (_owner2, subscriber, _owner_account2) = subscription_pair();
+    let err = crate::memory_write::set_contribution_owner(&subscriber, &"ab".repeat(32), NOW)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already subscribes"), "contribute names the conflict: {err}");
+}
+
+/// Subscribing to your OWN account would persist a configuration the drain ignores
+/// (`authoritative_content_stream` falls through when the configured owner is this store), so it
+/// is refused rather than stored as a lie.
+#[test]
+fn subscribing_to_your_own_account_is_refused() {
+    let store = scoped_conn();
+    let account = local_account(&store, NOW).unwrap();
+    let own_hex = rag_rat_base::hash::hex_lower(&account.to_bytes());
+    let err =
+        crate::memory_write::set_subscription_owner(&store, &own_hex, NOW).unwrap_err().to_string();
+    assert!(err.contains("your own account"), "the refusal names the cause: {err}");
 }

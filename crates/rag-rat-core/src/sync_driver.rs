@@ -926,13 +926,16 @@ async fn reconcile(
 /// * each configured contribution owner — this store authors onto the owner's stream and needs the
 ///   owner's log for authority plus the owner's content for read-back;
 /// * each effective writer grantee of this account — the grantee's contributions sit on THIS
-///   account's streams but only a session scoped to the GRANTEE's account carries them.
+///   account's streams but only a session scoped to the GRANTEE's account carries them;
+/// * each subscribed owner (#1156) — a read-only mirror is pull-only, and without its account here
+///   a subscription would be configured but never fetch anything.
 fn foreign_pull_targets(
     conn: &Connection,
     local: rag_rat_oplog::AccountId,
 ) -> anyhow::Result<Vec<rag_rat_oplog::AccountId>> {
     let mut targets: Vec<rag_rat_oplog::AccountId> =
         crate::memory_write::contribution_targets(conn)?.into_iter().map(|(_, o)| o).collect();
+    targets.extend(crate::memory_write::subscription_owners(conn)?);
     targets.extend(rag_rat_oplog::effective_writer_grantees(conn, local)?);
     targets.sort_unstable_by_key(|target| target.to_bytes());
     targets.dedup();
@@ -1685,6 +1688,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(foreign_pull_targets(&store, local).unwrap().len(), 2);
+    }
+
+    /// A read-only SUBSCRIBER (#1156) is pull-only: it authors nothing and is never served, so
+    /// nothing but this enumeration would ever fetch the owner's account — a subscription missing
+    /// here is configured but permanently empty.
+    #[test]
+    fn a_subscribed_owner_is_a_foreign_pull_target() {
+        let store = schema_conn();
+        let local = rag_rat_oplog::local_account(&store, 1_000).unwrap();
+        store
+            .execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES \
+                 ('repo-a','a',0)",
+                [],
+            )
+            .unwrap();
+        let owner = rag_rat_oplog::AccountId::from_bytes([0x55; 32]);
+        rag_rat_db::meta::set_repo_meta(
+            &store,
+            "repo-a",
+            "memory_subscription_owner",
+            &hash::hex_lower(&owner.to_bytes()),
+        )
+        .unwrap();
+        assert_eq!(foreign_pull_targets(&store, local).unwrap(), vec![owner]);
     }
 
     #[test]

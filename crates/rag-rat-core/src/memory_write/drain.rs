@@ -12,8 +12,9 @@
 //! ONE AUTHORITATIVE STREAM PER REPO. Which stream that is comes from
 //! [`authoritative_content_stream`] and there is never more than one: the removal anti-joins read
 //! "absent from this stream's projection" as "condemned", so a second stream materializing into the
-//! same repo would delete the first's rows. A granted contributor (#1164) therefore REPLACES its
-//! local derivation with the configured owner's stream rather than draining both.
+//! same repo would delete the first's rows. A granted contributor (#1164) and a read-only
+//! subscriber (#1156) therefore REPLACE the local derivation with the configured owner's stream
+//! rather than draining both — and a repo may hold at most one of those two configurations.
 //!
 //! CONVERGE, DON'T FREEZE. The accepted `/3` projection is the LWW-merged content across ALL of the
 //! account's devices, INCLUDING this one — so when another device updates or removes a memory/edge
@@ -94,7 +95,9 @@ impl DrainOutcome {
 /// then not restore them (each stream's watermark says it is up to date). So contribution mode
 /// (#1164) does not ADD the owner's stream to this repo's drain, it REPLACES the local one: a
 /// granted contributor authors nothing onto its own owner stream, which would sit empty and
-/// condemn everything the owner's stream materialized.
+/// condemn everything the owner's stream materialized. A read-only subscription (#1156) replaces it
+/// for the same reason, with the extra consequence that a subscribed repo stops draining its own
+/// account's stream — sibling-device sync for it pauses while the subscription is configured.
 ///
 /// Scope-gated the same way the reconcile is — a LEGACY placeholder or a `local:` shallow-clone id
 /// can never root an owner stream, so both yield `None`.
@@ -110,29 +113,18 @@ fn authoritative_content_stream(
     {
         return Ok(None);
     }
-    // A granted CONTRIBUTOR reads back the CONFIGURED owner's stream — where its own writes went
-    // and where the owner's and other contributors' memories live. A configured owner that IS this
-    // store is not contribution mode; fall through to the local derivation.
-    if let Some(owner) = super::authoring::contribution_owner_account(conn, repo_id)?
+    // A FOREIGN owner replaces the local derivation. Two configurations reach it, and a repo may
+    // hold at most one (both setters refuse the other): a granted CONTRIBUTOR (#1164) reads back
+    // the owner's stream — where its own writes went, and where the owner's and other contributors'
+    // memories live — and a read-only SUBSCRIBER (#1156) mirrors a published owner without
+    // authoring onto it. A configured owner that IS this store is neither; fall through to the
+    // local derivation.
+    let foreign_owner = super::authoring::contribution_owner_account(conn, repo_id)?
+        .or(super::authoring::subscription_owner_account(conn, repo_id)?);
+    if let Some(owner) = foreign_owner
         && rag_rat_oplog::read_local_account(conn)? != Some(owner)
     {
-        // Contribution targets the owner's PublicRead stream (v1 public only).
-        let stream = rag_rat_oplog::owner_stream_v2_id_for_account(
-            repo_id,
-            owner,
-            rag_rat_oplog::AccessMode::PublicRead,
-        )?;
-        // A DERIVED stream id is not yet an authority. `sync contribute` deliberately succeeds
-        // before the owner's log is synced (configure, then sync), and a mistyped owner id derives
-        // a stream that will never exist at all — in both cases the projection is EMPTY, and
-        // handing that to the drain would make the removal anti-joins condemn every synced row the
-        // repo currently reads. So authority begins only once the ownership fact has folded here.
-        // Until then this repo drains NOTHING: `None` rather than falling through to the local
-        // stream, whose own empty projection would condemn exactly the same rows.
-        if rag_rat_oplog::stream_owner_account(conn, stream)? != Some(owner) {
-            return Ok(None);
-        }
-        return Ok(Some(stream));
+        return verified_owner_stream(conn, repo_id, owner);
     }
     // Forward-derive the owner stream under the repo's access-mode intent — the SAME stream id the
     // live-write authored onto, so a published (PublicRead) repo drains its own public stream
@@ -141,6 +133,33 @@ fn authoritative_content_stream(
     // unstable scope).
     let mode = super::authoring::owner_stream_access_mode(conn, repo_id)?;
     rag_rat_oplog::owned_stream_v2_id_with_mode(conn, repo_id, mode)
+}
+
+/// `owner`'s stream for `repo_id`, but ONLY once the ownership fact has folded here.
+///
+/// A DERIVED stream id is not yet an authority. Both `sync contribute` and `sync subscribe`
+/// deliberately succeed before the owner's log is synced (configure, then sync), and a mistyped
+/// owner id derives a stream that will never exist at all — in both cases the projection is EMPTY,
+/// and handing that to the drain would make the removal anti-joins condemn every synced row the
+/// repo currently reads. So authority begins only once the ownership fact has folded here. Until
+/// then this repo drains NOTHING: `None` rather than falling through to the local stream, whose own
+/// empty projection would condemn exactly the same rows.
+///
+/// Both configurations target the owner's PublicRead stream (v1 public only).
+fn verified_owner_stream(
+    conn: &Connection,
+    repo_id: &str,
+    owner: rag_rat_oplog::AccountId,
+) -> anyhow::Result<Option<StreamId>> {
+    let stream = rag_rat_oplog::owner_stream_v2_id_for_account(
+        repo_id,
+        owner,
+        rag_rat_oplog::AccessMode::PublicRead,
+    )?;
+    if rag_rat_oplog::stream_owner_account(conn, stream)? != Some(owner) {
+        return Ok(None);
+    }
+    Ok(Some(stream))
 }
 
 /// Mirror a repo's accepted synced `/3` content into its local memory tables, from the one stream

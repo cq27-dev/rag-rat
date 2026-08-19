@@ -50,7 +50,8 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         | SyncCommand::Grant { .. }
         | SyncCommand::Revoke { .. }
         | SyncCommand::Grants
-        | SyncCommand::Contribute { .. } => {},
+        | SyncCommand::Contribute { .. }
+        | SyncCommand::Subscribe { .. } => {},
     }
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
@@ -100,9 +101,12 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         },
         SyncCommand::Whoami => {
             let account_id = db.sync_whoami()?;
+            let owner = db.sync_owner_config()?;
             print_output(&serde_json::json!({
                 "account_id": account_id,
                 "repo_id": db.active_repo_id,
+                "contribution_owner_account_id": owner.contribution_owner_account_id,
+                "subscription_owner_account_id": owner.subscription_owner_account_id,
                 "note": "share this account id with an owner so they can `sync grant` it write access to their repo's memories",
             }))
         },
@@ -166,6 +170,16 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "repo_id": db.active_repo_id,
                 "owner_account_id": account,
                 "note": "memory changes for this repo now target the owner's stream; the owner must `sync grant` this account, and this store needs the owner's log — automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
+            }))
+        },
+        SyncCommand::Subscribe { account } => {
+            db.sync_subscribe(account)?;
+            print_output(&serde_json::json!({
+                "status": "subscribed",
+                "repo_id": db.active_repo_id,
+                "owner_account_id": account,
+                "read_only": true,
+                "note": "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched, but its other devices' memories stop arriving while subscribed. This store needs the owner's log: automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
             }))
         },
         SyncCommand::Serve { .. }
@@ -941,11 +955,12 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
         };
 
         // Materialize what landed, and MEASURE the result rather than asserting it. The drain
-        // mirrors exactly ONE authoritative stream per repo: the configured contribution owner's,
-        // or this store's own. Those cover the two directions contribution needs — a contributor
-        // pulling its owner, and an owner pulling a contributor (whose entries sit on the owner's
-        // own stream). A standalone reader pulling some third account it neither owns nor
-        // contributes to has nowhere to put the content, and must not be told otherwise.
+        // mirrors exactly ONE authoritative stream per repo: a configured contribution owner's, a
+        // subscribed owner's, or this store's own. Those cover a contributor pulling its owner, an
+        // owner pulling a contributor (whose entries sit on the owner's own stream), and a
+        // read-only subscriber pulling the owner it mirrors. A pull of some third account this repo
+        // neither owns, contributes to, nor subscribes to has nowhere to put the content, and must
+        // not be told otherwise.
         let effects = rag_rat_core::drain_synced_memory(conn)?;
         rag_rat_core::resolve_synced_distill_anchors(conn)?;
         db.fold_wal();
@@ -953,15 +968,20 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
         // A successful pull implies convergence — the shared helper only reports a peer after
         // both legs converged, so there is no "incomplete success" to describe.
         let note = if effects.nodes_written > 0 || effects.edges_written > 0 {
-            "these memories are searchable locally; their code anchors do not cross an account \
-             boundary, so they will not attach as drive-by context"
+            "these memories are searchable locally, and the code anchors their author published \
+             are seeded here, so they attach as drive-by context wherever they resolve against \
+             this index — a symbol, path, or commit this checkout does not have stays unresolved \
+             and simply attaches nowhere. Call-path and chunk bindings are not carried across an \
+             account boundary, and anchors are seeded only for a memory this store holds none for"
         } else if !effects.is_empty() {
             "the authority this pull brought RETRACTED memories here — the drain removed what the \
              owner's log no longer accepts; nothing new was added"
         } else if content_entries > 0 {
             "content arrived but nothing materialized into this repo's memories: a repo mirrors \
-             ONE stream — its own, or a configured contribution owner's. Run `sync contribute \
-             <this account>` to mirror it, or pull from a store that owns or contributes to it"
+             ONE stream — its own, a subscribed owner's, or a configured contribution owner's. Run \
+             `sync subscribe <this account>` to mirror it read-only, `sync contribute <this \
+             account>` if you also intend to author back (that one needs a Writer grant from the \
+             owner), or pull from a store that already mirrors it"
         } else {
             "already up to date with this account"
         };

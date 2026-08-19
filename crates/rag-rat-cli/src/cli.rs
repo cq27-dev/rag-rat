@@ -389,6 +389,22 @@ pub(crate) enum SyncCommand {
         #[arg(value_name = "TICKET_OR_OWNER_ACCOUNT_ID")]
         account: String,
     },
+    /// Mirror another identity's published memories into this repo, read-only.
+    #[command(long_about = "Configures this repo's memories to materialize from ANOTHER \
+                            account's published owner stream instead of its own. Read-only: \
+                            nothing is authored onto the owner's stream, so no Writer grant is \
+                            needed — use `sync contribute` instead if you also intend to write \
+                            back. This store's own memories keep being authored onto its own \
+                            stream and are never removed by the mirror, but while subscribed \
+                            this repo stops mirroring its own account, so its other devices' \
+                            memories stop arriving. The owner's log must reach this store before \
+                            anything materializes: automatic sync pulls it once the owner's host \
+                            is in [sync] server_peers, or run `rag-rat sync pull <owner>`.")]
+    Subscribe {
+        /// The owner's 64-hex account id, from the owner's `rag-rat sync whoami`.
+        #[arg(value_name = "OWNER_ACCOUNT_ID")]
+        account: String,
+    },
     /// Fetch ANOTHER account's memories from a peer that serves them.
     #[command(long_about = "Syncs a DIFFERENT account's log and memories from a peer, then \
                             materializes them locally. This is how a contributor gets the \
@@ -1175,6 +1191,19 @@ mod tests {
             Command::Sync(SyncArgs { command: SyncCommand::Contribute { account } }) =>
                 assert_eq!(account, "cd".repeat(32)),
             other => panic!("expected sync contribute, got {other:?}"),
+        }
+    }
+
+    /// `sync subscribe` takes an owner ACCOUNT ID only — deliberately not a ticket, which exists to
+    /// carry a writer grant a read-only mirror never needs.
+    #[test]
+    fn sync_subscribe_parses() {
+        let cli =
+            Cli::try_parse_from(["rag-rat", "sync", "subscribe", &"ef".repeat(32)]).expect("parse");
+        match cli.command {
+            Command::Sync(SyncArgs { command: SyncCommand::Subscribe { account } }) =>
+                assert_eq!(account, "ef".repeat(32)),
+            other => panic!("expected sync subscribe, got {other:?}"),
         }
     }
 
