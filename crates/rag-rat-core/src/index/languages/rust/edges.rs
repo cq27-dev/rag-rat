@@ -529,6 +529,19 @@ fn path_tail_node(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+/// The identifier a nominal type ends in, normalized the way [`super::render_owner`] normalizes an
+/// identifier leaf — trimmed, `r#` stripped, NFC — so it is the same token the rendered path's tail
+/// carries. `None` when the peel does not reach an identifier at all (`<W as Tr>::Assoc`, `&W`, a
+/// tuple, a macro), which only the rendered path can name.
+fn plain_type_tail<'a>(type_node: Node<'_>, text: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+    let tail = path_tail_node(type_node)?;
+    if !matches!(tail.kind(), "type_identifier" | "identifier") {
+        return None;
+    }
+    let token = text.get(tail.byte_range())?.trim();
+    Some(super::nfc_ident(token.strip_prefix("r#").unwrap_or(token)))
+}
+
 /// The receiver type a declaration names, or `None` when this pass cannot name it.
 ///
 /// `type_node` supplies the type's structure; `context` supplies lexical binders and declarations.
@@ -709,7 +722,7 @@ fn visible_let_binding(
             clean_rust_type_name(type_node, type_node, text)
                 .and_then(|type_name| canonical_receiver_type(type_name, type_node, text))
         } else {
-            constructor_owner(child.child_by_field_name("value"), text)
+            binding_type_from_scoped_call(child.child_by_field_name("value"), text)
         };
         return type_name.map(VisibleBinding::Typed).unwrap_or(VisibleBinding::Shadowed);
     }
@@ -770,7 +783,15 @@ fn scope_declares_item(
     })
 }
 
-fn constructor_owner(value: Option<Node<'_>>, text: &str) -> Option<String> {
+/// The type of a `let` binding initialized by a scoped call `Owner::callee(..)`, read off the
+/// callee's DECLARED return type when the callee is declared in THIS file.
+///
+/// Nothing here requires the callee to construct anything: any same-file `function_item` of that
+/// name in a tail-matching impl answers. A UFCS method call (`Store::handle(&st)` where
+/// `fn handle(&self) -> Handle`) and a pure transformation (`Store::validate(st) -> Self`) type
+/// their bindings exactly as a constructor does, because the declaration — not the callee's name
+/// or shape — is the evidence.
+fn binding_type_from_scoped_call(value: Option<Node<'_>>, text: &str) -> Option<String> {
     let value = value?;
     if value.kind() != "call_expression" {
         return None;
@@ -780,55 +801,62 @@ fn constructor_owner(value: Option<Node<'_>>, text: &str) -> Option<String> {
         return None;
     }
     let owner_node = function.child_by_field_name("path")?;
-    let method_name = text.get(function.child_by_field_name("name")?.byte_range())?.trim();
-    // Only the two strongest conventions survive: Rust does not force ANY method to return
-    // `Self`, so `from`/`with_*` (routinely builder- or conversion-shaped) are declined
-    // outright, and `new`/`default` are verified against the constructor's DECLARED return type
-    // whenever it is visible in this file — a same-file `Factory::new() -> Worker` re-types the
-    // hint to `Worker`; an opaque or unit return declines. A constructor defined in another file
-    // also declines: Rust does not require `new` or `default` to return `Self`, so the owner name
-    // alone is not type evidence (#567).
-    if !matches!(method_name, "new" | "default") {
-        return None;
-    }
+    let callee = text.get(function.child_by_field_name("name")?.byte_range())?.trim();
+    // The hint comes from the DECLARED return type, never from the callee's name. A same-file
+    // `Factory::make() -> Worker` types the binding `Worker` exactly as `Factory::new()` would; an
+    // opaque or unit return declines, and so does a callee declared in another file, because Rust
+    // does not require any method to return `Self` and the owner name alone is not type evidence
+    // (#567).
+    //
+    // No name filter, therefore: `from` and `with_*` used to be declined outright as
+    // builder-shaped, but a builder that declares `-> Self` IS returning the owner, and one that
+    // declares something else says so. Reading the declaration answers for every name, so
+    // restricting to `new`/`default` only cost coverage — the convention was never what made the
+    // hint sound.
     let owner = clean_rust_type_name(owner_node, function, text)?;
-    let owner_canonical = canonical_receiver_type(owner.clone(), value, text)?;
-    match same_file_constructor_return(value, text, &owner_canonical, method_name) {
-        CtorReturn::SelfLike => Some(owner_canonical),
-        CtorReturn::Other(declared) => Some(declared),
-        CtorReturn::Opaque | CtorReturn::Unknown => None,
-    }
+    same_file_declared_return(value, text, &owner, callee)
 }
 
-enum CtorReturn {
-    /// Declared `-> Self` (or the owner type itself) — the convention holds.
-    SelfLike,
+/// What `impl <Owner> { fn <callee> … }` declares it returns.
+enum DeclaredReturn {
+    /// Declared `-> Self`, or the owner type spelled out.
+    Owner,
     /// Declared a different clean local type — use THAT as the receiver type.
     Other(String),
     /// Declared something this inference cannot name (generics chains, unit, `impl Trait`).
     Opaque,
-    /// The constructor is not defined in this file — without its return declaration, inference
-    /// must decline rather than assume a constructor-like name returns the owner.
-    Unknown,
 }
 
-/// Find `impl <Owner> { fn <ctor> ... }` in THIS file and classify its declared return type.
-fn same_file_constructor_return(node: Node<'_>, text: &str, owner: &str, ctor: &str) -> CtorReturn {
+/// The binding type an `Owner::callee(..)` call implies, from a declaration of `callee` in THIS
+/// file. `None` when no same-file impl declares it, when more than one does, or when what it
+/// declares is unnameable here — without a readable return declaration the inference must decline
+/// rather than assume a scoped call returns its owner.
+///
+/// Two passes, and the ORDER carries the cost of the whole path. The tail filter walks this file's
+/// impl headers, so it is bounded by how many impls the file holds. Canonicalizing the owner scans
+/// every enclosing scope for a shadowing item or import, so it costs a pass over the enclosing
+/// BLOCK — and every `let` in a long function asks. Most scoped calls name a callee declared in
+/// another file, so those must reach their decline from the header walk alone, without paying for a
+/// canonical owner path nothing will read.
+fn same_file_declared_return(
+    node: Node<'_>,
+    text: &str,
+    owner: &str,
+    callee: &str,
+) -> Option<String> {
+    // `Self` is the one owner spelling that does not carry its type's tail, so it is resolved
+    // before the tail filter. That resolution reads the enclosing impl header, not the block.
+    let resolved_self = (owner == "Self").then(|| infer_self_type_hint(node, text));
+    let owner = match &resolved_self {
+        Some(resolved) => resolved.as_deref()?,
+        None => owner,
+    };
+    let owner_tail = qn_tail(owner);
     let mut root = node;
     while let Some(parent) = root.parent() {
         root = parent;
     }
-    // Impl candidacy is decided on CANONICAL module-qualified owner paths, never on the type
-    // tail alone: one file may hold `mod a { impl Factory }` and `mod b { impl Factory }`, and a
-    // tail match would classify `a::Factory::new()` through module b's constructor. Candidates
-    // the canonicalization cannot tell apart (either side undecidable) still count — and MORE
-    // THAN ONE surviving candidate is ambiguity, which must decline rather than fall back to
-    // the naming convention. Missing or ambiguous same-file definitions decline the hint.
-    let owner_tail = qn_tail(owner);
-    // `constructor_owner` already resolved this against the call's lexical module. Re-applying
-    // module qualification here would turn `a::Factory` into `a::a::Factory`.
-    let owner_canonical = owner.to_string();
-    let mut candidates: Vec<CtorReturn> = Vec::new();
+    let mut tail_matched: Vec<(Node<'_>, String)> = Vec::new();
     let mut stack = vec![root];
     while let Some(current) = stack.pop() {
         let mut cursor = current.walk();
@@ -836,6 +864,14 @@ fn same_file_constructor_return(node: Node<'_>, text: &str, owner: &str, ctor: &
             match child.kind() {
                 "impl_item" => {
                     let Some(type_node) = child.child_by_field_name("type") else { continue };
+                    // The walk visits every impl in the file for every scoped-call binding in it,
+                    // so an impl that cannot match must cost a token compare rather than a
+                    // canonical render plus its allocation. The peel reaches the same identifier
+                    // the rendered path's tail carries, and declines to answer for a target it
+                    // cannot reduce to one — those still go the long way round.
+                    if plain_type_tail(type_node, text).is_some_and(|tail| tail != owner_tail) {
+                        continue;
+                    }
                     let impl_type = super::render_owner(type_node, text, &[]);
                     let impl_tail = qn_tail(degeneric_path(&impl_type).trim()).to_string();
                     if impl_tail != owner_tail {
@@ -843,74 +879,101 @@ fn same_file_constructor_return(node: Node<'_>, text: &str, owner: &str, ctor: &
                     }
                     // A BLANKET impl (`impl<Factory: Build> Build for Factory`) names its own
                     // binder as the target, so its tail matches any owner spelled the same way.
-                    // Counting it as a candidate is how a real constructor gets outvoted into
-                    // `Opaque` and its hint dropped — it implements nothing this call constructs.
+                    // Counting it as a candidate is how a real declaration gets outvoted into
+                    // ambiguity and its hint dropped — it implements nothing this call names.
                     if binders::binds_name(type_node, &impl_tail, text) {
                         continue;
                     }
-                    let impl_canonical = module_qualified_type_path(child, &impl_type, text);
-                    // An impl this pass CAN place, on some other type, is not this constructor's.
-                    // One it cannot place is not evidence either way, so it still gets a look.
-                    if impl_canonical.as_deref().is_some_and(|path| path != owner_canonical) {
-                        continue;
-                    }
-                    let Some(classified) =
-                        classify_constructor_return(child, text, ctor, impl_canonical.as_deref())
-                    else {
-                        continue; // this impl does not define the constructor
-                    };
-                    candidates.push(classified);
+                    tail_matched.push((child, impl_type));
                 },
-                // Constructors can sit inside inline modules; anything else cannot contain an
-                // impl at item level.
+                // Impls can sit inside inline modules; anything else cannot contain an impl at
+                // item level.
                 "mod_item" | "declaration_list" => stack.push(child),
                 _ => {},
             }
         }
     }
-    match candidates.len() {
-        0 => CtorReturn::Unknown,
-        1 => candidates.into_iter().next().expect("len checked"),
-        _ => CtorReturn::Opaque,
+    if tail_matched.is_empty() {
+        return None;
+    }
+    // Impl candidacy is decided on CANONICAL module-qualified owner paths, never on the type tail
+    // alone: one file may hold `mod a { impl Factory }` and `mod b { impl Factory }`, and a tail
+    // match would classify `a::Factory::make()` through module b's declaration. Candidates the
+    // canonicalization cannot tell apart (either side undecidable) still count — and MORE THAN ONE
+    // surviving candidate is ambiguity, which must decline rather than pick a traversal order.
+    let owner_canonical = match &resolved_self {
+        // `infer_self_type_hint` already resolved against the impl's own module; qualifying again
+        // here would turn `a::Factory` into `a::a::Factory`.
+        Some(_) => owner.to_string(),
+        None => module_qualified_type_path(node, owner, text)?,
+    };
+    let mut candidates: Vec<DeclaredReturn> = Vec::new();
+    for (impl_node, impl_type) in tail_matched {
+        let impl_canonical = module_qualified_type_path(impl_node, &impl_type, text);
+        // An impl this pass CAN place, on some other type, is not the callee's. One it cannot
+        // place is not evidence either way, so it still gets a look.
+        if impl_canonical.as_deref().is_some_and(|path| path != owner_canonical) {
+            continue;
+        }
+        let Some(classified) =
+            classify_declared_return(impl_node, text, callee, impl_canonical.as_deref())
+        else {
+            continue; // this impl does not declare the callee
+        };
+        candidates.push(classified);
+    }
+    if candidates.len() != 1 {
+        return None;
+    }
+    match candidates.into_iter().next().expect("len checked") {
+        DeclaredReturn::Owner => Some(owner_canonical),
+        DeclaredReturn::Other(declared) => Some(declared),
+        DeclaredReturn::Opaque => None,
     }
 }
 
-/// Classify the declared return type of `impl { fn <ctor> }`, or `None` when this impl does not
-/// define the constructor at all.
-fn classify_constructor_return(
+/// Classify the declared return type of `impl { fn <callee> }`, or `None` when this impl does not
+/// declare the callee at all.
+fn classify_declared_return(
     impl_node: Node<'_>,
     text: &str,
-    ctor: &str,
+    callee: &str,
     impl_canonical: Option<&str>,
-) -> Option<CtorReturn> {
+) -> Option<DeclaredReturn> {
     let body = impl_node.child_by_field_name("body")?;
     let mut cursor = body.walk();
     for item in body.named_children(&mut cursor) {
-        if item.kind() != "function_item" || child_name_text(item, text).as_deref() != Some(ctor) {
+        if item.kind() != "function_item" || child_name_text(item, text).as_deref() != Some(callee)
+        {
             continue;
         }
         let Some(return_node) = item.child_by_field_name("return_type") else {
-            // A "constructor" declared to return `()` constructs nothing.
-            return Some(CtorReturn::Opaque);
+            // A callee declared to return `()` produces no value to type the binding with.
+            return Some(DeclaredReturn::Opaque);
         };
-        // Anchored at the RETURN node, so the binders in force are the constructor's own impl
-        // and fn — `impl<T> Factory<T> { fn new<U>() -> U }` returns whatever the call site
-        // instantiates. The caller's binders are not in scope here and are not consulted, so
-        // `fn test<Worker>(..)` calling a constructor that genuinely returns the concrete
-        // `Worker` still gets its hint.
+        // Anchored at the RETURN node, so the binders in force are the callee's own impl and fn —
+        // `impl<T> Factory<T> { fn new<U>() -> U }` returns whatever the call site instantiates.
+        // The caller's binders are not in scope here and are not consulted, so a `fn test<Worker>`
+        // calling a declaration that genuinely returns the concrete `Worker` still gets its hint.
         let Some(declared) = clean_rust_type_name(return_node, return_node, text) else {
-            return Some(CtorReturn::Opaque);
+            return Some(DeclaredReturn::Opaque);
         };
         if declared == "Self" {
-            return Some(CtorReturn::SelfLike);
+            return Some(DeclaredReturn::Owner);
+        }
+        // A declared type that still carries generic arguments names no receiver: `-> Result<Self,
+        // E>` would emit `Result<Self,E>`, which resolves to nothing and — being present — also
+        // closes the bare-name fallback, so the call would stop resolving at all.
+        if degeneric_path(&declared) != declared {
+            return Some(DeclaredReturn::Opaque);
         }
         let Some(declared_canonical) = module_qualified_type_path(item, &declared, text) else {
-            return Some(CtorReturn::Opaque);
+            return Some(DeclaredReturn::Opaque);
         };
         return Some(if impl_canonical == Some(declared_canonical.as_str()) {
-            CtorReturn::SelfLike
+            DeclaredReturn::Owner
         } else {
-            CtorReturn::Other(declared_canonical)
+            DeclaredReturn::Other(declared_canonical)
         });
     }
     None
@@ -1186,7 +1249,7 @@ mod receiver_type_hint_tests {
     }
 
     #[test]
-    fn constructor_owner_comes_from_the_scoped_path_node() {
+    fn the_binding_owner_comes_from_the_scoped_path_node() {
         let code = r#"
             mod factory {
                 impl Factory { fn new() -> Worker { Worker } }
@@ -1331,7 +1394,7 @@ mod receiver_type_hint_tests {
     }
 
     #[test]
-    fn test_same_file_factory_return_type_overrides_the_convention() {
+    fn a_declared_return_of_another_type_retypes_the_hint() {
         let code = r#"
             impl Factory {
                 fn new() -> Worker { Worker }
@@ -1341,9 +1404,127 @@ mod receiver_type_hint_tests {
                 w.run();
             }
         "#;
-        // The declared return type is visible in this file: the receiver is a Worker, not a
-        // Factory — the naming convention must lose to the declaration.
+        // The declared return type is visible in this file: the receiver is a Worker, not the
+        // owner the call is scoped to.
         assert_eq!(extract_call_hints(code), vec![None, Some("Worker".to_string())]);
+    }
+
+    /// The callee's NAME is not what makes the hint sound — its declared return type is — so any
+    /// same-file associated item answers, whatever it is called and whatever it does.
+    ///
+    /// `new`/`default` used to be the only names considered, on the reasoning that Rust forces no
+    /// method to return `Self`. True, and exactly why the declaration is read: a builder-shaped
+    /// `with_capacity` that declares `-> Self` IS returning the owner, and one that declares
+    /// something else says so in the same place. Nothing checks that the callee constructs
+    /// anything, so a UFCS method call and a trait impl's associated fn answer on the same terms.
+    #[test]
+    fn a_same_file_declaration_answers_for_any_associated_item() {
+        let self_returning = r#"
+            impl Buffer {
+                fn with_capacity(n: usize) -> Self { todo!() }
+            }
+            fn test() {
+                let b = Buffer::with_capacity(8);
+                b.run();
+            }
+        "#;
+        assert_eq!(
+            extract_call_hints(self_returning),
+            vec![None, Some("Buffer".to_string())],
+            "a `-> Self` builder types its binding like any constructor",
+        );
+
+        // And the declaration still decides WHICH type, under a name no convention covers.
+        let other_returning = r#"
+            impl Factory {
+                fn spawn_worker() -> Worker { todo!() }
+            }
+            fn test() {
+                let w = Factory::spawn_worker();
+                w.run();
+            }
+        "#;
+        assert_eq!(
+            extract_call_hints(other_returning),
+            vec![None, Some("Worker".to_string())],
+            "the declared return re-types the hint regardless of the name",
+        );
+
+        // A `&self` method called through UFCS is a scoped call like any other, and its return is
+        // declared in the same place — the callee constructs nothing and still answers.
+        let ufcs_method = r#"
+            impl Store {
+                fn handle(&self) -> Handle { todo!() }
+            }
+            fn test(st: Store) {
+                let h = Store::handle(&st);
+                h.zap();
+            }
+        "#;
+        assert_eq!(
+            extract_call_hints(ufcs_method),
+            vec![None, Some("Handle".to_string())],
+            "a UFCS method call is typed by its declared return, not by being a constructor",
+        );
+
+        // `Self` in a TRAIT impl is the impl's `type`, not the trait — `impl From<u8> for Config`
+        // returning `Self` is a `Config`, never a `From<u8>`.
+        let trait_impl = r#"
+            impl From<u8> for Config {
+                fn from(v: u8) -> Self { todo!() }
+            }
+            fn test() {
+                let c = Config::from(3u8);
+                c.zap();
+            }
+        "#;
+        assert_eq!(
+            extract_call_hints(trait_impl),
+            vec![None, Some("Config".to_string())],
+            "a trait impl's `Self` is the implementing type",
+        );
+    }
+
+    /// A declared return this pass cannot peel names no receiver. `-> Result<Self, E>` reads as a
+    /// nameable path right up to its arguments, and carrying it through would be worse than
+    /// silence: nothing resolves `Result<Self,E>`, and a receiver type that is PRESENT closes the
+    /// bare-name fallback the call had without any hint at all.
+    #[test]
+    fn a_declared_return_carrying_generic_arguments_declines() {
+        for declared in ["Result<Self, E>", "Option<Self>", "Vec<Worker>", "Result<Worker, E>"] {
+            let code = format!(
+                r#"
+                    impl Worker {{
+                        fn make() -> {declared} {{ todo!() }}
+                    }}
+                    fn test() {{
+                        let w = Worker::make();
+                        w.run();
+                    }}
+                "#
+            );
+            assert_eq!(extract_call_hints(&code), vec![None, None], "{declared}");
+        }
+    }
+
+    /// One type can implement `From` many times, and every impl declares a `from`. Nothing in the
+    /// call `Config::from(3u8)` says which one it reaches — the argument types would, and this pass
+    /// does not read them — so the honest answer is no hint at all.
+    #[test]
+    fn duplicate_trait_impls_on_one_type_go_ambiguous() {
+        let code = r#"
+            impl From<u8> for Config {
+                fn from(v: u8) -> Self { todo!() }
+            }
+            impl From<u16> for Config {
+                fn from(v: u16) -> Config { todo!() }
+            }
+            fn test() {
+                let c = Config::from(3u8);
+                c.zap();
+            }
+        "#;
+        assert_eq!(extract_call_hints(code), vec![None, None]);
     }
 
     /// A binder is in force at every position inside the item that declares it, so the binder
@@ -1390,7 +1571,7 @@ mod receiver_type_hint_tests {
     }
 
     /// A blanket impl's target is its own binder, so its `new` is not a candidate constructor for
-    /// a same-spelled concrete owner — counting it would outvote the real one into `Opaque`.
+    /// a same-spelled concrete owner — counting it would outvote the real one into ambiguity.
     #[test]
     fn test_a_blanket_impl_does_not_outvote_the_real_constructor() {
         let code = r#"
@@ -1600,20 +1781,6 @@ mod receiver_type_hint_tests {
         "#;
         // A same-file `new` that returns `()` constructs nothing — the binding's type is unknown.
         assert_eq!(extract_call_hints(code), vec![None, None]);
-    }
-
-    #[test]
-    fn test_from_and_builder_initializers_declined() {
-        let code = r#"
-            fn test(source: u8) {
-                let a = Worker::from(source);
-                a.run();
-                let b = Worker::with_capacity(4);
-                b.run();
-            }
-        "#;
-        // Rust does not require `from`/`with_*` to return `Self` — no convention inference.
-        assert_eq!(extract_call_hints(code), vec![None, None, None, None]);
     }
 
     #[test]
@@ -2352,5 +2519,53 @@ mod receiver_type_hint_tests {
         let hints = extract_call_hints(&code);
         assert_eq!(hints.len(), 20_000);
         assert!(hints.into_iter().all(|hint| hint.is_none()));
+    }
+
+    /// A plain-identifier initializer never enters the same-file declaration scan, so the case
+    /// above pins only the backward `let` walk. This one pins the scan itself, on the answer it
+    /// gives most often: the callee is declared in another file.
+    ///
+    /// The ceiling is the ORDER inside that scan. Deciding "no impl here declares it" reads this
+    /// file's impl headers; canonicalizing the owner instead scans every enclosing scope for a
+    /// shadowing item or import, which is a pass over the enclosing block. Pay the second one
+    /// before the first and the cost is bindings x block size, and this fixture stops finishing.
+    #[test]
+    fn receiver_hint_scan_handles_twenty_thousand_scoped_call_initializers() {
+        let mut code = String::from("fn test() {");
+        for _ in 0..20_000 {
+            code.push_str("let worker = Owner::make(); worker.run();");
+        }
+        code.push('}');
+
+        let hints = extract_call_hints(&code);
+        assert_eq!(hints.len(), 40_000);
+        assert!(hints.into_iter().all(|hint| hint.is_none()));
+    }
+
+    /// The case above holds no impl at all, so its scan stops at the header walk. This one pins
+    /// where that walk leads: an impl whose tail matches sends the binding on to canonicalize its
+    /// owner — a pass over the enclosing block — and the file's other impls are re-walked for every
+    /// binding that asks. Both terms are paid under any callee name now, where the `new`/`default`
+    /// gate used to return before either, so the header walk has to decline a non-matching impl on
+    /// an identifier compare rather than a canonical render.
+    #[test]
+    fn receiver_hint_scan_handles_a_matching_impl_among_thousands() {
+        let mut code = String::from("impl Owner { fn make() -> Self { todo!() } }\n");
+        for i in 0..2_000 {
+            code.push_str(&format!("impl Other{i} {{ fn make() -> Self {{ todo!() }} }}\n"));
+        }
+        code.push_str("fn test() {");
+        for _ in 0..1_000 {
+            code.push_str("let worker = Owner::make(); worker.run();");
+        }
+        code.push('}');
+
+        let hints = extract_call_hints(&code);
+        assert_eq!(hints.len(), 2_000);
+        assert_eq!(
+            hints.iter().filter(|hint| hint.as_deref() == Some("Owner")).count(),
+            1_000,
+            "the one impl whose tail matches types every binding",
+        );
     }
 }

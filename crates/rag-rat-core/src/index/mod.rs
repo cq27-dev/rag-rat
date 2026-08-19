@@ -404,7 +404,10 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // `receiver_type_hint_id` so deployed indexes do not keep those calls untyped.
 // 16: Rust receiver type naming reads AST structure instead of reparsing rendered strings; raw
 // identifiers and constructor paths now share the canonical owner printer, so re-extract hints.
-const GRAPH_INDEX_VERSION: &str = "16";
+// 17: a same-file declared return types a `let` binding under ANY callee name, not only
+// `new`/`default`, and a declared return carrying generic arguments declines instead of naming
+// itself; re-extract `receiver_type_hint_id` so deployed indexes gain the one and drop the other.
+const GRAPH_INDEX_VERSION: &str = "17";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
 // on next open. Incremental discovery only rewrites a file row when its sha/language/kind changes —
