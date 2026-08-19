@@ -395,16 +395,41 @@ pub(crate) enum SyncCommand {
                             nothing is authored onto the owner's stream, so no Writer grant is \
                             needed — use `sync contribute` instead if you also intend to write \
                             back. This store's own memories keep being authored onto its own \
-                            stream and are never removed by the mirror, but while subscribed \
-                            this repo stops mirroring its own account, so its other devices' \
-                            memories stop arriving. The owner's log must reach this store before \
-                            anything materializes: automatic sync pulls it once the owner's host \
-                            is in [sync] server_peers, or run `rag-rat sync pull <owner>`.")]
+                            stream and are never removed by the mirror. What IS removed: exactly \
+                            one stream materializes a repo, so while subscribed this repo stops \
+                            mirroring its own account and the next drain DELETES every memory \
+                            this account's other devices had synced here — they do not go stale, \
+                            they go away. `sync unsubscribe` restores them, EXCEPT for local \
+                            binding work: a `memory rebind` you made on a synced memory is lost \
+                            with the row, because a re-drain seeds only the anchors its author \
+                            published. The owner's log must reach this store before anything \
+                            materializes: automatic sync pulls it once the owner's host is in \
+                            [sync] server_peers, or run `rag-rat sync pull <owner>`.")]
     Subscribe {
         /// The owner's 64-hex account id, from the owner's `rag-rat sync whoami`.
         #[arg(value_name = "OWNER_ACCOUNT_ID")]
         account: String,
     },
+    /// Stop mirroring a subscribed identity's memories.
+    #[command(long_about = "Clears this repo's `sync subscribe` configuration: its memories \
+                            materialize from its OWN account's stream again. The next drain \
+                            restores the memories this account's other devices had synced here \
+                            (the subscription deleted them) and removes the owner's in turn — \
+                            each side is re-materialized from its stream's projection, so the \
+                            round trip is lossless EXCEPT for checkout-local binding work: a \
+                            `memory rebind` made on a synced memory is not restored, because the \
+                            re-drain seeds only the anchors the memory's author published.")]
+    Unsubscribe,
+    /// Stop contributing this repo's memories to a configured owner.
+    #[command(long_about = "Clears this repo's `sync contribute` configuration: memory authoring \
+                            targets this store's own stream again, which is also the stream the \
+                            repo's memories materialize from, so the next drain restores what \
+                            this account's own devices synced here and removes the owner's. \
+                            Nothing is withdrawn from the owner: the contributions already \
+                            authored onto its stream stay, this store keeps its own copies of \
+                            them, and the Writer grant remains open until the owner runs `sync \
+                            revoke`.")]
+    Uncontribute,
     /// Fetch ANOTHER account's memories from a peer that serves them.
     #[command(long_about = "Syncs a DIFFERENT account's log and memories from a peer, then \
                             materializes them locally. This is how a contributor gets the \
@@ -1205,6 +1230,24 @@ mod tests {
                 assert_eq!(account, "ef".repeat(32)),
             other => panic!("expected sync subscribe, got {other:?}"),
         }
+    }
+
+    /// Both unsets take no argument — a repo configures at most one owner, so there is nothing to
+    /// name — and neither accepts one, so a pasted account id is a parse error rather than a
+    /// silently ignored word.
+    #[test]
+    fn sync_unsubscribe_and_uncontribute_parse_without_an_account() {
+        let cli = Cli::try_parse_from(["rag-rat", "sync", "unsubscribe"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Sync(SyncArgs { command: SyncCommand::Unsubscribe })
+        ));
+        let cli = Cli::try_parse_from(["rag-rat", "sync", "uncontribute"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Command::Sync(SyncArgs { command: SyncCommand::Uncontribute })
+        ));
+        assert!(Cli::try_parse_from(["rag-rat", "sync", "unsubscribe", &"ef".repeat(32)]).is_err());
     }
 
     #[test]

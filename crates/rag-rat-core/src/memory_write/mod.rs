@@ -24,14 +24,14 @@ pub(crate) use api::{create_memory, mark_obsolete, rebind_memory, update_memory}
 pub(crate) use authoring::backfill_memory_oplog;
 pub(crate) use authoring::{
     RepoGrantListing, RepoOwnerConfig, RepoRevokeReport, catch_up_enrolled_device_keys,
-    enable_public_authoring, enable_sealed_authoring, grant_repo_writer, list_repo_grants,
-    published_grant_target, repo_owner_config, revoke_repo_writer, set_contribution_owner,
-    set_subscription_owner,
+    clear_contribution_owner, clear_subscription_owner, enable_public_authoring,
+    enable_sealed_authoring, grant_repo_writer, list_repo_grants, published_grant_target,
+    repo_owner_config, revoke_repo_writer, set_contribution_owner, set_subscription_owner,
 };
 // The scope-explicit reconcile entry (#541): `authoring` is a PRIVATE module, so
 // `index::consolidate` names this through this re-export (Task 5 of #541).
 pub(crate) use authoring::{
-    contribution_targets, ensure_not_contributing, reconcile_owner_stream_for_repo,
+    contribution_targets, ensure_not_mirroring_another_account, reconcile_owner_stream_for_repo,
     subscription_owners,
 };
 // The synced-content drain entries (#691 A1): the per-repo drain (consolidate) and the

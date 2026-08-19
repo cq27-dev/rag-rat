@@ -97,11 +97,15 @@ impl DrainOutcome {
 /// granted contributor authors nothing onto its own owner stream, which would sit empty and
 /// condemn everything the owner's stream materialized. A read-only subscription (#1156) replaces it
 /// for the same reason, with the extra consequence that a subscribed repo stops draining its own
-/// account's stream — sibling-device sync for it pauses while the subscription is configured.
+/// account's stream: every `origin='synced'` row its SIBLING DEVICES put there is absent from the
+/// owner's projection, so the next drain REMOVES it. That is why both setters (and both unsetters)
+/// clear the OUTGOING stream's watermark as well as the incoming one — re-pointing back must
+/// re-materialize what the re-point condemned rather than short-circuit on a watermark that is
+/// still current.
 ///
 /// Scope-gated the same way the reconcile is — a LEGACY placeholder or a `local:` shallow-clone id
 /// can never root an owner stream, so both yield `None`.
-fn authoritative_content_stream(
+pub(super) fn authoritative_content_stream(
     conn: &Connection,
     repo_id: &str,
 ) -> anyhow::Result<Option<StreamId>> {
@@ -119,8 +123,12 @@ fn authoritative_content_stream(
     // memories live — and a read-only SUBSCRIBER (#1156) mirrors a published owner without
     // authoring onto it. A configured owner that IS this store is neither; fall through to the
     // local derivation.
-    let foreign_owner = super::authoring::contribution_owner_account(conn, repo_id)?
-        .or(super::authoring::subscription_owner_account(conn, repo_id)?);
+    // Lazily: a contributing repo must not pay for the subscription lookup on every drain, and a
+    // corrupt `memory_subscription_owner` value must not error a drain that never consults it.
+    let foreign_owner = match super::authoring::contribution_owner_account(conn, repo_id)? {
+        Some(owner) => Some(owner),
+        None => super::authoring::subscription_owner_account(conn, repo_id)?,
+    };
     if let Some(owner) = foreign_owner
         && rag_rat_oplog::read_local_account(conn)? != Some(owner)
     {

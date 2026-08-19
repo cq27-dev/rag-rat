@@ -90,7 +90,13 @@ use crate::index::{self, IndexDatabase, schema};
 ///        0 is load-bearing — A6), `clone_graph_live_generation`, `shallow_boundary` (adoption
 ///        proof for the legacy file's own registry), `source_root` (re-recorded by registration);
 ///      * derived/re-derivable caches: `local_crate_roots` (re-read from manifests),
-///        `embedding_throughput_tune_v1` (a tuning cache, re-derived).
+///        `embedding_throughput_tune_v1` (a tuning cache, re-derived);
+///      * `memory_contribution_owner` / `memory_subscription_owner` — the accounts whose stream
+///        materializes the repo. Not copied and never needed:
+///        `ensure_not_mirroring_another_account` REFUSES the whole run when the TARGET carries
+///        either key, and a legacy source that carries one has nowhere to put it (the target's own
+///        key must stay authoritative — it is what the target's drain already acted on). A repo
+///        consolidates only while it owns its own stream.
 const CARRIED_META_KEYS: &[&str] = &[
     "active_embedding_model",
     "embedding_active_model_version",
@@ -301,14 +307,16 @@ fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<Cons
         &crate::index::migration_hooks(),
     )?;
 
-    // Refuse a contribution-configured target BEFORE any import side effect. The reconcile that
-    // signs the imported rows onto an owned stream cannot run for a contributor (it owns none), and
-    // it is reached only AFTER `import_from_source` has committed — so failing there would leave
-    // exactly the half-applied state it exists to prevent: persisted rows and FTS children with no
-    // `NodeCreate`, re-imported and re-failed on every retry. Stopping here leaves the legacy file
-    // unrenamed and the target untouched, so the run is retryable once the repo is no longer
-    // configured to contribute.
-    crate::memory_write::ensure_not_contributing(
+    // Refuse a target whose memories materialize from ANOTHER account's stream, BEFORE any import
+    // side effect. The reconcile that signs the imported rows onto an owned stream cannot run for a
+    // contributor (it owns none), and it is reached only AFTER `import_from_source` has committed —
+    // so failing there would leave exactly the half-applied state it exists to prevent: persisted
+    // rows and FTS children with no `NodeCreate`, re-imported and re-failed on every retry. A
+    // SUBSCRIBER owns its stream but the drain does not honor it, so the import's `origin='synced'`
+    // rows (it carries both origins) are condemned by the next drain instead. Stopping here leaves
+    // the legacy file unrenamed and the target untouched, so the run is retryable once the repo is
+    // no longer configured to mirror another account.
+    crate::memory_write::ensure_not_mirroring_another_account(
         target_conn,
         &repo_id,
         "consolidating a legacy index",

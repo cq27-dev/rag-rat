@@ -51,7 +51,9 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         | SyncCommand::Revoke { .. }
         | SyncCommand::Grants
         | SyncCommand::Contribute { .. }
-        | SyncCommand::Subscribe { .. } => {},
+        | SyncCommand::Subscribe { .. }
+        | SyncCommand::Unsubscribe
+        | SyncCommand::Uncontribute => {},
     }
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
@@ -179,7 +181,23 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "repo_id": db.active_repo_id,
                 "owner_account_id": account,
                 "read_only": true,
-                "note": "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched, but its other devices' memories stop arriving while subscribed. This store needs the owner's log: automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
+                "note": "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except that a local `memory rebind` on a synced memory is lost with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log: automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
+            }))
+        },
+        SyncCommand::Unsubscribe => {
+            let cleared = db.sync_unsubscribe()?;
+            print_output(&serde_json::json!({
+                "status": if cleared { "unsubscribed" } else { "not_subscribed" },
+                "repo_id": db.active_repo_id,
+                "note": "this repo's memories materialize from its own account's stream again: the next drain restores what its other devices had synced here and removes the owner's. A local `memory rebind` made on a memory the subscription removed is not restored with it",
+            }))
+        },
+        SyncCommand::Uncontribute => {
+            let cleared = db.sync_uncontribute()?;
+            print_output(&serde_json::json!({
+                "status": if cleared { "uncontributed" } else { "not_contributing" },
+                "repo_id": db.active_repo_id,
+                "note": "memory changes for this repo target this store's own stream again, and the next drain materializes it in the owner's place. Contributions already authored onto the owner's stream stay there, and the owner's grant stays open until it runs `sync revoke`",
             }))
         },
         SyncCommand::Serve { .. }
@@ -761,6 +779,18 @@ fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
     )?
     .ok_or_else(|| anyhow!("the index write lock is busy (another writer is mid-pass); retry"))?;
     let db = crate::open_index(config)?;
+    // Refuse a subscribed repo HERE, before the redemption. `sync_contribute` refuses it too, but
+    // that call is the last step of this flow: by then the owner has authored a grant for this
+    // account, and bailing would leave it live for a store that will never contribute. Same
+    // reasoning as the repo-mismatch refusal below — stop while nothing is burned.
+    if let Some(subscribed) = db.sync_owner_config()?.subscription_owner_account_id {
+        bail!(
+            "this repo already subscribes to account {subscribed} — subscription and contribution \
+             both re-point the ONE stream that materializes this repo's memories, so only one can \
+             be configured. Run `sync unsubscribe` first, or redeem this ticket in a separate \
+             index"
+        );
+    }
     let (node_key, contributor) = {
         let conn = db.connection();
         // Mint the contributor identity if absent — a fresh store can redeem an invite as its

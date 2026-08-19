@@ -67,6 +67,41 @@ fn memory_titles(conn: &Connection) -> Vec<String> {
         .unwrap()
 }
 
+/// The memory titles this store holds for the repo as `origin='synced'` rows — the ones the drain
+/// materialized from a stream, and the only ones its removal anti-joins condemn.
+fn synced_memory_titles(conn: &Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT title FROM repo_memories WHERE repo_id = ?1 AND origin = 'synced' ORDER BY \
+             title",
+        )
+        .unwrap();
+    stmt.query_map([REPO], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+/// Put one node into `stream`'s projection directly — the shape a peer's accepted entry folds into,
+/// without needing that peer's device key. What the drain reads is the projection, so this is the
+/// state a sibling device's memory arrives in.
+fn plant_projected_node(conn: &Connection, stream: rag_rat_oplog::StreamId, id: &str, title: &str) {
+    conn.execute(
+        "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
+         VALUES (?1, ?2, ?3, 'active')",
+        params![
+            stream.to_bytes().as_slice(),
+            id,
+            serde_json::json!({
+                "kind": "Concept", "title": title, "body": "b",
+                "confidence": "high", "source": "agent", "tags": [], "payload": null,
+            })
+            .to_string(),
+        ],
+    )
+    .unwrap();
+}
+
 /// Replicate `src`'s account log (roster/ownership/grant) + content into `dst` — the state a
 /// contributor gains by syncing the owner's log.
 fn sync_account_into(dst: &Connection, src: &Connection, account: rag_rat_oplog::AccountId) {
@@ -168,20 +203,7 @@ fn the_contributors_own_stream_is_not_a_rival_authority_over_the_repo() {
     // If the drain still treated it as an authority it would materialize `local-stream-ghost` and
     // condemn `owner-note` (absent from this projection) on the very next pass.
     let own_stream = rag_rat_oplog::owned_stream_v2_id(&contributor, REPO).unwrap().unwrap();
-    contributor
-        .execute(
-            "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
-             VALUES (?1, 'ghost', ?2, 'active')",
-            params![
-                own_stream.to_bytes().as_slice(),
-                serde_json::json!({
-                    "kind": "Concept", "title": "local-stream-ghost", "body": "b",
-                    "confidence": "high", "source": "agent", "tags": [], "payload": null,
-                })
-                .to_string(),
-            ],
-        )
-        .unwrap();
+    plant_projected_node(&contributor, own_stream, "ghost", "local-stream-ghost");
     let tx = contributor.unchecked_transaction().unwrap();
     rag_rat_oplog::clear_content_drain_watermark(&tx, own_stream).unwrap();
     tx.commit().unwrap();
@@ -254,6 +276,33 @@ fn the_import_reconcile_refuses_in_contribution_mode_instead_of_half_applying() 
     assert_eq!(owned, 0, "no stream established for the contributor");
 }
 
+/// A SUBSCRIBER owns its stream, so the import reconcile would happily sign onto it — and the next
+/// drain, reading the OWNER's stream, would condemn every `origin='synced'` row the import brought
+/// in. The guard covers both configurations for that reason, not just the one that owns no stream.
+#[test]
+fn the_import_reconcile_refuses_while_subscribed() {
+    let (_owner, subscriber, _owner_account) = subscription_pair();
+    let err = crate::memory_write::reconcile_owner_stream_for_repo(&subscriber, REPO, NOW)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("while subscribed"), "refuses with an actionable message: {err}");
+    assert!(err.contains("sync unsubscribe"), "and hands over the escape: {err}");
+}
+
+/// The drain resolves the subscription owner LAZILY — a contributing repo never consults the key,
+/// so a corrupt value there must not error the drain of a repo whose authority is already decided.
+#[test]
+fn a_corrupt_subscription_owner_does_not_break_a_contributing_repos_drain() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    rag_rat_db::meta::set_repo_meta(&contributor, REPO, "memory_subscription_owner", "not-hex")
+        .unwrap();
+    crate::drain_synced_memory(&contributor).unwrap();
+    assert!(
+        memory_titles(&contributor).contains(&"owner-note".to_string()),
+        "the contribution owner decides the authority without reading the subscription key",
+    );
+}
+
 /// A configured owner is not yet an AUTHORITY. `sync contribute` succeeds before the owner's log
 /// is synced (configure, then sync), and a mistyped owner id derives a stream that never exists —
 /// both leave an EMPTY projection. Draining it would let the removal anti-joins condemn every
@@ -265,8 +314,8 @@ fn an_unsynced_or_mistyped_owner_never_becomes_removal_authority() {
     assert!(memory_titles(&contributor).contains(&"owner-note".to_string()));
 
     // Re-point at an owner whose log was never synced (the mistyped-id / configure-before-sync
-    // case): `set_contribution_owner` clears the incoming stream's watermark, so the next drain
-    // would otherwise make a FULL pass over an empty projection.
+    // case): `set_contribution_owner` forgets the OUTGOING stream's drain watermark, so the next
+    // drain would otherwise make a FULL pass over the new owner's empty projection.
     crate::memory_write::set_contribution_owner(&contributor, &"ab".repeat(32), NOW).unwrap();
     crate::drain_synced_memory(&contributor).unwrap();
 
@@ -274,6 +323,41 @@ fn an_unsynced_or_mistyped_owner_never_becomes_removal_authority() {
     assert!(
         titles.contains(&"owner-note".to_string()),
         "an unverified owner stream removes nothing: {titles:?}",
+    );
+}
+
+/// `sync contribute` is re-pointable too, and by the same one-stream rule the owner's memories are
+/// REMOVED when it is cleared — so the unset carries the same watermark discipline: the repo's own
+/// stream becomes the authority again and a full pass re-materializes it. What the contributor
+/// authored keeps its `origin='local'` and never depended on the mirror.
+#[test]
+fn uncontributing_re_points_the_repo_back_at_its_own_stream() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    create_memory(&contributor, concept("contributor-note")).unwrap();
+    crate::drain_synced_memory(&contributor).unwrap();
+    assert_eq!(
+        synced_memory_titles(&contributor),
+        vec!["owner-note".to_string()],
+        "the owner's memory is the mirrored row",
+    );
+
+    assert!(
+        crate::memory_write::clear_contribution_owner(&contributor).unwrap(),
+        "a contribution was configured",
+    );
+    crate::drain_synced_memory(&contributor).unwrap();
+    let titles = memory_titles(&contributor);
+    assert!(
+        !titles.contains(&"owner-note".to_string()),
+        "the owner's stream stops materializing this repo: {titles:?}",
+    );
+    assert!(
+        titles.contains(&"contributor-note".to_string()),
+        "what this store authored is its own, not the mirror's: {titles:?}",
+    );
+    assert!(
+        !crate::memory_write::clear_contribution_owner(&contributor).unwrap(),
+        "clearing an absent contribution reports it rather than re-pointing anything",
     );
 }
 
@@ -506,7 +590,10 @@ fn a_contributing_store_refuses_to_establish_a_private_stream_later() {
 
 /// A published owner plus a SUBSCRIBER of it: the owner's log + content are synced in, and the
 /// subscriber is configured read-only. Deliberately no grant and no `enable_public_authoring` on
-/// the subscriber — a read-only mirror needs neither. Returns `(owner, subscriber, owner_account)`.
+/// the subscriber — a read-only mirror needs neither. The subscriber authors one memory FIRST, so
+/// it owns a PRIVATE stream of its own before it subscribes: that is what makes the two absent
+/// guards observable (an account that owns nothing is vacuously fully-public and holds no rival
+/// stream at all). Returns `(owner, subscriber, owner_account)`.
 fn subscription_pair() -> (Connection, Connection, rag_rat_oplog::AccountId) {
     let owner = scoped_conn();
     let owner_account = local_account(&owner, NOW).unwrap();
@@ -516,6 +603,12 @@ fn subscription_pair() -> (Connection, Connection, rag_rat_oplog::AccountId) {
     let subscriber = scoped_conn();
     let subscriber_account = local_account(&subscriber, NOW).unwrap();
     assert_ne!(owner_account, subscriber_account, "separate identities");
+    create_memory(&subscriber, concept("subscriber-note")).unwrap();
+    assert!(
+        !rag_rat_oplog::account_is_fully_public(&subscriber, subscriber_account).unwrap(),
+        "the subscriber owns a private stream — the guard `sync contribute` carries would refuse \
+         it",
+    );
     sync_account_into(&subscriber, &owner, owner_account);
 
     let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
@@ -543,6 +636,10 @@ fn a_subscriber_mirrors_a_published_owner_without_a_grant_or_a_public_account() 
         .unwrap()
         .is_none(),
         "the subscriber holds no writer grant",
+    );
+    assert!(
+        !rag_rat_oplog::account_is_fully_public(&subscriber, subscriber_account).unwrap(),
+        "and its own account is not fully public",
     );
 
     crate::drain_synced_memory(&subscriber).unwrap();
@@ -603,9 +700,9 @@ fn an_unsynced_or_mistyped_subscription_owner_never_becomes_removal_authority() 
     crate::drain_synced_memory(&subscriber).unwrap();
     assert!(memory_titles(&subscriber).contains(&"owner-note".to_string()));
 
-    // Re-point at an owner whose log was never synced. `set_subscription_owner` clears the incoming
-    // stream's watermark, so the next drain would otherwise make a FULL pass over an empty
-    // projection.
+    // Re-point at an owner whose log was never synced. `set_subscription_owner` forgets the
+    // OUTGOING stream's drain watermark, so the next drain would otherwise make a FULL pass over
+    // the new owner's empty projection.
     crate::memory_write::set_subscription_owner(&subscriber, &"ab".repeat(32), NOW).unwrap();
     crate::drain_synced_memory(&subscriber).unwrap();
     let titles = memory_titles(&subscriber);
@@ -631,6 +728,101 @@ fn subscription_and_contribution_refuse_to_coexist() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("already subscribes"), "contribute names the conflict: {err}");
+}
+
+/// The subscriber's OWN account is the rival authority the contribution half never has: a
+/// contributor's own stream is empty by construction, but a subscriber's is actively authored — and
+/// it is also where this account's OTHER DEVICES' memories arrive, materialized `origin='synced'`.
+/// Re-pointing the repo at the owner condemns every one of them (absent from the owner's
+/// projection), which is correct — exactly one stream materializes a repo — but must not be a
+/// one-way door. `sync unsubscribe` re-points back and the rows come home, the owner's going in
+/// turn, each side re-materialized from its own stream's projection.
+///
+/// The fixture: a subscriber that already held sibling-device rows when it subscribed, drained
+/// once. Returns the subscriber connection; the assertions about what the subscription removed are
+/// made here, so both recovery routes below start from the same verified state.
+fn subscribed_store_that_held_sibling_device_memories() -> Connection {
+    let owner = scoped_conn();
+    let owner_account = local_account(&owner, NOW).unwrap();
+    assert!(enable_public_authoring(&owner, NOW).unwrap());
+    create_memory(&owner, concept("owner-note")).unwrap();
+
+    // A store of a DIFFERENT account holding two memories of its own account's: one this device
+    // authored (`origin='local'`) and one a SIBLING DEVICE authored, which reaches this device as a
+    // row in the shared stream's projection and materializes `origin='synced'`.
+    let subscriber = scoped_conn();
+    local_account(&subscriber, NOW).unwrap();
+    create_memory(&subscriber, concept("my-own-note")).unwrap();
+    let own_stream = rag_rat_oplog::owned_stream_v2_id(&subscriber, REPO).unwrap().unwrap();
+    plant_projected_node(&subscriber, own_stream, "sibling", "sibling-device-note");
+    crate::drain_synced_memory(&subscriber).unwrap();
+    assert_eq!(
+        synced_memory_titles(&subscriber),
+        vec!["sibling-device-note".to_string()],
+        "the sibling device's memory is materialized as a synced row",
+    );
+
+    // Subscribe. The owner's stream becomes the one authority, so the sibling's row is condemned.
+    sync_account_into(&subscriber, &owner, owner_account);
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    crate::memory_write::set_subscription_owner(&subscriber, &owner_hex, NOW).unwrap();
+    crate::drain_synced_memory(&subscriber).unwrap();
+    let titles = memory_titles(&subscriber);
+    assert!(
+        !titles.contains(&"sibling-device-note".to_string()),
+        "the subscription REMOVES the sibling device's memories, it does not leave them stale: \
+         {titles:?}",
+    );
+    assert!(titles.contains(&"owner-note".to_string()), "the owner's arrived: {titles:?}");
+    assert!(titles.contains(&"my-own-note".to_string()), "own work is spared: {titles:?}");
+    subscriber
+}
+
+/// The recovery route the operator has: `sync unsubscribe`.
+#[test]
+fn unsubscribing_restores_the_sibling_device_memories_the_subscription_removed() {
+    let subscriber = subscribed_store_that_held_sibling_device_memories();
+
+    // Unsubscribe: the own stream is the authority again, and only a FULL pass restores what the
+    // re-point condemned — which is why the re-point forgets both streams' drain watermarks.
+    assert!(
+        crate::memory_write::clear_subscription_owner(&subscriber).unwrap(),
+        "a subscription was configured",
+    );
+    crate::drain_synced_memory(&subscriber).unwrap();
+    let titles = memory_titles(&subscriber);
+    assert!(
+        titles.contains(&"sibling-device-note".to_string()),
+        "unsubscribing re-materializes the sibling device's memories: {titles:?}",
+    );
+    assert!(
+        !titles.contains(&"owner-note".to_string()),
+        "and the owner's go in turn — one stream materializes the repo: {titles:?}",
+    );
+    assert!(titles.contains(&"my-own-note".to_string()), "own work is spared again: {titles:?}");
+
+    assert!(
+        !crate::memory_write::clear_subscription_owner(&subscriber).unwrap(),
+        "clearing an absent subscription reports it rather than re-pointing anything",
+    );
+}
+
+/// The other route back is not a command at all: the operator (or a future write path) drops the
+/// `memory_subscription_owner` row directly. That bypasses the unsetter entirely, so recovery rests
+/// on what the SETTER did — it forgot the outgoing (own) stream's drain watermark on the way out,
+/// and nothing has drained that stream since, so the next pass is still a full one.
+#[test]
+fn dropping_the_subscription_meta_row_also_re_materializes_the_repo() {
+    let subscriber = subscribed_store_that_held_sibling_device_memories();
+    rag_rat_db::meta::delete_repo_meta(&subscriber, REPO, "memory_subscription_owner").unwrap();
+
+    crate::drain_synced_memory(&subscriber).unwrap();
+    let titles = memory_titles(&subscriber);
+    assert!(
+        titles.contains(&"sibling-device-note".to_string()),
+        "the own stream drains in full again: {titles:?}",
+    );
+    assert!(!titles.contains(&"owner-note".to_string()), "and the owner's go in turn: {titles:?}",);
 }
 
 /// Subscribing to your OWN account would persist a configuration the drain ignores
