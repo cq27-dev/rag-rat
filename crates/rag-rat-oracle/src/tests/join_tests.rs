@@ -18,6 +18,111 @@ fn package_extraction_from_scip_symbol() {
     assert!(!names_external_package("local 0"));
 }
 
+/// A reference occurrence, used where only the range and the symbol matter.
+fn occurrence(start_byte: usize, end_byte: usize, symbol: &str) -> super::scip::ScipOccurrence {
+    super::scip::ScipOccurrence {
+        start_byte,
+        end_byte,
+        symbol: symbol.to_string(),
+        is_definition: false,
+        is_import: false,
+    }
+}
+
+/// The same, carrying the `Definition` role.
+fn definition(start_byte: usize, end_byte: usize, symbol: &str) -> super::scip::ScipOccurrence {
+    super::scip::ScipOccurrence { is_definition: true, ..occurrence(start_byte, end_byte, symbol) }
+}
+
+/// The tightest containing occurrence wins, so a segment's own occurrence is not lost to the item
+/// that encloses it.
+///
+/// The extractor writes the token it saw — for `Type::method` that is the whole path — while SCIP
+/// records each segment separately. Taking the first containing occurrence handed such an edge to
+/// the enclosing definition, which then read as the compiler naming a different target.
+#[test]
+fn containing_occurrence_prefers_the_tightest_span() {
+    let occurrences = vec![
+        occurrence(0, 100, "rust-analyzer cargo demo 0.1 `Enclosing`#"),
+        occurrence(10, 20, "rust-analyzer cargo demo 0.1 `Tight`#"),
+    ];
+    let picked =
+        join::find_containing_occurrence(&occurrences, 12, 16).expect("a containing occurrence");
+    assert_eq!(picked.symbol, "rust-analyzer cargo demo 0.1 `Tight`#", "the tighter span wins");
+
+    // Past the tight span's end, only the enclosing one contains the token.
+    let picked =
+        join::find_containing_occurrence(&occurrences, 50, 60).expect("a containing occurrence");
+    assert_eq!(picked.symbol, "rust-analyzer cargo demo 0.1 `Enclosing`#");
+
+    assert!(
+        join::find_containing_occurrence(&occurrences, 200, 210).is_none(),
+        "nothing contains it"
+    );
+}
+
+/// A namespace WIDER than the token is the module the token sits inside, not the referent, so a
+/// span SCIP has no type or callable occurrence for reports no evidence rather than a disagreement.
+///
+/// Letting such a match be judged turned every span-width mismatch into a contradiction against a
+/// symbol no heuristic arm could produce (#1223). The exactly-bounding case is the referent and is
+/// covered separately.
+#[test]
+fn a_namespace_occurrence_is_never_the_compilers_answer() {
+    let module_only = vec![occurrence(0, 500, "rust-analyzer cargo demo 0.1 commands/clones/")];
+    assert!(
+        join::find_containing_occurrence(&module_only, 100, 122).is_none(),
+        "a module match is the absence of evidence, not the compiler naming a target",
+    );
+
+    // It must not shadow a real occurrence either, even when the namespace is the tighter span.
+    let with_type = vec![
+        occurrence(0, 500, "rust-analyzer cargo demo 0.1 `Wanted`#"),
+        occurrence(90, 130, "rust-analyzer cargo demo 0.1 commands/clones/"),
+    ];
+    let picked =
+        join::find_containing_occurrence(&with_type, 100, 122).expect("the type occurrence");
+    assert_eq!(picked.symbol, "rust-analyzer cargo demo 0.1 `Wanted`#");
+}
+
+/// A namespace that EXACTLY bounds the token is the referent, not the module the token sits in.
+///
+/// TypeScript emits a `references_type` edge for `ns.f()` whose callee range is the receiver node
+/// itself, so for `import * as ns` the occurrence at that token is the namespace symbol — and this
+/// crate indexes those. Width is the discriminator: a module spanning far past the token is
+/// context, a module bounding it exactly is the answer.
+#[test]
+fn a_namespace_bounding_the_token_exactly_is_the_referent() {
+    let receiver = vec![occurrence(100, 102, "scip-typescript npm demo 1.0 `src/m.ts`/ns/")];
+    let picked = join::find_containing_occurrence(&receiver, 100, 102)
+        .expect("a namespace naming the token itself still answers");
+    assert_eq!(picked.symbol, "scip-typescript npm demo 1.0 `src/m.ts`/ns/");
+}
+
+/// A containing REFERENCE outranks a containing definition of any width, so a call site sitting
+/// inside a definition's range is not judged against that definition. Tightest decides only within
+/// a pass.
+#[test]
+fn a_reference_outranks_a_tighter_definition() {
+    let occurrences = vec![
+        occurrence(0, 100, "rust-analyzer cargo demo 0.1 `WideRef`#"),
+        definition(10, 20, "rust-analyzer cargo demo 0.1 `TightDef`#"),
+    ];
+    let picked =
+        join::find_containing_occurrence(&occurrences, 12, 16).expect("a containing occurrence");
+    assert_eq!(
+        picked.symbol, "rust-analyzer cargo demo 0.1 `WideRef`#",
+        "a reference wins on role"
+    );
+
+    // With no reference containing the token, the definition is still selected — the
+    // self-referential edge.
+    let only_definition = vec![definition(10, 20, "rust-analyzer cargo demo 0.1 `TightDef`#")];
+    let picked = join::find_containing_occurrence(&only_definition, 12, 16)
+        .expect("a definition is the fallback, not excluded");
+    assert_eq!(picked.symbol, "rust-analyzer cargo demo 0.1 `TightDef`#");
+}
+
 /// `map_definition_to_symbol` picks the tightest span that REALLY contains the whole definition
 /// range (a method beats its enclosing impl) and returns `None` when no span contains it.
 #[test]

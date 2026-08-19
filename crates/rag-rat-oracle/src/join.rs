@@ -6,6 +6,12 @@
 //! range need only overlap on the identifier, not match byte-for-byte (SCIP may bound the range
 //! slightly differently around generics/paths). We require the occurrence to *contain* the edge's
 //! token start, which is robust to those boundary differences while still being per-identifier.
+//!
+//! Containment alone is too generous to decide by, though, because the ranges that contain a token
+//! nest: a segment, the item declaring it, and the module around both. The join takes the TIGHTEST
+//! containing occurrence and never considers a namespace one at all — a module is not something a
+//! call or a type reference can resolve to, so matching one means SCIP had no answer here, not that
+//! it named a different target.
 
 use super::scip::{ScipIndex, ScipOccurrence};
 use super::store::SymbolSpan;
@@ -169,18 +175,48 @@ fn heuristic_resolved_in_corpus(confidence: &str, heuristic_symbol_id: Option<i6
 
 /// The occurrence whose byte range contains the callee token. Prefers a reference occurrence (the
 /// common case for a call site); a definition occurrence only matches a self-referential edge.
-fn find_containing_occurrence(
+///
+/// TIGHTEST WINS WITHIN EACH PASS — a containing reference still outranks a containing definition
+/// of any width, which is what keeps a call site inside a definition's range from being judged
+/// against that definition. Within a pass the width matters: the extractor's callee span is the
+/// token it wrote — for `Type::method` that is the whole path, while SCIP records `Type` and
+/// `method` as separate occurrences. Neither segment CONTAINS the wider span, so the only
+/// containing occurrence left is the enclosing item's or module's definition, which then reads as
+/// the compiler's answer for this edge. Taking the first match in iteration order therefore turned
+/// a span-width disagreement into a confident wrong verdict; [`map_definition_to_symbol`] below
+/// picks the smallest span for the same reason.
+///
+/// A NAMESPACE OCCURRENCE IS A CANDIDATE ONLY WHEN IT EXACTLY BOUNDS THE TOKEN. Where it is wider,
+/// it is the module the token merely sits inside, and a module is not something a call or a type
+/// reference resolves to — matching it is the absence of evidence, not the compiler naming a
+/// different target, so [`classify_edge`] returns `None` into the `no_occurrence` bucket rather
+/// than manufacturing a contradiction against a symbol no heuristic arm could produce (#1223).
+///
+/// The exact-bounds carve-out is not a softening: a namespace CAN be the referent when the token IS
+/// the namespace. TypeScript emits a `references_type` edge for `ns.f()` whose callee range is the
+/// receiver node itself, and for `import * as ns` / `namespace Foo` scip-typescript's occurrence at
+/// that token is the namespace symbol — which this crate does index. Excluding it there would
+/// discard a real verdict, so width is what separates the two cases.
+pub(crate) fn find_containing_occurrence(
     occurrences: &[ScipOccurrence],
     token_start: usize,
     token_end: usize,
 ) -> Option<&ScipOccurrence> {
-    let contains = |occ: &ScipOccurrence| {
-        occ.start_byte <= token_start && token_end <= occ.end_byte && occ.start_byte < occ.end_byte
+    let candidate = |occ: &&ScipOccurrence| {
+        let exactly_bounds_token = occ.start_byte == token_start && occ.end_byte == token_end;
+        occ.start_byte <= token_start
+            && token_end <= occ.end_byte
+            && occ.start_byte < occ.end_byte
+            && (exactly_bounds_token || !super::scip::symbol_is_module(&occ.symbol))
     };
-    occurrences
-        .iter()
-        .find(|occ| !occ.is_definition && contains(occ))
-        .or_else(|| occurrences.iter().find(|occ| contains(occ)))
+    let tightest = |only_references: bool| {
+        occurrences
+            .iter()
+            .filter(|occ| !only_references || !occ.is_definition)
+            .filter(candidate)
+            .min_by_key(|occ| occ.end_byte - occ.start_byte)
+    };
+    tightest(true).or_else(|| tightest(false))
 }
 
 /// A SCIP symbol string names an external package when it parses to a symbol carrying a non-empty
