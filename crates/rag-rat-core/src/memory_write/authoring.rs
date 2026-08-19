@@ -478,6 +478,7 @@ fn build_reconcile_ops(
     conn: &Connection,
     missing_nodes: &[MemoryRow],
     missing_edges: &[NodeEdge],
+    anchor_backfill_ids: &[String],
     owner_repo_id: &str,
     elide_active_status: bool,
 ) -> anyhow::Result<Vec<MemoryOp>> {
@@ -518,6 +519,16 @@ fn build_reconcile_ops(
     for (_source, group) in by_source {
         for edge in group {
             ops.push(edge_add_op(edge, owner_repo_id)?);
+        }
+    }
+    // Anchors for memories whose node was authored before this op kind existed — the corpus the
+    // node anti-join above can never revisit. Same drop-rather-than-quarantine posture as the
+    // per-node snapshot: an unpublishable set costs its memory nothing.
+    for memory_id in anchor_backfill_ids {
+        if let Some(op) = anchors_op(conn, memory_id)?
+            && content_op_is_authorable(&op, StreamSealPolicy::Sealed)
+        {
+            ops.push(op);
         }
     }
     Ok(ops)
@@ -576,13 +587,17 @@ struct ReconcileWork {
     live_edges: Vec<NodeEdge>,
     quarantined_nodes: Vec<MemoryRow>,
     quarantined_edges: Vec<NodeEdge>,
+    /// Already-authored memories still owed an anchor snapshot — see [`read_anchor_backfill_ids`].
+    anchor_backfill_ids: Vec<String>,
 }
 
 impl ReconcileWork {
     /// Any AUTHORABLE work remaining. A quarantined row is intentionally NOT work: it never becomes
     /// authorable on its own, so counting it would spin the reconcile's slow path forever (#680).
     fn has_authorable_work(&self) -> bool {
-        !self.authorable_nodes.is_empty() || !self.live_edges.is_empty()
+        !self.authorable_nodes.is_empty()
+            || !self.live_edges.is_empty()
+            || !self.anchor_backfill_ids.is_empty()
     }
 
     /// Surface every quarantined node + edge as a warning naming the repo + the row's id — the
@@ -640,6 +655,50 @@ fn settle_owner_stream_in_tx(
 /// accepted-`/3` projection, which is stale while the stream owes a deferred refold. The
 /// autocommit fast path cannot settle, so it treats outstanding debt as "work may exist" rather
 /// than trusting an empty read (see `sync_owner_stream`).
+/// How many already-authored memories one reconcile pass backfills anchors for. The pass rides
+/// every authored write, so an unbounded sweep would make the first write after an upgrade pay for
+/// the whole corpus; bounded, it converges over successive writes and each pass stays cheap.
+const ANCHOR_BACKFILL_PER_PASS: i64 = 64;
+
+/// Memories whose node is ALREADY authored but whose anchors were never published — the corpus
+/// that predates the anchor op on any store that was already syncing.
+///
+/// This is the other half of the backfill. The node anti-join only revisits memories missing from
+/// the projection, so a memory authored before the op existed is never reconsidered by it, and
+/// without this its bindings would never reach a peer.
+///
+/// Idempotent by construction: authoring the snapshot refolds the stream in the same transaction,
+/// so `anchors_json` stops being NULL and the row drops out of this query. A memory with no
+/// bindings never matches at all, so an unanchored memory is not re-examined forever.
+fn read_anchor_backfill_ids(
+    conn: &Connection,
+    repo_id: &str,
+    stream: StreamId,
+) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        // `origin = 'local'` for the same load-bearing reason as the node anti-join above: a
+        // synced row is a peer's to publish, never this device's to author.
+        "SELECT m.id
+         FROM repo_memories m
+         JOIN content_projected_nodes p ON p.stream_id = ?2 AND p.node_id = m.id
+         WHERE m.repo_id = ?1
+           AND m.origin = 'local'
+           AND p.anchors_json IS NULL
+           AND EXISTS (
+                 SELECT 1 FROM repo_memory_bindings b
+                 WHERE b.memory_id = m.id AND b.repo_id = m.repo_id)
+         ORDER BY m.created_at_ms, m.id
+         LIMIT ?3",
+    )?;
+    let ids = stmt
+        .query_map(
+            params![repo_id, stream.to_bytes().as_slice(), ANCHOR_BACKFILL_PER_PASS],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
 fn read_reconcile_work(
     conn: &Connection,
     repo_id: &str,
@@ -665,7 +724,14 @@ fn read_reconcile_work(
             .into_iter()
             .filter(|edge| !quarantined_node_ids.contains(edge.source_node_id.as_str()))
             .partition(|edge| edge_is_authorable(edge, repo_id, policy));
-    Ok(ReconcileWork { authorable_nodes, live_edges, quarantined_nodes, quarantined_edges })
+    let anchor_backfill_ids = read_anchor_backfill_ids(conn, repo_id, stream)?;
+    Ok(ReconcileWork {
+        authorable_nodes,
+        live_edges,
+        quarantined_nodes,
+        quarantined_edges,
+        anchor_backfill_ids,
+    })
 }
 
 /// Reconcile the repo's owner-bound `/2` stream against its tables: establish ownership (mint the
@@ -718,6 +784,7 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
             conn,
             &work.authorable_nodes,
             &work.live_edges,
+            &work.anchor_backfill_ids,
             repo_id,
             rag_rat_oplog::content_stream_is_empty(conn, stream)?,
         )?;
@@ -747,7 +814,14 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     // for the public API to shrink or delete.
     let work = read_reconcile_work(&tx, repo_id, stream, policy)?;
     work.warn_quarantined(repo_id);
-    let ops = build_reconcile_ops(&tx, &work.authorable_nodes, &work.live_edges, repo_id, genesis)?;
+    let ops = build_reconcile_ops(
+        &tx,
+        &work.authorable_nodes,
+        &work.live_edges,
+        &work.anchor_backfill_ids,
+        repo_id,
+        genesis,
+    )?;
     // Skip the author when there is nothing to author: a fresh repo whose anti-join was empty only
     // needed ownership established (done above), and authoring an empty batch would still refold +
     // reproject for no change.
@@ -942,6 +1016,7 @@ pub(crate) fn enable_sealed_authoring(conn: &Connection, now_ms: i64) -> anyhow:
         &tx,
         &work.authorable_nodes,
         &work.live_edges,
+        &work.anchor_backfill_ids,
         &repo_id,
         rag_rat_oplog::content_stream_is_empty(&tx, stream)?,
     )?;

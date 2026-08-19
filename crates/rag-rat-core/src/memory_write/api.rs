@@ -455,6 +455,77 @@ mod anchor_authoring_tests {
         assert!(anchors.contains(&"src/old.rs".to_string()));
     }
 
+    /// The half the node anti-join cannot reach: a memory whose `NodeCreate` was ALREADY authored
+    /// before the anchor op existed. It is not missing from the projection, so the node backfill
+    /// never revisits it — without a second sweep its bindings would never reach a peer, which is
+    /// the state every store that was already syncing upgrades into.
+    #[test]
+    fn the_backfill_publishes_anchors_for_an_already_authored_memory() {
+        let conn = scoped_conn();
+        // The pre-anchor state, built honestly: author the node with NO snapshot (an unanchored
+        // create emits none), then give it a binding the way a pre-anchor store holds one — rows
+        // only. Nulling the projection column instead would prove nothing, because the refold
+        // restores it from the retained op.
+        let memory_id = create_memory(&conn, RepoMemoryCreate {
+            kind: "Concept".to_string(),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget::default(),
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+        assert_eq!(projected_anchors(&conn, &memory_id), None, "authored, with no snapshot");
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, anchor_status, created_at_ms)
+             VALUES (?1, ?2, 'path', 'src/old.rs', 'src/old.rs', 'current', 1)",
+            rusqlite::params![REPO, memory_id],
+        )
+        .unwrap();
+
+        // Any authored write drives the reconcile, which now sweeps these too.
+        bound_create(&conn, "src/other.rs");
+
+        let anchors =
+            projected_anchors(&conn, &memory_id).expect("the sweep published the missing snapshot");
+        assert!(anchors.contains(&"src/old.rs".to_string()));
+    }
+
+    /// A memory with no bindings must not be swept forever. Its snapshot is legitimately absent, so
+    /// a sweep keyed only on "no snapshot" would re-examine it on every single authored write.
+    #[test]
+    fn an_unanchored_memory_is_not_swept_repeatedly() {
+        let conn = scoped_conn();
+        let unanchored = create_memory(&conn, RepoMemoryCreate {
+            kind: "Concept".to_string(),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget::default(),
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+
+        bound_create(&conn, "src/lib.rs");
+
+        assert_eq!(
+            projected_anchors(&conn, &unanchored),
+            None,
+            "a memory with no bindings stays unsnapshotted rather than publishing an empty set",
+        );
+    }
+
     /// A rebind is an explicit choice of a new anchor and now mints a signed op for it — the
     /// full-set snapshot names where the memory points NOW, not how it got there.
     #[test]
