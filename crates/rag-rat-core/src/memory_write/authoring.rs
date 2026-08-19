@@ -754,14 +754,27 @@ fn read_reconcile_work(
     // `has_authorable_work` implying a non-empty batch.
     let mut anchor_backfill_ops = Vec::new();
     let mut quarantined_anchor_ids = Vec::new();
+    let mut swept = 0;
     for memory_id in read_anchor_backfill_ids(conn, repo_id, stream)? {
         // Stop once the pass has its publish budget. Candidates past this point are simply not this
         // pass's work — they are neither authored nor quarantined, and the next pass reaches them.
-        if anchor_backfill_ops.len() >= ANCHOR_BACKFILL_PER_PASS {
+        // Counted in MEMORIES, not ops, so the source hash riding along below cannot halve it.
+        if swept >= ANCHOR_BACKFILL_PER_PASS {
             break;
         }
         match anchors_op(conn, &memory_id)? {
-            Some(op) if content_op_is_authorable(&op, policy) => anchor_backfill_ops.push(op),
+            Some(op) if content_op_is_authorable(&op, policy) => {
+                anchor_backfill_ops.push(op);
+                swept += 1;
+                // The hash describes exactly the anchors this sweep is publishing, and a receiver
+                // applies it only where it seeds them — so it has to ride the same batch, or every
+                // memory in the corpus this leg exists to reach lands on a peer unmarked forever.
+                if let Some(op) = source_hash_op(conn, &memory_id)?
+                    && content_op_is_authorable(&op, policy)
+                {
+                    anchor_backfill_ops.push(op);
+                }
+            },
             // `None` is unreachable (the query requires a binding), but counting it as quarantined
             // keeps the partition total rather than silently dropping.
             _ => quarantined_anchor_ids.push(memory_id),
@@ -1492,8 +1505,9 @@ fn reject_unauthorable_content_op(op: &MemoryOp, policy: StreamSealPolicy) -> an
             node_id.as_str(),
             anchors.len()
         ),
-        // NodeStatus / EdgeRemove / Rebind carry no unbounded free-form field and cannot exceed the
-        // cap; this arm keeps the guard total over the op vocabulary.
+        // NodeStatus / EdgeRemove / Rebind / NodeSourceHash carry no unbounded free-form field a
+        // caller controls — a source hash is a fixed-width digest — so they cannot exceed the cap;
+        // this arm keeps the guard total over the op vocabulary.
         _ => anyhow::bail!(
             "this memory operation is too large to store: its assembled /3 content envelope \
              exceeds the 256 KiB signed-entry cap"
@@ -1608,22 +1622,16 @@ pub(crate) fn author_anchors(
     author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
 
-/// The `NodeAnchors` op for a memory's current bindings, or `None` when it has none.
-///
-/// An unanchored memory authors NOTHING rather than an empty set. The two are different facts to a
-/// receiver — nobody published bindings, versus the author saying there are none — but neither
-/// seeds anything, so publishing the empty case would cost a signed entry per unanchored memory to
-/// tell a peer something it cannot act on. The projection keeps the distinction because a future op
-/// that RETRACTS a binding set will need it.
-///
-/// Deliberately unfiltered: the author publishes every portable fact it holds, including kinds this
-/// binary's own drain declines to seed. Which anchors are usable is the receiver's judgment, and
-/// filtering here would destroy information a later receiver could use.
 /// The `NodeSourceHash` op for a memory's stamped source hash, or `None` when it has none.
 ///
 /// Like the anchor snapshot, an absent hash authors NOTHING rather than a sentinel: a receiver
 /// treats "nobody published one" as no evidence of drift, so spending a signed entry to say it
 /// would tell that peer nothing it can act on.
+///
+/// That silence has no retraction, so the published register can outlive the hash it was taken
+/// from — an author who rebinds onto a target that carries none (tracker / dir / commit / call
+/// path) nulls the column and publishes nothing. A receiver applies the hash only where it also
+/// installs the anchors it describes, which is what keeps the pair from contradicting each other.
 fn source_hash_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<MemoryOp>> {
     let mut stmt = conn.prepare("SELECT source_text_hash FROM repo_memories WHERE id = ?1")?;
     let hash: Option<String> = stmt
@@ -1637,6 +1645,17 @@ fn source_hash_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<M
     }))
 }
 
+/// The `NodeAnchors` op for a memory's current bindings, or `None` when it has none.
+///
+/// An unanchored memory authors NOTHING rather than an empty set. The two are different facts to a
+/// receiver — nobody published bindings, versus the author saying there are none — but neither
+/// seeds anything, so publishing the empty case would cost a signed entry per unanchored memory to
+/// tell a peer something it cannot act on. The projection keeps the distinction because a future op
+/// that RETRACTS a binding set will need it.
+///
+/// Deliberately unfiltered: the author publishes every portable fact it holds, including kinds this
+/// binary's own drain declines to seed. Which anchors are usable is the receiver's judgment, and
+/// filtering here would destroy information a later receiver could use.
 fn anchors_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<MemoryOp>> {
     let anchors = portable_anchors_of(conn, memory_id)?;
     if anchors.is_empty() {

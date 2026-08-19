@@ -373,6 +373,24 @@ mod anchor_authoring_tests {
         .memory_id
     }
 
+    /// An indexed file, so a `path` binding over it RESOLVES to a source hash. Without one
+    /// `resolve_path_binding` reads no `files` row, stamps `source_text_hash` NULL, and every
+    /// source-hash assertion below would pass against an op that was never built.
+    fn indexed_file(conn: &Connection, path: &str, sha256: &str) {
+        conn.execute(
+            "INSERT INTO files(repo_id, path, language, kind, sha256, modified_at_ms, \
+             indexed_at_ms)
+             VALUES (?1, ?2, 'rust', 'code', ?3, 1, 1)",
+            rusqlite::params![REPO, path, sha256],
+        )
+        .unwrap();
+    }
+
+    /// The 64-char lowercase hex the indexer writes — the shape `source_text_hash` carries.
+    fn sha_of(seed: &str) -> String {
+        rag_rat_base::hash::hex_sha256(seed.as_bytes())
+    }
+
     /// The anchor set the PROJECTION holds for `memory_id` — the authored op as a peer would see
     /// it, after acceptance and the fold, rather than as raw entry bytes. `None` means no
     /// `node_anchors` op was authored for it at all.
@@ -385,6 +403,18 @@ mod anchor_authoring_tests {
             .expect("the memory projects as a node")
             .anchors
             .map(|anchors| anchors.into_iter().map(|anchor| anchor.binding_id).collect())
+    }
+
+    /// The source hash the PROJECTION holds for `memory_id` — the twin of [`projected_anchors`].
+    /// `None` means no `node_source_hash` op was authored for it at all.
+    fn projected_source_hash(conn: &Connection, memory_id: &str) -> Option<String> {
+        let stream = rag_rat_oplog::owned_stream_v2_id(conn, REPO).unwrap().unwrap();
+        rag_rat_oplog::list_projected_content_nodes(conn, stream)
+            .unwrap()
+            .into_iter()
+            .find(|node| node.node_id == memory_id)
+            .expect("the memory projects as a node")
+            .source_text_hash
     }
 
     /// A bound create publishes its anchors beside the node, so a peer can seed them.
@@ -515,6 +545,160 @@ mod anchor_authoring_tests {
             !anchors.contains(&"src/lib.rs".to_string()),
             "a full-set snapshot retires the anchor the memory no longer points at",
         );
+    }
+
+    /// A bound create publishes the hash of the text it anchored to, beside the anchors it
+    /// describes. Without it a receiver has nothing to compare its own checkout against, and the
+    /// hash-relocation fallback — which reads exactly this column — can never fire for a synced
+    /// memory.
+    #[test]
+    fn a_bound_create_publishes_the_source_hash_it_anchored_to() {
+        let conn = scoped_conn();
+        let sha = sha_of("lib");
+        indexed_file(&conn, "src/lib.rs", &sha);
+
+        let memory_id = bound_create(&conn, "src/lib.rs");
+
+        assert_eq!(projected_source_hash(&conn, &memory_id), Some(sha));
+    }
+
+    /// A memory anchored to something with no text behind it publishes NO hash — the absence is
+    /// the honest answer, and a receiver reads it as no evidence of drift rather than a sentinel.
+    #[test]
+    fn a_create_over_an_unindexed_path_publishes_no_source_hash() {
+        let conn = scoped_conn();
+        let memory_id = bound_create(&conn, "src/lib.rs");
+
+        assert_eq!(projected_source_hash(&conn, &memory_id), None);
+    }
+
+    /// A rebind re-stamps `source_text_hash` in the same transaction, so the published hash has to
+    /// move with the anchors or a peer keeps comparing against the pre-rebind text.
+    #[test]
+    fn a_rebind_republishes_the_hash_of_the_text_it_now_points_at() {
+        let conn = scoped_conn();
+        let before = sha_of("lib");
+        let after = sha_of("other");
+        indexed_file(&conn, "src/lib.rs", &before);
+        indexed_file(&conn, "src/other.rs", &after);
+        let memory_id = bound_create(&conn, "src/lib.rs");
+        assert_eq!(projected_source_hash(&conn, &memory_id), Some(before));
+
+        rebind_memory(&conn, &memory_id, RepoMemoryBindTarget {
+            path: Some("src/other.rs".to_string()),
+            ..RepoMemoryBindTarget::default()
+        })
+        .unwrap();
+
+        assert_eq!(projected_source_hash(&conn, &memory_id), Some(after));
+    }
+
+    /// A rebind onto a target with no text behind it — a commit, a tracker ref, a directory — nulls
+    /// the local column and therefore publishes nothing, so the register keeps the PRE-rebind hash.
+    /// The op vocabulary has no retraction, which is why a receiver applies a published hash only
+    /// where it also seeds the anchors that hash describes: the pair then goes stale together
+    /// instead of the hash outliving the anchors it claims to be about.
+    #[test]
+    fn a_rebind_onto_a_hashless_target_leaves_the_published_hash_standing() {
+        let conn = scoped_conn();
+        let before = sha_of("lib");
+        indexed_file(&conn, "src/lib.rs", &before);
+        let memory_id = bound_create(&conn, "src/lib.rs");
+
+        rebind_memory(&conn, &memory_id, RepoMemoryBindTarget {
+            commit_hash: Some("f".repeat(40)),
+            ..RepoMemoryBindTarget::default()
+        })
+        .unwrap();
+
+        let local: Option<String> = conn
+            .query_row(
+                "SELECT source_text_hash FROM repo_memories WHERE id = ?1",
+                [&memory_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(local, None, "the rebind nulled the local hash");
+        assert_eq!(
+            projected_source_hash(&conn, &memory_id),
+            Some(before),
+            "and published nothing, so the register still holds the pre-rebind value",
+        );
+    }
+
+    /// The backfill leg must publish the hash too, for the same reason it must publish anchors: a
+    /// memory whose bindings predate the op is authored by the reconcile anti-join, not by
+    /// `create_memory`, and the anti-join never revisits a node once it exists.
+    #[test]
+    fn the_reconcile_backfill_publishes_the_source_hash_for_a_memory_that_predates_the_op() {
+        let conn = scoped_conn();
+        let sha = sha_of("old");
+        conn.execute(
+            "INSERT INTO repo_memories(
+                 id, kind, title, body, confidence, status, created_at_ms, updated_at_ms, source,
+                 source_text_hash, memory_version, repo_id, origin)
+             VALUES ('mem_old', 'Invariant', 't', 'b', 'high', 'active', 1, 1, 'agent', ?2, 'v1',
+                 ?1, 'local')",
+            rusqlite::params![REPO, sha],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, anchor_status, created_at_ms)
+             VALUES (?1, 'mem_old', 'path', 'src/old.rs', 'src/old.rs', 'current', 1)",
+            [REPO],
+        )
+        .unwrap();
+
+        // Any authored write drives the backfill, which reconciles the un-authored node.
+        bound_create(&conn, "src/lib.rs");
+
+        assert_eq!(projected_source_hash(&conn, "mem_old"), Some(sha));
+    }
+
+    /// The half the node anti-join cannot reach: a memory whose `NodeCreate` was ALREADY authored
+    /// before the op existed. The anchor sweep is the only leg that reaches it, and the hash has to
+    /// ride that batch — a receiver applies a hash only where it seeds the anchors it describes, so
+    /// a sweep that published anchors alone would leave this whole corpus unmarked on every peer.
+    #[test]
+    fn the_anchor_sweep_publishes_the_source_hash_for_an_already_authored_memory() {
+        let conn = scoped_conn();
+        let sha = sha_of("old");
+        // The pre-anchor state, built honestly: author the node with NO snapshot (an unanchored
+        // create emits none), then give it a binding and a hash the way a pre-anchor store holds
+        // them — rows only.
+        let memory_id = create_memory(&conn, RepoMemoryCreate {
+            kind: "Concept".to_string(),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            confidence: "high".to_string(),
+            created_by: None,
+            source: None,
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget::default(),
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+        assert_eq!(projected_source_hash(&conn, &memory_id), None, "authored, with no hash");
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, anchor_status, created_at_ms)
+             VALUES (?1, ?2, 'path', 'src/old.rs', 'src/old.rs', 'current', 1)",
+            rusqlite::params![REPO, memory_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE repo_memories SET source_text_hash = ?2 WHERE id = ?1",
+            rusqlite::params![memory_id, sha],
+        )
+        .unwrap();
+
+        // Any authored write drives the reconcile, which now sweeps these too.
+        bound_create(&conn, "src/other.rs");
+
+        assert_eq!(projected_source_hash(&conn, &memory_id), Some(sha));
     }
 }
 

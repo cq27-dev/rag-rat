@@ -940,6 +940,11 @@ mod tests {
     }
 
     /// One representative op per variant — the golden + round-trip fixtures.
+    ///
+    /// A new `MemoryOp` variant MUST gain an entry here (and a pinned vector in
+    /// `golden_vectors_pin_the_op_wire_format`). Three tests read this list, and a variant missing
+    /// from it is silently exempt from all three: its bytes are unpinned, its decode arm can be
+    /// dropped without failing anything, and its wire limits go unchecked.
     fn every_variant() -> Vec<(&'static str, MemoryOp)> {
         vec![
             ("node_create", MemoryOp::NodeCreate {
@@ -963,6 +968,11 @@ mod tests {
             ("node_anchors", MemoryOp::NodeAnchors {
                 node_id: NodeId::from("mem_1"),
                 anchors: anchors(),
+            }),
+            ("node_source_hash", MemoryOp::NodeSourceHash {
+                node_id: NodeId::from("mem_1"),
+                source_text_hash:
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
             }),
             ("snapshot", MemoryOp::Snapshot),
         ]
@@ -997,6 +1007,10 @@ mod tests {
             (
                 "node_anchors",
                 "836c7261672d7261742f6f702f316c6e6f64655f616e63686f727382656d656d5f31828e6673796d626f6c78186372617465732f782f7372632f6c69622e72733a3a72756e736372617465732f782f7372632f6c69622e72730a1466633066666565f6f6f61b0000018bcfe568006866756e6374696f6e6335696769736369702d7275737463302e338e67747261636b6572736769746875623a6f776e65722f7265706f2337f6f6f6f6666769746875626a6f776e65722f7265706f61371b0000018bcfe56801f6f6f6f6",
+            ),
+            (
+                "node_source_hash",
+                "836c7261672d7261742f6f702f31706e6f64655f736f757263655f6861736882656d656d5f31784065336230633434323938666331633134396166626634633839393666623932343237616534316534363439623933346361343935393931623738353262383535",
             ),
             ("snapshot", "836c7261672d7261742f6f702f3168736e617073686f74f6"),
         ];

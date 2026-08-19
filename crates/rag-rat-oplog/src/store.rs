@@ -672,11 +672,11 @@ pub fn load_projection(conn: &Connection, stream: StreamId) -> anyhow::Result<Pr
             state.nodes.insert(NodeId::from(node_id.as_str()), ProjectedNode {
                 content: NodeContent::from(content),
                 status,
-                // The `/1` shadow tables carry no anchor column and deliberately gain none: this
-                // path is frozen scaffolding, and anchors exist to cross an account boundary, which
-                // only `/3` does. A `NodeAnchors` op folded through here therefore round-trips
-                // lossily — if `/1` ever needs them, that is an explicit schema change, not a
-                // silent assumption.
+                // The `/1` shadow tables carry no anchor or source-hash column and deliberately
+                // gain none: this path is frozen scaffolding, and both facts exist to cross an
+                // account boundary, which only `/3` does. A `NodeAnchors` or `NodeSourceHash` op
+                // folded through here therefore round-trips lossily — if `/1` ever needs them, that
+                // is an explicit schema change, not a silent assumption.
                 anchors: None,
                 source_text_hash: None,
             });
