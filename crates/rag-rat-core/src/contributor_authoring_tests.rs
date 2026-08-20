@@ -656,6 +656,26 @@ fn index_maintenance_survives_the_ex_contributors_private_stream_refusal() {
     );
 }
 
+/// The maintenance tolerance covers the private-stream refusal and nothing else. A real failure in
+/// the ghost heal means the reconcile did NOT run, and swallowing it would hide that on every
+/// `rag-rat reconcile` and every watcher pass — silently, forever, since maintenance is the only
+/// caller that could report it. Break a table the heal reads and require the call to say so.
+#[test]
+fn the_ghost_heal_propagates_a_failure_that_is_not_the_private_stream_refusal() {
+    let conn = scoped_conn();
+    local_account(&conn, NOW).unwrap();
+    create_memory(&conn, concept("note")).unwrap();
+    conn.execute_batch("ALTER TABLE account_stream_ownership RENAME TO ownership_moved_away")
+        .unwrap();
+
+    let err = crate::memory_write::heal_memory_oplog_ghosts(&conn, NOW)
+        .expect_err("a non-refusal failure must fail the pass rather than be skipped");
+    assert!(
+        format!("{err:#}").contains("account_stream_ownership"),
+        "and the read failure surfaces instead of being swallowed: {err:#}",
+    );
+}
+
 /// The guard must block on exactly what the SERVING side would still serve. Once the owner runs
 /// `sync revoke`, its own pull already cannot reach this account for that stream, so establishing a
 /// private stream here strands nothing — and refusing anyway would be permanent, with no recourse
