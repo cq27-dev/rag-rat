@@ -362,8 +362,10 @@ fn grantee_context(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<Gr
 /// Run TWICE by each setter: once before the transaction, so this specific conflict is what the
 /// operator is told about rather than a later, blunter guard; and again INSIDE it, because the two
 /// setters read what the other writes — checked only outside, two concurrent configures each
-/// observe the other's absence and commit, leaving BOTH keys set. Nothing could then clear that:
-/// each setter refuses on account of the other, and the drain silently prefers contribution.
+/// observe the other's absence and commit, leaving BOTH keys set, which neither setter could then
+/// correct (each refuses on account of the other) and which the drain resolves silently in
+/// contribution's favor. Both setters open `BEGIN IMMEDIATE`, so the in-transaction read serializes
+/// them; the outside one only buys the better message.
 fn ensure_no_subscription_configured(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
     if let Some(subscribed) = subscription_owner_account(conn, repo_id)? {
         anyhow::bail!(
@@ -420,24 +422,7 @@ pub(crate) fn set_contribution_owner(
         "cannot contribute to your own account — the owner is a SEPARATE identity (its id from \
          the owner's `sync whoami`)"
     );
-    // A contributor is reachable only while its account is publicly servable: content is served by
-    // its AUTHOR account and the owner is not enrolled here, so if this account holds ANY private
-    // stream the owner can never pull what this store authors — the contributions would be
-    // authored, accepted on the owner's stream, and permanently unreachable.
-    //
-    // Refuse at configure time rather than let it fail invisibly later. A control log cannot be
-    // served as a subset (it is one hash chain), so there is no way to expose the roster while
-    // withholding the private stream metadata; a dedicated store is the only correct answer.
-    // `sync publish` guards the same property for OWNERS, but a contributor never publishes, so
-    // that check never runs on this path.
-    anyhow::ensure!(
-        rag_rat_oplog::account_is_fully_public(conn, local)?,
-        "this account owns private memory streams (from other repos in this index), so a granted \
-         owner could never fetch what you contribute — an account is servable to a peer only when \
-         all of its streams are public, and a control log cannot be served in part. Contribute \
-         from a dedicated index instead: `rag-rat init --database <path-to-a-fresh-index>` in \
-         this checkout, then run `sync contribute` there"
-    );
+    ensure_contributor_account_is_servable(conn, local)?;
 
     let canonical = rag_rat_base::hash::hex_lower(&owner.to_bytes());
 
@@ -448,7 +433,13 @@ pub(crate) fn set_contribution_owner(
         "active repo scope changed while starting sync contribute; retry"
     );
     ensure_no_subscription_configured(&tx, &repo_id)?;
-    repoint_authoritative_content_stream(&tx, &repo_id, |tx| {
+    // Re-read UNDER the write lock, like the conflict guard above and for the same reason: read
+    // only outside, a memory write in a SECOND repo of this index can establish that repo's
+    // private stream (`ensure_owner_stream` takes its own IMMEDIATE lock) between this check and
+    // the commit, and contribute would win the race into exactly the contributing-plus-private
+    // state `ensure_owner_stream` exists to forbid.
+    ensure_contributor_account_is_servable(&tx, local)?;
+    repoint_authoritative_content_stream(&tx, &repo_id, StreamResolution::Strict, |tx| {
         rag_rat_db::meta::set_repo_meta(tx, &repo_id, CONTRIBUTION_OWNER_META_KEY, &canonical)
             .map_err(Into::into)
     })?;
@@ -456,7 +447,42 @@ pub(crate) fn set_contribution_owner(
     Ok(())
 }
 
-/// Apply `repoint` — the write that changes which stream
+/// A contributor is reachable only while its account is publicly servable: content is served by its
+/// AUTHOR account and the owner is not enrolled here, so if this account holds ANY private stream
+/// the owner can never pull what this store authors — the contributions would be authored, accepted
+/// on the owner's stream, and permanently unreachable.
+///
+/// Refuse at configure time rather than let it fail invisibly later. A control log cannot be served
+/// as a subset (it is one hash chain), so there is no way to expose the roster while withholding
+/// the private stream metadata; a dedicated store is the only correct answer. `sync publish` guards
+/// the same property for OWNERS, but a contributor never publishes, so that check never runs on
+/// this path.
+fn ensure_contributor_account_is_servable(
+    conn: &Connection,
+    local: rag_rat_oplog::AccountId,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        rag_rat_oplog::account_is_fully_public(conn, local)?,
+        "this account owns private memory streams (from other repos in this index), so a granted \
+         owner could never fetch what you contribute — an account is servable to a peer only when \
+         all of its streams are public, and a control log cannot be served in part. Contribute \
+         from a dedicated index instead: `rag-rat init --database <path-to-a-fresh-index>` in \
+         this checkout, then run `sync contribute` there"
+    );
+    Ok(())
+}
+
+/// How a re-point resolves the streams whose drain watermarks it forgets.
+enum StreamResolution {
+    /// A SETTER: an unreadable owner key is a state the configure must not write over silently.
+    Strict,
+    /// A CLEAR: the unreadable owner key is precisely what is being removed, and a side that
+    /// cannot resolve had no stream to drain in the first place. Best-effort resolution is what
+    /// keeps the recovery command usable in the one state that needs it.
+    BestEffort,
+}
+
+/// Apply `repoint` — the CONFIGURATION write that changes which stream
 /// [`super::drain::authoritative_content_stream`] names for `repo_id` — and forget the drain
 /// watermark of the stream on BOTH sides of it.
 ///
@@ -469,16 +495,29 @@ pub(crate) fn set_contribution_owner(
 ///
 /// Both sides resolve through the drain's own helper, so the two can never disagree about which
 /// stream the re-point moved away from.
+///
+/// [`enable_public_authoring`] also moves the repo's authoritative stream (Private ⇒ PublicRead)
+/// without coming through here. That path is watermark-safe on its own: it refuses unless the
+/// account is fully public, so the outgoing Private stream is one nothing was ever authored or
+/// ingested onto and it holds no synced rows to condemn.
 fn repoint_authoritative_content_stream(
     tx: &Transaction<'_>,
     repo_id: &str,
+    resolution: StreamResolution,
     repoint: impl FnOnce(&Transaction<'_>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    if let Some(outgoing) = super::drain::authoritative_content_stream(tx, repo_id)? {
+    let resolve = |tx: &Transaction<'_>| -> anyhow::Result<Option<StreamId>> {
+        let resolved = super::drain::authoritative_content_stream(tx, repo_id);
+        match resolution {
+            StreamResolution::Strict => resolved,
+            StreamResolution::BestEffort => Ok(resolved.ok().flatten()),
+        }
+    };
+    if let Some(outgoing) = resolve(tx)? {
         rag_rat_oplog::clear_content_drain_watermark(tx, outgoing)?;
     }
     repoint(tx)?;
-    if let Some(incoming) = super::drain::authoritative_content_stream(tx, repo_id)? {
+    if let Some(incoming) = resolve(tx)? {
         rag_rat_oplog::clear_content_drain_watermark(tx, incoming)?;
     }
     Ok(())
@@ -527,7 +566,7 @@ pub(crate) fn set_subscription_owner(
         "active repo scope changed while starting sync subscribe; retry"
     );
     ensure_no_contribution_configured(&tx, &repo_id)?;
-    repoint_authoritative_content_stream(&tx, &repo_id, |tx| {
+    repoint_authoritative_content_stream(&tx, &repo_id, StreamResolution::Strict, |tx| {
         rag_rat_db::meta::set_repo_meta(tx, &repo_id, SUBSCRIPTION_OWNER_META_KEY, &canonical)
             .map_err(Into::into)
     })?;
@@ -545,8 +584,12 @@ pub(crate) fn set_subscription_owner(
 /// removal recoverable: the own stream's watermark is forgotten, so the next drain makes a full
 /// pass and re-materializes them from its projection. What does NOT come back is checkout-local
 /// binding work — `drain::seed_node_anchors` seeds only the author's published anchors, and only
-/// for a memory this store holds no bindings for, so a local `memory rebind` on a synced memory is
-/// lost with the row.
+/// for a memory this store holds no bindings for, so a `memory rebind` made here is lost with the
+/// row, as is any `origin='local'` edge that FK'd it.
+///
+/// Stream resolution here is BEST-EFFORT, unlike the setters': an owner key that will not parse is
+/// exactly what this command removes, and a side that cannot resolve had no stream to drain — a
+/// strict resolution would make the recovery command unusable in the state that most needs it.
 fn clear_foreign_owner(conn: &Connection, meta_key: &str, command: &str) -> anyhow::Result<bool> {
     let repo_id = memory_repo_scope(conn)?
         .with_context(|| format!("{command} requires an active repo scope"))?;
@@ -560,7 +603,7 @@ fn clear_foreign_owner(conn: &Connection, meta_key: &str, command: &str) -> anyh
     if rag_rat_db::meta::repo_meta(&tx, &repo_id, meta_key)?.is_none() {
         return Ok(false);
     }
-    repoint_authoritative_content_stream(&tx, &repo_id, |tx| {
+    repoint_authoritative_content_stream(&tx, &repo_id, StreamResolution::BestEffort, |tx| {
         rag_rat_db::meta::delete_repo_meta(tx, &repo_id, meta_key).map_err(Into::into)
     })?;
     tx.commit()?;
@@ -1134,24 +1177,54 @@ fn ensure_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow:
     // where the conflict is actually created, inside the same transaction that would create it.
     //
     // Yes, this means memory authoring in an unrelated private repo fails while this index
-    // contributes. That is the honest ordering: the alternative is authoring memories nobody can
-    // ever fetch and discovering it much later. The error names both escapes.
-    if mode != rag_rat_oplog::AccessMode::PublicRead {
-        let contributing = contribution_targets(&tx)?;
-        if let Some((contributing_repo, owner)) = contributing.first() {
-            anyhow::bail!(
-                "repo `{repo_id}` would need a PRIVATE memory stream, but this index contributes \
-                 repo `{contributing_repo}`'s memories to account {} — and an account is \
-                 fetchable by a peer only while all of its streams are public, so this would \
-                 strand those contributions unreachable. Index `{repo_id}` in a separate \
-                 database, or publish it with `rag-rat sync publish`",
-                rag_rat_base::hash::hex_lower(&owner.to_bytes()),
-            );
-        }
+    // contributes — or has ever contributed, since the authored entries outlive the configuration.
+    // That is the honest ordering: the alternative is authoring memories nobody can ever fetch and
+    // discovering it much later. The error names both escapes, and nothing is committed on the way
+    // out, so re-running `sync contribute` or publishing the repo unblocks it.
+    if mode != rag_rat_oplog::AccessMode::PublicRead
+        && let Some(cause) = private_stream_strands_contributions(&tx)?
+    {
+        anyhow::bail!(
+            "repo `{repo_id}` would need a PRIVATE memory stream, but this index {cause} — and an \
+             account is fetchable by a peer only while all of its streams are public, so this \
+             would strand those contributions unreachable. Index `{repo_id}` in a separate \
+             database, or publish it with `rag-rat sync publish`"
+        );
     }
     let stream = rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(&tx, repo_id, mode, now_ms)?;
     tx.commit()?;
     Ok(stream)
+}
+
+/// Why establishing a PRIVATE stream in this index would strand contributions, phrased as the
+/// middle of the refusal sentence — or `None` when nothing is at stake.
+///
+/// EVIDENCE outranks configuration, the same correction
+/// [`crate::sync_driver::account_is_public_kb`] makes on the serving side: `sync uncontribute` (or
+/// any other path that drops the meta row) clears the configured target, but the entries this
+/// account already authored onto the owner's PublicRead stream stay there, and the owner can fetch
+/// them only while this account owns no private stream. Keying the guard on configuration alone
+/// would let the unset open a door that a `StreamOwn` — append-only, never un-authorable — then
+/// closes forever.
+fn private_stream_strands_contributions(conn: &Connection) -> anyhow::Result<Option<String>> {
+    if let Some((contributing_repo, owner)) = contribution_targets(conn)?.first() {
+        return Ok(Some(format!(
+            "contributes repo `{contributing_repo}`'s memories to account {}",
+            rag_rat_base::hash::hex_lower(&owner.to_bytes()),
+        )));
+    }
+    // No local account ⇒ nothing was ever authored anywhere ⇒ nothing to strand.
+    let Some(account) = rag_rat_oplog::read_local_account(conn)? else {
+        return Ok(None);
+    };
+    let authored = rag_rat_oplog::authored_foreign_streams(conn, account)?;
+    if authored.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "has already authored memories onto {} stream(s) another account owns",
+        authored.len(),
+    )))
 }
 
 fn prepare_owner_authoring(

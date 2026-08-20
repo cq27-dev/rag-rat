@@ -327,9 +327,13 @@ fn an_unsynced_or_mistyped_owner_never_becomes_removal_authority() {
 }
 
 /// `sync contribute` is re-pointable too, and by the same one-stream rule the owner's memories are
-/// REMOVED when it is cleared — so the unset carries the same watermark discipline: the repo's own
-/// stream becomes the authority again and a full pass re-materializes it. What the contributor
-/// authored keeps its `origin='local'` and never depended on the mirror.
+/// REMOVED when it is cleared: the repo's own stream becomes the authority again and the owner's
+/// projection stops materializing here. What the contributor authored keeps its `origin='local'`
+/// and never depended on the mirror. (The unset's watermark discipline is exercised on the
+/// SUBSCRIPTION side —
+/// `unsubscribing_restores_the_sibling_device_memories_the_subscription_removed` — where the repo
+/// has an own stream that was drained to a current watermark before the re-point; a contributor
+/// owns no stream at all, so there is no watermark here to be wrong about.)
 #[test]
 fn uncontributing_re_points_the_repo_back_at_its_own_stream() {
     let (_owner, contributor, _owner_account) = contribution_pair();
@@ -586,6 +590,74 @@ fn a_contributing_store_refuses_to_establish_a_private_stream_later() {
     assert!(err.contains("PRIVATE memory stream"), "the refusal names the conflict: {err}");
     assert!(err.contains("separate database"), "and hands over an escape: {err}");
     assert!(err.contains("sync publish"), "and the other escape: {err}");
+}
+
+/// The guard keys on EVIDENCE, not configuration. `sync uncontribute` empties the configured
+/// targets, but the entries this store already authored onto the owner's stream stay there and the
+/// owner can fetch them only while this account owns no private stream. Keyed on configuration, the
+/// unset would let the very next memory write author a `Private` `StreamOwn` — append-only, never
+/// un-authorable — permanently un-serving the account and stranding those contributions.
+#[test]
+fn an_ex_contributor_still_refuses_to_establish_a_private_stream() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    let contributor_account = local_account(&contributor, NOW).unwrap();
+    create_memory(&contributor, concept("contributor-note")).unwrap();
+
+    assert!(
+        crate::memory_write::clear_contribution_owner(&contributor).unwrap(),
+        "a contribution was configured",
+    );
+    assert!(
+        crate::memory_write::contribution_targets(&contributor).unwrap().is_empty(),
+        "nothing is configured any more — the authored entries are all that is left",
+    );
+
+    let err = create_memory(&contributor, concept("post-unset-note")).unwrap_err().to_string();
+    assert!(err.contains("PRIVATE memory stream"), "the refusal names the conflict: {err}");
+    assert!(err.contains("already authored"), "and cites the evidence, not the config: {err}");
+    assert!(err.contains("sync publish"), "and hands over the escape: {err}");
+    assert!(
+        rag_rat_oplog::account_is_fully_public(&contributor, contributor_account).unwrap(),
+        "and nothing private was authored, so the owner can still fetch the contributions",
+    );
+}
+
+/// Both unsetters must work in the state the drain's LAZY owner resolution was made tolerant of: a
+/// `memory_subscription_owner` value that will not parse. Resolving it strictly on the re-point
+/// would bail and roll back, leaving the recovery commands unusable in precisely the state they are
+/// for. A side that cannot resolve had no stream to drain, so best-effort loses nothing.
+#[test]
+fn clearing_a_foreign_owner_tolerates_an_unparseable_owner_key() {
+    // OUTGOING side: the corrupt key is the one being cleared, so the FIRST resolution meets it.
+    let (_owner, subscriber, _owner_account) = subscription_pair();
+    rag_rat_db::meta::set_repo_meta(&subscriber, REPO, "memory_subscription_owner", "not-hex")
+        .unwrap();
+    assert!(
+        crate::memory_write::clear_subscription_owner(&subscriber).unwrap(),
+        "the corrupt subscription is cleared rather than defended",
+    );
+    assert!(
+        rag_rat_db::meta::repo_meta(&subscriber, REPO, "memory_subscription_owner")
+            .unwrap()
+            .is_none(),
+        "and the row is gone, not rolled back",
+    );
+
+    // INCOMING side: the contribution resolves fine on the way out, and the corrupt subscription
+    // key is what the repo falls back to once it is gone.
+    let (_owner2, contributor, _owner_account2) = contribution_pair();
+    rag_rat_db::meta::set_repo_meta(&contributor, REPO, "memory_subscription_owner", "not-hex")
+        .unwrap();
+    assert!(
+        crate::memory_write::clear_contribution_owner(&contributor).unwrap(),
+        "the contribution clears even though the fallback owner key is corrupt",
+    );
+    assert!(
+        rag_rat_db::meta::repo_meta(&contributor, REPO, "memory_contribution_owner")
+            .unwrap()
+            .is_none(),
+        "and the row is gone, not rolled back",
+    );
 }
 
 /// A published owner plus a SUBSCRIBER of it: the owner's log + content are synced in, and the

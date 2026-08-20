@@ -165,39 +165,59 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 })).collect::<Vec<_>>(),
             }))
         },
+        // Every arm that RE-POINTS the repo's authoritative stream drains before reporting, the way
+        // `contribute_with_ticket` already does: the re-point is only a configuration write, the
+        // memories move in the drain, and no read path runs one. Reporting the new configuration
+        // while `memory search` still shows the old contents reads as a failed command.
         SyncCommand::Contribute { account } => {
             db.sync_contribute(account)?;
+            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+            db.fold_wal();
             print_output(&serde_json::json!({
                 "status": "contributing",
                 "repo_id": db.active_repo_id,
                 "owner_account_id": account,
+                "memories_added": effects.nodes_written,
+                "memories_removed": effects.nodes_removed,
                 "note": "memory changes for this repo now target the owner's stream; the owner must `sync grant` this account, and this store needs the owner's log — automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
             }))
         },
         SyncCommand::Subscribe { account } => {
             db.sync_subscribe(account)?;
+            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+            db.fold_wal();
             print_output(&serde_json::json!({
                 "status": "subscribed",
                 "repo_id": db.active_repo_id,
                 "owner_account_id": account,
                 "read_only": true,
-                "note": "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except that a local `memory rebind` on a synced memory is lost with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log: automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
+                "memories_added": effects.nodes_written,
+                "memories_removed": effects.nodes_removed,
+                "note": "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log: automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
             }))
         },
         SyncCommand::Unsubscribe => {
             let cleared = db.sync_unsubscribe()?;
+            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+            db.fold_wal();
             print_output(&serde_json::json!({
                 "status": if cleared { "unsubscribed" } else { "not_subscribed" },
                 "repo_id": db.active_repo_id,
-                "note": "this repo's memories materialize from its own account's stream again: the next drain restores what its other devices had synced here and removes the owner's. A local `memory rebind` made on a memory the subscription removed is not restored with it",
+                "memories_restored": effects.nodes_written,
+                "memories_removed": effects.nodes_removed,
+                "note": "this repo's memories materialize from its own account's stream again: what its other devices had synced here is restored and the owner's goes in turn. Local binding work is not restored — a `memory rebind` made on a memory the subscription removed, and any local edge onto it, went with the row",
             }))
         },
         SyncCommand::Uncontribute => {
             let cleared = db.sync_uncontribute()?;
+            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+            db.fold_wal();
             print_output(&serde_json::json!({
                 "status": if cleared { "uncontributed" } else { "not_contributing" },
                 "repo_id": db.active_repo_id,
-                "note": "memory changes for this repo target this store's own stream again, and the next drain materializes it in the owner's place. Contributions already authored onto the owner's stream stay there, and the owner's grant stays open until it runs `sync revoke`",
+                "memories_restored": effects.nodes_written,
+                "memories_removed": effects.nodes_removed,
+                "note": "memory changes for this repo target this store's own stream again, and its own stream materializes it in the owner's place. Contributions already authored onto the owner's stream stay there, and the owner's grant stays open until it runs `sync revoke` — so this index still may not hold a private memory stream in any repo, or those contributions become unfetchable. Publish this repo, or re-run `sync contribute`, if memory authoring here starts refusing",
             }))
         },
         SyncCommand::Serve { .. }

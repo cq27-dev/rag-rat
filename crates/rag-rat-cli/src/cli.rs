@@ -397,14 +397,15 @@ pub(crate) enum SyncCommand {
                             back. This store's own memories keep being authored onto its own \
                             stream and are never removed by the mirror. What IS removed: exactly \
                             one stream materializes a repo, so while subscribed this repo stops \
-                            mirroring its own account and the next drain DELETES every memory \
-                            this account's other devices had synced here — they do not go stale, \
-                            they go away. `sync unsubscribe` restores them, EXCEPT for local \
-                            binding work: a `memory rebind` you made on a synced memory is lost \
-                            with the row, because a re-drain seeds only the anchors its author \
-                            published. The owner's log must reach this store before anything \
-                            materializes: automatic sync pulls it once the owner's host is in \
-                            [sync] server_peers, or run `rag-rat sync pull <owner>`.")]
+                            mirroring its own account and the drain DELETES every memory this \
+                            account's other devices had synced here — they do not go stale, they \
+                            go away. `sync unsubscribe` restores them, EXCEPT for local binding \
+                            work: a `memory rebind` you made on a synced memory, and any local \
+                            edge onto it, go with the row, because a re-drain seeds only the \
+                            anchors its author published. The owner's log must reach this store \
+                            before anything materializes: automatic sync pulls it once the \
+                            owner's host is in [sync] server_peers, or run `rag-rat sync pull \
+                            <owner>`.")]
     Subscribe {
         /// The owner's 64-hex account id, from the owner's `rag-rat sync whoami`.
         #[arg(value_name = "OWNER_ACCOUNT_ID")]
@@ -412,23 +413,28 @@ pub(crate) enum SyncCommand {
     },
     /// Stop mirroring a subscribed identity's memories.
     #[command(long_about = "Clears this repo's `sync subscribe` configuration: its memories \
-                            materialize from its OWN account's stream again. The next drain \
-                            restores the memories this account's other devices had synced here \
-                            (the subscription deleted them) and removes the owner's in turn — \
+                            materialize from its OWN account's stream again. Drains immediately, \
+                            restoring the memories this account's other devices had synced here \
+                            (the subscription deleted them) and removing the owner's in turn — \
                             each side is re-materialized from its stream's projection, so the \
                             round trip is lossless EXCEPT for checkout-local binding work: a \
-                            `memory rebind` made on a synced memory is not restored, because the \
-                            re-drain seeds only the anchors the memory's author published.")]
+                            `memory rebind` made on a synced memory, and any local edge onto it, \
+                            are not restored, because the re-drain seeds only the anchors the \
+                            memory's author published.")]
     Unsubscribe,
     /// Stop contributing this repo's memories to a configured owner.
     #[command(long_about = "Clears this repo's `sync contribute` configuration: memory authoring \
                             targets this store's own stream again, which is also the stream the \
-                            repo's memories materialize from, so the next drain restores what \
-                            this account's own devices synced here and removes the owner's. \
-                            Nothing is withdrawn from the owner: the contributions already \
-                            authored onto its stream stay, this store keeps its own copies of \
-                            them, and the Writer grant remains open until the owner runs `sync \
-                            revoke`.")]
+                            repo's memories materialize from, so this drains immediately, \
+                            restoring what this account's own devices synced here and removing \
+                            the owner's. Nothing is withdrawn from the owner: the contributions \
+                            already authored onto its stream stay, this store keeps its own \
+                            copies of them, and the Writer grant remains open until the owner \
+                            runs `sync revoke`. Because those contributions stay fetchable only \
+                            while this account owns no private stream, memory authoring in a \
+                            repo of this index that would need one keeps refusing after the \
+                            unset — publish that repo, index it separately, or re-run `sync \
+                            contribute`.")]
     Uncontribute,
     /// Fetch ANOTHER account's memories from a peer that serves them.
     #[command(long_about = "Syncs a DIFFERENT account's log and memories from a peer, then \
