@@ -9,9 +9,10 @@
 //!
 //! Containment alone is too generous to decide by, though, because the ranges that contain a token
 //! nest: a segment, the item declaring it, and the module around both. The join takes the TIGHTEST
-//! containing occurrence and never considers a namespace one at all — a module is not something a
-//! call or a type reference can resolve to, so matching one means SCIP had no answer here, not that
-//! it named a different target.
+//! containing occurrence, and admits a namespace one only where it bounds the token exactly — a
+//! module merely spanning the token is what the token sits inside, not something a call or a type
+//! reference resolves to, so matching one means SCIP had no answer here rather than that it named a
+//! different target.
 
 use super::scip::{ScipIndex, ScipOccurrence};
 use super::store::SymbolSpan;

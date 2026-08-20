@@ -315,3 +315,88 @@ fn decl_and_def_of_same_logical_symbol_is_confirm_not_contradiction() {
     assert_eq!(report.confirmed, 1);
     assert_eq!(report.contradicted, 0, "same logical symbol is not a contradiction");
 }
+
+/// A namespace occurrence answers for an edge when it BOUNDS the callee token, and is ignored when
+/// it merely contains it.
+///
+/// Width is the whole rule. A module spanning far past the token is the thing the token sits
+/// inside, and judging an edge against it manufactured a disagreement with a symbol no heuristic
+/// arm could produce. But a namespace CAN be the referent: TypeScript emits a `references_type`
+/// edge for `ns.f()` whose callee range is the receiver node itself, so a DECLARED `namespace ns`
+/// — which carries a definition occurrence over its own name — answers for that receiver.
+///
+/// The `import * as ns` variant is deliberately NOT modelled here. Its per-file symbol carries a
+/// synthetic zero-width `0..0` definition, which resolves by containment to whichever symbol
+/// happens to span byte 0 — a defect downstream of this rule, in definition mapping rather than
+/// occurrence selection (#1246).
+///
+/// The edge here carries the shape TypeScript emits — name-only, unresolved — so the counterfactual
+/// the wide case rules out is a spurious UPGRADE onto the namespace. The contradictions #1223
+/// measured need an edge the heuristic already resolved; either way the recorded target is a module
+/// no call can reach.
+///
+/// Both halves are pinned at RUN level rather than over the selector alone: no declared corpus
+/// produces a namespace verdict — rxjs's `src/internal` carries namespace imports in one re-export
+/// file and declares no `namespace` block — so a regression in either direction survives the corpus
+/// suite (#1234).
+#[test]
+fn a_namespace_occurrence_answers_only_when_it_bounds_the_token() {
+    // scip-typescript's spelling for a module: the trailing `/` descriptor.
+    const NAMESPACE: &str = "scip-typescript npm demo 1.0 `src/m.ts`/ns/";
+
+    /// One run over `function caller() { ns.f(); }`, with the namespace occurrence at
+    /// `occ_start..occ_end`. Returns the verdict written for the receiver edge and the id of the
+    /// namespace symbol it should have resolved to.
+    fn verdict_for(occ_start: i32, occ_end: i32) -> (Option<(String, Option<i64>, String)>, i64) {
+        let h = Harness::new();
+        let caller = h.add_file("caller.ts", "function caller() { ns.f(); }\n");
+        let defs = h.add_file("m.ts", "namespace ns {}\n");
+        // The declaration's own name spans bytes 10..12 ("ns") in m.ts.
+        let ns_sym = h.add_symbol(defs, "ns", 10, 12);
+        // The whole `namespace ns {}` block contains that definition too. The answer has to be the
+        // name it declares, not the enclosing block that merely spans it.
+        h.add_symbol(defs, "block", 0, 15);
+        // The receiver token `ns` sits at bytes 20..22 — the shape TypeScript emits, where the
+        // callee range is the receiver node rather than the whole path.
+        let edge = h.add_edge_with_kind(caller, "ns", 20, 22, "references_type", "NameOnly", None);
+
+        let bytes =
+            scip_bytes("caller.ts", PositionEncoding::UTF8CodeUnitOffsetFromLineStart, vec![
+                occurrence(
+                    0,
+                    occ_start,
+                    occ_end,
+                    NAMESPACE,
+                    SymbolRole::UnspecifiedSymbolRole as i32,
+                ),
+            ]);
+        let mut full = Index::parse_from_bytes(&bytes).unwrap();
+        full.documents.push(Document {
+            relative_path: "m.ts".to_string(),
+            occurrences: vec![occurrence(0, 10, 12, NAMESPACE, SymbolRole::Definition as i32)],
+            position_encoding: EnumOrUnknown::new(
+                PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+            ),
+            ..Default::default()
+        });
+        let bytes = full.write_to_bytes().unwrap();
+
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        (h.verdict(edge), ns_sym)
+    }
+
+    let (verdict, ns_sym) = verdict_for(20, 22);
+    let (kind, resolved, scip) =
+        verdict.expect("a namespace naming the token itself is the referent");
+    assert_eq!(kind, OracleResolutionKind::Upgrade.as_db_str());
+    assert_eq!(scip, NAMESPACE, "the verdict cites the namespace it resolved through");
+    // Citing the namespace is not enough: a definition-mapping regression can cite it while
+    // resolving to whatever symbol happens to sit at the definition's offset (#1246).
+    assert_eq!(resolved, Some(ns_sym), "and resolves to the declaration itself");
+
+    // The same symbol spanning the whole statement is context, not an answer.
+    assert!(
+        verdict_for(0, 29).0.is_none(),
+        "a namespace merely containing the token yields no evidence at all",
+    );
+}
