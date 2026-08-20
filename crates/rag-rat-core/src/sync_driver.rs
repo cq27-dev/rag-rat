@@ -554,22 +554,26 @@ fn prepare_advertisement(
             record
         },
     };
+    // An over-size envelope is LATCHED to `None` in the record, not filtered on the way out.
+    // Nothing `matches` compares moves when the ceiling or the wrap layout does, so the same
+    // record answers this question on every one-second tick — a filter alone would repeat the
+    // verdict forever. Latched, the roster is reported once and every later tick reads `None`.
+    // This covers a fresh seal and a record written before the ceiling moved alike, so the two
+    // never give an operator two different accounts of the same roster.
+    if record.envelope.as_deref().is_some_and(|envelope| !fits_one_announcement(envelope)) {
+        write_advertisement(conn, &PersistedAdvertisement { envelope: None, ..record })?;
+        return Ok(None);
+    }
     if record.live(now_ms) {
         return Ok(None);
     }
-    // Applied to the persisted envelope, not only to a fresh seal: a record written before the
-    // ceiling or the wrap layout moved is over-size too, and it would otherwise reach the publish
-    // boundary — which spends a dial to learn what is known here, and reports a bare byte count
-    // where the operator needs the roster.
-    Ok(record.envelope.filter(|envelope| fits_one_announcement(envelope)).map(|envelope| {
-        Publication {
-            tag,
-            node: *node,
-            service: *service,
-            relay: relay.to_owned(),
-            envelope,
-            ttl_seconds,
-        }
+    Ok(record.envelope.map(|envelope| Publication {
+        tag,
+        node: *node,
+        service: *service,
+        relay: relay.to_owned(),
+        envelope,
+        ttl_seconds,
     }))
 }
 
@@ -578,6 +582,8 @@ fn prepare_advertisement(
 /// The publish boundary refuses an over-size envelope too, but it sees bytes and not a roster, so
 /// its message names a byte count and no action. This one names the roster and its ceiling, which
 /// is the only thing an operator can change.
+///
+/// The verdict is warned, so a caller on a timer MUST latch it — see `prepare_advertisement`.
 fn fits_one_announcement(envelope: &[u8]) -> bool {
     if rag_rat_sync::discovery::fits_publish(envelope) {
         return true;
@@ -1458,6 +1464,91 @@ mod tests {
         assert!(can_sync(Some(rag_rat_sync::PeerCapability::ReadOnly)));
     }
 
+    const ADVERTISED_NODE: [u8; 32] = [0x11; 32];
+    const ADVERTISED_SERVICE: [u8; 32] = [0x22; 32];
+    const ADVERTISED_RELAY: &str = "https://relay.one";
+
+    /// Persist an advertisement record `prepare_advertisement` matches, so it is reused verbatim
+    /// rather than resealed — the shape in which an envelope sealed under an older byte ceiling or
+    /// wrap layout survives.
+    fn persist_advertised_envelope(database: &std::path::Path, envelope: Vec<u8>) {
+        let storage = super::IndexConnection::open(database).unwrap();
+        let conn = storage.connection();
+        rag_rat_db::schema::apply(conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        rag_rat_oplog::local_account(conn, 1_000).unwrap();
+        let secret = rag_rat_sync::discovery::discovery_secret(conn).unwrap().unwrap();
+        write_advertisement(conn, &PersistedAdvertisement {
+            tag: rag_rat_sync::discovery::account_tag(&secret),
+            node: ADVERTISED_NODE,
+            service: ADVERTISED_SERVICE,
+            relay: ADVERTISED_RELAY.to_owned(),
+            roster_stamp: rag_rat_oplog::discovery::roster_stamp(conn).unwrap(),
+            envelope: Some(envelope),
+            published_at_ms: None,
+            ttl_seconds: 600,
+        })
+        .unwrap();
+    }
+
+    /// One advertisement pass, with whatever it warned about.
+    ///
+    /// Every pass goes through the capturing subscriber, and that is not decoration: `tracing`
+    /// caches a callsite's interest PROCESS-wide on its first use, so a single pass made with no
+    /// subscriber installed caches "never" for the size warning and every later capture in the same
+    /// test binary comes back empty. Routing all of them through one seam takes that out of the
+    /// hands of test ordering.
+    fn prepare_advertised(database: &std::path::Path) -> (Option<super::Publication>, String) {
+        let mut prepared = None;
+        let logged = captured_warnings(|| {
+            prepared = prepare_advertisement(
+                database,
+                &ADVERTISED_NODE,
+                &ADVERTISED_SERVICE,
+                ADVERTISED_RELAY,
+                2_000,
+                600,
+            )
+            .unwrap();
+        });
+        (prepared, logged)
+    }
+
+    /// A `MakeWriter` that appends every formatted log line into a shared buffer, so a test can
+    /// assert on the `tracing` events a pass emitted — and on how many times.
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` with warnings captured, returning what it logged. The subscriber is thread-local
+    /// (`with_default`), so parallel tests do not see each other's output.
+    fn captured_warnings(body: impl FnOnce()) -> String {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(CaptureWriter(std::sync::Arc::clone(&buffer)))
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let logged = buffer.lock().unwrap().clone();
+        String::from_utf8(logged).expect("formatted log lines are UTF-8")
+    }
+
     /// A persisted envelope is judged against the byte ceiling too, not just a fresh seal.
     ///
     /// The record is reused verbatim whenever the tag, endpoint, service, relay, and roster stamp
@@ -1470,39 +1561,50 @@ mod tests {
     fn a_persisted_envelope_over_the_announcement_ceiling_is_not_advertised() {
         let dir = tempfile::TempDir::new().unwrap();
         let database = dir.path().join("index.sqlite");
-        let node = [0x11; 32];
-        let service = [0x22; 32];
-        let relay = "https://relay.one";
-        let persist = |envelope: Vec<u8>| {
-            let storage = super::IndexConnection::open(&database).unwrap();
-            let conn = storage.connection();
-            rag_rat_db::schema::apply(conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
-            rag_rat_oplog::local_account(conn, 1_000).unwrap();
-            let secret = rag_rat_sync::discovery::discovery_secret(conn).unwrap().unwrap();
-            write_advertisement(conn, &PersistedAdvertisement {
-                tag: rag_rat_sync::discovery::account_tag(&secret),
-                node,
-                service,
-                relay: relay.to_owned(),
-                roster_stamp: rag_rat_oplog::discovery::roster_stamp(conn).unwrap(),
-                envelope: Some(envelope),
-                published_at_ms: None,
-                ttl_seconds: 600,
-            })
-            .unwrap();
-        };
         let ceiling = rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES;
 
-        persist(vec![0; ceiling + 1]);
+        persist_advertised_envelope(&database, vec![0; ceiling + 1]);
         assert!(
-            prepare_advertisement(&database, &node, &service, relay, 2_000, 600).unwrap().is_none(),
+            prepare_advertised(&database).0.is_none(),
             "an over-size persisted envelope must not be handed to the publish path"
         );
 
-        persist(vec![0; ceiling]);
+        persist_advertised_envelope(&database, vec![0; ceiling]);
         assert!(
-            prepare_advertisement(&database, &node, &service, relay, 2_000, 600).unwrap().is_some(),
+            prepare_advertised(&database).0.is_some(),
             "the ceiling itself fits, so the same record one byte smaller is still advertised"
+        );
+    }
+
+    /// The over-size verdict is reported ONCE, however long the roster stays too large.
+    ///
+    /// `prepare_advertisement` runs on the one-second `ADVERTISEMENT_REFRESH` tick, and nothing the
+    /// record `matches` on moves when the ceiling does — so a verdict re-derived on every pass and
+    /// not latched is a warning per second, indefinitely, burying every other line the operator
+    /// needs. Latching the record to `envelope: None` is what holds it to one, and it is also what
+    /// keeps the dial suppressed: the publish rate limiter never sees this condition, because the
+    /// pass returns before `exchange`.
+    #[test]
+    fn an_over_size_roster_is_reported_once_and_not_on_every_pass() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let database = dir.path().join("index.sqlite");
+        let ceiling = rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES;
+        persist_advertised_envelope(&database, vec![0; ceiling + 1]);
+
+        let reported: usize = (0..10)
+            .map(|_| {
+                let (publication, logged) = prepare_advertised(&database);
+                assert!(publication.is_none(), "an over-size roster is never advertised");
+                logged.matches("roster is too large to seal into one announcement").count()
+            })
+            .sum();
+        assert_eq!(reported, 1, "ten passes must report the over-size roster once, not once each");
+
+        let storage = super::IndexConnection::open(&database).unwrap();
+        assert_eq!(
+            read_advertisement(storage.connection()).unwrap().unwrap().envelope,
+            None,
+            "the record is latched, so there is no envelope left for a later pass to judge"
         );
     }
 
