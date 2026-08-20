@@ -419,7 +419,11 @@ pub fn account_is_public_kb(
 /// AUTHORED-evidence one: the owner's ownership fact must be synced and declare `PublicRead`
 /// (`stream_access_mode` fails closed to `Private` when it is not), and the grant must still be
 /// effective.
-fn contribution_stream_is_servable(
+///
+/// Shared with [`crate::memory_write`]'s private-stream guard, which must block on exactly the
+/// authorship this predicate says is still reachable — otherwise it refuses a store whose
+/// contributions the owner already cannot pull, permanently and with no recourse.
+pub(crate) fn contribution_stream_is_servable(
     conn: &Connection,
     owner: rag_rat_oplog::AccountId,
     stream: rag_rat_oplog::StreamId,

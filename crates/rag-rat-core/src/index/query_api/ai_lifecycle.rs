@@ -84,8 +84,11 @@ impl IndexDatabase {
     /// a no-op under an absent/unstable scope. Runs after the embedding reconcile has
     /// committed, so its authored write (a durable `IMMEDIATE` txn only when a ghost exists)
     /// never nests inside it.
+    ///
+    /// Maintenance, not authoring: the memory-write helper skips the stream-establishment refusal
+    /// an ex-contributor's repo raises rather than take the reconcile down with it.
     pub(crate) fn heal_memory_oplog_ghosts(&self) -> anyhow::Result<()> {
-        crate::memory_write::backfill_memory_oplog(
+        crate::memory_write::heal_memory_oplog_ghosts(
             self.storage.connection(),
             rag_rat_base::time::now_ms(),
         )

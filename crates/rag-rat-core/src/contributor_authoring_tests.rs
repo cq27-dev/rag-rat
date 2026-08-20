@@ -622,10 +622,81 @@ fn an_ex_contributor_still_refuses_to_establish_a_private_stream() {
     );
 }
 
+/// The refusal is a stream-establishment POLICY and belongs where a user is asking for a write.
+/// INDEX MAINTENANCE reaches the very same reconcile — `rag-rat reconcile`, every watcher
+/// incremental pass and `rag-rat index` all route the idle-repo ghost heal through
+/// `heal_memory_oplog_ghosts` — and there the refusal must be SKIPPED. Propagated, an ordinary
+/// `sync uncontribute` would break all three on the next pass, with no ghost to heal, while the
+/// `uncontribute` itself still reported success.
+#[test]
+fn index_maintenance_survives_the_ex_contributors_private_stream_refusal() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    let contributor_account = local_account(&contributor, NOW).unwrap();
+    create_memory(&contributor, concept("contributor-note")).unwrap();
+    assert!(crate::memory_write::clear_contribution_owner(&contributor).unwrap());
+
+    // Authoring — where a user asked for a write — still refuses.
+    assert!(
+        create_memory(&contributor, concept("post-unset-note"))
+            .unwrap_err()
+            .to_string()
+            .contains("PRIVATE memory stream"),
+        "the authoring path keeps the refusal",
+    );
+
+    // Maintenance does not. Twice, because the pass runs on every reconcile and must not become
+    // sticky on the first refusal.
+    for pass in 1..=2 {
+        crate::memory_write::heal_memory_oplog_ghosts(&contributor, NOW)
+            .unwrap_or_else(|err| panic!("the ghost heal must survive pass {pass}: {err:#}"));
+    }
+    assert!(
+        rag_rat_oplog::account_is_fully_public(&contributor, contributor_account).unwrap(),
+        "and it skipped rather than established the private stream it refused",
+    );
+}
+
+/// The guard must block on exactly what the SERVING side would still serve. Once the owner runs
+/// `sync revoke`, its own pull already cannot reach this account for that stream, so establishing a
+/// private stream here strands nothing — and refusing anyway would be permanent, with no recourse
+/// the store can take. The authorship evidence itself survives the revoke (the entries stay
+/// `accepted = 1`), so only the servability filter can tell the two apart.
+#[test]
+fn a_revoked_ex_contributor_may_establish_its_private_stream() {
+    // A DEPARTED revoke, whose chain-tail cut vouches the contribution the owner already accepted:
+    // the grant goes, the accepted entry stays.
+    let (owner, contributor, owner_account, contributor_account) = revocable_pair();
+    revoke_repo_writer(
+        &owner,
+        &rag_rat_base::hash::hex_lower(&contributor_account.to_bytes()),
+        rag_rat_oplog::RevokeReason::Departed,
+        None,
+        NOW,
+    )
+    .unwrap();
+    sync_account_into(&contributor, &owner, owner_account);
+    assert!(crate::memory_write::clear_contribution_owner(&contributor).unwrap());
+    assert!(
+        !rag_rat_oplog::authored_foreign_streams(&contributor, contributor_account)
+            .unwrap()
+            .is_empty(),
+        "the authorship evidence outlives the revoke — an unfiltered guard would still block",
+    );
+
+    create_memory(&contributor, concept("post-revoke-note"))
+        .expect("a revoked authorship strands nothing, so the private stream is allowed");
+    assert!(
+        memory_titles(&contributor).contains(&"post-revoke-note".to_string()),
+        "and the memory is really there",
+    );
+}
+
 /// Both unsetters must work in the state the drain's LAZY owner resolution was made tolerant of: a
 /// `memory_subscription_owner` value that will not parse. Resolving it strictly on the re-point
 /// would bail and roll back, leaving the recovery commands unusable in precisely the state they are
-/// for. A side that cannot resolve had no stream to drain, so best-effort loses nothing.
+/// for. A side that cannot resolve had no stream to drain, so tolerating THAT loses nothing — and
+/// the tolerance stops there, see
+/// `clearing_a_foreign_owner_propagates_a_resolution_failure_that_is_not_a_parse`.
 #[test]
 fn clearing_a_foreign_owner_tolerates_an_unparseable_owner_key() {
     // OUTGOING side: the corrupt key is the one being cleared, so the FIRST resolution meets it.
@@ -657,6 +728,33 @@ fn clearing_a_foreign_owner_tolerates_an_unparseable_owner_key() {
             .unwrap()
             .is_none(),
         "and the row is gone, not rolled back",
+    );
+}
+
+/// The unsetters' tolerance covers the unparseable owner key and nothing else. A real read failure
+/// means the outgoing stream is UNKNOWN, not absent — swallowing it skips a watermark clear the
+/// command's own promise depends on, and reports success for a repo whose memories will not come
+/// back. Break the ownership read the resolution goes through and require the command to say so.
+#[test]
+fn clearing_a_foreign_owner_propagates_a_resolution_failure_that_is_not_a_parse() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    contributor
+        .execute_batch("ALTER TABLE account_stream_ownership RENAME TO ownership_moved_away")
+        .unwrap();
+
+    let err = crate::memory_write::clear_contribution_owner(&contributor).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("account_stream_ownership"),
+        "the read failure surfaces instead of being swallowed: {err:#}",
+    );
+    contributor
+        .execute_batch("ALTER TABLE ownership_moved_away RENAME TO account_stream_ownership")
+        .unwrap();
+    assert!(
+        rag_rat_db::meta::repo_meta(&contributor, REPO, "memory_contribution_owner")
+            .unwrap()
+            .is_some(),
+        "and the configuration is rolled back, not half-cleared",
     );
 }
 

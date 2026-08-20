@@ -17,11 +17,12 @@ mod edges;
 mod oracle_relocation_tests;
 
 pub(crate) use api::{create_memory, mark_obsolete, rebind_memory, update_memory};
-// The scope-READING reconcile entry (#541): reconciles the active repo's owner stream, reading
-// the repo id from the connection scope and no-oping under an absent/unstable scope.
-// Re-exported so the index reconcile path (the idle-repo ghost backstop, #583) can name it
-// across the private module.
-pub(crate) use authoring::backfill_memory_oplog;
+// The scope-READING reconcile entry (#541) as index MAINTENANCE runs it: reconciles the active
+// repo's owner stream, reading the repo id from the connection scope, no-oping under an
+// absent/unstable scope, and skipping the stream-establishment refusal that must not fail a
+// maintenance pass. Re-exported so the index reconcile path (the idle-repo ghost backstop,
+// #583) can name it across the private module.
+pub(crate) use authoring::heal_memory_oplog_ghosts;
 pub(crate) use authoring::{
     RepoGrantListing, RepoOwnerConfig, RepoRevokeReport, catch_up_enrolled_device_keys,
     clear_contribution_owner, clear_subscription_owner, enable_public_authoring,

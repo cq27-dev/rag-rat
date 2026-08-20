@@ -208,6 +208,17 @@ pub(crate) fn contribution_targets(
     Ok(out)
 }
 
+/// A configured owner key that will not parse — the ONE stream-resolution failure
+/// [`repoint_authoritative_content_stream`] tolerates. Attached as context so the parse error's own
+/// message survives in the chain, and so a genuine read failure (which carries no such context)
+/// stays distinguishable from it.
+#[derive(Debug, thiserror::Error)]
+#[error("repo `{repo_id}`'s `{meta_key}` is not a 64-hex account id")]
+struct UnparseableOwnerKey {
+    repo_id: String,
+    meta_key: &'static str,
+}
+
 pub(super) fn contribution_owner_account(
     conn: &Connection,
     repo_id: &str,
@@ -215,7 +226,13 @@ pub(super) fn contribution_owner_account(
     let Some(hex) = rag_rat_db::meta::repo_meta(conn, repo_id, CONTRIBUTION_OWNER_META_KEY)? else {
         return Ok(None);
     };
-    Ok(Some(rag_rat_oplog::AccountId::from_hex(&hex)?))
+    let owner = rag_rat_oplog::AccountId::from_hex(&hex).map_err(|err| {
+        err.context(UnparseableOwnerKey {
+            repo_id: repo_id.to_string(),
+            meta_key: CONTRIBUTION_OWNER_META_KEY,
+        })
+    })?;
+    Ok(Some(owner))
 }
 
 /// The `repo_meta` key holding the account this repo MIRRORS read-only (set by `sync subscribe`,
@@ -234,7 +251,13 @@ pub(super) fn subscription_owner_account(
     let Some(hex) = rag_rat_db::meta::repo_meta(conn, repo_id, SUBSCRIPTION_OWNER_META_KEY)? else {
         return Ok(None);
     };
-    Ok(Some(rag_rat_oplog::AccountId::from_hex(&hex)?))
+    let owner = rag_rat_oplog::AccountId::from_hex(&hex).map_err(|err| {
+        err.context(UnparseableOwnerKey {
+            repo_id: repo_id.to_string(),
+            meta_key: SUBSCRIPTION_OWNER_META_KEY,
+        })
+    })?;
+    Ok(Some(owner))
 }
 
 /// Every owner account this store SUBSCRIBES to. Unlike [`contribution_targets`] the repo id is not
@@ -477,8 +500,9 @@ enum StreamResolution {
     /// A SETTER: an unreadable owner key is a state the configure must not write over silently.
     Strict,
     /// A CLEAR: the unreadable owner key is precisely what is being removed, and a side that
-    /// cannot resolve had no stream to drain in the first place. Best-effort resolution is what
-    /// keeps the recovery command usable in the one state that needs it.
+    /// cannot resolve had no stream to drain in the first place. Tolerating THAT — and only that,
+    /// see [`UnparseableOwnerKey`] — is what keeps the recovery command usable in the one state
+    /// that needs it.
     BestEffort,
 }
 
@@ -507,10 +531,24 @@ fn repoint_authoritative_content_stream(
     repoint: impl FnOnce(&Transaction<'_>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let resolve = |tx: &Transaction<'_>| -> anyhow::Result<Option<StreamId>> {
-        let resolved = super::drain::authoritative_content_stream(tx, repo_id);
-        match resolution {
-            StreamResolution::Strict => resolved,
-            StreamResolution::BestEffort => Ok(resolved.ok().flatten()),
+        match super::drain::authoritative_content_stream(tx, repo_id) {
+            Ok(stream) => Ok(stream),
+            // Tolerate the ONE failure the unset is itself the cure for. Every other error is real
+            // and must roll the command back: skipping a watermark clear on a read failure loses
+            // the clear silently, and on the INCOMING side that watermark is the stream the repo
+            // moves BACK to — the clear that makes the memories the re-point removed reappear.
+            Err(err)
+                if matches!(resolution, StreamResolution::BestEffort)
+                    && err.downcast_ref::<UnparseableOwnerKey>().is_some() =>
+            {
+                tracing::warn!(
+                    repo_id,
+                    error = format!("{err:#}"),
+                    "skipping a drain-watermark clear: the configured owner key does not parse",
+                );
+                Ok(None)
+            },
+            Err(err) => Err(err),
         }
     };
     if let Some(outgoing) = resolve(tx)? {
@@ -1184,28 +1222,43 @@ fn ensure_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow:
     if mode != rag_rat_oplog::AccessMode::PublicRead
         && let Some(cause) = private_stream_strands_contributions(&tx)?
     {
-        anyhow::bail!(
+        return Err(PrivateStreamRefusal(format!(
             "repo `{repo_id}` would need a PRIVATE memory stream, but this index {cause} — and an \
              account is fetchable by a peer only while all of its streams are public, so this \
              would strand those contributions unreachable. Index `{repo_id}` in a separate \
              database, or publish it with `rag-rat sync publish`"
-        );
+        ))
+        .into());
     }
     let stream = rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(&tx, repo_id, mode, now_ms)?;
     tx.commit()?;
     Ok(stream)
 }
 
+/// The refusal [`ensure_owner_stream`] raises rather than establish a PRIVATE stream that would
+/// strand contributions. Typed, not a bare `bail!`, because this is a stream-establishment POLICY:
+/// it belongs on the paths where a user is asking for a memory write, and the INDEX-MAINTENANCE
+/// seam that shares the same reconcile ([`heal_memory_oplog_ghosts`]) recognizes it and skips.
+/// Left as an opaque error there, an ordinary `sync uncontribute` would fail `rag-rat reconcile`,
+/// every watcher pass, and `rag-rat index` — with no ghost to heal in the first place.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct PrivateStreamRefusal(String);
+
 /// Why establishing a PRIVATE stream in this index would strand contributions, phrased as the
 /// middle of the refusal sentence — or `None` when nothing is at stake.
 ///
-/// EVIDENCE outranks configuration, the same correction
-/// [`crate::sync_driver::account_is_public_kb`] makes on the serving side: `sync uncontribute` (or
-/// any other path that drops the meta row) clears the configured target, but the entries this
-/// account already authored onto the owner's PublicRead stream stay there, and the owner can fetch
-/// them only while this account owns no private stream. Keying the guard on configuration alone
-/// would let the unset open a door that a `StreamOwn` — append-only, never un-authorable — then
-/// closes forever.
+/// EVIDENCE outranks configuration for the streams this account has ALREADY authored onto: `sync
+/// uncontribute` (or any other path that drops the meta row) clears the configured target, but
+/// those entries stay on the owner's PublicRead stream, and the owner can fetch them only while
+/// this account owns no private stream. Keyed on configuration alone, the unset would open a door
+/// that a `StreamOwn` — append-only, never un-authorable — then closes forever.
+///
+/// Each authored stream is put through the same servability check the serving side applies
+/// ([`crate::sync_driver::contribution_stream_is_servable`]), so the refusal fires exactly when
+/// something real is at stake. Authorship the owner has since revoked strands nothing — its pull
+/// already cannot reach this account for that stream — and blocking on it would be a permanent
+/// refusal with no recourse.
 fn private_stream_strands_contributions(conn: &Connection) -> anyhow::Result<Option<String>> {
     if let Some((contributing_repo, owner)) = contribution_targets(conn)?.first() {
         return Ok(Some(format!(
@@ -1217,13 +1270,21 @@ fn private_stream_strands_contributions(conn: &Connection) -> anyhow::Result<Opt
     let Some(account) = rag_rat_oplog::read_local_account(conn)? else {
         return Ok(None);
     };
-    let authored = rag_rat_oplog::authored_foreign_streams(conn, account)?;
-    if authored.is_empty() {
+    let mut still_servable = 0usize;
+    for stream in rag_rat_oplog::authored_foreign_streams(conn, account)? {
+        let Some(owner) = rag_rat_oplog::stream_owner_account(conn, stream)? else {
+            continue;
+        };
+        if crate::sync_driver::contribution_stream_is_servable(conn, owner, stream, account)? {
+            still_servable += 1;
+        }
+    }
+    if still_servable == 0 {
         return Ok(None);
     }
     Ok(Some(format!(
-        "has already authored memories onto {} stream(s) another account owns",
-        authored.len(),
+        "has already authored memories onto {still_servable} stream(s) another account owns and \
+         can still serve"
     )))
 }
 
@@ -1667,6 +1728,28 @@ pub(crate) fn backfill_memory_oplog(conn: &Connection, now_ms: i64) -> anyhow::R
         return Ok(());
     }
     sync_owner_stream(conn, &repo_id, now_ms)
+}
+
+/// [`backfill_memory_oplog`] as INDEX MAINTENANCE runs it — after an embedding reconcile, on every
+/// watcher pass, on every `rag-rat index` — where nobody asked for a memory write.
+///
+/// The one difference is the stream-establishment refusal ([`PrivateStreamRefusal`]): an
+/// ex-contributor still owes the owner a public account, so it provably has no owner stream and
+/// never will until it publishes or re-contributes. Propagating that here would fail the whole
+/// pass, with zero ghosts required — the refusal belongs on the authoring paths, which keep it.
+/// Any OTHER error is a real failure and still propagates.
+pub(crate) fn heal_memory_oplog_ghosts(conn: &Connection, now_ms: i64) -> anyhow::Result<()> {
+    match backfill_memory_oplog(conn, now_ms) {
+        Err(err) if err.downcast_ref::<PrivateStreamRefusal>().is_some() => {
+            tracing::warn!(
+                error = format!("{err:#}"),
+                "skipping the memory op-log ghost heal; memory authoring in this repo stays \
+                 refused until it is published or contributing again",
+            );
+            Ok(())
+        },
+        other => other,
+    }
 }
 
 /// Reconcile a SPECIFIC repo's owner stream independent of connection scope — the seam

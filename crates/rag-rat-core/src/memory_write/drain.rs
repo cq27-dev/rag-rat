@@ -2158,7 +2158,7 @@ mod tests {
 
         // The reconcile runs: the synced row is excluded from re-authoring (origin gate), and it is
         // also already in the projection, so nothing is appended to the immutable /3 log.
-        crate::memory_write::backfill_memory_oplog(&conn, 6_000).unwrap();
+        crate::memory_write::authoring::backfill_memory_oplog(&conn, 6_000).unwrap();
         assert_eq!(
             content_entry_count(&conn),
             entries_before,
