@@ -1289,8 +1289,7 @@ fn replay_receipt(
                 .map(|entry| (entry.entry_hash, entry.signed_bytes))
                 .collect();
         let mut account_entries = Vec::with_capacity(manifest.len() / 32);
-        for hash in manifest.chunks_exact(32) {
-            let hash: [u8; 32] = hash.try_into().expect("chunked by 32");
+        for &hash in manifest.as_chunks::<32>().0 {
             let bytes = signed_by_hash.remove(&hash).ok_or_else(|| {
                 InviteError::Storage(anyhow::anyhow!(
                     "receipt entry missing from the candidate DAG"

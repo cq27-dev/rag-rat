@@ -1158,8 +1158,8 @@ fn decode_node_secret(hex: &str) -> anyhow::Result<Zeroizing<[u8; 32]>> {
         bail!("persisted sync node secret is {} hex chars, expected 64", hex.len());
     }
     let mut out = Zeroizing::new([0u8; 32]);
-    for (i, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
-        match ((pair[0] as char).to_digit(16), (pair[1] as char).to_digit(16)) {
+    for (i, &[high, low]) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        match ((high as char).to_digit(16), (low as char).to_digit(16)) {
             (Some(hi), Some(lo)) => out[i] = ((hi << 4) | lo) as u8,
             _ => bail!("persisted sync node secret is not valid hex"),
         }

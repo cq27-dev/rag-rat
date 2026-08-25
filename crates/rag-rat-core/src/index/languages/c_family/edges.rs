@@ -1,5 +1,4 @@
 //! C and C++ graph-edge extraction for the shared structural edge walk.
-use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(in crate::index::languages) fn c_like_edges(

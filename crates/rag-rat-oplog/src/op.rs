@@ -133,10 +133,10 @@ impl FromStr for DeviceFingerprint {
             return Err(ParseDeviceFingerprintError::Length { actual: value.len() });
         }
         let mut bytes = [0u8; 32];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-            let high = rag_rat_base::hash::hex_nibble(pair[0])
+        for (index, &[hi, lo]) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let high = rag_rat_base::hash::hex_nibble(hi)
                 .ok_or(ParseDeviceFingerprintError::InvalidHex { index: index * 2 })?;
-            let low = rag_rat_base::hash::hex_nibble(pair[1])
+            let low = rag_rat_base::hash::hex_nibble(lo)
                 .ok_or(ParseDeviceFingerprintError::InvalidHex { index: index * 2 + 1 })?;
             bytes[index] = high << 4 | low;
         }

@@ -45,11 +45,11 @@ impl AccountId {
             value.len()
         );
         let mut bytes = [0u8; 32];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-            let high = rag_rat_base::hash::hex_nibble(pair[0]).ok_or_else(|| {
+        for (index, &[hi, lo]) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+            let high = rag_rat_base::hash::hex_nibble(hi).ok_or_else(|| {
                 anyhow::anyhow!("account id has invalid hex at position {}", index * 2)
             })?;
-            let low = rag_rat_base::hash::hex_nibble(pair[1]).ok_or_else(|| {
+            let low = rag_rat_base::hash::hex_nibble(lo).ok_or_else(|| {
                 anyhow::anyhow!("account id has invalid hex at position {}", index * 2 + 1)
             })?;
             bytes[index] = high << 4 | low;

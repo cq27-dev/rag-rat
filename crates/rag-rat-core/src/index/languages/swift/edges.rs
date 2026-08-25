@@ -3,7 +3,6 @@
 use tree_sitter::Node;
 
 use super::syntax;
-use crate::index::edges::extract::*;
 use crate::index::edges::*;
 
 pub(in crate::index::languages) fn swift_edges(

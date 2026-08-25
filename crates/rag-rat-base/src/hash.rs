@@ -29,12 +29,12 @@ pub fn hex_nibble(byte: u8) -> Option<u8> {
 /// Decode an even-length hex string. `None` on an odd length or any non-hex byte; callers that
 /// need the failing position iterate [`hex_nibble`] themselves for the precise error.
 pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        out.push(hex_nibble(pair[0])? << 4 | hex_nibble(pair[1])?);
+    let (pairs, remainder) = text.as_bytes().as_chunks::<2>();
+    let mut out = Vec::with_capacity(pairs.len());
+    for &[high, low] in pairs {
+        out.push(hex_nibble(high)? << 4 | hex_nibble(low)?);
     }
-    bytes.chunks_exact(2).remainder().is_empty().then_some(out)
+    remainder.is_empty().then_some(out)
 }
 
 /// Hex SHA-256 of a byte slice. This is the hash space of `files.sha256` (the indexer writes
@@ -43,4 +43,26 @@ pub fn hex_decode(text: &str) -> Option<Vec<u8>> {
 /// this function to stay in the same space.
 pub fn hex_sha256(bytes: &[u8]) -> String {
     hex_lower(&Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hex_decode, hex_lower};
+
+    /// Both halves of the round trip, plus the rejections the doc promises. `hex_decode` consumes
+    /// whole pairs and reports the leftover separately, so an odd length and a bad nibble must
+    /// both come back `None` rather than a short read.
+    #[test]
+    fn hex_decode_reads_whole_pairs_and_rejects_anything_else() {
+        assert_eq!(hex_decode("0a1bff"), Some(vec![0x0a, 0x1b, 0xff]));
+        assert_eq!(hex_decode(""), Some(vec![]));
+        assert_eq!(hex_decode("0A1BFF"), Some(vec![0x0a, 0x1b, 0xff]), "upper case decodes too");
+
+        assert_eq!(hex_decode("abc"), None, "an odd length is not a short read");
+        assert_eq!(hex_decode("zz"), None, "a non-hex byte fails the whole decode");
+        assert_eq!(hex_decode("00zz"), None, "including after a valid pair");
+
+        let bytes = [0x00, 0x7f, 0x80, 0xff];
+        assert_eq!(hex_decode(&hex_lower(&bytes)), Some(bytes.to_vec()));
+    }
 }

@@ -169,8 +169,8 @@ const INT8_QUANT_LEVELS: f32 = 127.0;
 pub(crate) fn decode_vector(blob: &[u8], dim: usize) -> Option<Vec<f32>> {
     if blob.len() == dim.checked_mul(4)? {
         let mut out = Vec::with_capacity(dim);
-        for bytes in blob.chunks_exact(4) {
-            out.push(f32::from_le_bytes(bytes.try_into().ok()?));
+        for &bytes in blob.as_chunks::<4>().0 {
+            out.push(f32::from_le_bytes(bytes));
         }
         return Some(out);
     }

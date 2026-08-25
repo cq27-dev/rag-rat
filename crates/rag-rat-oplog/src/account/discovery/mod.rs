@@ -214,7 +214,9 @@ fn parse_wraps(envelope: &[u8]) -> Option<Vec<SealedKeyWrap>> {
         return None;
     }
     Some(
-        rest.chunks_exact(WRAP_LEN)
+        rest.as_chunks::<WRAP_LEN>()
+            .0
+            .iter()
             .map(|chunk| {
                 let mut ephemeral_pubkey = [0u8; 32];
                 let mut ciphertext = [0u8; 48];

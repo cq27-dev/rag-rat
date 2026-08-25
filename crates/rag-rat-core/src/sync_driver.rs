@@ -1293,7 +1293,7 @@ fn decode_secret(encoded: &str) -> anyhow::Result<Zeroizing<[u8; 32]>> {
         ));
     }
     let mut secret = Zeroizing::new([0; 32]);
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         secret[index] = u8::from_str_radix(std::str::from_utf8(pair)?, 16)
             .map_err(|_| anyhow!("persisted sync node secret is not valid hex"))?;
     }

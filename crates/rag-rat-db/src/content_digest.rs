@@ -114,11 +114,11 @@ pub fn decode_state(hex: &str) -> Result<DigestState, MalformedDigestState> {
         return Err(MalformedDigestState(format!("expected 64 hex chars, got {}", bytes.len())));
     }
     let mut raw = [0u8; 32];
-    for (out, chunk) in raw.iter_mut().zip(bytes.chunks_exact(2)) {
-        let hi = rag_rat_base::hash::hex_nibble(chunk[0])
-            .ok_or_else(|| MalformedDigestState(format!("non-hex byte {:#04x}", chunk[0])))?;
-        let lo = rag_rat_base::hash::hex_nibble(chunk[1])
-            .ok_or_else(|| MalformedDigestState(format!("non-hex byte {:#04x}", chunk[1])))?;
+    for (out, &[high, low]) in raw.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        let hi = rag_rat_base::hash::hex_nibble(high)
+            .ok_or_else(|| MalformedDigestState(format!("non-hex byte {high:#04x}")))?;
+        let lo = rag_rat_base::hash::hex_nibble(low)
+            .ok_or_else(|| MalformedDigestState(format!("non-hex byte {low:#04x}")))?;
         *out = (hi << 4) | lo;
     }
     let mut lanes = [0u64; 4];
