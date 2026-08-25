@@ -41,133 +41,76 @@ fn is_screaming_const_identifier(name: &str) -> bool {
         && characters.all(|character| is_xid_continue(character) && !character.is_lowercase())
 }
 
-/// A method identifier may carry leading underscores, but its first non-underscore character must
-/// be lowercase and the rest must remain within Rust's identifier boundaries. The field token
-/// comes directly from tree-sitter, so comments/whitespace around the member-access dot never
-/// affect this check.
-fn is_lowercase_method_identifier(name: &str) -> bool {
-    let name = name.strip_prefix("r#").unwrap_or(name).trim_start_matches('_');
-    let mut characters = name.chars();
-    characters.next().is_some_and(char::is_lowercase) && characters.all(is_xid_continue)
-}
-
-/// The innermost receiver of a method chain glued onto a call's callee — what the whole chain
-/// ultimately reads — plus whether every field crossed on the way was a lowercase METHOD. Both
-/// halves of the constant-chain decision need the same walk, and doing it once is what keeps them
-/// from disagreeing about the same expression (#1124 maintainer feedback).
-struct MethodChainRoot<'tree> {
-    receiver: Node<'tree>,
-    all_methods: bool,
+/// Peel the wrappers that sit between a method-chain link and the value it reads WITHOUT changing
+/// that value's identity: a turbofish (`generic_function`), a `?`, an `.await`, and redundant
+/// parentheses. A chain's role must not depend on which of these the source happens to spell —
+/// `POOL.get()?.execute(sql)`, `POOL.get().await.execute(sql)` and `POOL.get().execute(sql)` all
+/// glue `execute` onto the same produced value, so a guard that recognizes only the bare form
+/// hands the other two to the delegate fall-through and records the adapter (#1124).
+fn unwrap_transparent(node: Node<'_>) -> Node<'_> {
+    let mut current = unwrap_generic_function(node);
+    while matches!(
+        current.kind(),
+        "try_expression" | "await_expression" | "parenthesized_expression"
+    ) {
+        let Some(inner) = current.named_child(0) else {
+            return current;
+        };
+        current = unwrap_generic_function(inner);
+    }
+    current
 }
 
 /// Walk the Rust AST's nested `field_expression` nodes from the call's callee inward, following an
 /// intermediate `call_expression` only when its own callee is another field expression — a
 /// constructor/function-call root ends the walk there, because that call's RESULT is the value the
 /// rest of the chain adapts. `None` when the callee is not a method chain at all (a bare name, a
-/// path, a `Type::assoc` call). Insensitive to trivia and turbofish wrappers, so comments and
-/// generic arguments around the member-access dot cannot move a verdict.
-fn method_chain_root<'tree>(function: Node<'tree>, text: &str) -> Option<MethodChainRoot<'tree>> {
-    let mut current = unwrap_generic_function(function);
+/// path, a `Type::assoc` call). Insensitive to trivia and to every [`unwrap_transparent`] wrapper,
+/// so comments, generic arguments, `?` and `.await` around the member-access dot cannot move a
+/// verdict.
+fn method_chain_root(function: Node<'_>) -> Option<Node<'_>> {
+    let mut current = unwrap_transparent(function);
     if current.kind() != "field_expression" {
         return None;
     }
-    let mut all_methods = true;
     while current.kind() == "field_expression" {
-        let field = current.child_by_field_name("field")?;
-        all_methods &= is_lowercase_method_identifier(field.utf8_text(text.as_bytes()).ok()?);
-        let value = unwrap_generic_function(current.child_by_field_name("value")?);
+        let value = unwrap_transparent(current.child_by_field_name("value")?);
         if value.kind() != "call_expression" {
             current = value;
             continue;
         }
-        let inner_function = unwrap_generic_function(value.child_by_field_name("function")?);
+        let inner_function = unwrap_transparent(value.child_by_field_name("function")?);
         current = if inner_function.kind() == "field_expression" { inner_function } else { value };
     }
-    Some(MethodChainRoot { receiver: current, all_methods })
+    Some(current)
 }
 
-/// What a method chain's root receiver is, when it is a SCREAMING_SNAKE constant.
-enum ConstantReceiver {
-    /// Owned by a named TYPE — `Handler::DEFAULT`, `crate::ml::Handler::DEFAULT`,
-    /// `<Handler as Runner>::_DEFAULT`. Naming the owner is what makes the chained method the
-    /// dispatch, so the call delegates to that method.
-    TypeOwned,
-    /// Named on its own or through the MODULE it lives in — `LIMIT`, `crate::config::LIMIT`,
-    /// `self::LIMIT`, `super::config::LIMIT`, an aliased `cfg::LIMIT`. A module is not a receiver,
-    /// so the chained method adapts the constant's VALUE and is never the handler.
-    Unowned,
-}
-
-fn constant_receiver(receiver: Node<'_>, text: &str) -> Option<ConstantReceiver> {
-    match receiver.kind() {
-        "identifier" => is_screaming_const_identifier(receiver.utf8_text(text.as_bytes()).ok()?)
-            .then_some(ConstantReceiver::Unowned),
-        "scoped_identifier" => {
-            let name = receiver.child_by_field_name("name")?;
-            if !is_screaming_const_identifier(name.utf8_text(text.as_bytes()).ok()?) {
-                return None;
-            }
-            // A leading `::` names the crate root — a module, and never a type.
-            let Some(path) = receiver.child_by_field_name("path") else {
-                return Some(ConstantReceiver::Unowned);
-            };
-            Some(if qualifier_names_a_type(path, text) {
-                ConstantReceiver::TypeOwned
-            } else {
-                ConstantReceiver::Unowned
-            })
-        },
-        _ => None,
-    }
-}
-
-/// Whether a constant's qualifier names the TYPE that owns it rather than the MODULE it lives in.
-/// Rust's naming convention is the only extraction-time signal there is — type names begin with an
-/// uppercase character, module names do not, and `crate`/`self`/`super` are modules by definition —
-/// so the test is on the qualifier's LAST segment, which keeps the verdict independent of how long
-/// the path to it is (`Handler::DEFAULT` and `crate::a::b::Handler::DEFAULT` agree, as do `LIMIT`
-/// and `crate::a::b::LIMIT`). A bracketed UFCS qualifier (`<Handler as Runner>::DEFAULT`) names its
-/// type outright.
-fn qualifier_names_a_type(path: Node<'_>, text: &str) -> bool {
-    let Ok(raw) = path.utf8_text(text.as_bytes()) else {
+/// Whether the callee is a method chain whose ROOT receiver is a SCREAMING_SNAKE constant —
+/// `LIMIT.min(cap).max(..)`, `crate::config::BASE.to_string()`, `Handler::DEFAULT.run(..)`,
+/// `<Handler as Runner>::DEFAULT.run(..)`. Such a chain adapts the constant's VALUE, so it is never
+/// the handler.
+///
+/// The verdict is read off the root and nothing else. Whether the qualifier names the OWNING TYPE
+/// or the MODULE the constant lives in cannot be told apart at extraction time except by the case
+/// of a path segment, and that guess is wrong for an uppercase module, a type alias, and a
+/// bracketed UFCS qualifier — so making the two spellings disagree only moves the error around.
+/// It also would not help: `Resp::DEFAULT.with_body(handle(cap))` and
+/// `Handler::DEFAULT.run(normalize(input))` are the same expression modulo identifier spelling, so
+/// nothing in the AST distinguishes a builder from a dispatch. Under the false-edge-is-a-bug
+/// contract an undecidable case emits nothing (#1124).
+fn chain_root_is_constant(function: Node<'_>, text: &str) -> bool {
+    let Some(root) = method_chain_root(function) else {
         return false;
     };
-    let raw = raw.trim();
-    if raw.starts_with('<') {
-        return true;
-    }
-    let stripped = degeneric_path(raw);
-    scope_grammar::segments(&stripped)
-        .into_iter()
-        .map(str::trim)
-        .rfind(|segment| !segment.is_empty())
-        .is_some_and(|segment| {
-            let segment = segment.strip_prefix("r#").unwrap_or(segment);
-            segment.chars().next().is_some_and(char::is_uppercase)
-        })
-}
-
-/// Where a method chain glued onto a SCREAMING constant lands, or `None` when the callee is not
-/// such a chain.
-enum ConstantChain {
-    /// The chain adapts the constant's value — emit nothing.
-    AdapterTail,
-    /// The chain calls a method ON the constant — record that method.
-    Dispatch,
-}
-
-/// The ONE decision about a constant-rooted method chain, taken on the chain's ROOT (#1124
-/// maintainer feedback). The adapter verdict is read off the same root as the dispatch verdict, so
-/// there is no order in which one can claim an expression before the other, and no spelling of the
-/// root can route otherwise identical expressions to different verdicts.
-fn constant_method_chain(function: Node<'_>, text: &str) -> Option<ConstantChain> {
-    let root = method_chain_root(function, text)?;
-    match constant_receiver(root.receiver, text)? {
-        ConstantReceiver::Unowned => Some(ConstantChain::AdapterTail),
-        // A PascalCase field is a variant/constructor spelling, not a method call, so it is left to
-        // the qualifier fallbacks below rather than billed as a dispatch.
-        ConstantReceiver::TypeOwned => root.all_methods.then_some(ConstantChain::Dispatch),
-    }
+    let name = match root.kind() {
+        "identifier" => root,
+        "scoped_identifier" => match root.child_by_field_name("name") {
+            Some(name) => name,
+            None => return false,
+        },
+        _ => return false,
+    };
+    name.utf8_text(text.as_bytes()).is_ok_and(is_screaming_const_identifier)
 }
 
 /// The `Enum::Variant` dispatch key from a scoped path node — its last two `::`-segments when BOTH
@@ -706,19 +649,18 @@ fn pattern_binding_names_impl(pattern: Node<'_>, text: &str, out: &mut Vec<Strin
 
 /// How `result_handler_calls` treats a `call_expression` (#200/#208 — one classifier so the
 /// delegate/wrapper decision can't disagree with itself, as it did across review rounds):
-/// - `Delegate`: RECORD it as the handler (a free fn `run`, a method `self.embed`, a module-pathed
-///   fn `crate::ml::embed::embed_text`, or a method chain on a constant a TYPE owns
-///   (`Handler::DEFAULT.run(..)`) — the constant is the chained method's receiver).
+/// - `Delegate`: RECORD it as the handler (a free fn `run`, a method `self.embed`, or a
+///   module-pathed fn `crate::ml::embed::embed_text`).
 /// - `Wrapper`: a TRANSPARENT wrapper / variant constructor whose single argument IS the response —
 ///   `Ok`/`Some`, or ANY PascalCase-tail ctor (`MlResp::Embedded`, `dto::Wrapped`, bare `Wrapped`).
 ///   Trace its lone payload argument.
 /// - `Skip`: emit nothing — `Err`/`None` (error/absence payload), a snake-tail `Type::assoc`
 ///   constructor (`Vec::with_capacity`, `Resp::empty` — its arg configures, isn't the response), a
 ///   UFCS associated call (`<Resp as Default>::default()`), or an adapter tail glued onto another
-///   call's result or onto a SCREAMING constant no type owns — `LIMIT.min(cap).max(..)`,
-///   `crate::config::BASE.to_string()`, and every other spelling of that root — since it adapts a
-///   value, and recording the trailing method would bind it to an unrelated same-named symbol
-///   (#1124 maintainer feedback).
+///   call's result or onto a SCREAMING constant — `LIMIT.min(cap).max(..)`,
+///   `crate::config::BASE.to_string()`, `Handler::DEFAULT.with_body(..)`, and every other spelling
+///   of those roots — since it adapts a value, and recording the trailing method would bind it to
+///   an unrelated same-named symbol (#1124).
 ///
 /// Classification is by the path TAIL (constructor names are PascalCase; fns/methods are
 /// snake_case), which is receiver-agnostic — so `dto::Wrapped` and `Resp::Embedded` are both
@@ -754,22 +696,14 @@ fn classify_call(call: Node<'_>, text: &str) -> CallRole {
     let Some(tail) = segments.last() else {
         return CallRole::Delegate;
     };
-    // A method chain rooted at a SCREAMING constant is decided by that ROOT, in one place, before
-    // BOTH qualifier fallbacks: the leading-`<` UFCS early return and the PascalCase-receiver
-    // `Skip` below would otherwise bill `Handler::DEFAULT.run(..)` /
-    // `<Handler as Runner>::DEFAULT.run(..)` as an associated/constructor call (#1124 held
-    // feedback), and a separate later adapter guard let the module-pathed spelling of an adapter
-    // tail reach a different verdict than the bare one (#1124 maintainer feedback).
-    //
-    // When a TYPE owns the constant, the chained method is called ON it and delegates
-    // UNCONDITIONALLY: the argument shape says nothing, since
-    // `Resp::DEFAULT.with_body(handle(cap))` and `Handler::DEFAULT.run(normalize(input))` are the
-    // same expression modulo identifier spelling, so a nested-argument test cannot tell a builder
-    // from a dispatch and only picks which of the two loses its handler.
-    match constant_method_chain(function, text) {
-        Some(ConstantChain::AdapterTail) => return CallRole::Skip,
-        Some(ConstantChain::Dispatch) => return CallRole::Delegate,
-        None => {},
+    // A method chain rooted at a SCREAMING constant is decided by that ROOT, in one place, so no
+    // spelling of the path to the constant can route otherwise identical expressions to different
+    // verdicts. It runs before the segment fallbacks below because those read the callee's TEXT,
+    // where a chained method glued onto the constant lands in the tail segment
+    // (`crate::config::BASE.to_string` → tail `BASE.to_string`, receiver `config`) and reaches the
+    // bare-callee delegate fall-through (#1124).
+    if chain_root_is_constant(function, text) {
+        return CallRole::Skip;
     }
     // A LEADING `<...>` is a UFCS qualifier (`<Resp as Default>::default()`), an
     // associated/constructor call — never a handler, and its arg (if any) isn't the response.
@@ -806,17 +740,18 @@ fn classify_call(call: Node<'_>, text: &str) -> CallRole {
 ///
 /// A method on a plain binding/`self`/field receiver (`worker.run`, `self.embed`) is a bare callee:
 /// that receiver holds the handler. A chain rooted at a SCREAMING constant never reaches here —
-/// [`constant_method_chain`] decides it earlier, on the root, so that `LIMIT.min(cap).max(..)` and
-/// `crate::config::LIMIT.min(cap).max(..)` cannot be answered differently.
+/// [`chain_root_is_constant`] decides it earlier, on the root, so that `LIMIT.min(cap).max(..)` and
+/// `crate::config::LIMIT.min(cap).max(..)` cannot be answered differently. The receiver is read
+/// through [`unwrap_transparent`], so `make_worker()?.run(x)` and `make_worker().run(x)` agree too.
 fn is_chained_adapter_tail(function: Node<'_>) -> bool {
-    let function = unwrap_generic_function(function);
+    let function = unwrap_transparent(function);
     if function.kind() != "field_expression" {
         return false;
     }
     let Some(value) = function.child_by_field_name("value") else {
         return false;
     };
-    unwrap_generic_function(value).kind() == "call_expression"
+    unwrap_transparent(value).kind() == "call_expression"
 }
 
 /// Whether a `scoped_identifier` sits in an expression VALUE position where a unit enum-variant is
@@ -1047,17 +982,31 @@ mod classify_call_tests {
             // The iterator-adapter chain the classifier was first written for.
             "TOOL_NAMES.iter().map(|name| describe(name))",
             "crate::tools::TOOL_NAMES.iter().map(|name| describe(name))",
-        ];
-        let delegate_forms = [
-            // A qualifier that names the OWNING TYPE is not a module path: the chained method is
-            // the dispatch, at any path depth and through a UFCS qualifier.
+            // A qualifier that names the OWNING TYPE is not distinguishable from a module path
+            // except by the case of a segment, and the case guess is wrong for an uppercase
+            // module, a type alias, and a bracketed UFCS qualifier. Both spellings skip.
             "Handler::DEFAULT.run(input)",
             "crate::ml::Handler::DEFAULT.run(input)",
             "crate::a::b::Handler::DEFAULT.build().run(input)",
             "<Handler as Runner>::DEFAULT.run(input)",
+            "<u32 as Bounded>::MAX.min(cap)",
+            "u32::MAX.min(cap)",
+            // A `?`, an `.await` or a paren between the links wraps a value without changing its
+            // identity — the same adapter, so the same verdict.
+            "LIMIT.min(cap)?.max(1)",
+            "crate::config::LIMIT.min(cap)?.max(1)",
+            "POOL.get(url).await.text()",
+            "(LIMIT.min(cap)).max(1)",
+            "(LIMIT).wrapping_mul(cap)",
+            "make_worker()?.run(input)",
+            "make_worker().await.run(input)",
+            "(make_worker()).run(input)",
+        ];
+        let delegate_forms = [
             // A bare callee keeps delegating whatever the receiver is called.
             "worker.run(input)",
             "self.embed(input)",
+            "self.worker.run(input)",
         ];
         let mut misclassified = Vec::new();
         misclassified
@@ -1068,36 +1017,17 @@ mod classify_call_tests {
         assert!(misclassified.is_empty(), "misclassified root spellings: {misclassified:?}");
     }
 
-    /// An associated-constant method chain is the dispatch itself, whatever its arguments hold
-    /// (#1124 maintainer feedback): the constant is the chained method's receiver, so the call
-    /// delegates to that method. Reading the ARGUMENT SHAPE to tell a dispatch from a builder
-    /// cannot work — `Resp::DEFAULT.with_body(handle(cap))` and
-    /// `Handler::DEFAULT.run(normalize(input))` are the same expression modulo spelling — so a
-    /// nested argument call no longer diverts the classification to `Wrapper`.
+    /// A method chain glued onto an ASSOCIATED CONSTANT records no handler (#1124), and no
+    /// spelling around the member-access dot changes that. Whether the qualifier names the owning
+    /// TYPE (`Handler::DEFAULT`) or the MODULE the constant lives in (`crate::config::LIMIT`) is
+    /// not decidable at extraction time except by the case of a path segment, and a builder
+    /// (`Resp::DEFAULT.with_body(handle(cap))`) is not decidable from a dispatch
+    /// (`Handler::DEFAULT.run(normalize(input))`) at all — the two are the same expression modulo
+    /// identifier spelling. Under the false-edge-is-a-bug contract an undecidable case emits
+    /// nothing. The verdicts are collected before asserting, so one failure names EVERY
+    /// misclassified form.
     #[test]
-    fn an_associated_constant_method_chain_always_delegates() {
-        assert!(matches!(role_of("Handler::DEFAULT.run(input)"), CallRole::Delegate));
-        assert!(matches!(role_of("<Handler as Runner>::DEFAULT.run(input)"), CallRole::Delegate));
-        // A nested argument call is argument shape, not classification evidence.
-        assert!(matches!(role_of("Handler::DEFAULT.run(normalize(input))"), CallRole::Delegate));
-        assert!(matches!(role_of("Resp::DEFAULT.with_body(handle(cap))"), CallRole::Delegate));
-        assert!(matches!(
-            role_of("<Resp as Build>::DEFAULT.with_body(handle(cap))"),
-            CallRole::Delegate
-        ));
-        // An intermediate call inside the chain still delegates to the final chained method.
-        assert!(matches!(role_of("Handler::DEFAULT.build().run(input)"), CallRole::Delegate));
-    }
-
-    /// A method chain glued onto an ASSOCIATED CONSTANT delegates to the chained method (#1124
-    /// held feedback): `Handler::DEFAULT.run(input)` calls `run` on the `DEFAULT` constant — the
-    /// constant is the receiver, not a constructor — so neither the PascalCase receiver (`Handler`)
-    /// nor a UFCS qualifier (`<Handler as Runner>`) may bill the call as an associated/constructor
-    /// call. The guards stay: an associated FN (`Handler::new`) configures rather than responds,
-    /// and a bare UFCS associated call (`<Resp as Default>::default()`) is a constructor. The
-    /// verdicts are collected before asserting, so one failure names EVERY misclassified form.
-    #[test]
-    fn an_associated_constant_method_chain_delegates_to_the_chained_method() {
+    fn an_associated_constant_method_chain_records_no_handler() {
         // Trivia is not part of Rust's token identity. Generate the same four semantic forms
         // through several legal spellings around the member-access dot, including comments and a
         // line break. The leading underscore is part of the SCREAMING_SNAKE convention, not a
@@ -1109,14 +1039,14 @@ mod classify_call_tests {
             "<Handler as Runner>::_DEFAULT",
         ];
         let trivia = [".", " . ", "\n .\n", " /* receiver */ . ", "\n /* receiver */\n .\t"];
-        let mut delegate_forms = Vec::new();
+        let mut chain_forms = Vec::new();
         for qualifier in qualifiers {
             for separator in trivia {
-                delegate_forms.push(format!("{qualifier}{separator}run(input)"));
+                chain_forms.push(format!("{qualifier}{separator}run(input)"));
             }
         }
         // A nested field chain and a turbofish must use the same token structure, too.
-        delegate_forms.extend([
+        chain_forms.extend([
             "Handler::DEFAULT . build.ship(input)".to_string(),
             "<Handler as Runner>::_DEFAULT /* receiver */ . run::<u8>(input)".to_string(),
             // A leading underscore is valid on a lowercase method as well as on the associated
@@ -1130,6 +1060,17 @@ mod classify_call_tests {
             "Handler::DEFAULT.build::<u8>().run::<u8>(input)".to_string(),
             "Handler::DEFAULT.combine(Other::DEFAULT).run(input)".to_string(),
             "<Handler as Runner>::DEFAULT.build().configure()._run::<u8>(input)".to_string(),
+            // A `?`, an `.await` or a paren between the links wraps a value without changing its
+            // identity, so it cannot hand the chain to the delegate fall-through.
+            "Handler::DEFAULT.build()?.run(input)".to_string(),
+            "Handler::DEFAULT.build().await.run(input)".to_string(),
+            "(Handler::DEFAULT.build()).run(input)".to_string(),
+            "Handler::DEFAULT.build()?.configure().await.run::<u8>(input)".to_string(),
+            // An argument that nests a produced call is argument shape, not evidence: a builder
+            // and a dispatch are indistinguishable here, so neither records anything.
+            "Handler::DEFAULT.run(normalize(input))".to_string(),
+            "Resp::DEFAULT.with_body(handle(cap))".to_string(),
+            "<Resp as Build>::DEFAULT.with_body(handle(cap))".to_string(),
             "<Handler as Runner>::_DEFAULT /* receiver */ . build /* call */ () /* between */ . \
              run::<u8>(input)"
                 .to_string(),
@@ -1154,9 +1095,9 @@ mod classify_call_tests {
         let wrapper_forms = ["Ok(body)", "Some(body)"];
         let mut misclassified = Vec::new();
         misclassified.extend(
-            delegate_forms
+            chain_forms
                 .iter()
-                .filter(|expression| !matches!(role_of(expression), CallRole::Delegate))
+                .filter(|expression| !matches!(role_of(expression), CallRole::Skip))
                 .map(String::as_str),
         );
         misclassified.extend(

@@ -193,40 +193,43 @@ fn delete_dispatch_handle_facts(db: &IndexDatabase, file_id: i64) {
         .unwrap();
 }
 
+fn current_graph_version() -> i64 {
+    GRAPH_INDEX_VERSION.parse().expect("GRAPH_INDEX_VERSION is an integer")
+}
+
+/// The stamp a deployed index carries when the newest `GRAPH_INDEX_VERSION` ladder entry is the one
+/// that must re-extract it. DERIVED from the constant, never written out: a hardcoded pair of
+/// literals keeps passing when a change forgets to bump the ladder, because the staged version and
+/// the expected one then describe a step that already happened rather than this one.
+fn previous_graph_version() -> i64 {
+    current_graph_version() - 1
+}
+
 /// Stage the graph-only part of the version upgrade while leaving the logical-key derivation at
-/// its current value. Version 16 is the persisted stamp immediately before this classifier change;
-/// version 17 is the first graph version that must re-extract it.
-fn stage_graph_version_16(db: &IndexDatabase) {
-    db.set_repo_meta("graph_index_version", "16").unwrap();
+/// its current value.
+fn stage_previous_graph_version(db: &IndexDatabase) {
+    let previous = previous_graph_version();
+    db.set_repo_meta("graph_index_version", &previous.to_string()).unwrap();
     db.storage
         .connection()
         .execute(
-            "UPDATE main.files SET graph_version = 16
+            "UPDATE main.files SET graph_version = ?3
              WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'",
-            params![&db.active_repo_id, db.active_generation],
+            params![&db.active_repo_id, db.active_generation, previous],
         )
         .unwrap();
     *db.drift_snapshot.lock().expect("drift snapshot lock") = None;
 }
 
-/// The handler vehicle is an associated-constant method chain owned by a TYPE, which is the shape
-/// that delegates to its chained method. A constant reached through a MODULE path
-/// (`tools::TOOL_NAMES.iter().map(..)`) is an adapter tail and records no handler at all, so it
-/// cannot carry a dispatch fact for these upgrade assertions to watch (#1124 maintainer feedback).
+/// The handler vehicle is a plain in-file free function — the shape whose delegate verdict no
+/// classifier rule is contested over, so these upgrade assertions watch the version ladder rather
+/// than the classifier. A chain glued onto a constant (`Handler::DEFAULT.run(..)`,
+/// `tools::TOOL_NAMES.iter().map(..)`) is an adapter tail and records no handler at all, so it
+/// cannot carry a dispatch fact for them to watch (#1124).
 fn dispatch_fixture_body(handler_expression: &str) -> String {
     format!(
         r#"
 pub enum Msg {{ Work }}
-pub struct Handler;
-impl Handler {{
-    pub const DEFAULT: Handler = Handler;
-    fn run(&self, _input: usize) -> usize {{ 0 }}
-}}
-pub struct Clock;
-impl Clock {{
-    pub const NOW: Clock = Clock;
-    fn elapsed(&self) -> usize {{ 0 }}
-}}
 
 pub fn enqueue() {{ send(Msg::Work); }}
 fn send(_msg: Msg) {{}}
@@ -236,18 +239,20 @@ pub fn handle(msg: Msg) {{
         Msg::Work => {handler_expression},
     }}
 }}
+
+fn run(_input: usize) -> usize {{ 0 }}
+fn elapsed() -> usize {{ 0 }}
 "#
     )
 }
 
 #[test]
-fn a_v16_database_reextracts_the_corrected_dispatch_handle_fact() {
-    let (root, config) =
-        indexed_root(&[("lib.rs", &dispatch_fixture_body("Handler::DEFAULT.run(1)"))]);
+fn a_previous_version_database_reextracts_the_corrected_dispatch_handle_fact() {
+    let (root, config) = indexed_root(&[("lib.rs", &dispatch_fixture_body("run(1)"))]);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let file_id = scoped_file_id(&db, "src/lib.rs", &db.active_worktree_id);
 
-    // Simulate the deployed v16 row after the old classifier omitted this handle fact.
+    // Simulate the deployed row after the old classifier omitted this handle fact.
     let initial_handles = edge_kind_rows_with_resolution(&db, file_id, "dispatch_handle");
     assert!(
         initial_handles.iter().any(|(name, _, evidence)| {
@@ -257,7 +262,7 @@ fn a_v16_database_reextracts_the_corrected_dispatch_handle_fact() {
     );
     delete_dispatch_handle_facts(&db, file_id);
     assert!(edge_kind_rows_with_resolution(&db, file_id, "dispatch_handle").is_empty());
-    stage_graph_version_16(&db);
+    stage_previous_graph_version(&db);
 
     db.ensure_graph_index_current().unwrap();
 
@@ -270,10 +275,10 @@ fn a_v16_database_reextracts_the_corrected_dispatch_handle_fact() {
                 && resolution == "target_name_fallback"
                 && evidence.as_deref() == Some("Msg::Work")
         }),
-        "the v16 row must be re-extracted with the corrected handle fact: {handles:?}"
+        "the stale row must be re-extracted with the corrected handle fact: {handles:?}"
     );
-    assert_eq!(file_graph_version(&db, file_id), 17);
-    assert_eq!(db.repo_meta("graph_index_version").unwrap().as_deref(), Some("17"));
+    assert_eq!(file_graph_version(&db, file_id), current_graph_version());
+    assert_eq!(db.repo_meta("graph_index_version").unwrap().as_deref(), Some(GRAPH_INDEX_VERSION));
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -283,7 +288,7 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
     let main = unique_temp_root();
     let _ = fs::remove_dir_all(&main);
     fs::create_dir_all(main.join("src")).unwrap();
-    fs::write(main.join("src/lib.rs"), dispatch_fixture_body("Handler::DEFAULT.run(1)")).unwrap();
+    fs::write(main.join("src/lib.rs"), dispatch_fixture_body("run(1)")).unwrap();
     init_git_repo(&main);
     run_git(&main, &["add", "."]);
     run_git(&main, &["commit", "-q", "-m", "base"]);
@@ -295,7 +300,7 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
     run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
     // A TYPE-owned constant chain like the active checkout's, naming a different method so the
     // sibling's fact is distinguishable from the active checkout's.
-    fs::write(linked.join("src/lib.rs"), dispatch_fixture_body("Clock::NOW.elapsed()")).unwrap();
+    fs::write(linked.join("src/lib.rs"), dispatch_fixture_body("elapsed()")).unwrap();
     run_git(&linked, &["add", "."]);
     run_git(&linked, &["commit", "-q", "-m", "branch body"]);
     db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
@@ -326,9 +331,9 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
     let overlay_all_before = edge_targets_with_resolution(&db, overlay_id);
     let overlay_edge_ids_before = edge_ids(&db, overlay_id);
 
-    // Remove only the active checkout's corrected fact, then present both rows as v16 data.
+    // Remove only the active checkout's corrected fact, then present both rows as stale data.
     delete_dispatch_handle_facts(&db, base_id);
-    stage_graph_version_16(&db);
+    stage_previous_graph_version(&db);
     db.ensure_graph_index_current().unwrap();
 
     let base_handles = edge_kind_rows_with_resolution(&db, base_id, "dispatch_handle");
@@ -338,12 +343,12 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
         }),
         "the active checkout receives the corrected dispatch fact: {base_handles:?}"
     );
-    assert_eq!(file_graph_version(&db, base_id), 17);
-    assert_eq!(file_graph_version(&db, overlay_id), 16);
+    assert_eq!(file_graph_version(&db, base_id), current_graph_version());
+    assert_eq!(file_graph_version(&db, overlay_id), previous_graph_version());
     assert_eq!(edge_ids(&db, overlay_id), overlay_edge_ids_before);
     assert_eq!(edge_targets_with_resolution(&db, overlay_id), overlay_all_before);
     assert_eq!(edge_kind_rows_with_resolution(&db, overlay_id, "dispatch_handle"), overlay_before);
-    assert_ne!(db.repo_meta("graph_index_version").unwrap().as_deref(), Some("17"));
+    assert_ne!(db.repo_meta("graph_index_version").unwrap().as_deref(), Some(GRAPH_INDEX_VERSION));
 
     let mut linked_config = source_config(linked.to_path_buf(), Language::Rust);
     linked_config.database = config.database.clone();
@@ -356,10 +361,13 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
         }),
         "the sibling later re-extracts its own fact: {overlay_handles:?}"
     );
-    assert_eq!(file_graph_version(&linked_db, base_id), 17);
-    assert_eq!(file_graph_version(&linked_db, overlay_id), 17);
+    assert_eq!(file_graph_version(&linked_db, base_id), current_graph_version());
+    assert_eq!(file_graph_version(&linked_db, overlay_id), current_graph_version());
     assert_eq!(edge_kind_rows_with_resolution(&linked_db, base_id, "dispatch_handle")[0].0, "run");
-    assert_eq!(linked_db.repo_meta("graph_index_version").unwrap().as_deref(), Some("17"));
+    assert_eq!(
+        linked_db.repo_meta("graph_index_version").unwrap().as_deref(),
+        Some(GRAPH_INDEX_VERSION)
+    );
 
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);
