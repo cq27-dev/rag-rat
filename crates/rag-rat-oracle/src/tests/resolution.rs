@@ -399,4 +399,10 @@ fn a_namespace_occurrence_answers_only_when_it_bounds_the_token() {
         verdict_for(0, 29).0.is_none(),
         "a namespace merely containing the token yields no evidence at all",
     );
+    // Starting at the token is not bounding it. `ns.f()` is the shape an `import x.y` receiver
+    // produces, and only the END edge separates it from the exact match above.
+    assert!(
+        verdict_for(20, 26).0.is_none(),
+        "a namespace starting at the token but running past it is still context",
+    );
 }
