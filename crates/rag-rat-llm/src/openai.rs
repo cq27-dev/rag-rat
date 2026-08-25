@@ -786,6 +786,49 @@ mod tests {
         (url, handle, requests, max_in_flight)
     }
 
+    /// What the stub's workers coordinate on: responses fully written, and waits that have
+    /// parked.
+    ///
+    /// Both live under one mutex because a waiter has to snapshot `done` and register its park
+    /// as a single step. Split them and a response can land between the two, which is the whole
+    /// failure this pairing exists to prevent.
+    #[derive(Default)]
+    struct Progress {
+        /// Responses fully written.
+        done: usize,
+        /// Waits that have parked, cumulative. A released waiter still counts: it goes on to
+        /// write a response of its own, and must not be made to wait for a handshake it already
+        /// satisfied.
+        parked: usize,
+    }
+
+    /// Raises the in-flight gauge for exactly the window a request is outstanding: up once the
+    /// request has been read, down before anything is written back.
+    ///
+    /// The scope IS the window. The gauge has to fall before the response write, because a client
+    /// that reads response N can dispatch N+1 before this worker is rescheduled, and a decrement
+    /// that lands after that reads as two requests overlapping when only one ever did. Holding
+    /// that boundary in a guard means the write cannot drift inside it by accident — moving the
+    /// decrement takes moving the write into the scope, which is not something you do by mistake.
+    struct InFlight(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl InFlight {
+        fn enter(
+            gauge: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            max_seen: &std::sync::atomic::AtomicUsize,
+        ) -> Self {
+            let now = gauge.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            raise_max(max_seen, now);
+            Self(std::sync::Arc::clone(gauge))
+        }
+    }
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// A one-shot barrier that holds each request the stub has read until `threshold` of them are
     /// held at once, then stays open for the rest of the run. `threshold <= 1` never holds.
     ///
@@ -873,9 +916,10 @@ mod tests {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_in_flight = Arc::new(AtomicUsize::new(0));
         let waits_satisfied = Arc::new(AtomicUsize::new(0));
-        // Count of requests that have FULLY written their response, paired with a condvar so a
-        // parked worker is released by an explicit completion signal rather than by polling.
-        let completions = Arc::new((Mutex::new(0usize), Condvar::new()));
+        // Progress ledger, paired with a condvar so a parked worker is released by an explicit
+        // signal rather than by polling. One condvar serves both transitions; every waiter
+        // re-tests its own predicate on wake.
+        let completions = Arc::new((Mutex::new(Progress::default()), Condvar::new()));
         let counter = Arc::clone(&requests);
         let wait_for_prior_response = Arc::new(wait_for_prior_response);
         let max_seen = Arc::clone(&max_in_flight);
@@ -904,43 +948,83 @@ mod tests {
                     // it is strictly inside the window the client sees as outstanding. A client
                     // that waits for response N before sending N+1 therefore cannot be observed
                     // with two in flight, and an overlap the gauge does record is a real one.
-                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                    raise_max(&max_seen, now);
                     let indices = request_text_indices(&body);
-                    // Deterministic "later request finishes first" ordering: a request whose first
-                    // text index is in `wait_for_prior_response` parks until ANOTHER request has
-                    // fully written its response and signalled completion via the condvar — no
-                    // scheduler timing, no busy-poll. The 30s cap is only a deadlock guard (if the
-                    // client never dispatches a concurrent second request the assertion fails
-                    // rather than hanging CI); on a healthy run the signal arrives in milliseconds,
-                    // so the release never depends on beating a deadline.
-                    if let Some(first) = indices.first().copied()
-                        && wait_for_prior_response.contains(&first)
-                    {
-                        let (lock, cvar) = &*completions;
-                        let mut done = lock.lock().unwrap();
-                        let started = std::time::Instant::now();
-                        let deadline = Duration::from_secs(30);
-                        while *done == 0 {
-                            let remaining = deadline.saturating_sub(started.elapsed());
-                            if remaining.is_zero() {
-                                break;
+                    let vector_ids = {
+                        let _outstanding = InFlight::enter(&in_flight, &max_seen);
+                        // Deterministic "later request finishes first" ordering: a request whose
+                        // first text index is in `wait_for_prior_response` parks until ANOTHER
+                        // request completes a response AFTER this one parked — no scheduler
+                        // timing, no busy-poll.
+                        //
+                        // The gate is relative to the count at entry, not to zero. `completions`
+                        // only ever rises, so a wait that tested it against zero was satisfied by
+                        // any response the run had already written: the worker fell straight
+                        // through without parking, and still reported the wait as satisfied. A
+                        // caller asserting on that count could not tell a released wait from one
+                        // that never waited, which is the whole property the counter exists for.
+                        //
+                        // The deadline is a deadlock guard only (if the client never dispatches a
+                        // concurrent second request, the count comes back short and the assertion
+                        // fails on a number instead of hanging CI). It stays below the caller's
+                        // HTTP timeout so that client reports the count that explains the failure
+                        // rather than a transport timeout.
+                        if let Some(first) = indices.first().copied()
+                            && wait_for_prior_response.contains(&first)
+                        {
+                            let (lock, cvar) = &*completions;
+                            let mut progress = lock.lock().unwrap();
+                            let parked_at = progress.done;
+                            progress.parked += 1;
+                            cvar.notify_all();
+                            let started = std::time::Instant::now();
+                            let deadline = Duration::from_secs(2);
+                            while progress.done == parked_at {
+                                let remaining = deadline.saturating_sub(started.elapsed());
+                                if remaining.is_zero() {
+                                    break;
+                                }
+                                let (guard, timeout) =
+                                    cvar.wait_timeout(progress, remaining).unwrap();
+                                progress = guard;
+                                if timeout.timed_out() {
+                                    break;
+                                }
                             }
-                            let (guard, timeout) = cvar.wait_timeout(done, remaining).unwrap();
-                            done = guard;
-                            if timeout.timed_out() {
-                                break;
+                            if progress.done > parked_at {
+                                waits_seen.fetch_add(1, Ordering::SeqCst);
                             }
                         }
-                        if *done > 0 {
-                            waits_seen.fetch_add(1, Ordering::SeqCst);
+                        // Explicit release point: hold this request until the configured number
+                        // are in flight together, so the caller's overlap assertion is a released
+                        // fact.
+                        hold.hold();
+                        // Hold this response until every configured wait has parked. "A later
+                        // request finishes first" only happens if the earlier one is ALREADY
+                        // parked when the later one completes; let the completion land first and
+                        // the waiter snapshots a count it can never move past, then waits out its
+                        // deadline. Arrival order is a scheduling detail, so without this the
+                        // assertion depends on which worker the OS runs first. A waiter that has
+                        // been released passes here immediately — it registered its own park.
+                        if !wait_for_prior_response.is_empty() {
+                            let (lock, cvar) = &*completions;
+                            let mut progress = lock.lock().unwrap();
+                            let started = std::time::Instant::now();
+                            let deadline = Duration::from_secs(2);
+                            while progress.parked < wait_for_prior_response.len() {
+                                let remaining = deadline.saturating_sub(started.elapsed());
+                                if remaining.is_zero() {
+                                    break;
+                                }
+                                let (guard, timeout) =
+                                    cvar.wait_timeout(progress, remaining).unwrap();
+                                progress = guard;
+                                if timeout.timed_out() {
+                                    break;
+                                }
+                            }
                         }
-                    }
-                    // Explicit release point: hold this request until the configured number are
-                    // in flight together, so the caller's overlap assertion is a released fact.
-                    hold.hold();
-                    in_flight.fetch_sub(1, Ordering::SeqCst);
-                    let vector_ids = if indices.is_empty() { vec![0] } else { indices };
+                        if indices.is_empty() { vec![0] } else { indices }
+                    };
                     let vectors: Vec<Vec<f32>> = vector_ids
                         .into_iter()
                         .map(|idx| {
@@ -962,7 +1046,7 @@ mod tests {
                     // `wait_for_prior_response` above, forcing a deterministic completion order.
                     {
                         let (lock, cvar) = &*completions;
-                        *lock.lock().unwrap() += 1;
+                        lock.lock().unwrap().done += 1;
                         cvar.notify_all();
                     }
                 }));
@@ -1121,8 +1205,9 @@ mod tests {
         let (url, handle, requests, _, waits_satisfied) =
             spawn_parallel_counting_stub_with_waits(2, vec![0]);
         let first_url = url.clone();
+        // No sender-side sleep: the stub holds `text 1`'s response until `text 0` has parked, so
+        // the ordering is a released fact rather than a bet on which worker the OS runs first.
         let first = thread::spawn(move || post_stub_embedding_request(&first_url, "text 0"));
-        thread::sleep(Duration::from_millis(20));
         let second = thread::spawn(move || post_stub_embedding_request(&url, "text 1"));
 
         first.join().unwrap();
