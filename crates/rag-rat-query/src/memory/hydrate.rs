@@ -287,6 +287,14 @@ pub(crate) fn mark_drifted_synced_anchor(
     // the path branch would leave a peer's path-anchored memory permanently unpriced, and so
     // permanently presented as current however far its file had moved on.
     //
+    // The last two branches carry the SEEDED state. `seed_node_anchors` writes portable columns
+    // only and leaves `chunk_id`/`edge_id` at their defaults for the validate/relocate loop to
+    // fill, and nothing runs that loop automatically after a drain — so keying solely on the
+    // resolved ids would leave every freshly synced symbol and edge anchor unpriced for as long as
+    // no one happened to run `memory_validate`, which is exactly the window in which a peer's
+    // memories first appear. Both are reachable from the portable identity: an edge anchor's
+    // `path` IS its source file's, and a symbol anchor's span selects the chunk covering it.
+    //
     // Reads go through the SCOPED `files` view, never `main.files`. The view is what this checkout
     // actually serves: it applies the live generation, drops tombstones, keeps a sibling
     // checkout's rows out, and — the part a hand-rolled predicate gets wrong — SHADOWS a base row
@@ -314,6 +322,25 @@ pub(crate) fn mark_drifted_synced_anchor(
             JOIN files ON files.path = repo_memory_bindings.path
             WHERE repo_memory_bindings.memory_id = ?1
               AND repo_memory_bindings.binding_kind = 'path'
+            UNION ALL
+            SELECT files.sha256 AS current_hash
+            FROM repo_memory_bindings
+            JOIN files ON files.path = repo_memory_bindings.path
+            WHERE repo_memory_bindings.memory_id = ?1
+              AND repo_memory_bindings.binding_kind = 'edge'
+              AND repo_memory_bindings.edge_id IS NULL
+            UNION ALL
+            SELECT chunks.text_hash AS current_hash
+            FROM repo_memory_bindings
+            JOIN files ON files.path = repo_memory_bindings.path
+            JOIN chunks ON chunks.file_id = files.id
+                       AND chunks.start_line <= repo_memory_bindings.start_line
+                       AND chunks.end_line >= repo_memory_bindings.end_line
+            WHERE repo_memory_bindings.memory_id = ?1
+              AND repo_memory_bindings.binding_kind IN ('symbol', 'logical_symbol')
+              AND repo_memory_bindings.chunk_id IS NULL
+              AND repo_memory_bindings.start_line IS NOT NULL
+              AND repo_memory_bindings.end_line IS NOT NULL
         )
         ",
         params![&memory.memory_id, stamp],
@@ -922,6 +949,86 @@ mod drift_tests {
             serde_json::to_value(&clean[0]).unwrap().get("synced_anchor_drifted").is_none(),
             "the common case stays off the wire"
         );
+    }
+
+    /// The row shape `seed_node_anchors` writes: portable columns only, resolved ids left NULL.
+    fn seed_unresolved_binding(
+        conn: &Connection,
+        kind: &str,
+        path: &str,
+        span: Option<(i64, i64)>,
+    ) {
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             start_line, end_line, anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1',?1,'portable-id',?2,?3,?4,'unverified',0,?5)",
+            params![kind, path, span.map(|s| s.0), span.map(|s| s.1), REPO],
+        )
+        .unwrap();
+    }
+
+    fn seed_bare_memory(conn: &Connection, stamp: &str) {
+        conn.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version, repo_id, origin, \
+             source_text_hash) VALUES \
+             ('m1','Invariant','t','b','high','active','agent',1,1,'agent','v1',?1,'synced',?2)",
+            params![REPO, stamp],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_freshly_seeded_symbol_anchor_is_priced_before_validation_resolves_it() {
+        let conn = db();
+        // Straight out of the drain: the seeder writes portable columns only, and nothing runs the
+        // validate/relocate loop for it automatically. Keying on `chunk_id` alone would leave a
+        // peer's symbol-anchored memory unpriced for as long as nobody ran `memory_validate` —
+        // precisely the window in which their memories first show up.
+        seed_chunk(&conn, "src/a.rs", "now");
+        install_files_view(&conn, "");
+        seed_bare_memory(&conn, "stamped-then");
+        seed_unresolved_binding(&conn, "logical_symbol", "src/a.rs", Some((2, 4)));
+
+        let mut memory = memory_by_id(&conn, "m1").unwrap().unwrap();
+        mark_drifted_synced_anchor(&conn, &mut memory).unwrap();
+        assert!(memory.synced_anchor_drifted, "the covering chunk prices an unresolved symbol");
+    }
+
+    #[test]
+    fn a_freshly_seeded_symbol_anchor_still_matching_is_not_marked() {
+        let conn = db();
+        // The mirror: pricing the seeded state must not manufacture drift for a peer whose text
+        // this checkout genuinely still holds.
+        seed_chunk(&conn, "src/a.rs", "same");
+        install_files_view(&conn, "");
+        seed_bare_memory(&conn, "same");
+        seed_unresolved_binding(&conn, "logical_symbol", "src/a.rs", Some((2, 4)));
+
+        let mut memory = memory_by_id(&conn, "m1").unwrap().unwrap();
+        mark_drifted_synced_anchor(&conn, &mut memory).unwrap();
+        assert!(!memory.synced_anchor_drifted, "a seeded anchor on matching text is current");
+    }
+
+    #[test]
+    fn a_freshly_seeded_edge_anchor_is_priced_by_its_source_file() {
+        let conn = db();
+        // An edge anchor's stamp is its source file's hash, and the seeded row already carries
+        // that file's path — so the portable identity prices it exactly, with no id to resolve.
+        conn.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id, repo_id, generation) VALUES \
+             ('src/a.rs','rust','source','moved-on',0,0,'','',?1,0)",
+            params![REPO],
+        )
+        .unwrap();
+        install_files_view(&conn, "");
+        seed_bare_memory(&conn, "stamped-then");
+        seed_unresolved_binding(&conn, "edge", "src/a.rs", None);
+
+        let mut memory = memory_by_id(&conn, "m1").unwrap().unwrap();
+        mark_drifted_synced_anchor(&conn, &mut memory).unwrap();
+        assert!(memory.synced_anchor_drifted, "an unresolved edge is priced by its file");
     }
 
     #[test]
