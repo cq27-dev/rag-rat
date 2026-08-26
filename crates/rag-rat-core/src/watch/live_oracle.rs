@@ -960,6 +960,12 @@ impl LiveBackendTail {
         // consolidate the databases they do not have sends them after the wrong problem
         // entirely. Adding a branch would narrow the set without closing it. So: state what was
         // observed, offer the causes, and make each remedy conditional on its own cause.
+        //
+        // That includes not claiming the database PARSED. An incomplete scan withholds every sole
+        // database fact on purpose — it cannot prove the marker it saw is the only one — so a
+        // checkout whose single database this reader could not read reaches here with both flags
+        // false, warmable under `Trust::Possible` and skipping every file under `Trust::Proven`.
+        // Whatever this branch asserts, some layout that withheld its facts will contradict.
         tracing::warn!(
             target: "rag_rat_core::watch",
             tool = self.backend.tool.as_db_str(),
@@ -971,9 +977,10 @@ impl LiveBackendTail {
              holds several, the server has to find each file's database itself and skips a file \
              it finds none for — leave a single compilation database, or put each file's database \
              in one of its ancestor directories or that directory's `build/`. If it holds exactly \
-             one, that database may parse while still not proving it covers these files — an \
-             entry whose `file` is not a string is the usual shape — so regenerate it with string \
-             `file` fields naming the indexed sources."
+             one, this reader could not establish a configuration for these files from it — the \
+             file may not have parsed, or may have parsed without describing them. Inspect its \
+             entries against what the server expects: a `file` naming the source, and a `command` \
+             or `arguments` a compiler would accept."
         );
     }
 
@@ -1477,13 +1484,30 @@ mod tests {
             unidentified.contains("do not identify which cause"),
             "the terminal branch must not assert a diagnosis: {unidentified:?}",
         );
+        // Both remedies are present and BOTH are conditional. A terminal branch that named one
+        // cause would drop a conditional, which is what these two read.
+        assert!(
+            unidentified.contains("if it holds several"),
+            "the several-databases remedy must stay conditional: {unidentified:?}",
+        );
+        assert!(
+            unidentified.contains("If it holds exactly one"),
+            "and so must the sole-database one: {unidentified:?}",
+        );
         assert!(
             unidentified.contains("leave a single compilation database"),
             "…while still carrying the several-databases remedy: {unidentified:?}",
         );
         assert!(
-            unidentified.contains("is not a string"),
-            "…and the sole-database one: {unidentified:?}",
+            unidentified.contains("a `command` or `arguments` a compiler would accept"),
+            "…and a sole-database remedy that does not presume which field is wrong: \
+             {unidentified:?}",
+        );
+        // Not even parsing may be asserted: an incomplete scan withholds the unreadable-database
+        // fact, so a checkout whose only database could not be read reaches this branch too.
+        assert!(
+            unidentified.contains("may not have parsed"),
+            "the terminal branch cannot claim the database parsed: {unidentified:?}",
         );
         assert!(!unidentified.contains("names no file this checkout indexes"));
 
@@ -1623,6 +1647,50 @@ mod tests {
             sole_unreadable_entry.contains("do not identify which cause"),
             "a sole database that reaches the terminal branch must not be diagnosed as several: \
              {sole_unreadable_entry:?}",
+        );
+
+        // A sole database that PARSES and is still unusable — a string `file` naming an indexed
+        // source, with an empty `command` — reaches the terminal branch too: entries counted zero
+        // makes it NotLoadable, so the unreadable branch declines it, and NotLoadable is not the
+        // Loadable the governs-nothing branch requires. Nothing about this entry's `file` is
+        // wrong, so a remedy naming that field would send its operator to the wrong line.
+        std::fs::write(
+            fixture.path().join("compile_commands.json"),
+            format!(
+                "[{{\"directory\":\"/x\",\"file\":{:?},\"command\":\"\"}}]",
+                fixture.path().join("src/main.c").display().to_string()
+            ),
+        )
+        .unwrap();
+        let empty_command = clangd.resolve_layout(&scope);
+        assert!(!empty_command.has_unreadable_database());
+        assert!(!empty_command.has_database_governing_nothing_indexed());
+        let unusable_entry = warning(LivePassReport {
+            skipped_unconfigured: 1,
+            database_unreadable: empty_command.has_unreadable_database(),
+            database_governs_nothing: empty_command.has_database_governing_nothing_indexed(),
+            ..LivePassReport::default()
+        });
+        assert!(
+            unusable_entry.contains("do not identify which cause"),
+            "a database whose entries are malformed some other way is still undiagnosed: \
+             {unusable_entry:?}",
+        );
+        assert!(
+            unusable_entry.contains("a `command` or `arguments` a compiler would accept"),
+            "and the remedy must reach the field that IS wrong: {unusable_entry:?}",
+        );
+
+        // A checkout that holds NO database never reaches this warning: it cannot signal
+        // readiness, so it blocks on the prerequisite instead of spawning, and a running session
+        // whose checkout loses every database ends its pass at the layout-refresh check. The
+        // prerequisite already words that remedy; a branch here would be unreachable.
+        std::fs::remove_file(fixture.path().join("compile_commands.json")).unwrap();
+        let no_database = clangd.resolve_layout(&scope);
+        assert!(no_database.has_no_database(), "the checkout holds no database to find");
+        assert!(
+            !clangd.checkout_can_signal_readiness(&scope, &no_database),
+            "so no session spawns against it, and no pass can report it",
         );
     }
 

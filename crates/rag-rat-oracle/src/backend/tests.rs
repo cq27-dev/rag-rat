@@ -1822,6 +1822,77 @@ fn a_real_linked_worktree_inside_the_checkout_is_not_this_checkouts_project() {
     );
 }
 
+/// Losing every compilation database is scoped to the checkout that lost it.
+///
+/// A linked worktree and its main checkout share one index in this repository's model, so an
+/// absence read at repository scope would end the main checkout's session over a deletion next
+/// door, and one read only at main would leave the linked worktree warming against a project it
+/// no longer has. The scan answers per `CheckoutScope`, and this pins that from both sides.
+///
+/// The main checkout's own scan is INCOMPLETE here — a nested checkout's `.git` is a file it
+/// cannot classify — which is the second half: an incomplete scan must never report an absence,
+/// because it cannot prove there is nothing left to find.
+#[test]
+fn a_linked_worktree_losing_its_database_does_not_take_the_sibling_with_it() {
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let (_dir_guard, dir) = checkout("clangd-worktree-database-loss");
+    let main = dir.join("main");
+    std::fs::create_dir_all(main.join("src")).unwrap();
+    rag_rat_base::test_git::run(&main, &["init"]);
+    std::fs::write(main.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_database(&main, "build/compile_commands.json", &["src/main.c"]);
+    rag_rat_base::test_git::run(&main, &["add", "."]);
+    rag_rat_base::test_git::run(&main, &["commit", "-m", "seed"]);
+
+    let linked = main.join(".claude/worktrees/feature");
+    std::fs::create_dir_all(main.join(".claude/worktrees")).unwrap();
+    rag_rat_base::test_git::run(&main, &[
+        "worktree",
+        "add",
+        linked.to_str().unwrap(),
+        "-b",
+        "feature",
+    ]);
+    write_database(&linked, "build/compile_commands.json", &["src/main.c"]);
+
+    let main_corpus = crate::test_support::PrefixCorpus::new(&main, &["src"]);
+    let linked_corpus = crate::test_support::PrefixCorpus::new(&linked, &["src"]);
+    let main_layout = || clangd.resolve_layout(&super::CheckoutScope::resolve(&main, &main_corpus));
+    let linked_layout =
+        || clangd.resolve_layout(&super::CheckoutScope::resolve(&linked, &linked_corpus));
+
+    // Control: with both databases present neither side reports an absence, or the assertions
+    // below prove nothing.
+    assert!(!main_layout().has_no_database(), "control: main holds a database");
+    assert!(!linked_layout().has_no_database(), "control: so does the linked worktree");
+
+    // The linked worktree loses its database. Its own layout is the one that says so.
+    std::fs::remove_file(linked.join("build/compile_commands.json")).unwrap();
+    assert!(
+        linked_layout().has_no_database(),
+        "the checkout that lost its database reports the absence, under its own ceiling",
+    );
+    let sibling = main_layout();
+    assert!(
+        !sibling.has_no_database(),
+        "and the sibling, which still holds one, is not ended for a deletion next door",
+    );
+    assert!(!sibling.is_empty(), "its own database is still found");
+
+    // The other direction: main's scan cannot classify the nested checkout, so it is incomplete
+    // and must decline to claim an absence even once its own database is gone.
+    std::fs::remove_file(main.join("build/compile_commands.json")).unwrap();
+    assert!(
+        !main_layout().has_no_database(),
+        "an incomplete scan has not established there is nothing left to find, so it must not \
+         report an absence that would tear a working session down",
+    );
+    assert!(
+        linked_layout().has_no_database(),
+        "while the linked worktree, whose own scan finished, still reports its own absence",
+    );
+}
+
 /// What the scan proves is now "every database that could GOVERN an indexed file", not "every
 /// database under the root" — and both halves of that need pinning, or the redefinition lives only
 /// in a comment.
