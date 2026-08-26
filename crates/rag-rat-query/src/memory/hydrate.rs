@@ -169,6 +169,10 @@ pub(crate) fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemory
         source_text_hash: row.get("source_text_hash")?,
         input_hash: row.get("input_hash")?,
         memory_version: row.get("memory_version")?,
+        // Drift is a property of the reading surface, not of the row: only the drive-by readers
+        // mark it (`mark_drifted_synced_anchor`). The mechanical hydration leaves it clear so
+        // `memory_get`, `memory_search`, dream, distill and doctor are unaffected.
+        synced_anchor_drifted: false,
         bindings: Vec::new(),
         call_paths: Vec::new(),
         tags: Vec::new(),
@@ -248,13 +252,94 @@ pub fn tags_for_memory(conn: &Connection, memory_id: &str) -> anyhow::Result<Vec
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
+/// Mark a synced memory whose anchored text this checkout no longer holds (#1236).
+///
+/// The stamp is not a bespoke hash: `resolve.rs` takes it from `chunks.text_hash` for a
+/// chunk/symbol anchor and from `files.sha256` for an edge anchor, so the current value is the
+/// same column read back — a join, not a recomputation, and no filesystem read on a drive-by
+/// surface. Comparing anything else (a fresh span read, or `files.sha256` for a chunk anchor)
+/// would compare against a quantity the author never stamped.
+///
+/// Drift is "the stamp matches nothing this checkout currently holds at the memory's anchors": the
+/// memory carries candidate hashes and none of them equals the stamp. A content-confirmed
+/// relocation therefore passes by construction — it moved the anchor to text that hashes the same.
+/// A moniker- or name-matched relocation onto changed text does mark, which is the honest reading
+/// of a pure hash comparison and costs a mark rather than a disappearance.
+pub(crate) fn mark_drifted_synced_anchor(
+    conn: &Connection,
+    memory: &mut RepoMemory,
+) -> anyhow::Result<()> {
+    // An absent stamp is not evidence of drift — every pre-carrier row is NULL.
+    let Some(stamp) = memory.source_text_hash.as_deref() else { return Ok(()) };
+    // Scoped to synced rows. A local memory's stamp is its own authoring snapshot, and local
+    // drift already has a mechanism: relocation stamps `anchor_status`, which demotes on its own.
+    let synced: bool = conn.query_row(
+        "SELECT origin = 'synced' FROM repo_memories WHERE id = ?1",
+        [&memory.memory_id],
+        |row| row.get(0),
+    )?;
+    if !synced {
+        return Ok(());
+    }
+    // Only rows THIS checkout currently serves may price an anchor. Without the live-generation
+    // and `deleted` filters a superseded staging row or a tombstone could answer, and the memory
+    // would be judged against text no reader can see; without the worktree filter a sibling
+    // checkout's copy of the file could answer for this one. `worktree_id = ''` is the shared base
+    // row, which belongs to every checkout — see `path_is_live_in_another_scope`.
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let live_generation = rag_rat_db::schema::live_files_generation(conn, &repo_id)?;
+    let active_worktree =
+        rag_rat_db::schema::connection_context_value(conn, "worktree_id").unwrap_or_default();
+    let (candidates, matches): (i64, i64) = conn.query_row(
+        "
+        WITH live_files AS (
+            SELECT id, sha256 FROM main.files
+            WHERE repo_id = ?3 AND kind != 'deleted' AND generation = ?4
+              AND (worktree_id = '' OR worktree_id = ?5)
+        )
+        SELECT COUNT(*), COALESCE(SUM(current_hash = ?2), 0)
+        FROM (
+            SELECT chunks.text_hash AS current_hash
+            FROM repo_memory_bindings
+            JOIN chunks ON chunks.id = repo_memory_bindings.chunk_id
+            JOIN live_files ON live_files.id = chunks.file_id
+            WHERE repo_memory_bindings.memory_id = ?1
+            UNION ALL
+            SELECT live_files.sha256 AS current_hash
+            FROM repo_memory_bindings
+            JOIN edges ON edges.id = repo_memory_bindings.edge_id
+            JOIN live_files ON live_files.id = edges.source_file_id
+            WHERE repo_memory_bindings.memory_id = ?1
+        )
+        ",
+        params![&memory.memory_id, stamp, repo_id, live_generation, active_worktree],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    // No candidate anchors this checkout can price (a bare `path` binding, or an anchor whose
+    // chunk is gone) leaves the memory unmarked: absence of evidence, not evidence of drift.
+    memory.synced_anchor_drifted = candidates > 0 && matches == 0;
+    Ok(())
+}
+
+/// Hydrate ids into memories for a DRIVE-BY surface — the five `memories_for_*` readers. Unlike
+/// bare `memory_by_id`, this marks anchor drift (#1236), which is why the drive-by readers must
+/// route through here rather than looping `memory_by_id` themselves.
+pub(crate) fn drive_by_memory(
+    conn: &Connection,
+    memory_id: &str,
+) -> anyhow::Result<Option<RepoMemory>> {
+    let Some(mut memory) = memory_by_id(conn, memory_id)? else { return Ok(None) };
+    mark_drifted_synced_anchor(conn, &mut memory)?;
+    Ok(Some(memory))
+}
+
 pub(crate) fn ids_to_memories(
     conn: &Connection,
     rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<String>>,
 ) -> anyhow::Result<Vec<RepoMemory>> {
     let mut memories = Vec::new();
     for row in rows {
-        if let Some(memory) = memory_by_id(conn, &row?)? {
+        if let Some(memory) = drive_by_memory(conn, &row?)? {
             memories.push(memory);
         }
     }
@@ -374,6 +459,10 @@ pub fn split_active_stale(memories: Vec<RepoMemory>) -> (Vec<RepoMemory>, Vec<Re
         // oracle runs. A real problem with the anchored code shows on the primary
         // symbol/logical_symbol binding, which still demotes.
         if memory.status == "stale"
+            // A synced memory anchored to text this checkout no longer holds (#1236). It still
+            // surfaces — in the demoted lane, like any other weakened anchor — because a hash
+            // divergence cannot distinguish a peer running ahead from a local edit after a pull.
+            || memory.synced_anchor_drifted
             || memory.bindings.iter().any(|binding| {
                 binding.binding_kind != SCIP_MONIKER_BINDING_KIND
                     && matches!(
@@ -391,4 +480,286 @@ pub fn split_active_stale(memories: Vec<RepoMemory>) -> (Vec<RepoMemory>, Vec<Re
         }
     }
     (direct, stale)
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+    use crate::memory::api::{memories_for_chunk, memories_for_path, memories_for_symbol};
+
+    const REPO: &str = "r";
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', ?1)",
+            [REPO],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// A file with one chunk whose current text hashes to `text_hash`.
+    fn seed_chunk(conn: &Connection, path: &str, text_hash: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id, repo_id, generation) VALUES \
+             (?1,'rust','source',?2,0,0,'','',?3,0)",
+            params![path, format!("sha-{path}"), REPO],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chunks(file_id, chunk_kind, start_byte, end_byte, start_line, end_line, \
+             text_hash) VALUES (?1,'code',0,10,1,5,?2)",
+            params![file_id, text_hash],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// A memory carrying `stamp` as its author-stamped hash, anchored to `chunk_id`.
+    fn seed_memory(conn: &Connection, id: &str, origin: &str, stamp: Option<&str>, chunk_id: i64) {
+        conn.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version, repo_id, origin, \
+             source_text_hash) VALUES \
+             (?1,'Invariant','t','b','high','active','agent',1,1,'agent','v1',?2,?3,?4)",
+            params![id, REPO, origin, stamp],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             chunk_id, anchor_status, created_at_ms, repo_id) VALUES \
+             (?1,'chunk',?2,'src/a.rs',?3,'current',0,?4)",
+            params![id, chunk_id.to_string(), chunk_id, REPO],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_synced_memory_whose_anchor_text_moved_on_is_demoted_but_still_surfaces() {
+        let conn = db();
+        // The checkout now holds `now`; the author stamped `then`.
+        let chunk = seed_chunk(&conn, "src/a.rs", "now");
+        seed_memory(&conn, "m1", "synced", Some("then"), chunk);
+
+        let found = memories_for_chunk(&conn, chunk, 10).unwrap();
+        assert_eq!(found.len(), 1, "drift must never hide a memory");
+        assert!(found[0].synced_anchor_drifted, "a diverged stamp marks");
+
+        let (direct, stale) = split_active_stale(found);
+        assert!(direct.is_empty(), "a drifted anchor does not present as confidently current");
+        assert_eq!(stale.len(), 1, "it is demoted into the stale lane, not dropped");
+    }
+
+    #[test]
+    fn a_synced_memory_still_anchored_to_its_stamped_text_is_untouched() {
+        let conn = db();
+        // What a content-confirmed relocation leaves behind: the anchor moved, the text did not,
+        // so the stamp still names what is there.
+        let chunk = seed_chunk(&conn, "src/a.rs", "same");
+        seed_memory(&conn, "m1", "synced", Some("same"), chunk);
+
+        let found = memories_for_chunk(&conn, chunk, 10).unwrap();
+        assert!(!found[0].synced_anchor_drifted, "a matching stamp is not drift");
+        assert_eq!(split_active_stale(found).0.len(), 1, "and it stays in the direct lane");
+    }
+
+    #[test]
+    fn a_synced_memory_carrying_no_stamp_surfaces_unmarked() {
+        let conn = db();
+        // Every pre-carrier row is NULL. Absence of a stamp is not evidence of drift.
+        let chunk = seed_chunk(&conn, "src/a.rs", "now");
+        seed_memory(&conn, "m1", "synced", None, chunk);
+
+        let found = memories_for_chunk(&conn, chunk, 10).unwrap();
+        assert!(!found[0].synced_anchor_drifted, "a NULL stamp cannot diverge");
+        assert_eq!(split_active_stale(found).0.len(), 1);
+    }
+
+    #[test]
+    fn a_local_memory_in_identical_drift_is_not_marked() {
+        let conn = db();
+        // Same divergence as the marked case, authored locally. Local drift is relocation's job;
+        // marking it here would demote most of a living repo's own memories.
+        let chunk = seed_chunk(&conn, "src/a.rs", "now");
+        seed_memory(&conn, "m1", "local", Some("then"), chunk);
+
+        let found = memories_for_chunk(&conn, chunk, 10).unwrap();
+        assert!(!found[0].synced_anchor_drifted, "the rule is scoped to synced rows");
+        assert_eq!(split_active_stale(found).0.len(), 1);
+    }
+
+    #[test]
+    fn an_anchor_this_checkout_cannot_price_leaves_the_memory_unmarked() {
+        let conn = db();
+        // A bare `path` binding names no span, so nothing here holds a comparable hash. Silence is
+        // not divergence.
+        seed_chunk(&conn, "src/a.rs", "now");
+        conn.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version, repo_id, origin, \
+             source_text_hash) VALUES \
+             ('m1','Invariant','t','b','high','active','agent',1,1,'agent','v1',?1,'synced','then'\
+             )",
+            params![REPO],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/a.rs','src/a.rs','current',0,?1)",
+            params![REPO],
+        )
+        .unwrap();
+
+        let found = memories_for_path(&conn, "src/a.rs", 10).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].synced_anchor_drifted, "no priceable anchor means no verdict");
+    }
+
+    #[test]
+    fn every_drive_by_reader_marks_including_the_one_that_hydrates_its_own_ids() {
+        let conn = db();
+        let chunk = seed_chunk(&conn, "src/a.rs", "now");
+        seed_memory(&conn, "m1", "synced", Some("then"), chunk);
+        // `memories_for_symbol` collects ids into a set and hydrates them itself rather than going
+        // through `ids_to_memories`, so it is the reader a seam-only fix would silently miss.
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/a.rs','src/a.rs','current',0,?1)",
+            params![REPO],
+        )
+        .unwrap();
+
+        let hit = crate::symbol::SymbolHit {
+            symbol_id: 0,
+            logical_symbol_id: None,
+            logical_variant_count: None,
+            logical_group_reason: None,
+            file_id: 0,
+            path: "src/a.rs".to_string(),
+            file_kind: "source".to_string(),
+            language: "rust".to_string(),
+            name: "a".to_string(),
+            symbol_path: "src/a.rs::a".to_string(),
+            qualified_name: "src/a.rs::a".to_string(),
+            kind: "function".to_string(),
+            start_byte: 0,
+            end_byte: 0,
+            signature: None,
+            docs: None,
+            importance: None,
+        };
+        let found = memories_for_symbol(&conn, &hit, 10).unwrap();
+        assert_eq!(found.len(), 1, "the symbol reader still finds it");
+        assert!(found[0].synced_anchor_drifted, "and marks it, like the other four readers");
+    }
+
+    /// Seed a file+chunk owned by a specific checkout, so the active-scope filter can be exercised.
+    fn seed_chunk_in(conn: &Connection, path: &str, text_hash: &str, worktree: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id, repo_id, generation) VALUES \
+             (?1,'rust','source',?2,0,0,'',?3,?4,0)",
+            params![path, format!("sha-{path}"), worktree, REPO],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO chunks(file_id, chunk_kind, start_byte, end_byte, start_line, end_line, \
+             text_hash) VALUES (?1,'code',0,10,1,5,?2)",
+            params![file_id, text_hash],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn set_active_worktree(conn: &Connection, worktree: &str) {
+        conn.execute(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('worktree_id', ?1)",
+            [worktree],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_sibling_checkouts_chunk_never_prices_this_checkouts_anchor() {
+        let conn = db();
+        // The anchor names a chunk owned by ANOTHER checkout's file row — the shape a binding
+        // takes when it was resolved over there. That text is not what this checkout serves, so
+        // it must not decide this checkout's verdict; the memory simply goes unpriced here.
+        let theirs = seed_chunk_in(&conn, "src/a.rs", "their-text", "wt-sibling");
+        set_active_worktree(&conn, "wt-active");
+        seed_memory(&conn, "m1", "synced", Some("stamped"), theirs);
+
+        let mut memory = memory_by_id(&conn, "m1").unwrap().unwrap();
+        mark_drifted_synced_anchor(&conn, &mut memory).unwrap();
+        assert!(
+            !memory.synced_anchor_drifted,
+            "a sibling checkout's text is not evidence about this one"
+        );
+    }
+
+    #[test]
+    fn the_shared_base_row_still_prices_an_anchor_inside_a_linked_worktree() {
+        let conn = db();
+        // The `worktree_id = ''` base row belongs to every checkout, so working inside a linked
+        // worktree must not silence drift on files that checkout has not overridden — otherwise
+        // the filter above would turn every linked worktree into a blanket exemption.
+        let base = seed_chunk_in(&conn, "src/a.rs", "now", "");
+        set_active_worktree(&conn, "wt-active");
+        seed_memory(&conn, "m1", "synced", Some("then"), base);
+
+        let mut memory = memory_by_id(&conn, "m1").unwrap().unwrap();
+        mark_drifted_synced_anchor(&conn, &mut memory).unwrap();
+        assert!(memory.synced_anchor_drifted, "the shared base row is this checkout's text too");
+    }
+
+    #[test]
+    fn a_superseded_generation_row_never_prices_an_anchor() {
+        let conn = db();
+        // A staging row from an in-flight rebuild carries a higher generation than the live one.
+        // It is not what any reader is served, so it must not answer for the anchor either.
+        let chunk = seed_chunk(&conn, "src/a.rs", "now");
+        conn.execute("UPDATE main.files SET generation = 7 WHERE path = 'src/a.rs'", []).unwrap();
+        seed_memory(&conn, "m1", "synced", Some("then"), chunk);
+
+        let mut memory = memory_by_id(&conn, "m1").unwrap().unwrap();
+        mark_drifted_synced_anchor(&conn, &mut memory).unwrap();
+        assert!(
+            !memory.synced_anchor_drifted,
+            "no LIVE row prices this anchor, so there is no verdict to reach"
+        );
+    }
+
+    #[test]
+    fn a_deleted_files_chunk_never_prices_an_anchor() {
+        let conn = db();
+        let chunk = seed_chunk(&conn, "src/a.rs", "now");
+        conn.execute("UPDATE main.files SET kind = 'deleted' WHERE path = 'src/a.rs'", []).unwrap();
+        seed_memory(&conn, "m1", "synced", Some("then"), chunk);
+
+        let mut memory = memory_by_id(&conn, "m1").unwrap().unwrap();
+        mark_drifted_synced_anchor(&conn, &mut memory).unwrap();
+        assert!(!memory.synced_anchor_drifted, "a tombstone is not evidence of drift");
+    }
+
+    #[test]
+    fn a_by_id_read_never_marks() {
+        let conn = db();
+        let chunk = seed_chunk(&conn, "src/a.rs", "now");
+        seed_memory(&conn, "m1", "synced", Some("then"), chunk);
+        // `memory_by_id` backs `memory_get` and `memory_search`. Drift is a drive-by presentation
+        // rule, so those surfaces must be untouched by it.
+        let direct = memory_by_id(&conn, "m1").unwrap().unwrap();
+        assert!(!direct.synced_anchor_drifted, "memory_get / memory_search stay unaffected");
+    }
 }

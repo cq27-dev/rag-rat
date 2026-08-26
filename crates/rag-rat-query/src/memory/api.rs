@@ -208,7 +208,10 @@ pub fn memories_for_symbol(
     }
     let mut memories = Vec::new();
     for id in candidate_ids.into_iter().take(usize::try_from(limit).unwrap_or(usize::MAX)) {
-        if let Some(memory) = memory_by_id(conn, &id)? {
+        // `drive_by_memory`, not `memory_by_id`: this reader collects ids into a set rather than
+        // going through `ids_to_memories`, so it has to ask for the drive-by hydration explicitly
+        // or it would be the one `memories_for_*` surface that never marks anchor drift (#1236).
+        if let Some(memory) = drive_by_memory(conn, &id)? {
             memories.push(memory);
         }
     }
