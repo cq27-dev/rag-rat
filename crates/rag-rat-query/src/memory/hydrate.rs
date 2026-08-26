@@ -295,6 +295,11 @@ pub(crate) fn mark_drifted_synced_anchor(
     // memories first appear. Both are reachable from the portable identity: an edge anchor's
     // `path` IS its source file's, and a symbol anchor's span selects the chunk covering it.
     //
+    // The fallback keys on whether the resolved id is SERVED here, not on whether it is set. A
+    // validated binding inside a linked worktree keeps pointing at the base row the overlay
+    // shadows, so an id that is present but invisible is no more usable than a missing one —
+    // gating on `IS NULL` would leave that memory unpriced while the checkout serves changed text.
+    //
     // Reads go through the SCOPED `files` view, never `main.files`. The view is what this checkout
     // actually serves: it applies the live generation, drops tombstones, keeps a sibling
     // checkout's rows out, and — the part a hand-rolled predicate gets wrong — SHADOWS a base row
@@ -328,7 +333,11 @@ pub(crate) fn mark_drifted_synced_anchor(
             JOIN files ON files.path = repo_memory_bindings.path
             WHERE repo_memory_bindings.memory_id = ?1
               AND repo_memory_bindings.binding_kind = 'edge'
-              AND repo_memory_bindings.edge_id IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM edges
+                  JOIN files AS served ON served.id = edges.source_file_id
+                  WHERE edges.id = repo_memory_bindings.edge_id
+              )
             UNION ALL
             SELECT chunks.text_hash AS current_hash
             FROM repo_memory_bindings
@@ -338,7 +347,11 @@ pub(crate) fn mark_drifted_synced_anchor(
                        AND chunks.end_line >= repo_memory_bindings.end_line
             WHERE repo_memory_bindings.memory_id = ?1
               AND repo_memory_bindings.binding_kind IN ('symbol', 'logical_symbol')
-              AND repo_memory_bindings.chunk_id IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM chunks AS resolved
+                  JOIN files AS served ON served.id = resolved.file_id
+                  WHERE resolved.id = repo_memory_bindings.chunk_id
+              )
               AND repo_memory_bindings.start_line IS NOT NULL
               AND repo_memory_bindings.end_line IS NOT NULL
         )
@@ -349,6 +362,20 @@ pub(crate) fn mark_drifted_synced_anchor(
     // An anchor this checkout cannot price at all — its file shadowed, tombstoned, or never
     // indexed here — leaves the memory unmarked: absence of evidence, not evidence of drift.
     memory.synced_anchor_drifted = candidates > 0 && matches == 0;
+    Ok(())
+}
+
+/// Mark anchor drift across a list a drive-by surface is about to render (#1236).
+///
+/// The augmenters assemble one list from several lanes — symbol, path, and a lexical lane fed by
+/// `memory_search_scored`, which hydrates through plain `memory_by_id`. Rendering that list without
+/// this leaves the same memory marked or unmarked depending on which lane happened to find it,
+/// which is worse than not marking at all: the reader cannot tell a current anchor from an
+/// unpriced one. Idempotent, so lanes already marked at hydration recompute the same answer.
+pub fn mark_drive_by_drift(conn: &Connection, memories: &mut [RepoMemory]) -> anyhow::Result<()> {
+    for memory in memories.iter_mut() {
+        mark_drifted_synced_anchor(conn, memory)?;
+    }
     Ok(())
 }
 
@@ -1029,6 +1056,97 @@ mod drift_tests {
         let mut memory = memory_by_id(&conn, "m1").unwrap().unwrap();
         mark_drifted_synced_anchor(&conn, &mut memory).unwrap();
         assert!(memory.synced_anchor_drifted, "an unresolved edge is priced by its file");
+    }
+
+    #[test]
+    fn a_validated_anchor_the_overlay_shadows_falls_back_to_the_served_chunk() {
+        let conn = db();
+        // A binding validated in the base checkout keeps that checkout's `chunk_id`. Inside a
+        // linked worktree that overrides the file, the scoped view hides that row — so the id is
+        // present but unusable, and gating the fallback on `IS NULL` would leave the memory
+        // unpriced while this checkout serves changed text.
+        let base_chunk = seed_chunk_in(&conn, "src/a.rs", "stamped-then", "");
+        seed_chunk_in(&conn, "src/a.rs", "moved-on", "wt-active");
+        set_active_worktree(&conn, "wt-active");
+        install_files_view(&conn, "wt-active");
+        seed_bare_memory(&conn, "stamped-then");
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             start_line, end_line, chunk_id, anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','logical_symbol','sym','src/a.rs',1,5,?1,'current',0,?2)",
+            params![base_chunk, REPO],
+        )
+        .unwrap();
+
+        let mut memory = memory_by_id(&conn, "m1").unwrap().unwrap();
+        mark_drifted_synced_anchor(&conn, &mut memory).unwrap();
+        assert!(
+            memory.synced_anchor_drifted,
+            "a resolved id this checkout does not serve must fall back, not go silent"
+        );
+    }
+
+    #[test]
+    fn a_validated_edge_anchor_the_overlay_shadows_falls_back_to_the_served_file() {
+        let conn = db();
+        // The edge mirror of the case above: the edge row hangs off the base file the overlay
+        // shadows, so its resolved id is present but unserved here and the path fallback must
+        // price it against the text this checkout does serve.
+        conn.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id, repo_id, generation) VALUES \
+             ('src/a.rs','rust','source','stamped-then',0,0,'','',?1,0)",
+            params![REPO],
+        )
+        .unwrap();
+        let base_file = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id, repo_id, generation) VALUES \
+             ('src/a.rs','rust','source','moved-on',0,0,'','wt-active',?1,0)",
+            params![REPO],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges_data(source_file_id, to_name_id, resolution_id, edge_kind_id, \
+             confidence_id) VALUES (?1, 0, 0, 0, 0)",
+            params![base_file],
+        )
+        .unwrap();
+        let edge_id = conn.last_insert_rowid();
+        set_active_worktree(&conn, "wt-active");
+        install_files_view(&conn, "wt-active");
+        seed_bare_memory(&conn, "stamped-then");
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, edge_id, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','edge','fp','src/a.rs',?1,'current',0,?2)",
+            params![edge_id, REPO],
+        )
+        .unwrap();
+
+        let mut memory = memory_by_id(&conn, "m1").unwrap().unwrap();
+        mark_drifted_synced_anchor(&conn, &mut memory).unwrap();
+        assert!(
+            memory.synced_anchor_drifted,
+            "an edge id this checkout does not serve must fall back to its path"
+        );
+    }
+
+    #[test]
+    fn marking_a_list_reaches_a_memory_no_drive_by_reader_hydrated() {
+        let conn = db();
+        // The augmenter's lexical lane hydrates through plain `memory_by_id`. Rendering that list
+        // beside path/symbol lanes would present the same memory as current or drifted depending
+        // on which lane found it, so the assembled list is marked as a whole.
+        let chunk = seed_chunk(&conn, "src/a.rs", "now");
+        install_files_view(&conn, "");
+        seed_memory(&conn, "m1", "synced", Some("then"), chunk);
+
+        let mut lexical = vec![memory_by_id(&conn, "m1").unwrap().unwrap()];
+        assert!(!lexical[0].synced_anchor_drifted, "a plain by-id hydration carries no verdict");
+        mark_drive_by_drift(&conn, &mut lexical).unwrap();
+        assert!(lexical[0].synced_anchor_drifted, "marking the list reaches it");
     }
 
     #[test]

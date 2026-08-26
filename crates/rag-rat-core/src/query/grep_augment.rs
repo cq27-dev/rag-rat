@@ -323,6 +323,11 @@ pub fn compose(
     }
     // Apply session-level dedupe filter last (after insertion-order dedup above).
     memories.retain(|m| !dedupe.memory_ids.contains(&m.memory_id));
+    // The lexical lane hydrates through plain `memory_by_id`, so a memory that reached this list
+    // by matching prose carries no drift verdict while the same memory reached by path or symbol
+    // does. Mark the assembled list, so one rendered lane cannot present a drifted anchor as
+    // current just because of how the pattern happened to find it.
+    memory::mark_drive_by_drift(conn, &mut memories)?;
     // Honor `[memory] surface`: under `Summary` each memory renders its dream summary + verdict
     // marker (title-only fallback) instead of the clamped body — the hook context stays terse and
     // the full body is one `memory show` away.
@@ -816,6 +821,47 @@ mod tests {
         assert!(
             rendered.contains("anchor drifted"),
             "the drift must reach the rendered line: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_memory_found_only_by_prose_still_renders_its_anchor_drift() {
+        // The lexical lane hydrates through plain `memory_by_id`, so a memory the pattern reaches
+        // by prose alone arrives unmarked. Rendering it beside the path/symbol lanes would present
+        // the same memory as current or drifted purely by how it was found.
+        let conn = seeded_conn();
+        let memory = seed_fts_memory(
+            &conn,
+            "Zebraglyph routing pins quokkaform",
+            "zebraglyph quokkaform lorikeetwise — the zebraglyph router pins quokkaform.",
+        );
+        // Make it a synced memory whose stamped text this checkout no longer holds. The pattern
+        // below matches its prose only: nothing names `src/watch.rs` or a symbol in it.
+        conn.execute(
+            "UPDATE repo_memories SET origin = 'synced', source_text_hash = 'stamped-then' WHERE \
+             id = ?1",
+            rusqlite::params![memory.memory_id],
+        )
+        .unwrap();
+
+        let out = compose(
+            &conn,
+            "zebraglyph quokkaform lorikeetwise",
+            None,
+            &DedupeFilter::default(),
+            rag_rat_base::config::MemorySurface::Full,
+        )
+        .unwrap()
+        .expect("payload expected");
+        assert!(
+            out.context.contains("Zebraglyph routing pins quokkaform"),
+            "the prose match surfaces: {}",
+            out.context
+        );
+        assert!(
+            out.context.contains("anchor drifted"),
+            "and carries its drift, though no drive-by reader hydrated it: {}",
+            out.context
         );
     }
 
