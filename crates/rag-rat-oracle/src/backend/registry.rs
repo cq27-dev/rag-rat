@@ -145,6 +145,21 @@ pub(super) enum ProjectScope {
 }
 
 impl LiveBackend {
+    /// The operator-facing name of this backend's project marker, for a diagnostic that has to
+    /// tell someone which file to open.
+    ///
+    /// Every message that names a marker derives it from the declaration rather than spelling it
+    /// out, so a second backend declaring `ProjectScope::Checkout` + `MarkerKind::Parsed` cannot
+    /// inherit another backend's filename with no compile error to catch it.
+    pub fn marker_name_hint(&self) -> String {
+        // The model goes in a binding: `files()` borrows from it, so calling it on a temporary
+        // does not compile — its own rustdoc says as much.
+        match &self.project_model {
+            Some(model) => crate::manifest::hint_marker_names(model.files()),
+            None => crate::manifest::hint_marker_names(&[]),
+        }
+    }
+
     /// The live backend for `tool`, or `None` for a batch tool. Total over the non-batch variants:
     /// [`OracleTool::batch_capable`] is `false` exactly when this returns `Some`.
     pub fn for_tool(tool: OracleTool) -> Option<Self> {

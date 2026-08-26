@@ -1198,6 +1198,53 @@ mod tests {
         }
     }
 
+    /// Both guards on both "sole database" predicates, because the word an operator reads is
+    /// SOLE and neither guard is what makes it true on its own.
+    ///
+    /// A truncated scan may have missed the database that governs half the sources, so it cannot
+    /// establish that the one it saw is the only one. And a second marker means the file the
+    /// warning names is not the only one to look at — the operator is sent to inspect a database
+    /// that may be perfectly fine while the one that matters goes unmentioned.
+    #[test]
+    fn a_sole_database_fact_needs_a_finished_scan_and_exactly_one_marker() {
+        let site = |verdict, governs| MarkerSite {
+            dir: PathBuf::from("x"),
+            reading: MarkerReading { verdict, governs },
+        };
+        let layout = |sites: Vec<MarkerSite>, scan_finished| {
+            ProjectLayout::from_marker_sites("compile_commands.json", MarkerScan {
+                sites,
+                complete: scan_finished,
+            })
+        };
+        let unreadable = site(MarkerVerdict::Unknown, Governs::Unknown);
+        let governs_nothing = site(MarkerVerdict::Loadable, Governs::NothingIndexed);
+        let good = site(MarkerVerdict::Loadable, Governs::IndexedSource);
+
+        assert!(layout(vec![unreadable.clone()], true).has_unreadable_database());
+        assert!(
+            layout(vec![governs_nothing.clone()], true).has_database_governing_nothing_indexed()
+        );
+
+        assert!(
+            !layout(vec![unreadable.clone()], false).has_unreadable_database(),
+            "a truncated scan cannot prove the unreadable marker is the checkout's only database",
+        );
+        assert!(
+            !layout(vec![governs_nothing.clone()], false).has_database_governing_nothing_indexed(),
+            "nor that the non-governing one is",
+        );
+
+        assert!(
+            !layout(vec![unreadable, good.clone()], true).has_unreadable_database(),
+            "a second, readable database means the unreadable one is not the sole database",
+        );
+        assert!(
+            !layout(vec![governs_nothing, good], true).has_database_governing_nothing_indexed(),
+            "and a second database means the non-governing one is not either",
+        );
+    }
+
     #[test]
     fn an_entry_that_cannot_be_enumerated_makes_the_scan_incomplete() {
         // `ReadDir` reports a per-item failure as an `Err` element, and the entry behind it could
