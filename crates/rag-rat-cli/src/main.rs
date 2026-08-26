@@ -496,6 +496,7 @@ fn serve_http(config: Config, args: &ServeArgs) -> anyhow::Result<()> {
                 auth_token: token,
                 allowed_origins,
                 advertise_url,
+                bound_address: None,
             },
             election_lock,
             shutdown_signal(),

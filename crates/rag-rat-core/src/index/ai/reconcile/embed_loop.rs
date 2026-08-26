@@ -1713,13 +1713,12 @@ mod freshness_version_tests {
         // probe embed's connect is refused, so defer (SkipEphemeral), NOT embed-and-fail into
         // `Failed` chunk_embeddings, and without paying an O(repo) candidate scan first.
         let conn = schema_conn();
-        let closed = {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener); // the port now refuses connections
-            format!("http://127.0.0.1:{port}")
-        };
-        activate_ephemeral_with_query_endpoint(&conn, Some(&closed));
+        // Port 9 (discard) is never served on a dev box or a CI runner, so the connect is refused
+        // by construction. Binding an ephemeral port and dropping it does NOT give a closed port:
+        // it is free for the whole machine from that moment, and a sibling test that takes it
+        // turns this into a test of the reachable path — silently, since it would then pass or
+        // hang rather than fail. The sibling below already dials this address for the same reason.
+        activate_ephemeral_with_query_endpoint(&conn, Some("http://127.0.0.1:9"));
         seed_embedding_chunk(&conn, 1);
         assert!(matches!(ephemeral_light_acquire(&conn), ChunkEmbedder::SkipEphemeral));
     }

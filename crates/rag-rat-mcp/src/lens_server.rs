@@ -362,6 +362,12 @@ pub struct StandaloneServeOptions {
     /// Publish discovery advertising this URL instead of the bind address (the
     /// container-split shape: the extension dials this, not the bind IP).
     pub advertise_url: Option<String>,
+    /// Reports the address actually bound, once, as soon as the listener exists.
+    ///
+    /// A caller that asks for port 0 has no other way to learn what it got. Naming a concrete port
+    /// instead means picking one nothing else has taken, which is not something a caller can know:
+    /// a port is only yours while you hold it.
+    pub bound_address: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
 }
 
 pub async fn serve_standalone(
@@ -372,7 +378,8 @@ pub async fn serve_standalone(
     election_lock: FileLock,
     shutdown: impl Future<Output = std::io::Result<()>> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let StandaloneServeOptions { auth_token, allowed_origins, advertise_url } = options;
+    let StandaloneServeOptions { auth_token, allowed_origins, advertise_url, bound_address } =
+        options;
     // The caller acquires the election lock before any side effects (index heal, watcher) so a
     // contended worktree fails fast.
     let _election_lock = election_lock;
@@ -380,6 +387,9 @@ pub async fn serve_standalone(
     db.materialize_lens_coupling()?;
     drop(db);
     let listener = TcpListener::bind(address).await?;
+    if let Some(report) = bound_address {
+        let _ = report.send(listener.local_addr()?);
+    }
     let repo_id = rag_rat_base::repo_identity::resolve_repo_identity(
         &config.root,
         config.repo_id_override.as_deref(),
@@ -1320,12 +1330,16 @@ mod tests {
     async fn port_scan_falls_back_after_a_busy_candidate() {
         let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let busy_port = busy.local_addr().unwrap().port();
-        let available = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let available_port = available.local_addr().unwrap().port();
-        drop(available);
 
-        let selected = bind_first_free([busy_port, available_port]).await.unwrap();
-        assert_eq!(selected.local_addr().unwrap().port(), available_port);
+        // `0` as the second candidate is a port nothing can take from us: the kernel assigns it at
+        // bind time. Reserving a real port and freeing it to name here would hand it to the whole
+        // machine in between, and a sibling test doing the same dance takes it from the same
+        // ephemeral range — the scan then falls through to a third choice and an equality
+        // assertion fails on an unrelated number.
+        let selected = bind_first_free([busy_port, 0]).await.unwrap();
+        let port = selected.local_addr().unwrap().port();
+        assert_ne!(port, busy_port, "a busy candidate must be skipped, not returned");
+        assert_ne!(port, 0, "the scan must return a bound listener, not the wildcard");
     }
 
     #[tokio::test]
@@ -1337,12 +1351,12 @@ mod tests {
         let conn = rusqlite::Connection::open(&config.database).unwrap();
         conn.execute("DELETE FROM repo_meta WHERE key = 'git_coupling_stamp'", []).unwrap();
         drop(conn);
-        let available = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let port = available.local_addr().unwrap().port();
-        drop(available);
-
+        // `0` rather than a port claimed and released: between the release and the task's bind
+        // the port belongs to the machine, and a sibling test drawing from the same ephemeral
+        // range can take it. What the published port must equal is what the task actually bound,
+        // which the connection below establishes without naming a number.
         let control = ServeControl::default();
-        let task = tokio::spawn(run_on_ports(config.clone(), [port], control));
+        let task = tokio::spawn(run_on_ports(config.clone(), [0], control));
         let path = lens_discovery_path(&root);
         for _ in 0..100 {
             if path.is_file() {
@@ -1352,7 +1366,10 @@ mod tests {
         }
         assert!(path.is_file(), "active lens task did not publish discovery");
         let discovery: LensDiscovery = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(discovery.port, port);
+        assert!(
+            tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, discovery.port)).await.is_ok(),
+            "the published port must be the one the task is serving on",
+        );
         let conn = rusqlite::Connection::open(&config.database).unwrap();
         assert!(
             conn.query_row(
@@ -1390,11 +1407,11 @@ mod tests {
             let mut config = test_config(root.clone());
             config.allow_empty = true;
             drop(rag_rat_core::IndexDatabase::rebuild(&config).unwrap());
-            // Claim a port, then release it so `serve_standalone` binds that exact one — its
-            // chosen address is not otherwise observable from here.
-            let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
+            // Bind `0` and let the server report what it got. Claiming a port and releasing it
+            // so the server takes "that exact one" hands it to the whole machine in between, and
+            // a sibling test drawing from the same ephemeral range can take it first — the bind
+            // then fails and this test dies on an unrelated assertion.
+            let (bound, bound_report) = tokio::sync::oneshot::channel();
 
             let election = FileLock::try_acquire(&root.join("election.lock"))
                 .unwrap()
@@ -1403,11 +1420,12 @@ mod tests {
             let served = tokio::spawn(serve_standalone(
                 config.clone(),
                 root.clone(),
-                SocketAddr::new(bind_ip, port),
+                SocketAddr::new(bind_ip, 0),
                 StandaloneServeOptions {
                     auth_token: "standalone-token".to_string(),
                     allowed_origins: Vec::new(),
                     advertise_url: None,
+                    bound_address: Some(bound),
                 },
                 election,
                 async move {
@@ -1415,6 +1433,12 @@ mod tests {
                     Ok(())
                 },
             ));
+
+            let port = tokio::time::timeout(std::time::Duration::from_secs(10), bound_report)
+                .await
+                .expect("the server must report its bound address")
+                .expect("the server must not drop the reporter before binding")
+                .port();
 
             // Publication happens before the listener is served, so a port that answers means the
             // decision has already been made either way.
@@ -1461,10 +1485,6 @@ mod tests {
         let mut config = test_config(root.clone());
         config.allow_empty = true;
         drop(rag_rat_core::IndexDatabase::rebuild(&config).unwrap());
-        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
         let election = FileLock::try_acquire(&root.join("election.lock"))
             .unwrap()
             .expect("an uncontended election lock");
@@ -1472,11 +1492,14 @@ mod tests {
         let served = tokio::spawn(serve_standalone(
             config.clone(),
             root.clone(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+            // Nothing here asserts on the port — the advertised URL is the subject — so the bind
+            // asks for `0` rather than naming a port it would have to win a race to keep.
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             StandaloneServeOptions {
                 auth_token: "standalone-token".to_string(),
                 allowed_origins: Vec::new(),
                 advertise_url: Some("http://lens.internal:18120".to_string()),
+                bound_address: None,
             },
             election,
             async move {
