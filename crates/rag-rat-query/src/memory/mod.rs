@@ -38,6 +38,12 @@ pub(crate) fn memory_repo_scope_clause(scope: &Option<String>) -> String {
     rag_rat_db::schema::periphery_repo_scope_clause(scope, "repo_memories")
 }
 
+/// Serialize `synced_anchor_drifted` only when it is set, so the common case adds no field and a
+/// drifted memory carries a visible one. A reader that never demotes still sees the divergence.
+fn is_not_drifted(drifted: &bool) -> bool {
+    !*drifted
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoMemory {
     pub memory_id: String,
@@ -88,7 +94,7 @@ pub struct RepoMemory {
     /// reason to mark, never to withhold. Always `false` for a locally authored memory, and for a
     /// memory carrying no stamp (every pre-carrier row is NULL, and an absent stamp is not
     /// evidence of drift).
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing_if = "is_not_drifted")]
     pub synced_anchor_drifted: bool,
     pub bindings: Vec<RepoMemoryBinding>,
     pub call_paths: Vec<RepoMemoryCallPath>,

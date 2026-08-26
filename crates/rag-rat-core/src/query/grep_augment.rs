@@ -416,10 +416,19 @@ pub(crate) fn memory_render_item(m: memory::RepoMemory) -> RenderItem {
     };
     let gist_part = if gist.is_empty() { String::new() } else { format!(" — {gist}") };
     let verdict_part = m.verdict.as_deref().map(|v| format!(" {v}")).unwrap_or_default();
+    // A synced memory anchored to text this checkout no longer holds reads in the status slot,
+    // which is where a reader looks to decide how far to trust the line. These surfaces render a
+    // raw list and never partition it, so without this the divergence would be computed and then
+    // dropped on the way out.
+    let status = if m.synced_anchor_drifted {
+        format!("{} · anchor drifted", m.status)
+    } else {
+        m.status.clone()
+    };
     RenderItem {
         line: format!(
             "- [{} | {}] {}{}{} (rag-rat: memory_search)",
-            m.kind, m.status, m.title, gist_part, verdict_part,
+            m.kind, status, m.title, gist_part, verdict_part,
         ),
         memory_id: Some(m.memory_id),
         symbol_key: None,
@@ -776,6 +785,40 @@ mod tests {
 
     /// A memory reachable ONLY through the FTS lane: bound to the seeded file's path, which
     /// `compose` never consults here because these tests pass `search_path: None`.
+    #[test]
+    fn a_drifted_memory_renders_its_drift_in_the_status_slot() {
+        // grep- and read-augment render a raw list without partitioning it, so the status slot is
+        // the only place a reader learns the anchor moved on. Kept next to the persisted status
+        // rather than replacing it: the row really is active, and this says what is untrustworthy.
+        let memory = memory::RepoMemory {
+            memory_id: "m1".to_string(),
+            kind: "Invariant".to_string(),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            summary: None,
+            verdict: None,
+            confidence: "high".to_string(),
+            status: "active".to_string(),
+            created_by: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            source: "agent".to_string(),
+            payload_json: None,
+            source_text_hash: None,
+            input_hash: None,
+            memory_version: "v1".to_string(),
+            synced_anchor_drifted: true,
+            bindings: Vec::new(),
+            call_paths: Vec::new(),
+            tags: Vec::new(),
+        };
+        let rendered = memory_render_item(memory).line;
+        assert!(
+            rendered.contains("anchor drifted"),
+            "the drift must reach the rendered line: {rendered}"
+        );
+    }
+
     fn seed_fts_memory(conn: &Connection, title: &str, body: &str) -> memory::RepoMemory {
         crate::memory_write::create_memory(conn, RepoMemoryCreate {
             kind: "Invariant".to_string(),

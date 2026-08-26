@@ -896,6 +896,35 @@ mod drift_tests {
     }
 
     #[test]
+    fn a_drifted_memory_carries_the_flag_on_the_wire() {
+        let conn = db();
+        // The augmenters and the raw MCP readers return a list and never partition it, so the
+        // demotion has to survive serialization or those surfaces present a drifted memory as
+        // plainly current. An undrifted memory adds no field.
+        let chunk = seed_chunk(&conn, "src/a.rs", "now");
+        install_files_view(&conn, "");
+        seed_memory(&conn, "m1", "synced", Some("then"), chunk);
+
+        let found = memories_for_chunk(&conn, chunk, 10).unwrap();
+        let json = serde_json::to_value(&found[0]).unwrap();
+        assert_eq!(
+            json.get("synced_anchor_drifted").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a consumer that never calls split_active_stale still sees the divergence"
+        );
+
+        let conn2 = db();
+        let ok = seed_chunk(&conn2, "src/a.rs", "same");
+        install_files_view(&conn2, "");
+        seed_memory(&conn2, "m2", "synced", Some("same"), ok);
+        let clean = memories_for_chunk(&conn2, ok, 10).unwrap();
+        assert!(
+            serde_json::to_value(&clean[0]).unwrap().get("synced_anchor_drifted").is_none(),
+            "the common case stays off the wire"
+        );
+    }
+
+    #[test]
     fn a_by_id_read_never_marks() {
         let conn = db();
         let chunk = seed_chunk(&conn, "src/a.rs", "now");
