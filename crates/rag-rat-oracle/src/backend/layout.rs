@@ -643,6 +643,16 @@ pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
 /// about whether the entries describe a loadable project.
 fn read_marker_file(path: &Path, checkout: &CheckoutScope<'_>) -> MarkerReading {
     let unreadable = MarkerReading { verdict: MarkerVerdict::Unknown, governs: Governs::Unknown };
+    // Both callers reach here having checked only that the path EXISTS, and a marker path that
+    // exists is not necessarily something that can be read: opening a FIFO with no writer blocks
+    // until one appears. This scan runs while the maintenance pass holds the repository write
+    // lock, so a stray `mkfifo compile_commands.json` wedges that pass instead of failing it.
+    // Anything that is not a regular file lands in the same "recorded, not usable" state a corrupt
+    // database already occupies. The guard belongs here rather than at either caller's existence
+    // check, because there are two of them and they would drift apart.
+    if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+        return unreadable;
+    }
     let Ok(file) = std::fs::File::open(path) else {
         return unreadable;
     };
