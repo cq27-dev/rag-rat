@@ -1992,6 +1992,45 @@ fn a_database_this_crate_cannot_parse_is_not_trusted_but_does_not_block_the_back
     );
 }
 
+/// A marker path that is not a regular file is refused without opening it.
+///
+/// `File::open` on a FIFO with no writer blocks until one appears, and both marker callers gate on
+/// existence alone — so a stray `mkfifo compile_commands.json` used to hang the scan. That scan
+/// runs under the repository write lock, which turns one unusable file into a wedged maintenance
+/// pass rather than a reported one.
+///
+/// A directory at the same path would NOT prove the guard: `File::open` already fails on one. The
+/// FIFO is the case that separates "opening it failed" from "we never opened it".
+#[cfg(unix)]
+#[test]
+fn a_marker_path_that_is_not_a_regular_file_is_refused_without_opening_it() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
+    let (_dir_guard, dir) = checkout("clangd-fifo-marker");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.c"), "int m(void){return 0;}\n").unwrap();
+
+    let marker = dir.join("compile_commands.json");
+    let c_path = std::ffi::CString::new(marker.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a nul-terminated path this test owns, in a scratch directory nothing else writes.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0, "mkfifo must succeed");
+    assert!(marker.exists(), "the FIFO passes the existence gate both callers apply");
+
+    // Reaching this line at all is the assertion: before the guard, resolving the layout opened
+    // the FIFO and never returned.
+    let layout = clangd.resolve_layout(&scope(&dir));
+    assert!(
+        clangd.checkout_can_signal_readiness(&scope(&dir), &layout),
+        "a marker that cannot be read says nothing about the project, so it must not block",
+    );
+    assert_eq!(
+        clangd.spawn_args(&layout),
+        vec![OsString::from("--background-index")],
+        "…and it is not evidence either, so the session is not pinned to it",
+    );
+}
+
 #[test]
 fn a_database_clangd_can_read_is_not_refused_over_a_bom_or_trailing_bytes() {
     // Both are accepted by clangd (measured) and rejected by `serde_json`, so without handling

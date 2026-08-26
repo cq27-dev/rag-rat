@@ -5268,6 +5268,7 @@ name = "rag-rat-oracle"
 version = "0.23.0"
 dependencies = [
  "anyhow",
+ "libc",
  "protobuf",
  "rag-rat-base",
  "rag-rat-clones",
