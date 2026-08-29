@@ -1026,16 +1026,33 @@ async fn pull_foreign_accounts(
     if targets.is_empty() {
         return Ok(());
     }
-    let peers = &config.sync.server_peers;
+    // Configured peers PLUS whatever a `.rag-rat-stream` recorded for a subscribed owner. A clone
+    // that subscribed from a locator has no `[sync] server_peers` by design — that is the routing
+    // the locator exists to carry — and discovery cannot stand in for it, since a foreign account's
+    // discovery tag derives from that account's own secret. Without the union this pass would skip
+    // exactly the repos the locator was meant to serve.
+    let (subscribed_peers, subscribed_relay) = crate::memory_write::subscription_routing(conn)?;
+    let mut peers = config.sync.server_peers.clone();
+    peers.extend(subscribed_peers);
+    peers.sort_unstable();
+    peers.dedup();
     if peers.is_empty() {
-        // Discovery cannot stand in: a foreign account's discovery tag derives from that
-        // account's own secret, which only its own devices hold.
         tracing::warn!(
-            "cross-account sync has accounts to pull but no [sync] server_peers to pull from"
+            "cross-account sync has accounts to pull but no peer to pull from: set [sync] \
+             server_peers, or subscribe from a `.rag-rat-stream` that names the owner's host"
         );
         return Ok(());
     }
-    let relay = relay_url(config);
+    let peers = &peers;
+    // The locator's relay fills a GAP only. This pass pulls every foreign account, not just the
+    // subscribed owner, so letting one repo's locator retarget the relay would move traffic for
+    // accounts that never named it; the configured relay (and its env override) stays
+    // authoritative wherever one is set.
+    let configured = relay_url(config);
+    let relay = match subscribed_relay {
+        Some(from_locator) if configured.trim().is_empty() => from_locator,
+        _ => configured,
+    };
     for target in targets {
         let account_hex = hash::hex_lower(&target.to_bytes());
         let memo_key = format!("{PULL_PEER_MEMO_PREFIX}{account_hex}");
