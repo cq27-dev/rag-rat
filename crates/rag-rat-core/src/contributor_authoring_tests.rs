@@ -802,7 +802,13 @@ fn subscription_pair() -> (Connection, Connection, rag_rat_oplog::AccountId) {
     sync_account_into(&subscriber, &owner, owner_account);
 
     let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
-    crate::memory_write::set_subscription_owner(&subscriber, &owner_hex, NOW).unwrap();
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &owner_hex,
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+    )
+    .unwrap();
     (owner, subscriber, owner_account)
 }
 
@@ -893,7 +899,13 @@ fn an_unsynced_or_mistyped_subscription_owner_never_becomes_removal_authority() 
     // Re-point at an owner whose log was never synced. `set_subscription_owner` forgets the
     // OUTGOING stream's drain watermark, so the next drain would otherwise make a FULL pass over
     // the new owner's empty projection.
-    crate::memory_write::set_subscription_owner(&subscriber, &"ab".repeat(32), NOW).unwrap();
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+    )
+    .unwrap();
     crate::drain_synced_memory(&subscriber).unwrap();
     let titles = memory_titles(&subscriber);
     assert!(
@@ -908,9 +920,14 @@ fn an_unsynced_or_mistyped_subscription_owner_never_becomes_removal_authority() 
 #[test]
 fn subscription_and_contribution_refuse_to_coexist() {
     let (_owner, contributor, _owner_account) = contribution_pair();
-    let err = crate::memory_write::set_subscription_owner(&contributor, &"ab".repeat(32), NOW)
-        .unwrap_err()
-        .to_string();
+    let err = crate::memory_write::set_subscription_owner(
+        &contributor,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("already contributes"), "subscribe names the conflict: {err}");
 
     let (_owner2, subscriber, _owner_account2) = subscription_pair();
@@ -955,7 +972,13 @@ fn subscribed_store_that_held_sibling_device_memories() -> Connection {
     // Subscribe. The owner's stream becomes the one authority, so the sibling's row is condemned.
     sync_account_into(&subscriber, &owner, owner_account);
     let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
-    crate::memory_write::set_subscription_owner(&subscriber, &owner_hex, NOW).unwrap();
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &owner_hex,
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+    )
+    .unwrap();
     crate::drain_synced_memory(&subscriber).unwrap();
     let titles = memory_titles(&subscriber);
     assert!(
@@ -1023,7 +1046,142 @@ fn subscribing_to_your_own_account_is_refused() {
     let store = scoped_conn();
     let account = local_account(&store, NOW).unwrap();
     let own_hex = rag_rat_base::hash::hex_lower(&account.to_bytes());
-    let err =
-        crate::memory_write::set_subscription_owner(&store, &own_hex, NOW).unwrap_err().to_string();
+    let err = crate::memory_write::set_subscription_owner(
+        &store,
+        &own_hex,
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("your own account"), "the refusal names the cause: {err}");
+}
+
+/// The locator (`.rag-rat-stream`) is checked in, so anyone who can land a commit can edit it. It
+/// may establish this repo's trust root and never move it: the first subscribe pins the owner, and
+/// a later locator naming a different one is refused.
+#[test]
+fn a_locator_may_establish_a_pin_but_never_move_it() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    let repo_id = rag_rat_db::schema::active_repo_id(&subscriber).unwrap();
+    assert_eq!(
+        crate::memory_write::stream_pin(&subscriber, &repo_id).unwrap().as_deref(),
+        Some(owner_hex.as_str()),
+        "subscribing pins the owner it subscribed to",
+    );
+
+    // A locator re-pointing at a different account is the attack: an edited in-repo file silently
+    // moving a subscriber's memory source. Refused.
+    let err = crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Locator,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("pinned to"), "the refusal names the conflict: {err}");
+    assert!(
+        err.contains("rag-rat sync subscribe"),
+        "and routes to an explicit re-subscribe rather than to unsubscribe, which would reset the \
+         pin: {err}",
+    );
+    assert!(
+        !err.contains("unsubscribe"),
+        "the remedy must never be the sequence that defeats the pin: {err}",
+    );
+
+    // The same locator naming the SAME owner is the ordinary case and must stay silent.
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &owner_hex,
+        NOW,
+        crate::memory_write::SubscribeTrust::Locator,
+    )
+    .expect("a locator that agrees with the pin is the ordinary case");
+}
+
+/// An operator naming an id on the command line obtained it out of band, so they may move the pin —
+/// that is what makes the refusal above a trust decision rather than a wall.
+#[test]
+fn an_operator_named_account_moves_the_pin() {
+    let (_owner, subscriber, _owner_account) = subscription_pair();
+    let repo_id = rag_rat_db::schema::active_repo_id(&subscriber).unwrap();
+
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+    )
+    .expect("an operator may re-point");
+    assert_eq!(
+        crate::memory_write::stream_pin(&subscriber, &repo_id).unwrap(),
+        Some("ab".repeat(32)),
+        "and the pin follows them, so the locator is then measured against the new trust root",
+    );
+}
+
+/// The pin outlives `sync unsubscribe`. If it did not, the fail-closed refusal would be defeated by
+/// the very sequence an agent handed that error would try next.
+#[test]
+fn unsubscribing_does_not_reset_the_pin() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    let repo_id = rag_rat_db::schema::active_repo_id(&subscriber).unwrap();
+
+    assert!(crate::memory_write::clear_subscription_owner(&subscriber).unwrap());
+    assert_eq!(
+        crate::memory_write::stream_pin(&subscriber, &repo_id).unwrap().as_deref(),
+        Some(owner_hex.as_str()),
+        "unsubscribe clears the subscription, not the trust root",
+    );
+
+    // So unsubscribe-then-locator-subscribe still cannot move it.
+    let err = crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Locator,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("pinned to"), "the pin survives the unsubscribe dance: {err}");
+}
+
+/// A locator exists so a clone needs no `[sync] server_peers`. Recording only the owner would leave
+/// that clone holding a subscription it can never fetch: a foreign account's host cannot be
+/// discovered, because the discovery tag derives from that account's own secret.
+#[test]
+fn subscribing_from_a_locator_records_the_routing_that_reaches_the_owner() {
+    let (_owner, subscriber, _owner_account) = subscription_pair();
+
+    crate::memory_write::set_subscription_routing(
+        &subscriber,
+        &["node-a".to_string(), "node-b".to_string()],
+        Some("https://relay.example"),
+    )
+    .unwrap();
+    let (peers, relay) = crate::memory_write::subscription_routing(&subscriber).unwrap();
+    assert_eq!(peers, ["node-a", "node-b"], "the pull paths read these when nothing is configured");
+    assert_eq!(relay.as_deref(), Some("https://relay.example"));
+}
+
+/// An operator-named subscribe supplies no routing, and must not inherit the previous owner's host:
+/// dialing it for a different account is a wasted connection to a peer that never held the stream.
+#[test]
+fn re_subscribing_without_routing_clears_the_previous_owners_host() {
+    let (_owner, subscriber, _owner_account) = subscription_pair();
+    crate::memory_write::set_subscription_routing(
+        &subscriber,
+        &["node-a".to_string()],
+        Some("https://relay.example"),
+    )
+    .unwrap();
+
+    crate::memory_write::set_subscription_routing(&subscriber, &[], None).unwrap();
+    let (peers, relay) = crate::memory_write::subscription_routing(&subscriber).unwrap();
+    assert!(peers.is_empty(), "stale routing is cleared, not carried onto the new owner");
+    assert_eq!(relay, None);
 }

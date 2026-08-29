@@ -157,12 +157,48 @@ impl IndexDatabase {
     /// No Writer grant is involved — a subscriber authors nothing onto the owner's stream — but the
     /// owner's log must reach this store (automatic sync pulls it once the owner's host is in
     /// `[sync] server_peers`, or `sync pull <owner>`) before anything materializes.
+    /// Subscribe to an owner an OPERATOR named. Re-pins this repo's trust root: a human who
+    /// obtained the id out of band is entitled to move it.
     pub fn sync_subscribe(&self, owner_account_hex: &str) -> anyhow::Result<()> {
         crate::memory_write::set_subscription_owner(
             self.storage.connection(),
             owner_account_hex,
             rag_rat_base::time::now_ms(),
+            crate::memory_write::SubscribeTrust::Operator,
         )
+    }
+
+    /// Subscribe to the owner a checked-in `.rag-rat-stream` names. Refuses when this repo is
+    /// already pinned to a different owner — an editable in-repo file may establish a trust root,
+    /// never move one.
+    pub fn sync_subscribe_from_locator(&self, owner_account_hex: &str) -> anyhow::Result<()> {
+        crate::memory_write::set_subscription_owner(
+            self.storage.connection(),
+            owner_account_hex,
+            rag_rat_base::time::now_ms(),
+            crate::memory_write::SubscribeTrust::Locator,
+        )
+    }
+
+    /// Record how to reach the subscribed owner's host, as a locator supplied it. Empty peers
+    /// clear the record — an operator-named subscribe must not inherit the previous owner's host.
+    pub fn set_subscription_routing(
+        &self,
+        peers: &[String],
+        relay: Option<&str>,
+    ) -> anyhow::Result<()> {
+        crate::memory_write::set_subscription_routing(self.storage.connection(), peers, relay)
+    }
+
+    /// Peers and relay recorded for a subscribed owner, pooled across this store's repos.
+    pub fn subscription_routing(&self) -> anyhow::Result<(Vec<String>, Option<String>)> {
+        crate::memory_write::subscription_routing(self.storage.connection())
+    }
+
+    /// The owner this repo has pinned, if any — reported by `sync whoami` so an operator can see
+    /// the trust root without reading repo_meta.
+    pub fn stream_pin(&self) -> anyhow::Result<Option<String>> {
+        crate::memory_write::stream_pin(self.storage.connection(), &self.active_repo_id)
     }
 
     /// Stop mirroring a subscribed owner (`sync unsubscribe`): the active repo's memories
