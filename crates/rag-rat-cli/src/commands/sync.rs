@@ -183,13 +183,39 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
             }))
         },
         SyncCommand::Subscribe { account } => {
-            db.sync_subscribe(account)?;
+            // Two trust paths, not one command with a default. An operator naming the id has
+            // obtained it out of band and may move this repo's pin; the checked-in locator is
+            // untrusted input and may only establish one.
+            let (owner, source, locator) = match account {
+                Some(account) => (account.clone(), "argument", None),
+                None => {
+                    let locator =
+                        rag_rat_base::stream_locator::load(&config.root)?.with_context(|| {
+                            format!(
+                                "no owner given and this repo checks in no `{}`. Pass the owner's \
+                                 64-hex account id (from their `rag-rat sync whoami`), or add the \
+                                 locator file.",
+                                rag_rat_base::stream_locator::STREAM_LOCATOR_FILE,
+                            )
+                        })?;
+                    (locator.owner.clone(), "locator", Some(locator))
+                },
+            };
+            match account {
+                Some(_) => db.sync_subscribe(&owner)?,
+                None => db.sync_subscribe_from_locator(&owner)?,
+            }
             let effects = rag_rat_core::drain_synced_memory(db.connection())?;
             db.fold_wal();
             print_output(&serde_json::json!({
                 "status": "subscribed",
                 "repo_id": db.active_repo_id,
-                "owner_account_id": account,
+                "owner_account_id": owner,
+                "owner_source": source,
+                // The routing the locator supplied, echoed so an operator can see what this store
+                // will dial without opening the file. Neither carries authority.
+                "peers": locator.as_ref().map(|l| l.peers.clone()),
+                "relay": locator.as_ref().and_then(|l| l.relay.clone()),
                 "read_only": true,
                 "memories_added": effects.nodes_written,
                 "memories_removed": effects.nodes_removed,

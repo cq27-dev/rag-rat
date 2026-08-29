@@ -24,10 +24,11 @@ pub(crate) use api::{create_memory, mark_obsolete, rebind_memory, update_memory}
 // #583) can name it across the private module.
 pub(crate) use authoring::heal_memory_oplog_ghosts;
 pub(crate) use authoring::{
-    RepoGrantListing, RepoOwnerConfig, RepoRevokeReport, catch_up_enrolled_device_keys,
-    clear_contribution_owner, clear_subscription_owner, enable_public_authoring,
-    enable_sealed_authoring, grant_repo_writer, list_repo_grants, published_grant_target,
-    repo_owner_config, revoke_repo_writer, set_contribution_owner, set_subscription_owner,
+    RepoGrantListing, RepoOwnerConfig, RepoRevokeReport, SubscribeTrust,
+    catch_up_enrolled_device_keys, clear_contribution_owner, clear_subscription_owner,
+    enable_public_authoring, enable_sealed_authoring, grant_repo_writer, list_repo_grants,
+    published_grant_target, repo_owner_config, revoke_repo_writer, set_contribution_owner,
+    set_subscription_owner, stream_pin,
 };
 // The scope-explicit reconcile entry (#541): `authoring` is a PRIVATE module, so
 // `index::consolidate` names this through this re-export (Task 5 of #541).
