@@ -19,6 +19,7 @@ pub mod repo_identity;
 pub mod serde_big_id;
 pub mod single_flight;
 pub mod stack;
+pub mod stream_locator;
 pub mod test_git;
 pub mod test_scratch;
 pub mod time;

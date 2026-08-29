@@ -405,11 +405,20 @@ pub(crate) enum SyncCommand {
                             anchors its author published. The owner's log must reach this store \
                             before anything materializes: automatic sync pulls it once the \
                             owner's host is in [sync] server_peers, or run `rag-rat sync pull \
-                            <owner>`.")]
+                            <owner>`.\n\nWith no argument, the owner comes from the repo's \
+                            checked-in `.rag-rat-stream`, along with any peers and relay it \
+                            names for reaching that owner's host. The FIRST subscribe pins the \
+                            owner; because that file is editable by anyone who can land a \
+                            commit, a later edit naming a DIFFERENT owner is refused rather than \
+                            followed — confirm the new id with the stream's owner and pass it \
+                            explicitly to move the pin. The peers and relay carry no authority \
+                            and are followed as given: every entry pulled is verified against \
+                            the pinned account.")]
     Subscribe {
-        /// The owner's 64-hex account id, from the owner's `rag-rat sync whoami`.
+        /// The owner's 64-hex account id, from the owner's `rag-rat sync whoami`. Omit it to use
+        /// the owner named by the repo's checked-in `.rag-rat-stream`.
         #[arg(value_name = "OWNER_ACCOUNT_ID")]
-        account: String,
+        account: Option<String>,
     },
     /// Stop mirroring a subscribed identity's memories.
     #[command(long_about = "Clears this repo's `sync subscribe` configuration: its memories \
@@ -1233,7 +1242,18 @@ mod tests {
             Cli::try_parse_from(["rag-rat", "sync", "subscribe", &"ef".repeat(32)]).expect("parse");
         match cli.command {
             Command::Sync(SyncArgs { command: SyncCommand::Subscribe { account } }) =>
-                assert_eq!(account, "ef".repeat(32)),
+                assert_eq!(account, Some("ef".repeat(32))),
+            other => panic!("expected sync subscribe, got {other:?}"),
+        }
+    }
+
+    /// The no-argument form is what a clone runs: the owner comes from the checked-in locator.
+    #[test]
+    fn sync_subscribe_parses_without_an_account() {
+        let cli = Cli::try_parse_from(["rag-rat", "sync", "subscribe"]).expect("parse");
+        match cli.command {
+            Command::Sync(SyncArgs { command: SyncCommand::Subscribe { account } }) =>
+                assert_eq!(account, None),
             other => panic!("expected sync subscribe, got {other:?}"),
         }
     }
