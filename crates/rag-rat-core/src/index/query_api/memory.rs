@@ -180,6 +180,21 @@ impl IndexDatabase {
         )
     }
 
+    /// Record how to reach the subscribed owner's host, as a locator supplied it. Empty peers
+    /// clear the record — an operator-named subscribe must not inherit the previous owner's host.
+    pub fn set_subscription_routing(
+        &self,
+        peers: &[String],
+        relay: Option<&str>,
+    ) -> anyhow::Result<()> {
+        crate::memory_write::set_subscription_routing(self.storage.connection(), peers, relay)
+    }
+
+    /// Peers and relay recorded for a subscribed owner, pooled across this store's repos.
+    pub fn subscription_routing(&self) -> anyhow::Result<(Vec<String>, Option<String>)> {
+        crate::memory_write::subscription_routing(self.storage.connection())
+    }
+
     /// The owner this repo has pinned, if any — reported by `sync whoami` so an operator can see
     /// the trust root without reading repo_meta.
     pub fn stream_pin(&self) -> anyhow::Result<Option<String>> {

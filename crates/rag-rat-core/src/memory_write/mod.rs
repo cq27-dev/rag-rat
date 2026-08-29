@@ -28,7 +28,7 @@ pub(crate) use authoring::{
     catch_up_enrolled_device_keys, clear_contribution_owner, clear_subscription_owner,
     enable_public_authoring, enable_sealed_authoring, grant_repo_writer, list_repo_grants,
     published_grant_target, repo_owner_config, revoke_repo_writer, set_contribution_owner,
-    set_subscription_owner, stream_pin,
+    set_subscription_owner, set_subscription_routing, stream_pin, subscription_routing,
 };
 // The scope-explicit reconcile entry (#541): `authoring` is a PRIVATE module, so
 // `index::consolidate` names this through this re-export (Task 5 of #541).

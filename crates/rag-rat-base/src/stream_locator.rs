@@ -137,6 +137,46 @@ mod tests {
     }
 
     #[test]
+    fn a_linked_worktree_reads_its_own_locator_not_the_main_checkouts() {
+        // `config.root` is main-anchored in a linked worktree, so a caller that loads the locator
+        // from it pins or refuses against the WRONG file while the operator stands in the branch.
+        // `worktree_root` is the session-side root that rebases onto the active checkout.
+        const OTHER: &str = "99ff249f76f43de5497761bde999a7baa902008491e4cd1a6a943bcbf1d1f7b1";
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        crate::test_git::run(&main, &["init", "-q", "."]);
+        crate::test_git::run(&main, &["config", "user.email", "t@t"]);
+        crate::test_git::run(&main, &["config", "user.name", "t"]);
+        std::fs::write(main.join(STREAM_LOCATOR_FILE), format!("owner = \"{OWNER}\"\n")).unwrap();
+        crate::test_git::run(&main, &["add", "-A"]);
+        crate::test_git::run(&main, &["commit", "-qm", "main locator"]);
+
+        let linked = tmp.path().join("linked");
+        crate::test_git::run(&main, &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "branch",
+            linked.to_str().unwrap(),
+        ]);
+        std::fs::write(linked.join(STREAM_LOCATOR_FILE), format!("owner = \"{OTHER}\"\n")).unwrap();
+
+        let active = crate::config::worktree_root(&linked).expect("a linked worktree has a root");
+        assert_eq!(
+            load(&active).unwrap().expect("the branch checks one in").owner,
+            OTHER,
+            "the active checkout's locator governs, not the main checkout's",
+        );
+        assert_eq!(
+            load(&main).unwrap().expect("main still has its own").owner,
+            OWNER,
+            "and the main checkout is unaffected by the branch's",
+        );
+    }
+
+    #[test]
     fn an_absent_file_is_not_an_error_but_a_malformed_one_is() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load(dir.path()).unwrap(), None, "a repo may simply check none in");

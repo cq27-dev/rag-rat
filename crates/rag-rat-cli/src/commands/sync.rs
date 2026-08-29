@@ -189,8 +189,15 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
             let (owner, source, locator) = match account {
                 Some(account) => (account.clone(), "argument", None),
                 None => {
+                    // The ACTIVE checkout, not `config.root`: in a linked worktree the config is
+                    // main-anchored, so reading the locator from it would pin or reject against
+                    // the main checkout's file while the operator is standing in the branch.
+                    let checkout = std::env::current_dir()
+                        .ok()
+                        .and_then(|cwd| rag_rat_base::config::worktree_root(&cwd))
+                        .unwrap_or_else(|| config.root.clone());
                     let locator =
-                        rag_rat_base::stream_locator::load(&config.root)?.with_context(|| {
+                        rag_rat_base::stream_locator::load(&checkout)?.with_context(|| {
                             format!(
                                 "no owner given and this repo checks in no `{}`. Pass the owner's \
                                  64-hex account id (from their `rag-rat sync whoami`), or add the \
@@ -205,6 +212,16 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 Some(_) => db.sync_subscribe(&owner)?,
                 None => db.sync_subscribe_from_locator(&owner)?,
             }
+            // Persisted, not merely echoed: a clone that subscribed from a locator has no
+            // `[sync] server_peers` — carrying that routing is the locator's whole purpose — and a
+            // foreign account cannot be discovered, so without this the repo would record a
+            // subscription it can never fetch. An operator-named subscribe clears any stale
+            // routing rather than dialing the previous owner's host for a different account.
+            let (peers, relay) = match locator.as_ref() {
+                Some(locator) => (locator.peers.clone(), locator.relay.clone()),
+                None => (Vec::new(), None),
+            };
+            db.set_subscription_routing(&peers, relay.as_deref())?;
             let effects = rag_rat_core::drain_synced_memory(db.connection())?;
             db.fold_wal();
             print_output(&serde_json::json!({
@@ -219,7 +236,11 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "read_only": true,
                 "memories_added": effects.nodes_written,
                 "memories_removed": effects.nodes_removed,
-                "note": "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log: automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
+                "note": if locator.as_ref().is_some_and(|l| !l.peers.is_empty()) {
+                    "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). The locator's peers are recorded, so automatic sync pulls the owner's log without any [sync] server_peers; run `sync pull` now to fetch it immediately"
+                } else {
+                    "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log and no routing was supplied: automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner> --peer <NODE_ID>` now"
+                },
             }))
         },
         SyncCommand::Unsubscribe => {
@@ -979,15 +1000,26 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
     };
     drop(repo_lock);
 
+    // An explicit `--peer` wins; otherwise configured peers PLUS whatever a `.rag-rat-stream`
+    // recorded when this repo subscribed. A clone that subscribed from a locator has no configured
+    // peers by design, and this is the command its own subscribe output tells it to run.
+    let (subscribed_peers, _) = db.subscription_routing()?;
     let peer_ids: Vec<String> = match peer_override {
         Some(peer) => vec![peer.to_string()],
-        None => config.sync.server_peers.clone(),
+        None => {
+            let mut peers = config.sync.server_peers.clone();
+            peers.extend(subscribed_peers);
+            peers.sort_unstable();
+            peers.dedup();
+            peers
+        },
     };
     if peer_ids.is_empty() {
         bail!(
-            "no peer to pull from: pass --peer <NODE_ID> or set [sync] server_peers. Discovery \
-             cannot find a FOREIGN account's host — its discovery tag derives from that account's \
-             own secret, which only its own devices hold"
+            "no peer to pull from: pass --peer <NODE_ID>, set [sync] server_peers, or subscribe \
+             from a `.rag-rat-stream` that names the owner's host. Discovery cannot find a \
+             FOREIGN account's host — its discovery tag derives from that account's own secret, \
+             which only its own devices hold"
         );
     }
     // An invalid entry skips to the next peer rather than aborting: one typo in a configured

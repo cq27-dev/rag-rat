@@ -1149,3 +1149,39 @@ fn unsubscribing_does_not_reset_the_pin() {
     .to_string();
     assert!(err.contains("pinned to"), "the pin survives the unsubscribe dance: {err}");
 }
+
+/// A locator exists so a clone needs no `[sync] server_peers`. Recording only the owner would leave
+/// that clone holding a subscription it can never fetch: a foreign account's host cannot be
+/// discovered, because the discovery tag derives from that account's own secret.
+#[test]
+fn subscribing_from_a_locator_records_the_routing_that_reaches_the_owner() {
+    let (_owner, subscriber, _owner_account) = subscription_pair();
+
+    crate::memory_write::set_subscription_routing(
+        &subscriber,
+        &["node-a".to_string(), "node-b".to_string()],
+        Some("https://relay.example"),
+    )
+    .unwrap();
+    let (peers, relay) = crate::memory_write::subscription_routing(&subscriber).unwrap();
+    assert_eq!(peers, ["node-a", "node-b"], "the pull paths read these when nothing is configured");
+    assert_eq!(relay.as_deref(), Some("https://relay.example"));
+}
+
+/// An operator-named subscribe supplies no routing, and must not inherit the previous owner's host:
+/// dialing it for a different account is a wasted connection to a peer that never held the stream.
+#[test]
+fn re_subscribing_without_routing_clears_the_previous_owners_host() {
+    let (_owner, subscriber, _owner_account) = subscription_pair();
+    crate::memory_write::set_subscription_routing(
+        &subscriber,
+        &["node-a".to_string()],
+        Some("https://relay.example"),
+    )
+    .unwrap();
+
+    crate::memory_write::set_subscription_routing(&subscriber, &[], None).unwrap();
+    let (peers, relay) = crate::memory_write::subscription_routing(&subscriber).unwrap();
+    assert!(peers.is_empty(), "stale routing is cleared, not carried onto the new owner");
+    assert_eq!(relay, None);
+}
