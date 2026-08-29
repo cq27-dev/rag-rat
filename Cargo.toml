@@ -21,7 +21,7 @@ resolver = "3"
 # and the internal path deps below pin the same literal, so the three crates always publish in
 # lockstep. Bump this one line (and the two internal-dep `version`s under workspace.dependencies)
 # to release.
-version = "0.23.0"
+version = "0.23.1"
 authors = ["Kristaps Karlsons"]
 edition = "2024"
 # Bundled SQLite (rusqlite `bundled` -> libsqlite3-sys 0.38.1) compiles a build script that uses the
@@ -38,18 +38,18 @@ categories = ["command-line-utilities", "development-tools"]
 # Internal crates — declared once here so the version requirement is set in lockstep with
 # [workspace.package].version above. Members reference these via `{ workspace = true }` and add
 # their own feature toggles at the use site.
-rag-rat-base = { version = "0.23.0", path = "crates/rag-rat-base", default-features = false }
-rag-rat-clones = { version = "0.23.0", path = "crates/rag-rat-clones", default-features = false }
-rag-rat-db = { version = "0.23.0", path = "crates/rag-rat-db", default-features = false }
-rag-rat-dream = { version = "0.23.0", path = "crates/rag-rat-dream", default-features = false }
-rag-rat-llm = { version = "0.23.0", path = "crates/rag-rat-llm", default-features = false }
-rag-rat-oracle = { version = "0.23.0", path = "crates/rag-rat-oracle", default-features = false }
-rag-rat-oplog = { version = "0.23.0", path = "crates/rag-rat-oplog", default-features = false }
-rag-rat-papertrail = { version = "0.23.0", path = "crates/rag-rat-papertrail", default-features = false }
-rag-rat-query = { version = "0.23.0", path = "crates/rag-rat-query", default-features = false }
-rag-rat-core = { version = "0.23.0", path = "crates/rag-rat-core", default-features = false }
-rag-rat-mcp = { version = "0.23.0", path = "crates/rag-rat-mcp", default-features = false }
-rag-rat-sync = { version = "0.23.0", path = "crates/rag-rat-sync", default-features = false }
+rag-rat-base = { version = "0.23.1", path = "crates/rag-rat-base", default-features = false }
+rag-rat-clones = { version = "0.23.1", path = "crates/rag-rat-clones", default-features = false }
+rag-rat-db = { version = "0.23.1", path = "crates/rag-rat-db", default-features = false }
+rag-rat-dream = { version = "0.23.1", path = "crates/rag-rat-dream", default-features = false }
+rag-rat-llm = { version = "0.23.1", path = "crates/rag-rat-llm", default-features = false }
+rag-rat-oracle = { version = "0.23.1", path = "crates/rag-rat-oracle", default-features = false }
+rag-rat-oplog = { version = "0.23.1", path = "crates/rag-rat-oplog", default-features = false }
+rag-rat-papertrail = { version = "0.23.1", path = "crates/rag-rat-papertrail", default-features = false }
+rag-rat-query = { version = "0.23.1", path = "crates/rag-rat-query", default-features = false }
+rag-rat-core = { version = "0.23.1", path = "crates/rag-rat-core", default-features = false }
+rag-rat-mcp = { version = "0.23.1", path = "crates/rag-rat-mcp", default-features = false }
+rag-rat-sync = { version = "0.23.1", path = "crates/rag-rat-sync", default-features = false }
 anyhow = "1.0"
 axum = "0.8"
 # ed25519 device-identity signing for the op-log's signed entry envelope (§C4 layer-1). Default
