@@ -325,17 +325,34 @@ impl LiveOracleSession {
     /// `false` means the checkout now pins a DIFFERENT database (one appeared, moved, or was
     /// removed). That cannot be corrected in place: the server was spawned with an argv derived
     /// from the old layout, so the session has to be replaced.
-    fn layout_still_holds(&mut self, checkout: &CheckoutScope<'_>) -> bool {
+    fn layout_change_ending_the_pass(
+        &mut self,
+        checkout: &CheckoutScope<'_>,
+    ) -> Option<&'static str> {
         if self.layout_resolved_at.elapsed() < backend::LAYOUT_MAX_AGE {
-            return true;
+            return None;
         }
         let fresh = self.backend.resolve_layout(checkout);
         self.layout_resolved_at = Instant::now();
+        // REMOVAL is tested first, because it is also a pin change when the checkout held exactly
+        // one: reported the other way round, an operator whose only database was deleted is told
+        // the checkout points at a different one, which is a database that does not exist.
+        //
+        // And pinning the same database is not holding the same layout. SEVERAL databases and
+        // NONE both pin nothing, so a checkout that lost every database it had passes the pin
+        // test and the session survives against a layout describing no project at all. It cannot
+        // do useful work there: its argv was derived while the databases existed, and a session
+        // that has not yet signalled ready would warm forever with nothing to become ready for.
+        // End the pass so the watcher replaces it — a fresh spawn blocks on the prerequisite,
+        // which is where a checkout with no project belongs and where the remedy is worded.
+        if fresh.has_no_database() && !self.layout.has_no_database() {
+            return Some("the checkout no longer holds a compilation database");
+        }
         if !fresh.pins_same_database_as(&self.layout) {
-            return false;
+            return Some("the checkout now points at a different compilation database");
         }
         self.layout = fresh;
-        true
+        None
     }
 
     /// Whether the checkout's sole database was declined for describing nothing indexed.
@@ -478,11 +495,10 @@ pub fn live_oracle_pass(
     // never reach this check, so a database removed during warm-up would leave it warming forever
     // with no way back. End the pass instead and let the watcher replace the session — its argv
     // was derived from the old layout, so it cannot be corrected in place.
-    if !session.layout_still_holds(input.scope) {
+    if let Some(reason) = session.layout_change_ending_the_pass(input.scope) {
         report.unfinished_paths = input.worklist.to_vec();
         report.abort = Some(LivePassAbort::LayoutChanged);
-        report.status =
-            "Aborted: the checkout now points at a different compilation database".to_string();
+        report.status = format!("Aborted: {reason}");
         return Ok(report);
     }
     match session.readiness_checkpoint() {

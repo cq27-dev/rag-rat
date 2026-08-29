@@ -916,14 +916,18 @@ impl LiveBackendTail {
         }
         self.unconfigured_reported = true;
         if report.database_unreadable {
+            // The marker's name comes from the backend's own declaration, like every other
+            // message that names one. Spelling it out here would let a second checkout-scoped
+            // backend send an operator to a file it does not use, with nothing to catch it.
+            let marker = self.backend.marker_name_hint();
             tracing::warn!(
                 target: "rag_rat_core::watch",
                 tool = self.backend.tool.as_db_str(),
                 skipped = report.skipped_unconfigured,
                 "live oracle: this pass sent the server no requests and skipped candidates because \
                  this checkout's sole compilation database could not be used by this reader. \
-                 Inspect compile_commands.json: it may be unreadable, contain unsupported syntax \
-                 (such as clangd's YAML forms), or contain an unsupported entry key."
+                 Inspect {marker}: it may be unreadable, contain unsupported syntax (such as \
+                 clangd's YAML forms), or contain an unsupported entry key."
             );
             return;
         }
@@ -949,18 +953,34 @@ impl LiveBackendTail {
             );
             return;
         }
+        // TERMINAL branch: it runs for every layout the branches above did not claim, and that
+        // set is defined as the complement of theirs — new verdict/governs combinations join it
+        // silently, so it must not assert a diagnosis. A sole database whose entries parse but
+        // carry a non-string `file` lands here today (#1255), and telling that operator to
+        // consolidate the databases they do not have sends them after the wrong problem
+        // entirely. Adding a branch would narrow the set without closing it. So: state what was
+        // observed, offer the causes, and make each remedy conditional on its own cause.
+        //
+        // That includes not claiming the database PARSED. An incomplete scan withholds every sole
+        // database fact on purpose — it cannot prove the marker it saw is the only one — so a
+        // checkout whose single database this reader could not read reaches here with both flags
+        // false, warmable under `Trust::Possible` and skipping every file under `Trust::Proven`.
+        // Whatever this branch asserts, some layout that withheld its facts will contradict.
         tracing::warn!(
             target: "rag_rat_core::watch",
             tool = self.backend.tool.as_db_str(),
             skipped = report.skipped_unconfigured,
             "live oracle: this pass sent the server no requests and skipped candidates because \
-             the session cannot configure their files. A compilation database is pinned for the \
-             server (`--compile-commands-dir`) only when the checkout holds exactly one; \
-             otherwise the server has to find each file's database itself, and a file it cannot \
-             find one for is skipped rather than answered with fallback flags. Those files stay \
-             unresolvable until the checkout's layout changes — leave a single compilation \
-             database, or put each file's database in one of its ancestor directories or that \
-             directory's `build/`."
+             the session cannot configure their files. The layout facts collected do not identify \
+             which cause, so both are worth checking. A compilation database is pinned for the \
+             server (`--compile-commands-dir`) only when the checkout holds exactly one: if it \
+             holds several, the server has to find each file's database itself and skips a file \
+             it finds none for — leave a single compilation database, or put each file's database \
+             in one of its ancestor directories or that directory's `build/`. If it holds exactly \
+             one, this reader could not establish a configuration for these files from it — the \
+             file may not have parsed, or may have parsed without describing them. Inspect its \
+             entries against what the server expects: a `file` naming the source, and a `command` \
+             or `arguments` a compiler would accept."
         );
     }
 
@@ -1456,14 +1476,40 @@ mod tests {
             captured_warnings(|| tail.note_unconfigured(&report))
         };
 
-        let several_databases =
+        // No database fact set: the terminal branch. It must OFFER its causes rather than pick
+        // one — the set it covers is the complement of the branches above, so it cannot know.
+        let unidentified =
             warning(LivePassReport { skipped_unconfigured: 1, ..LivePassReport::default() });
         assert!(
-            several_databases.contains("leave a single compilation database"),
-            "several databases need the consolidation remedy: {several_databases:?}",
+            unidentified.contains("do not identify which cause"),
+            "the terminal branch must not assert a diagnosis: {unidentified:?}",
         );
-        assert!(!several_databases.contains("names no file this checkout indexes"));
-        assert!(!several_databases.contains("could not be read as JSON"));
+        // Both remedies are present and BOTH are conditional. A terminal branch that named one
+        // cause would drop a conditional, which is what these two read.
+        assert!(
+            unidentified.contains("if it holds several"),
+            "the several-databases remedy must stay conditional: {unidentified:?}",
+        );
+        assert!(
+            unidentified.contains("If it holds exactly one"),
+            "and so must the sole-database one: {unidentified:?}",
+        );
+        assert!(
+            unidentified.contains("leave a single compilation database"),
+            "…while still carrying the several-databases remedy: {unidentified:?}",
+        );
+        assert!(
+            unidentified.contains("a `command` or `arguments` a compiler would accept"),
+            "…and a sole-database remedy that does not presume which field is wrong: \
+             {unidentified:?}",
+        );
+        // Not even parsing may be asserted: an incomplete scan withholds the unreadable-database
+        // fact, so a checkout whose only database could not be read reaches this branch too.
+        assert!(
+            unidentified.contains("may not have parsed"),
+            "the terminal branch cannot claim the database parsed: {unidentified:?}",
+        );
+        assert!(!unidentified.contains("names no file this checkout indexes"));
 
         let governs_nothing = warning(LivePassReport {
             skipped_unconfigured: 1,
@@ -1475,7 +1521,6 @@ mod tests {
             "a non-governing database needs its own remedy: {governs_nothing:?}",
         );
         assert!(!governs_nothing.contains("leave a single compilation database"));
-        assert!(!governs_nothing.contains("could not be read as JSON"));
 
         let fixture = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(fixture.path().join("src")).unwrap();
@@ -1510,7 +1555,6 @@ mod tests {
             unreadable.contains("compile_commands.json"),
             "a sole unreadable database warning must identify its file: {unreadable:?}",
         );
-        assert!(!unreadable.contains("could not be read as JSON"));
         assert!(unreadable.contains("unsupported syntax"));
         assert!(unreadable.contains("unsupported entry key"));
         assert!(!unreadable.contains("leave a single compilation database"));
@@ -1532,9 +1576,9 @@ mod tests {
             ..LivePassReport::default()
         });
         assert!(
-            !strict_json_unknown_key.contains("could not be read as JSON"),
-            "strict JSON with an unknown key must not be described as unparseable: \
-             {strict_json_unknown_key:?}",
+            strict_json_unknown_key.contains("may be unreadable"),
+            "strict JSON with an unknown key parses, so unreadability may only be OFFERED as a \
+             cause, never asserted: {strict_json_unknown_key:?}",
         );
         assert!(
             strict_json_unknown_key.contains("compile_commands.json"),
@@ -1565,16 +1609,88 @@ mod tests {
             "the warning must identify an unreadable marker path: {unreadable_marker:?}",
         );
         assert!(
-            !unreadable_marker.contains("has syntax or entry fields this reader cannot accept"),
-            "an unopenable marker must not assert a content-level cause: {unreadable_marker:?}",
-        );
-        assert!(
             unreadable_marker.contains("could not be used"),
             "the warning must state the reader could not use the marker: {unreadable_marker:?}",
         );
         assert!(
             unreadable_marker.contains("may be unreadable"),
             "the warning must present unreadability as a possible cause: {unreadable_marker:?}",
+        );
+
+        // The shape that made the terminal branch lie: a SOLE database whose entries parse, so
+        // the unreadable branch declines it, and whose `file` this reader cannot read as a path,
+        // so `Governs::Unknown` makes the governs-nothing branch decline it too. It falls
+        // through — and the fallthrough used to tell an operator with one database to leave a
+        // single one.
+        std::fs::remove_dir(fixture.path().join("compile_commands.json")).unwrap();
+        std::fs::write(
+            fixture.path().join("compile_commands.json"),
+            r#"[{"directory":"/x","file":42,"command":"cc -c a.c"}]"#,
+        )
+        .unwrap();
+        let non_string_file = clangd.resolve_layout(&scope);
+        assert!(
+            !non_string_file.has_unreadable_database(),
+            "entries that parse are not an unreadable database",
+        );
+        assert!(
+            !non_string_file.has_database_governing_nothing_indexed(),
+            "a `file` this reader cannot read is unknown governance, not proven non-governance",
+        );
+        let sole_unreadable_entry = warning(LivePassReport {
+            skipped_unconfigured: 1,
+            database_unreadable: non_string_file.has_unreadable_database(),
+            database_governs_nothing: non_string_file.has_database_governing_nothing_indexed(),
+            ..LivePassReport::default()
+        });
+        assert!(
+            sole_unreadable_entry.contains("do not identify which cause"),
+            "a sole database that reaches the terminal branch must not be diagnosed as several: \
+             {sole_unreadable_entry:?}",
+        );
+
+        // A sole database that PARSES and is still unusable — a string `file` naming an indexed
+        // source, with an empty `command` — reaches the terminal branch too: entries counted zero
+        // makes it NotLoadable, so the unreadable branch declines it, and NotLoadable is not the
+        // Loadable the governs-nothing branch requires. Nothing about this entry's `file` is
+        // wrong, so a remedy naming that field would send its operator to the wrong line.
+        std::fs::write(
+            fixture.path().join("compile_commands.json"),
+            format!(
+                "[{{\"directory\":\"/x\",\"file\":{:?},\"command\":\"\"}}]",
+                fixture.path().join("src/main.c").display().to_string()
+            ),
+        )
+        .unwrap();
+        let empty_command = clangd.resolve_layout(&scope);
+        assert!(!empty_command.has_unreadable_database());
+        assert!(!empty_command.has_database_governing_nothing_indexed());
+        let unusable_entry = warning(LivePassReport {
+            skipped_unconfigured: 1,
+            database_unreadable: empty_command.has_unreadable_database(),
+            database_governs_nothing: empty_command.has_database_governing_nothing_indexed(),
+            ..LivePassReport::default()
+        });
+        assert!(
+            unusable_entry.contains("do not identify which cause"),
+            "a database whose entries are malformed some other way is still undiagnosed: \
+             {unusable_entry:?}",
+        );
+        assert!(
+            unusable_entry.contains("a `command` or `arguments` a compiler would accept"),
+            "and the remedy must reach the field that IS wrong: {unusable_entry:?}",
+        );
+
+        // A checkout that holds NO database never reaches this warning: it cannot signal
+        // readiness, so it blocks on the prerequisite instead of spawning, and a running session
+        // whose checkout loses every database ends its pass at the layout-refresh check. The
+        // prerequisite already words that remedy; a branch here would be unreachable.
+        std::fs::remove_file(fixture.path().join("compile_commands.json")).unwrap();
+        let no_database = clangd.resolve_layout(&scope);
+        assert!(no_database.has_no_database(), "the checkout holds no database to find");
+        assert!(
+            !clangd.checkout_can_signal_readiness(&scope, &no_database),
+            "so no session spawns against it, and no pass can report it",
         );
     }
 

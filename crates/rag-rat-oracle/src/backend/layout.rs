@@ -216,6 +216,21 @@ impl ProjectLayout {
             )
     }
 
+    /// Whether this checkout holds NO compilation database at all.
+    ///
+    /// Carries the same finished-scan guard as its siblings, and for the same reason: a truncated
+    /// scan that found nothing has not established that there is nothing to find, and telling an
+    /// operator to generate a database they already have is its own wrong remedy. Unproven falls
+    /// through to the terminal warning, which claims no cause.
+    ///
+    /// A checkout that holds none at SPAWN never reaches a running pass — it blocks on the
+    /// prerequisite. What this covers is the decay: a session that warmed while the checkout held
+    /// several, which have since been removed. Both layouts pin nothing, so the session survives
+    /// the refresh and every path it carries is then skipped as unconfigurable.
+    pub fn has_no_database(&self) -> bool {
+        self.complete && self.markers.is_empty()
+    }
+
     /// Whether this complete layout has exactly one compilation database that this crate could
     /// not read as JSON. An incomplete scan cannot establish that the unreadable marker is the
     /// sole database, so it does not carry this operator-facing fact.
@@ -1196,6 +1211,111 @@ mod tests {
             found: Vec::new(),
             truncated: false,
         }
+    }
+
+    /// Both guards on both "sole database" predicates, because the word an operator reads is
+    /// SOLE and neither guard is what makes it true on its own.
+    ///
+    /// A truncated scan may have missed the database that governs half the sources, so it cannot
+    /// establish that the one it saw is the only one. And a second marker means the file the
+    /// warning names is not the only one to look at — the operator is sent to inspect a database
+    /// that may be perfectly fine while the one that matters goes unmentioned.
+    #[test]
+    fn a_sole_database_fact_needs_a_finished_scan_and_exactly_one_marker() {
+        let site = |verdict, governs| MarkerSite {
+            dir: PathBuf::from("x"),
+            reading: MarkerReading { verdict, governs },
+        };
+        let layout = |sites: Vec<MarkerSite>, scan_finished| {
+            ProjectLayout::from_marker_sites("compile_commands.json", MarkerScan {
+                sites,
+                complete: scan_finished,
+            })
+        };
+        let unreadable = site(MarkerVerdict::Unknown, Governs::Unknown);
+        let governs_nothing = site(MarkerVerdict::Loadable, Governs::NothingIndexed);
+        let good = site(MarkerVerdict::Loadable, Governs::IndexedSource);
+
+        assert!(layout(Vec::new(), true).has_no_database());
+        assert!(
+            !layout(Vec::new(), false).has_no_database(),
+            "a truncated scan that found nothing has not established there is nothing to find",
+        );
+        assert!(
+            !layout(vec![good.clone()], true).has_no_database(),
+            "and a database that was found is not an absent one",
+        );
+
+        assert!(layout(vec![unreadable.clone()], true).has_unreadable_database());
+        assert!(
+            layout(vec![governs_nothing.clone()], true).has_database_governing_nothing_indexed()
+        );
+
+        assert!(
+            !layout(vec![unreadable.clone()], false).has_unreadable_database(),
+            "a truncated scan cannot prove the unreadable marker is the checkout's only database",
+        );
+        assert!(
+            !layout(vec![governs_nothing.clone()], false).has_database_governing_nothing_indexed(),
+            "nor that the non-governing one is",
+        );
+
+        // Withholding is not free: a truncated scan over a checkout whose only database cannot be
+        // read reports NEITHER fact, so it reaches the terminal warning like any other undiagnosed
+        // layout. That warning therefore cannot claim the database parsed.
+        let truncated_unreadable = layout(vec![unreadable.clone()], false);
+        assert!(!truncated_unreadable.has_unreadable_database());
+        assert!(!truncated_unreadable.has_database_governing_nothing_indexed());
+        assert!(!truncated_unreadable.has_no_database());
+
+        assert!(
+            !layout(vec![unreadable, good.clone()], true).has_unreadable_database(),
+            "a second, readable database means the unreadable one is not the sole database",
+        );
+        assert!(
+            !layout(vec![governs_nothing, good], true).has_database_governing_nothing_indexed(),
+            "and a second database means the non-governing one is not either",
+        );
+    }
+
+    /// Why a session's layout-refresh check cannot be pin equality alone.
+    ///
+    /// `pins_same_database_as` asks "does the argv already passed to the running server still
+    /// describe this checkout" — and NOTHING is a legitimate answer on both sides. So a checkout
+    /// that held several databases and now holds none reads as unchanged, and a session that has
+    /// not yet signalled ready would warm forever against a project that no longer exists. The
+    /// absence has to be tested for separately.
+    #[test]
+    fn pinning_nothing_is_not_proof_the_layout_is_unchanged() {
+        let site = |verdict, governs| MarkerSite {
+            dir: PathBuf::from("x"),
+            reading: MarkerReading { verdict, governs },
+        };
+        let layout = |sites: Vec<MarkerSite>| {
+            ProjectLayout::from_marker_sites("compile_commands.json", MarkerScan {
+                sites,
+                complete: true,
+            })
+        };
+        let good = site(MarkerVerdict::Loadable, Governs::IndexedSource);
+        let several = layout(vec![good.clone(), good.clone()]);
+        let none = layout(Vec::new());
+
+        assert!(several.sole_marker_dir().is_none(), "several databases pin nothing");
+        assert!(none.sole_marker_dir().is_none(), "and so does no database at all");
+        assert!(
+            none.pins_same_database_as(&several),
+            "so pin equality reads the loss of every database as no change — which is why the \
+             refresh has to ask `has_no_database` as well",
+        );
+        assert!(none.has_no_database() && !several.has_no_database());
+
+        // Losing a SOLE database is both an absence and a pin change, so the two tests overlap
+        // and their order decides what the operator is told. Absence has to win: "points at a
+        // different compilation database" names a database that does not exist.
+        let one = layout(vec![good]);
+        assert!(!one.pins_same_database_as(&none), "a sole database going away moves the pin");
+        assert!(none.has_no_database() && !one.has_no_database(), "and is also an absence");
     }
 
     #[test]
