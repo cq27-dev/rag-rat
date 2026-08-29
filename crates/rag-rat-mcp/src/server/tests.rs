@@ -171,17 +171,29 @@ async fn blocking_tool_work_returns_timeout_error() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn blocking_tool_work_applies_worker_limit() {
     let workers = test_tool_workers(1);
+    // The runner only runs once the permit is held, so signalling from inside it is the fact the
+    // queued call needs: sleeping instead assumed 10ms was long enough to acquire a semaphore, and
+    // under load it is not. Holding until the test releases it removes the other half of the same
+    // bet — that 100ms of held worker outlasts a 20ms timeout that may itself be scheduled late.
+    let (holds_worker, worker_held) = tokio::sync::oneshot::channel();
+    let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
     let slow = tokio::spawn(blocking::run_blocking_tool(
         "slow_test_tool".to_string(),
         Duration::from_secs(1),
         ToolTimeoutPolicy::ReturnTimeout,
         Arc::clone(&workers),
-        || {
-            std::thread::sleep(Duration::from_millis(100));
+        move || {
+            let _ = holds_worker.send(());
+            let _ = wait_for_release.blocking_recv();
             Ok(ok_result())
         },
     ));
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Bounded, so a runner that never starts FAILS instead of hanging: the wait has no other way
+    // to end, and an unbounded one leaves the suite stuck rather than red.
+    tokio::time::timeout(Duration::from_secs(10), worker_held)
+        .await
+        .expect("the slow tool must reach its runner within the deadlock guard")
+        .expect("reaching the runner means it holds the worker");
 
     let err = blocking::run_blocking_tool(
         "queued_test_tool".to_string(),
@@ -197,6 +209,7 @@ async fn blocking_tool_work_applies_worker_limit() {
         "queued timeout error should be actionable, got: {}",
         err.message
     );
+    let _ = release.send(());
     slow.await.unwrap().unwrap();
 }
 

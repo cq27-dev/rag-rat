@@ -656,16 +656,37 @@ async fn dropping_a_request_cancels_its_database_work() {
     };
     let cancelled_observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let task_observed = std::sync::Arc::clone(&cancelled_observed);
+    let (work_started, has_started) = tokio::sync::oneshot::channel();
     let mut request = Box::pin(run_db(state.clone(), move |_, _, cancelled| {
-        while !cancelled.load(Ordering::Acquire) {
+        let _ = work_started.send(());
+        // Bounded: waiting on a flag that a REGRESSION would never set is how this test wedges
+        // rather than fails. Tokio's shutdown waits for blocking tasks, so an unbounded loop here
+        // means the runtime can never drop and the run hangs with no failure to read. Only a loop
+        // that actually observed cancellation records it, so the assertion still fails.
+        let give_up_at = std::time::Instant::now() + Duration::from_secs(10);
+        while !cancelled.load(Ordering::Acquire) && std::time::Instant::now() < give_up_at {
             std::thread::sleep(Duration::from_millis(1));
         }
-        task_observed.store(true, Ordering::Release);
+        if cancelled.load(Ordering::Acquire) {
+            task_observed.store(true, Ordering::Release);
+        }
         Ok(())
     }));
-    // Poll far enough for the blocking work to start, then drop the future the way axum drops a
+    // Wait for the blocking work to actually START, then drop the future the way axum drops a
     // request whose client disconnected — the editor aborts a file lane on every index change.
-    assert!(tokio::time::timeout(Duration::from_millis(250), &mut request).await.is_err());
+    // Polling for a fixed 250ms instead assumed the work had begun by then; under load it may not
+    // have, and dropping a request with nothing in flight cancels nothing while still looking
+    // like it passed the setup.
+    // Bounded for the same reason: the runner loops until cancelled, so if it never starts,
+    // neither branch of the select can ever complete and the test would hang instead of fail.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            _ = &mut request => panic!("the request loops until cancelled, so it cannot end here"),
+            started = has_started => started.expect("the blocking work must reach its runner"),
+        }
+    })
+    .await
+    .expect("the blocking work must start within the deadlock guard");
     drop(request);
 
     tokio::time::timeout(Duration::from_secs(10), async {
