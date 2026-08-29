@@ -1709,17 +1709,11 @@ mod freshness_version_tests {
 
     #[test]
     fn light_pass_with_unreachable_query_endpoint_defers() {
-        // Ephemeral watcher pass, `query_endpoint` set but the server is DOWN (a closed port) → the
-        // probe embed's connect is refused, so defer (SkipEphemeral), NOT embed-and-fail into
+        // Ephemeral watcher pass, `query_endpoint` set to port zero (which no server listens on) →
+        // the probe embed's connect is refused, so defer (SkipEphemeral), NOT embed-and-fail into
         // `Failed` chunk_embeddings, and without paying an O(repo) candidate scan first.
         let conn = schema_conn();
-        let closed = {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = listener.local_addr().unwrap().port();
-            drop(listener); // the port now refuses connections
-            format!("http://127.0.0.1:{port}")
-        };
-        activate_ephemeral_with_query_endpoint(&conn, Some(&closed));
+        activate_ephemeral_with_query_endpoint(&conn, Some("http://127.0.0.1:0"));
         seed_embedding_chunk(&conn, 1);
         assert!(matches!(ephemeral_light_acquire(&conn), ChunkEmbedder::SkipEphemeral));
     }
