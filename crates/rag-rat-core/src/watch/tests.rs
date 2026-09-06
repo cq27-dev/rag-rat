@@ -226,6 +226,7 @@ fn activate_ephemeral_model(config: &Config, repo_id: &str, query_endpoint: Opti
 #[derive(Debug, Default)]
 struct RecordingWatcher {
     watched: Vec<(PathBuf, RecursiveMode)>,
+    unwatched: Vec<PathBuf>,
 }
 
 impl notify::Watcher for RecordingWatcher {
@@ -244,7 +245,8 @@ impl notify::Watcher for RecordingWatcher {
         Ok(())
     }
 
-    fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        self.unwatched.push(path.to_path_buf());
         Ok(())
     }
 
@@ -275,6 +277,270 @@ impl notify::Watcher for FailingWatcher {
     fn kind() -> notify::WatcherKind {
         notify::WatcherKind::NullWatcher
     }
+}
+
+/// Re-placing a tree must not register a path notify already watches. The watcher re-places
+/// routinely — the linked-worktree trees after every pass, the base tree on every `.gitignore`
+/// edit — and Windows' `ReadDirectoryChangesW` backend does not release the previous watch when a
+/// path is registered again: each duplicate strands a directory handle, a semaphore and a 16 KiB
+/// read request, so an unguarded re-place grows handles and memory for as long as the watcher runs
+/// (#1269). A directory that REAPPEARS is the exception — its old watch is on a handle that no
+/// longer refers to it, so placement must run again.
+#[test]
+fn re_placing_a_tree_does_not_register_an_already_watched_path_twice() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let scratch = scratch_root(format!("ragrat-watch-dedup-{}-{id}", std::process::id()));
+    std::fs::create_dir_all(scratch.join("src/inner")).unwrap();
+    let scratch = scratch.canonicalize().unwrap();
+    let target_dirs = vec![PathBuf::from(".")];
+    let (config, root) = whole_root_config(&scratch, &target_dirs);
+    let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
+
+    let counters = placement_counters();
+    let mut watcher = RecordingWatcher::default();
+    watch_tree_pruned(&mut watcher, &counters, &root, &ignore);
+    let first = watcher.watched.clone();
+    assert!(first.len() >= 3, "the first placement walks the tree: {first:?}");
+
+    watch_tree_pruned(&mut watcher, &counters, &root, &ignore);
+    assert_eq!(
+        watcher.watched, first,
+        "re-placing an unchanged tree must not hand notify a single duplicate registration",
+    );
+    assert_eq!(
+        counters.counts().0,
+        first.len() as u64,
+        "a skipped duplicate is not a placement attempt either",
+    );
+
+    // The nested directory is deleted and recreated: the recorded watch is on a dead handle, so
+    // the create event has to re-place it rather than trust the record.
+    let recreated = root.join("src/inner");
+    std::fs::remove_dir_all(&recreated).unwrap();
+    std::fs::create_dir(&recreated).unwrap();
+    let create = Event::new(EventKind::Create(CreateKind::Folder)).add_path(recreated.clone());
+    assert!(
+        watch_created_dirs(
+            &mut watcher,
+            &counters,
+            &create,
+            &config,
+            &target_dirs,
+            &mut ignore,
+            None
+        ),
+        "a recreated directory below a target is a placement",
+    );
+    assert!(
+        watcher.watched[first.len()..].iter().any(|(path, _)| path == &recreated),
+        "the recreated directory is watched again: {:?}",
+        &watcher.watched[first.len()..],
+    );
+    assert!(
+        watcher.unwatched.contains(&recreated),
+        "the dead registration is handed back, not merely forgotten: {:?}",
+        watcher.unwatched,
+    );
+}
+
+/// A backend rescan means events were DROPPED, so a watched directory could have been deleted and
+/// recreated without a create event ever arriving — every placement record is suspect. The watcher
+/// must retire the records (handing the watches back to notify, not merely forgetting them, so the
+/// dead registrations are released rather than duplicated) and rebuild. The rebuild has to be as
+/// COMPLETE as the retire: the `.gitignore` rule directories, the fleet binary's parent and the
+/// worktree registry are placed nowhere but the initial placement, so re-placing only the
+/// configured trees would leave a whole category dark for the rest of the process's life (#1269).
+#[test]
+fn a_rescan_retires_every_placement_and_rebuilds_the_full_watch_state() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let scratch = scratch_root(format!("ragrat-watch-rescan-{}-{id}", std::process::id()));
+    let linked = scratch_root(format!("ragrat-watch-rescan-linked-{}-{id}", std::process::id()));
+    std::fs::create_dir_all(scratch.join("src")).unwrap();
+    rag_rat_base::test_git::run(&scratch, &["init", "-q"]);
+    rag_rat_base::test_git::run(&scratch, &["config", "user.email", "t@e"]);
+    rag_rat_base::test_git::run(&scratch, &["config", "user.name", "t"]);
+    std::fs::write(scratch.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    rag_rat_base::test_git::run(&scratch, &["add", "-A"]);
+    rag_rat_base::test_git::run(&scratch, &["commit", "-qm", "seed"]);
+    let linked_arg = linked.to_string_lossy().into_owned();
+    rag_rat_base::test_git::run(&scratch, &["worktree", "add", "-q", "-b", "feature", &linked_arg]);
+
+    let fleet_bin = scratch.join("bin/rag-rat");
+    std::fs::create_dir_all(fleet_bin.parent().unwrap()).unwrap();
+    let scratch = scratch.canonicalize().unwrap();
+    let target_dirs = vec![PathBuf::from("src")];
+    let (config, root) = whole_root_config(&scratch, &target_dirs);
+    let mut ignore = IgnoreMatcher::compile(&root, &target_dirs);
+    let counters = placement_counters();
+    let mut watcher = RecordingWatcher::default();
+    let mut linked_worktrees = LinkedWorktreeWatches::default();
+
+    let (_, registry) = place_initial_watch_state(
+        &mut watcher,
+        &counters,
+        &config,
+        &target_dirs,
+        &ignore,
+        Some(fleet_bin.as_path()),
+    );
+    let placed = watcher.watched.clone();
+    let registry = registry.expect("a git checkout has a worktree registry");
+    for expected in [root.join("src"), fleet_bin.parent().unwrap().to_path_buf(), registry.clone()]
+    {
+        assert!(
+            placed.iter().any(|(path, _)| path == &expected),
+            "{expected:?} is watched by the initial placement: {placed:?}",
+        );
+    }
+
+    let rebuilt_registry = rebuild_watch_state_after_rescan(
+        &mut watcher,
+        &counters,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        &mut linked_worktrees,
+        Some(fleet_bin.as_path()),
+    );
+    assert_eq!(
+        rebuilt_registry.as_ref(),
+        Some(&registry),
+        "the rebuild hands back the registry for the caller to classify against",
+    );
+
+    for (path, _) in &placed {
+        assert!(
+            watcher.unwatched.contains(path),
+            "a rescan hands {path:?} back to notify instead of stranding it: {:?}",
+            watcher.unwatched,
+        );
+    }
+    let rebuilt = &watcher.watched[placed.len()..];
+    for (path, mode) in &placed {
+        assert!(
+            rebuilt.contains(&(path.clone(), *mode)),
+            "a rescan re-places {path:?} — every category, not just the configured trees: \
+             {rebuilt:?}",
+        );
+    }
+}
+
+/// A directory that goes away must drop its placement record. Only a reappearance at the same
+/// path, a departed checkout or a backend rescan retires anything otherwise, so a repo that churns
+/// uniquely-named directories under a target would grow the map by one key per directory for the
+/// life of the watcher (#1269). The record is dropped only when the path is really gone — a remove
+/// event racing a recreate must not strip a live directory of its watch.
+#[test]
+fn a_removed_directory_drops_its_placement_record() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let scratch = scratch_root(format!("ragrat-watch-removed-{}-{id}", std::process::id()));
+    std::fs::create_dir_all(scratch.join("src/gone")).unwrap();
+    std::fs::create_dir_all(scratch.join("src/stays")).unwrap();
+    let scratch = scratch.canonicalize().unwrap();
+    let target_dirs = vec![PathBuf::from("src")];
+    let (config, root) = whole_root_config(&scratch, &target_dirs);
+    let ignore = IgnoreMatcher::compile(&root, &target_dirs);
+    let counters = placement_counters();
+    let mut watcher = RecordingWatcher::default();
+    let mut linked = LinkedWorktreeWatches::default();
+
+    watch_configured_trees(&mut watcher, &counters, &config, &target_dirs, &ignore);
+    let gone = root.join("src/gone");
+    let stays = root.join("src/stays");
+    assert!(watcher.watched.iter().any(|(path, _)| path == &gone), "{:?}", watcher.watched);
+
+    // Still present: a remove event that races a recreate must leave the live watch alone.
+    let mut ignore = ignore;
+    let racing = Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(stays.clone());
+    event_requests_maintenance(
+        &mut watcher,
+        &counters,
+        &racing,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        &mut linked,
+        None,
+    );
+    assert!(
+        !watcher.unwatched.contains(&stays),
+        "a directory that still exists keeps its watch: {:?}",
+        watcher.unwatched,
+    );
+
+    // Actually gone: the record is retired, so a later directory at that path is watched afresh.
+    std::fs::remove_dir_all(&gone).unwrap();
+    let removed = Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(gone.clone());
+    event_requests_maintenance(
+        &mut watcher,
+        &counters,
+        &removed,
+        &config,
+        &target_dirs,
+        &mut ignore,
+        &mut linked,
+        None,
+    );
+    assert!(
+        watcher.unwatched.contains(&gone),
+        "the departed directory's watch is handed back: {:?}",
+        watcher.unwatched,
+    );
+
+    std::fs::create_dir(&gone).unwrap();
+    let before = watcher.watched.len();
+    watch_configured_trees(&mut watcher, &counters, &config, &target_dirs, &ignore);
+    assert!(
+        watcher.watched[before..].iter().any(|(path, _)| path == &gone),
+        "a re-place after the retire watches the path again: {:?}",
+        &watcher.watched[before..],
+    );
+}
+
+/// `git worktree remove` deletes the checkout directory, taking its watches with it; a later `add`
+/// can recreate the very same path. The placement records must not survive that round trip, or the
+/// restored checkout is skipped as already watched and never observed again (#1269).
+#[test]
+fn a_linked_checkout_removed_and_re_added_at_the_same_path_is_watched_again() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let scratch = scratch_root(format!("ragrat-watch-readd-{}-{id}", std::process::id()));
+    std::fs::create_dir_all(scratch.join("wt/src")).unwrap();
+    let scratch = scratch.canonicalize().unwrap();
+    let target_dirs = vec![PathBuf::from("src")];
+    let (config, root) = whole_root_config(&scratch, &target_dirs);
+    let checkout = root.join("wt");
+    let counters = placement_counters();
+    let mut watcher = RecordingWatcher::default();
+    let mut worktrees = LinkedWorktreeWatches::default();
+
+    worktrees.sync(&mut watcher, &counters, &config, vec![checkout.clone()]);
+    let placed = watcher.watched.clone();
+    assert!(placed.iter().any(|(path, _)| path.starts_with(&checkout)), "{placed:?}");
+
+    // Removed: the checkout leaves the set, and its watches die with the directory.
+    worktrees.sync(&mut watcher, &counters, &config, Vec::new());
+    assert!(
+        watcher.unwatched.iter().any(|path| path.starts_with(&checkout)),
+        "a departed checkout's watches are handed back: {:?}",
+        watcher.unwatched,
+    );
+
+    // Re-added at the same path.
+    let before = watcher.watched.len();
+    worktrees.sync(&mut watcher, &counters, &config, vec![checkout.clone()]);
+    assert!(
+        watcher.watched[before..].iter().any(|(path, _)| path.starts_with(&checkout)),
+        "the restored checkout is watched again: {:?}",
+        &watcher.watched[before..],
+    );
 }
 
 /// A failed watch placement is COUNTED (so `index_status` can surface silent degradation), and the

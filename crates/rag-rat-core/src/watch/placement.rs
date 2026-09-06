@@ -1,6 +1,7 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RemoveKind, RenameMode};
@@ -24,6 +25,9 @@ use crate::index::target_for_path;
 /// in [`watch_tree_pruned`], its whole unwalked subtree) then silently falls back to the periodic
 /// sweep. These counters make that fallback *observable*. Interior atomics so the shared `&self`
 /// can be read on the pass thread while the event-loop thread records placements concurrently.
+///
+/// It also carries the set of watches this watcher has live, which is what keeps a re-placement
+/// pass from registering an already-watched path a second time (#1269).
 #[derive(Debug, Default)]
 pub(crate) struct WatchPlacementCounters {
     attempts: AtomicU64,
@@ -32,6 +36,17 @@ pub(crate) struct WatchPlacementCounters {
     /// (instance-local), NOT on the persisted high-water mark — a restarted watcher whose fresh
     /// count is below a prior high-water still has real new failures to log.
     last_warned: AtomicU64,
+    /// Live placements, so a path already watched at the SAME recursive mode is never registered
+    /// twice. `notify::Watcher::watch` is idempotent on inotify and FSEvents, but the Windows
+    /// `ReadDirectoryChangesW` backend stores a fresh watch state over the old one without
+    /// releasing it — every duplicate strands a directory handle, a semaphore, and the pending
+    /// 16 KiB read request (#1269). Re-placement is routine here, not exceptional: the
+    /// linked-worktree trees are re-placed after every pass and the base tree on every
+    /// `.gitignore` edit, so unguarded duplicates grow handles and memory without bound for as
+    /// long as the watcher runs. A record that stops being trustworthy is retired — unwatched,
+    /// then dropped — by [`retire_placements`], so the path is watched again on a live handle
+    /// instead of trusting the dead one.
+    placed: Mutex<BTreeMap<PathBuf, RecursiveMode>>,
 }
 
 impl WatchPlacementCounters {
@@ -62,21 +77,124 @@ impl WatchPlacementCounters {
         let prior = self.last_warned.fetch_max(current, Ordering::Relaxed);
         (current > prior).then_some(current)
     }
+
+    /// The recursive mode `path` is currently watched at, if any. A poisoned lock answers `None`,
+    /// so the worst case is the unguarded re-registration this repo had before.
+    fn placed_mode(&self, path: &Path) -> Option<RecursiveMode> {
+        self.placed.lock().ok().and_then(|placed| placed.get(path).copied())
+    }
+
+    fn record_placed(&self, path: &Path, mode: RecursiveMode) {
+        if let Ok(mut placed) = self.placed.lock() {
+            placed.insert(path.to_path_buf(), mode);
+        }
+    }
+
+    /// Drop every record at or below `prefix` — or ALL of them when `prefix` is `None` — and hand
+    /// the paths back so the caller can unwatch them. Taking them out under the lock and
+    /// unwatching outside it keeps the notify call off this mutex.
+    fn take_placed_under(&self, prefix: Option<&Path>) -> Vec<PathBuf> {
+        let Ok(mut placed) = self.placed.lock() else {
+            return Vec::new();
+        };
+        let taken: Vec<PathBuf> = placed
+            .keys()
+            .filter(|watched| prefix.is_none_or(|prefix| watched.starts_with(prefix)))
+            .cloned()
+            .collect();
+        for path in &taken {
+            placed.remove(path);
+        }
+        taken
+    }
 }
 
-/// Place one non-recursive watch, counting the outcome into `counters`; returns `true` on success.
-/// EVERY `.watch()` in this module goes through here so a swallowed failure is still counted.
-/// Behavior is unchanged — a failed watch still falls back to the sweep exactly as before; only its
-/// visibility changes.
+/// Hand every watch at or below `path` — or EVERY watch, when `path` is `None` — back to notify
+/// and drop its record, so the next placement registers afresh instead of trusting a record that
+/// may describe a dead watch.
+///
+/// Unwatching rather than merely forgetting is the point: notify still holds the old registration,
+/// and on Windows re-`watch()`ing over a live entry is what strands its handles (#1269). Retiring
+/// first is therefore both the correctness fix (the recreated path IS re-watched) and the leak fix
+/// (the dead watch is released instead of duplicated).
+///
+/// Called wherever a record stops being trustworthy: a directory that reappeared under a name we
+/// already watch, a directory that went away ([`retire_removed_dirs`]), a linked checkout that
+/// left the worktree set (`git worktree remove` may be followed by an `add` at the same path), a
+/// backend rescan (events were dropped, so any disappearance inside that window went unseen), and
+/// a mode change on an existing watch.
+///
+/// The record is taken out from under the lock BEFORE `unwatch`, so the notify call never runs
+/// while the mutex is held. A failed `unwatch` therefore leaves no record behind — which is the
+/// right outcome, because the only way it fails is that notify was not holding the watch, and
+/// re-registering a path the backend has already dropped strands nothing.
+fn retire_placements(
+    watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
+    path: Option<&Path>,
+) {
+    for retired in counters.take_placed_under(path) {
+        // The directory is usually already gone — that is why we are retiring it — and the backend
+        // may have dropped the watch itself. Either way there is nothing to recover from the error.
+        let _ = watcher.unwatch(&retired);
+    }
+}
+
+/// Retire the records for directories an event says are GONE, so the map does not grow one entry
+/// per created-and-deleted directory for the life of the watcher. Without this only a reappearance
+/// at the same path, a departed checkout or a rescan ever removes anything, and a repo that churns
+/// uniquely-named directories under a target would accumulate keys indefinitely.
+///
+/// Gated on the path actually being absent: a `Remove` names a path that is gone, but the same
+/// event can race a recreate, and retiring a live directory would drop a watch that only a later
+/// re-place would restore. A rename AWAY (`RenameMode::From`) is a removal from this watcher's
+/// point of view. `RenameMode::Both` is deliberately left alone — its second path is the
+/// destination, which [`watch_created_dirs`] retires and re-places.
+fn retire_removed_dirs(
+    watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
+    event: &Event,
+) {
+    let dir_left = matches!(event.kind, EventKind::Remove(_))
+        || matches!(event.kind, EventKind::Modify(ModifyKind::Name(RenameMode::From)));
+    if !dir_left {
+        return;
+    }
+    for path in &event.paths {
+        if path.try_exists().unwrap_or(true) {
+            continue;
+        }
+        retire_placements(watcher, counters, Some(path));
+    }
+}
+
+/// Place one non-recursive watch, counting the outcome into `counters`; returns `true` on success
+/// or when the watch is already live. EVERY `.watch()` in this module goes through here so a
+/// swallowed failure is still counted and no path is registered twice (#1269). A failed watch
+/// still falls back to the sweep exactly as before.
 fn place_watch(
     watcher: &mut impl notify::Watcher,
     counters: &WatchPlacementCounters,
     path: &Path,
     mode: RecursiveMode,
 ) -> bool {
+    match counters.placed_mode(path) {
+        Some(current) if current == mode => return true,
+        // A mode change REPLACES the watch: hand the old registration back first, or notify
+        // strands it exactly as a duplicate would. Only this entry — descendants hold their own
+        // watches, which this call does not re-place, so retiring them would leave them dark.
+        // `record_placed` below overwrites the record with the new mode.
+        Some(_) => {
+            let _ = watcher.unwatch(path);
+        },
+        None => {},
+    }
     counters.record_attempt();
     match watcher.watch(path, mode) {
-        Ok(()) => true,
+        Ok(()) => {
+            counters.record_placed(path, mode);
+            true
+        },
         Err(_) => {
             // Only a watch that failed on a directory that EXISTS is a silently-dropped watch (the
             // ENOSPC / inotify-exhaustion case this signal is for). A watch that failed because the
@@ -290,6 +408,21 @@ impl LinkedWorktreeWatches {
         base_config: &Config,
         checkout_roots: Vec<PathBuf>,
     ) {
+        // A checkout that leaves the set can come back at the SAME path — `git worktree remove`
+        // deletes the directory, a later `add` recreates it — and the watches did not survive the
+        // removal. Retire the departed roots so a re-add places watches instead of skipping them
+        // as already live (#1269).
+        let retained: BTreeSet<&Path> = checkout_roots.iter().map(PathBuf::as_path).collect();
+        let departed: Vec<PathBuf> = self
+            .states
+            .iter()
+            .map(|state| state.checkout_root.clone())
+            .filter(|root| !retained.contains(root.as_path()))
+            .collect();
+        for root in departed {
+            retire_placements(watcher, counters, Some(&root));
+        }
+
         let mut states = Vec::with_capacity(checkout_roots.len());
         for root in checkout_roots {
             let state = LinkedWorktreeWatch::new(base_config, root);
@@ -592,6 +725,10 @@ pub(crate) fn watch_created_dirs(
         if !is_real_dir {
             continue;
         }
+        // This directory is NEW — created, or moved in over a deleted one — so any watch recorded
+        // for it or below it is on a handle that no longer refers to this tree. Retire those or
+        // the placements below would be skipped as already live (#1269).
+        retire_placements(watcher, counters, Some(path));
         match created_dir_placement(config, target_dirs, path, bootstrap_root) {
             CreatedDirPlacement::OutsideTargets => continue,
             CreatedDirPlacement::TargetAncestor => {
@@ -621,6 +758,42 @@ pub(crate) fn watch_created_dirs(
         }
     }
     placed_target_watch
+}
+
+/// Rebuild every watch this watcher holds, after a backend rescan.
+///
+/// A rescan means events were DROPPED, so a watched directory may have been deleted and recreated
+/// without a create event ever arriving: every placement record is suspect, and a stale one would
+/// suppress the re-placement that recovers such a directory (a watcher with the periodic sweep
+/// disabled would then never see it again). Retiring hands the watches back to notify rather than
+/// merely forgetting them, so nothing is stranded (#1269).
+///
+/// The rebuild goes through [`place_initial_watch_state`] — the SAME placement the watcher boots
+/// with — because a retire that is not matched by an equally complete re-place silently drops a
+/// whole category of watch. The `.gitignore` rule directories, the fleet binary's parent and the
+/// worktree registry are placed nowhere else, so re-placing only the configured trees would leave
+/// them dark for the rest of the process's life.
+///
+/// Returns the rebuilt worktree registry, which the caller must ADOPT: the registry path is
+/// derived from the repo, and a root that was not a Git checkout when the watcher booted has one
+/// now. Classifying later events against the boot-time value would watch the registry the rebuild
+/// just placed while never attributing its events.
+#[must_use]
+pub(crate) fn rebuild_watch_state_after_rescan(
+    watcher: &mut impl notify::Watcher,
+    counters: &WatchPlacementCounters,
+    config: &Config,
+    target_dirs: &[PathBuf],
+    ignore: &mut IgnoreMatcher,
+    linked_worktrees: &mut LinkedWorktreeWatches,
+    fleet_bin: Option<&Path>,
+) -> Option<PathBuf> {
+    retire_placements(watcher, counters, None);
+    *ignore = IgnoreMatcher::compile(&config.root, target_dirs);
+    let (rebuilt, registry) =
+        place_initial_watch_state(watcher, counters, config, target_dirs, ignore, fleet_bin);
+    *linked_worktrees = rebuilt;
+    registry
 }
 
 pub(crate) fn place_initial_watch_state(
@@ -666,6 +839,7 @@ pub(crate) fn event_requests_maintenance(
     linked_worktrees: &mut LinkedWorktreeWatches,
     worktree_registry: Option<&Path>,
 ) -> Option<OverlayScope> {
+    retire_removed_dirs(watcher, counters, event);
     let created_dir_watch_placed =
         watch_created_dirs(watcher, counters, event, config, target_dirs, ignore, None);
     let linked_created_dir_roots = linked_worktrees.watch_created_dirs(watcher, counters, event);
