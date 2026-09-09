@@ -82,6 +82,9 @@ pub(crate) enum Command {
     /// Run the stdio MCP server.
     Mcp,
 
+    /// Invoke repository intelligence tools directly, without requiring an MCP client or server.
+    Tools(ToolsArgs),
+
     /// Serve the authenticated editor Lens HTTP API.
     Serve(ServeArgs),
 
@@ -188,6 +191,14 @@ pub(crate) enum AgentHookHarnessArg {
     Auto,
     Cursor,
     Vscode,
+}
+
+#[derive(Debug, Args)]
+#[command(disable_help_flag = true, trailing_var_arg = true)]
+pub(crate) struct ToolsArgs {
+    /// Tool command and arguments. Run `rag-rat tools --help` to inspect the generated catalog.
+    #[arg(value_name = "TOOL_ARGS", num_args = 0.., allow_hyphen_values = true)]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1121,6 +1132,25 @@ mod tests {
 
         let flagged = Cli::try_parse_from(["rag-rat", "query", "foo", "--json"]).expect("parse");
         assert!(flagged.json, "--json must be accepted globally, after the subcommand");
+    }
+
+    #[test]
+    fn tools_namespace_captures_dynamic_subcommand_arguments() {
+        let cli = Cli::try_parse_from([
+            "rag-rat",
+            "tools",
+            "find-callers",
+            "--symbol",
+            "parse_config",
+            "--limit",
+            "20",
+        ])
+        .expect("parse tools namespace");
+        match cli.command {
+            Command::Tools(ToolsArgs { args }) =>
+                assert_eq!(args, ["find-callers", "--symbol", "parse_config", "--limit", "20"]),
+            other => panic!("expected tools namespace, got {other:?}"),
+        }
     }
 
     #[test]

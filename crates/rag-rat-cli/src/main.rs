@@ -72,14 +72,18 @@ fn main() -> anyhow::Result<()> {
     configure_jemalloc();
     let cli = Cli::parse();
 
-    // Pin the process-wide output format from the global flag before any command runs, so
+    // Pin the process wide output format from the global flag before normal commands run, so
     // `print_output` renders TOON by default and JSON under `--json` without threading the format
-    // through every command signature.
-    set_output_format(if cli.json {
-        rag_rat_core::OutputFormat::Json
-    } else {
-        rag_rat_core::OutputFormat::Toon
-    });
+    // through every command signature. `tools` owns a second stage dynamic parser so flags after
+    // `tools` (including its inherited `--json`) are intentionally resolved there before the
+    // OnceLock is set.
+    if !matches!(&cli.command, Cmd::Tools(_)) {
+        set_output_format(if cli.json {
+            rag_rat_core::OutputFormat::Json
+        } else {
+            rag_rat_core::OutputFormat::Toon
+        });
+    }
 
     // These commands must tolerate the ABSENCE of a config: `init` creates one; `agent-hook`
     // reads its event from stdin; `mcp` serves a dormant server so a globally-registered MCP stays
@@ -95,6 +99,7 @@ fn main() -> anyhow::Result<()> {
         // agent-hook.
         Cmd::EditReindex(args) => return agent_hook::edit_reindex::run(&args.cwd, &args.paths),
         Cmd::Mcp => return run_mcp(cli.config.as_deref(), cli.json),
+        Cmd::Tools(args) => return run_tools(cli.config.as_deref(), cli.json, &args.args),
         Cmd::Doctor(args) => return run_doctor(args, cli.config.as_deref()),
         // `status` is a cross-repo view of the consolidated global store, so — like `doctor` — it
         // tolerates config absence: outside a rag-rat repo it still reports the machine-global
@@ -123,7 +128,8 @@ fn main() -> anyhow::Result<()> {
         | Cmd::Mcp
         | Cmd::Doctor(_)
         | Cmd::Status
-        | Cmd::Rm(_) => unreachable!("handled before the config load above"),
+        | Cmd::Rm(_)
+        | Cmd::Tools(_) => unreachable!("handled before the config load above"),
         Cmd::Index(args) => index(&config, &args)?,
         Cmd::Query(args) => query(&config, &args)?,
         Cmd::Brief(args) => brief(&config, &args)?,

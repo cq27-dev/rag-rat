@@ -21,6 +21,7 @@ mod runtime_env;
 mod search;
 mod status;
 mod sync;
+mod tools;
 
 pub(crate) use clones::{clones, clones_for};
 pub(crate) use config_info::{dump_config, version_check};
@@ -41,3 +42,4 @@ pub(crate) use runtime_env::apply_embedding_runtime_env;
 pub(crate) use search::{brief, clusters, important_symbols, query};
 pub(crate) use status::status;
 pub(crate) use sync::sync;
+pub(crate) use tools::run_tools;

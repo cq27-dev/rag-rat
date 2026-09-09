@@ -52,12 +52,51 @@ specific profile, and `rag-rat mcp --json` switches tool results from TOON to JS
 To run from a checkout without installing, use a project-scoped server whose command is
 `cargo run --manifest-path /path/to/rag-rat/Cargo.toml --bin rag-rat -- mcp`.
 
+## Native CLI
+
+MCP is one way to expose the catalog, but it is not required to use it. The same tools are also
+available as ordinary CLI subcommands for shells, CI, agents, and subprocess automation:
+
+```bash
+rag-rat tools semantic-search --query "config reload" --limit 5
+rag-rat tools find-callers --symbol parse_config --limit 20
+rag-rat --json tools impact-surface --symbol parse_config
+```
+
+The native surface is generated from the same canonical catalog and JSON schemas served by MCP
+`tools/list`. Execution calls the same `call_tool_for_config` path used by MCP `tools/call`, directly
+in the current process. No MCP server or client is started, and there is no second set of handlers or
+argument definitions. Existing curated top level commands such as `query`, `brief`, `memory`, and
+`dream` remain unchanged. `tools` exposes every catalog entry.
+
+Tool names and argument names use normal CLI kebab case (`find_callers` becomes `find-callers`,
+`full_memories` becomes `--full-memories`). Discovery follows the normal CLI help model:
+
+```bash
+rag-rat tools --help
+rag-rat tools find-callers --help
+```
+
+Machine readable discovery is available without a repository config:
+
+```bash
+rag-rat --json tools --schema
+rag-rat --json tools find-callers --schema
+```
+
+Actual invocations use normal `rag-rat.toml` discovery or the global `--config`. Primitive, enum,
+boolean, and string or enum array fields become native flags. String and enum arrays accept repeated
+or comma separated values. A bare array flag represents an explicit empty list. Nested, polymorphic,
+or otherwise complex values stay as JSON arguments. Callers that need the exact canonical object can
+use `--arguments-json '<object>'`.
+
 ## Tools
 
-The MCP surface is **47 tools** in nine groups. The signatures are below; the prose sections that
-follow describe response shapes and per-tool behavior. Every read tool additionally accepts an
-optional `"worktree": string` — an absolute path to a linked git worktree, served as a branch
-overlay over the indexed checkout — omitted from the signatures below for brevity. The write tools
+The catalog is **47 tools** in nine groups. The signatures below use canonical MCP snake_case.
+The native CLI exposes the same names in kebab case under `rag-rat tools` and derives its flags from
+the same schemas. Every read tool also accepts an optional `"worktree": string`, an absolute path to
+a linked git worktree served as a branch overlay over the indexed checkout. It is omitted from the
+signatures below for brevity. The write tools
 and `compare_graph_to_text` do not: they stay scoped to the indexed checkout, so they neither
 declare the parameter nor honor one.
 
@@ -168,14 +207,12 @@ used by the handlers. Existing tool names and response fields are kept stable fo
 
 ### Response encoding (TOON)
 
-Tool **results** are returned as **TOON** (Token-Oriented Object Notation), not JSON. TOON is a
-token-efficient text encoding that renders uniform result rows (caller lists, symbol candidates,
-clusters) as a dense `[N]{cols}:` table — measured ~30% smaller than compact JSON on those payloads,
-and never larger in practice (it ties compact JSON on nested shapes). Because MCP results are text
-content consumed by an LLM, the denser encoding is both valid and cheaper. There is no per-call flag;
-MCP output is always TOON. The JSON snippets below describe the **logical shape** of each response —
-the same fields, just shown in JSON for readability. (The `rag-rat` CLI mirrors this: it defaults to
-TOON and takes a global `--json` flag for JSON output.)
+Tool **results** default to **TOON**, not JSON. TOON renders
+uniform result rows such as callers, symbol candidates, and clusters as dense `[N]{cols}:` tables.
+On those payloads it measured about 30% smaller than compact JSON and was never larger in practice.
+MCP has no per call format flag, so launch `rag-rat mcp --json` when the client requires JSON. Native
+`rag-rat tools <name>` follows the CLI format setting: TOON by default and JSON with `--json`. The
+snippets below show the logical response shapes in JSON for readability.
 
 `symbol_lookup` is the candidate-selection step for symbol-shaped tools. It returns:
 
