@@ -652,9 +652,9 @@ fn applied_snapshot(
 /// publish stamps beside them — which only the sweep emits, and only for anchors published before
 /// the hash op existed.
 ///
-/// The hash is applied on its own change, so a hash published for a set this store already holds
-/// lands without touching the bindings. That pairs safely because a rebind always publishes the
-/// hash beside the anchors — an explicit empty one when the new target has none (see
+/// The hash is applied when it or the set changes, so a hash published for a set this store already
+/// holds lands without touching the bindings. That pairs safely because a rebind always publishes
+/// the hash beside the anchors — an explicit empty one when the new target has none (see
 /// `author_anchors`) — so the register never outlives the set it describes. Every change is
 /// recorded in `source_hash_applied`, apart from the stamped `source_text_hash`, so a rebind made
 /// here keeps its own hash until the author publishes something new — even one made after a hash
@@ -679,7 +679,8 @@ fn apply_published_anchors(
     // it. Only the record-only branch can find out they are not.
     let mut authors_bindings = true;
     let digest = anchor_snapshot_digest(&node.node_id, anchors);
-    if applied.digest.as_deref() != Some(digest.as_str()) {
+    let set_changed = applied.digest.as_deref() != Some(digest.as_str());
+    if set_changed {
         let held = held_bindings(tx, repo_id, &node.node_id)?;
         if applied.digest.is_none() && !held.is_empty() {
             authors_bindings = held.iter().all(|(kind, id)| {
@@ -696,7 +697,11 @@ fn apply_published_anchors(
         )?;
     }
     let published = published_source_hash(repo_id, node);
-    if published != applied.hash.as_deref() {
+    // Reconsidered when the SET changes, not only the hash: a new set can give an unchanged hash
+    // its first binding. A memory bound only to a chunk (never seeded here) takes no stamp, and a
+    // rebind to the symbol over the same text republishes the same hash — gating on the hash alone
+    // would leave that memory without one for good.
+    if set_changed || published != applied.hash.as_deref() {
         let holds_binding = memory_has_any_binding(tx, repo_id, &node.node_id)?;
         if !holds_binding || authors_bindings {
             let stamp = published.filter(|_| holds_binding);
@@ -763,8 +768,8 @@ fn published_source_hash<'a>(repo_id: &str, node: &'a ProjectedContentNode) -> O
 }
 
 /// Bring a memory's bindings to a published set BY IDENTITY — `(binding_kind, binding_id)`, the
-/// primary key — so whatever already matches is left exactly as it is, local resolution state
-/// included. A held row the set no longer names is deleted, with its call path when it is one; an
+/// primary key — so a row the set still names keeps its local resolution state while its target is
+/// unchanged. A held row the set no longer names is deleted, with its call path when it is one; an
 /// anchor the set names that is missing here is inserted when this store can resolve its kind.
 /// Returns whether any row moved.
 ///
@@ -806,6 +811,53 @@ fn converge_bindings(
             }
         }
         changed = true;
+    }
+    // The identity can survive a rebind whose target moved — a struct and its impl share a
+    // qualified name — and a row still resolving the old target would validate against text the
+    // published hash no longer describes. So a named row whose portable columns differ takes the
+    // author's values and drops its resolution, for the validate loop to redo. `created_at_ms` is
+    // written but not compared: every rebind restamps it, which says nothing about the target.
+    // Kinds this store never seeds are left alone — their checkout-local id IS their resolution,
+    // and clearing it would leave them unverified for good.
+    for anchor in anchors {
+        if !SEEDABLE_BINDING_KINDS.contains(&anchor.binding_kind.as_str())
+            || !held
+                .iter()
+                .any(|(kind, id)| *kind == anchor.binding_kind && *id == anchor.binding_id)
+        {
+            continue;
+        }
+        changed |= tx.execute(
+            "UPDATE repo_memory_bindings
+             SET path = ?5, start_line = ?6, end_line = ?7, commit_hash = ?8, tracker = ?9,
+                 project = ?10, item_key = ?11, symbol_kind = ?12, signature_hash = ?13,
+                 moniker_tool = ?14, moniker_tool_version = ?15, created_at_ms = ?16,
+                 logical_symbol_id = NULL, symbol_id = NULL, chunk_id = NULL, edge_id = NULL,
+                 anchor_status = 'unverified', relocation_reason = NULL,
+                 downgrade_pending_at_ms = NULL
+             WHERE repo_id = ?1 AND memory_id = ?2 AND binding_kind = ?3 AND binding_id = ?4
+               AND (path, start_line, end_line, commit_hash, tracker, project, item_key,
+                    symbol_kind, signature_hash, moniker_tool, moniker_tool_version)
+                   IS NOT (?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                repo_id,
+                memory_id,
+                anchor.binding_kind,
+                anchor.binding_id,
+                anchor.path,
+                anchor.start_line,
+                anchor.end_line,
+                anchor.commit_hash,
+                anchor.tracker,
+                anchor.project,
+                anchor.item_key,
+                anchor.symbol_kind,
+                anchor.signature_hash,
+                anchor.moniker_tool,
+                anchor.moniker_tool_version,
+                anchor.created_at_ms,
+            ],
+        )? > 0;
     }
     let missing: Vec<rag_rat_oplog::PortableAnchor> = anchors
         .iter()
@@ -1828,6 +1880,95 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kept, ("current".to_string(), Some(42)));
+    }
+
+    /// Set one field of the first anchor in a projected node's published snapshot.
+    fn set_projected_anchor_field(
+        conn: &Connection,
+        stream: StreamId,
+        node_id: &str,
+        field: &str,
+        value: &str,
+    ) {
+        conn.execute(
+            "UPDATE content_projected_nodes
+             SET anchors_json = json_set(anchors_json, '$[0].' || ?3, ?4)
+             WHERE stream_id = ?1 AND node_id = ?2",
+            params![stream.to_bytes().as_slice(), node_id, field, value],
+        )
+        .unwrap();
+    }
+
+    /// A new set can give an unchanged hash its first binding. A memory bound only to a chunk,
+    /// which this store never seeds, takes no stamp; a rebind to the symbol over the same text
+    /// republishes the same hash. The stamp is reconsidered on the set's change, or the memory
+    /// would keep a NULL hash for good.
+    #[test]
+    fn a_changed_set_that_gives_the_hash_a_binding_stamps_it() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", Some(&[("chunk", "42")]));
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(source_hash_of(&conn, "mem_peer"), None, "nothing held for it to describe");
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::run".to_string()
+        )]);
+        assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_A.to_string()));
+    }
+
+    /// A binding's identity can survive a rebind whose target moved: a struct and its impl share a
+    /// qualified name, and only `symbol_kind` / `signature_hash` differ. The still-named row takes
+    /// the author's new values and drops the resolution it held for the old target, so the
+    /// validate loop re-resolves it instead of checking the new hash against the old text.
+    #[test]
+    fn a_still_named_binding_whose_target_moved_is_refreshed() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::Run")]),
+        );
+        set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "struct");
+        drain_worker(&conn, stream, 1_000);
+        conn.execute(
+            "UPDATE repo_memory_bindings SET anchor_status = 'current', symbol_id = 42
+             WHERE memory_id = 'mem_peer'",
+            [],
+        )
+        .unwrap();
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::Run")]),
+        );
+        set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "impl");
+        drain_worker(&conn, stream, 2_000);
+
+        let row: (Option<String>, String, Option<i64>) = conn
+            .query_row(
+                "SELECT symbol_kind, anchor_status, symbol_id FROM repo_memory_bindings
+                 WHERE memory_id = 'mem_peer'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (Some("impl".to_string()), "unverified".to_string(), None));
     }
 
     /// A rebind onto a target with no text behind it publishes an EMPTY hash, so the pre-rebind
