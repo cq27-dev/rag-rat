@@ -968,52 +968,79 @@ fn foreign_pull_targets(
     Ok(targets)
 }
 
-/// The peers to try for a foreign account, each paired with the relay that reaches it.
+/// The routes to try for ONE foreign account, each a node paired with the relay that reaches it.
 ///
-/// Configured peers come first and dial through the configured relay. A peer a subscription's
-/// locator recorded dials through the relay THAT locator named: a locator relay must reach the host
-/// it describes, yet this pass pulls every foreign account, so no single locator may choose the
-/// relay for the pass. Treating the configured relay as an override would never let a locator's
-/// relay win, since the shipped default is always present. A locator peer that duplicates a
-/// configured one — under any spelling, compared as raw node-id bytes — keeps the configured route.
+/// `subscribed` must be that account's own routes (`subscription_routing(conn, account)`).
+/// Configured peers come first, through the configured relay; each locator route dials through the
+/// relay its locator named — the shipped default relay is always present, so it can never act as an
+/// override without silencing every locator relay.
+///
+/// Only an EXACT duplicate collapses: the same node, under any spelling (compared as raw node-id
+/// bytes), through the same relay. A route never suppresses another that reaches the same node a
+/// different way, so a dead or hostile relay recorded for a node cannot shadow the one that works.
 pub fn foreign_pull_peers(
     configured_peers: &[String],
     configured_relay: &str,
     subscribed: &[(String, Option<String>)],
 ) -> Vec<(String, String)> {
-    let mut routes: Vec<(String, String)> =
-        configured_peers.iter().map(|peer| (peer.clone(), configured_relay.to_string())).collect();
-    for (peer, relay) in subscribed {
-        if routes.iter().any(|(known, _)| peer_identity(known) == peer_identity(peer)) {
-            continue;
-        }
+    let configured = configured_peers.iter().map(|peer| (peer.as_str(), configured_relay));
+    let from_locators = subscribed.iter().map(|(peer, relay)| {
         let relay = relay.as_deref().filter(|relay| !relay.trim().is_empty());
-        routes.push((peer.clone(), relay.unwrap_or(configured_relay).to_string()));
+        (peer.as_str(), relay.unwrap_or(configured_relay))
+    });
+    let mut routes: Vec<(String, String)> = Vec::new();
+    for (peer, relay) in configured.chain(from_locators) {
+        let duplicate = routes.iter().any(|(known, known_relay)| {
+            peer_identity(known) == peer_identity(peer) && known_relay.trim() == relay.trim()
+        });
+        if !duplicate {
+            routes.push((peer.to_string(), relay.to_string()));
+        }
     }
     routes
 }
 
-/// Resolve peers, in dial order, to addresses — each through the relay its route names.
+/// Each node the routes name, once, in first-seen order. The peer memo ranks NODES, and a node
+/// reachable through several relays is still one node.
+pub fn distinct_peers(routes: &[(String, String)]) -> Vec<String> {
+    let mut peers: Vec<String> = Vec::new();
+    for (peer, _) in routes {
+        if !peers.iter().any(|known| peer_identity(known) == peer_identity(peer)) {
+            peers.push(peer.clone());
+        }
+    }
+    peers
+}
+
+/// Resolve nodes, in dial order, to addresses — one per route that names the node.
 ///
-/// Both pull paths dial through here, so a relay a locator recorded cannot be dropped at one call
-/// site while the other keeps it. `order` may spell a node id differently from `routes` — the peer
-/// memo stores whichever spelling answered — so a route is found by node identity; a peer with no
-/// route dials through `fallback_relay`.
+/// A node named by several routes through different relays is dialed through each in turn, so a
+/// relay that does not reach it costs one failed attempt rather than the node. Both pull paths dial
+/// through here, so a relay a locator recorded cannot be dropped at one call site while the other
+/// keeps it. `order` may spell a node id differently from `routes` — the peer memo keeps whichever
+/// spelling answered — so routes are matched by node identity; a node with no route dials through
+/// `fallback_relay`.
 pub fn route_addrs(
     order: &[String],
     routes: &[(String, String)],
     fallback_relay: &str,
 ) -> Vec<(String, Result<rag_rat_sync::EndpointAddr, String>)> {
-    order
-        .iter()
-        .map(|peer| {
-            let relay = routes
-                .iter()
-                .find(|(route, _)| peer_identity(route) == peer_identity(peer))
-                .map_or(fallback_relay, |(_, relay)| relay.as_str());
-            (peer.clone(), rag_rat_sync::peer_addr(peer, relay).map_err(|e| e.to_string()))
-        })
-        .collect()
+    let mut resolved = Vec::new();
+    for peer in order {
+        let mut relays: Vec<&str> = routes
+            .iter()
+            .filter(|(route, _)| peer_identity(route) == peer_identity(peer))
+            .map(|(_, relay)| relay.as_str())
+            .collect();
+        if relays.is_empty() {
+            relays.push(fallback_relay);
+        }
+        for relay in relays {
+            let addr = rag_rat_sync::peer_addr(peer, relay).map_err(|e| e.to_string());
+            resolved.push((peer.clone(), addr));
+        }
+    }
+    resolved
 }
 
 /// Which peer answered for which foreign account, so quiet cycles dial ONE peer instead of
@@ -1075,25 +1102,28 @@ async fn pull_foreign_accounts(
         return Ok(());
     }
     let configured_relay = relay_url(config);
-    let routes = foreign_pull_peers(
-        &config.sync.server_peers,
-        &configured_relay,
-        &crate::memory_write::subscription_routing(conn)?,
-    );
-    if routes.is_empty() {
-        // Discovery cannot stand in: a foreign account's discovery tag derives from that
-        // account's own secret, which only its own devices hold.
-        tracing::warn!(
-            "cross-account sync has accounts to pull but no peer to pull from: set [sync] \
-             server_peers, or subscribe from a `.rag-rat-stream` that names the owner's host"
-        );
-        return Ok(());
-    }
-    let peers: Vec<String> = routes.iter().map(|(peer, _)| peer.clone()).collect();
     for target in targets {
         let account_hex = hash::hex_lower(&target.to_bytes());
+        // The TARGET account's own routes only: a locator describes how to reach the owner its
+        // repository subscribes to, so another subscription's routes are never tried for this
+        // account, and never allowed to displace a route toward it.
+        let routes = foreign_pull_peers(
+            &config.sync.server_peers,
+            &configured_relay,
+            &crate::memory_write::subscription_routing(conn, &account_hex)?,
+        );
+        if routes.is_empty() {
+            // Discovery cannot stand in: a foreign account's discovery tag derives from that
+            // account's own secret, which only its own devices hold.
+            tracing::warn!(
+                account = %account_hex,
+                "cross-account sync has an account to pull but no peer to pull it from: set \
+                 [sync] server_peers, or subscribe from a `.rag-rat-stream` that names its host"
+            );
+            continue;
+        }
         let memo_key = format!("{PULL_PEER_MEMO_PREFIX}{account_hex}");
-        let order = ordered_pull_peers(conn, &memo_key, &peers)?;
+        let order = ordered_pull_peers(conn, &memo_key, &distinct_peers(&routes))?;
         let ordered: Vec<(String, rag_rat_sync::EndpointAddr)> = route_addrs(
             &order,
             &routes,
@@ -1951,19 +1981,44 @@ mod tests {
         assert_eq!(routes, [(NODE_A.to_string(), LOCATOR_RELAY.to_string())]);
     }
 
-    /// Configured peers keep the configured relay; a locator peer naming no relay falls back to it;
-    /// and a locator peer that duplicates a configured one under another spelling is the same node,
-    /// so it keeps the configured route rather than being dialed twice.
+    /// Only an exact duplicate — the same node, under any spelling, through the same relay —
+    /// collapses. A locator route reaching a configured node through ANOTHER relay is an extra way
+    /// in, not a conflict, and configured routes still come first.
     #[test]
-    fn configured_routes_win_and_duplicates_are_found_by_node_identity() {
+    fn only_an_exact_duplicate_route_collapses() {
         let routes = super::foreign_pull_peers(&[NODE_A.to_string()], CONFIGURED_RELAY, &[
-            (format!("  {NODE_A}  "), Some(LOCATOR_RELAY.to_string())),
+            (format!("  {NODE_A}  "), None),
+            (NODE_A.to_string(), Some(LOCATOR_RELAY.to_string())),
             (NODE_B.to_string(), None),
         ]);
         assert_eq!(routes, [
             (NODE_A.to_string(), CONFIGURED_RELAY.to_string()),
+            (NODE_A.to_string(), LOCATOR_RELAY.to_string()),
             (NODE_B.to_string(), CONFIGURED_RELAY.to_string()),
         ]);
+    }
+
+    /// Two routes naming one node through different relays are both dialed, in order. Keeping only
+    /// the first would let a dead or hostile relay recorded for a node shadow the relay that
+    /// reaches it — and the first is whichever repository happened to sort first.
+    #[test]
+    fn a_dead_relay_for_a_node_cannot_shadow_a_live_one() {
+        const DEAD_RELAY: &str = "https://relay.dead";
+        let routes = super::foreign_pull_peers(&[], CONFIGURED_RELAY, &[
+            (NODE_A.to_string(), Some(DEAD_RELAY.to_string())),
+            (NODE_A.to_string(), Some(LOCATOR_RELAY.to_string())),
+        ]);
+        let resolved =
+            super::route_addrs(&super::distinct_peers(&routes), &routes, CONFIGURED_RELAY);
+        let addrs: Vec<_> = resolved.into_iter().map(|(_, addr)| addr.unwrap()).collect();
+        assert_eq!(
+            addrs,
+            [
+                rag_rat_sync::peer_addr(NODE_A, DEAD_RELAY).unwrap(),
+                rag_rat_sync::peer_addr(NODE_A, LOCATOR_RELAY).unwrap(),
+            ],
+            "the live relay is still tried after the dead one",
+        );
     }
 
     /// The memo keeps whichever spelling of a node id answered, which need not match the spelling

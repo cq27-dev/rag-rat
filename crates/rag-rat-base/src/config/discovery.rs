@@ -108,9 +108,17 @@ pub fn worktree_root(path: &Path) -> Option<PathBuf> {
     Some(crate::paths::canonicalize_or_simplified(workdir))
 }
 
+/// The canonical git COMMON directory of the checkout containing `path` — the one directory every
+/// worktree of a repository shares: `<main>/.git` for linked worktrees, the hub itself for sibling
+/// worktrees of a bare repository. It identifies a repository across its checkouts where a checkout
+/// root cannot, including when there is no main checkout to compare. `None` outside git.
+pub fn git_common_dir(path: &Path) -> Option<PathBuf> {
+    let repo = crate::repo_discover::discover_repo(path).ok()?;
+    crate::paths::canonicalize(repo.common_dir()).ok()
+}
+
 pub(crate) fn main_worktree_root(root: &Path) -> Option<PathBuf> {
-    let repo = crate::repo_discover::discover_repo(root).ok()?;
-    let common_dir = crate::paths::canonicalize(repo.common_dir()).ok()?;
+    let common_dir = git_common_dir(root)?;
     // Only the standard `<main>/.git` layout maps cleanly to a main worktree root.
     if common_dir.file_name()?.to_str()? != ".git" {
         return None;

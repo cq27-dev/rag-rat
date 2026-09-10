@@ -194,7 +194,7 @@ pub enum ConfigError {
 }
 
 pub use discovery::{
-    default_database_path, default_legacy_database_path, discover_config_path,
+    default_database_path, default_legacy_database_path, discover_config_path, git_common_dir,
     linked_worktree_main_root, nearest_config_at_or_above, worktree_root,
 };
 pub(crate) use discovery::{main_worktree_root, normalize_existing_dir, resolve_default_database};

@@ -191,8 +191,11 @@ impl IndexDatabase {
     }
 
     /// Peers recorded for subscribed owners, each with the relay its locator named.
-    pub fn subscription_routing(&self) -> anyhow::Result<Vec<(String, Option<String>)>> {
-        crate::memory_write::subscription_routing(self.storage.connection())
+    pub fn subscription_routing(
+        &self,
+        owner_hex: &str,
+    ) -> anyhow::Result<Vec<(String, Option<String>)>> {
+        crate::memory_write::subscription_routing(self.storage.connection(), owner_hex)
     }
 
     /// The owner this repo has pinned, if any — reported by `sync whoami` so an operator can see

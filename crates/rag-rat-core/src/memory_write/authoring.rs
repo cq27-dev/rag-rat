@@ -710,22 +710,25 @@ pub(crate) fn set_subscription_routing(
     Ok(())
 }
 
-/// Every peer recorded for a subscribed owner, each paired with the relay its locator named.
+/// Every peer recorded by a subscription to `owner_hex`, each paired with the relay its locator
+/// named.
 ///
-/// Store-wide rather than repo-scoped because the cross-account pull pass is store-wide: it pulls
-/// each foreign account once, not once per repo, so it needs every repo's routing pooled. Pairing
-/// each peer with its OWN relay is what lets a locator's relay reach the host it names without
-/// retargeting the pass for accounts that never named it.
+/// Attributed to the owner because a locator describes how to reach ONE owner's host. Pooled across
+/// owners, one repository's locator could name another owner's peer through a dead relay and put
+/// that route in front of a live one; scoped, a pull for an account only ever sees routes toward
+/// that account. Pooled across the repositories subscribing to the same owner, since the pull pass
+/// pulls each account once, not once per repository.
 ///
-/// Only repos with a live subscription contribute. Routing describes how to reach the owner a repo
-/// mirrors; once it mirrors nobody, dialing that host is a wasted connection at best, and an
-/// obsolete one stalls every pull behind a failing attempt.
+/// Only live subscriptions contribute. Once a repository mirrors nobody, its host drops out of
+/// every pull — an obsolete host stalls each pass behind a failing dial.
 pub(crate) fn subscription_routing(
     conn: &Connection,
+    owner_hex: &str,
 ) -> anyhow::Result<Vec<(String, Option<String>)>> {
     let mut routes = Vec::new();
     for repo_id in rag_rat_db::schema::real_repo_ids(conn)? {
-        if rag_rat_db::meta::repo_meta(conn, &repo_id, SUBSCRIPTION_OWNER_META_KEY)?.is_none() {
+        let owner = rag_rat_db::meta::repo_meta(conn, &repo_id, SUBSCRIPTION_OWNER_META_KEY)?;
+        if owner.as_deref() != Some(owner_hex) {
             continue;
         }
         let Some(recorded) =

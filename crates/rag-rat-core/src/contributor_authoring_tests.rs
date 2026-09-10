@@ -1155,7 +1155,8 @@ fn unsubscribing_does_not_reset_the_pin() {
 /// discovered, because the discovery tag derives from that account's own secret.
 #[test]
 fn subscribing_from_a_locator_records_the_routing_that_reaches_the_owner() {
-    let (_owner, subscriber, _owner_account) = subscription_pair();
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
 
     crate::memory_write::set_subscription_routing(
         &subscriber,
@@ -1165,7 +1166,7 @@ fn subscribing_from_a_locator_records_the_routing_that_reaches_the_owner() {
     .unwrap();
     let relay = Some("https://relay.example".to_string());
     assert_eq!(
-        crate::memory_write::subscription_routing(&subscriber).unwrap(),
+        crate::memory_write::subscription_routing(&subscriber, &owner_hex).unwrap(),
         [("node-a".to_string(), relay.clone()), ("node-b".to_string(), relay)],
         "each recorded peer carries the relay its locator named — the pull paths dial it there",
     );
@@ -1175,7 +1176,8 @@ fn subscribing_from_a_locator_records_the_routing_that_reaches_the_owner() {
 /// dialing it for a different account is a wasted connection to a peer that never held the stream.
 #[test]
 fn re_subscribing_without_routing_clears_the_previous_owners_host() {
-    let (_owner, subscriber, _owner_account) = subscription_pair();
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
     crate::memory_write::set_subscription_routing(
         &subscriber,
         &["node-a".to_string()],
@@ -1185,7 +1187,7 @@ fn re_subscribing_without_routing_clears_the_previous_owners_host() {
 
     crate::memory_write::set_subscription_routing(&subscriber, &[], None).unwrap();
     assert!(
-        crate::memory_write::subscription_routing(&subscriber).unwrap().is_empty(),
+        crate::memory_write::subscription_routing(&subscriber, &owner_hex).unwrap().is_empty(),
         "stale routing is cleared, not carried onto the new owner",
     );
 }
@@ -1237,22 +1239,51 @@ fn unsubscribing_an_upgraded_store_first_still_keeps_its_trust_root() {
 /// drop out of every pull — an obsolete host stalls each pass behind a failing dial.
 #[test]
 fn routing_for_a_repo_that_no_longer_subscribes_is_never_dialed() {
-    let (_owner, subscriber, _owner_account) = subscription_pair();
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
     crate::memory_write::set_subscription_routing(&subscriber, &["node-a".to_string()], None)
         .unwrap();
     assert!(crate::memory_write::clear_subscription_owner(&subscriber).unwrap());
     assert!(
-        crate::memory_write::subscription_routing(&subscriber).unwrap().is_empty(),
+        crate::memory_write::subscription_routing(&subscriber, &owner_hex).unwrap().is_empty(),
         "unsubscribe takes the routing out of every pull",
     );
 
     // And the reader holds the line on its own: routing rows that outlived their subscription by
     // any other path are not pooled either.
-    let (_owner, stale, _owner_account) = subscription_pair();
+    let (_owner, stale, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
     crate::memory_write::set_subscription_routing(&stale, &["node-b".to_string()], None).unwrap();
     stale.execute("DELETE FROM repo_meta WHERE key = 'memory_subscription_owner'", []).unwrap();
     assert!(
-        crate::memory_write::subscription_routing(&stale).unwrap().is_empty(),
+        crate::memory_write::subscription_routing(&stale, &owner_hex).unwrap().is_empty(),
         "routing without a live subscription is ignored",
+    );
+}
+
+/// A locator describes how to reach ONE owner's host, so its routes belong to that owner. Pooled
+/// across owners, one repository's locator could name another owner's peer through a dead relay and
+/// put that route in front of the live one.
+#[test]
+fn routing_reaches_only_the_owner_its_locator_describes() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    crate::memory_write::set_subscription_routing(
+        &subscriber,
+        &["node-a".to_string()],
+        Some("https://relay.example"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        crate::memory_write::subscription_routing(&subscriber, &owner_hex).unwrap().len(),
+        1,
+        "the subscribed owner's pull sees its route",
+    );
+    assert!(
+        crate::memory_write::subscription_routing(&subscriber, &"cd".repeat(32))
+            .unwrap()
+            .is_empty(),
+        "another account's pull never sees this repository's routes",
     );
 }

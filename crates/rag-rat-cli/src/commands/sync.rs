@@ -290,15 +290,18 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
 /// only speaks for the configured repo when it is one of that repo's worktrees: from repo A with
 /// `--config` naming repo B, the store being written is B's, and A's locator must not choose B's
 /// trust root. Anything that is not the configured repo's own family falls back to its root.
+///
+/// Two checkouts are one repository exactly when they share a git common directory. Keying on the
+/// main checkout's root instead misses sibling worktrees of a BARE repository, which have no main
+/// checkout: each would count as its own repository, and the configured checkout's locator would be
+/// read while the operator stands in a sibling.
 fn locator_checkout(config_root: &Path, cwd: Option<PathBuf>) -> PathBuf {
-    let family = |path: &Path| {
-        rag_rat_base::config::linked_worktree_main_root(path)
-            .or_else(|| rag_rat_base::config::worktree_root(path))
-    };
+    let repository = rag_rat_base::config::git_common_dir;
     let configured = rag_rat_base::config::worktree_root(config_root);
     let session = cwd.as_deref().and_then(|cwd| {
-        let family_matches = family(cwd).is_some() && family(cwd) == family(config_root);
-        family_matches.then(|| rag_rat_base::config::worktree_root(cwd)).flatten()
+        let same_repository =
+            repository(cwd).is_some() && repository(cwd) == repository(config_root);
+        same_repository.then(|| rag_rat_base::config::worktree_root(cwd)).flatten()
     });
     session.or(configured).unwrap_or_else(|| config_root.to_path_buf())
 }
@@ -1035,16 +1038,16 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
     };
     drop(repo_lock);
 
-    // An explicit `--peer` wins; otherwise configured peers PLUS whatever a `.rag-rat-stream`
-    // recorded when this repo subscribed, each dialed through the relay that reaches it. A clone
-    // that subscribed from a locator has no configured peers by design, and this is the command its
-    // own subscribe output tells it to run.
+    // An explicit `--peer` wins; otherwise configured peers PLUS the routes a `.rag-rat-stream`
+    // recorded for a subscription to THIS account, each dialed through the relay that reaches it. A
+    // clone that subscribed from a locator has no configured peers by design, and this is the
+    // command its own subscribe output tells it to run.
     let routes: Vec<(String, String)> = match peer_override {
         Some(peer) => vec![(peer.to_string(), relay.clone())],
         None => rag_rat_core::sync_driver::foreign_pull_peers(
             &config.sync.server_peers,
             &relay,
-            &db.subscription_routing()?,
+            &db.subscription_routing(&hash::hex_lower(&target.to_bytes()))?,
         ),
     };
     if routes.is_empty() {
@@ -1057,7 +1060,7 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
     }
     // An invalid entry skips to the next peer rather than aborting: one typo in a configured
     // peer list must not block a pull another entry could serve.
-    let order: Vec<String> = routes.iter().map(|(peer, _)| peer.clone()).collect();
+    let order = rag_rat_core::sync_driver::distinct_peers(&routes);
     let mut peers = Vec::with_capacity(routes.len());
     let mut resolve_error = None;
     for (peer_id, addr) in rag_rat_core::sync_driver::route_addrs(&order, &routes, &relay) {
@@ -1338,6 +1341,61 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         assert_eq!(super::locator_checkout(&nested, None), top(&b_main));
         assert_eq!(super::locator_checkout(&nested, Some(b_linked.clone())), top(&b_linked));
+    }
+
+    /// Sibling worktrees of a BARE repository have no main checkout, so a repository keyed on the
+    /// main root sees two unrelated repositories. Their shared git common directory is what makes
+    /// them one.
+    #[test]
+    fn sibling_worktrees_of_a_bare_repository_are_one_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seed = tmp.path().join("seed");
+        init_repo(&seed);
+        let hub = tmp.path().join("hub.git");
+        rag_rat_base::test_git::run(tmp.path(), &[
+            "clone",
+            "-q",
+            "--bare",
+            seed.to_str().unwrap(),
+            hub.to_str().unwrap(),
+        ]);
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        rag_rat_base::test_git::run(&hub, &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "a",
+            a.to_str().unwrap(),
+        ]);
+        rag_rat_base::test_git::run(&hub, &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "b",
+            b.to_str().unwrap(),
+        ]);
+        let other = tmp.path().join("other");
+        init_repo(&other);
+        let top = |path: &std::path::Path| rag_rat_base::config::worktree_root(path).unwrap();
+
+        assert_eq!(
+            rag_rat_base::config::linked_worktree_main_root(&b),
+            None,
+            "a bare hub has no main checkout — the topology a main-keyed comparison misses",
+        );
+        assert_eq!(
+            super::locator_checkout(&a, Some(b.clone())),
+            top(&b),
+            "standing in B with A's config, B's own locator governs",
+        );
+        assert_eq!(
+            super::locator_checkout(&a, Some(other.clone())),
+            top(&a),
+            "an unrelated repository still never chooses",
+        );
     }
 
     /// `sync pull` requires the account id, so a suggestion without it would hand the operator a
