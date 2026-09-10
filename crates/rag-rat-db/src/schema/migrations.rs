@@ -8544,6 +8544,30 @@ pub(crate) fn apply_content_projected_node_source_hash(conn: &Connection) -> rus
     ensure_content_projection_shape(conn)
 }
 
+/// A synced memory records WHICH published anchor set and source hash the drain last applied to it
+/// (#1243). Without that record a receiver can only seed once, so an author's later rebind never
+/// reaches it; with it, the drain replaces bindings when the published set CHANGES and leaves them
+/// alone otherwise — which is what keeps a local relocation from being undone on every pass.
+///
+/// Both columns are nullable and start NULL. Existing synced memories are revisited once: the drain
+/// only walks a stream whose projection moved since its last pass, so the per-stream watermarks are
+/// cleared — but only when the columns are actually added, since `schema::apply` replays every step
+/// and a replay must not force a full drain.
+pub fn apply_memory_applied_anchor_snapshot(conn: &Connection) -> rusqlite::Result<()> {
+    let adding = !column_exists(conn, "repo_memories", "anchors_applied_digest")?;
+    add_column_if_missing(conn, "repo_memories", "anchors_applied_digest", "TEXT")?;
+    add_column_if_missing(conn, "repo_memories", "source_hash_applied", "TEXT")?;
+    let has_oplog_meta: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'oplog_meta')",
+        [],
+        |row| row.get(0),
+    )?;
+    if adding && has_oplog_meta {
+        conn.execute("DELETE FROM oplog_meta WHERE key LIKE 'content:drain-wm:%'", [])?;
+    }
+    Ok(())
+}
+
 /// Every column the CURRENT content projector writes, applied ahead of any migration that replays
 /// the fold.
 ///

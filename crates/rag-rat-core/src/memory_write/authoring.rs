@@ -1179,13 +1179,9 @@ const ANCHOR_BACKFILL_SCAN_PER_PASS: i64 = 512;
 /// outside any authoring path, so a renamed symbol leaves a peer holding the pre-rename set until
 /// an explicit rebind re-authors it. Republish-on-drift is a separate mechanism, not this one.
 ///
-/// The match set is `anchors_json IS NULL` only. A memory whose anchors were published BEFORE the
-/// source-hash op existed has left it for good, so its hash is never swept and the peer holds the
-/// anchors unmarked. Widening this to also select on `source_text_hash IS NULL` would not fix it:
-/// the receiver applies a hash only where it seeds the anchors (`stamp_seeded_source_hash`), and a
-/// peer that already holds them seeds nothing. Healing the pair needs a republish path that
-/// re-seeds both together. No released version authored anchors, so the exposure is stores that ran
-/// an unreleased build of the anchor op.
+/// The match set is `anchors_json IS NULL` only. A memory whose anchors were published before the
+/// source-hash op existed has left it for good; [`read_source_hash_backfill_ids`] publishes its
+/// hash, which a receiver applies without re-seeding the bindings it already holds.
 fn read_anchor_backfill_ids(
     conn: &Connection,
     repo_id: &str,
@@ -1203,6 +1199,38 @@ fn read_anchor_backfill_ids(
            AND EXISTS (
                  SELECT 1 FROM repo_memory_bindings b
                  WHERE b.memory_id = m.id AND b.repo_id = m.repo_id)
+         ORDER BY m.created_at_ms, m.id
+         LIMIT ?3",
+    )?;
+    let ids = stmt
+        .query_map(
+            params![repo_id, stream.to_bytes().as_slice(), ANCHOR_BACKFILL_SCAN_PER_PASS],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Memories whose anchors were published but whose source hash never was — a corpus published
+/// before the hash op existed, which [`read_anchor_backfill_ids`] has left for good. Drops out once
+/// the hash folds, like that leg; a memory with no hash of its own never matches, so a hashless one
+/// is not re-examined forever.
+fn read_source_hash_backfill_ids(
+    conn: &Connection,
+    repo_id: &str,
+    stream: StreamId,
+) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        // `origin = 'local'` for the same reason as the anchor leg: a synced row is a peer's to
+        // publish, never this device's to author.
+        "SELECT m.id
+         FROM repo_memories m
+         JOIN content_projected_nodes p ON p.stream_id = ?2 AND p.node_id = m.id
+         WHERE m.repo_id = ?1
+           AND m.origin = 'local'
+           AND m.source_text_hash IS NOT NULL
+           AND p.anchors_json IS NOT NULL
+           AND p.source_text_hash IS NULL
          ORDER BY m.created_at_ms, m.id
          LIMIT ?3",
     )?;
@@ -1281,6 +1309,25 @@ fn read_reconcile_work(
             // `None` is unreachable (the query requires a binding), but counting it as quarantined
             // keeps the partition total rather than silently dropping.
             _ => quarantined_anchor_ids.push(memory_id),
+        }
+    }
+    // The hash leg: anchors published before the source-hash op existed. It shares the pass budget.
+    // A 64-character hash always fits the entry cap, so one that cannot be authored is no oversized
+    // set to report — it is skipped, and never counted as work.
+    for memory_id in read_source_hash_backfill_ids(conn, repo_id, stream)? {
+        if swept >= ANCHOR_BACKFILL_PER_PASS {
+            break;
+        }
+        match source_hash_op(conn, &memory_id)? {
+            Some(op) if content_op_is_authorable(&op, policy) => {
+                anchor_backfill_ops.push(op);
+                swept += 1;
+            },
+            _ => tracing::debug!(
+                repo_id,
+                memory_id = %memory_id,
+                "skipping a source hash this stream cannot author",
+            ),
         }
     }
     Ok(ReconcileWork {
@@ -2195,8 +2242,13 @@ pub(crate) fn author_anchors(
 ) -> anyhow::Result<()> {
     let mut ops: Vec<MemoryOp> = anchors_op(tx, memory_id)?.into_iter().collect();
     // A rebind re-stamps `source_text_hash` in the same transaction, so the published hash has to
-    // move with the anchors or a peer keeps comparing against the pre-rebind text.
-    ops.extend(source_hash_op(tx, memory_id)?);
+    // move with the anchors or a peer keeps comparing against the pre-rebind text. A target with no
+    // hash publishes an EMPTY one: the register has no other retraction, and a receiver applies the
+    // hash on its own change, so silence would pair the new anchors with the old text.
+    ops.push(source_hash_op(tx, memory_id)?.unwrap_or_else(|| MemoryOp::NodeSourceHash {
+        node_id: NodeId::from(memory_id),
+        source_text_hash: String::new(),
+    }));
     author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
 
@@ -2206,10 +2258,8 @@ pub(crate) fn author_anchors(
 /// treats "nobody published one" as no evidence of drift, so spending a signed entry to say it
 /// would tell that peer nothing it can act on.
 ///
-/// That silence has no retraction, so the published register can outlive the hash it was taken
-/// from — an author who rebinds onto a target that carries none (tracker / dir / commit / call
-/// path) nulls the column and publishes nothing. A receiver applies the hash only where it also
-/// installs the anchors it describes, which is what keeps the pair from contradicting each other.
+/// Silence is right for a create and for the sweeps, which have no earlier value of their own to
+/// retract. A rebind can have one, so [`author_anchors`] publishes an explicit empty hash instead.
 fn source_hash_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<MemoryOp>> {
     let mut stmt = conn.prepare("SELECT source_text_hash FROM repo_memories WHERE id = ?1")?;
     let hash: Option<String> = stmt

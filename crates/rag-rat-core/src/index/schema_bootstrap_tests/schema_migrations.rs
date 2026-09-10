@@ -1839,7 +1839,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 119, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 120, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
@@ -1958,6 +1958,42 @@ fn migration_103_syncable_memory_bindings() {
         )
         .unwrap();
     assert_eq!(preserved, ("src/lib.rs".into(), 3, 4, 5, "relocated".into(), 9));
+}
+
+/// V120 (#1243) records which published anchor snapshot the drain applied to a synced memory, and
+/// clears the drain watermarks exactly once so existing memories are revisited — never on a replay,
+/// which `schema::apply` performs over a store that is already current.
+#[test]
+fn migration_120_memory_applied_anchor_snapshot() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    for column in ["anchors_applied_digest", "source_hash_applied"] {
+        assert!(
+            schema::migrations::column_exists(&conn, "repo_memories", column).unwrap(),
+            "{column} exists"
+        );
+    }
+    let watermarks = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM oplog_meta WHERE key LIKE 'content:drain-wm:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    conn.execute("INSERT INTO oplog_meta(key, value) VALUES ('content:drain-wm:AB', '3')", [])
+        .unwrap();
+
+    schema::migrations::apply_memory_applied_anchor_snapshot(&conn).unwrap();
+    assert_eq!(watermarks(&conn), 1, "a replay over a current store leaves the watermarks alone");
+
+    conn.execute_batch(
+        "ALTER TABLE repo_memories DROP COLUMN anchors_applied_digest;
+         ALTER TABLE repo_memories DROP COLUMN source_hash_applied;",
+    )
+    .unwrap();
+    schema::migrations::apply_memory_applied_anchor_snapshot(&conn).unwrap();
+    assert_eq!(watermarks(&conn), 0, "adding the columns forces one full drain pass");
 }
 
 /// V104 (#997) adds the durable re-adoption worklist and audit provenance.

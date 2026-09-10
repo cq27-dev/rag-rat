@@ -594,12 +594,11 @@ mod anchor_authoring_tests {
     }
 
     /// A rebind onto a target with no text behind it — a commit, a tracker ref, a directory — nulls
-    /// the local column and therefore publishes nothing, so the register keeps the PRE-rebind hash.
-    /// The op vocabulary has no retraction, which is why a receiver applies a published hash only
-    /// where it also seeds the anchors that hash describes: the pair then goes stale together
-    /// instead of the hash outliving the anchors it claims to be about.
+    /// the local column and publishes an EMPTY hash. The register has no other retraction, and a
+    /// receiver applies the hash on its own change, so staying silent would leave the pre-rebind
+    /// value standing beside the new anchors.
     #[test]
-    fn a_rebind_onto_a_hashless_target_leaves_the_published_hash_standing() {
+    fn a_rebind_onto_a_hashless_target_retracts_the_published_hash() {
         let conn = scoped_conn();
         let before = sha_of("lib");
         indexed_file(&conn, "src/lib.rs", &before);
@@ -621,9 +620,31 @@ mod anchor_authoring_tests {
         assert_eq!(local, None, "the rebind nulled the local hash");
         assert_eq!(
             projected_source_hash(&conn, &memory_id),
-            Some(before),
-            "and published nothing, so the register still holds the pre-rebind value",
+            Some(String::new()),
+            "and retracted the pre-rebind value from the register",
         );
+    }
+
+    /// The half the anchor sweep cannot reach: a memory whose anchors were published before the
+    /// hash op existed. Its `anchors_json` is set, so only the hash leg revisits it, and it
+    /// publishes the hash alone — a receiver applies it without touching the bindings.
+    #[test]
+    fn the_hash_leg_publishes_a_hash_for_anchors_published_without_one() {
+        let conn = scoped_conn();
+        let sha = sha_of("old");
+        // An unindexed path: the create publishes its anchors and no hash.
+        let memory_id = bound_create(&conn, "src/lib.rs");
+        assert_eq!(projected_source_hash(&conn, &memory_id), None, "anchors, and no hash");
+        conn.execute(
+            "UPDATE repo_memories SET source_text_hash = ?2 WHERE id = ?1",
+            rusqlite::params![memory_id, sha],
+        )
+        .unwrap();
+
+        // Any authored write drives the reconcile.
+        bound_create(&conn, "src/other.rs");
+
+        assert_eq!(projected_source_hash(&conn, &memory_id), Some(sha));
     }
 
     /// The backfill leg must publish the hash too, for the same reason it must publish anchors: a

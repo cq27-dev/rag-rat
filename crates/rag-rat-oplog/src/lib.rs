@@ -163,6 +163,9 @@ pub use content_projection::{
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
 // — and the only direction of the dependency (`oplog` never depends back on `query::memory`).
 pub use identity::{LocalDevice, load_local_device, local_device};
+// The byte-canonical op encoding, for a consumer that needs a stable identity for an op's
+// payload: the memory drain digests an anchor set to record which one it applied.
+pub use op::encode as encode_op;
 pub use op::{
     DeviceFingerprint, EdgeKey, EdgeSpec, MAX_ANCHORS_PER_OP, MemoryOp, NodeContent, NodeId,
     NodeStatus, ParseDeviceFingerprintError, PortableAnchor, ResolvedAnchor, within_wire_limits,
