@@ -1522,3 +1522,35 @@ fn a_routing_lookup_reads_one_subscription_state() {
         .unwrap();
     assert_eq!(owner_now, other, "the concurrent re-subscribe really committed mid-lookup");
 }
+
+/// A subscribe decides the pin in THIS store, so it stops being a copy an earlier consolidation
+/// left: the marker that lets a retried consolidation replace an imported pin must go with it.
+#[test]
+fn a_subscribe_takes_the_pin_out_of_import_provenance() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscriber
+        .execute(
+            "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, 'memory_stream_pin_imported', \
+             ?2)",
+            params![REPO, owner_hex],
+        )
+        .unwrap();
+
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+        Default::default(),
+    )
+    .unwrap();
+    let marker: Option<String> = subscriber
+        .query_row(
+            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = 'memory_stream_pin_imported'",
+            [REPO],
+            |row| row.get(0),
+        )
+        .ok();
+    assert_eq!(marker, None, "a pin decided here is no longer an imported copy");
+}

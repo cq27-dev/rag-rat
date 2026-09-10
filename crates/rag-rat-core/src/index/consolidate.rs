@@ -84,8 +84,10 @@ use crate::index::{self, IndexDatabase, schema};
 ///        dropping it on the move would let a changed `.rag-rat-stream` read as first use. The
 ///        source's EFFECTIVE pin crosses — its recorded pin, else the owner it is subscribed to,
 ///        which a store from before the pin existed records its trust decision as (that
-///        subscription itself never crosses — see (b)). A target already pinned keeps its own: it
-///        is the trust decision the target has acted on, and a pin survives either way.
+///        subscription itself never crosses — see (b)). Until the rename lands the legacy index is
+///        the live store, so a retry replaces a pin an earlier run of this consolidation wrote
+///        (recorded in `memory_stream_pin_imported`); a conflicting pin the target decided itself
+///        REFUSES the run, since carrying either would silently override the other trust root.
 ///
 ///  (b) DB-LOCAL STATE — never copied; each entry states why:
 ///      * freshness/progress cursors that would make a fresh 0-row index falsely report itself
@@ -107,6 +109,9 @@ use crate::index::{self, IndexDatabase, schema};
 ///      * `memory_subscription_peers` / `memory_subscription_relay` — how to reach the subscribed
 ///        owner's host. They describe a subscription, and the subscription never crosses; carried
 ///        alone they would route toward an owner this repo no longer mirrors.
+///      * `memory_stream_pin_imported` — the pin value an earlier run of this consolidation wrote,
+///        which is how a retry tells its own copy from a trust decision the target made; any `sync
+///        subscribe` there clears it.
 const CARRIED_META_KEYS: &[&str] = &[
     "active_embedding_model",
     "embedding_active_model_version",
@@ -119,6 +124,7 @@ const CARRIED_META_KEYS: &[&str] = &[
 const MEMORY_STREAM_SEAL_POLICY_META_KEY: &str = "memory_stream_seal_policy";
 const MEMORY_STREAM_ACCESS_MODE_META_KEY: &str = "memory_stream_access_mode";
 const MEMORY_STREAM_PIN_META_KEY: &str = "memory_stream_pin";
+const MEMORY_STREAM_PIN_IMPORTED_META_KEY: &str = "memory_stream_pin_imported";
 const MEMORY_SUBSCRIPTION_OWNER_META_KEY: &str = "memory_subscription_owner";
 
 /// How long consolidate waits for the repo's per-repo write locks (global-side and legacy-side)
@@ -1532,6 +1538,16 @@ fn merge_stream_pin(source: &Connection, tx: &Connection, repo_id: &str) -> anyh
             .optional()?
             .flatten())
     };
+    let target_meta = |key: &str| -> anyhow::Result<Option<String>> {
+        Ok(tx
+            .query_row(
+                "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = ?2",
+                params![repo_id, key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    };
     // The EFFECTIVE pin: a store from before the pin existed, or one still subscribed, records its
     // trust decision only as the subscription owner.
     let Some(source_pin) = source_meta(MEMORY_STREAM_PIN_META_KEY)?
@@ -1539,32 +1555,36 @@ fn merge_stream_pin(source: &Connection, tx: &Connection, repo_id: &str) -> anyh
     else {
         return Ok(0);
     };
-    let target_pin: Option<String> = tx
-        .query_row(
-            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = ?2",
-            params![repo_id, MEMORY_STREAM_PIN_META_KEY],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten();
-    match target_pin {
-        None => Ok(tx.execute(
-            "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, ?3)",
-            params![repo_id, MEMORY_STREAM_PIN_META_KEY, source_pin],
-        )? as u64),
-        Some(target_pin) => {
-            if target_pin != source_pin {
-                tracing::warn!(
-                    repo_id,
-                    target_pin = %target_pin,
-                    source_pin = %source_pin,
-                    "consolidation keeps the target's stream pin over a different one in the \
-                     legacy source"
-                );
-            }
-            Ok(0)
-        },
+    let target_pin = target_meta(MEMORY_STREAM_PIN_META_KEY)?;
+    let replaceable = match &target_pin {
+        None => true,
+        Some(pin) if *pin == source_pin => return Ok(0),
+        // The pin an earlier run of THIS consolidation wrote, untouched since: a subscribe in the
+        // target clears the marker. Until the rename lands the legacy index is the live store, so
+        // a repin made there in the crash-retry window must replace the copy the last run left —
+        // keeping it would restore a trust root the operator has since moved away from.
+        Some(pin) =>
+            target_meta(MEMORY_STREAM_PIN_IMPORTED_META_KEY)?.as_deref() == Some(pin.as_str()),
+    };
+    if !replaceable {
+        anyhow::bail!(
+            "consolidation refused: the legacy index for `{repo_id}` trusts stream owner \
+             {source_pin}, but the global store already pins {} from a decision made there, not \
+             from an earlier consolidation. Carrying either would silently override the other \
+             trust root. Confirm which owner this repository should trust, record it in the \
+             legacy index with `rag-rat sync subscribe <owner>`, and retry",
+            target_pin.unwrap_or_default(),
+        );
     }
+    let mut written = 0;
+    for key in [MEMORY_STREAM_PIN_META_KEY, MEMORY_STREAM_PIN_IMPORTED_META_KEY] {
+        written += tx.execute(
+            "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(repo_id, key) DO UPDATE SET value = excluded.value",
+            params![repo_id, key, source_pin],
+        )?;
+    }
+    Ok(written as u64)
 }
 
 fn merge_stream_seal_policy(
@@ -3012,10 +3032,10 @@ mod tests {
         );
     }
 
-    /// A target already pinned keeps its own pin: it is the trust decision the target acted on, and
-    /// a pin survives either way, so nothing reads as first use.
+    /// A conflicting pin the target decided itself is a separate trust decision. Carrying either
+    /// would silently override the other, so the run refuses — before anything is imported.
     #[test]
-    fn an_existing_target_pin_stays_authoritative() {
+    fn a_conflicting_target_pin_refuses_the_import() {
         let source = seeded_source();
         source
             .execute(
@@ -3032,8 +3052,76 @@ mod tests {
                 [],
             )
             .unwrap();
+
+        let err =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .err()
+                .expect("two trust roots for one repository must not be reconciled silently");
+        assert!(err.to_string().contains("consolidation refused"), "got: {err}");
+        assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-a"));
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories"), 0, "nothing imported");
+    }
+
+    /// Until the rename lands the legacy index is the live store. A repin made there after an
+    /// import committed but the rename failed must replace the pin that import wrote; keeping it
+    /// would restore the owner the operator has just moved away from.
+    #[test]
+    fn a_retry_carries_a_repin_made_in_the_legacy_index() {
+        let source = seeded_source();
+        source
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', \
+                 'memory_stream_pin', 'owner-a')",
+                [],
+            )
+            .unwrap();
+        let target = fresh_target();
         import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
         assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-a"));
+
+        source
+            .execute("UPDATE repo_meta SET value = 'owner-b' WHERE key = 'memory_stream_pin'", [])
+            .unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
+        assert_eq!(
+            target_meta(&target, "memory_stream_pin").as_deref(),
+            Some("owner-b"),
+            "the retry carries the legacy-side repin forward",
+        );
+    }
+
+    /// A pin re-decided in the target after an import is the target's own decision again, not a
+    /// copy this consolidation left, so a retry carrying a different one refuses rather than
+    /// overwriting it.
+    #[test]
+    fn a_pin_re_decided_in_the_target_after_an_import_is_not_overwritten() {
+        let source = seeded_source();
+        source
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', \
+                 'memory_stream_pin', 'owner-a')",
+                [],
+            )
+            .unwrap();
+        let target = fresh_target();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
+        target
+            .execute(
+                "UPDATE repo_meta SET value = 'owner-c' WHERE repo_id = 'global-repo' AND key = \
+                 'memory_stream_pin'",
+                [],
+            )
+            .unwrap();
+        source
+            .execute("UPDATE repo_meta SET value = 'owner-b' WHERE key = 'memory_stream_pin'", [])
+            .unwrap();
+
+        let err =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .err()
+                .expect("a pin the target re-decided is not this consolidation's to replace");
+        assert!(err.to_string().contains("consolidation refused"), "got: {err}");
+        assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-c"));
     }
 
     /// The `repo_meta` classification (see [`CARRIED_META_KEYS`]): repo-PORTABLE configuration is
