@@ -21,7 +21,8 @@ use super::pass::{
 use super::placement::{
     LinkedWorktreeWatches, WatchPlacementCounters, event_requests_maintenance,
     event_targets_binary, is_gitignore_path, kind_is_mutation, place_initial_watch_state,
-    recompile_ignore_and_place_watches, sync_linked_worktrees_after_pass,
+    rebuild_watch_state_after_rescan, recompile_ignore_and_place_watches,
+    sync_linked_worktrees_after_pass,
 };
 use crate::fleet;
 use crate::index::ignore_rules::IgnoreMatcher;
@@ -247,7 +248,7 @@ fn watcher_main(
         counters: &watch_counters,
         ignore: &mut ignore,
         linked_worktrees: &mut linked_worktrees,
-        worktree_registry: worktree_registry.as_deref(),
+        worktree_registry,
         rx,
         pass_tx: &pass_tx,
         scheduler: &mut scheduler,
@@ -342,7 +343,7 @@ pub(crate) struct EventLoop<'a, W: notify::Watcher> {
     pub(crate) counters: &'a WatchPlacementCounters,
     pub(crate) ignore: &'a mut IgnoreMatcher,
     pub(crate) linked_worktrees: &'a mut LinkedWorktreeWatches,
-    pub(crate) worktree_registry: Option<&'a Path>,
+    pub(crate) worktree_registry: Option<PathBuf>,
     pub(crate) rx: Receiver<LoopMsg>,
     pub(crate) pass_tx: &'a Sender<PassRequest>,
     pub(crate) scheduler: &'a mut PassScheduler,
@@ -357,7 +358,7 @@ pub(crate) struct EventLoop<'a, W: notify::Watcher> {
 impl<W: notify::Watcher> EventLoop<'_, W> {
     /// Run until `stop`; returns whether a final shutdown refresh is owed (the debounce is still
     /// armed — events arrived after the last dispatched pass).
-    pub(crate) fn run(self) -> bool {
+    pub(crate) fn run(mut self) -> bool {
         let mut debounce = Debounce::new(
             Duration::from_millis(self.config.watch.debounce_ms),
             Duration::from_millis(self.config.watch.max_latency_ms),
@@ -434,6 +435,21 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
             match self.rx.recv_timeout(wait) {
                 Ok(LoopMsg::Fs(Ok(event))) => {
                     let now = Instant::now();
+                    // A rescan means the backend dropped events, so anything could have vanished
+                    // unseen — including a watched directory that was deleted and recreated.
+                    // Rebuild the whole watch state before classifying, or a record left over
+                    // from before the gap suppresses the placement that recovers it (#1269).
+                    if event.need_rescan() {
+                        self.worktree_registry = rebuild_watch_state_after_rescan(
+                            self.notify_watcher,
+                            self.counters,
+                            self.config,
+                            self.target_dirs,
+                            self.ignore,
+                            self.linked_worktrees,
+                            self.fleet_bin,
+                        );
+                    }
                     // Place watches on newly-appeared, non-ignored directories REGARDLESS of
                     // relevance (#332). Target dirs are watched NON-recursively (#331), so notify
                     // won't auto-descend into a new subdir — and a bare `mkdir src/foo` is NOT
@@ -457,7 +473,7 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
                         self.target_dirs,
                         self.ignore,
                         self.linked_worktrees,
-                        self.worktree_registry,
+                        self.worktree_registry.as_deref(),
                     ) {
                         debounce.on_event(now);
                         pending_overlay_scope = Some(match pending_overlay_scope.take() {

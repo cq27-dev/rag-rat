@@ -54,7 +54,8 @@ pub(crate) use placement::{
     created_dir_placement, event_is_relevant, event_requests_maintenance, event_touches_worktree,
     gitignore_rule_watch_dirs, gitignore_watch_dirs, is_gitignore_path, kind_is_mutation,
     missing_config_root_bootstrap_dirs, place_initial_watch_state,
-    recompile_ignore_and_place_watches, sync_linked_worktrees_after_pass, watch_created_dirs,
+    rebuild_watch_state_after_rescan, recompile_ignore_and_place_watches,
+    sync_linked_worktrees_after_pass, watch_configured_trees, watch_created_dirs,
     watch_linked_worktrees, watch_tree_pruned, worktree_watch_targets,
 };
 
