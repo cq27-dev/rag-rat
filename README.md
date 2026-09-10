@@ -234,6 +234,7 @@ rag-rat query "where is config reload handled?"
 rag-rat important-symbols --limit 20
 rag-rat brief --mode spine
 rag-rat clusters --limit 10
+rag-rat tools impact-surface --symbol parse_config
 ```
 
 ## The agent loop
@@ -304,8 +305,11 @@ Prefer reusing the existing function(s) over duplicating — impact_surface / sy
 
 ## The tools
 
-rag-rat's **MCP tools** — the full catalog with JSON schemas lives in
-[`docs/mcp-tools.md`](docs/mcp-tools.md). The ones you'll reach for most:
+rag-rat's **tool catalog** is exposed through both MCP and native CLI commands. The full catalog
+and JSON schemas are documented in [`docs/mcp-tools.md`](docs/mcp-tools.md). Run
+`rag-rat tools --help` to browse every tool or `rag-rat tools <name> --help` to inspect arguments
+from the canonical schema. Existing curated commands such as `query`, `brief`, `memory`, and `dream`
+stay unchanged. The ones you'll reach for most:
 
 - **`impact_surface`** — the coding preflight from the loop above: callers, callees, tests, git
   history, GitHub papertrail, and the repo memories crossing a symbol, in one call. Memories default
@@ -532,6 +536,7 @@ rag-rat hooks install              # git maintenance hooks
 rag-rat gc                         # prune rows for dead git contexts
 rag-rat eval [--json|--update-baseline]   # CI search-quality gate; requires a `--features eval` build (absent from the released binary)
 rag-rat serve                      # authenticated editor Lens HTTP API
+rag-rat tools <name>               # invoke any tool directly; see `tools --help`
 rag-rat mcp                        # start the STDIO server
 ```
 

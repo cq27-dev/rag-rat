@@ -22,7 +22,7 @@ rag-rat-dream.workspace = true
 rag-rat-llm = { workspace = true, default-features = false }
 rag-rat-papertrail.workspace = true
 anyhow.workspace = true
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive", "string"] }
 dialoguer = "0.12"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 tui-tree-widget = "0.24"
