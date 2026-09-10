@@ -244,6 +244,56 @@ pub(super) fn contribution_owner_account(
 /// re-points.
 const SUBSCRIPTION_OWNER_META_KEY: &str = "memory_subscription_owner";
 
+/// The owner this repo has ever been told to trust, kept SEPARATELY from the live subscription so
+/// it outlives `sync unsubscribe`.
+///
+/// Trust-on-first-use only works if the "first use" cannot be replayed. Were the pin the live
+/// subscription key, the refusal below would be defeated by the very sequence its message would
+/// otherwise suggest — unsubscribe, subscribe — and that sequence is what an agent handed a
+/// fail-closed error will try. So the pin is written on the first locator-driven subscribe, left
+/// behind by unsubscribe, and re-written ONLY when an operator names an account id themselves.
+const STREAM_PIN_META_KEY: &str = "memory_stream_pin";
+
+/// The pin an UNFINISHED `rag-rat consolidate` run wrote into this store, and the legacy source it
+/// came from. It is how a retry of that same source tells its own stale copy — replaceable, because
+/// the legacy index stays the live store until the rename lands — from a pin decided here, which it
+/// must not override. A subscribe decides the pin here, so it clears this.
+const STREAM_PIN_IMPORTED_META_KEY: &str = "memory_stream_pin_imported";
+
+/// Routing to reach the subscribed owner's host, as the locator supplied it.
+///
+/// Persisted rather than merely echoed because the point of the locator is a clone that has NO
+/// `[sync] server_peers`: a subscriber cannot discover a foreign account's host — that account's
+/// discovery tag derives from its own secret — so without somewhere to keep these, the repo records
+/// a subscription it can never fetch. Both the manual pull and the automatic cross-account pass
+/// read them.
+///
+/// They carry NO authority and are safe to persist from an untrusted file: every entry pulled is
+/// verified against the pinned account's signature chain, so a hostile entry here can waste a dial,
+/// never forge content. One node id per line; the relay is a single URL.
+const SUBSCRIPTION_PEERS_META_KEY: &str = "memory_subscription_peers";
+const SUBSCRIPTION_RELAY_META_KEY: &str = "memory_subscription_relay";
+
+/// Who chose the account being subscribed to — the whole basis of the pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubscribeTrust {
+    /// An operator passed the id on the command line, having obtained it out of band. A human
+    /// asserting a trust root: it re-pins.
+    Operator,
+    /// A checked-in `.rag-rat-stream` supplied it. Untrusted input — anyone who can land a commit
+    /// can change it — so it may establish a pin but never move one.
+    Locator,
+}
+
+/// How to reach the owner being subscribed to, as a checked-in locator supplied it. Empty for an
+/// operator-named subscribe, which therefore CLEARS whatever routing a previous subscription
+/// recorded rather than dialing that owner's host for a different account.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SubscriptionRouting<'a> {
+    pub(crate) peers: &'a [String],
+    pub(crate) relay: Option<&'a str>,
+}
+
 pub(super) fn subscription_owner_account(
     conn: &Connection,
     repo_id: &str,
@@ -578,6 +628,8 @@ pub(crate) fn set_subscription_owner(
     conn: &Connection,
     owner_account_hex: &str,
     now_ms: i64,
+    trust: SubscribeTrust,
+    routing: SubscriptionRouting<'_>,
 ) -> anyhow::Result<()> {
     let repo_id =
         memory_repo_scope(conn)?.context("sync subscribe requires an active repo scope")?;
@@ -604,12 +656,135 @@ pub(crate) fn set_subscription_owner(
         "active repo scope changed while starting sync subscribe; retry"
     );
     ensure_no_contribution_configured(&tx, &repo_id)?;
+    // Decided UNDER the write lock. A check made before `BEGIN IMMEDIATE` can pass against a pin
+    // another connection replaces before this transaction starts, and this write would then restore
+    // the owner that pin had just moved away from.
+    //
+    // A locator may establish this repo's trust root, never move it. Moving it is how an edited
+    // checked-in file would silently re-point a subscriber onto another account's stream — and a
+    // re-point is destructive, not merely redirecting: the drain removes the previous owner's
+    // mirrored rows, and the local binding work on them (a `memory rebind`, any local edge) does
+    // not come back on unsubscribe. The remedy names a human step rather than a command, because
+    // the point of the override is that the operator obtains the id from the owner, not from the
+    // file that just changed.
+    if trust == SubscribeTrust::Locator
+        && let Some(pinned) = effective_stream_pin(&tx, &repo_id)?
+        && pinned != canonical
+    {
+        anyhow::bail!(
+            "`{}` names owner {canonical}, but this repo is pinned to {pinned}.\n\nA checked-in \
+             locator cannot re-point a subscription. Confirm the new id with the stream's owner \
+             out of band, then subscribe to it explicitly:\n\n    rag-rat sync subscribe \
+             {canonical}",
+            rag_rat_base::stream_locator::STREAM_LOCATOR_FILE,
+        );
+    }
     repoint_authoritative_content_stream(&tx, &repo_id, StreamResolution::Strict, |tx| {
         rag_rat_db::meta::set_repo_meta(tx, &repo_id, SUBSCRIPTION_OWNER_META_KEY, &canonical)
             .map_err(Into::into)
     })?;
+    // Owner, pin and routing commit together: this function is the single writer of all four
+    // subscription fields. A torn write could otherwise leave a repo subscribed to an owner it
+    // never pinned, or holding the previous owner's routes — which `subscription_routing` would
+    // then attribute to the new account and dial on its behalf.
+    rag_rat_db::meta::set_repo_meta(&tx, &repo_id, STREAM_PIN_META_KEY, &canonical)?;
+    write_subscription_routing(&tx, &repo_id, &routing)?;
+    // The pin is now a decision made in THIS store, no longer a copy an earlier consolidation left:
+    // a retried consolidation may replace an imported pin, never this one.
+    rag_rat_db::meta::delete_repo_meta(&tx, &repo_id, STREAM_PIN_IMPORTED_META_KEY)?;
     tx.commit()?;
     Ok(())
+}
+
+/// The owner this repo has pinned, if any. Survives `sync unsubscribe`.
+pub(crate) fn stream_pin(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<String>> {
+    effective_stream_pin(conn, repo_id)
+}
+
+/// The recorded pin, or — when none was ever recorded — the owner this repo is already subscribed
+/// to. A store upgraded from a release without the pin holds a live subscription and no pin, and
+/// reading that as "never trusted anyone" would let a changed locator silently replace an owner an
+/// operator chose. An existing subscription IS an existing trust decision.
+fn effective_stream_pin(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<String>> {
+    Ok(match rag_rat_db::meta::repo_meta(conn, repo_id, STREAM_PIN_META_KEY)? {
+        Some(pinned) => Some(pinned),
+        None => rag_rat_db::meta::repo_meta(conn, repo_id, SUBSCRIPTION_OWNER_META_KEY)?,
+    })
+}
+
+/// Record how to reach the subscribed owner's host, or clear it when the routing is empty. Private
+/// and called only inside `set_subscription_owner`'s transaction, so there is no path that updates
+/// routing apart from the owner it belongs to.
+fn write_subscription_routing(
+    conn: &Connection,
+    repo_id: &str,
+    routing: &SubscriptionRouting<'_>,
+) -> anyhow::Result<()> {
+    let joined = routing.peers.join("\n");
+    if joined.is_empty() {
+        rag_rat_db::meta::delete_repo_meta(conn, repo_id, SUBSCRIPTION_PEERS_META_KEY)?;
+    } else {
+        rag_rat_db::meta::set_repo_meta(conn, repo_id, SUBSCRIPTION_PEERS_META_KEY, &joined)?;
+    }
+    match routing.relay {
+        Some(relay) if !relay.trim().is_empty() =>
+            rag_rat_db::meta::set_repo_meta(conn, repo_id, SUBSCRIPTION_RELAY_META_KEY, relay)?,
+        _ => rag_rat_db::meta::delete_repo_meta(conn, repo_id, SUBSCRIPTION_RELAY_META_KEY)?,
+    };
+    Ok(())
+}
+
+/// Every peer recorded by a subscription to `owner_hex`, each paired with the relay its locator
+/// named.
+///
+/// Attributed to the owner because a locator describes how to reach ONE owner's host. Pooled across
+/// owners, one repository's locator could name another owner's peer through a dead relay and put
+/// that route in front of a live one; scoped, a pull for an account only ever sees routes toward
+/// that account. Pooled across the repositories subscribing to the same owner, since the pull pass
+/// pulls each account once, not once per repository.
+///
+/// Only live subscriptions contribute. Once a repository mirrors nobody, its host drops out of
+/// every pull — an obsolete host stalls each pass behind a failing dial.
+///
+/// ONE statement, so ownership, peers and relay come from one snapshot. Separate reads can straddle
+/// a concurrent re-subscribe — find this owner, then read the NEXT owner's peers — and hand one
+/// account the routes recorded for another. The write side commits all four fields together; that
+/// only protects a reader that also reads them together.
+pub(crate) fn subscription_routing(
+    conn: &Connection,
+    owner_hex: &str,
+) -> anyhow::Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT peers.value, relay.value
+         FROM repos
+         JOIN repo_meta AS owner ON owner.repo_id = repos.repo_id AND owner.key = ?2
+         JOIN repo_meta AS peers ON peers.repo_id = repos.repo_id AND peers.key = ?3
+         LEFT JOIN repo_meta AS relay ON relay.repo_id = repos.repo_id AND relay.key = ?4
+         WHERE owner.value = ?1 AND repos.repo_id != ?5
+         ORDER BY repos.repo_id",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            owner_hex,
+            SUBSCRIPTION_OWNER_META_KEY,
+            SUBSCRIPTION_PEERS_META_KEY,
+            SUBSCRIPTION_RELAY_META_KEY,
+            rag_rat_base::repo_identity::LEGACY_REPO_ID,
+        ],
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+    )?;
+    let mut routes = Vec::new();
+    for row in rows {
+        let (Some(recorded), relay) = row? else { continue };
+        routes.extend(
+            recorded
+                .lines()
+                .map(str::trim)
+                .filter(|peer| !peer.is_empty())
+                .map(|peer| (peer.to_string(), relay.clone())),
+        );
+    }
+    Ok(routes)
 }
 
 /// Stop mirroring another account (`sync unsubscribe` / `sync uncontribute`): drop the configured
@@ -628,7 +803,12 @@ pub(crate) fn set_subscription_owner(
 /// Stream resolution here is BEST-EFFORT, unlike the setters': an owner key that will not parse is
 /// exactly what this command removes, and a side that cannot resolve had no stream to drain — a
 /// strict resolution would make the recovery command unusable in the state that most needs it.
-fn clear_foreign_owner(conn: &Connection, meta_key: &str, command: &str) -> anyhow::Result<bool> {
+fn clear_foreign_owner(
+    conn: &Connection,
+    meta_key: &str,
+    command: &str,
+    before_clear: impl FnOnce(&Connection, &str) -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
     let repo_id = memory_repo_scope(conn)?
         .with_context(|| format!("{command} requires an active repo scope"))?;
 
@@ -641,6 +821,7 @@ fn clear_foreign_owner(conn: &Connection, meta_key: &str, command: &str) -> anyh
     if rag_rat_db::meta::repo_meta(&tx, &repo_id, meta_key)?.is_none() {
         return Ok(false);
     }
+    before_clear(&tx, &repo_id)?;
     repoint_authoritative_content_stream(&tx, &repo_id, StreamResolution::BestEffort, |tx| {
         rag_rat_db::meta::delete_repo_meta(tx, &repo_id, meta_key).map_err(Into::into)
     })?;
@@ -650,14 +831,25 @@ fn clear_foreign_owner(conn: &Connection, meta_key: &str, command: &str) -> anyh
 
 /// Stop mirroring a subscribed owner (`sync unsubscribe`).
 pub(crate) fn clear_subscription_owner(conn: &Connection) -> anyhow::Result<bool> {
-    clear_foreign_owner(conn, SUBSCRIPTION_OWNER_META_KEY, "sync unsubscribe")
+    clear_foreign_owner(conn, SUBSCRIPTION_OWNER_META_KEY, "sync unsubscribe", |tx, repo_id| {
+        // Only the trust root outlives the subscription. If the pin was never recorded — a store
+        // upgraded from before it existed, unsubscribing first — record the owner being cleared
+        // now, or the next locator subscribe would read as first use and pin whatever it names.
+        if rag_rat_db::meta::repo_meta(tx, repo_id, STREAM_PIN_META_KEY)?.is_none()
+            && let Some(owner) =
+                rag_rat_db::meta::repo_meta(tx, repo_id, SUBSCRIPTION_OWNER_META_KEY)?
+        {
+            rag_rat_db::meta::set_repo_meta(tx, repo_id, STREAM_PIN_META_KEY, &owner)?;
+        }
+        Ok(())
+    })
 }
 
 /// Stop contributing to a configured owner (`sync uncontribute`). The owner's Writer grant is
 /// untouched — only this store's routing changes — and the contributions already authored onto the
 /// owner's stream stay there; this store keeps its own `origin='local'` copies of them.
 pub(crate) fn clear_contribution_owner(conn: &Connection) -> anyhow::Result<bool> {
-    clear_foreign_owner(conn, CONTRIBUTION_OWNER_META_KEY, "sync uncontribute")
+    clear_foreign_owner(conn, CONTRIBUTION_OWNER_META_KEY, "sync uncontribute", |_, _| Ok(()))
 }
 
 fn explicit_stream_seal_policy(

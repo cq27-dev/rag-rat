@@ -23,7 +23,11 @@ const NOW: i64 = 1_700_000_000_000;
 const REPO: &str = "repo-a";
 
 fn scoped_conn() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
+    scope(Connection::open_in_memory().unwrap())
+}
+
+/// Apply the schema, register the test repo and scope the connection to it.
+fn scope(conn: Connection) -> Connection {
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
     rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     conn.execute(
@@ -785,12 +789,19 @@ fn clearing_a_foreign_owner_propagates_a_resolution_failure_that_is_not_a_parse(
 /// guards observable (an account that owns nothing is vacuously fully-public and holds no rival
 /// stream at all). Returns `(owner, subscriber, owner_account)`.
 fn subscription_pair() -> (Connection, Connection, rag_rat_oplog::AccountId) {
+    subscription_pair_with(scoped_conn())
+}
+
+/// [`subscription_pair`] with the subscriber's connection supplied — file-backed when a test needs
+/// a second connection to the same store.
+fn subscription_pair_with(
+    subscriber: Connection,
+) -> (Connection, Connection, rag_rat_oplog::AccountId) {
     let owner = scoped_conn();
     let owner_account = local_account(&owner, NOW).unwrap();
     assert!(enable_public_authoring(&owner, NOW).unwrap());
     create_memory(&owner, concept("owner-note")).unwrap();
 
-    let subscriber = scoped_conn();
     let subscriber_account = local_account(&subscriber, NOW).unwrap();
     assert_ne!(owner_account, subscriber_account, "separate identities");
     create_memory(&subscriber, concept("subscriber-note")).unwrap();
@@ -802,7 +813,14 @@ fn subscription_pair() -> (Connection, Connection, rag_rat_oplog::AccountId) {
     sync_account_into(&subscriber, &owner, owner_account);
 
     let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
-    crate::memory_write::set_subscription_owner(&subscriber, &owner_hex, NOW).unwrap();
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &owner_hex,
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+        Default::default(),
+    )
+    .unwrap();
     (owner, subscriber, owner_account)
 }
 
@@ -893,7 +911,14 @@ fn an_unsynced_or_mistyped_subscription_owner_never_becomes_removal_authority() 
     // Re-point at an owner whose log was never synced. `set_subscription_owner` forgets the
     // OUTGOING stream's drain watermark, so the next drain would otherwise make a FULL pass over
     // the new owner's empty projection.
-    crate::memory_write::set_subscription_owner(&subscriber, &"ab".repeat(32), NOW).unwrap();
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+        Default::default(),
+    )
+    .unwrap();
     crate::drain_synced_memory(&subscriber).unwrap();
     let titles = memory_titles(&subscriber);
     assert!(
@@ -908,9 +933,15 @@ fn an_unsynced_or_mistyped_subscription_owner_never_becomes_removal_authority() 
 #[test]
 fn subscription_and_contribution_refuse_to_coexist() {
     let (_owner, contributor, _owner_account) = contribution_pair();
-    let err = crate::memory_write::set_subscription_owner(&contributor, &"ab".repeat(32), NOW)
-        .unwrap_err()
-        .to_string();
+    let err = crate::memory_write::set_subscription_owner(
+        &contributor,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+        Default::default(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("already contributes"), "subscribe names the conflict: {err}");
 
     let (_owner2, subscriber, _owner_account2) = subscription_pair();
@@ -955,7 +986,14 @@ fn subscribed_store_that_held_sibling_device_memories() -> Connection {
     // Subscribe. The owner's stream becomes the one authority, so the sibling's row is condemned.
     sync_account_into(&subscriber, &owner, owner_account);
     let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
-    crate::memory_write::set_subscription_owner(&subscriber, &owner_hex, NOW).unwrap();
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &owner_hex,
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+        Default::default(),
+    )
+    .unwrap();
     crate::drain_synced_memory(&subscriber).unwrap();
     let titles = memory_titles(&subscriber);
     assert!(
@@ -1023,7 +1061,496 @@ fn subscribing_to_your_own_account_is_refused() {
     let store = scoped_conn();
     let account = local_account(&store, NOW).unwrap();
     let own_hex = rag_rat_base::hash::hex_lower(&account.to_bytes());
-    let err =
-        crate::memory_write::set_subscription_owner(&store, &own_hex, NOW).unwrap_err().to_string();
+    let err = crate::memory_write::set_subscription_owner(
+        &store,
+        &own_hex,
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+        Default::default(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("your own account"), "the refusal names the cause: {err}");
+}
+
+/// The locator (`.rag-rat-stream`) is checked in, so anyone who can land a commit can edit it. It
+/// may establish this repo's trust root and never move it: the first subscribe pins the owner, and
+/// a later locator naming a different one is refused.
+#[test]
+fn a_locator_may_establish_a_pin_but_never_move_it() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    let repo_id = rag_rat_db::schema::active_repo_id(&subscriber).unwrap();
+    assert_eq!(
+        crate::memory_write::stream_pin(&subscriber, &repo_id).unwrap().as_deref(),
+        Some(owner_hex.as_str()),
+        "subscribing pins the owner it subscribed to",
+    );
+
+    // A locator re-pointing at a different account is the attack: an edited in-repo file silently
+    // moving a subscriber's memory source. Refused.
+    let err = crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Locator,
+        Default::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("pinned to"), "the refusal names the conflict: {err}");
+    assert!(
+        err.contains("rag-rat sync subscribe"),
+        "and routes to an explicit re-subscribe rather than to unsubscribe, which would reset the \
+         pin: {err}",
+    );
+    assert!(
+        !err.contains("unsubscribe"),
+        "the remedy must never be the sequence that defeats the pin: {err}",
+    );
+
+    // The same locator naming the SAME owner is the ordinary case and must stay silent.
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &owner_hex,
+        NOW,
+        crate::memory_write::SubscribeTrust::Locator,
+        Default::default(),
+    )
+    .expect("a locator that agrees with the pin is the ordinary case");
+}
+
+/// An operator naming an id on the command line obtained it out of band, so they may move the pin —
+/// that is what makes the refusal above a trust decision rather than a wall.
+#[test]
+fn an_operator_named_account_moves_the_pin() {
+    let (_owner, subscriber, _owner_account) = subscription_pair();
+    let repo_id = rag_rat_db::schema::active_repo_id(&subscriber).unwrap();
+
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+        Default::default(),
+    )
+    .expect("an operator may re-point");
+    assert_eq!(
+        crate::memory_write::stream_pin(&subscriber, &repo_id).unwrap(),
+        Some("ab".repeat(32)),
+        "and the pin follows them, so the locator is then measured against the new trust root",
+    );
+}
+
+/// The pin outlives `sync unsubscribe`. If it did not, the fail-closed refusal would be defeated by
+/// the very sequence an agent handed that error would try next.
+#[test]
+fn unsubscribing_does_not_reset_the_pin() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    let repo_id = rag_rat_db::schema::active_repo_id(&subscriber).unwrap();
+
+    assert!(crate::memory_write::clear_subscription_owner(&subscriber).unwrap());
+    assert_eq!(
+        crate::memory_write::stream_pin(&subscriber, &repo_id).unwrap().as_deref(),
+        Some(owner_hex.as_str()),
+        "unsubscribe clears the subscription, not the trust root",
+    );
+
+    // So unsubscribe-then-locator-subscribe still cannot move it.
+    let err = crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Locator,
+        Default::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("pinned to"), "the pin survives the unsubscribe dance: {err}");
+}
+
+/// A locator exists so a clone needs no `[sync] server_peers`. Recording only the owner would leave
+/// that clone holding a subscription it can never fetch: a foreign account's host cannot be
+/// discovered, because the discovery tag derives from that account's own secret.
+#[test]
+fn subscribing_from_a_locator_records_the_routing_that_reaches_the_owner() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscribe_via_locator(
+        &subscriber,
+        &owner_hex,
+        &["node-a".to_string(), "node-b".to_string()],
+        Some("https://relay.example"),
+    );
+    let relay = Some("https://relay.example".to_string());
+    assert_eq!(
+        crate::memory_write::subscription_routing(&subscriber, &owner_hex).unwrap(),
+        [("node-a".to_string(), relay.clone()), ("node-b".to_string(), relay)],
+        "each recorded peer carries the relay its locator named — the pull paths dial it there",
+    );
+}
+
+/// An operator-named subscribe supplies no routing, and must not inherit the previous owner's host:
+/// dialing it for a different account is a wasted connection to a peer that never held the stream.
+#[test]
+fn re_subscribing_without_routing_clears_the_previous_owners_host() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscribe_via_locator(&subscriber, &owner_hex, &["node-a".to_string()], Some("https://r"));
+
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &owner_hex,
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+        Default::default(),
+    )
+    .unwrap();
+    assert!(
+        crate::memory_write::subscription_routing(&subscriber, &owner_hex).unwrap().is_empty(),
+        "stale routing is cleared, not carried onto the new subscription",
+    );
+}
+
+/// A store upgraded from a release without the pin holds a live subscription and no pin. Reading
+/// that as first use would let a changed locator silently replace the owner an operator chose.
+#[test]
+fn an_upgraded_store_treats_its_existing_subscription_as_the_pin() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscriber.execute("DELETE FROM repo_meta WHERE key = 'memory_stream_pin'", []).unwrap();
+
+    let err = crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Locator,
+        Default::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains(&format!("pinned to {owner_hex}")),
+        "the existing subscription is the trust root: {err}",
+    );
+}
+
+/// The upgrade case again, with `sync unsubscribe` as the first thing run after it. Clearing the
+/// subscription must carry its owner into the pin, or the next locator subscribe reads as first
+/// use.
+#[test]
+fn unsubscribing_an_upgraded_store_first_still_keeps_its_trust_root() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscriber.execute("DELETE FROM repo_meta WHERE key = 'memory_stream_pin'", []).unwrap();
+
+    assert!(crate::memory_write::clear_subscription_owner(&subscriber).unwrap());
+    let err = crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Locator,
+        Default::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains(&format!("pinned to {owner_hex}")), "the pin was seeded: {err}");
+}
+
+/// Routing describes how to reach the owner a repo mirrors. Once it mirrors nobody, its host must
+/// drop out of every pull — an obsolete host stalls each pass behind a failing dial.
+#[test]
+fn routing_for_a_repo_that_no_longer_subscribes_is_never_dialed() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscribe_via_locator(&subscriber, &owner_hex, &["node-a".to_string()], None);
+    assert!(crate::memory_write::clear_subscription_owner(&subscriber).unwrap());
+    assert!(
+        crate::memory_write::subscription_routing(&subscriber, &owner_hex).unwrap().is_empty(),
+        "unsubscribe takes the routing out of every pull",
+    );
+}
+
+/// A locator describes how to reach ONE owner's host, so its routes belong to that owner. Pooled
+/// across owners, one repository's locator could name another owner's peer through a dead relay and
+/// put that route in front of the live one.
+#[test]
+fn routing_reaches_only_the_owner_its_locator_describes() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscribe_via_locator(&subscriber, &owner_hex, &["node-a".to_string()], Some("https://r"));
+
+    assert_eq!(
+        crate::memory_write::subscription_routing(&subscriber, &owner_hex).unwrap().len(),
+        1,
+        "the subscribed owner's pull sees its route",
+    );
+    assert!(
+        crate::memory_write::subscription_routing(&subscriber, &"cd".repeat(32))
+            .unwrap()
+            .is_empty(),
+        "another account's pull never sees this repository's routes",
+    );
+}
+
+/// Owner, pin and routing change together or not at all. A re-subscribe whose routing write fails
+/// must leave the previous subscription whole: were the owner and pin committed first, the previous
+/// owner's routes would survive beside the new owner and be dialed on its behalf.
+#[test]
+fn a_resubscribe_that_cannot_record_its_routing_changes_nothing() {
+    use rusqlite::OptionalExtension;
+
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscribe_via_locator(&subscriber, &owner_hex, &["node-a".to_string()], Some("https://r"));
+    let meta = |key: &str| -> Option<String> {
+        subscriber
+            .query_row("SELECT value FROM repo_meta WHERE key = ?1", [key], |row| row.get(0))
+            .optional()
+            .unwrap()
+    };
+
+    // Every write that would replace or clear the recorded routing now fails.
+    subscriber
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_routing_insert BEFORE INSERT ON repo_meta
+                 WHEN NEW.key = 'memory_subscription_peers'
+                 BEGIN SELECT RAISE(ABORT, 'injected routing failure'); END;
+             CREATE TEMP TRIGGER fail_routing_update BEFORE UPDATE ON repo_meta
+                 WHEN OLD.key = 'memory_subscription_peers'
+                 BEGIN SELECT RAISE(ABORT, 'injected routing failure'); END;
+             CREATE TEMP TRIGGER fail_routing_delete BEFORE DELETE ON repo_meta
+                 WHEN OLD.key = 'memory_subscription_peers'
+                 BEGIN SELECT RAISE(ABORT, 'injected routing failure'); END;",
+        )
+        .unwrap();
+
+    let other = "ab".repeat(32);
+    let err = crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &other,
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+        Default::default(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("injected routing failure"),
+        "the injected fault is what failed: {err:#}",
+    );
+
+    assert_eq!(
+        meta("memory_subscription_owner"),
+        Some(owner_hex.clone()),
+        "the owner did not move"
+    );
+    assert_eq!(meta("memory_stream_pin"), Some(owner_hex.clone()), "the pin did not move");
+    assert_eq!(
+        meta("memory_subscription_peers").as_deref(),
+        Some("node-a"),
+        "routing kept its owner"
+    );
+    assert!(
+        crate::memory_write::subscription_routing(&subscriber, &other).unwrap().is_empty(),
+        "the new owner was never handed the previous owner's routes",
+    );
+}
+
+/// Re-subscribe `conn` to `owner_hex` from a locator carrying this routing — the only path that
+/// records routing, so tests set it up the way production does.
+fn subscribe_via_locator(
+    conn: &rusqlite::Connection,
+    owner_hex: &str,
+    peers: &[String],
+    relay: Option<&str>,
+) {
+    crate::memory_write::set_subscription_owner(
+        conn,
+        owner_hex,
+        NOW,
+        crate::memory_write::SubscribeTrust::Locator,
+        crate::memory_write::SubscriptionRouting { peers, relay },
+    )
+    .unwrap();
+}
+
+/// A connection to a file-backed store with the pragmas production relies on for concurrency: WAL,
+/// so a reader keeps its snapshot while another connection commits, and a busy timeout.
+fn file_conn(path: &std::path::Path) -> Connection {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+    conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+    conn
+}
+
+/// Set once the locator's connection is waiting on the write lock — the causal signal the pin race
+/// commits on, rather than a sleep.
+static LOCATOR_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn locator_is_waiting(_attempts: i32) -> bool {
+    LOCATOR_WAITING.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    true
+}
+
+/// A locator subscribe decides against the pin it commits under. An operator re-subscribe holds the
+/// write lock with a new pin not yet committed; the locator, naming the OLD owner that matched the
+/// pin a moment earlier, waits on that lock, and only then does the operator commit. Checked before
+/// taking the lock, the locator would pass against the stale pin and restore the old owner over the
+/// one just committed; checked under it, the locator sees the new pin and refuses.
+#[test]
+fn a_locator_subscribe_decides_against_the_pin_it_commits_under() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let (_owner, subscriber, owner_account) = subscription_pair_with(scope(file_conn(&path)));
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    let other = "ab".repeat(32);
+
+    let operator = file_conn(&path);
+    operator.execute_batch("BEGIN IMMEDIATE").unwrap();
+    operator
+        .execute(
+            "UPDATE repo_meta SET value = ?1 WHERE repo_id = ?2
+               AND key IN ('memory_subscription_owner', 'memory_stream_pin')",
+            params![other, REPO],
+        )
+        .unwrap();
+
+    LOCATOR_WAITING.store(false, std::sync::atomic::Ordering::SeqCst);
+    subscriber.busy_handler(Some(locator_is_waiting)).unwrap();
+    let locator = std::thread::spawn(move || {
+        crate::memory_write::set_subscription_owner(
+            &subscriber,
+            &owner_hex,
+            NOW,
+            crate::memory_write::SubscribeTrust::Locator,
+            Default::default(),
+        )
+        .map_err(|err| format!("{err:#}"))
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !LOCATOR_WAITING.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(std::time::Instant::now() < deadline, "the locator never reached the write lock");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    operator.execute_batch("COMMIT").unwrap();
+
+    let outcome = locator.join().unwrap();
+    let pin: String = operator
+        .query_row(
+            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = 'memory_stream_pin'",
+            [REPO],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pin, other, "the pin committed ahead of the locator survives");
+    let refusal = outcome.expect_err("the locator must see that pin and refuse");
+    assert!(
+        refusal.contains(&format!("pinned to {other}")),
+        "it refuses against the new pin: {refusal}"
+    );
+}
+
+/// A routing lookup reads one subscription state. The reader's `repo_meta` is shadowed by a view
+/// that, the first time it is read, commits a re-subscribe to another owner from a second
+/// connection. Read in one statement, the lookup keeps its snapshot and returns this owner's own
+/// routes; read key by key, it would find this owner and then the NEXT owner's peers and relay.
+#[test]
+fn a_routing_lookup_reads_one_subscription_state() {
+    use rusqlite::functions::FunctionFlags;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let (_owner, subscriber, owner_account) = subscription_pair_with(scope(file_conn(&path)));
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscribe_via_locator(
+        &subscriber,
+        &owner_hex,
+        &["node-a".to_string()],
+        Some("https://relay-a"),
+    );
+
+    let other = "ab".repeat(32);
+    let resubscribe = format!(
+        "BEGIN IMMEDIATE;
+         UPDATE repo_meta SET value = CASE key
+             WHEN 'memory_subscription_owner' \
+         THEN '{other}'
+             WHEN 'memory_subscription_peers' THEN 'node-b'
+             WHEN \
+         'memory_subscription_relay' THEN 'https://relay-b'
+             ELSE value END
+         WHERE repo_id = '{REPO}';
+         COMMIT;"
+    );
+    let writer = std::sync::Mutex::new(Some(file_conn(&path)));
+    subscriber
+        .create_scalar_function(
+            "resubscribe_concurrently",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_| {
+                if let Some(writer) = writer.lock().unwrap().take() {
+                    writer
+                        .execute_batch(&resubscribe)
+                        .map_err(|err| rusqlite::Error::UserFunctionError(err.into()))?;
+                }
+                Ok(1)
+            },
+        )
+        .unwrap();
+    subscriber
+        .execute_batch(
+            "CREATE TEMP VIEW repo_meta AS
+                 SELECT repo_id, key, value FROM main.repo_meta WHERE resubscribe_concurrently()",
+        )
+        .unwrap();
+
+    assert_eq!(
+        crate::memory_write::subscription_routing(&subscriber, &owner_hex).unwrap(),
+        [("node-a".to_string(), Some("https://relay-a".to_string()))],
+        "one snapshot: this owner's own routes, never the next owner's",
+    );
+    let owner_now: String = file_conn(&path)
+        .query_row(
+            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = 'memory_subscription_owner'",
+            [REPO],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner_now, other, "the concurrent re-subscribe really committed mid-lookup");
+}
+
+/// A subscribe decides the pin in THIS store, so it stops being a copy an earlier consolidation
+/// left: the marker that lets a retried consolidation replace an imported pin must go with it.
+#[test]
+fn a_subscribe_takes_the_pin_out_of_import_provenance() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscriber
+        .execute(
+            "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, 'memory_stream_pin_imported', \
+             ?2)",
+            params![REPO, owner_hex],
+        )
+        .unwrap();
+
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+        Default::default(),
+    )
+    .unwrap();
+    let marker: Option<String> = subscriber
+        .query_row(
+            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = 'memory_stream_pin_imported'",
+            [REPO],
+            |row| row.get(0),
+        )
+        .ok();
+    assert_eq!(marker, None, "a pin decided here is no longer an imported copy");
 }
