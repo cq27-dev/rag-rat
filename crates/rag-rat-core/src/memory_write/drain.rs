@@ -767,10 +767,12 @@ fn published_source_hash<'a>(repo_id: &str, node: &'a ProjectedContentNode) -> O
 
 /// Bring a memory's bindings to a published set BY IDENTITY — `(binding_kind, binding_id)`, the
 /// primary key — for the kinds this store can install. A held row the set no longer names is
-/// deleted. A named row keeps its local resolution while its target is unchanged; one whose target
-/// moved (a struct and its impl share a qualified name) takes the author's values and drops that
-/// resolution for the validate loop to redo. A named anchor missing here is inserted. Returns
-/// whether any row moved.
+/// deleted. A named row takes the author's values and drops its cached resolution for the validate
+/// loop to redo — on every set change, not only when its portable columns differ: `anchors/1`
+/// updates those in place and keeps the local ids, so a row whose target moved under an unchanged
+/// identity (a struct and its impl share a qualified name) can match the new set while its ids
+/// still name the old target. A named anchor missing here is inserted. Returns whether any row
+/// moved.
 ///
 /// Kinds this store never inserts (`chunk`, `call_path`) are never deleted or refreshed. The drain
 /// cannot put back what it removes of them, and on a device of the author's own account they are
@@ -789,7 +791,6 @@ fn converge_bindings(
     for row in held.iter().filter(|row| SEEDABLE_BINDING_KINDS.contains(&row.binding_kind.as_str()))
     {
         match anchors.iter().find(|anchor| same_row(row, anchor)) {
-            Some(anchor) if same_target(row, anchor) => continue,
             Some(anchor) => refresh_binding(tx, repo_id, memory_id, anchor)?,
             None => {
                 tx.execute(
@@ -1780,21 +1781,27 @@ mod tests {
         assert_eq!(call_paths, 1, "the call path the set still names is kept");
     }
 
-    /// A row the author's new set still names keeps its local resolution state; only what the set
-    /// adds or drops moves.
+    /// A set change re-resolves every row it still names, even one whose portable columns already
+    /// match: `anchors/1` updates those in place and keeps the checkout-local ids, so a
+    /// struct-to-impl rebind reaching this device through it first leaves a row that looks like
+    /// the impl while its ids still name the struct. Trusting them would put the impl's hash beside
+    /// the struct.
     #[test]
-    fn a_row_the_new_set_still_names_keeps_its_local_resolution() {
+    fn a_set_change_re_resolves_a_row_anchors1_already_moved() {
         let conn = scoped_conn();
         let stream = StreamId::from_bytes([0x44; 32]);
         seed_projected_node_with_anchors(
             &conn,
             stream,
             "mem_peer",
-            Some(&[("symbol", "src/lib.rs::run")]),
+            Some(&[("symbol", "src/lib.rs::Run")]),
         );
+        set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "struct");
         drain_worker(&conn, stream, 1_000);
+        // Resolved against the struct, then moved to the impl in place by `anchors/1`.
         conn.execute(
-            "UPDATE repo_memory_bindings SET anchor_status = 'current', symbol_id = 42
+            "UPDATE repo_memory_bindings
+             SET anchor_status = 'current', symbol_id = 42, symbol_kind = 'impl'
              WHERE memory_id = 'mem_peer'",
             [],
         )
@@ -1804,23 +1811,26 @@ mod tests {
             &conn,
             stream,
             "mem_peer",
-            Some(&[("symbol", "src/lib.rs::run"), ("symbol", "src/other.rs::walk")]),
+            Some(&[("symbol", "src/lib.rs::Run")]),
         );
+        set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "impl");
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
         drain_worker(&conn, stream, 2_000);
 
-        assert_eq!(bindings_of(&conn, "mem_peer"), vec![
-            ("symbol".to_string(), "src/lib.rs::run".to_string()),
-            ("symbol".to_string(), "src/other.rs::walk".to_string()),
-        ]);
-        let kept: (String, Option<i64>) = conn
+        let row: (String, Option<i64>) = conn
             .query_row(
                 "SELECT anchor_status, symbol_id FROM repo_memory_bindings
-                 WHERE memory_id = 'mem_peer' AND binding_id = 'src/lib.rs::run'",
+                 WHERE memory_id = 'mem_peer'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(kept, ("current".to_string(), Some(42)));
+        assert_eq!(
+            row,
+            ("unverified".to_string(), None),
+            "the struct's resolution is not trusted for the impl",
+        );
+        assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_A.to_string()));
     }
 
     /// A chunk binding relocates on every re-chunk without a new snapshot, and on a device of the

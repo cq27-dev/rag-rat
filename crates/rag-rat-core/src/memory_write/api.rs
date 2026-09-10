@@ -625,6 +625,41 @@ mod anchor_authoring_tests {
         );
     }
 
+    /// A memory's hash and anchor set are separate entries on one chain, and a peer accepts a chain
+    /// in order. The hash goes first, so a pull that stops between them never pairs the new
+    /// bindings with the previous target's hash; a rebind onto a hashless target leads with the
+    /// empty retraction.
+    #[test]
+    fn the_hash_is_published_ahead_of_the_anchor_set() {
+        use rag_rat_oplog::MemoryOp;
+        let conn = scoped_conn();
+        indexed_file(&conn, "src/lib.rs", &sha_of("lib"));
+        let hashed = bound_create(&conn, "src/lib.rs");
+        let unhashed = bound_create(&conn, "src/other.rs");
+        let publication = |memory_id: &str, retract: bool| {
+            crate::memory_write::authoring::anchor_publication_ops(&conn, memory_id, retract)
+                .unwrap()
+        };
+
+        let ops = publication(&hashed, false);
+        assert!(
+            matches!(ops.as_slice(), [
+                MemoryOp::NodeSourceHash { .. },
+                MemoryOp::NodeAnchors { .. }
+            ]),
+            "{ops:?}"
+        );
+        let ops = publication(&unhashed, true);
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [MemoryOp::NodeSourceHash { source_text_hash, .. }, MemoryOp::NodeAnchors { .. }]
+                    if source_text_hash.is_empty()
+            ),
+            "{ops:?}"
+        );
+    }
+
     /// The half the anchor sweep cannot reach: a memory whose anchors were published before the
     /// hash op existed. Its `anchors_json` is set, so only the hash leg revisits it, and it
     /// publishes the hash alone — a receiver applies it without touching the bindings.
