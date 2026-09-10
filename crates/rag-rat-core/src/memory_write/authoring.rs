@@ -993,7 +993,7 @@ fn build_reconcile_ops(
         //
         // An unpublishable set is dropped rather than quarantining the node: anchors are
         // decoration, and losing them must never cost a peer the memory itself.
-        let publication = anchor_publication_ops(conn, &row.memory_id, false)?;
+        let publication = anchor_publication_ops(conn, &row.memory_id)?;
         if publication.iter().all(|op| content_op_is_authorable(op, policy)) {
             ops.extend(publication);
         }
@@ -1291,7 +1291,7 @@ fn read_reconcile_work(
         // ahead of them (see `anchor_publication_ops`). An empty publication is unreachable — the
         // query requires a binding — but counting it as quarantined keeps the partition total
         // rather than silently dropping.
-        let publication = anchor_publication_ops(conn, &memory_id, false)?;
+        let publication = anchor_publication_ops(conn, &memory_id)?;
         if !publication.is_empty()
             && publication.iter().all(|op| content_op_is_authorable(op, policy))
         {
@@ -1308,16 +1308,18 @@ fn read_reconcile_work(
         if swept >= ANCHOR_BACKFILL_PER_PASS {
             break;
         }
-        match source_hash_op(conn, &memory_id)? {
-            Some(op) if content_op_is_authorable(&op, policy) => {
-                anchor_backfill_ops.push(op);
-                swept += 1;
-            },
-            _ => tracing::debug!(
+        // The hash rides with the set it describes, never alone (see `anchor_publication_ops`). A
+        // receiver already holding that set skips it by digest and only takes the hash.
+        let publication = anchor_publication_ops(conn, &memory_id)?;
+        if publication.iter().all(|op| content_op_is_authorable(op, policy)) {
+            anchor_backfill_ops.extend(publication);
+            swept += 1;
+        } else {
+            tracing::debug!(
                 repo_id,
                 memory_id = %memory_id,
-                "skipping a source hash this stream cannot author",
-            ),
+                "skipping a hash publication this stream cannot author",
+            );
         }
     }
     Ok(ReconcileWork {
@@ -2217,7 +2219,7 @@ pub(crate) fn author_create(
     let node_id = NodeId::from(memory.memory_id.as_str());
     let mut ops =
         vec![MemoryOp::NodeCreate { node_id: node_id.clone(), content: content_of(memory) }];
-    ops.extend(anchor_publication_ops(tx, &memory.memory_id, false)?);
+    ops.extend(anchor_publication_ops(tx, &memory.memory_id)?);
     author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
 
@@ -2233,13 +2235,19 @@ pub(crate) fn author_anchors(
     // move with the anchors or a peer keeps comparing against the pre-rebind text. A target with no
     // hash publishes an EMPTY one: the register has no other retraction, and a receiver applies the
     // hash on its own change, so silence would pair the new anchors with the old text.
-    let ops = anchor_publication_ops(tx, memory_id, true)?;
+    let ops = anchor_publication_ops(tx, memory_id)?;
     author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
 
 /// The ops that publish a memory's anchor set — its source hash, then the set — or none when the
-/// memory holds no binding. `retract_absent_hash` publishes an EMPTY hash when the memory has none:
-/// a rebind's retraction of the pre-rebind value, which the register has no other way to express.
+/// memory holds no binding. A memory with no hash publishes an EMPTY one: the register's only
+/// retraction, and the op that keeps the pair a pair.
+///
+/// Always BOTH, never one alone. The fold resolves the hash and the set as independent registers by
+/// `(lamport, device)`, and one writer's pair sits at adjacent lamports, so two writers' full pairs
+/// compare the same way on both registers and can never split. A lone op has no partner: racing a
+/// concurrent rebind from another device or a grantee, it can win one register and lose the other,
+/// leaving a pair nobody published — for good, since nothing republishes afterwards.
 ///
 /// The hash goes FIRST. The two are separate entries on one chain, and a peer accepts a chain in
 /// order, so a pull that stops between them leaves a prefix. Hash-first makes that prefix a newer
@@ -2249,19 +2257,15 @@ pub(crate) fn author_anchors(
 pub(crate) fn anchor_publication_ops(
     conn: &Connection,
     memory_id: &str,
-    retract_absent_hash: bool,
 ) -> anyhow::Result<Vec<MemoryOp>> {
     let Some(anchors) = anchors_op(conn, memory_id)? else {
         return Ok(Vec::new());
     };
-    let hash = match source_hash_op(conn, memory_id)? {
-        None if retract_absent_hash => Some(MemoryOp::NodeSourceHash {
-            node_id: NodeId::from(memory_id),
-            source_text_hash: String::new(),
-        }),
-        hash => hash,
-    };
-    Ok(hash.into_iter().chain([anchors]).collect())
+    let hash = source_hash_op(conn, memory_id)?.unwrap_or_else(|| MemoryOp::NodeSourceHash {
+        node_id: NodeId::from(memory_id),
+        source_text_hash: String::new(),
+    });
+    Ok(vec![hash, anchors])
 }
 
 /// The `NodeSourceHash` op for a memory's stamped source hash, or `None` when it has none.

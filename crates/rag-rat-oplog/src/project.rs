@@ -267,6 +267,32 @@ mod tests {
         }
     }
 
+    /// A memory's hash and anchor set are always published as ADJACENT entries of one writer. The
+    /// two registers resolve independently, but adjacent pairs compare the same way on both, so two
+    /// writers' full pairs never split: whoever wins one register wins the other, at any clock
+    /// offset and on a tie. A lone op has no partner and could split a pair, which is why the
+    /// author never publishes one.
+    #[test]
+    fn concurrent_full_pairs_never_split_the_anchor_and_hash_registers() {
+        let hash = |value: &str| MemoryOp::NodeSourceHash {
+            node_id: NodeId::from("mem_1"),
+            source_text_hash: value.to_string(),
+        };
+        for (x, y) in [(5, 5), (5, 6), (6, 5), (5, 9), (9, 5)] {
+            let state = project(&[
+                at(1, 1, create("mem_1", "t")),
+                at(x, 1, hash("hx")),
+                at(x + 1, 1, anchors_op("mem_1", &["x"])),
+                at(y, 2, hash("hy")),
+                at(y + 1, 2, anchors_op("mem_1", &["y"])),
+            ]);
+            let node = &state.nodes[&NodeId::from("mem_1")];
+            let anchors_from_x = node.anchors.as_ref().unwrap()[0].binding_id == "x";
+            let hash_from_x = node.source_text_hash.as_deref() == Some("hx");
+            assert_eq!(anchors_from_x, hash_from_x, "writers at {x}/{y} split the pair");
+        }
+    }
+
     fn anchors_op(id: &str, binding_ids: &[&str]) -> MemoryOp {
         MemoryOp::NodeAnchors {
             node_id: NodeId::from(id),

@@ -562,14 +562,15 @@ mod anchor_authoring_tests {
         assert_eq!(projected_source_hash(&conn, &memory_id), Some(sha));
     }
 
-    /// A memory anchored to something with no text behind it publishes NO hash — the absence is
-    /// the honest answer, and a receiver reads it as no evidence of drift rather than a sentinel.
+    /// A memory anchored to something with no text behind it publishes an EMPTY hash beside its
+    /// anchors, never the set alone: a lone op can win one register against a concurrent writer's
+    /// pair and lose the other. A receiver reads the empty hash as no evidence of drift.
     #[test]
-    fn a_create_over_an_unindexed_path_publishes_no_source_hash() {
+    fn a_create_over_an_unindexed_path_publishes_an_empty_source_hash() {
         let conn = scoped_conn();
         let memory_id = bound_create(&conn, "src/lib.rs");
 
-        assert_eq!(projected_source_hash(&conn, &memory_id), None);
+        assert_eq!(projected_source_hash(&conn, &memory_id), Some(String::new()));
     }
 
     /// A rebind re-stamps `source_text_hash` in the same transaction, so the published hash has to
@@ -636,12 +637,11 @@ mod anchor_authoring_tests {
         indexed_file(&conn, "src/lib.rs", &sha_of("lib"));
         let hashed = bound_create(&conn, "src/lib.rs");
         let unhashed = bound_create(&conn, "src/other.rs");
-        let publication = |memory_id: &str, retract: bool| {
-            crate::memory_write::authoring::anchor_publication_ops(&conn, memory_id, retract)
-                .unwrap()
+        let publication = |memory_id: &str| {
+            crate::memory_write::authoring::anchor_publication_ops(&conn, memory_id).unwrap()
         };
 
-        let ops = publication(&hashed, false);
+        let ops = publication(&hashed);
         assert!(
             matches!(ops.as_slice(), [
                 MemoryOp::NodeSourceHash { .. },
@@ -649,7 +649,7 @@ mod anchor_authoring_tests {
             ]),
             "{ops:?}"
         );
-        let ops = publication(&unhashed, true);
+        let ops = publication(&unhashed);
         assert!(
             matches!(
                 ops.as_slice(),
@@ -667,9 +667,14 @@ mod anchor_authoring_tests {
     fn the_hash_leg_publishes_a_hash_for_anchors_published_without_one() {
         let conn = scoped_conn();
         let sha = sha_of("old");
-        // An unindexed path: the create publishes its anchors and no hash.
+        // The state a store from before the hash op leaves: anchors published, no hash op at all.
+        // A create now always publishes one, so the projection is set back by hand.
         let memory_id = bound_create(&conn, "src/lib.rs");
-        assert_eq!(projected_source_hash(&conn, &memory_id), None, "anchors, and no hash");
+        conn.execute(
+            "UPDATE content_projected_nodes SET source_text_hash = NULL WHERE node_id = ?1",
+            [&memory_id],
+        )
+        .unwrap();
         conn.execute(
             "UPDATE repo_memories SET source_text_hash = ?2 WHERE id = ?1",
             rusqlite::params![memory_id, sha],
@@ -680,6 +685,13 @@ mod anchor_authoring_tests {
         bound_create(&conn, "src/other.rs");
 
         assert_eq!(projected_source_hash(&conn, &memory_id), Some(sha));
+        // Published once: a later pass finds nothing owed, instead of republishing on every write.
+        let entries = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM content_entries", [], |row| row.get(0)).unwrap()
+        };
+        let before = entries(&conn);
+        crate::memory_write::authoring::backfill_memory_oplog(&conn, 10_000).unwrap();
+        assert_eq!(entries(&conn), before, "the hash leg does not re-select what it published");
     }
 
     /// The backfill leg must publish the hash too, for the same reason it must publish anchors: a

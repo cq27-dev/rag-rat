@@ -689,6 +689,14 @@ fn apply_published_anchors(
                 held.iter().all(|row| anchors.iter().any(|anchor| same_target(row, anchor)));
         } else {
             changed |= converge_bindings(tx, repo_id, &node.node_id, anchors, &held)?;
+            // Converging never removes a kind this store cannot install, so such a row can outlive
+            // a set that names nothing of its kind any more — a rebind made here onto a chunk, say
+            // — and the author's hash does not describe it. A kept row of a kind the set still
+            // names is taken as the author's: a chunk relocates on every re-chunk, snapshot or not.
+            authors_bindings = held
+                .iter()
+                .filter(|row| !SEEDABLE_BINDING_KINDS.contains(&row.binding_kind.as_str()))
+                .all(|row| anchors.iter().any(|anchor| anchor.binding_kind == row.binding_kind));
         }
         tx.execute(
             "UPDATE repo_memories SET anchors_applied_digest = ?3 WHERE id = ?1 AND repo_id = ?2",
@@ -724,14 +732,24 @@ fn same_row(held: &rag_rat_oplog::PortableAnchor, anchor: &rag_rat_oplog::Portab
     held.binding_kind == anchor.binding_kind && held.binding_id == anchor.binding_id
 }
 
-/// Whether a held binding and a published anchor name the same row AND the same target: every
-/// portable column but `created_at_ms`, which each rebind restamps without saying anything about
-/// the target. The row alone is not enough — a struct and its impl share a qualified name.
+/// Whether a held binding and a published anchor name the same row AND the same target, compared on
+/// what identifies the target rather than where it currently sits. The row alone is not enough: a
+/// struct and its impl share a qualified name, told apart by `symbol_kind` and `signature_hash`.
+/// The location is left out because the validate loop rewrites it in place for the SAME target —
+/// `path` and the line span when a symbol only moves, `moniker_tool_version` on a moniker refresh —
+/// and `created_at_ms` because each rebind restamps it.
 fn same_target(
     held: &rag_rat_oplog::PortableAnchor,
     anchor: &rag_rat_oplog::PortableAnchor,
 ) -> bool {
-    rag_rat_oplog::PortableAnchor { created_at_ms: anchor.created_at_ms, ..held.clone() } == *anchor
+    same_row(held, anchor)
+        && held.symbol_kind == anchor.symbol_kind
+        && held.signature_hash == anchor.signature_hash
+        && held.moniker_tool == anchor.moniker_tool
+        && held.commit_hash == anchor.commit_hash
+        && held.tracker == anchor.tracker
+        && held.project == anchor.project
+        && held.item_key == anchor.item_key
 }
 
 /// The identity of a published anchor set: its byte-canonical op encoding, hashed. The fold has
@@ -1897,6 +1915,131 @@ mod tests {
         drain_worker(&conn, stream, 2_000);
 
         assert_eq!(source_hash_of(&conn, "mem_peer"), None);
+    }
+
+    /// The validate loop rewrites a binding's location in place for the SAME target — here a
+    /// symbol that moved down its file. Bindings kept by the record-only branch are matched on the
+    /// target, not its location, so the author's hash still reaches them.
+    #[test]
+    fn a_kept_binding_that_only_moved_lines_takes_the_published_hash() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", None);
+        drain_worker(&conn, stream, 1_000);
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                 anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'symbol', 'src/lib.rs::run', 'src/lib.rs', 5, 6, 'current',
+                 1)",
+            [REPO],
+        )
+        .unwrap();
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_A.to_string()));
+    }
+
+    /// Converging never removes a kind this store cannot install, so a rebind made here onto a
+    /// chunk outlives an author's set that names no chunk at all. The author's new hash does not
+    /// describe that row, so the rebind keeps its own.
+    #[test]
+    fn a_kept_chunk_the_new_set_names_nothing_like_keeps_the_authors_hash_off() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        drain_worker(&conn, stream, 1_000);
+        // A rebind made here, onto a chunk.
+        conn.execute("DELETE FROM repo_memory_bindings WHERE memory_id = 'mem_peer'", []).unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'chunk', '43', 'current', 1)",
+            [REPO],
+        )
+        .unwrap();
+        conn.execute("UPDATE repo_memories SET source_text_hash = ?1 WHERE id = 'mem_peer'", [
+            HASH_B,
+        ])
+        .unwrap();
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/other.rs::walk")]),
+        );
+        let hash_c = "c".repeat(64);
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(&hash_c));
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![
+            ("chunk".to_string(), "43".to_string()),
+            ("symbol".to_string(), "src/other.rs::walk".to_string()),
+        ]);
+        assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_B.to_string()));
+    }
+
+    /// Named rows of a kind this store cannot install keep their local resolution across a set
+    /// change: their checkout-local id IS that resolution, and a refresh would clear it for good.
+    #[test]
+    fn named_bindings_this_store_cannot_seed_keep_their_resolution() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        drain_worker(&conn, stream, 1_000);
+        conn.execute("DELETE FROM repo_memory_bindings WHERE memory_id = 'mem_peer'", []).unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, chunk_id, anchor_status,
+                 created_at_ms)
+             VALUES (?1, 'mem_peer', 'chunk', '42', 99, 'current', 1),
+                    (?1, 'mem_peer', 'call_path', 'seq', NULL, 'current', 1)",
+            [REPO],
+        )
+        .unwrap();
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("chunk", "42"), ("call_path", "seq")]),
+        );
+        drain_worker(&conn, stream, 2_000);
+
+        let rows: Vec<(String, Option<i64>, String)> = conn
+            .prepare(
+                "SELECT binding_kind, chunk_id, anchor_status FROM repo_memory_bindings
+                 WHERE memory_id = 'mem_peer' ORDER BY binding_kind",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows, vec![
+            ("call_path".to_string(), None, "current".to_string()),
+            ("chunk".to_string(), Some(99), "current".to_string()),
+        ]);
     }
 
     /// Set one field of the first anchor in a projected node's published snapshot.
