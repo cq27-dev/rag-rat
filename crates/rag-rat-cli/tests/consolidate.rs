@@ -634,3 +634,70 @@ fn consolidate_rebuilds_stale_content_projection_before_reconcile() {
     // CONTENT_PROJECTOR_VERSION bump.
     assert_eq!(stamp, "5", "consolidate upgraded the store-global projector stamp");
 }
+
+/// Two clones of one repository share its repo id but hold separate legacy indexes, each pinned to
+/// a different stream owner. Consolidating the first carries its pin and, once the rename lands,
+/// retires the import marker — so consolidating the second cannot pass for a retry of the first and
+/// silently move the global pin. It is refused, and the first clone's trust root stands.
+#[test]
+fn consolidating_a_second_clone_cannot_replace_the_first_clones_pin() {
+    const KEYLESS: &str = "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \
+                           \"none\"\n\n[target_bindings]\nrust = [\"src\"]\n";
+    let first = fixture_repo();
+    let second = unique_dir("repo-second");
+    fs::create_dir_all(&second).unwrap();
+    git(&second, &["clone", "-q", first.to_str().unwrap(), "."]);
+    let data_dir = unique_dir("data");
+    let model_cache = unique_dir("cache");
+    let (owner_first, owner_second) = ("ab".repeat(32), "cd".repeat(32));
+
+    // Each clone builds its own legacy index and pins its own owner there. Unsubscribing keeps the
+    // pin — it is built to outlive the subscription — and consolidation needs an unsubscribed repo.
+    for (root, owner) in [(&first, &owner_first), (&second, &owner_second)] {
+        for args in [
+            &["index", "--full"][..],
+            &["sync", "subscribe", owner.as_str()][..],
+            &["sync", "unsubscribe"][..],
+        ] {
+            let out = run(root, &data_dir, &model_cache, args);
+            assert!(
+                out.status.success(),
+                "`{}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        fs::write(root.join("rag-rat.toml"), KEYLESS).unwrap();
+    }
+
+    let global = data_dir.join("rag-rat.sqlite");
+    let meta = |key: &str| -> Option<String> {
+        rusqlite::Connection::open(&global)
+            .unwrap()
+            .query_row("SELECT value FROM repo_meta WHERE key = ?1", [key], |row| row.get(0))
+            .ok()
+    };
+
+    let out = run(&first, &data_dir, &model_cache, &["consolidate"]);
+    assert!(
+        out.status.success(),
+        "consolidating the first clone failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        meta("memory_stream_pin"),
+        Some(owner_first.clone()),
+        "the first clone's pin carried"
+    );
+    assert_eq!(
+        meta("memory_stream_pin_imported"),
+        None,
+        "a completed consolidation retires its import marker",
+    );
+
+    let out = run(&second, &data_dir, &model_cache, &["consolidate"]);
+    assert!(!out.status.success(), "the second clone's conflicting pin must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("consolidation refused"), "the refusal names the conflict: {stderr}");
+    assert_eq!(meta("memory_stream_pin"), Some(owner_first), "the first clone's trust root stands");
+}

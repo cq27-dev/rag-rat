@@ -85,9 +85,10 @@ use crate::index::{self, IndexDatabase, schema};
 ///        source's EFFECTIVE pin crosses — its recorded pin, else the owner it is subscribed to,
 ///        which a store from before the pin existed records its trust decision as (that
 ///        subscription itself never crosses — see (b)). Until the rename lands the legacy index is
-///        the live store, so a retry replaces a pin an earlier run of this consolidation wrote
-///        (recorded in `memory_stream_pin_imported`); a conflicting pin the target decided itself
-///        REFUSES the run, since carrying either would silently override the other trust root.
+///        the live store, so a retry of the SAME legacy source replaces the pin its earlier,
+///        unfinished run wrote (recorded, with that source, in `memory_stream_pin_imported`, and
+///        retired once the rename lands); any other conflicting pin REFUSES the run, since carrying
+///        either would silently override the other trust root.
 ///
 ///  (b) DB-LOCAL STATE — never copied; each entry states why:
 ///      * freshness/progress cursors that would make a fresh 0-row index falsely report itself
@@ -109,9 +110,9 @@ use crate::index::{self, IndexDatabase, schema};
 ///      * `memory_subscription_peers` / `memory_subscription_relay` — how to reach the subscribed
 ///        owner's host. They describe a subscription, and the subscription never crosses; carried
 ///        alone they would route toward an owner this repo no longer mirrors.
-///      * `memory_stream_pin_imported` — the pin value an earlier run of this consolidation wrote,
-///        which is how a retry tells its own copy from a trust decision the target made; any `sync
-///        subscribe` there clears it.
+///      * `memory_stream_pin_imported` — the pin an UNFINISHED consolidation wrote and the legacy
+///        source it came from, which is how a retry of that source tells its own stale copy from a
+///        trust decision; it is retired once the rename lands, and any `sync subscribe` clears it.
 const CARRIED_META_KEYS: &[&str] = &[
     "active_embedding_model",
     "embedding_active_model_version",
@@ -414,6 +415,17 @@ fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<Cons
     fs::rename(&source, &imported)
         .with_context(|| format!("renaming {} to {}", source.display(), imported.display()))?;
     rename_wal_sidecars(&source, &imported);
+    // The legacy index is archived, so no retry of THIS consolidation can follow: the pin it wrote
+    // stops being a replaceable copy and becomes the global store's own trust decision. A failure
+    // here is left as a warning — the source identity in the marker already keeps any other source
+    // from claiming it, and failing an import that has completed would help nothing.
+    if let Err(error) = retire_pin_import(target_conn, &repo_id) {
+        tracing::warn!(
+            repo_id = %repo_id,
+            %error,
+            "consolidation completed but could not retire its stream pin import marker"
+        );
+    }
 
     Ok(ConsolidateOutcome::Imported(ImportSummary {
         repo_id,
@@ -1559,12 +1571,15 @@ fn merge_stream_pin(source: &Connection, tx: &Connection, repo_id: &str) -> anyh
     let replaceable = match &target_pin {
         None => true,
         Some(pin) if *pin == source_pin => return Ok(0),
-        // The pin an earlier run of THIS consolidation wrote, untouched since: a subscribe in the
-        // target clears the marker. Until the rename lands the legacy index is the live store, so
-        // a repin made there in the crash-retry window must replace the copy the last run left —
-        // keeping it would restore a trust root the operator has since moved away from.
+        // The pin an earlier, unfinished run wrote FROM THIS SAME legacy source, untouched since —
+        // a subscribe in the target clears the marker, and a completed consolidation retires it.
+        // Until the rename lands the legacy index is the live store, so a repin made there in the
+        // crash-retry window must replace the copy the last run left. Another source's pin is not
+        // a stale copy of this one: two clones of a repository share its repo id, and letting the
+        // second overwrite the first would silently move the trust root.
         Some(pin) =>
-            target_meta(MEMORY_STREAM_PIN_IMPORTED_META_KEY)?.as_deref() == Some(pin.as_str()),
+            target_meta(MEMORY_STREAM_PIN_IMPORTED_META_KEY)?.as_deref()
+                == Some(pin_import_marker(source, pin).as_str()),
     };
     if !replaceable {
         anyhow::bail!(
@@ -1576,15 +1591,34 @@ fn merge_stream_pin(source: &Connection, tx: &Connection, repo_id: &str) -> anyh
             target_pin.unwrap_or_default(),
         );
     }
+    let marker = pin_import_marker(source, &source_pin);
     let mut written = 0;
-    for key in [MEMORY_STREAM_PIN_META_KEY, MEMORY_STREAM_PIN_IMPORTED_META_KEY] {
+    for (key, value) in [
+        (MEMORY_STREAM_PIN_META_KEY, source_pin.as_str()),
+        (MEMORY_STREAM_PIN_IMPORTED_META_KEY, marker.as_str()),
+    ] {
         written += tx.execute(
             "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, ?3)
              ON CONFLICT(repo_id, key) DO UPDATE SET value = excluded.value",
-            params![repo_id, key, source_pin],
+            params![repo_id, key, value],
         )?;
     }
     Ok(written as u64)
+}
+
+/// What `memory_stream_pin_imported` holds: the pin an import wrote AND the legacy source it came
+/// from, so only a retry of that same source can claim it. A legacy index is always a file, so its
+/// path identifies it for as long as the consolidation stays unfinished.
+fn pin_import_marker(source: &Connection, pin: &str) -> String {
+    serde_json::json!({ "source": source.path().unwrap_or_default(), "pin": pin }).to_string()
+}
+
+/// Retire the import marker once a consolidation has completed — see `merge_stream_pin`.
+fn retire_pin_import(conn: &Connection, repo_id: &str) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM repo_meta WHERE repo_id = ?1 AND key = ?2", params![
+        repo_id,
+        MEMORY_STREAM_PIN_IMPORTED_META_KEY
+    ])
 }
 
 fn merge_stream_seal_policy(
@@ -3060,6 +3094,38 @@ mod tests {
         assert!(err.to_string().contains("consolidation refused"), "got: {err}");
         assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-a"));
         assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories"), 0, "nothing imported");
+    }
+
+    /// Two clones of one repository hold separate legacy indexes. The pin the first one's import
+    /// wrote is not the second one's to replace — only a retry of the SAME source may — so a second
+    /// source carrying a conflicting pin refuses.
+    #[test]
+    fn a_second_source_cannot_replace_the_pin_another_source_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_source = |name: &str, pin: &str| -> Connection {
+            let seed = seeded_source();
+            seed.execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', \
+                 'memory_stream_pin', ?1)",
+                [pin],
+            )
+            .unwrap();
+            let path = dir.path().join(name);
+            seed.execute("VACUUM INTO ?1", [path.to_str().unwrap()]).unwrap();
+            Connection::open(&path).unwrap()
+        };
+        let first = file_source("first.sqlite", "owner-a");
+        let second = file_source("second.sqlite", "owner-b");
+        let target = fresh_target();
+        import_from_source(&first, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
+        assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-a"));
+
+        let err =
+            import_from_source(&second, &target, "global-repo", ImportMode::ConsolidateLegacy)
+                .err()
+                .expect("another source's conflicting pin is not a retry of the first");
+        assert!(err.to_string().contains("consolidation refused"), "got: {err}");
+        assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-a"));
     }
 
     /// Until the rename lands the legacy index is the live store. A repin made there after an

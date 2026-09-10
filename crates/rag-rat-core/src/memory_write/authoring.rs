@@ -254,10 +254,10 @@ const SUBSCRIPTION_OWNER_META_KEY: &str = "memory_subscription_owner";
 /// behind by unsubscribe, and re-written ONLY when an operator names an account id themselves.
 const STREAM_PIN_META_KEY: &str = "memory_stream_pin";
 
-/// The pin value an earlier run of `rag-rat consolidate` wrote into this store. It is how a retried
-/// consolidation tells its own stale copy — replaceable, because the legacy index stays the live
-/// store until the rename lands — from a pin decided here, which it must not override. A subscribe
-/// decides the pin here, so it clears this.
+/// The pin an UNFINISHED `rag-rat consolidate` run wrote into this store, and the legacy source it
+/// came from. It is how a retry of that same source tells its own stale copy — replaceable, because
+/// the legacy index stays the live store until the rename lands — from a pin decided here, which it
+/// must not override. A subscribe decides the pin here, so it clears this.
 const STREAM_PIN_IMPORTED_META_KEY: &str = "memory_stream_pin_imported";
 
 /// Routing to reach the subscribed owner's host, as the locator supplied it.
