@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.23.0...rag-rat-base-v0.23.1) - 2026-09-10
+
+### Added
+
+- *(sync)* subscribe from a checked-in stream locator, pinned on first use ([#1266](https://github.com/cq27-dev/rag-rat/pull/1266))
+- *(cli)* expose tool catalog as native subcommands ([#1273](https://github.com/cq27-dev/rag-rat/pull/1273))
+- *(dream)* keep the reasoning when compacting a memory ([#1207](https://github.com/cq27-dev/rag-rat/pull/1207))
+
+### Fixed
+
+- *(build)* decode fixed-size chunks as arrays, drop a redundant glob ([#1252](https://github.com/cq27-dev/rag-rat/pull/1252))
+- *(base)* make the test suite pass on windows-latest ([#1192](https://github.com/cq27-dev/rag-rat/pull/1192))
+
 ## [0.23.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.22.0...rag-rat-base-v0.23.0) - 2026-08-16
 
 ### Added
