@@ -23,7 +23,11 @@ const NOW: i64 = 1_700_000_000_000;
 const REPO: &str = "repo-a";
 
 fn scoped_conn() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
+    scope(Connection::open_in_memory().unwrap())
+}
+
+/// Apply the schema, register the test repo and scope the connection to it.
+fn scope(conn: Connection) -> Connection {
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
     rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
     conn.execute(
@@ -785,12 +789,19 @@ fn clearing_a_foreign_owner_propagates_a_resolution_failure_that_is_not_a_parse(
 /// guards observable (an account that owns nothing is vacuously fully-public and holds no rival
 /// stream at all). Returns `(owner, subscriber, owner_account)`.
 fn subscription_pair() -> (Connection, Connection, rag_rat_oplog::AccountId) {
+    subscription_pair_with(scoped_conn())
+}
+
+/// [`subscription_pair`] with the subscriber's connection supplied — file-backed when a test needs
+/// a second connection to the same store.
+fn subscription_pair_with(
+    subscriber: Connection,
+) -> (Connection, Connection, rag_rat_oplog::AccountId) {
     let owner = scoped_conn();
     let owner_account = local_account(&owner, NOW).unwrap();
     assert!(enable_public_authoring(&owner, NOW).unwrap());
     create_memory(&owner, concept("owner-note")).unwrap();
 
-    let subscriber = scoped_conn();
     let subscriber_account = local_account(&subscriber, NOW).unwrap();
     assert_ne!(owner_account, subscriber_account, "separate identities");
     create_memory(&subscriber, concept("subscriber-note")).unwrap();
@@ -1362,4 +1373,152 @@ fn subscribe_via_locator(
         crate::memory_write::SubscriptionRouting { peers, relay },
     )
     .unwrap();
+}
+
+/// A connection to a file-backed store with the pragmas production relies on for concurrency: WAL,
+/// so a reader keeps its snapshot while another connection commits, and a busy timeout.
+fn file_conn(path: &std::path::Path) -> Connection {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+    conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+    conn
+}
+
+/// Set once the locator's connection is waiting on the write lock — the causal signal the pin race
+/// commits on, rather than a sleep.
+static LOCATOR_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn locator_is_waiting(_attempts: i32) -> bool {
+    LOCATOR_WAITING.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    true
+}
+
+/// A locator subscribe decides against the pin it commits under. An operator re-subscribe holds the
+/// write lock with a new pin not yet committed; the locator, naming the OLD owner that matched the
+/// pin a moment earlier, waits on that lock, and only then does the operator commit. Checked before
+/// taking the lock, the locator would pass against the stale pin and restore the old owner over the
+/// one just committed; checked under it, the locator sees the new pin and refuses.
+#[test]
+fn a_locator_subscribe_decides_against_the_pin_it_commits_under() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let (_owner, subscriber, owner_account) = subscription_pair_with(scope(file_conn(&path)));
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    let other = "ab".repeat(32);
+
+    let operator = file_conn(&path);
+    operator.execute_batch("BEGIN IMMEDIATE").unwrap();
+    operator
+        .execute(
+            "UPDATE repo_meta SET value = ?1 WHERE repo_id = ?2
+               AND key IN ('memory_subscription_owner', 'memory_stream_pin')",
+            params![other, REPO],
+        )
+        .unwrap();
+
+    LOCATOR_WAITING.store(false, std::sync::atomic::Ordering::SeqCst);
+    subscriber.busy_handler(Some(locator_is_waiting)).unwrap();
+    let locator = std::thread::spawn(move || {
+        crate::memory_write::set_subscription_owner(
+            &subscriber,
+            &owner_hex,
+            NOW,
+            crate::memory_write::SubscribeTrust::Locator,
+            Default::default(),
+        )
+        .map_err(|err| format!("{err:#}"))
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !LOCATOR_WAITING.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(std::time::Instant::now() < deadline, "the locator never reached the write lock");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    operator.execute_batch("COMMIT").unwrap();
+
+    let outcome = locator.join().unwrap();
+    let pin: String = operator
+        .query_row(
+            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = 'memory_stream_pin'",
+            [REPO],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pin, other, "the pin committed ahead of the locator survives");
+    let refusal = outcome.expect_err("the locator must see that pin and refuse");
+    assert!(
+        refusal.contains(&format!("pinned to {other}")),
+        "it refuses against the new pin: {refusal}"
+    );
+}
+
+/// A routing lookup reads one subscription state. The reader's `repo_meta` is shadowed by a view
+/// that, the first time it is read, commits a re-subscribe to another owner from a second
+/// connection. Read in one statement, the lookup keeps its snapshot and returns this owner's own
+/// routes; read key by key, it would find this owner and then the NEXT owner's peers and relay.
+#[test]
+fn a_routing_lookup_reads_one_subscription_state() {
+    use rusqlite::functions::FunctionFlags;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.sqlite");
+    let (_owner, subscriber, owner_account) = subscription_pair_with(scope(file_conn(&path)));
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscribe_via_locator(
+        &subscriber,
+        &owner_hex,
+        &["node-a".to_string()],
+        Some("https://relay-a"),
+    );
+
+    let other = "ab".repeat(32);
+    let resubscribe = format!(
+        "BEGIN IMMEDIATE;
+         UPDATE repo_meta SET value = CASE key
+             WHEN 'memory_subscription_owner' \
+         THEN '{other}'
+             WHEN 'memory_subscription_peers' THEN 'node-b'
+             WHEN \
+         'memory_subscription_relay' THEN 'https://relay-b'
+             ELSE value END
+         WHERE repo_id = '{REPO}';
+         COMMIT;"
+    );
+    let writer = std::sync::Mutex::new(Some(file_conn(&path)));
+    subscriber
+        .create_scalar_function(
+            "resubscribe_concurrently",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_| {
+                if let Some(writer) = writer.lock().unwrap().take() {
+                    writer
+                        .execute_batch(&resubscribe)
+                        .map_err(|err| rusqlite::Error::UserFunctionError(err.into()))?;
+                }
+                Ok(1)
+            },
+        )
+        .unwrap();
+    subscriber
+        .execute_batch(
+            "CREATE TEMP VIEW repo_meta AS
+                 SELECT repo_id, key, value FROM main.repo_meta WHERE resubscribe_concurrently()",
+        )
+        .unwrap();
+
+    assert_eq!(
+        crate::memory_write::subscription_routing(&subscriber, &owner_hex).unwrap(),
+        [("node-a".to_string(), Some("https://relay-a".to_string()))],
+        "one snapshot: this owner's own routes, never the next owner's",
+    );
+    let owner_now: String = file_conn(&path)
+        .query_row(
+            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = 'memory_subscription_owner'",
+            [REPO],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner_now, other, "the concurrent re-subscribe really committed mid-lookup");
 }

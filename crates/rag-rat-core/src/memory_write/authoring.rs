@@ -643,6 +643,17 @@ pub(crate) fn set_subscription_owner(
 
     let canonical = rag_rat_base::hash::hex_lower(&owner.to_bytes());
 
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        memory_repo_scope(&tx)?.as_deref() == Some(repo_id.as_str()),
+        "active repo scope changed while starting sync subscribe; retry"
+    );
+    ensure_no_contribution_configured(&tx, &repo_id)?;
+    // Decided UNDER the write lock. A check made before `BEGIN IMMEDIATE` can pass against a pin
+    // another connection replaces before this transaction starts, and this write would then restore
+    // the owner that pin had just moved away from.
+    //
     // A locator may establish this repo's trust root, never move it. Moving it is how an edited
     // checked-in file would silently re-point a subscriber onto another account's stream — and a
     // re-point is destructive, not merely redirecting: the drain removes the previous owner's
@@ -651,7 +662,7 @@ pub(crate) fn set_subscription_owner(
     // the point of the override is that the operator obtains the id from the owner, not from the
     // file that just changed.
     if trust == SubscribeTrust::Locator
-        && let Some(pinned) = effective_stream_pin(conn, &repo_id)?
+        && let Some(pinned) = effective_stream_pin(&tx, &repo_id)?
         && pinned != canonical
     {
         anyhow::bail!(
@@ -662,14 +673,6 @@ pub(crate) fn set_subscription_owner(
             rag_rat_base::stream_locator::STREAM_LOCATOR_FILE,
         );
     }
-
-    let _durability = AuthoredDurability::begin(conn)?;
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    anyhow::ensure!(
-        memory_repo_scope(&tx)?.as_deref() == Some(repo_id.as_str()),
-        "active repo scope changed while starting sync subscribe; retry"
-    );
-    ensure_no_contribution_configured(&tx, &repo_id)?;
     repoint_authoritative_content_stream(&tx, &repo_id, StreamResolution::Strict, |tx| {
         rag_rat_db::meta::set_repo_meta(tx, &repo_id, SUBSCRIPTION_OWNER_META_KEY, &canonical)
             .map_err(Into::into)
@@ -733,22 +736,37 @@ fn write_subscription_routing(
 ///
 /// Only live subscriptions contribute. Once a repository mirrors nobody, its host drops out of
 /// every pull — an obsolete host stalls each pass behind a failing dial.
+///
+/// ONE statement, so ownership, peers and relay come from one snapshot. Separate reads can straddle
+/// a concurrent re-subscribe — find this owner, then read the NEXT owner's peers — and hand one
+/// account the routes recorded for another. The write side commits all four fields together; that
+/// only protects a reader that also reads them together.
 pub(crate) fn subscription_routing(
     conn: &Connection,
     owner_hex: &str,
 ) -> anyhow::Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT peers.value, relay.value
+         FROM repos
+         JOIN repo_meta AS owner ON owner.repo_id = repos.repo_id AND owner.key = ?2
+         JOIN repo_meta AS peers ON peers.repo_id = repos.repo_id AND peers.key = ?3
+         LEFT JOIN repo_meta AS relay ON relay.repo_id = repos.repo_id AND relay.key = ?4
+         WHERE owner.value = ?1 AND repos.repo_id != ?5
+         ORDER BY repos.repo_id",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            owner_hex,
+            SUBSCRIPTION_OWNER_META_KEY,
+            SUBSCRIPTION_PEERS_META_KEY,
+            SUBSCRIPTION_RELAY_META_KEY,
+            rag_rat_base::repo_identity::LEGACY_REPO_ID,
+        ],
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+    )?;
     let mut routes = Vec::new();
-    for repo_id in rag_rat_db::schema::real_repo_ids(conn)? {
-        let owner = rag_rat_db::meta::repo_meta(conn, &repo_id, SUBSCRIPTION_OWNER_META_KEY)?;
-        if owner.as_deref() != Some(owner_hex) {
-            continue;
-        }
-        let Some(recorded) =
-            rag_rat_db::meta::repo_meta(conn, &repo_id, SUBSCRIPTION_PEERS_META_KEY)?
-        else {
-            continue;
-        };
-        let relay = rag_rat_db::meta::repo_meta(conn, &repo_id, SUBSCRIPTION_RELAY_META_KEY)?;
+    for row in rows {
+        let (Some(recorded), relay) = row? else { continue };
         routes.extend(
             recorded
                 .lines()

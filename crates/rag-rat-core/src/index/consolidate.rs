@@ -79,6 +79,13 @@ use crate::index::{self, IndexDatabase, schema};
 ///      * `memory_stream_seal_policy` — the one-way privacy intent for the repo's owner stream.
 ///        Unlike model-state keys it is MERGED monotonically: `sealed` on either side wins, absence
 ///        never clears it, and unknown values abort consolidation before reconciliation.
+///      * `memory_stream_pin` — the owner this repo has trusted (see `sync subscribe`). MERGED, not
+///        copied verbatim: it is the one subscription field built to outlive the subscription, so
+///        dropping it on the move would let a changed `.rag-rat-stream` read as first use. The
+///        source's EFFECTIVE pin crosses — its recorded pin, else the owner it is subscribed to,
+///        which a store from before the pin existed records its trust decision as (that
+///        subscription itself never crosses — see (b)). A target already pinned keeps its own: it
+///        is the trust decision the target has acted on, and a pin survives either way.
 ///
 ///  (b) DB-LOCAL STATE — never copied; each entry states why:
 ///      * freshness/progress cursors that would make a fresh 0-row index falsely report itself
@@ -97,6 +104,9 @@ use crate::index::{self, IndexDatabase, schema};
 ///        either key, and a legacy source that carries one has nowhere to put it (the target's own
 ///        key must stay authoritative — it is what the target's drain already acted on). A repo
 ///        consolidates only while it owns its own stream.
+///      * `memory_subscription_peers` / `memory_subscription_relay` — how to reach the subscribed
+///        owner's host. They describe a subscription, and the subscription never crosses; carried
+///        alone they would route toward an owner this repo no longer mirrors.
 const CARRIED_META_KEYS: &[&str] = &[
     "active_embedding_model",
     "embedding_active_model_version",
@@ -108,6 +118,8 @@ const CARRIED_META_KEYS: &[&str] = &[
 
 const MEMORY_STREAM_SEAL_POLICY_META_KEY: &str = "memory_stream_seal_policy";
 const MEMORY_STREAM_ACCESS_MODE_META_KEY: &str = "memory_stream_access_mode";
+const MEMORY_STREAM_PIN_META_KEY: &str = "memory_stream_pin";
+const MEMORY_SUBSCRIPTION_OWNER_META_KEY: &str = "memory_subscription_owner";
 
 /// How long consolidate waits for the repo's per-repo write locks (global-side and legacy-side)
 /// before refusing — an in-flight index/maintenance pass finishes well within it, and an explicit
@@ -1498,6 +1510,7 @@ fn copy_model_state(source: &Connection, tx: &Connection, repo_id: &str) -> anyh
     }
     count += merge_stream_seal_policy(source, tx, repo_id)?;
     count += merge_stream_access_mode(source, tx, repo_id)?;
+    count += merge_stream_pin(source, tx, repo_id)?;
     if let Some(model_id) = active_model {
         carry_active_model_readiness(source, tx, &model_id)?;
     }
@@ -1508,6 +1521,52 @@ fn copy_model_state(source: &Connection, tx: &Connection, repo_id: &str) -> anyh
 /// understands is `sealed`; absence means no explicit intent. A sealed source must seal the target,
 /// while a target already sealed remains sealed across retries even if the legacy source is absent.
 /// Unknown values on either side fail closed before consolidation's reconciliation authoring.
+/// Carry the source's trust pin onto the target — see the `memory_stream_pin` entry in the
+/// classification on [`CARRIED_META_KEYS`]. Returns the rows written.
+fn merge_stream_pin(source: &Connection, tx: &Connection, repo_id: &str) -> anyhow::Result<u64> {
+    let source_meta = |key: &str| -> anyhow::Result<Option<String>> {
+        Ok(source
+            .query_row("SELECT value FROM repo_meta WHERE key = ?1 LIMIT 1", [key], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten())
+    };
+    // The EFFECTIVE pin: a store from before the pin existed, or one still subscribed, records its
+    // trust decision only as the subscription owner.
+    let Some(source_pin) = source_meta(MEMORY_STREAM_PIN_META_KEY)?
+        .or(source_meta(MEMORY_SUBSCRIPTION_OWNER_META_KEY)?)
+    else {
+        return Ok(0);
+    };
+    let target_pin: Option<String> = tx
+        .query_row(
+            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = ?2",
+            params![repo_id, MEMORY_STREAM_PIN_META_KEY],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    match target_pin {
+        None => Ok(tx.execute(
+            "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, ?3)",
+            params![repo_id, MEMORY_STREAM_PIN_META_KEY, source_pin],
+        )? as u64),
+        Some(target_pin) => {
+            if target_pin != source_pin {
+                tracing::warn!(
+                    repo_id,
+                    target_pin = %target_pin,
+                    source_pin = %source_pin,
+                    "consolidation keeps the target's stream pin over a different one in the \
+                     legacy source"
+                );
+            }
+            Ok(0)
+        },
+    }
+}
+
 fn merge_stream_seal_policy(
     source: &Connection,
     tx: &Connection,
@@ -2900,6 +2959,81 @@ mod tests {
         assert!(err.to_string().contains("unknown memory stream seal policy"));
         assert_eq!(policy(), "sealed", "the conflicting import cannot downgrade the target");
         assert_eq!(count(&target, "SELECT COUNT(*) FROM content_entries"), 0);
+    }
+
+    fn target_meta(target: &Connection, key: &str) -> Option<String> {
+        target
+            .query_row(
+                "SELECT value FROM repo_meta WHERE repo_id = 'global-repo' AND key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// The pin is the one subscription field built to outlive the subscription. Dropped on the
+    /// move, a changed `.rag-rat-stream` would read as first use afterward.
+    #[test]
+    fn consolidation_carries_the_trust_pin() {
+        let source = seeded_source();
+        source
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', \
+                 'memory_stream_pin', 'owner-a')",
+                [],
+            )
+            .unwrap();
+        let target = fresh_target();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
+        assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-a"));
+    }
+
+    /// A store from before the pin existed, or one still subscribed, records its trust decision
+    /// only as the subscription owner. The pin carries that owner; the subscription itself
+    /// never crosses.
+    #[test]
+    fn consolidation_carries_a_subscription_owner_as_the_pin() {
+        let source = seeded_source();
+        source
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', \
+                 'memory_subscription_owner', 'owner-a')",
+                [],
+            )
+            .unwrap();
+        let target = fresh_target();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
+        assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-a"));
+        assert_eq!(
+            target_meta(&target, "memory_subscription_owner"),
+            None,
+            "the subscription itself stays behind",
+        );
+    }
+
+    /// A target already pinned keeps its own pin: it is the trust decision the target acted on, and
+    /// a pin survives either way, so nothing reads as first use.
+    #[test]
+    fn an_existing_target_pin_stays_authoritative() {
+        let source = seeded_source();
+        source
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('__unassigned__', \
+                 'memory_stream_pin', 'owner-b')",
+                [],
+            )
+            .unwrap();
+        let target = fresh_target();
+        target
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('global-repo', \
+                 'memory_stream_pin', 'owner-a')",
+                [],
+            )
+            .unwrap();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
+        assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-a"));
     }
 
     /// The `repo_meta` classification (see [`CARRIED_META_KEYS`]): repo-PORTABLE configuration is
