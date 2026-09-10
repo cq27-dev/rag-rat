@@ -165,29 +165,28 @@ impl IndexDatabase {
             owner_account_hex,
             rag_rat_base::time::now_ms(),
             crate::memory_write::SubscribeTrust::Operator,
+            crate::memory_write::SubscriptionRouting::default(),
         )
     }
 
     /// Subscribe to the owner a checked-in `.rag-rat-stream` names. Refuses when this repo is
     /// already pinned to a different owner — an editable in-repo file may establish a trust root,
     /// never move one.
-    pub fn sync_subscribe_from_locator(&self, owner_account_hex: &str) -> anyhow::Result<()> {
+    ///
+    /// The locator's routing commits in the same transaction as the owner and pin.
+    pub fn sync_subscribe_from_locator(
+        &self,
+        owner_account_hex: &str,
+        peers: &[String],
+        relay: Option<&str>,
+    ) -> anyhow::Result<()> {
         crate::memory_write::set_subscription_owner(
             self.storage.connection(),
             owner_account_hex,
             rag_rat_base::time::now_ms(),
             crate::memory_write::SubscribeTrust::Locator,
+            crate::memory_write::SubscriptionRouting { peers, relay },
         )
-    }
-
-    /// Record how to reach the subscribed owner's host, as a locator supplied it. Empty peers
-    /// clear the record — an operator-named subscribe must not inherit the previous owner's host.
-    pub fn set_subscription_routing(
-        &self,
-        peers: &[String],
-        relay: Option<&str>,
-    ) -> anyhow::Result<()> {
-        crate::memory_write::set_subscription_routing(self.storage.connection(), peers, relay)
     }
 
     /// Peers recorded for subscribed owners, each with the relay its locator named.

@@ -203,20 +203,18 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                     (locator.owner.clone(), "locator", Some(locator))
                 },
             };
-            match account {
-                Some(_) => db.sync_subscribe(&owner)?,
-                None => db.sync_subscribe_from_locator(&owner)?,
+            // The routing is persisted, not merely echoed: a clone that subscribed from a locator
+            // has no `[sync] server_peers` — carrying that routing is the locator's whole purpose —
+            // and a foreign account cannot be discovered. It commits in the same transaction as the
+            // owner and pin, and an operator-named subscribe clears any previous routing there too.
+            match locator.as_ref() {
+                None => db.sync_subscribe(&owner)?,
+                Some(locator) => db.sync_subscribe_from_locator(
+                    &owner,
+                    &locator.peers,
+                    locator.relay.as_deref(),
+                )?,
             }
-            // Persisted, not merely echoed: a clone that subscribed from a locator has no
-            // `[sync] server_peers` — carrying that routing is the locator's whole purpose — and a
-            // foreign account cannot be discovered, so without this the repo would record a
-            // subscription it can never fetch. An operator-named subscribe clears any stale
-            // routing rather than dialing the previous owner's host for a different account.
-            let (peers, relay) = match locator.as_ref() {
-                Some(locator) => (locator.peers.clone(), locator.relay.clone()),
-                None => (Vec::new(), None),
-            };
-            db.set_subscription_routing(&peers, relay.as_deref())?;
             let effects = rag_rat_core::drain_synced_memory(db.connection())?;
             db.fold_wal();
             print_output(&serde_json::json!({

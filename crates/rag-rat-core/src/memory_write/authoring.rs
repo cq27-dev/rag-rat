@@ -279,6 +279,15 @@ pub(crate) enum SubscribeTrust {
     Locator,
 }
 
+/// How to reach the owner being subscribed to, as a checked-in locator supplied it. Empty for an
+/// operator-named subscribe, which therefore CLEARS whatever routing a previous subscription
+/// recorded rather than dialing that owner's host for a different account.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SubscriptionRouting<'a> {
+    pub(crate) peers: &'a [String],
+    pub(crate) relay: Option<&'a str>,
+}
+
 pub(super) fn subscription_owner_account(
     conn: &Connection,
     repo_id: &str,
@@ -614,6 +623,7 @@ pub(crate) fn set_subscription_owner(
     owner_account_hex: &str,
     now_ms: i64,
     trust: SubscribeTrust,
+    routing: SubscriptionRouting<'_>,
 ) -> anyhow::Result<()> {
     let repo_id =
         memory_repo_scope(conn)?.context("sync subscribe requires an active repo scope")?;
@@ -664,9 +674,12 @@ pub(crate) fn set_subscription_owner(
         rag_rat_db::meta::set_repo_meta(tx, &repo_id, SUBSCRIPTION_OWNER_META_KEY, &canonical)
             .map_err(Into::into)
     })?;
-    // Written under the same transaction as the subscription it authorizes, so a torn write cannot
-    // leave a repo subscribed to an owner it never pinned.
+    // Owner, pin and routing commit together: this function is the single writer of all four
+    // subscription fields. A torn write could otherwise leave a repo subscribed to an owner it
+    // never pinned, or holding the previous owner's routes — which `subscription_routing` would
+    // then attribute to the new account and dial on its behalf.
     rag_rat_db::meta::set_repo_meta(&tx, &repo_id, STREAM_PIN_META_KEY, &canonical)?;
+    write_subscription_routing(&tx, &repo_id, &routing)?;
     tx.commit()?;
     Ok(())
 }
@@ -687,25 +700,24 @@ fn effective_stream_pin(conn: &Connection, repo_id: &str) -> anyhow::Result<Opti
     })
 }
 
-/// Record how to reach the subscribed owner's host. Empty peers CLEAR the record rather than
-/// leaving a previous owner's routing behind to be dialed for a different account.
-pub(crate) fn set_subscription_routing(
+/// Record how to reach the subscribed owner's host, or clear it when the routing is empty. Private
+/// and called only inside `set_subscription_owner`'s transaction, so there is no path that updates
+/// routing apart from the owner it belongs to.
+fn write_subscription_routing(
     conn: &Connection,
-    peers: &[String],
-    relay: Option<&str>,
+    repo_id: &str,
+    routing: &SubscriptionRouting<'_>,
 ) -> anyhow::Result<()> {
-    let repo_id =
-        memory_repo_scope(conn)?.context("recording subscription routing requires a repo scope")?;
-    let joined = peers.join("\n");
+    let joined = routing.peers.join("\n");
     if joined.is_empty() {
-        rag_rat_db::meta::delete_repo_meta(conn, &repo_id, SUBSCRIPTION_PEERS_META_KEY)?;
+        rag_rat_db::meta::delete_repo_meta(conn, repo_id, SUBSCRIPTION_PEERS_META_KEY)?;
     } else {
-        rag_rat_db::meta::set_repo_meta(conn, &repo_id, SUBSCRIPTION_PEERS_META_KEY, &joined)?;
+        rag_rat_db::meta::set_repo_meta(conn, repo_id, SUBSCRIPTION_PEERS_META_KEY, &joined)?;
     }
-    match relay {
+    match routing.relay {
         Some(relay) if !relay.trim().is_empty() =>
-            rag_rat_db::meta::set_repo_meta(conn, &repo_id, SUBSCRIPTION_RELAY_META_KEY, relay)?,
-        _ => rag_rat_db::meta::delete_repo_meta(conn, &repo_id, SUBSCRIPTION_RELAY_META_KEY)?,
+            rag_rat_db::meta::set_repo_meta(conn, repo_id, SUBSCRIPTION_RELAY_META_KEY, relay)?,
+        _ => rag_rat_db::meta::delete_repo_meta(conn, repo_id, SUBSCRIPTION_RELAY_META_KEY)?,
     };
     Ok(())
 }
