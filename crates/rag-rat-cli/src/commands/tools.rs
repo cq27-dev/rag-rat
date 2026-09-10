@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use clap::builder::PossibleValuesParser;
+use clap::builder::{PossibleValuesParser, Resettable};
 use clap::error::ErrorKind;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Map, Value, json};
@@ -30,12 +30,11 @@ pub(crate) fn run_tools(
     outer_json: bool,
     argv: &[String],
 ) -> anyhow::Result<()> {
-    let command = tools_command();
     let mut args = Vec::with_capacity(argv.len() + 1);
     args.push("rag-rat tools".to_string());
     args.extend(argv.iter().cloned());
 
-    let matches = match command.try_get_matches_from(args) {
+    let matches = match parse_tools(&args) {
         Ok(matches) => matches,
         Err(err) if matches!(err.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
             err.print()?;
@@ -79,6 +78,23 @@ pub(crate) fn run_tools(
     let result =
         rag_rat_mcp::tools::call_tool_for_config(&config, tool_name, Value::Object(arguments))?;
     print_output(&result)
+}
+
+fn parse_tools(args: &[String]) -> Result<ArgMatches, clap::Error> {
+    let command = tools_command();
+    // Clap propagates global values after subcommand validation, so a parent-level --schema
+    // cannot waive a child's required_unless check. Defer only those checks until the schema
+    // flag is resolved; discovery still validates flag names, values, and conflicts.
+    let matches = command
+        .clone()
+        .mut_subcommands(|subcommand| {
+            subcommand.mut_args(|arg| arg.required_unless_present(Resettable::Reset))
+        })
+        .try_get_matches_from(args)?;
+    if matches.get_flag(SCHEMA) {
+        return Ok(matches);
+    }
+    command.try_get_matches_from(args)
 }
 
 /// Build the complete native command tree from the same catalog MCP advertises through
@@ -180,7 +196,7 @@ fn property_arg(root_schema: &Value, name: &str, property: &Value, required: boo
     }
 
     if required {
-        arg = arg.required_unless_present_any([ARGUMENTS_JSON, SCHEMA]);
+        arg = arg.required_unless_present(ARGUMENTS_JSON);
     }
 
     match spec.kind {
@@ -500,7 +516,8 @@ mod tests {
     fn parse(args: &[&str]) -> ArgMatches {
         let mut argv = vec!["rag-rat tools"];
         argv.extend_from_slice(args);
-        tools_command().try_get_matches_from(argv).expect("parse generated tools command")
+        let argv: Vec<String> = argv.into_iter().map(str::to_string).collect();
+        parse_tools(&argv).expect("parse generated tools command")
     }
 
     #[test]

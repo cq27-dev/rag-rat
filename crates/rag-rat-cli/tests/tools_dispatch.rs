@@ -96,18 +96,52 @@ fn schema_discovery_is_configless_and_uses_the_canonical_catalog() {
     let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(actual, rag_rat_mcp::tools::list_tools());
 
-    let output = run(&["--json", "tools", "find-callers", "--schema"], &root);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(actual["name"], "find_callers");
-    assert_eq!(actual["inputSchema"], rag_rat_mcp::tools::schema("find_callers"));
+    // Every tool, including those with required fields, supports either global flag position.
+    for &tool in rag_rat_mcp::tools::TOOL_NAMES {
+        let cli_name = tool.replace('_', "-");
+        for args in [["--json", "tools", "--schema", cli_name.as_str()], [
+            "--json",
+            "tools",
+            cli_name.as_str(),
+            "--schema",
+        ]] {
+            let output = run(&args, &root);
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                actual,
+                json!({
+                    "name": tool,
+                    "description": rag_rat_mcp::tools::description(tool),
+                    "inputSchema": rag_rat_mcp::tools::schema(tool),
+                }),
+                "{args:?}"
+            );
+        }
+    }
+}
 
-    // Schema discovery must bypass the generated required argument gate as well.
-    let output = run(&["--json", "tools", "semantic-search", "--schema"], &root);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(actual["name"], "semantic_search");
-    assert_eq!(actual["inputSchema"], rag_rat_mcp::tools::schema("semantic_search"));
+#[test]
+fn schema_discovery_still_rejects_invalid_arguments() {
+    let root = unique_dir("cli_tools_schema_invalid");
+    fs::create_dir_all(&root).unwrap();
+
+    for args in [
+        vec!["tools", "--schema", "unknown-tool"],
+        vec!["tools", "--schema", "semantic-search", "--unknown-flag"],
+        vec!["tools", "semantic-search", "--schema", "--unknown-flag"],
+        vec!["tools", "--schema", "semantic-search", "--include", "invalid"],
+        vec!["tools", "--schema", "semantic-search", "--query"],
+        vec!["tools", "--schema", "semantic-search", "--query", "text", "--arguments-json", "{}"],
+    ] {
+        let output = run(&args, &root);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
 }
 
 #[test]
@@ -153,8 +187,14 @@ fn required_schema_fields_are_required_by_the_generated_cli() {
     let root = unique_dir("cli_tools_required");
     fs::create_dir_all(&root).unwrap();
 
-    let output = run(&["tools", "semantic-search"], &root);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("--query"), "unexpected stderr: {stderr}");
+    for args in [
+        vec!["tools", "semantic-search"],
+        vec!["tools", "--config=--schema", "semantic-search"],
+        vec!["tools", "semantic-search", "--config=--schema"],
+    ] {
+        let output = run(&args, &root);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("--query"), "{args:?}: {stderr}");
+    }
 }
