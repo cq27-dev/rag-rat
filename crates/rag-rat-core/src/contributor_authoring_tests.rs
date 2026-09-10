@@ -1163,9 +1163,12 @@ fn subscribing_from_a_locator_records_the_routing_that_reaches_the_owner() {
         Some("https://relay.example"),
     )
     .unwrap();
-    let (peers, relay) = crate::memory_write::subscription_routing(&subscriber).unwrap();
-    assert_eq!(peers, ["node-a", "node-b"], "the pull paths read these when nothing is configured");
-    assert_eq!(relay.as_deref(), Some("https://relay.example"));
+    let relay = Some("https://relay.example".to_string());
+    assert_eq!(
+        crate::memory_write::subscription_routing(&subscriber).unwrap(),
+        [("node-a".to_string(), relay.clone()), ("node-b".to_string(), relay)],
+        "each recorded peer carries the relay its locator named — the pull paths dial it there",
+    );
 }
 
 /// An operator-named subscribe supplies no routing, and must not inherit the previous owner's host:
@@ -1181,7 +1184,75 @@ fn re_subscribing_without_routing_clears_the_previous_owners_host() {
     .unwrap();
 
     crate::memory_write::set_subscription_routing(&subscriber, &[], None).unwrap();
-    let (peers, relay) = crate::memory_write::subscription_routing(&subscriber).unwrap();
-    assert!(peers.is_empty(), "stale routing is cleared, not carried onto the new owner");
-    assert_eq!(relay, None);
+    assert!(
+        crate::memory_write::subscription_routing(&subscriber).unwrap().is_empty(),
+        "stale routing is cleared, not carried onto the new owner",
+    );
+}
+
+/// A store upgraded from a release without the pin holds a live subscription and no pin. Reading
+/// that as first use would let a changed locator silently replace the owner an operator chose.
+#[test]
+fn an_upgraded_store_treats_its_existing_subscription_as_the_pin() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscriber.execute("DELETE FROM repo_meta WHERE key = 'memory_stream_pin'", []).unwrap();
+
+    let err = crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Locator,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains(&format!("pinned to {owner_hex}")),
+        "the existing subscription is the trust root: {err}",
+    );
+}
+
+/// The upgrade case again, with `sync unsubscribe` as the first thing run after it. Clearing the
+/// subscription must carry its owner into the pin, or the next locator subscribe reads as first
+/// use.
+#[test]
+fn unsubscribing_an_upgraded_store_first_still_keeps_its_trust_root() {
+    let (_owner, subscriber, owner_account) = subscription_pair();
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    subscriber.execute("DELETE FROM repo_meta WHERE key = 'memory_stream_pin'", []).unwrap();
+
+    assert!(crate::memory_write::clear_subscription_owner(&subscriber).unwrap());
+    let err = crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &"ab".repeat(32),
+        NOW,
+        crate::memory_write::SubscribeTrust::Locator,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains(&format!("pinned to {owner_hex}")), "the pin was seeded: {err}");
+}
+
+/// Routing describes how to reach the owner a repo mirrors. Once it mirrors nobody, its host must
+/// drop out of every pull — an obsolete host stalls each pass behind a failing dial.
+#[test]
+fn routing_for_a_repo_that_no_longer_subscribes_is_never_dialed() {
+    let (_owner, subscriber, _owner_account) = subscription_pair();
+    crate::memory_write::set_subscription_routing(&subscriber, &["node-a".to_string()], None)
+        .unwrap();
+    assert!(crate::memory_write::clear_subscription_owner(&subscriber).unwrap());
+    assert!(
+        crate::memory_write::subscription_routing(&subscriber).unwrap().is_empty(),
+        "unsubscribe takes the routing out of every pull",
+    );
+
+    // And the reader holds the line on its own: routing rows that outlived their subscription by
+    // any other path are not pooled either.
+    let (_owner, stale, _owner_account) = subscription_pair();
+    crate::memory_write::set_subscription_routing(&stale, &["node-b".to_string()], None).unwrap();
+    stale.execute("DELETE FROM repo_meta WHERE key = 'memory_subscription_owner'", []).unwrap();
+    assert!(
+        crate::memory_write::subscription_routing(&stale).unwrap().is_empty(),
+        "routing without a live subscription is ignored",
+    );
 }

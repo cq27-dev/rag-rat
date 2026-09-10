@@ -968,6 +968,54 @@ fn foreign_pull_targets(
     Ok(targets)
 }
 
+/// The peers to try for a foreign account, each paired with the relay that reaches it.
+///
+/// Configured peers come first and dial through the configured relay. A peer a subscription's
+/// locator recorded dials through the relay THAT locator named: a locator relay must reach the host
+/// it describes, yet this pass pulls every foreign account, so no single locator may choose the
+/// relay for the pass. Treating the configured relay as an override would never let a locator's
+/// relay win, since the shipped default is always present. A locator peer that duplicates a
+/// configured one — under any spelling, compared as raw node-id bytes — keeps the configured route.
+pub fn foreign_pull_peers(
+    configured_peers: &[String],
+    configured_relay: &str,
+    subscribed: &[(String, Option<String>)],
+) -> Vec<(String, String)> {
+    let mut routes: Vec<(String, String)> =
+        configured_peers.iter().map(|peer| (peer.clone(), configured_relay.to_string())).collect();
+    for (peer, relay) in subscribed {
+        if routes.iter().any(|(known, _)| peer_identity(known) == peer_identity(peer)) {
+            continue;
+        }
+        let relay = relay.as_deref().filter(|relay| !relay.trim().is_empty());
+        routes.push((peer.clone(), relay.unwrap_or(configured_relay).to_string()));
+    }
+    routes
+}
+
+/// Resolve peers, in dial order, to addresses — each through the relay its route names.
+///
+/// Both pull paths dial through here, so a relay a locator recorded cannot be dropped at one call
+/// site while the other keeps it. `order` may spell a node id differently from `routes` — the peer
+/// memo stores whichever spelling answered — so a route is found by node identity; a peer with no
+/// route dials through `fallback_relay`.
+pub fn route_addrs(
+    order: &[String],
+    routes: &[(String, String)],
+    fallback_relay: &str,
+) -> Vec<(String, Result<rag_rat_sync::EndpointAddr, String>)> {
+    order
+        .iter()
+        .map(|peer| {
+            let relay = routes
+                .iter()
+                .find(|(route, _)| peer_identity(route) == peer_identity(peer))
+                .map_or(fallback_relay, |(_, relay)| relay.as_str());
+            (peer.clone(), rag_rat_sync::peer_addr(peer, relay).map_err(|e| e.to_string()))
+        })
+        .collect()
+}
+
 /// Which peer answered for which foreign account, so quiet cycles dial ONE peer instead of
 /// re-probing (and re-warning about) every configured peer that does not hold the account.
 const PULL_PEER_MEMO_PREFIX: &str = "sync_pull_peer:";
@@ -1026,41 +1074,33 @@ async fn pull_foreign_accounts(
     if targets.is_empty() {
         return Ok(());
     }
-    // Configured peers PLUS whatever a `.rag-rat-stream` recorded for a subscribed owner. A clone
-    // that subscribed from a locator has no `[sync] server_peers` by design — that is the routing
-    // the locator exists to carry — and discovery cannot stand in for it, since a foreign account's
-    // discovery tag derives from that account's own secret. Without the union this pass would skip
-    // exactly the repos the locator was meant to serve.
-    let (subscribed_peers, subscribed_relay) = crate::memory_write::subscription_routing(conn)?;
-    let mut peers = config.sync.server_peers.clone();
-    peers.extend(subscribed_peers);
-    peers.sort_unstable();
-    peers.dedup();
-    if peers.is_empty() {
+    let configured_relay = relay_url(config);
+    let routes = foreign_pull_peers(
+        &config.sync.server_peers,
+        &configured_relay,
+        &crate::memory_write::subscription_routing(conn)?,
+    );
+    if routes.is_empty() {
+        // Discovery cannot stand in: a foreign account's discovery tag derives from that
+        // account's own secret, which only its own devices hold.
         tracing::warn!(
             "cross-account sync has accounts to pull but no peer to pull from: set [sync] \
              server_peers, or subscribe from a `.rag-rat-stream` that names the owner's host"
         );
         return Ok(());
     }
-    let peers = &peers;
-    // The locator's relay fills a GAP only. This pass pulls every foreign account, not just the
-    // subscribed owner, so letting one repo's locator retarget the relay would move traffic for
-    // accounts that never named it; the configured relay (and its env override) stays
-    // authoritative wherever one is set.
-    let configured = relay_url(config);
-    let relay = match subscribed_relay {
-        Some(from_locator) if configured.trim().is_empty() => from_locator,
-        _ => configured,
-    };
+    let peers: Vec<String> = routes.iter().map(|(peer, _)| peer.clone()).collect();
     for target in targets {
         let account_hex = hash::hex_lower(&target.to_bytes());
         let memo_key = format!("{PULL_PEER_MEMO_PREFIX}{account_hex}");
-        let ordered: Vec<(String, rag_rat_sync::EndpointAddr)> = ordered_pull_peers(
-            conn, &memo_key, peers,
-        )?
+        let order = ordered_pull_peers(conn, &memo_key, &peers)?;
+        let ordered: Vec<(String, rag_rat_sync::EndpointAddr)> = route_addrs(
+            &order,
+            &routes,
+            &configured_relay,
+        )
         .into_iter()
-        .filter_map(|peer| match rag_rat_sync::peer_addr(&peer, &relay) {
+        .filter_map(|(peer, addr)| match addr {
             Ok(addr) => Some((peer, addr)),
             Err(error) => {
                 tracing::warn!(peer, %error, "skipping cross-account peer: invalid node id");
@@ -1891,6 +1931,61 @@ mod tests {
         assert!(
             limiter.try_acquire(PEER_A, 1).is_some(),
             "the slot was released on the panic unwind, not leaked",
+        );
+    }
+
+    /// Real node ids, so the spelling comparison below exercises the byte path, not the fallback.
+    const NODE_A: &str = "3f73ab97d1b322be91b77890f1ac48f142f6e91daad428dd5fc73490a44b5b78";
+    const NODE_B: &str = "4fe0090702f76cfa4b74beb42e4c880d385dcc5699d909f4fd0a2b1190be3c08";
+    const CONFIGURED_RELAY: &str = "https://relay.configured";
+    const LOCATOR_RELAY: &str = "https://relay.locator";
+
+    /// A relay is ALWAYS configured — the shipped default is never empty — so a locator's relay
+    /// that only filled a gap would never reach the host it names.
+    #[test]
+    fn a_locator_relay_reaches_its_own_peer_though_a_relay_is_always_configured() {
+        let routes = super::foreign_pull_peers(&[], CONFIGURED_RELAY, &[(
+            NODE_A.to_string(),
+            Some(LOCATOR_RELAY.to_string()),
+        )]);
+        assert_eq!(routes, [(NODE_A.to_string(), LOCATOR_RELAY.to_string())]);
+    }
+
+    /// Configured peers keep the configured relay; a locator peer naming no relay falls back to it;
+    /// and a locator peer that duplicates a configured one under another spelling is the same node,
+    /// so it keeps the configured route rather than being dialed twice.
+    #[test]
+    fn configured_routes_win_and_duplicates_are_found_by_node_identity() {
+        let routes = super::foreign_pull_peers(&[NODE_A.to_string()], CONFIGURED_RELAY, &[
+            (format!("  {NODE_A}  "), Some(LOCATOR_RELAY.to_string())),
+            (NODE_B.to_string(), None),
+        ]);
+        assert_eq!(routes, [
+            (NODE_A.to_string(), CONFIGURED_RELAY.to_string()),
+            (NODE_B.to_string(), CONFIGURED_RELAY.to_string()),
+        ]);
+    }
+
+    /// The memo keeps whichever spelling of a node id answered, which need not match the spelling
+    /// the route recorded — so the relay is found by node identity, or a locator peer would
+    /// silently fall back to the configured relay and never reach a host homed elsewhere.
+    #[test]
+    fn a_peer_dials_through_its_routes_relay_whichever_spelling_names_it() {
+        let routes = [(NODE_A.to_string(), LOCATOR_RELAY.to_string())];
+        let resolved = super::route_addrs(
+            &[format!("  {NODE_A}  "), NODE_B.to_string()],
+            &routes,
+            CONFIGURED_RELAY,
+        );
+        assert_eq!(
+            resolved[0].1.as_ref().unwrap(),
+            &rag_rat_sync::peer_addr(NODE_A, LOCATOR_RELAY).unwrap(),
+            "a routed peer dials through its route's relay",
+        );
+        assert_eq!(
+            resolved[1].1.as_ref().unwrap(),
+            &rag_rat_sync::peer_addr(NODE_B, CONFIGURED_RELAY).unwrap(),
+            "an unrouted peer dials through the fallback",
         );
     }
 

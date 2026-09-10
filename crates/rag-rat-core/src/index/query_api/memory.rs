@@ -190,8 +190,8 @@ impl IndexDatabase {
         crate::memory_write::set_subscription_routing(self.storage.connection(), peers, relay)
     }
 
-    /// Peers and relay recorded for a subscribed owner, pooled across this store's repos.
-    pub fn subscription_routing(&self) -> anyhow::Result<(Vec<String>, Option<String>)> {
+    /// Peers recorded for subscribed owners, each with the relay its locator named.
+    pub fn subscription_routing(&self) -> anyhow::Result<Vec<(String, Option<String>)>> {
         crate::memory_write::subscription_routing(self.storage.connection())
     }
 

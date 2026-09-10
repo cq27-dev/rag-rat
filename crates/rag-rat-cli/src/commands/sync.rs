@@ -1,6 +1,7 @@
 //! The `rag-rat sync` command: local memory-stream authoring configuration plus the peer transport
 //! driver (a persisted node identity today; `serve`/pairing land on top).
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
@@ -189,13 +190,7 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
             let (owner, source, locator) = match account {
                 Some(account) => (account.clone(), "argument", None),
                 None => {
-                    // The ACTIVE checkout, not `config.root`: in a linked worktree the config is
-                    // main-anchored, so reading the locator from it would pin or reject against
-                    // the main checkout's file while the operator is standing in the branch.
-                    let checkout = std::env::current_dir()
-                        .ok()
-                        .and_then(|cwd| rag_rat_base::config::worktree_root(&cwd))
-                        .unwrap_or_else(|| config.root.clone());
+                    let checkout = locator_checkout(&config.root, std::env::current_dir().ok());
                     let locator =
                         rag_rat_base::stream_locator::load(&checkout)?.with_context(|| {
                             format!(
@@ -237,9 +232,18 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "memories_added": effects.nodes_written,
                 "memories_removed": effects.nodes_removed,
                 "note": if locator.as_ref().is_some_and(|l| !l.peers.is_empty()) {
-                    "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). The locator's peers are recorded, so automatic sync pulls the owner's log without any [sync] server_peers; run `sync pull` now to fetch it immediately"
+                    format!(
+                        "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). The locator's peers are recorded, so automatic sync pulls the \
+                         owner's log without any [sync] server_peers; run `{}` to fetch it now",
+                        subscribe_pull_hint(&owner, false),
+                    )
                 } else {
-                    "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log and no routing was supplied: automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner> --peer <NODE_ID>` now"
+                    format!(
+                        "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log and no routing was supplied: \
+                         automatic sync pulls it once the owner's host is in [sync] server_peers, \
+                         or run `{}` now",
+                        subscribe_pull_hint(&owner, true),
+                    )
                 },
             }))
         },
@@ -278,6 +282,37 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
 
 /// The relay this invocation binds: `RAG_RAT_SYNC_RELAY` (ops/tests) overrides the configured
 /// `[sync] relay_url`, which itself defaults to the shipped relay.
+/// Where a subscribe reads `.rag-rat-stream`: the git root of the ACTIVE checkout, provided that
+/// checkout belongs to the repository the config names.
+///
+/// `config.root` is main-anchored, so in a linked worktree it points at the main checkout and
+/// would pin or reject against the wrong file while the operator stands in the branch. But the cwd
+/// only speaks for the configured repo when it is one of that repo's worktrees: from repo A with
+/// `--config` naming repo B, the store being written is B's, and A's locator must not choose B's
+/// trust root. Anything that is not the configured repo's own family falls back to its root.
+fn locator_checkout(config_root: &Path, cwd: Option<PathBuf>) -> PathBuf {
+    let family = |path: &Path| {
+        rag_rat_base::config::linked_worktree_main_root(path)
+            .or_else(|| rag_rat_base::config::worktree_root(path))
+    };
+    let configured = rag_rat_base::config::worktree_root(config_root);
+    let session = cwd.as_deref().and_then(|cwd| {
+        let family_matches = family(cwd).is_some() && family(cwd) == family(config_root);
+        family_matches.then(|| rag_rat_base::config::worktree_root(cwd)).flatten()
+    });
+    session.or(configured).unwrap_or_else(|| config_root.to_path_buf())
+}
+
+/// The pull a subscribe tells its operator to run. `sync pull` requires the account id, so the
+/// suggestion names the owner rather than handing over a command that fails to parse.
+fn subscribe_pull_hint(owner: &str, needs_peer: bool) -> String {
+    if needs_peer {
+        format!("rag-rat sync pull {owner} --peer <NODE_ID>")
+    } else {
+        format!("rag-rat sync pull {owner}")
+    }
+}
+
 fn effective_relay_url(config: &Config) -> String {
     match std::env::var("RAG_RAT_SYNC_RELAY") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -1001,20 +1036,18 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
     drop(repo_lock);
 
     // An explicit `--peer` wins; otherwise configured peers PLUS whatever a `.rag-rat-stream`
-    // recorded when this repo subscribed. A clone that subscribed from a locator has no configured
-    // peers by design, and this is the command its own subscribe output tells it to run.
-    let (subscribed_peers, _) = db.subscription_routing()?;
-    let peer_ids: Vec<String> = match peer_override {
-        Some(peer) => vec![peer.to_string()],
-        None => {
-            let mut peers = config.sync.server_peers.clone();
-            peers.extend(subscribed_peers);
-            peers.sort_unstable();
-            peers.dedup();
-            peers
-        },
+    // recorded when this repo subscribed, each dialed through the relay that reaches it. A clone
+    // that subscribed from a locator has no configured peers by design, and this is the command its
+    // own subscribe output tells it to run.
+    let routes: Vec<(String, String)> = match peer_override {
+        Some(peer) => vec![(peer.to_string(), relay.clone())],
+        None => rag_rat_core::sync_driver::foreign_pull_peers(
+            &config.sync.server_peers,
+            &relay,
+            &db.subscription_routing()?,
+        ),
     };
-    if peer_ids.is_empty() {
+    if routes.is_empty() {
         bail!(
             "no peer to pull from: pass --peer <NODE_ID>, set [sync] server_peers, or subscribe \
              from a `.rag-rat-stream` that names the owner's host. Discovery cannot find a \
@@ -1024,10 +1057,11 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
     }
     // An invalid entry skips to the next peer rather than aborting: one typo in a configured
     // peer list must not block a pull another entry could serve.
-    let mut peers = Vec::with_capacity(peer_ids.len());
+    let order: Vec<String> = routes.iter().map(|(peer, _)| peer.clone()).collect();
+    let mut peers = Vec::with_capacity(routes.len());
     let mut resolve_error = None;
-    for peer_id in peer_ids {
-        match rag_rat_sync::peer_addr(&peer_id, &relay) {
+    for (peer_id, addr) in rag_rat_core::sync_driver::route_addrs(&order, &routes, &relay) {
+        match addr {
             Ok(addr) => peers.push((peer_id, addr)),
             Err(error) => {
                 resolve_error = Some(format!("peer `{peer_id}` is not a valid node id: {error}"));
@@ -1258,6 +1292,73 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
         conn
+    }
+
+    /// A git repo with one commit, so a linked worktree can branch off it.
+    fn init_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        rag_rat_base::test_git::run(dir, &["init", "-q", "."]);
+        rag_rat_base::test_git::run(dir, &["config", "user.email", "t@t"]);
+        rag_rat_base::test_git::run(dir, &["config", "user.name", "t"]);
+        rag_rat_base::test_git::run(dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    /// The locator belongs to the repository the config names, read from whichever of ITS checkouts
+    /// the operator stands in. A cwd outside that repository's worktree family never chooses.
+    #[test]
+    fn a_subscribe_reads_the_locator_of_the_configured_repos_active_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b_main = tmp.path().join("b");
+        init_repo(&b_main);
+        let b_linked = tmp.path().join("b-linked");
+        rag_rat_base::test_git::run(&b_main, &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "branch",
+            b_linked.to_str().unwrap(),
+        ]);
+        let a = tmp.path().join("a");
+        init_repo(&a);
+        let top = |path: &std::path::Path| rag_rat_base::config::worktree_root(path).unwrap();
+
+        // `config.root` is main-anchored, so standing in B's linked worktree the branch's own
+        // checkout must speak — not the main checkout the config points at.
+        assert_eq!(super::locator_checkout(&b_main, Some(b_linked.clone())), top(&b_linked));
+        // From repo A with `--config` naming B, the store being written is B's: A's locator must
+        // not pin B's trust root.
+        assert_eq!(super::locator_checkout(&b_main, Some(a.clone())), top(&b_main));
+        // With no usable cwd, the configured repo's own checkout.
+        assert_eq!(super::locator_checkout(&b_main, None), top(&b_main));
+
+        // A config whose `[index] root` is a subdirectory still reads the locator from the git root
+        // of the checkout, in the main checkout and a linked one alike.
+        let nested = b_main.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(super::locator_checkout(&nested, None), top(&b_main));
+        assert_eq!(super::locator_checkout(&nested, Some(b_linked.clone())), top(&b_linked));
+    }
+
+    /// `sync pull` requires the account id, so a suggestion without it would hand the operator a
+    /// command that fails to parse instead of one that fetches the stream.
+    #[test]
+    fn the_pull_a_subscribe_suggests_is_a_command_that_parses() {
+        use clap::Parser;
+
+        use crate::cli::{Cli, Command, SyncArgs, SyncCommand};
+
+        let owner = "ab".repeat(32);
+        for needs_peer in [false, true] {
+            let hint = super::subscribe_pull_hint(&owner, needs_peer);
+            let cli = Cli::try_parse_from(hint.split_whitespace())
+                .unwrap_or_else(|err| panic!("`{hint}` must parse: {err}"));
+            match cli.command {
+                Command::Sync(SyncArgs { command: SyncCommand::Pull { account, .. } }) =>
+                    assert_eq!(account, owner, "and it fetches the subscribed owner"),
+                other => panic!("`{hint}` parsed as something other than a pull: {other:?}"),
+            }
+        }
     }
 
     /// A minimal config whose paths are never touched by these gate tests (they all return before
