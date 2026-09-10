@@ -2294,7 +2294,7 @@ fn anchors_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<Memor
 
 /// Read a memory's bindings as the portable facts the wire carries — every replicated column, and
 /// no checkout-local resolution state.
-fn portable_anchors_of(
+pub(super) fn portable_anchors_of(
     conn: &Connection,
     memory_id: &str,
 ) -> anyhow::Result<Vec<rag_rat_oplog::PortableAnchor>> {

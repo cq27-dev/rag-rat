@@ -645,9 +645,10 @@ fn applied_snapshot(
 ///
 /// Bindings present with no digest recorded arrived some other way — `anchors/1` from the author's
 /// own account, a seed from before the digest existed, or a rebind made here. The digest is
-/// recorded WITHOUT replacing them, which would only undo the relocation loop's work. But only an
-/// identity match says they are the author's set: when any held row is one the published set does
-/// not name, they are a stale seed or a local rebind, and the author's hash is kept off them. That
+/// recorded WITHOUT replacing them, which would only undo the relocation loop's work. But only a
+/// target match says they are the author's set: when any held row is not one the published set
+/// names with the same target, it is a stale seed, a local rebind, or a row whose target has since
+/// moved, and the author's hash is kept off them. That
 /// verdict holds for the pass that records the digest and is not stored, so a later hash-only
 /// publish stamps beside them — which only the sweep emits, and only for anchors published before
 /// the hash op existed.
@@ -676,18 +677,16 @@ fn apply_published_anchors(
     };
     let mut changed = false;
     // Whether the bindings held here are the author's set, or rows the relocation loop moved from
-    // it. Only the record-only branch can find out they are not.
+    // it. Only the record-only branch can find out they are not — by target, not identity alone: a
+    // struct kept from before the upgrade shares its impl's qualified name.
     let mut authors_bindings = true;
     let digest = anchor_snapshot_digest(&node.node_id, anchors);
     let set_changed = applied.digest.as_deref() != Some(digest.as_str());
     if set_changed {
-        let held = held_bindings(tx, repo_id, &node.node_id)?;
+        let held = super::authoring::portable_anchors_of(tx, &node.node_id)?;
         if applied.digest.is_none() && !held.is_empty() {
-            authors_bindings = held.iter().all(|(kind, id)| {
-                anchors
-                    .iter()
-                    .any(|anchor| anchor.binding_kind == *kind && anchor.binding_id == *id)
-            });
+            authors_bindings =
+                held.iter().all(|row| anchors.iter().any(|anchor| same_target(row, anchor)));
         } else {
             changed |= converge_bindings(tx, repo_id, &node.node_id, anchors, &held)?;
         }
@@ -719,21 +718,20 @@ fn apply_published_anchors(
     Ok(changed)
 }
 
-/// The identities — `(binding_kind, binding_id)`, the primary key — of the bindings this store
-/// holds for a memory.
-fn held_bindings(
-    tx: &Transaction<'_>,
-    repo_id: &str,
-    memory_id: &str,
-) -> anyhow::Result<Vec<(String, String)>> {
-    let mut stmt = tx.prepare(
-        "SELECT binding_kind, binding_id FROM repo_memory_bindings
-         WHERE repo_id = ?1 AND memory_id = ?2",
-    )?;
-    let held = stmt
-        .query_map(params![repo_id, memory_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
-    Ok(held)
+/// Whether a held binding and a published anchor name the same row — `(binding_kind, binding_id)`,
+/// the primary key.
+fn same_row(held: &rag_rat_oplog::PortableAnchor, anchor: &rag_rat_oplog::PortableAnchor) -> bool {
+    held.binding_kind == anchor.binding_kind && held.binding_id == anchor.binding_id
+}
+
+/// Whether a held binding and a published anchor name the same row AND the same target: every
+/// portable column but `created_at_ms`, which each rebind restamps without saying anything about
+/// the target. The row alone is not enough — a struct and its impl share a qualified name.
+fn same_target(
+    held: &rag_rat_oplog::PortableAnchor,
+    anchor: &rag_rat_oplog::PortableAnchor,
+) -> bool {
+    rag_rat_oplog::PortableAnchor { created_at_ms: anchor.created_at_ms, ..held.clone() } == *anchor
 }
 
 /// The identity of a published anchor set: its byte-canonical op encoding, hashed. The fold has
@@ -768,108 +766,90 @@ fn published_source_hash<'a>(repo_id: &str, node: &'a ProjectedContentNode) -> O
 }
 
 /// Bring a memory's bindings to a published set BY IDENTITY — `(binding_kind, binding_id)`, the
-/// primary key — so a row the set still names keeps its local resolution state while its target is
-/// unchanged. A held row the set no longer names is deleted, with its call path when it is one; an
-/// anchor the set names that is missing here is inserted when this store can resolve its kind.
-/// Returns whether any row moved.
+/// primary key — for the kinds this store can install. A held row the set no longer names is
+/// deleted. A named row keeps its local resolution while its target is unchanged; one whose target
+/// moved (a struct and its impl share a qualified name) takes the author's values and drops that
+/// resolution for the validate loop to redo. A named anchor missing here is inserted. Returns
+/// whether any row moved.
 ///
-/// A kind this store never inserts (`chunk`, `call_path`) is therefore kept for as long as the
-/// author still names it. Clearing the set and re-inserting only what seeds would delete it here,
-/// and `anchors/1`, which publishes this table's deletes, would carry that loss to every device of
-/// the account — including the one that authored the binding.
+/// Kinds this store never inserts (`chunk`, `call_path`) are never deleted or refreshed. The drain
+/// cannot put back what it removes of them, and on a device of the author's own account they are
+/// `anchors/1`'s to carry: a chunk binding relocates on every re-chunk without a new snapshot, so
+/// deleting the unnamed, relocated row would unbind the memory — and `anchors/1`, which publishes
+/// this table's deletes, would carry that to every device, the author's included. Their
+/// checkout-local id is also their whole resolution, which a refresh would clear for good.
 fn converge_bindings(
     tx: &Transaction<'_>,
     repo_id: &str,
     memory_id: &str,
     anchors: &[rag_rat_oplog::PortableAnchor],
-    held: &[(String, String)],
+    held: &[rag_rat_oplog::PortableAnchor],
 ) -> anyhow::Result<bool> {
-    let named: std::collections::HashSet<(&str, &str)> = anchors
-        .iter()
-        .map(|anchor| (anchor.binding_kind.as_str(), anchor.binding_id.as_str()))
-        .collect();
     let mut changed = false;
-    for (kind, id) in held {
-        if named.contains(&(kind.as_str(), id.as_str())) {
-            continue;
-        }
-        tx.execute(
-            "DELETE FROM repo_memory_bindings
-             WHERE repo_id = ?1 AND memory_id = ?2 AND binding_kind = ?3 AND binding_id = ?4",
-            params![repo_id, memory_id, kind, id],
-        )?;
-        // A call path and its edges hang off the memory rather than the binding naming them —
-        // `rebind_memory` clears the path the same way — so the ones this binding named go with it.
-        if kind == "call_path" {
-            for table in ["repo_memory_call_paths", "repo_memory_call_path_edges"] {
+    for row in held.iter().filter(|row| SEEDABLE_BINDING_KINDS.contains(&row.binding_kind.as_str()))
+    {
+        match anchors.iter().find(|anchor| same_row(row, anchor)) {
+            Some(anchor) if same_target(row, anchor) => continue,
+            Some(anchor) => refresh_binding(tx, repo_id, memory_id, anchor)?,
+            None => {
                 tx.execute(
-                    &format!(
-                        "DELETE FROM {table} WHERE memory_id = ?1 AND edge_sequence_hash = ?2"
-                    ),
-                    params![memory_id, id],
+                    "DELETE FROM repo_memory_bindings
+                     WHERE repo_id = ?1 AND memory_id = ?2 AND binding_kind = ?3
+                       AND binding_id = ?4",
+                    params![repo_id, memory_id, row.binding_kind, row.binding_id],
                 )?;
-            }
+            },
         }
         changed = true;
     }
-    // The identity can survive a rebind whose target moved — a struct and its impl share a
-    // qualified name — and a row still resolving the old target would validate against text the
-    // published hash no longer describes. So a named row whose portable columns differ takes the
-    // author's values and drops its resolution, for the validate loop to redo. `created_at_ms` is
-    // written but not compared: every rebind restamps it, which says nothing about the target.
-    // Kinds this store never seeds are left alone — their checkout-local id IS their resolution,
-    // and clearing it would leave them unverified for good.
-    for anchor in anchors {
-        if !SEEDABLE_BINDING_KINDS.contains(&anchor.binding_kind.as_str())
-            || !held
-                .iter()
-                .any(|(kind, id)| *kind == anchor.binding_kind && *id == anchor.binding_id)
-        {
-            continue;
-        }
-        changed |= tx.execute(
-            "UPDATE repo_memory_bindings
-             SET path = ?5, start_line = ?6, end_line = ?7, commit_hash = ?8, tracker = ?9,
-                 project = ?10, item_key = ?11, symbol_kind = ?12, signature_hash = ?13,
-                 moniker_tool = ?14, moniker_tool_version = ?15, created_at_ms = ?16,
-                 logical_symbol_id = NULL, symbol_id = NULL, chunk_id = NULL, edge_id = NULL,
-                 anchor_status = 'unverified', relocation_reason = NULL,
-                 downgrade_pending_at_ms = NULL
-             WHERE repo_id = ?1 AND memory_id = ?2 AND binding_kind = ?3 AND binding_id = ?4
-               AND (path, start_line, end_line, commit_hash, tracker, project, item_key,
-                    symbol_kind, signature_hash, moniker_tool, moniker_tool_version)
-                   IS NOT (?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![
-                repo_id,
-                memory_id,
-                anchor.binding_kind,
-                anchor.binding_id,
-                anchor.path,
-                anchor.start_line,
-                anchor.end_line,
-                anchor.commit_hash,
-                anchor.tracker,
-                anchor.project,
-                anchor.item_key,
-                anchor.symbol_kind,
-                anchor.signature_hash,
-                anchor.moniker_tool,
-                anchor.moniker_tool_version,
-                anchor.created_at_ms,
-            ],
-        )? > 0;
-    }
     let missing: Vec<rag_rat_oplog::PortableAnchor> = anchors
         .iter()
-        .filter(|anchor| {
-            !held.iter().any(|(kind, id)| *kind == anchor.binding_kind && *id == anchor.binding_id)
-        })
+        .filter(|anchor| !held.iter().any(|row| same_row(row, anchor)))
         .cloned()
         .collect();
     if insert_seedable_anchors(tx, repo_id, memory_id, &missing)? > 0 {
         changed = true;
     }
     Ok(changed)
+}
+
+/// Give a held row the author's portable values for its target, and clear the local resolution it
+/// held for the previous one.
+fn refresh_binding(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    memory_id: &str,
+    anchor: &rag_rat_oplog::PortableAnchor,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE repo_memory_bindings
+         SET path = ?5, start_line = ?6, end_line = ?7, commit_hash = ?8, tracker = ?9,
+             project = ?10, item_key = ?11, symbol_kind = ?12, signature_hash = ?13,
+             moniker_tool = ?14, moniker_tool_version = ?15, created_at_ms = ?16,
+             logical_symbol_id = NULL, symbol_id = NULL, chunk_id = NULL, edge_id = NULL,
+             anchor_status = 'unverified', relocation_reason = NULL,
+             downgrade_pending_at_ms = NULL
+         WHERE repo_id = ?1 AND memory_id = ?2 AND binding_kind = ?3 AND binding_id = ?4",
+        params![
+            repo_id,
+            memory_id,
+            anchor.binding_kind,
+            anchor.binding_id,
+            anchor.path,
+            anchor.start_line,
+            anchor.end_line,
+            anchor.commit_hash,
+            anchor.tracker,
+            anchor.project,
+            anchor.item_key,
+            anchor.symbol_kind,
+            anchor.signature_hash,
+            anchor.moniker_tool,
+            anchor.moniker_tool_version,
+            anchor.created_at_ms,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Whether this store holds ANY binding for `(repo_id, memory_id)` — the per-memory seed gate.
@@ -1660,8 +1640,10 @@ mod tests {
         drain_worker(&conn, stream, 1_000);
         conn.execute(
             "INSERT INTO repo_memory_bindings(
-                 repo_id, memory_id, binding_kind, binding_id, path, anchor_status, created_at_ms)
-             VALUES (?1, 'mem_peer', 'symbol', 'src/lib.rs::run', 'src/lib.rs', 'current', 1)",
+                 repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                 anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'symbol', 'src/lib.rs::run', 'src/lib.rs', 1, 2, 'current',
+                 1)",
             [REPO],
         )
         .unwrap();
@@ -1715,8 +1697,7 @@ mod tests {
 
     /// The gap a seed-once gate left: an author who rebinds publishes a new set, and a receiver
     /// that already holds the old one moves to it — bindings and hash together, whatever the
-    /// relocation loop had done to the old rows, and without the call paths the old binding
-    /// carried.
+    /// relocation loop had done to the old rows.
     #[test]
     fn an_author_rebind_replaces_a_synced_memorys_bindings_and_hash_together() {
         let conn = scoped_conn();
@@ -1735,30 +1716,6 @@ mod tests {
             [],
         )
         .unwrap();
-        // A call-path binding in the old set, as `anchors/1` delivers one: the drain never inserts
-        // that kind, but the new set dropping it must take it and its call path away.
-        conn.execute(
-            "INSERT INTO repo_memory_bindings(
-                 repo_id, memory_id, binding_kind, binding_id, anchor_status, created_at_ms)
-             VALUES (?1, 'mem_peer', 'call_path', 'seq', 'current', 1)",
-            [REPO],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO repo_memory_call_paths(
-                 memory_id, edge_sequence_hash, path_summary, created_at_ms)
-             VALUES ('mem_peer', 'seq', 'run -> walk', 1)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO repo_memory_call_path_edges(
-                 memory_id, edge_sequence_hash, ordinal, edge_fingerprint, to_name, edge_kind)
-             VALUES ('mem_peer', 'seq', 0, 'fp', 'walk', 'calls')",
-            [],
-        )
-        .unwrap();
-
         seed_projected_node_with_anchors(
             &conn,
             stream,
@@ -1773,22 +1730,6 @@ mod tests {
             "src/other.rs::walk".to_string()
         )]);
         assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_B.to_string()));
-        let call_paths: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM repo_memory_call_paths WHERE memory_id = 'mem_peer'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(call_paths, 0, "the call paths went with the bindings they belonged to");
-        let call_path_edges: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM repo_memory_call_path_edges WHERE memory_id = 'mem_peer'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(call_path_edges, 0, "and so did the call path's edges");
     }
 
     /// A kind this store never inserts — here a call path — is kept while the author still names
@@ -1880,6 +1821,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kept, ("current".to_string(), Some(42)));
+    }
+
+    /// A chunk binding relocates on every re-chunk without a new snapshot, and on a device of the
+    /// author's own account `anchors/1` delivers the relocated row. When the author's next snapshot
+    /// still names the pre-relocation chunk, the drain cannot insert it, so it must not delete the
+    /// relocated row either: the memory would be unbound here, and `anchors/1` would carry that
+    /// delete to every device.
+    #[test]
+    fn a_relocated_chunk_binding_the_drain_cannot_reinsert_is_kept() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        drain_worker(&conn, stream, 1_000);
+        // The author rebinds to chunk 42 and re-chunks; `anchors/1` delivers the rebind and the
+        // relocation to 43 before this device drains the new snapshot.
+        conn.execute("DELETE FROM repo_memory_bindings WHERE memory_id = 'mem_peer'", []).unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'chunk', '43', 'current', 1)",
+            [REPO],
+        )
+        .unwrap();
+
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", Some(&[("chunk", "42")]));
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![("chunk".to_string(), "43".to_string())]);
+    }
+
+    /// The record-only branch matches by TARGET, not identity alone. A struct binding kept from
+    /// before the upgrade shares a qualified name with the impl its author has since published;
+    /// that hash describes the impl, and stamping it beside the struct's target would read as
+    /// drift.
+    #[test]
+    fn a_kept_binding_whose_target_moved_does_not_take_the_published_hash() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", None);
+        drain_worker(&conn, stream, 1_000);
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                 symbol_kind, anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'symbol', 'src/lib.rs::Run', 'src/lib.rs', 1, 2, 'struct',
+                 'current', 7)",
+            [REPO],
+        )
+        .unwrap();
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::Run")]),
+        );
+        set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "impl");
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(source_hash_of(&conn, "mem_peer"), None);
     }
 
     /// Set one field of the first anchor in a projected node's published snapshot.
