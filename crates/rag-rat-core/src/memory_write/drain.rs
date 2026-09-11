@@ -480,9 +480,15 @@ fn drain_node(
     // snapshot check comes first because it is free: until anchors are authored, every node answers
     // `None` and this costs no query at all.
     if node.anchors.is_some() && node_in_repo(tx, &node.node_id, repo_id)? {
+        // A local memory's bindings are its own — unless another account authored the winning set:
+        // a contributor rebinding a memory this account created. That set reaches this device
+        // through the snapshot alone, as it does a synced memory.
+        let foreign =
+            node.anchors_author.is_some() && node.anchors_author.as_ref() != local_account;
         let changed = match applied_snapshot(tx, repo_id, &node.node_id)? {
-            Some(applied) => apply_published_anchors(tx, repo_id, node, local_account, applied)?,
-            None => seed_node_anchors(tx, repo_id, node)? > 0,
+            Some(applied) if !applied.local || foreign =>
+                apply_published_anchors(tx, repo_id, node, local_account, applied)?,
+            _ => seed_node_anchors(tx, repo_id, node)? > 0,
         };
         if changed {
             // `anchors/1` declares that a write to this table advances these lanes, and the `/5`
@@ -613,9 +619,11 @@ fn insert_seedable_anchors(
     Ok(seeded)
 }
 
-/// What the drain last applied to a SYNCED memory, or `None` for any other row — a local memory's
-/// bindings are its own, and only [`seed_node_anchors`] may fill them.
+/// What the drain last applied to a memory of this repo, or `None` when it has no row here.
 struct AppliedSnapshot {
+    /// Whether the memory was created here (`origin = 'local'`): its bindings are its own, taken
+    /// from a published set only when another account authored it.
+    local: bool,
     /// The [`anchor_snapshot_digest`] of the set last applied; NULL until one is.
     digest: Option<String>,
     /// The published hash last applied, as stored; NULL until one is, or when it was none.
@@ -667,18 +675,27 @@ fn applied_snapshot(
     memory_id: &str,
 ) -> anyhow::Result<Option<AppliedSnapshot>> {
     tx.query_row(
-        "SELECT anchors_applied_digest, source_hash_applied, anchors_applied_targets
+        "SELECT anchors_applied_digest, source_hash_applied, anchors_applied_targets,
+                origin = 'local'
            FROM repo_memories
-         WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced'",
+         WHERE id = ?1 AND repo_id = ?2",
         params![memory_id, repo_id],
-        |row| Ok(AppliedSnapshot { digest: row.get(0)?, hash: row.get(1)?, targets: row.get(2)? }),
+        |row| {
+            Ok(AppliedSnapshot {
+                local: row.get(3)?,
+                digest: row.get(0)?,
+                hash: row.get(1)?,
+                targets: row.get(2)?,
+            })
+        },
     )
     .optional()
     .map_err(Into::into)
 }
 
-/// Apply the anchor set and source hash a synced memory's author published, wherever either CHANGED
-/// since the drain last applied it. Returns whether the memory's bindings or hash moved.
+/// Apply the anchor set and source hash a synced memory's author published — or, for a memory
+/// created here, a set another account authored — wherever either CHANGED since the drain last
+/// applied it. Returns whether the memory's bindings or hash moved.
 ///
 /// Change, not difference, is the trigger. The bindings here drift from the snapshot by design —
 /// the validate/relocate loop re-keys them as the checkout moves — so comparing against them would
@@ -737,8 +754,9 @@ fn apply_published_anchors(
     }
     if set_changed {
         // Bindings held with no digest recorded arrived some other way: the set is recorded
-        // against them rather than replacing them.
-        if held.is_empty() || (!own && applied.digest.is_some()) {
+        // against them rather than replacing them. A local memory's held bindings are its creator's
+        // own last set, which another account's set supersedes on first sight.
+        if held.is_empty() || (!own && (applied.digest.is_some() || applied.local)) {
             let previous = parse_applied_targets(applied.targets.as_deref());
             changed |=
                 converge_bindings(tx, repo_id, &node.node_id, anchors, &held, previous.as_ref())?;
@@ -2789,8 +2807,9 @@ mod tests {
         assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_B.to_string()));
     }
 
-    /// A LOCAL memory's bindings are its own: a peer's snapshot only ever seeds one that holds
-    /// none, and never replaces one that does — even when the published set changes.
+    /// A LOCAL memory's bindings are its own: a snapshot this account (or nobody known) authored
+    /// only ever seeds one that holds none, and never replaces one that does — even when the
+    /// published set changes.
     #[test]
     fn a_local_memory_that_holds_bindings_is_never_replaced() {
         let conn = scoped_conn();
@@ -2833,6 +2852,48 @@ mod tests {
             "src/lib.rs::keep".to_string()
         )]);
         assert_eq!(source_hash_of(&conn, "mem_mine"), None, "a local memory's hash is its own");
+    }
+
+    /// A contributor's rebind of a memory this account created is authored by another account, so
+    /// it reaches this device through the snapshot alone: the creator's local row takes it, on
+    /// first sight, as a synced row would.
+    #[test]
+    fn a_local_memory_takes_a_set_another_account_authored() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
+        conn.execute(
+            "INSERT INTO repo_memories(
+                 id, kind, title, body, confidence, status, created_at_ms, updated_at_ms, source,
+                 memory_version, repo_id, origin)
+             VALUES ('mem_mine', 'Invariant', 't', 'b', 'high', 'active', 1, 1, 'agent', 'v1', ?1,
+                 'local')",
+            [REPO],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, anchor_status, created_at_ms)
+             VALUES (?1, 'mem_mine', 'symbol', 'src/lib.rs::old', 'src/lib.rs', 'current', 1)",
+            [REPO],
+        )
+        .unwrap();
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_mine",
+            Some(&[("symbol", "src/other.rs::new")]),
+        );
+        set_projected_anchors_author(&conn, stream, "mem_mine", &foreign);
+        set_projected_source_hash(&conn, stream, "mem_mine", Some(HASH_A));
+        drain_worker(&conn, stream, 1_000);
+
+        assert_eq!(bindings_of(&conn, "mem_mine"), vec![(
+            "symbol".to_string(),
+            "src/other.rs::new".to_string()
+        )]);
+        assert_eq!(source_hash_of(&conn, "mem_mine"), Some(HASH_A.to_string()));
     }
 
     /// The published hash crosses the same untrusted boundary as the content and lands in a column
