@@ -902,7 +902,12 @@ fn converge_bindings(
 }
 
 /// Give a held row the author's portable values for its target, and clear the cached resolution the
-/// validator would otherwise trust outright — the raw row ids and the verdict.
+/// validator would otherwise trust outright — the raw symbol and chunk ids and the verdict.
+///
+/// An edge's `edge_id` is KEPT: its binding id is the edge fingerprint, which names the exact edge
+/// (resolved callee included), so a row the set still names is still that edge. Clearing it would
+/// lose an edge only a linked worktree holds — validation keeps such a sibling edge pending only
+/// while its stored id is present.
 ///
 /// The logical handle is KEPT: it is the only stored evidence that tells two impls of different
 /// traits for one type apart when they also share the captured signature, so clearing it would
@@ -945,7 +950,7 @@ pub(crate) fn refresh_binding(
          SET path = ?5, start_line = ?6, end_line = ?7, commit_hash = ?8, tracker = ?9,
              project = ?10, item_key = ?11, symbol_kind = ?12, signature_hash = ?13,
              moniker_tool = ?14, moniker_tool_version = ?15, created_at_ms = ?16,
-             symbol_id = NULL, chunk_id = NULL, edge_id = NULL,
+             symbol_id = NULL, chunk_id = NULL,
              anchor_status = 'unverified',
              relocation_reason = ?17,
              downgrade_pending_at_ms = NULL
@@ -2095,6 +2100,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reason.as_deref(), Some(rag_rat_query::memory::RETARGETED_REASON));
+    }
+
+    /// An edge binding's id is its fingerprint, which names the exact edge, so a republish that
+    /// still names it keeps the cached `edge_id` — the only thing keeping an edge a linked worktree
+    /// alone holds from reading `gone` in the base checkout.
+    #[test]
+    fn a_refresh_keeps_an_edge_bindings_cached_id() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let publish = |path: &str| {
+            seed_projected_node_with_anchors(&conn, stream, "mem_peer", Some(&[("edge", "fp-1")]));
+            set_projected_anchor_field(&conn, stream, "mem_peer", "path", path);
+        };
+        publish("src/lib.rs");
+        drain_worker(&conn, stream, 1_000);
+        conn.execute(
+            "UPDATE repo_memory_bindings SET edge_id = 77 WHERE memory_id = 'mem_peer'",
+            [],
+        )
+        .unwrap();
+
+        publish("src/moved.rs");
+        drain_worker(&conn, stream, 2_000);
+
+        let (path, edge_id): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT path, edge_id FROM repo_memory_bindings WHERE memory_id = 'mem_peer'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path.as_deref(), Some("src/moved.rs"), "the refresh ran");
+        assert_eq!(edge_id, Some(77));
     }
 
     /// A chunk binding relocates on every re-chunk without a new snapshot, and on a device of the

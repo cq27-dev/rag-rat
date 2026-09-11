@@ -618,15 +618,17 @@ fn memory_logical_binding_relocates_across_files() {
     let db = IndexDatabase::rebuild(&config).unwrap();
 
     // Corrupt both fast-path identifiers so only the bare-name+hash fallback can recover the
-    // binding. The binding_id keeps "logical_target" as the bare name (after rsplit "::").
+    // binding. The binding_id keeps "logical_target" as the bare name (after rsplit "::"). A
+    // pending retarget mark rides along: a content-hash match is identity, so it answers it.
     db.storage
         .connection()
         .execute(
             "UPDATE repo_memory_bindings
              SET logical_symbol_id = -9999,
-                 binding_id        = 'src/gone.rs::logical_target'
+                 binding_id        = 'src/gone.rs::logical_target',
+                 relocation_reason = ?1
              WHERE binding_kind = 'logical_symbol'",
-            [],
+            [rag_rat_query::memory::RETARGETED_REASON],
         )
         .unwrap();
 
@@ -636,6 +638,17 @@ fn memory_logical_binding_relocates_across_files() {
         "logical binding must relocate via name+hash fallback: {report:?}"
     );
     assert_eq!(report.gone, 0, "logical binding must not be gone after relocation: {report:?}");
+    let reason: Option<String> = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT relocation_reason FROM repo_memory_bindings WHERE binding_kind = \
+             'logical_symbol'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, None, "the content-hash match answers the retarget mark");
 
     // The binding path must now reference b.rs.
     let path = db

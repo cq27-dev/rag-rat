@@ -170,6 +170,8 @@ pub(crate) fn validate_logical_symbol_binding(
             binding.end_line = m.end_line;
             binding.symbol_kind = m.symbol_kind;
             binding.signature_hash = m.signature_hash;
+            // A content-hash match is identity: it answers a pending retarget.
+            answer_retarget_mark(binding);
             return Ok("relocated".to_string());
         }
     }
@@ -192,9 +194,9 @@ pub(crate) fn validate_logical_symbol_binding(
 /// a linked worktree that edited the target leaves the mark for the checkout that has it (the
 /// logical arm's candidates are repo-wide, so any checkout can answer there). That works because
 /// relocation does not refresh a marked row's recorded kind or signature until the mark is
-/// answered. An identity match answers it outright: the content-hash fallback restates the kind and
-/// signature, and a moniker relocation replaces the reason with its own. (An `anchors/1` row update
-/// also moves a binding in place, but marks nothing.)
+/// answered. An identity match answers it outright: the content-hash fallback clears it and
+/// restates the kind and signature, and a moniker relocation replaces the reason with its own. (An
+/// `anchors/1` row update also moves a binding in place, but marks nothing.)
 pub const RETARGETED_REASON: &str = "retargeted";
 
 /// Whether the binding carries [`RETARGETED_REASON`].
@@ -408,6 +410,8 @@ pub(crate) fn validate_symbol_binding(
             binding.end_line = m.end_line;
             binding.symbol_kind = m.symbol_kind;
             binding.signature_hash = m.signature_hash;
+            // A content-hash match is identity: it answers a pending retarget.
+            answer_retarget_mark(binding);
             return Ok("relocated".to_string());
         }
     }
