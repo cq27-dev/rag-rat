@@ -75,19 +75,18 @@ pub(crate) fn validate_logical_symbol_binding(
     // A live handle whose kind contradicts the binding — or, on a retargeted row, whose signature
     // does — is held back rather than trusted (see `cached_kind_agrees`, `RETARGETED_REASON`), and
     // only rejected if the relocation pick finds something better.
-    let retargeted = take_retarget_mark(binding);
+    let retargeted = is_retargeted(binding);
     let mut held_back = None;
     if let Some(id) = binding.logical_symbol_id
         && let Some(hit) = crate::symbol::lookup_logical_by_id(conn, id)?
     {
-        if cached_kind_agrees(binding, &hit.kind)
-            && (!retargeted
-                || binding_signature_agrees(
-                    binding,
-                    logical_symbol_signature(conn, id)?.as_deref(),
-                )
-                .unwrap_or(true))
-        {
+        let trusted = if retargeted {
+            target_agrees(binding, &hit.kind, logical_symbol_signature(conn, id)?.as_deref())
+        } else {
+            cached_kind_agrees(binding, &hit.kind)
+        };
+        if trusted {
+            answer_retarget_mark(binding);
             return validate_live_logical_symbol(conn, binding, id);
         }
         held_back = Some(id);
@@ -137,7 +136,7 @@ pub(crate) fn validate_logical_symbol_binding(
     // it matters — the stable-id arm above resolves them on its own, since the logical key hashes
     // `scope_path`.
     let relocated = pick_relocation_twin(candidates, binding, retargeted);
-    if let Some((id, path)) = relocated {
+    if let Some(RelocationTwin { id, path, kind, signature, .. }) = relocated {
         // The pick came back to the very handle the kind check held back: nothing that matches the
         // binding better answers to its name, so it is the recorded kind that is out of date, not
         // the handle. Validate it live — relocating would report `relocated` on every pass, since
@@ -145,6 +144,9 @@ pub(crate) fn validate_logical_symbol_binding(
         // of the kind back through `anchors/1`.
         if Some(id) == held_back {
             return validate_live_logical_symbol(conn, binding, id);
+        }
+        if target_agrees(binding, &kind, signature.as_deref()) {
+            answer_retarget_mark(binding);
         }
         binding.logical_symbol_id = Some(id);
         binding.path = Some(path);
@@ -189,26 +191,40 @@ fn cached_kind_agrees(binding: &RepoMemoryBinding, kind: &str) -> bool {
     binding.symbol_kind.as_deref().is_none_or(|bound| bound == kind)
 }
 
-/// The `relocation_reason` a writer stamps on a symbol binding it moved IN PLACE to a target
-/// another store published — the synced-memory drain's refresh. Its cached ids may still name the
-/// target it left: a rebind between two impls of one type keeps the binding's identity and kind, so
-/// only the signature says it moved.
+/// The `relocation_reason` the synced-memory drain stamps on a symbol binding it moved IN PLACE to
+/// a target another store published, when the published kind or signature differs from the row's.
+/// Its cached ids may still name the target it left: a rebind between two impls of one type keeps
+/// the binding's identity and kind, so only the signature says it moved.
 ///
 /// The validator follows a recorded signature against a live handle ONLY on a row so marked. Any
 /// other row can disagree with its handle because this checkout moved it after an edit — the
 /// logical arm's relocation keeps the recorded signature — and following the signature there would
-/// hand an edited symbol's memory to any same-named sibling that later takes the old text. Only the
-/// writer knows it retargeted, so it says so; the validator answers once, in the repo and checkout
-/// it runs scoped to, and clears the mark.
+/// hand an edited symbol's memory to any same-named sibling that later takes the old text.
+///
+/// The mark stands until a validation lands on a target agreeing with the recorded kind and
+/// signature, and until then the validator never overwrites them. The row is shared by every
+/// checkout of the repo, and the one validating first may not hold the author's target: a sibling
+/// worktree that edited it must leave the author's evidence for the checkout that has it. (An
+/// `anchors/1` row update also moves a binding in place, but marks nothing.)
 pub const RETARGETED_REASON: &str = "retargeted";
 
-/// Whether the binding carries [`RETARGETED_REASON`], clearing it: the mark is answered once.
-fn take_retarget_mark(binding: &mut RepoMemoryBinding) -> bool {
-    let marked = binding.relocation_reason.as_deref() == Some(RETARGETED_REASON);
-    if marked {
+/// Whether the binding carries [`RETARGETED_REASON`].
+fn is_retargeted(binding: &RepoMemoryBinding) -> bool {
+    binding.relocation_reason.as_deref() == Some(RETARGETED_REASON)
+}
+
+/// Clear [`RETARGETED_REASON`]: validation found a target agreeing with the author's evidence.
+fn answer_retarget_mark(binding: &mut RepoMemoryBinding) {
+    if is_retargeted(binding) {
         binding.relocation_reason = None;
     }
-    marked
+}
+
+/// Whether a symbol of `kind` and `signature` agrees with everything the binding records of its
+/// target — the evidence a retargeted row must be answered with.
+fn target_agrees(binding: &RepoMemoryBinding, kind: &str, signature: Option<&str>) -> bool {
+    cached_kind_agrees(binding, kind)
+        && binding_signature_agrees(binding, signature).unwrap_or(true)
 }
 
 /// Whether `signature` hashes to the binding's recorded signature hash; `None` when either side has
@@ -269,7 +285,7 @@ fn pick_relocation_twin(
     candidates: Vec<RelocationTwin>,
     binding: &RepoMemoryBinding,
     retargeted: bool,
-) -> Option<(i64, String)> {
+) -> Option<RelocationTwin> {
     candidates
         .into_iter()
         .map(|twin| {
@@ -292,7 +308,7 @@ fn pick_relocation_twin(
             (score, -twin.id, twin)
         })
         .max_by_key(|(score, neg_id, _)| (*score, *neg_id))
-        .map(|(_, _, twin)| (twin.id, twin.path))
+        .map(|(_, _, twin)| twin)
 }
 
 /// Validate a binding against the live symbol row `id` it resolves to, named `qualified_name`.
@@ -324,15 +340,18 @@ pub(crate) fn validate_symbol_binding(
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
     // As on the logical path: a contradicting live row is held back, not trusted.
-    let retargeted = take_retarget_mark(binding);
+    let retargeted = is_retargeted(binding);
     let mut held_back = None;
     if let Some(id) = binding.symbol_id
         && let Some(hit) = crate::symbol::lookup_by_id(conn, id)?
     {
-        if cached_kind_agrees(binding, &hit.kind)
-            && (!retargeted
-                || binding_signature_agrees(binding, hit.signature.as_deref()).unwrap_or(true))
-        {
+        let trusted = if retargeted {
+            target_agrees(binding, &hit.kind, hit.signature.as_deref())
+        } else {
+            cached_kind_agrees(binding, &hit.kind)
+        };
+        if trusted {
+            answer_retarget_mark(binding);
             return validate_live_symbol(conn, binding, id, hit.qualified_name);
         }
         held_back = Some(id);
@@ -367,13 +386,16 @@ pub(crate) fn validate_symbol_binding(
         rows.collect::<rusqlite::Result<_>>()?
     };
     let relocated = pick_relocation_twin(candidates, binding, retargeted);
-    if let Some((id, path)) = relocated {
+    if let Some(RelocationTwin { id, path, kind, signature, .. }) = relocated {
         // Back at the row the kind check held back: nothing better answers to the name, so the
         // recorded kind is what is out of date. Validate it live rather than relocate onto itself
         // and rewrite a portable kind that `anchors/1` would publish.
         if Some(id) == held_back {
             let qualified_name = binding.binding_id.clone();
             return validate_live_symbol(conn, binding, id, qualified_name);
+        }
+        if target_agrees(binding, &kind, signature.as_deref()) {
+            answer_retarget_mark(binding);
         }
         binding.symbol_id = Some(id);
         binding.logical_symbol_id = logical_symbol_id_for_symbol(conn, id)?;
@@ -383,9 +405,13 @@ pub(crate) fn validate_symbol_binding(
             binding.start_line = Some(chunk.start_line);
             binding.end_line = Some(chunk.end_line);
         }
-        let (kind, sig) = symbol_signal(conn, id)?;
-        binding.symbol_kind = kind;
-        binding.signature_hash = sig;
+        // An unanswered retarget keeps the author's kind and signature: they are what the next
+        // checkout to validate — perhaps one holding the author's target — must answer.
+        if !is_retargeted(binding) {
+            let (kind, sig) = symbol_signal(conn, id)?;
+            binding.symbol_kind = kind;
+            binding.signature_hash = sig;
+        }
         return Ok("relocated".to_string());
     }
     // Cross-file move: qualified_name changed with the path. Match by bare name + content hash.
@@ -1358,7 +1384,7 @@ mod call_path_receiver_type_hint_tests {
             &binding,
             false,
         );
-        assert_eq!(picked.map(|(id, _)| id), Some(2));
+        assert_eq!(picked.map(|twin| twin.id), Some(2));
     }
 
     /// Where the handle agrees with the kind it still decides: two impls of different traits for
@@ -1375,7 +1401,7 @@ mod call_path_receiver_type_hint_tests {
             &binding,
             false,
         );
-        assert_eq!(picked.map(|(id, _)| id), Some(2));
+        assert_eq!(picked.map(|twin| twin.id), Some(2));
     }
 
     fn call_path_binding(memory_id: &str, edge_sequence_hash: &str) -> RepoMemoryBinding {

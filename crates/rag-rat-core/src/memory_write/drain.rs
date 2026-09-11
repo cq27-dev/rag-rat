@@ -838,20 +838,37 @@ fn converge_bindings(
 /// Give a held row the author's portable values for its target, and clear the cached resolution the
 /// validator would otherwise trust outright — the raw row ids and the verdict.
 ///
-/// The logical handle is KEPT, and a symbol row is marked
-/// [`rag_rat_query::memory::RETARGETED_REASON`]. The handle is the only stored evidence that tells
-/// two impls of different traits for one type apart when they also share the captured signature,
-/// so clearing it would send the binding to the lowest-id twin; but it can name the target the
-/// author just left, since a rebind between two impls of one type keeps the binding's identity and
-/// kind. The mark has the validator weigh the author's kind and signature above the handle on its
-/// next pass, in the repo and checkout it runs scoped to — which this drain, running for every
-/// repo, is not.
+/// The logical handle is KEPT: it is the only stored evidence that tells two impls of different
+/// traits for one type apart when they also share the captured signature, so clearing it would
+/// send the binding to the lowest-id twin. But it can name the target the author just left — a
+/// rebind between two impls of one type keeps the binding's identity and kind — so a symbol row
+/// whose published kind or signature differs from what it held is marked
+/// [`rag_rat_query::memory::RETARGETED_REASON`], and an earlier mark still unanswered is kept.
+/// The validator, running scoped to a checkout of the memory's repo (which this drain, running for
+/// every repo, is not), then weighs the author's evidence above the handle. A republish that only
+/// moves lines marks nothing: there the recorded signature can be stale from a relocation this
+/// checkout made after an edit, and following it would hand the memory to a same-named sibling.
 pub(crate) fn refresh_binding(
     tx: &Transaction<'_>,
     repo_id: &str,
     memory_id: &str,
     anchor: &rag_rat_oplog::PortableAnchor,
 ) -> anyhow::Result<()> {
+    let held: Option<(Option<String>, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT symbol_kind, signature_hash, relocation_reason FROM repo_memory_bindings
+             WHERE repo_id = ?1 AND memory_id = ?2 AND binding_kind = ?3 AND binding_id = ?4",
+            params![repo_id, memory_id, anchor.binding_kind, anchor.binding_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let retarget = rag_rat_query::memory::RETARGETED_REASON;
+    let retargeted = matches!(anchor.binding_kind.as_str(), "symbol" | "logical_symbol")
+        && held.is_some_and(|(kind, signature, reason)| {
+            reason.as_deref() == Some(retarget)
+                || kind != anchor.symbol_kind
+                || signature != anchor.signature_hash
+        });
     tx.execute(
         "UPDATE repo_memory_bindings
          SET path = ?5, start_line = ?6, end_line = ?7, commit_hash = ?8, tracker = ?9,
@@ -859,7 +876,7 @@ pub(crate) fn refresh_binding(
              moniker_tool = ?14, moniker_tool_version = ?15, created_at_ms = ?16,
              symbol_id = NULL, chunk_id = NULL, edge_id = NULL,
              anchor_status = 'unverified',
-             relocation_reason = CASE WHEN ?3 IN ('symbol', 'logical_symbol') THEN ?17 END,
+             relocation_reason = ?17,
              downgrade_pending_at_ms = NULL
          WHERE repo_id = ?1 AND memory_id = ?2 AND binding_kind = ?3 AND binding_id = ?4",
         params![
@@ -879,7 +896,7 @@ pub(crate) fn refresh_binding(
             anchor.moniker_tool,
             anchor.moniker_tool_version,
             anchor.created_at_ms,
-            rag_rat_query::memory::RETARGETED_REASON,
+            retargeted.then_some(retarget),
         ],
     )?;
     Ok(())

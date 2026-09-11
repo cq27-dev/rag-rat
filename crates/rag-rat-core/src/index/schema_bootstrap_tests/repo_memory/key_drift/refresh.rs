@@ -2041,7 +2041,196 @@ fn an_edited_symbols_memory_is_not_taken_by_a_sibling_with_its_old_signature() {
         assert_eq!(start_line, Some(3), "pass {pass}: the memory stays on A::new");
     }
 
+    // A foreign author republishing the same target — its lines moved, its kind and signature as
+    // this row already records them — is no retarget, and must not have the validator follow the
+    // recorded (old) signature either.
+    let conn = db.storage.connection();
+    let republished = conn
+        .query_row(
+            "SELECT repo_id, binding_kind, binding_id, path, start_line, end_line, created_at_ms,
+                    symbol_kind, signature_hash
+               FROM repo_memory_bindings WHERE memory_id = ?1",
+            params![memory_id],
+            |r| {
+                Ok((r.get::<_, String>(0)?, rag_rat_oplog::PortableAnchor {
+                    binding_kind: r.get(1)?,
+                    binding_id: r.get(2)?,
+                    path: r.get(3)?,
+                    start_line: r.get::<_, Option<i64>>(4)?.map(|line| line + 20),
+                    end_line: r.get::<_, Option<i64>>(5)?.map(|line| line + 20),
+                    commit_hash: None,
+                    tracker: None,
+                    project: None,
+                    item_key: None,
+                    created_at_ms: r.get::<_, i64>(6)? + 1,
+                    symbol_kind: r.get(7)?,
+                    signature_hash: r.get(8)?,
+                    moniker_tool: None,
+                    moniker_tool_version: None,
+                }))
+            },
+        )
+        .unwrap();
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    crate::memory_write::refresh_binding(&tx, &republished.0, &memory_id, &republished.1).unwrap();
+    tx.commit().unwrap();
+    db.memory_validate().unwrap();
+    let start_line: Option<i64> = conn
+        .query_row(
+            "SELECT start_line FROM repo_memory_bindings WHERE memory_id = ?1",
+            params![memory_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(start_line, Some(3), "a same-target republish must leave the memory on A::new");
+
     let _ = fs::remove_dir_all(&root);
+}
+
+/// The retarget mark sits on a row every checkout of the repo shares, and the checkout validating
+/// first may not hold the author's new target: here a linked worktree edited it. That checkout
+/// must leave the mark — and the author's kind and signature — for the base checkout, which then
+/// moves the memory to the target the author named.
+#[test]
+fn a_linked_checkout_without_the_authors_target_leaves_the_retarget_to_the_base() {
+    use rag_rat_base::hash::hex_sha256;
+
+    let base_source = "pub struct W;\npub trait Alpha { fn run(&self); }\npub trait Beta { fn \
+                       run(&self); }\nimpl Alpha for W { fn run(&self) {} }\nimpl Beta for W { fn \
+                       run(&self) {} }\n";
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/lib.rs"), base_source).unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.to_path_buf(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    // (symbol id, signature, start line) of each base impl, in declaration order.
+    let impls: Vec<(i64, String, i64)> = {
+        let conn = db.storage.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.signature, c.start_line
+                   FROM symbols s JOIN chunks c ON c.symbol_id = s.id
+                  WHERE s.name = 'W' AND s.kind = 'impl' ORDER BY s.id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let [alpha, beta] = &impls[..] else {
+        panic!("two impl rows expected: {impls:?}");
+    };
+    let memory_id = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Rebound from Alpha to Beta by its author".to_string(),
+            body: "Bound to the Alpha impl by its raw symbol id.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(alpha.0),
+                ..Default::default()
+            },
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+    db.memory_validate().unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(
+        linked.join("src/lib.rs"),
+        base_source.replace("impl Beta for W {", "impl Beta for W where W: Sized {"),
+    )
+    .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    let beta_signature = hex_sha256(beta.1.trim().as_bytes());
+    // The author's rebind to Beta, as the drain applies it; `created_at_ms` tells republishes
+    // apart.
+    let publish_beta = |db: &IndexDatabase, created_at_ms: i64| {
+        let conn = db.storage.connection();
+        let (repo_id, binding_kind, binding_id): (String, String, String) = conn
+            .query_row(
+                "SELECT repo_id, binding_kind, binding_id FROM repo_memory_bindings
+                  WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        crate::memory_write::refresh_binding(
+            &tx,
+            &repo_id,
+            &memory_id,
+            &rag_rat_oplog::PortableAnchor {
+                binding_kind,
+                binding_id,
+                path: Some("src/lib.rs".to_string()),
+                start_line: Some(beta.2),
+                end_line: Some(beta.2),
+                commit_hash: None,
+                tracker: None,
+                project: None,
+                item_key: None,
+                created_at_ms,
+                symbol_kind: Some("impl".to_string()),
+                signature_hash: Some(beta_signature.clone()),
+                moniker_tool: None,
+                moniker_tool_version: None,
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    };
+    publish_beta(&db, 1);
+    let read = |db: &IndexDatabase| -> (Option<i64>, Option<String>, Option<String>) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT start_line, signature_hash, relocation_reason FROM repo_memory_bindings
+                  WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    };
+
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    db.memory_validate().unwrap();
+    let (_, signature, reason) = read(&db);
+    assert_eq!(signature.as_deref(), Some(beta_signature.as_str()), "the author's signature stays");
+    assert_eq!(
+        reason.as_deref(),
+        Some(rag_rat_query::memory::RETARGETED_REASON),
+        "a checkout without the author's target leaves the retarget unanswered",
+    );
+    // A republish of the same set before any checkout answers keeps the mark.
+    publish_beta(&db, 2);
+
+    db.use_worktree_scope(&main, None).unwrap();
+    db.memory_validate().unwrap();
+    let (start_line, _, reason) = read(&db);
+    assert_eq!(start_line, Some(beta.2), "the base checkout moves the memory to Beta");
+    assert_eq!(reason, None, "and answers the retarget");
+
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&main);
 }
 
 /// Each trait sits on the line AFTER `impl` so both impl symbols capture the same signature text,
