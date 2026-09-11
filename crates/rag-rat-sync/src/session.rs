@@ -216,9 +216,7 @@ where
     let (peer_have_tx, peer_have_rx) = tokio::sync::oneshot::channel::<HashSet<Hash>>();
 
     let sender = async move {
-        codec::write_frame(&mut send, &Frame::Hello { account_id, have })
-            .await
-            .map_err(SessionError::Codec)?;
+        write_frame_before(&mut send, &Frame::Hello { account_id, have }, idle_timeout).await?;
         // If the receiver aborted before delivering the peer hello, there is nothing to stream.
         let Ok(peer_have) = peer_have_rx.await else {
             return Ok((send, 0usize));
@@ -254,11 +252,10 @@ where
             let tail = rest.split_off(rest.len().min(MAX_ENTRIES_PER_PAGE));
             let page = std::mem::replace(&mut rest, tail);
             let more = !rest.is_empty();
-            codec::write_frame(&mut send, &Frame::Entries { entries: page, more })
-                .await
-                .map_err(SessionError::Codec)?;
+            write_frame_before(&mut send, &Frame::Entries { entries: page, more }, idle_timeout)
+                .await?;
         }
-        codec::write_frame(&mut send, &Frame::Done).await.map_err(SessionError::Codec)?;
+        write_frame_before(&mut send, &Frame::Done, idle_timeout).await?;
         // Keep the send half open for the completion acknowledgement. Returning ownership lets the
         // role-ordered phase below send it only after this side has consumed the peer's `Done`.
         Ok::<(W, usize), SessionError>((send, total))
@@ -389,21 +386,48 @@ where
 {
     match role {
         AuthRole::Dialer => {
-            send_ack_and_finish(send).await?;
+            send_ack_and_finish(send, idle_timeout).await?;
             read_ack_before(recv, idle_timeout).await
         },
         AuthRole::Acceptor => {
             read_ack_before(recv, idle_timeout).await?;
-            send_ack_and_finish(send).await
+            send_ack_and_finish(send, idle_timeout).await
         },
     }
 }
 
-async fn send_ack_and_finish<W: AsyncWrite + Unpin>(send: &mut W) -> Result<(), SessionError> {
-    codec::write_frame(send, &Frame::Ack).await.map_err(SessionError::Codec)?;
+async fn send_ack_and_finish<W: AsyncWrite + Unpin>(
+    send: &mut W,
+    idle_timeout: Duration,
+) -> Result<(), SessionError> {
+    write_frame_before(send, &Frame::Ack, idle_timeout).await?;
     // On iroh this maps to QUIC FIN. The acceptor remains alive until the dialer closes, while the
     // dialer does not close until it has read the acceptor's acknowledgement.
-    send.shutdown().await.map_err(|e| SessionError::Codec(CodecError::Io(e)))
+    match tokio::time::timeout(idle_timeout, send.shutdown()).await {
+        Ok(result) => result.map_err(|e| SessionError::Codec(CodecError::Io(e))),
+        Err(_elapsed) => Err(stalled(idle_timeout)),
+    }
+}
+
+/// Write one frame, failing if the peer takes nothing within `idle_timeout`. The write side waits
+/// on the peer as much as the read side does: QUIC flow control blocks a write while the peer's
+/// window is full, so a peer that stops reading would otherwise hold the session — its serving
+/// permit and database connection — for as long as it keeps the connection open.
+async fn write_frame_before<W: AsyncWrite + Unpin>(
+    send: &mut W,
+    frame: &Frame,
+    idle_timeout: Duration,
+) -> Result<(), SessionError> {
+    match tokio::time::timeout(idle_timeout, codec::write_frame(send, frame)).await {
+        Ok(result) => result.map_err(SessionError::Codec),
+        Err(_elapsed) => Err(stalled(idle_timeout)),
+    }
+}
+
+fn stalled(idle_timeout: Duration) -> SessionError {
+    SessionError::Protocol(format!(
+        "peer took no data within {idle_timeout:?} — session aborted as stalled"
+    ))
 }
 
 async fn read_ack_before<R: AsyncRead + Unpin>(
@@ -724,6 +748,40 @@ mod tests {
         assert_eq!(rb.entries_sent, 0);
         assert_eq!(ra.entries_newly_stored, 0);
         assert_eq!(rb.entries_newly_stored, 0);
+    }
+
+    /// A peer that sends `Hello` and `Done`, then stops reading while keeping its connection open,
+    /// must not hold the session: the writes wait on the peer as much as the reads do.
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_cannot_hold_the_session() {
+        let full: Vec<_> = (0u8..64).map(entry).collect();
+        let mut server = MemStore::new([6; 32], &full);
+        let (mut peer_send, recv) = tokio::io::duplex(1 << 16);
+        // A tiny window the peer never drains: the first large write blocks on it.
+        let (send, _peer_recv_never_read) = tokio::io::duplex(64);
+        codec::write_frame(&mut peer_send, &Frame::Hello { account_id: [6; 32], have: vec![] })
+            .await
+            .unwrap();
+        codec::write_frame(&mut peer_send, &Frame::Done).await.unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session_with_idle_timeout(
+                &mut server,
+                send,
+                recv,
+                AuthRole::Acceptor,
+                SessionCapabilities::bidirectional(),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("the session must give up on a peer that stops reading, not wait on it");
+        assert!(
+            matches!(result, Err(SessionError::Protocol(ref message)) if message.contains("stalled")),
+            "{result:?}",
+        );
+        drop(peer_send);
     }
 
     #[tokio::test]
