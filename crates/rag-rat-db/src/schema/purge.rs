@@ -413,6 +413,17 @@ pub fn purge_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
         conn.execute(&format!("DELETE FROM \"{table}\" WHERE repo_id = ?1"), params![repo_id])?;
     }
 
+    // A synced memory is materialized from its content stream's projection, which is store-global
+    // and survives this purge, and the memory drain walks a stream only when its projection moved
+    // past the drain's watermark. Left alone, a repository registered again would never get its
+    // synced memories back until their author published something new. The watermarks only let
+    // the drain skip unchanged streams, so dropping them costs each stream one full pass.
+    // ponytail: clears every stream's watermark, not just this repo's (purge cannot name a repo's
+    // content streams from this crate); scope it if purges ever become frequent.
+    if crate::schema::table_exists(conn, "oplog_meta")? {
+        conn.execute("DELETE FROM oplog_meta WHERE key LIKE 'content:drain-wm:%'", [])?;
+    }
+
     // commit_fts is external-content on git_commits, now desynced by the git-commit delete above.
     // 'rebuild' re-derives it from the remaining commits (all repos) — the desync-safe fixup.
     rebuild_commit_fts(conn)?;
