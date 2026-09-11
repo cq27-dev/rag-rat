@@ -1833,6 +1833,124 @@ fn a_kind_nothing_here_has_validates_the_held_back_row_live() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A rebind between two impls of one type keeps the binding's identity and kind — only the
+/// signature says the target moved — and an in-place writer keeps the first impl's ids. Validation
+/// must follow the recorded signature to the second impl. A signature no impl here has (this
+/// checkout's source differs from the writer's) is no such evidence, and the ids stand.
+#[test]
+fn a_same_kind_rebind_follows_the_signature_but_a_drifted_one_keeps_the_ids() {
+    use rag_rat_base::hash::hex_sha256;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub struct W;\npub trait Alpha { fn run(&self); }\npub trait Beta { fn run(&self); \
+         }\nimpl Alpha for W { fn run(&self) {} }\nimpl Beta for W { fn run(&self) {} }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let impls: Vec<(i64, i64, String)> = {
+        let conn = db.storage.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, (SELECT m.logical_symbol_id FROM logical_symbol_members m
+                                WHERE m.symbol_id = s.id LIMIT 1), s.signature
+                   FROM symbols s WHERE s.name = 'W' AND s.kind = 'impl' ORDER BY s.id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let [(alpha_id, alpha_logical, _), (beta_id, beta_logical, beta_signature)] = &impls[..] else {
+        panic!("two impl rows expected: {impls:?}");
+    };
+    assert_ne!(impls[0].2, impls[1].2, "the fixture's impls must differ by signature");
+
+    for (title, by_logical_handle) in [("raw symbol id", false), ("logical handle", true)] {
+        let bind_to = |symbol_id: i64, logical_id: i64| {
+            if by_logical_handle {
+                rag_rat_query::memory::RepoMemoryBindTarget {
+                    logical_symbol_id: Some(logical_id),
+                    ..Default::default()
+                }
+            } else {
+                rag_rat_query::memory::RepoMemoryBindTarget {
+                    symbol_id: Some(symbol_id),
+                    ..Default::default()
+                }
+            }
+        };
+        let create_with_signature = |bind, what: &str, signature_hash: String| {
+            let memory_id = db
+                .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+                    kind: "Invariant".to_string(),
+                    title: format!("{what} by {title}"),
+                    body: format!("{what}, bound by {title}."),
+                    confidence: "high".to_string(),
+                    created_by: Some("test-agent".to_string()),
+                    source: Some("agent".to_string()),
+                    tags: Vec::new(),
+                    payload_json: None,
+                    bind,
+                })
+                .unwrap()
+                .memory
+                .memory_id;
+            db.storage
+                .connection()
+                .execute(
+                    "UPDATE repo_memory_bindings SET signature_hash = ?2 WHERE memory_id = ?1",
+                    params![memory_id, signature_hash],
+                )
+                .unwrap();
+            memory_id
+        };
+        let rebound = create_with_signature(
+            bind_to(*alpha_id, *alpha_logical),
+            "Rebound from Alpha to Beta in place",
+            hex_sha256(beta_signature.trim().as_bytes()),
+        );
+        let drifted = create_with_signature(
+            bind_to(*beta_id, *beta_logical),
+            "Bound to Beta under a signature this checkout lacks",
+            hex_sha256(b"impl Beta for W where W: Send"),
+        );
+
+        db.memory_validate().unwrap();
+
+        let landed = |memory_id: &str| -> (Option<i64>, Option<i64>, String) {
+            db.storage
+                .connection()
+                .query_row(
+                    "SELECT symbol_id, logical_symbol_id, anchor_status FROM repo_memory_bindings
+                      WHERE memory_id = ?1 AND binding_kind IN ('symbol', 'logical_symbol')",
+                    params![memory_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        let (symbol_id, logical_id, _) = landed(&rebound);
+        assert!(
+            symbol_id == Some(*beta_id) || logical_id == Some(*beta_logical),
+            "bound by {title}: the rebind must land on Beta ({symbol_id:?}/{logical_id:?})",
+        );
+        let (symbol_id, logical_id, status) = landed(&drifted);
+        assert!(
+            symbol_id == Some(*beta_id) || logical_id == Some(*beta_logical),
+            "bound by {title}: a drifted signature must not move the binding \
+             ({symbol_id:?}/{logical_id:?})",
+        );
+        assert_ne!(status, "relocated", "bound by {title}: a drifted signature relocates nothing");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Each trait sits on the line AFTER `impl` so both impl symbols capture the same signature text,
 /// which is what leaves the logical handle as the only discriminator.
 const TWO_TRAIT_IMPLS_FIXTURE: &str = "pub struct Twin;\npub trait Alpha { fn run(&self); }\npub \

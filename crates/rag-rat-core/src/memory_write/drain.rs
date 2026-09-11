@@ -839,9 +839,10 @@ fn converge_bindings(
 /// validator would otherwise trust outright — the raw row ids and the verdict.
 ///
 /// The logical handle is KEPT. It is the only stored evidence that tells two impls of different
-/// traits for one type apart — they share the qualified name, the kind and the captured signature —
-/// so clearing it would send the binding to the lowest-id twin. A handle left over from a previous
-/// target is harmless: the relocation pick discounts one that contradicts the binding's kind.
+/// traits for one type apart when they also share the captured signature, so clearing it would send
+/// the binding to the lowest-id twin. A handle left over from a previous target is harmless: the
+/// validator trusts none whose kind or signature contradicts the binding, and the relocation pick
+/// ranks both above it.
 fn refresh_binding(
     tx: &Transaction<'_>,
     repo_id: &str,
