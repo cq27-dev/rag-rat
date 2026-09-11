@@ -1834,147 +1834,141 @@ fn a_kind_nothing_here_has_validates_the_held_back_row_live() {
 }
 
 /// The drain moves a synced binding to its author's new target IN PLACE, and a rebind between two
-/// impls of one type keeps the binding's identity and kind. The handle the row carried names the
-/// impl the author left, and the validator trusts a live handle whose kind agrees — so the refresh
-/// must re-point it: by the published signature where the two differ, by the published start line
-/// where they agree. A published signature nothing here has (this checkout's source differs from
-/// the author's) names nothing, and the handle stands.
+/// impls of one type keeps the binding's identity and kind — only the signature says it moved. The
+/// row keeps the handle of the impl the author left, so the refresh marks it retargeted and the
+/// validator follows the published signature once. A published signature nothing here has (this
+/// checkout's source differs from the author's) names nothing, and the handle stands.
 #[test]
-fn a_published_rebind_between_same_named_impls_moves_the_kept_handle() {
+fn a_published_rebind_between_same_named_impls_follows_the_signature() {
     use rag_rat_base::hash::hex_sha256;
 
-    let single_line = "pub struct W;\npub trait Alpha { fn run(&self); }\npub trait Beta { fn \
-                       run(&self); }\nimpl Alpha for W { fn run(&self) {} }\nimpl Beta for W { fn \
-                       run(&self) {} }\n";
-    for (fixture, source, self_type) in [
-        ("distinct signatures", single_line, "W"),
-        ("identical signatures", TWO_TRAIT_IMPLS_FIXTURE, "Twin"),
-    ] {
-        let root = unique_temp_root();
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/lib.rs"), source).unwrap();
-        let config = source_config(root.clone(), Language::Rust);
-        let db = IndexDatabase::rebuild(&config).unwrap();
-        // (symbol id, logical id, signature, start line) of each impl, in declaration order.
-        let impls: Vec<(i64, i64, String, i64)> = {
-            let conn = db.storage.connection();
-            let mut stmt = conn
-                .prepare(
-                    "SELECT s.id, (SELECT m.logical_symbol_id FROM logical_symbol_members m
-                                    WHERE m.symbol_id = s.id LIMIT 1),
-                            s.signature, c.start_line
-                       FROM symbols s JOIN chunks c ON c.symbol_id = s.id
-                      WHERE s.name = ?1 AND s.kind = 'impl' ORDER BY s.id",
-                )
-                .unwrap();
-            stmt.query_map([self_type], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
-        };
-        let [alpha, beta] = &impls[..] else {
-            panic!("{fixture}: two impl rows expected: {impls:?}");
-        };
-        assert_eq!(alpha.2 == beta.2, fixture == "identical signatures", "{fixture}: precondition");
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub struct W;\npub trait Alpha { fn run(&self); }\npub trait Beta { fn run(&self); \
+         }\nimpl Alpha for W { fn run(&self) {} }\nimpl Beta for W { fn run(&self) {} }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    // (symbol id, logical id, signature, start line) of each impl, in declaration order.
+    let impls: Vec<(i64, i64, String, i64)> = {
+        let conn = db.storage.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, (SELECT m.logical_symbol_id FROM logical_symbol_members m
+                                WHERE m.symbol_id = s.id LIMIT 1),
+                        s.signature, c.start_line
+                   FROM symbols s JOIN chunks c ON c.symbol_id = s.id
+                  WHERE s.name = 'W' AND s.kind = 'impl' ORDER BY s.id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let [alpha, beta] = &impls[..] else {
+        panic!("two impl rows expected: {impls:?}");
+    };
+    assert_ne!(alpha.2, beta.2, "the fixture's impls must differ by signature");
 
-        for (title, by_logical_handle) in [("raw symbol id", false), ("logical handle", true)] {
-            let bind_to = |(symbol_id, logical_id, _, _): &(i64, i64, String, i64)| {
-                if by_logical_handle {
-                    rag_rat_query::memory::RepoMemoryBindTarget {
-                        logical_symbol_id: Some(*logical_id),
-                        ..Default::default()
-                    }
-                } else {
-                    rag_rat_query::memory::RepoMemoryBindTarget {
-                        symbol_id: Some(*symbol_id),
-                        ..Default::default()
-                    }
+    for (title, by_logical_handle) in [("raw symbol id", false), ("logical handle", true)] {
+        let bind_to = |(symbol_id, logical_id, _, _): &(i64, i64, String, i64)| {
+            if by_logical_handle {
+                rag_rat_query::memory::RepoMemoryBindTarget {
+                    logical_symbol_id: Some(*logical_id),
+                    ..Default::default()
                 }
-            };
-            // Create a memory on `from`, validate it, then refresh it in place to `published`.
-            let retarget = |from, what: &str, published: rag_rat_oplog::PortableAnchor| {
-                let memory_id = db
-                    .memory_create(rag_rat_query::memory::RepoMemoryCreate {
-                        kind: "Invariant".to_string(),
-                        title: format!("{what} ({fixture}, {title})"),
-                        body: format!("{what}, with {fixture}, bound by {title}."),
-                        confidence: "high".to_string(),
-                        created_by: Some("test-agent".to_string()),
-                        source: Some("agent".to_string()),
-                        tags: Vec::new(),
-                        payload_json: None,
-                        bind: bind_to(from),
-                    })
-                    .unwrap()
-                    .memory
-                    .memory_id;
-                db.memory_validate().unwrap();
-                let conn = db.storage.connection();
-                let (repo_id, binding_kind, binding_id): (String, String, String) = conn
-                    .query_row(
-                        "SELECT repo_id, binding_kind, binding_id FROM repo_memory_bindings
-                          WHERE memory_id = ?1",
-                        params![memory_id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                    )
-                    .unwrap();
-                let tx = rusqlite::Transaction::new_unchecked(
-                    conn,
-                    rusqlite::TransactionBehavior::Immediate,
-                )
-                .unwrap();
-                crate::memory_write::refresh_binding(
-                    &tx,
-                    &repo_id,
-                    &memory_id,
-                    &rag_rat_oplog::PortableAnchor { binding_kind, binding_id, ..published },
-                )
-                .unwrap();
-                tx.commit().unwrap();
-                db.memory_validate().unwrap();
-                conn.query_row(
-                    "SELECT start_line FROM repo_memory_bindings WHERE memory_id = ?1",
-                    params![memory_id],
-                    |r| r.get::<_, Option<i64>>(0),
-                )
+            } else {
+                rag_rat_query::memory::RepoMemoryBindTarget {
+                    symbol_id: Some(*symbol_id),
+                    ..Default::default()
+                }
+            }
+        };
+        // Create a memory on `from`, validate it, refresh it in place to `published`, validate
+        // again, and read back where it landed and the reason left on it.
+        let retarget = |from, what: &str, published: rag_rat_oplog::PortableAnchor| {
+            let memory_id = db
+                .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+                    kind: "Invariant".to_string(),
+                    title: format!("{what} ({title})"),
+                    body: format!("{what}, bound by {title}."),
+                    confidence: "high".to_string(),
+                    created_by: Some("test-agent".to_string()),
+                    source: Some("agent".to_string()),
+                    tags: Vec::new(),
+                    payload_json: None,
+                    bind: bind_to(from),
+                })
                 .unwrap()
-            };
-            let published = |signature: &str, start_line: i64| rag_rat_oplog::PortableAnchor {
-                binding_kind: String::new(),
-                binding_id: String::new(),
-                path: Some("src/lib.rs".to_string()),
-                start_line: Some(start_line),
-                end_line: Some(start_line),
-                commit_hash: None,
-                tracker: None,
-                project: None,
-                item_key: None,
-                created_at_ms: 1,
-                symbol_kind: Some("impl".to_string()),
-                signature_hash: Some(hex_sha256(signature.trim().as_bytes())),
-                moniker_tool: None,
-                moniker_tool_version: None,
-            };
+                .memory
+                .memory_id;
+            db.memory_validate().unwrap();
+            let conn = db.storage.connection();
+            let (repo_id, binding_kind, binding_id): (String, String, String) = conn
+                .query_row(
+                    "SELECT repo_id, binding_kind, binding_id FROM repo_memory_bindings
+                      WHERE memory_id = ?1",
+                    params![memory_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .unwrap();
+            crate::memory_write::refresh_binding(
+                &tx,
+                &repo_id,
+                &memory_id,
+                &rag_rat_oplog::PortableAnchor { binding_kind, binding_id, ..published },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            db.memory_validate().unwrap();
+            conn.query_row(
+                "SELECT start_line, relocation_reason FROM repo_memory_bindings
+                  WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+        };
+        let published = |signature: &str, start_line: i64| rag_rat_oplog::PortableAnchor {
+            binding_kind: String::new(),
+            binding_id: String::new(),
+            path: Some("src/lib.rs".to_string()),
+            start_line: Some(start_line),
+            end_line: Some(start_line),
+            commit_hash: None,
+            tracker: None,
+            project: None,
+            item_key: None,
+            created_at_ms: 1,
+            symbol_kind: Some("impl".to_string()),
+            signature_hash: Some(hex_sha256(signature.trim().as_bytes())),
+            moniker_tool: None,
+            moniker_tool_version: None,
+        };
 
-            assert_eq!(
-                retarget(alpha, "Rebound from Alpha to Beta", published(&beta.2, beta.3)),
-                Some(beta.3),
-                "{fixture}, bound by {title}: the rebind must land on Beta",
-            );
-            assert_eq!(
-                retarget(
-                    beta,
-                    "Republished under a signature this checkout lacks",
-                    published("impl Beta for Elsewhere", alpha.3),
-                ),
-                Some(beta.3),
-                "{fixture}, bound by {title}: evidence naming nothing here must not move it",
-            );
-        }
-
-        let _ = fs::remove_dir_all(&root);
+        let (line, reason) =
+            retarget(alpha, "Rebound from Alpha to Beta", published(&beta.2, beta.3));
+        assert_eq!(line, Some(beta.3), "bound by {title}: the rebind must land on Beta");
+        assert_eq!(reason, None, "bound by {title}: validation answers the mark once");
+        let (line, _) = retarget(
+            beta,
+            "Republished under a signature this checkout lacks",
+            published("impl Beta for Elsewhere", alpha.3),
+        );
+        assert_eq!(line, Some(beta.3), "bound by {title}: evidence naming nothing here keeps it");
     }
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// The logical arm relocates a memory whose symbol's signature was edited but keeps the recorded

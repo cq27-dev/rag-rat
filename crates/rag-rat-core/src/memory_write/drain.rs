@@ -838,45 +838,28 @@ fn converge_bindings(
 /// Give a held row the author's portable values for its target, and clear the cached resolution the
 /// validator would otherwise trust outright — the raw row ids and the verdict.
 ///
-/// The logical handle is re-checked rather than cleared or kept blindly
-/// ([`rag_rat_query::memory::retargeted_symbol_handle`]). Kept, it can name the target the author
-/// just left: a rebind between two impls of one type keeps the binding's identity and kind, and the
-/// validator trusts a live handle whose kind agrees. Cleared, it would send twins the shape cannot
-/// tell apart to the lowest-id one. Only this writer knows the row was retargeted, so the check
-/// happens here.
+/// The logical handle is KEPT, and a symbol row is marked
+/// [`rag_rat_query::memory::RETARGETED_REASON`]. The handle is the only stored evidence that tells
+/// two impls of different traits for one type apart when they also share the captured signature,
+/// so clearing it would send the binding to the lowest-id twin; but it can name the target the
+/// author just left, since a rebind between two impls of one type keeps the binding's identity and
+/// kind. The mark has the validator weigh the author's kind and signature above the handle on its
+/// next pass, in the repo and checkout it runs scoped to — which this drain, running for every
+/// repo, is not.
 pub(crate) fn refresh_binding(
     tx: &Transaction<'_>,
     repo_id: &str,
     memory_id: &str,
     anchor: &rag_rat_oplog::PortableAnchor,
 ) -> anyhow::Result<()> {
-    let kept: Option<i64> = tx
-        .query_row(
-            "SELECT logical_symbol_id FROM repo_memory_bindings
-             WHERE repo_id = ?1 AND memory_id = ?2 AND binding_kind = ?3 AND binding_id = ?4",
-            params![repo_id, memory_id, anchor.binding_kind, anchor.binding_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    let handle = rag_rat_query::memory::retargeted_symbol_handle(
-        tx,
-        &rag_rat_query::memory::PublishedSymbolTarget {
-            binding_kind: &anchor.binding_kind,
-            binding_id: &anchor.binding_id,
-            symbol_kind: anchor.symbol_kind.as_deref(),
-            signature_hash: anchor.signature_hash.as_deref(),
-            start_line: anchor.start_line,
-        },
-        kept,
-    )?;
     tx.execute(
         "UPDATE repo_memory_bindings
          SET path = ?5, start_line = ?6, end_line = ?7, commit_hash = ?8, tracker = ?9,
              project = ?10, item_key = ?11, symbol_kind = ?12, signature_hash = ?13,
              moniker_tool = ?14, moniker_tool_version = ?15, created_at_ms = ?16,
-             logical_symbol_id = ?17, symbol_id = NULL, chunk_id = NULL, edge_id = NULL,
-             anchor_status = 'unverified', relocation_reason = NULL,
+             symbol_id = NULL, chunk_id = NULL, edge_id = NULL,
+             anchor_status = 'unverified',
+             relocation_reason = CASE WHEN ?3 IN ('symbol', 'logical_symbol') THEN ?17 END,
              downgrade_pending_at_ms = NULL
          WHERE repo_id = ?1 AND memory_id = ?2 AND binding_kind = ?3 AND binding_id = ?4",
         params![
@@ -896,7 +879,7 @@ pub(crate) fn refresh_binding(
             anchor.moniker_tool,
             anchor.moniker_tool_version,
             anchor.created_at_ms,
-            handle,
+            rag_rat_query::memory::RETARGETED_REASON,
         ],
     )?;
     Ok(())

@@ -72,24 +72,71 @@ pub(crate) fn validate_logical_symbol_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
-    // A live handle whose kind contradicts the binding is held back rather than trusted (see
-    // `cached_kind_agrees`), and only rejected if the relocation pick finds something better.
+    // A live handle whose kind contradicts the binding — or, on a retargeted row, whose signature
+    // does — is held back rather than trusted (see `cached_kind_agrees`, `RETARGETED_REASON`), and
+    // only rejected if the relocation pick finds something better.
+    let retargeted = take_retarget_mark(binding);
     let mut held_back = None;
     if let Some(id) = binding.logical_symbol_id
         && let Some(hit) = crate::symbol::lookup_logical_by_id(conn, id)?
     {
-        if cached_kind_agrees(binding, &hit.kind) {
+        if cached_kind_agrees(binding, &hit.kind)
+            && (!retargeted
+                || binding_signature_agrees(
+                    binding,
+                    logical_symbol_signature(conn, id)?.as_deref(),
+                )
+                .unwrap_or(true))
+        {
             return validate_live_logical_symbol(conn, binding, id);
         }
         held_back = Some(id);
     }
-    let candidates = logical_symbol_twins(conn, &binding.binding_id)?;
+    // Scope the qualified-name relocation to the ACTIVE repo. `logical_symbols` is direct-scoped by
+    // `repo_id` (V040) and its ids are repo-distinct, so a consolidated DB can hold the SAME
+    // qualified name under a sibling repo. Without the predicate, validating repo A's memory (whose
+    // remembered symbol was deleted/renamed) could rebind it to repo B's logical id/path and report
+    // `relocated` instead of `gone`/`stale`. The `files`-view queries elsewhere in this module are
+    // repo-scoped for free through the scope view; `logical_symbols` is a direct table, so it needs
+    // the explicit filter.
+    let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    // #491: one qualified name can hold several live twins (a struct and its impl block;
+    // overloads with distinct signatures), so a bare `LIMIT 1` is a plan-order coin flip that
+    // can land a struct-bound memory on the impl row. The binding stores the V014 relocation
+    // discriminators (`symbol_kind`, `signature_hash`) — fetch every twin (with a member
+    // signature: all members of a group share it, since the signature is part of the logical
+    // key) and prefer the one that agrees, tiebreaking deterministically by id.
+    let candidates: Vec<RelocationTwin> = {
+        let mut stmt = conn.prepare(
+            "
+            SELECT ls.id, ls.path, ls.kind,
+                   (SELECT s.signature FROM logical_symbol_members m
+                      JOIN symbols s ON s.id = m.symbol_id
+                     WHERE m.logical_symbol_id = ls.id LIMIT 1),
+                   ls.id
+            FROM logical_symbols ls
+            WHERE ls.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
+              AND ls.repo_id = ?2
+            ORDER BY ls.id
+            ",
+        )?;
+        let rows = stmt.query_map(params![&binding.binding_id, active_repo_id], |row| {
+            Ok(RelocationTwin {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                kind: row.get(2)?,
+                signature: row.get(3)?,
+                logical_symbol_id: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
     // The group axis is nearly inert here: this arm is reached when the binding's handle is absent,
     // names a row that no longer exists, or names a live row whose kind contradicts the binding —
     // a handle the pick credits only where the kind agrees. Impl twins are still separated where
     // it matters — the stable-id arm above resolves them on its own, since the logical key hashes
     // `scope_path`.
-    let relocated = pick_relocation_twin(candidates, binding);
+    let relocated = pick_relocation_twin(candidates, binding, retargeted);
     if let Some((id, path)) = relocated {
         // The pick came back to the very handle the kind check held back: nothing that matches the
         // binding better answers to its name, so it is the recorded kind that is out of date, not
@@ -142,153 +189,46 @@ fn cached_kind_agrees(binding: &RepoMemoryBinding, kind: &str) -> bool {
     binding.symbol_kind.as_deref().is_none_or(|bound| bound == kind)
 }
 
-/// The live logical symbols answering to `qualified_name` in the active repo — the logical arm's
-/// relocation candidates.
-fn logical_symbol_twins(
-    conn: &Connection,
-    qualified_name: &str,
-) -> anyhow::Result<Vec<RelocationTwin>> {
-    // Scope the qualified-name relocation to the ACTIVE repo. `logical_symbols` is direct-scoped by
-    // `repo_id` (V040) and its ids are repo-distinct, so a consolidated DB can hold the SAME
-    // qualified name under a sibling repo. Without the predicate, validating repo A's memory (whose
-    // remembered symbol was deleted/renamed) could rebind it to repo B's logical id/path and report
-    // `relocated` instead of `gone`/`stale`. The `files`-view queries elsewhere in this module are
-    // repo-scoped for free through the scope view; `logical_symbols` is a direct table, so it needs
-    // the explicit filter.
-    let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-    // #491: one qualified name can hold several live twins (a struct and its impl block;
-    // overloads with distinct signatures), so a bare `LIMIT 1` is a plan-order coin flip that
-    // can land a struct-bound memory on the impl row. The binding stores the V014 relocation
-    // discriminators (`symbol_kind`, `signature_hash`) — fetch every twin (with a member
-    // signature: all members of a group share it, since the signature is part of the logical
-    // key) and prefer the one that agrees, tiebreaking deterministically by id.
-    let mut stmt = conn.prepare(
-        "
-        SELECT ls.id, ls.path, ls.kind,
-               (SELECT s.signature FROM logical_symbol_members m
-                  JOIN symbols s ON s.id = m.symbol_id
-                 WHERE m.logical_symbol_id = ls.id LIMIT 1),
-               ls.id
-        FROM logical_symbols ls
-        WHERE ls.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
-          AND ls.repo_id = ?2
-        ORDER BY ls.id
-        ",
-    )?;
-    let rows = stmt.query_map(params![qualified_name, active_repo_id], |row| {
-        Ok(RelocationTwin {
-            id: row.get(0)?,
-            path: row.get(1)?,
-            kind: row.get(2)?,
-            signature: row.get(3)?,
-            logical_symbol_id: row.get(4)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
-}
-
-/// The live symbol rows answering to `qualified_name` — the raw-id arm's relocation candidates.
-fn symbol_twins(conn: &Connection, qualified_name: &str) -> anyhow::Result<Vec<RelocationTwin>> {
-    // One qualified name can hold several live rows: `{path}::{name}` is shared by a `struct
-    // Worker` and its `impl Worker` block, since an impl symbol is named for its self type. A
-    // `LIMIT 1` here is a plan-order coin flip between them, so the binding's own discriminators
-    // pick — the same rule, and the same helper, the logical-symbol path uses. Each candidate
-    // carries its logical group, keyed on its own row id so the correlated read adds no scope
-    // surface, because the group is what separates two impls of different traits for one type.
-    let mut stmt = conn.prepare(
-        "
-        SELECT symbols.id, files.path, symbols.kind, symbols.signature,
-               (SELECT m.logical_symbol_id FROM logical_symbol_members m
-                 WHERE m.symbol_id = symbols.id LIMIT 1)
-        FROM symbols
-        JOIN files ON files.id = symbols.file_id
-        WHERE symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
-        ORDER BY symbols.id
-        ",
-    )?;
-    let rows = stmt.query_map([qualified_name], |row| {
-        Ok(RelocationTwin {
-            id: row.get(0)?,
-            path: row.get(1)?,
-            kind: row.get(2)?,
-            signature: row.get(3)?,
-            logical_symbol_id: row.get(4)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
-}
-
-/// The target another store published for a symbol binding that a writer moves IN PLACE — the
-/// evidence [`retargeted_symbol_handle`] resolves against this checkout.
-pub struct PublishedSymbolTarget<'a> {
-    pub binding_kind: &'a str,
-    pub binding_id: &'a str,
-    pub symbol_kind: Option<&'a str>,
-    pub signature_hash: Option<&'a str>,
-    pub start_line: Option<i64>,
-}
-
-/// The logical handle a symbol binding keeps when a writer moves it in place to a target another
-/// store published (the synced-memory drain's refresh): `kept` while it names a live target that
-/// agrees with the published kind and signature, the candidate the published evidence names when
-/// it names another, and `None` otherwise — the relocation pick then chooses, as for a freshly
-/// seeded row.
+/// The `relocation_reason` a writer stamps on a symbol binding it moved IN PLACE to a target
+/// another store published — the synced-memory drain's refresh. Its cached ids may still name the
+/// target it left: a rebind between two impls of one type keeps the binding's identity and kind, so
+/// only the signature says it moved.
 ///
-/// Settled here, at the write, not by the validator on every pass. A recorded signature that
-/// disagrees with a live handle is as often one this checkout moved after an edit — the logical
-/// arm's relocation keeps the recorded signature — as one a writer retargeted, and only the writer
-/// knows which: a validator that followed the signature would hand an edited symbol's memory to
-/// any sibling that later takes the old signature text. The published start line separates twins
-/// the shape cannot, such as two impls of one type whose captured signatures agree — reliably where
-/// this checkout's lines match the author's, a guess where they do not. When nothing
-/// here agrees with the published kind and signature, this checkout's source differs from the
-/// author's and the evidence names nothing here, so `kept` stands.
-pub fn retargeted_symbol_handle(
-    conn: &Connection,
-    target: &PublishedSymbolTarget<'_>,
-    kept: Option<i64>,
-) -> anyhow::Result<Option<i64>> {
-    let logical = match target.binding_kind {
-        "logical_symbol" => true,
-        "symbol" => false,
-        _ => return Ok(kept),
-    };
-    let twins = if logical {
-        logical_symbol_twins(conn, target.binding_id)?
-    } else {
-        symbol_twins(conn, target.binding_id)?
-    };
-    let agreeing: Vec<RelocationTwin> = twins
-        .into_iter()
-        .filter(|twin| {
-            target.symbol_kind.is_none_or(|kind| kind == twin.kind)
-                && match (target.signature_hash, twin.signature.as_deref()) {
-                    (Some(bound), Some(sig)) => bound == hex_sha256(sig.trim().as_bytes()),
-                    _ => true,
-                }
-        })
-        .collect();
-    if agreeing.is_empty() {
-        return Ok(kept);
+/// The validator follows a recorded signature against a live handle ONLY on a row so marked. Any
+/// other row can disagree with its handle because this checkout moved it after an edit — the
+/// logical arm's relocation keeps the recorded signature — and following the signature there would
+/// hand an edited symbol's memory to any same-named sibling that later takes the old text. Only the
+/// writer knows it retargeted, so it says so; the validator answers once, in the repo and checkout
+/// it runs scoped to, and clears the mark.
+pub const RETARGETED_REASON: &str = "retargeted";
+
+/// Whether the binding carries [`RETARGETED_REASON`], clearing it: the mark is answered once.
+fn take_retarget_mark(binding: &mut RepoMemoryBinding) -> bool {
+    let marked = binding.relocation_reason.as_deref() == Some(RETARGETED_REASON);
+    if marked {
+        binding.relocation_reason = None;
     }
-    if let Some(line) = target.start_line {
-        let mut at_line = std::collections::BTreeSet::new();
-        for twin in &agreeing {
-            let span = if logical {
-                chunk_for_logical_symbol(conn, twin.id)?.map(|c| (c.start_line, c.end_line))
-            } else {
-                chunk_for_symbol(conn, twin.id, target.binding_id)?
-                    .map(|c| (c.start_line, c.end_line))
-            };
-            if span.is_some_and(|(start, end)| (start..=end).contains(&line)) {
-                at_line.extend(twin.logical_symbol_id);
-            }
-        }
-        if let [only] = at_line.into_iter().collect::<Vec<_>>()[..] {
-            return Ok(Some(only));
-        }
-    }
-    Ok(kept.filter(|handle| agreeing.iter().any(|twin| twin.logical_symbol_id == Some(*handle))))
+    marked
+}
+
+/// Whether `signature` hashes to the binding's recorded signature hash; `None` when either side has
+/// none to compare.
+fn binding_signature_agrees(binding: &RepoMemoryBinding, signature: Option<&str>) -> Option<bool> {
+    Some(binding.signature_hash.as_deref()? == hex_sha256(signature?.trim().as_bytes()))
+}
+
+/// The signature a logical symbol's members share (it is part of the logical key).
+fn logical_symbol_signature(conn: &Connection, id: i64) -> anyhow::Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT s.signature FROM logical_symbol_members m
+               JOIN symbols s ON s.id = m.symbol_id
+              WHERE m.logical_symbol_id = ?1 LIMIT 1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 /// A live logical-symbol row sharing the dead binding's qualified name — a relocation candidate.
@@ -321,9 +261,14 @@ struct RelocationTwin {
 /// — can leave the previous target's handle behind: a rebind from a struct to its impl keeps the
 /// struct's handle beside the impl's kind, and crediting it would put the binding back on the
 /// struct.
+///
+/// On a row its writer marked [`RETARGETED_REASON`] the recorded kind and signature outrank the
+/// handle instead: the writer set them, while the handle can be the one it left. The handle still
+/// decides where they tie — including a signature no candidate has, which names nothing here.
 fn pick_relocation_twin(
     candidates: Vec<RelocationTwin>,
     binding: &RepoMemoryBinding,
+    retargeted: bool,
 ) -> Option<(i64, String)> {
     candidates
         .into_iter()
@@ -333,15 +278,17 @@ fn pick_relocation_twin(
                 (binding.logical_symbol_id, twin.logical_symbol_id),
                 (Some(bound), Some(group)) if bound == group
             ) && (binding.symbol_kind.is_none() || kind_agrees);
-            let signature_agrees = match (binding.signature_hash.as_deref(), &twin.signature) {
-                (Some(bound), Some(sig)) => bound == hex_sha256(sig.trim().as_bytes()),
-                _ => false,
-            };
+            let signature_agrees =
+                binding_signature_agrees(binding, twin.signature.as_deref()).unwrap_or(false);
             // Candidates arrive id-ascending; max_by_key keeps the LAST maximum, so compare on
             // (score, negated id) to keep the lowest-id winner among evidence ties.
-            let score = (u8::from(group_agrees) << 2)
-                | (u8::from(kind_agrees) << 1)
-                | u8::from(signature_agrees);
+            let [kind, signature, group] =
+                [kind_agrees, signature_agrees, group_agrees].map(u8::from);
+            let score = if retargeted {
+                (kind << 2) | (signature << 1) | group
+            } else {
+                (group << 2) | (kind << 1) | signature
+            };
             (score, -twin.id, twin)
         })
         .max_by_key(|(score, neg_id, _)| (*score, *neg_id))
@@ -376,19 +323,50 @@ pub(crate) fn validate_symbol_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
-    // A live row whose kind contradicts the binding is held back rather than trusted (see
-    // `cached_kind_agrees`), and only rejected if the relocation pick finds something better.
+    // As on the logical path: a contradicting live row is held back, not trusted.
+    let retargeted = take_retarget_mark(binding);
     let mut held_back = None;
     if let Some(id) = binding.symbol_id
         && let Some(hit) = crate::symbol::lookup_by_id(conn, id)?
     {
-        if cached_kind_agrees(binding, &hit.kind) {
+        if cached_kind_agrees(binding, &hit.kind)
+            && (!retargeted
+                || binding_signature_agrees(binding, hit.signature.as_deref()).unwrap_or(true))
+        {
             return validate_live_symbol(conn, binding, id, hit.qualified_name);
         }
         held_back = Some(id);
     }
-    let candidates = symbol_twins(conn, &binding.binding_id)?;
-    let relocated = pick_relocation_twin(candidates, binding);
+    // One qualified name can hold several live rows: `{path}::{name}` is shared by a `struct
+    // Worker` and its `impl Worker` block, since an impl symbol is named for its self type. A
+    // `LIMIT 1` here is a plan-order coin flip between them, so the binding's own discriminators
+    // pick — the same rule, and the same helper, the logical-symbol path uses. Each candidate
+    // carries its logical group, keyed on its own row id so the correlated read adds no scope
+    // surface, because the group is what separates two impls of different traits for one type.
+    let candidates: Vec<RelocationTwin> = {
+        let mut stmt = conn.prepare(
+            "
+            SELECT symbols.id, files.path, symbols.kind, symbols.signature,
+                   (SELECT m.logical_symbol_id FROM logical_symbol_members m
+                     WHERE m.symbol_id = symbols.id LIMIT 1)
+            FROM symbols
+            JOIN files ON files.id = symbols.file_id
+            WHERE symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
+            ORDER BY symbols.id
+            ",
+        )?;
+        let rows = stmt.query_map([&binding.binding_id], |row| {
+            Ok(RelocationTwin {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                kind: row.get(2)?,
+                signature: row.get(3)?,
+                logical_symbol_id: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let relocated = pick_relocation_twin(candidates, binding, retargeted);
     if let Some((id, path)) = relocated {
         // Back at the row the kind check held back: nothing better answers to the name, so the
         // recorded kind is what is out of date. Validate it live rather than relocate onto itself
@@ -1378,6 +1356,7 @@ mod call_path_receiver_type_hint_tests {
         let picked = pick_relocation_twin(
             vec![relocation_twin(1, "struct", 7), relocation_twin(2, "impl", 8)],
             &binding,
+            false,
         );
         assert_eq!(picked.map(|(id, _)| id), Some(2));
     }
@@ -1394,6 +1373,7 @@ mod call_path_receiver_type_hint_tests {
         let picked = pick_relocation_twin(
             vec![relocation_twin(1, "impl", 7), relocation_twin(2, "impl", 8)],
             &binding,
+            false,
         );
         assert_eq!(picked.map(|(id, _)| id), Some(2));
     }
