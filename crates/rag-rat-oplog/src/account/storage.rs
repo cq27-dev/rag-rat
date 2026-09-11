@@ -1003,6 +1003,23 @@ pub fn owner_ever_granted(
     )?)
 }
 
+/// Every account `owner_account_id` has ever granted a stream, open or closed, any role — the logs
+/// an owner relays (#1280). See [`owner_ever_granted`] for why a closed grant still counts.
+pub fn ever_granted_accounts(
+    conn: &Connection,
+    owner_account_id: AccountId,
+) -> anyhow::Result<Vec<AccountId>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT grantee_account_id FROM account_stream_grants
+         WHERE owner_account_id = ?1 AND grantee_account_id != ?1
+         ORDER BY grantee_account_id",
+    )?;
+    let rows = stmt
+        .query_map(params![owner_account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.iter().map(|bytes| Ok(AccountId::from_bytes(fixed(bytes)?))).collect()
+}
+
 /// Whether `grantee_account_id` holds an effective (not-closed) Writer grant on a stream that
 /// resolves **`PublicRead`**. Unlike [`effective_writer_grant`], which answers "may this account
 /// write to THIS stream", this answers "is this account a public contributor at all" — the question
@@ -4870,6 +4887,9 @@ mod tests {
             owner_ever_granted(&conn, account_id, writer).unwrap(),
             "a revoked grantee's pre-cut history must stay verifiable, so it is still relayed",
         );
+        let mut relayed = vec![writer, reader];
+        relayed.sort_by_key(|account| account.to_bytes());
+        assert_eq!(ever_granted_accounts(&conn, account_id).unwrap(), relayed);
     }
 
     #[test]

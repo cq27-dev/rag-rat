@@ -2708,18 +2708,20 @@ pub fn content_signed_entry_exists(
 }
 
 /// Every `/3` content entry authored under `account_id` that a peer may need — the held candidates
-/// AND the ones durably PARKED in `content_pre_verify` awaiting their roster key.
+/// AND the ones durably PARKED in `content_pre_verify` awaiting their roster key — plus the
+/// contributions this account relays ([`relayed_content_entries`], #1280).
 ///
-/// Scoped to the account's OWN content (`author_account_id = account_id`): this restores a device's
-/// own memories onto a fresh sibling. Content authored by OTHER accounts (shared streams) is a
-/// later slice (#407); offering it through an account-scoped session would let a peer flood the
-/// pre-verify table with foreign candidates the session never authorized.
+/// The account's OWN content restores a device's own memories onto a fresh sibling. Content
+/// authored by OTHER accounts is offered only on a stream this account owns and granted to that
+/// author, so a peer that syncs only the owner receives its contributors' memories while a stranger
+/// can never use the owner's session to reach a peer.
 ///
 /// Held candidates come first, ordered `(stream_id, seq, entry_hash)` — a causal-leaning per-stream
 /// order so a cooperative receiver folds predecessors before successors and avoids
-/// park-then-promote churn. Parked rows follow, since they depend on roster material in the held
-/// set. It is NOT a topological guarantee against an adversarial sender (that is a reconciliation
-/// concern at the caller, #878); it makes the honest restore converge in one session.
+/// park-then-promote churn. Relayed contributions follow, then parked rows, since they depend on
+/// roster material in the held set. It is NOT a topological guarantee against an adversarial sender
+/// (that is a reconciliation concern at the caller, #878); it makes the honest restore converge in
+/// one session.
 pub fn content_entries_for_sync(
     conn: &Connection,
     account_id: AccountId,
@@ -2752,6 +2754,7 @@ pub fn content_entries_for_sync(
             signed_bytes,
         });
     }
+    out.extend(relayed_content_entries(conn, account_id)?);
 
     // Parked rows carry raw signed bytes; decode the header for the stream/seq the wire records
     // (informational — the session diffs on the signed hash). A parked row that no longer decodes
@@ -2786,9 +2789,9 @@ pub fn content_entries_for_sync(
 /// The public-serve variant of [`content_entries_for_sync`] (#407): AUTHENTICATED `content_entries`
 /// rows only — the parked `content_pre_verify` candidates are EXCLUDED, because those are
 /// unauthenticated bytes from arbitrary peers and a public server must not relay forged candidates
-/// to anonymous readers. Still author-scoped (`author_account_id = account_id`): serving
-/// guest/foreign authors' content is a separate concern (an anonymous reader has no way to fetch a
-/// guest's account log to verify it).
+/// to anonymous readers. Relayed contributions (#1280) are served only from an author that is
+/// itself fully public: the account session relays a grantee's log to anonymous readers under the
+/// same rule, and a contribution whose author's log is withheld could never verify.
 ///
 /// EVERY row is filtered by ITS OWN stream's access mode, not by a caller-level "this account is
 /// public" gate. That gate is `account_is_fully_public`, which inspects only streams the account
@@ -2847,7 +2850,83 @@ pub fn content_entries_for_public_sync(
             signed_bytes,
         });
     }
+    let mut public_authors: std::collections::HashMap<AccountId, bool> =
+        std::collections::HashMap::new();
+    for entry in relayed_content_entries(conn, account_id)? {
+        let author = entry.author_account_id;
+        let author_is_public = match public_authors.get(&author) {
+            Some(known) => *known,
+            None => {
+                let verdict = crate::account::storage::account_is_fully_public(conn, author)?;
+                public_authors.insert(author, verdict);
+                verdict
+            },
+        };
+        if author_is_public && stream_is_public(conn, entry.stream_id)? {
+            out.push(entry);
+        }
+    }
     Ok(out)
+}
+
+/// The held content that accounts `owner_account_id` granted a stream authored on that stream —
+/// the contributions an owner relays (#1280), ordered `(stream_id, seq, entry_hash)`.
+///
+/// Held, NOT only accepted. A receiver never takes the sender's verdict: it refolds from the same
+/// authority facts, and condemns what the owner condemned. Two things break if acceptance filters
+/// the relay. First, a condemned entry can be the target a device cut names, and without it a fresh
+/// receiver cannot verify the accepted entries before it. Second, this function also supplies the
+/// receiver's inventory: it holds a relayed row unaccepted until its refold after the session, so
+/// an acceptance filter would leave the row out of what it advertises and the sender would resend
+/// it every round.
+///
+/// But only rows a device of the author's roster signed, then or now. `author_account_id` is
+/// attacker-settable: a self-signed `DeviceAdd` candidate lets anyone store content claiming a
+/// granted author's name, and the fold never makes that device a roster member. Relaying such rows
+/// would let a stranger reach the owner's peers through the owner.
+fn relayed_content_entries(
+    conn: &Connection,
+    owner_account_id: AccountId,
+) -> anyhow::Result<Vec<SyncContentEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.entry_hash, e.stream_id, e.author_account_id, e.seq, e.signed_bytes
+         FROM content_entries e
+         JOIN account_stream_ownership o ON o.stream_id = e.stream_id AND o.account_id = ?1
+         WHERE e.author_account_id != ?1
+           AND EXISTS (
+               SELECT 1 FROM account_stream_grants g
+               WHERE g.owner_account_id = ?1 AND g.stream_id = e.stream_id
+                 AND g.grantee_account_id = e.author_account_id
+           )
+           AND EXISTS (
+               SELECT 1 FROM account_roster_history r
+               WHERE r.account_id = e.author_account_id
+                 AND r.device_fingerprint = e.device_fingerprint
+           )
+         ORDER BY e.stream_id, e.seq, e.entry_hash",
+    )?;
+    let rows = stmt
+        .query_map(params![owner_account_id.to_bytes().as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(hash, stream, author, seq, signed_bytes)| {
+            Ok(SyncContentEntry {
+                stream_id: StreamId::from_bytes(fixed::<32>(&stream)?),
+                author_account_id: AccountId::from_bytes(fixed::<32>(&author)?),
+                seq: u64::from_be_bytes(fixed::<8>(&seq)?),
+                entry_hash: fixed::<32>(&hash)?,
+                signed_bytes,
+            })
+        })
+        .collect()
 }
 
 fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
@@ -3296,6 +3375,62 @@ mod tests {
             "rows on a stream that does not resolve PublicRead are withheld, whatever the account",
         );
         assert_eq!(all.len(), 2, "both rows are still served on the whole-account (Full) path");
+    }
+
+    /// An owner relays held content on its streams only from an author it granted that stream, and
+    /// only when a device of that author's roster signed it — accepted or not, so a condemned entry
+    /// a cut names still travels, while a candidate forged under a granted author's name, or
+    /// written by an account never granted, does not (#1280).
+    #[test]
+    fn relayed_content_is_the_granted_authors_rows_signed_by_their_roster() {
+        let conn = db();
+        let owner = AccountId::from_bytes([0x11; 32]);
+        let granted = AccountId::from_bytes([0x22; 32]);
+        let stranger = AccountId::from_bytes([0x33; 32]);
+        let (member, forger, outsider) = ([0x71; 32], [0x72; 32], [0x73; 32]);
+        seed_ownership(&conn, owner);
+        seed_grant(&conn, [0x55; 32], owner, granted, "writer");
+        for (account, device) in [(granted, member), (stranger, outsider)] {
+            conn.execute(
+                "INSERT INTO account_roster_history(
+                     roster_ref, account_id, device_fingerprint, role, effective_at, closed_at)
+                 VALUES(?1, ?2, ?3, 'owner', 1, NULL)",
+                params![device.as_slice(), account.to_bytes().as_slice(), device.as_slice()],
+            )
+            .unwrap();
+        }
+        let row = |hash: u8, author: AccountId, device: [u8; 32], seq: u64, accepted: bool| {
+            conn.execute(
+                "INSERT INTO content_entries(
+                     entry_hash, stream_id, author_account_id, device_fingerprint, seq,
+                     prev_hash, grant_id, roster_ref, owner_auth_len, author_auth_len,
+                     accepted, signed_bytes, received_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?7, ?8, x'00', 0)",
+                params![
+                    [hash; 32].as_slice(),
+                    STREAM.as_slice(),
+                    author.to_bytes().as_slice(),
+                    device.as_slice(),
+                    seq.to_be_bytes().as_slice(),
+                    [3_u8; 32].as_slice(),
+                    [0_u8; 8].as_slice(),
+                    accepted,
+                ],
+            )
+            .unwrap();
+        };
+        row(1, granted, member, 0, true);
+        row(2, granted, member, 1, false); // condemned by a cut, still evidence
+        row(3, granted, forger, 0, false); // claims the granted author, signed outside its roster
+        row(4, stranger, outsider, 0, false); // never granted this stream
+        row(5, owner, member, 0, true); // the owner's own rows are served on their own
+
+        let relayed: Vec<EntryHash> = relayed_content_entries(&conn, owner)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.entry_hash)
+            .collect();
+        assert_eq!(relayed, vec![[1; 32], [2; 32]]);
     }
 
     /// `content_signed_entry_exists` is signed-envelope precise, not entry_hash precise, and

@@ -17,8 +17,10 @@ use minicbor::{Decoder, Encoder};
 /// The ALPN for the ACCOUNT-LOG stream. Versioned: a breaking wire change bumps the suffix so an
 /// old peer declines the handshake instead of misreading frames. Bumped to `/4` for the
 /// post-binding capability grant: a `/3` sender considers only its own role and can upload when the
-/// receiver has granted it read-only access.
-pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/4";
+/// receiver has granted it read-only access. Bumped to `/5` when an owner's session began relaying
+/// its grantees' logs (#1280): a `/4` receiver drops every entry authored under another account, so
+/// against a relaying sender it would never reach a quiet round.
+pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/5";
 
 /// The ALPN for the `/3` CONTENT stream — the memories themselves (#907). Same frame protocol and
 /// same account-level auth phase as [`SYNC_ALPN`]; only the STORE differs (`OplogContentSyncStore`
@@ -26,8 +28,11 @@ pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/4";
 /// acceptor picks the store from `conn.alpn()` and the account-log wire stays byte-identical. A
 /// peer that does not speak this ALPN simply never exchanges content — account-log sync is
 /// unaffected.
-/// Bumped to `/3` alongside [`SYNC_ALPN`] because content uses the same auth state machine.
-pub const CONTENT_SYNC_ALPN: &[u8] = b"rag-rat/content/3";
+/// Bumped to `/3` alongside [`SYNC_ALPN`] because content uses the same auth state machine, and to
+/// `/4` when an owner's session began relaying its contributors' accepted content (#1280): a `/3`
+/// receiver keys its already-held check on the session's account, so a relayed entry would read as
+/// new on every offer and the session would never go quiet.
+pub const CONTENT_SYNC_ALPN: &[u8] = b"rag-rat/content/4";
 
 /// Domain tag committed into every frame's leading array element, so a frame from another protocol
 /// (or a truncated one) cannot be mistaken for a valid frame.
@@ -282,8 +287,8 @@ mod tests {
     /// acceptor can route each protocol by ALPN.
     #[test]
     fn alpn_identifiers_are_frozen() {
-        assert_eq!(SYNC_ALPN, b"rag-rat/sync/4");
-        assert_eq!(CONTENT_SYNC_ALPN, b"rag-rat/content/3");
+        assert_eq!(SYNC_ALPN, b"rag-rat/sync/5");
+        assert_eq!(CONTENT_SYNC_ALPN, b"rag-rat/content/4");
         assert_eq!(crate::table_wire::TABLE_SYNC_ALPN, b"rag-rat/table-sync/3");
         assert_eq!(crate::enrollment::ENROLL_ALPN, b"rag-rat/enroll/1");
         assert_ne!(SYNC_ALPN, CONTENT_SYNC_ALPN);

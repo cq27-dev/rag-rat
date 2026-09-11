@@ -51,7 +51,7 @@ use self::wire::{DiscoveryRequest, DiscoveryResponse, TAG_LEN};
 ///
 /// Operator-namespaced rather than named for this project: the service is shared infrastructure
 /// that rag-rat CONSUMES and does not own or deploy, and naming a shared service after one of its
-/// clients is backwards. Contrast `rag-rat/sync/4` and `rag-rat/content/3`, which name protocols
+/// clients is backwards. Contrast `rag-rat/sync/5` and `rag-rat/content/4`, which name protocols
 /// rag-rat defines and serves.
 pub const PEER_DISCOVERY_ALPN: &[u8] = b"dev.cq27.peer-discovery/1";
 

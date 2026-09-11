@@ -895,6 +895,51 @@ fn subscription_pair_with(
     (owner, subscriber, owner_account)
 }
 
+/// Pull `owner`'s account and content from `src` into `dst` through the real session stores, as an
+/// anonymous subscriber is served: each served entry passes the receiving store's admission gate.
+fn pull_owner_anonymously(dst: &Connection, src: &Connection, owner: rag_rat_oplog::AccountId) {
+    use rag_rat_sync::{OplogContentSyncStore, OplogSyncStore, ServeScope, SyncStore};
+    let mut serve = OplogSyncStore::new(src, owner, || NOW);
+    serve.set_serve_scope(ServeScope::PublicOnly);
+    let mut pull = OplogSyncStore::new(dst, owner, || NOW);
+    for (_, bytes) in serve.snapshot().unwrap() {
+        pull.ingest(&bytes).unwrap();
+    }
+    let mut serve = OplogContentSyncStore::new(src, owner, || NOW);
+    serve.set_serve_scope(ServeScope::PublicOnly);
+    let mut pull = OplogContentSyncStore::new(dst, owner, || NOW);
+    for (_, bytes) in serve.snapshot().unwrap() {
+        pull.ingest(&bytes).unwrap();
+    }
+    settle_pending_content_refolds(dst, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+}
+
+/// A subscriber that syncs only the owner still gets the memory a granted contributor wrote on the
+/// owner's stream (#1280): the owner relays the contributor's log and the accepted contribution,
+/// and the subscriber's drain materializes both memories.
+#[test]
+fn a_subscriber_gets_a_contributors_memory_through_the_owner_alone() {
+    let (owner, contributor, owner_account) = contribution_pair();
+    let contributor_account = local_account(&contributor, NOW).unwrap();
+    create_memory(&contributor, concept("guest-note")).unwrap();
+    sync_account_into(&owner, &contributor, contributor_account);
+
+    let subscriber = scoped_conn();
+    local_account(&subscriber, NOW).unwrap();
+    pull_owner_anonymously(&subscriber, &owner, owner_account);
+    let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
+    crate::memory_write::set_subscription_owner(
+        &subscriber,
+        &owner_hex,
+        NOW,
+        crate::memory_write::SubscribeTrust::Operator,
+        Default::default(),
+    )
+    .unwrap();
+    crate::drain_synced_memory(&subscriber).unwrap();
+    assert_eq!(synced_memory_titles(&subscriber), vec!["guest-note", "owner-note"]);
+}
+
 /// The read-only half of cross-account mirroring (#1156): the two guards `sync contribute` carries
 /// (an effective Writer grant, a fully-public local account) exist only because a contributor
 /// AUTHORS onto the owner's stream. A subscriber writes nothing there and is never pulled from, so
