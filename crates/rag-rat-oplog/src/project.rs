@@ -337,6 +337,26 @@ mod tests {
         }
     }
 
+    /// A device's LATEST hash pairs with its set: a device that republished describes its newest
+    /// set with its newest hash, never the one it published beside an earlier set.
+    #[test]
+    fn the_winning_device_s_latest_hash_pairs_with_its_set() {
+        let hash = |value: &str| MemoryOp::NodeSourceHash {
+            node_id: NodeId::from("mem_1"),
+            source_text_hash: value.to_string(),
+        };
+        let state = project(&[
+            at(1, 1, create("mem_1", "t")),
+            at(2, 1, hash("first")),
+            at(3, 1, anchors_op("mem_1", &["a"])),
+            at(4, 1, hash("second")),
+            at(5, 1, anchors_op("mem_1", &["b"])),
+        ]);
+        let node = &state.nodes[&NodeId::from("mem_1")];
+        assert_eq!(node.anchors.as_ref().unwrap()[0].binding_id, "b");
+        assert_eq!(node.source_text_hash.as_deref(), Some("second"));
+    }
+
     /// A set whose device published no hash — anchors from before the hash op existed, hashed
     /// later from another device — takes the last-in-order hash from any device.
     #[test]

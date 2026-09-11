@@ -620,6 +620,45 @@ struct AppliedSnapshot {
     digest: Option<String>,
     /// The published hash last applied, as stored; NULL until one is, or when it was none.
     hash: Option<String>,
+    /// What that set named for each symbol anchor (see [`applied_targets_json`]); NULL until a set
+    /// is applied.
+    targets: Option<String>,
+}
+
+/// What an applied set named for each symbol anchor: identity `(binding_kind, binding_id)` to the
+/// `(symbol_kind, signature_hash)` its author recorded — the baseline a later set's anchors are
+/// compared against to tell a retarget from a republish of the same target.
+type AppliedTargets =
+    std::collections::BTreeMap<(String, String), (Option<String>, Option<String>)>;
+
+/// Serialize the [`AppliedTargets`] of `anchors` for `repo_memories.anchors_applied_targets`.
+fn applied_targets_json(anchors: &[rag_rat_oplog::PortableAnchor]) -> anyhow::Result<String> {
+    let targets: Vec<(&str, &str, Option<&str>, Option<&str>)> = anchors
+        .iter()
+        .filter(|anchor| matches!(anchor.binding_kind.as_str(), "symbol" | "logical_symbol"))
+        .map(|anchor| {
+            (
+                anchor.binding_kind.as_str(),
+                anchor.binding_id.as_str(),
+                anchor.symbol_kind.as_deref(),
+                anchor.signature_hash.as_deref(),
+            )
+        })
+        .collect();
+    Ok(serde_json::to_string(&targets)?)
+}
+
+/// Parse [`applied_targets_json`]'s output; `None` when nothing was recorded or it does not parse,
+/// which leaves the retarget decision to the row's own values.
+fn parse_applied_targets(json: Option<&str>) -> Option<AppliedTargets> {
+    let targets: Vec<(String, String, Option<String>, Option<String>)> =
+        serde_json::from_str(json?).ok()?;
+    Some(
+        targets
+            .into_iter()
+            .map(|(kind, id, symbol_kind, signature)| ((kind, id), (symbol_kind, signature)))
+            .collect(),
+    )
 }
 
 fn applied_snapshot(
@@ -628,10 +667,11 @@ fn applied_snapshot(
     memory_id: &str,
 ) -> anyhow::Result<Option<AppliedSnapshot>> {
     tx.query_row(
-        "SELECT anchors_applied_digest, source_hash_applied FROM repo_memories
+        "SELECT anchors_applied_digest, source_hash_applied, anchors_applied_targets
+           FROM repo_memories
          WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced'",
         params![memory_id, repo_id],
-        |row| Ok(AppliedSnapshot { digest: row.get(0)?, hash: row.get(1)? }),
+        |row| Ok(AppliedSnapshot { digest: row.get(0)?, hash: row.get(1)?, targets: row.get(2)? }),
     )
     .optional()
     .map_err(Into::into)
@@ -692,11 +732,14 @@ fn apply_published_anchors(
         // Bindings held with no digest recorded arrived some other way: the set is recorded
         // against them rather than replacing them.
         if held.is_empty() || (!own && applied.digest.is_some()) {
-            changed |= converge_bindings(tx, repo_id, &node.node_id, anchors, &held)?;
+            let previous = parse_applied_targets(applied.targets.as_deref());
+            changed |=
+                converge_bindings(tx, repo_id, &node.node_id, anchors, &held, previous.as_ref())?;
         }
         tx.execute(
-            "UPDATE repo_memories SET anchors_applied_digest = ?3 WHERE id = ?1 AND repo_id = ?2",
-            params![node.node_id, repo_id, digest],
+            "UPDATE repo_memories SET anchors_applied_digest = ?3, anchors_applied_targets = ?4
+             WHERE id = ?1 AND repo_id = ?2",
+            params![node.node_id, repo_id, digest, applied_targets_json(anchors)?],
         )?;
     }
     let published = published_source_hash(repo_id, node);
@@ -807,12 +850,20 @@ fn converge_bindings(
     memory_id: &str,
     anchors: &[rag_rat_oplog::PortableAnchor],
     held: &[rag_rat_oplog::PortableAnchor],
+    previous: Option<&AppliedTargets>,
 ) -> anyhow::Result<bool> {
     let mut changed = false;
     for row in held.iter().filter(|row| SEEDABLE_BINDING_KINDS.contains(&row.binding_kind.as_str()))
     {
         match anchors.iter().find(|anchor| same_row(row, anchor)) {
-            Some(anchor) => refresh_binding(tx, repo_id, memory_id, anchor)?,
+            Some(anchor) => {
+                let previous = previous
+                    .and_then(|targets| {
+                        targets.get(&(row.binding_kind.clone(), row.binding_id.clone()))
+                    })
+                    .cloned();
+                refresh_binding(tx, repo_id, memory_id, anchor, previous)?
+            },
             None => {
                 tx.execute(
                     "DELETE FROM repo_memory_bindings
@@ -842,17 +893,21 @@ fn converge_bindings(
 /// traits for one type apart when they also share the captured signature, so clearing it would
 /// send the binding to the lowest-id twin. But it can name the target the author just left — a
 /// rebind between two impls of one type keeps the binding's identity and kind — so a symbol row
-/// whose published kind or signature differs from what it held is marked
+/// whose published kind or signature differs from what the author published for it last time
+/// (`previous`, from the last applied set; the row's own values when none was recorded) is marked
 /// [`rag_rat_query::memory::RETARGETED_REASON`], and an earlier mark still unanswered is kept.
 /// The validator, running scoped to a checkout of the memory's repo (which this drain, running for
-/// every repo, is not), then weighs the author's evidence above the handle. A republish that only
-/// moves lines marks nothing: there the recorded signature can be stale from a relocation this
-/// checkout made after an edit, and following it would hand the memory to a same-named sibling.
+/// every repo, is not), then weighs the author's evidence above the handle.
+///
+/// The baseline is the author's last statement, not the row: relocation refreshes the row's kind
+/// and signature to this checkout's view, so after a local edit an unchanged republish would read
+/// as a retarget, and the validator would follow the old signature to a same-named sibling.
 pub(crate) fn refresh_binding(
     tx: &Transaction<'_>,
     repo_id: &str,
     memory_id: &str,
     anchor: &rag_rat_oplog::PortableAnchor,
+    previous: Option<(Option<String>, Option<String>)>,
 ) -> anyhow::Result<()> {
     let held: Option<(Option<String>, Option<String>, Option<String>)> = tx
         .query_row(
@@ -865,6 +920,7 @@ pub(crate) fn refresh_binding(
     let retarget = rag_rat_query::memory::RETARGETED_REASON;
     let retargeted = matches!(anchor.binding_kind.as_str(), "symbol" | "logical_symbol")
         && held.is_some_and(|(kind, signature, reason)| {
+            let (kind, signature) = previous.unwrap_or((kind, signature));
             reason.as_deref() == Some(retarget)
                 || kind != anchor.symbol_kind
                 || signature != anchor.signature_hash
@@ -1912,6 +1968,55 @@ mod tests {
             "the struct's resolution is not trusted for the impl",
         );
         assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_A.to_string()));
+    }
+
+    /// A retarget is told from a republish of the same target by what the author published last,
+    /// not by the row: relocation refreshes a row's kind and signature to this checkout's view, so
+    /// after a local edit the row no longer matches the author's unchanged republish — which must
+    /// not mark it, or the validator follows the old signature to a same-named sibling.
+    #[test]
+    fn a_republish_is_compared_with_the_last_applied_set_not_the_row() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let publish = |path: &str, signature: &str| {
+            seed_projected_node_with_anchors(
+                &conn,
+                stream,
+                "mem_peer",
+                Some(&[("symbol", "src/lib.rs::new")]),
+            );
+            set_projected_anchor_field(&conn, stream, "mem_peer", "path", path);
+            set_projected_anchor_field(&conn, stream, "mem_peer", "signature_hash", signature);
+        };
+        let reason = || -> Option<String> {
+            conn.query_row(
+                "SELECT relocation_reason FROM repo_memory_bindings WHERE memory_id = 'mem_peer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        publish("src/lib.rs", "sig-author");
+        drain_worker(&conn, stream, 1_000);
+        // Relocation here recorded this checkout's edited signature.
+        conn.execute(
+            "UPDATE repo_memory_bindings SET signature_hash = 'sig-local'
+             WHERE memory_id = 'mem_peer'",
+            [],
+        )
+        .unwrap();
+
+        publish("src/moved.rs", "sig-author");
+        drain_worker(&conn, stream, 2_000);
+        assert_eq!(reason(), None, "a republish of the same target is no retarget");
+
+        publish("src/moved.rs", "sig-other");
+        drain_worker(&conn, stream, 3_000);
+        assert_eq!(
+            reason().as_deref(),
+            Some(rag_rat_query::memory::RETARGETED_REASON),
+            "a changed signature is"
+        );
     }
 
     /// A chunk binding relocates on every re-chunk without a new snapshot, and on a device of the

@@ -2267,14 +2267,8 @@ pub(crate) fn anchor_publication_ops(
     Ok(vec![hash, anchors])
 }
 
-/// The `NodeSourceHash` op for a memory's stamped source hash, or `None` when it has none.
-///
-/// Like the anchor snapshot, an absent hash authors NOTHING rather than a sentinel: a receiver
-/// treats "nobody published one" as no evidence of drift, so spending a signed entry to say it
-/// would tell that peer nothing it can act on.
-///
-/// Silence is right for a create and for the sweeps, which have no earlier value of their own to
-/// retract. A rebind can have one, so [`author_anchors`] publishes an explicit empty hash instead.
+/// The `NodeSourceHash` op for a memory's stamped source hash, or `None` when it has none — in
+/// which case [`anchor_publication_ops`] publishes an explicit empty hash in its place.
 fn source_hash_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<MemoryOp>> {
     let mut stmt = conn.prepare("SELECT source_text_hash FROM repo_memories WHERE id = ?1")?;
     let hash: Option<String> = stmt

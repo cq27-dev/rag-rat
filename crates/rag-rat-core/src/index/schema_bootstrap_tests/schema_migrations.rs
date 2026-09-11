@@ -1839,7 +1839,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 121, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 122, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
@@ -1994,6 +1994,27 @@ fn migration_120_memory_applied_anchor_snapshot() {
     .unwrap();
     schema::migrations::apply_memory_applied_anchor_snapshot(&conn).unwrap();
     assert_eq!(watermarks(&conn), 0, "adding the columns forces one full drain pass");
+}
+
+/// V122 (#1243) records what the last applied anchor set named for each symbol anchor, the
+/// drain's baseline for telling a retarget from a republish; nullable, and a replay is a no-op.
+#[test]
+fn migration_122_memory_applied_anchor_targets() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    assert!(
+        schema::migrations::column_exists(&conn, "repo_memories", "anchors_applied_targets")
+            .unwrap()
+    );
+    schema::migrations::apply_memory_applied_anchor_targets(&conn).unwrap();
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '122_memory_applied_anchor_targets'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
 }
 
 /// V104 (#997) adds the durable re-adoption worklist and audit provenance.

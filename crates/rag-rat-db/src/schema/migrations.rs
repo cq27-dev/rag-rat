@@ -8557,6 +8557,15 @@ pub(crate) fn apply_content_projected_node_anchors_author(
     ensure_content_projection_shape(conn)
 }
 
+/// What the last anchor set the memory drain applied to a synced memory named for each symbol
+/// anchor — identity, recorded kind, signature hash (#1243). The drain compares a new set against
+/// it to tell an author's retarget from a republish of the same target: the binding row itself
+/// cannot serve, since relocation refreshes its kind and signature to the checkout's view. NULL
+/// until a set is applied; the drain then falls back to the row.
+pub fn apply_memory_applied_anchor_targets(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "repo_memories", "anchors_applied_targets", "TEXT")
+}
+
 /// A synced memory records WHICH published anchor set and source hash the drain last applied to it
 /// (#1243). Without that record a receiver can only seed once, so an author's later rebind never
 /// reaches it; with it, the drain replaces bindings when the published set CHANGES and leaves them

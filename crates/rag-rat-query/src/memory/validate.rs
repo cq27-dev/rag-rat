@@ -181,19 +181,18 @@ pub(crate) fn validate_logical_symbol_binding(
 /// the binding's identity and kind, so only the signature says it moved.
 ///
 /// The validator weighs a recorded kind or signature against a live handle ONLY on a row so marked.
-/// Any other row can disagree with its handle because this checkout moved it after an edit —
-/// relocation keeps the recorded values, so a `struct Worker` that became an `enum`, or a `new()`
-/// that became `new(cap)`, still records the old ones — and following them there would hand the
-/// memory to any same-named sibling that later has the old kind or signature.
+/// Any other row can disagree with its handle for reasons that name no other target — a sibling
+/// device's `anchors/1` update carrying its own checkout's view, or values recorded before the
+/// target's kind or signature changed here — and following them there would hand the memory to any
+/// same-named sibling that has the old kind or signature.
 ///
 /// The mark stands until a validation lands on a target agreeing with the recorded kind and
 /// signature. The row is shared by every checkout of the repo, and the one validating first may not
 /// hold the author's target: on the raw-id arm, whose candidates are the validating checkout's own,
 /// a linked worktree that edited the target leaves the mark for the checkout that has it (the
 /// logical arm's candidates are repo-wide, so any checkout can answer there). That works because
-/// the name-based arms never overwrite a binding's recorded kind or signature; only an identity
-/// match — content hash, moniker — restates them. (An `anchors/1` row update also moves a binding
-/// in place, but marks nothing.)
+/// relocation does not refresh a marked row's recorded kind or signature until the mark is
+/// answered. (An `anchors/1` row update also moves a binding in place, but marks nothing.)
 pub const RETARGETED_REASON: &str = "retargeted";
 
 /// Whether the binding carries [`RETARGETED_REASON`].
@@ -383,12 +382,15 @@ pub(crate) fn validate_symbol_binding(
             binding.start_line = Some(chunk.start_line);
             binding.end_line = Some(chunk.end_line);
         }
-        // The recorded kind and signature are left as the binding's writer stated them, as the
-        // logical arm leaves them: rewritten to this checkout's view they would read, to the
-        // synced-memory drain, as an author's retarget whenever the author republishes, and the
-        // pick would then follow the old signature to a same-named sibling. A stale value costs
-        // nothing here — the pick credits the handle first, and one landing back on a held-back
-        // row validates it live.
+        // The relocated target's kind and signature become the recorded ones, so the next pick —
+        // after the handle dies with a later edit — credits the target, not a same-named sibling
+        // that keeps the old kind or signature. An unanswered retarget keeps the author's: they are
+        // what a checkout holding the author's target must answer.
+        if !is_retargeted(binding) {
+            let (kind, sig) = symbol_signal(conn, id)?;
+            binding.symbol_kind = kind;
+            binding.signature_hash = sig;
+        }
         return Ok("relocated".to_string());
     }
     // Cross-file move: qualified_name changed with the path. Match by bare name + content hash.
@@ -1363,9 +1365,9 @@ mod call_path_receiver_type_hint_tests {
         assert_eq!(picked.map(|twin| twin.id), Some(2));
     }
 
-    /// On any other row the handle outranks a contradicting kind: relocation keeps the recorded
-    /// kind, so a `struct` that became an `enum` still records `struct`, and a same-named struct
-    /// added later must not take the memory from the handle's enum.
+    /// On any other row the handle outranks a contradicting kind: a recorded `struct` beside a
+    /// handle naming an `enum` is as often this checkout's own history as a retarget, and a
+    /// same-named struct must not take the memory from the handle's enum.
     #[test]
     fn on_an_unmarked_row_the_handle_outranks_a_contradicting_kind() {
         let binding = RepoMemoryBinding {

@@ -1927,6 +1927,7 @@ fn a_published_rebind_between_same_named_impls_follows_the_signature() {
                 &repo_id,
                 &memory_id,
                 &rag_rat_oplog::PortableAnchor { binding_kind, binding_id, ..published },
+                None,
             )
             .unwrap();
             tx.commit().unwrap();
@@ -2091,7 +2092,10 @@ fn an_edited_symbols_memory_is_not_taken_by_a_sibling_with_its_old_signature() {
         let tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
                 .unwrap();
-        crate::memory_write::refresh_binding(&tx, &repo_id, &memory_id, &anchor).unwrap();
+        // The drain compares against what the author published last — the recorded values — not
+        // the row, which relocation refreshed to this checkout's `new(cap)`.
+        let previous = Some((recorded_kind.clone(), recorded_signature.clone()));
+        crate::memory_write::refresh_binding(&tx, &repo_id, &memory_id, &anchor, previous).unwrap();
         tx.commit().unwrap();
         db.memory_validate().unwrap();
         assert_eq!(
@@ -2210,6 +2214,7 @@ fn a_linked_checkout_without_the_authors_target_leaves_the_retarget_to_the_base(
                 moniker_tool: None,
                 moniker_tool_version: None,
             },
+            None,
         )
         .unwrap();
         tx.commit().unwrap();
@@ -2249,10 +2254,10 @@ fn a_linked_checkout_without_the_authors_target_leaves_the_retarget_to_the_base(
     let _ = fs::remove_dir_all(&main);
 }
 
-/// Relocation keeps a binding's recorded kind, so a memory that followed `struct Worker` becoming
-/// `enum Worker` still records `struct`. A same-named struct added later — in the same checkout or
-/// in a linked worktree sharing the binding row — must not take the memory from the enum its
-/// handle names: only a row its writer marked retargeted weighs the recorded kind over the handle.
+/// A memory follows `struct Worker` becoming `enum Worker`. A same-named struct added later — in
+/// the same checkout or in a linked worktree sharing the binding row — must not take the memory
+/// from the enum: not while its handle lives, and not once a later edit kills the handle, which
+/// leaves the recorded kind to decide — so relocation must have recorded `enum`.
 #[test]
 fn a_local_kind_change_is_not_taken_by_a_sibling_with_the_old_kind() {
     const ENUM: &str = "pub enum Worker {\n    A,\n    B,\n}\n";
@@ -2305,7 +2310,7 @@ fn a_local_kind_change_is_not_taken_by_a_sibling_with_the_old_kind() {
             .memory_id;
         drop(db);
 
-        // The struct becomes an enum; validation follows it, keeping the recorded `struct`.
+        // The struct becomes an enum; validation follows it.
         fs::write(main.join("src/lib.rs"), ENUM).unwrap();
         run_git(&main, &["commit", "-q", "-am", "enum"]);
         let mut db = IndexDatabase::rebuild(&config).unwrap();
@@ -2320,7 +2325,7 @@ fn a_local_kind_change_is_not_taken_by_a_sibling_with_the_old_kind() {
                 )
                 .unwrap()
         };
-        assert_eq!(landed(&db), (Some(1), Some("struct".to_string())), "bound by {title}");
+        assert_eq!(landed(&db).0, Some(1), "bound by {title}");
 
         // A linked worktree adds an unrelated `struct Worker` under the same qualified name.
         let linked = unique_temp_root();
@@ -2367,6 +2372,23 @@ fn a_local_kind_change_is_not_taken_by_a_sibling_with_the_old_kind() {
                 "bound by {title}, base pass {pass}: stays on the enum"
             );
         }
+
+        // A later edit changes the enum's signature, so its handle dies with the sibling still
+        // there: the pick must credit the enum's recorded kind, not the struct's.
+        fs::write(
+            main.join("src/lib.rs"),
+            format!("pub enum Worker<T> {{\n    A(T),\n    B,\n}}\n{SIBLING}"),
+        )
+        .unwrap();
+        run_git(&main, &["commit", "-q", "-am", "generic enum"]);
+        drop(db);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.memory_validate().unwrap();
+        assert_eq!(
+            landed(&db).0,
+            Some(1),
+            "bound by {title}: a dead handle still lands on the enum"
+        );
 
         let _ = fs::remove_dir_all(&linked);
         let _ = fs::remove_dir_all(&main);
