@@ -505,11 +505,17 @@ fn candidate_capacity(
     entry: &VerifiedContentEntry,
     incoming_bytes: usize,
 ) -> anyhow::Result<Option<ContentCapacityScope>> {
-    // Both budgets are REMOTE-abuse ceilings (#652): exclude the local device's OWN signed rows so
-    // a large local history never starves foreign ingest. Key the exclusion on the local DEVICE
-    // FINGERPRINT, NOT `author_account_id` — the latter is attacker-settable (a self-signed
-    // DeviceAdd can store forged content under a claimed local account id), while a row can
-    // carry the local fingerprint only if it was signed with the local device key
+    // Both budgets are REMOTE-abuse ceilings (#652) on UNRESOLVED candidates, so they count only
+    // rows the acceptance fold has not accepted: accepted content is authorized — signed by a
+    // device on its author's roster, or under a grant — and counting it would make an author's
+    // history a wall, refusing its 4,097th legitimate entry forever, and a store's whole foreign
+    // history a wall for every author. A burst above a budget still stalls only until the settle
+    // accepts it; the rest is re-offered by the next session. Forged, parked, and later
+    // condemned rows stay `accepted = 0` and keep counting. The local device's OWN signed rows are
+    // excluded too, so a large local history never starves foreign ingest. Key the exclusion on the
+    // local DEVICE FINGERPRINT, NOT `author_account_id` — the latter is attacker-settable (a
+    // self-signed DeviceAdd can store forged content under a claimed local account id), while a
+    // row can carry the local fingerprint only if it was signed with the local device key
     // (`verify_content_signed` binds the signature to `header.device_fingerprint`). `None` (no
     // local device minted yet) excludes nothing; the nullable `?local_fp` parameter selects the
     // branch in-SQL.
@@ -523,7 +529,8 @@ fn candidate_capacity(
     let (count, bytes): (i64, i64) = tx.query_row(
         "SELECT count(*), coalesce(sum(length(signed_bytes)), 0)
          FROM content_entries
-         WHERE author_account_id = ?1 AND (device_fingerprint != ?2 OR ?2 IS NULL)",
+         WHERE author_account_id = ?1 AND accepted = 0
+           AND (device_fingerprint != ?2 OR ?2 IS NULL)",
         params![author.as_slice(), local_fp],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -537,7 +544,7 @@ fn candidate_capacity(
     // remote abuse and are excluded on the same forge-proof key.
     let (count, bytes): (i64, i64) = tx.query_row(
         "SELECT count(*), coalesce(sum(length(signed_bytes)), 0)
-         FROM content_entries WHERE device_fingerprint != ?1 OR ?1 IS NULL",
+         FROM content_entries WHERE accepted = 0 AND (device_fingerprint != ?1 OR ?1 IS NULL)",
         params![local_fp],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -3734,6 +3741,50 @@ mod tests {
             candidate_capacity(&tx, &verified, signed.signed_bytes.len()).unwrap(),
             Some(ContentCapacityScope::CandidateGlobalBytes)
         );
+    }
+
+    /// The candidate budgets bound UNRESOLVED candidates. Accepted history is authorized content,
+    /// so an author with a full budget of it — and a store with a full global budget of it — still
+    /// admits the author's next entry.
+    #[test]
+    fn accepted_history_does_not_consume_candidate_capacity() {
+        let secret = DeviceSecret::from_seed(&[18; 32]);
+        let conn = db();
+        let (account, roster_ref) = roster(&conn, &secret);
+        seed_content_candidates(
+            &conn,
+            account,
+            FOREIGN_FP,
+            1,
+            CANDIDATES_PER_AUTHOR_MAX as usize,
+            1,
+        );
+        // Another device of the same author, so the accepted rows do not share a chain position.
+        seed_content_candidates(
+            &conn,
+            account,
+            [0x77; 32],
+            2,
+            1,
+            CANDIDATE_BYTES_PER_AUTHOR_MAX as usize,
+        );
+        for author in 0..5_u8 {
+            seed_content_candidates(
+                &conn,
+                super::super::super::AccountId::from_bytes([author; 32]),
+                FOREIGN_FP,
+                10 + u64::from(author),
+                CANDIDATES_PER_AUTHOR_MAX as usize,
+                13 * 1024,
+            );
+        }
+        conn.execute("UPDATE content_entries SET accepted = 1", []).unwrap();
+
+        let signed = content(&secret, account, roster_ref, 0, None);
+        let verified =
+            envelope::verify_content_signed(&signed.signed_bytes, &secret.public()).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        assert_eq!(candidate_capacity(&tx, &verified, signed.signed_bytes.len()).unwrap(), None);
     }
 
     #[test]
