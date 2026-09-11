@@ -8544,50 +8544,23 @@ pub(crate) fn apply_content_projected_node_source_hash(conn: &Connection) -> rus
     ensure_content_projection_shape(conn)
 }
 
-/// The `/3` projection records which account authored each node's winning anchor set (#1243).
-/// NULL when no `node_anchors` op has been folded. The memory drain reads it to tell a set its own
-/// account's `anchors/1` already carries — where converging would race that carrier — from one only
-/// the snapshot can deliver.
+/// A synced memory records WHICH published anchor set and source hash the drain last applied to it,
+/// and what that set named for each symbol anchor it still matched; the `/3` projection records
+/// which account authored each node's winning anchor set (#1243). Without the record a receiver can
+/// only seed once, so an author's later rebind never reaches it; with it, the drain replaces
+/// bindings when the published set CHANGES and leaves them alone otherwise — which keeps a local
+/// relocation from being undone on every pass — and tells an author's retarget from a republish of
+/// the same target. The author column lets the drain leave a set its own account's `anchors/1`
+/// already carries to that carrier.
 ///
-/// Delegates to [`ensure_content_projection_shape`] for the reason documented there: a projected
-/// column has two homes, and the refold steps need the projection's final shape.
-pub(crate) fn apply_content_projected_node_anchors_author(
-    conn: &Connection,
-) -> rusqlite::Result<()> {
-    ensure_content_projection_shape(conn)
-}
-
-/// What the last anchor set the memory drain applied to a synced memory named for each symbol
-/// anchor — identity, recorded kind, signature hash (#1243). The drain compares a new set against
-/// it to tell an author's retarget from a republish of the same target: the binding row itself
-/// cannot serve, since relocation refreshes its kind and signature to the checkout's view. NULL
-/// until a set is applied; the drain then falls back to the row.
-pub fn apply_memory_applied_anchor_targets(conn: &Connection) -> rusqlite::Result<()> {
-    add_column_if_missing(conn, "repo_memories", "anchors_applied_targets", "TEXT")
-}
-
-/// A synced memory records WHICH published anchor set and source hash the drain last applied to it
-/// (#1243). Without that record a receiver can only seed once, so an author's later rebind never
-/// reaches it; with it, the drain replaces bindings when the published set CHANGES and leaves them
-/// alone otherwise — which is what keeps a local relocation from being undone on every pass.
-///
-/// Both columns are nullable and start NULL. Existing synced memories are revisited once: the drain
-/// only walks a stream whose projection moved since its last pass, so the per-stream watermarks are
-/// cleared — but only when the columns are actually added, since `schema::apply` replays every step
-/// and a replay must not force a full drain.
+/// Every column is nullable and starts NULL. The projected one delegates to
+/// [`ensure_content_projection_shape`] for the reason documented there: a projected column has two
+/// homes, and the refold steps need the projection's final shape.
 pub fn apply_memory_applied_anchor_snapshot(conn: &Connection) -> rusqlite::Result<()> {
-    let adding = !column_exists(conn, "repo_memories", "anchors_applied_digest")?;
     add_column_if_missing(conn, "repo_memories", "anchors_applied_digest", "TEXT")?;
     add_column_if_missing(conn, "repo_memories", "source_hash_applied", "TEXT")?;
-    let has_oplog_meta: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'oplog_meta')",
-        [],
-        |row| row.get(0),
-    )?;
-    if adding && has_oplog_meta {
-        conn.execute("DELETE FROM oplog_meta WHERE key LIKE 'content:drain-wm:%'", [])?;
-    }
-    Ok(())
+    add_column_if_missing(conn, "repo_memories", "anchors_applied_targets", "TEXT")?;
+    ensure_content_projection_shape(conn)
 }
 
 /// Every column the CURRENT content projector writes, applied ahead of any migration that replays

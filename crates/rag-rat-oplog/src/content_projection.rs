@@ -370,7 +370,7 @@ fn write_projection(
         // authored to `anchors/1`, which already carries it.
         let anchors_author = node
             .anchors_meta
-            .and_then(|meta| authors.get(&(meta.lamport, meta.device)).copied().flatten())
+            .and_then(|meta| authors.get(&(meta.lamport, meta.device)).copied())
             .map(AccountId::to_bytes);
         tx.execute(
             "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status, \
@@ -420,26 +420,9 @@ fn write_projection(
 }
 
 /// Each accepted `NodeAnchors` entry's author account, keyed by its `(lamport, device)` — the key
-/// the fold reports a register's winner by. A key claimed by two entries with different authors
-/// maps to `None`: acceptance keeps lamports strictly increasing per chain, so a real stream cannot
-/// produce one, and it yields no author rather than a guessed one.
-type EntryAuthors = std::collections::BTreeMap<(u64, DeviceFingerprint), Option<AccountId>>;
-
-/// Record one entry's author under its fold key; see [`EntryAuthors`].
-fn record_entry_author(
-    authors: &mut EntryAuthors,
-    key: (u64, DeviceFingerprint),
-    author: AccountId,
-) {
-    authors
-        .entry(key)
-        .and_modify(|seen| {
-            if *seen != Some(author) {
-                *seen = None;
-            }
-        })
-        .or_insert(Some(author));
-}
+/// the fold reports a register's winner by, and unique per stream: acceptance keeps lamports
+/// strictly increasing per device chain.
+type EntryAuthors = std::collections::BTreeMap<(u64, DeviceFingerprint), AccountId>;
 
 /// Load one stream's ACCEPTED `/3` entries as projector [`Entry`]s: decode the content envelope for
 /// its `lamport` + `device_fingerprint` (the `(lamport, device)` LWW order), then [`op::decode`]
@@ -527,11 +510,7 @@ fn load_accepted_entries(
                 };
                 // Only an anchor set's winner is ever looked up, so only those entries are kept.
                 if matches!(op, op::MemoryOp::NodeAnchors { .. }) {
-                    record_entry_author(
-                        &mut authors,
-                        (meta.lamport, meta.device),
-                        signed.header.author_account_id,
-                    );
+                    authors.insert((meta.lamport, meta.device), signed.header.author_account_id);
                 }
                 entries.push(Entry { meta, op });
             },
@@ -671,25 +650,6 @@ pub fn list_projected_content_edges(
         });
     }
     Ok(edges)
-}
-
-#[cfg(test)]
-mod entry_author_tests {
-    use super::*;
-
-    /// Two entries claiming one fold key with different authors yield no author rather than a
-    /// guessed one; the same author twice is still that author.
-    #[test]
-    fn a_fold_key_claimed_by_two_authors_yields_none() {
-        let key = (4, DeviceFingerprint::from_bytes([1; 32]));
-        let (first, second) = (AccountId::from_bytes([2; 32]), AccountId::from_bytes([3; 32]));
-        let mut authors = EntryAuthors::new();
-        record_entry_author(&mut authors, key, first);
-        record_entry_author(&mut authors, key, first);
-        assert_eq!(authors[&key], Some(first));
-        record_entry_author(&mut authors, key, second);
-        assert_eq!(authors[&key], None);
-    }
 }
 
 #[cfg(test)]

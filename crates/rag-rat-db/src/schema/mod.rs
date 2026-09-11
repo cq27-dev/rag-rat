@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 122;
+pub const LATEST_SCHEMA_VERSION: u32 = 120;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -860,24 +860,12 @@ const MIGRATION_119_DESCRIPTION: &str =
 const MIGRATION_120_ID: &str = "120_memory_applied_anchor_snapshot";
 const MIGRATION_120_CHECKSUM: &str = "sha256:rag-rat-memory-applied-anchor-snapshot-v120";
 const MIGRATION_120_DESCRIPTION: &str =
-    "Add repo_memories.anchors_applied_digest and source_hash_applied, recording which published \
-     anchor set and source hash the drain last applied to a synced memory (#1243), so an author's \
-     later rebind replaces them without undoing local relocation. Clears the per-stream drain \
-     watermarks once so existing synced memories are revisited";
-const MIGRATION_121_ID: &str = "121_content_projected_node_anchors_author";
-const MIGRATION_121_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-author-v121";
-const MIGRATION_121_DESCRIPTION: &str =
-    "Add the nullable anchors_author column to content_projected_nodes: the account that authored \
-     each node's winning anchor set (#1243). The memory drain leaves a set its own account's \
-     anchors/1 already carries to that carrier, and converges only sets another account authored; \
-     NULL means no node_anchors op has been folded";
-const MIGRATION_122_ID: &str = "122_memory_applied_anchor_targets";
-const MIGRATION_122_CHECKSUM: &str = "sha256:rag-rat-memory-applied-anchor-targets-v122";
-const MIGRATION_122_DESCRIPTION: &str =
-    "Add the nullable anchors_applied_targets column to repo_memories: the kind and signature the \
-     last anchor set the memory drain applied named for each symbol anchor (#1243). The drain \
-     compares a new set against it to tell an author's retarget from a republish of the same \
-     target";
+    "Record what the memory drain last applied to a synced memory (#1243): \
+     repo_memories.anchors_applied_digest and source_hash_applied, so an author's later rebind \
+     replaces them without undoing local relocation, and anchors_applied_targets, the kind and \
+     signature that set named for each symbol anchor, to tell a retarget from a republish. Add \
+     content_projected_nodes.anchors_author, the account that authored each node's winning anchor \
+     set, so the drain leaves a set its own account's anchors/1 carries to that carrier";
 const MIGRATION_118_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-v118";
 const MIGRATION_118_DESCRIPTION: &str =
     "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
@@ -1895,18 +1883,6 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_120_CHECKSUM,
         description: MIGRATION_120_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_memory_applied_anchor_snapshot),
-    },
-    Migration {
-        id: MIGRATION_121_ID,
-        checksum: MIGRATION_121_CHECKSUM,
-        description: MIGRATION_121_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_content_projected_node_anchors_author),
-    },
-    Migration {
-        id: MIGRATION_122_ID,
-        checksum: MIGRATION_122_CHECKSUM,
-        description: MIGRATION_122_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_memory_applied_anchor_targets),
     },
 ];
 

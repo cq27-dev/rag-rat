@@ -1982,6 +1982,18 @@ mod tests {
             ("unverified".to_string(), None),
             "the struct's resolution is not trusted for the impl",
         );
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT relocation_reason FROM repo_memory_bindings WHERE memory_id = 'mem_peer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            reason.as_deref(),
+            Some(rag_rat_query::memory::RETARGETED_REASON),
+            "judged against the struct the last set named, not the row `anchors/1` moved",
+        );
         assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_A.to_string()));
     }
 

@@ -660,40 +660,6 @@ mod anchor_authoring_tests {
         );
     }
 
-    /// The half the anchor sweep cannot reach: a memory whose anchors were published before the
-    /// hash op existed. Its `anchors_json` is set, so only the hash leg revisits it, and it
-    /// publishes the hash alone — a receiver applies it without touching the bindings.
-    #[test]
-    fn the_hash_leg_publishes_a_hash_for_anchors_published_without_one() {
-        let conn = scoped_conn();
-        let sha = sha_of("old");
-        // The state a store from before the hash op leaves: anchors published, no hash op at all.
-        // A create now always publishes one, so the projection is set back by hand.
-        let memory_id = bound_create(&conn, "src/lib.rs");
-        conn.execute(
-            "UPDATE content_projected_nodes SET source_text_hash = NULL WHERE node_id = ?1",
-            [&memory_id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE repo_memories SET source_text_hash = ?2 WHERE id = ?1",
-            rusqlite::params![memory_id, sha],
-        )
-        .unwrap();
-
-        // Any authored write drives the reconcile.
-        bound_create(&conn, "src/other.rs");
-
-        assert_eq!(projected_source_hash(&conn, &memory_id), Some(sha));
-        // Published once: a later pass finds nothing owed, instead of republishing on every write.
-        let entries = |conn: &Connection| -> i64 {
-            conn.query_row("SELECT COUNT(*) FROM content_entries", [], |row| row.get(0)).unwrap()
-        };
-        let before = entries(&conn);
-        crate::memory_write::authoring::backfill_memory_oplog(&conn, 10_000).unwrap();
-        assert_eq!(entries(&conn), before, "the hash leg does not re-select what it published");
-    }
-
     /// The backfill leg must publish the hash too, for the same reason it must publish anchors: a
     /// memory whose bindings predate the op is authored by the reconcile anti-join, not by
     /// `create_memory`, and the anti-join never revisits a node once it exists.

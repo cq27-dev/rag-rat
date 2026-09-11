@@ -775,6 +775,50 @@ fn memory_survives_file_move_via_moniker_relocation() {
     assert_eq!(moniker_binding.logical_symbol_id, Some(2002));
 }
 
+/// A moniker is identity, so a moniker relocation answers a pending retarget mark: the binding
+/// lands on the target the moniker names, and its reason becomes `moniker-match`.
+#[test]
+fn a_moniker_relocation_answers_a_retarget_mark() {
+    let h = Harness::new();
+    let defs = h.add_file("defs.rs", "fn target() {}\n");
+    let sym = h.add_symbol_qualified(defs, "target", "defs.rs::target", "function", 0, 14);
+    h.add_chunk(defs, "defs.rs::target", "fn target() {}\n");
+    h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", sym);
+    let bytes = scip_bytes_docs(vec![("defs.rs", vec![occurrence(
+        0,
+        3,
+        9,
+        TARGET_MONIKER,
+        SymbolRole::Definition as i32,
+    )])]);
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    let memory_id = create_target_memory(&h, sym);
+    move_target_with_edit(&h, defs, "function");
+    let bytes = scip_bytes_docs(vec![("moved.rs", vec![occurrence(
+        0,
+        3,
+        9,
+        TARGET_MONIKER,
+        SymbolRole::Definition as i32,
+    )])]);
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    h.conn
+        .execute(
+            "UPDATE repo_memory_bindings SET relocation_reason = ?2
+              WHERE memory_id = ?1 AND binding_kind = 'symbol'",
+            rusqlite::params![memory_id, rag_rat_query::memory::RETARGETED_REASON],
+        )
+        .unwrap();
+
+    validate_memories(&h.conn, None).unwrap();
+
+    let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
+    let symbol_binding =
+        memory.bindings.iter().find(|b| b.binding_kind == "symbol").expect("symbol binding");
+    assert_eq!(symbol_binding.binding_id, "moved.rs::target");
+    assert_eq!(symbol_binding.relocation_reason.as_deref(), Some("moniker-match"));
+}
+
 /// A moniker match under a DIFFERENT current tool_version is lower confidence: it relocates only
 /// when the stored `symbol_kind` corroborates the candidate.
 #[test]

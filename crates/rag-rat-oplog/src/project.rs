@@ -14,12 +14,11 @@
 //!   is folded, which is distinct from an empty set (nobody has said, versus said "no bindings").
 //! - node **source hash** — the text an author anchored to, so a receiver can tell its own checkout
 //!   has drifted from what that author meant. Not an independent register: it is the latest
-//!   `NodeSourceHash` from the device that wrote the winning anchor set, and the last-in-order one
-//!   from any device only when that device published none. A device publishes its hash beside its
-//!   anchors, so its latest hash describes its latest set — whichever order its binary wrote the
-//!   pair in — while two independent registers split pairs written in opposite orders: `anchors A
-//!   @10, hash A @11` from one device and `hash B @10, anchors B @11` from another would settle on
-//!   anchors B beside hash A.
+//!   `NodeSourceHash` from the device that wrote the winning anchor set, `None` when that device
+//!   published none. A device publishes its hash beside its anchors, so its latest hash describes
+//!   its latest set — whichever order its binary wrote the pair in — while two independent
+//!   registers split pairs written in opposite orders: `anchors A @10, hash A @11` from one device
+//!   and `hash B @10, anchors B @11` from another would settle on anchors B beside hash A.
 //! - edge **presence** — the last-in-order `EdgeAdd`/`EdgeRemove`; present iff the winner is an
 //!   add.
 //! - edge **resolved anchor** — the last-in-order `Rebind`; rides along iff the edge is present,
@@ -86,7 +85,6 @@ struct NodeAccum {
     content: Option<NodeContent>,
     status: Option<NodeStatus>,
     anchors: Option<(Vec<PortableAnchor>, OpMeta)>,
-    source_text_hash: Option<String>,
     /// Each device's latest `NodeSourceHash`, to pair with that device's anchor set.
     source_text_hash_by_device: BTreeMap<op::DeviceFingerprint, String>,
 }
@@ -171,9 +169,11 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                 edges.entry(edge_key.clone()).or_default().resolved = Some(resolved.clone());
             },
             MemoryOp::NodeSourceHash { node_id, source_text_hash } => {
-                let node = nodes.entry(node_id.clone()).or_default();
-                node.source_text_hash = Some(source_text_hash.clone());
-                node.source_text_hash_by_device.insert(entry.meta.device, source_text_hash.clone());
+                nodes
+                    .entry(node_id.clone())
+                    .or_default()
+                    .source_text_hash_by_device
+                    .insert(entry.meta.device, source_text_hash.clone());
             },
             MemoryOp::NodeAnchors { node_id, anchors } => {
                 // Full-set replacement, like content — an anchor set is one register, not a
@@ -215,8 +215,7 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                     None => (None, None),
                 };
                 let source_text_hash = anchors_meta
-                    .and_then(|meta| acc.source_text_hash_by_device.get(&meta.device).cloned())
-                    .or(acc.source_text_hash);
+                    .and_then(|meta| acc.source_text_hash_by_device.get(&meta.device).cloned());
                 Some((id, ProjectedNode {
                     content,
                     status: acc.status.unwrap_or_default(),
@@ -355,22 +354,6 @@ mod tests {
         let node = &state.nodes[&NodeId::from("mem_1")];
         assert_eq!(node.anchors.as_ref().unwrap()[0].binding_id, "b");
         assert_eq!(node.source_text_hash.as_deref(), Some("second"));
-    }
-
-    /// A set whose device published no hash — anchors from before the hash op existed, hashed
-    /// later from another device — takes the last-in-order hash from any device.
-    #[test]
-    fn a_set_whose_device_published_no_hash_takes_the_latest_one() {
-        let state = project(&[
-            at(1, 1, create("mem_1", "t")),
-            at(2, 1, anchors_op("mem_1", &["x"])),
-            at(3, 2, MemoryOp::NodeSourceHash {
-                node_id: NodeId::from("mem_1"),
-                source_text_hash: "backfilled".to_string(),
-            }),
-        ]);
-        let node = &state.nodes[&NodeId::from("mem_1")];
-        assert_eq!(node.source_text_hash.as_deref(), Some("backfilled"));
     }
 
     /// The anchors register remembers WHICH entry won it — the content projection maps that entry

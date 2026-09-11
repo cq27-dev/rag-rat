@@ -1172,10 +1172,6 @@ const ANCHOR_BACKFILL_SCAN_PER_PASS: i64 = 512;
 /// cannot heal `some -> different`, and the relocation engine does rewrite portable anchor identity
 /// outside any authoring path, so a renamed symbol leaves a peer holding the pre-rename set until
 /// an explicit rebind re-authors it. Republish-on-drift is a separate mechanism, not this one.
-///
-/// The match set is `anchors_json IS NULL` only. A memory whose anchors were published before the
-/// source-hash op existed has left it for good; [`read_source_hash_backfill_ids`] publishes its
-/// hash, which a receiver applies without re-seeding the bindings it already holds.
 fn read_anchor_backfill_ids(
     conn: &Connection,
     repo_id: &str,
@@ -1193,38 +1189,6 @@ fn read_anchor_backfill_ids(
            AND EXISTS (
                  SELECT 1 FROM repo_memory_bindings b
                  WHERE b.memory_id = m.id AND b.repo_id = m.repo_id)
-         ORDER BY m.created_at_ms, m.id
-         LIMIT ?3",
-    )?;
-    let ids = stmt
-        .query_map(
-            params![repo_id, stream.to_bytes().as_slice(), ANCHOR_BACKFILL_SCAN_PER_PASS],
-            |row| row.get::<_, String>(0),
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ids)
-}
-
-/// Memories whose anchors were published but whose source hash never was — a corpus published
-/// before the hash op existed, which [`read_anchor_backfill_ids`] has left for good. Drops out once
-/// the hash folds, like that leg; a memory with no hash of its own never matches, so a hashless one
-/// is not re-examined forever.
-fn read_source_hash_backfill_ids(
-    conn: &Connection,
-    repo_id: &str,
-    stream: StreamId,
-) -> anyhow::Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        // `origin = 'local'` for the same reason as the anchor leg: a synced row is a peer's to
-        // publish, never this device's to author.
-        "SELECT m.id
-         FROM repo_memories m
-         JOIN content_projected_nodes p ON p.stream_id = ?2 AND p.node_id = m.id
-         WHERE m.repo_id = ?1
-           AND m.origin = 'local'
-           AND m.source_text_hash IS NOT NULL
-           AND p.anchors_json IS NOT NULL
-           AND p.source_text_hash IS NULL
          ORDER BY m.created_at_ms, m.id
          LIMIT ?3",
     )?;
@@ -1299,27 +1263,6 @@ fn read_reconcile_work(
             swept += 1;
         } else {
             quarantined_anchor_ids.push(memory_id);
-        }
-    }
-    // The hash leg: anchors published before the source-hash op existed. It shares the pass budget.
-    // A 64-character hash always fits the entry cap, so one that cannot be authored is no oversized
-    // set to report — it is skipped, and never counted as work.
-    for memory_id in read_source_hash_backfill_ids(conn, repo_id, stream)? {
-        if swept >= ANCHOR_BACKFILL_PER_PASS {
-            break;
-        }
-        // The hash rides with the set it describes, never alone (see `anchor_publication_ops`). A
-        // receiver already holding that set skips it by digest and only takes the hash.
-        let publication = anchor_publication_ops(conn, &memory_id)?;
-        if publication.iter().all(|op| content_op_is_authorable(op, policy)) {
-            anchor_backfill_ops.extend(publication);
-            swept += 1;
-        } else {
-            tracing::debug!(
-                repo_id,
-                memory_id = %memory_id,
-                "skipping a hash publication this stream cannot author",
-            );
         }
     }
     Ok(ReconcileWork {
