@@ -2263,137 +2263,112 @@ fn a_linked_checkout_without_the_authors_target_leaves_the_retarget_to_the_base(
 fn a_local_kind_change_is_not_taken_by_a_sibling_with_the_old_kind() {
     const ENUM: &str = "pub enum Worker {\n    A,\n    B,\n}\n";
     const SIBLING: &str = "mod unrelated {\n    pub struct Worker;\n}\n";
-    for (title, by_logical_handle) in [("raw symbol id", false)] {
-        let main = unique_temp_root();
-        let _ = fs::remove_dir_all(&main);
-        fs::create_dir_all(main.join("src")).unwrap();
-        fs::write(main.join("src/lib.rs"), "pub struct Worker {\n    pub a: u8,\n}\n").unwrap();
-        init_git_repo(&main);
-        run_git(&main, &["add", "."]);
-        run_git(&main, &["commit", "-q", "-m", "struct"]);
-        let config = source_config(main.to_path_buf(), Language::Rust);
-        let db = IndexDatabase::rebuild(&config).unwrap();
-        let (symbol_id, logical_id): (i64, i64) = db
-            .storage
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/lib.rs"), "pub struct Worker {\n    pub a: u8,\n}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "struct"]);
+    let config = source_config(main.to_path_buf(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let symbol_id: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM symbols WHERE name = 'Worker' AND kind = 'struct'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let memory_id = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Worker is the job runner".to_string(),
+            body: "Bound to Worker by its raw symbol id.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(symbol_id),
+                ..Default::default()
+            },
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+    drop(db);
+
+    // The struct becomes an enum; validation follows it.
+    fs::write(main.join("src/lib.rs"), ENUM).unwrap();
+    run_git(&main, &["commit", "-q", "-am", "enum"]);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    db.memory_validate().unwrap();
+    let landed = |db: &IndexDatabase| -> (Option<i64>, Option<String>) {
+        db.storage
             .connection()
             .query_row(
-                "SELECT s.id, m.logical_symbol_id FROM symbols s
-                   JOIN logical_symbol_members m ON m.symbol_id = s.id
-                  WHERE s.name = 'Worker' AND s.kind = 'struct'",
-                [],
+                "SELECT start_line, symbol_kind FROM repo_memory_bindings WHERE memory_id = ?1",
+                params![memory_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .unwrap();
-        let memory_id = db
-            .memory_create(rag_rat_query::memory::RepoMemoryCreate {
-                kind: "Invariant".to_string(),
-                title: format!("Worker is the job runner ({title})"),
-                body: format!("Bound to Worker by its {title}."),
-                confidence: "high".to_string(),
-                created_by: Some("test-agent".to_string()),
-                source: Some("agent".to_string()),
-                tags: Vec::new(),
-                payload_json: None,
-                bind: if by_logical_handle {
-                    rag_rat_query::memory::RepoMemoryBindTarget {
-                        logical_symbol_id: Some(logical_id),
-                        ..Default::default()
-                    }
-                } else {
-                    rag_rat_query::memory::RepoMemoryBindTarget {
-                        symbol_id: Some(symbol_id),
-                        ..Default::default()
-                    }
-                },
-            })
             .unwrap()
-            .memory
-            .memory_id;
-        drop(db);
+    };
+    assert_eq!(landed(&db).0, Some(1), "after the kind change");
 
-        // The struct becomes an enum; validation follows it.
-        fs::write(main.join("src/lib.rs"), ENUM).unwrap();
-        run_git(&main, &["commit", "-q", "-am", "enum"]);
-        let mut db = IndexDatabase::rebuild(&config).unwrap();
-        db.memory_validate().unwrap();
-        let landed = |db: &IndexDatabase| -> (Option<i64>, Option<String>) {
-            db.storage
-                .connection()
-                .query_row(
-                    "SELECT start_line, symbol_kind FROM repo_memory_bindings WHERE memory_id = ?1",
-                    params![memory_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap()
-        };
-        assert_eq!(landed(&db).0, Some(1), "bound by {title}");
-
-        // A linked worktree adds an unrelated `struct Worker` under the same qualified name.
-        let linked = unique_temp_root();
-        let _ = fs::remove_dir_all(&linked);
-        run_git(&main, &["worktree", "add", "-q", "-b", "sibling", linked.to_str().unwrap()]);
-        fs::write(linked.join("src/lib.rs"), format!("{ENUM}{SIBLING}")).unwrap();
-        run_git(&linked, &["commit", "-q", "-am", "sibling"]);
-        db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
-        db.use_worktree_scope(&main, Some(&linked)).unwrap();
-        let same_name: i64 = db
-            .storage
-            .connection()
-            .query_row(
-                "SELECT COUNT(DISTINCT kind) FROM symbols
-                  WHERE qualified_name_id = (SELECT qualified_name_id FROM symbols
-                                              WHERE name = 'Worker' AND kind = 'enum' LIMIT 1)",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(same_name, 2, "precondition: the sibling struct shares the enum's name");
-        for pass in 0..2 {
-            db.memory_validate().unwrap();
-            assert_eq!(
-                landed(&db).0,
-                Some(1),
-                "bound by {title}, linked pass {pass}: the memory stays on the enum",
-            );
-        }
-        db.use_worktree_scope(&main, None).unwrap();
-        db.memory_validate().unwrap();
-        assert_eq!(landed(&db).0, Some(1), "bound by {title}: and on the base checkout's enum");
-
-        // The same sibling in the base checkout itself.
-        fs::write(main.join("src/lib.rs"), format!("{ENUM}{SIBLING}")).unwrap();
-        run_git(&main, &["commit", "-q", "-am", "sibling in base"]);
-        drop(db);
-        let db = IndexDatabase::rebuild(&config).unwrap();
-        for pass in 0..2 {
-            db.memory_validate().unwrap();
-            assert_eq!(
-                landed(&db).0,
-                Some(1),
-                "bound by {title}, base pass {pass}: stays on the enum"
-            );
-        }
-
-        // A later edit changes the enum's signature, so its handle dies with the sibling still
-        // there: the pick must credit the enum's recorded kind, not the struct's.
-        fs::write(
-            main.join("src/lib.rs"),
-            format!("pub enum Worker<T> {{\n    A(T),\n    B,\n}}\n{SIBLING}"),
+    // A linked worktree adds an unrelated `struct Worker` under the same qualified name.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "sibling", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/lib.rs"), format!("{ENUM}{SIBLING}")).unwrap();
+    run_git(&linked, &["commit", "-q", "-am", "sibling"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    let same_name: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(DISTINCT kind) FROM symbols
+              WHERE qualified_name_id = (SELECT qualified_name_id FROM symbols
+                                          WHERE name = 'Worker' AND kind = 'enum' LIMIT 1)",
+            [],
+            |r| r.get(0),
         )
         .unwrap();
-        run_git(&main, &["commit", "-q", "-am", "generic enum"]);
-        drop(db);
-        let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(same_name, 2, "precondition: the sibling struct shares the enum's name");
+    for pass in 0..2 {
         db.memory_validate().unwrap();
-        assert_eq!(
-            landed(&db).0,
-            Some(1),
-            "bound by {title}: a dead handle still lands on the enum"
-        );
-
-        let _ = fs::remove_dir_all(&linked);
-        let _ = fs::remove_dir_all(&main);
+        assert_eq!(landed(&db).0, Some(1), "linked pass {pass}: the memory stays on the enum",);
     }
+    db.use_worktree_scope(&main, None).unwrap();
+    db.memory_validate().unwrap();
+    assert_eq!(landed(&db).0, Some(1), "and on the base checkout's enum");
+
+    // The same sibling in the base checkout itself.
+    fs::write(main.join("src/lib.rs"), format!("{ENUM}{SIBLING}")).unwrap();
+    run_git(&main, &["commit", "-q", "-am", "sibling in base"]);
+    drop(db);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    for pass in 0..2 {
+        db.memory_validate().unwrap();
+        assert_eq!(landed(&db).0, Some(1), "base pass {pass}: stays on the enum");
+    }
+
+    // A later edit changes the enum's signature, so its handle dies with the sibling still
+    // there: the pick must credit the enum's recorded kind, not the struct's.
+    fs::write(
+        main.join("src/lib.rs"),
+        format!("pub enum Worker<T> {{\n    A(T),\n    B,\n}}\n{SIBLING}"),
+    )
+    .unwrap();
+    run_git(&main, &["commit", "-q", "-am", "generic enum"]);
+    drop(db);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.memory_validate().unwrap();
+    assert_eq!(landed(&db).0, Some(1), "a dead handle still lands on the enum");
+
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&main);
 }
 
 /// Each trait sits on the line AFTER `impl` so both impl symbols capture the same signature text,

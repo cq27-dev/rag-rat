@@ -794,11 +794,16 @@ fn same_row(held: &rag_rat_oplog::PortableAnchor, anchor: &rag_rat_oplog::Portab
 /// The location is left out because the validate loop rewrites it in place for the SAME target —
 /// `path` and the line span when a symbol only moves, `moniker_tool_version` on a moniker refresh —
 /// and `created_at_ms` because each rebind restamps it.
+///
+/// A kind the drain never installs (`chunk`, `call_path`) never matches: its id is a checkout-local
+/// rowid, so equal ids on two stores say nothing about the target, and such a row held beside a
+/// foreign set can only be a rebind made here — which keeps the author's hash off it.
 fn same_target(
     held: &rag_rat_oplog::PortableAnchor,
     anchor: &rag_rat_oplog::PortableAnchor,
 ) -> bool {
-    same_row(held, anchor)
+    SEEDABLE_BINDING_KINDS.contains(&held.binding_kind.as_str())
+        && same_row(held, anchor)
         && held.symbol_kind == anchor.symbol_kind
         && held.signature_hash == anchor.signature_hash
         && held.moniker_tool == anchor.moniker_tool
@@ -2225,6 +2230,42 @@ mod tests {
 
     /// Named rows of a kind this store cannot install keep their local resolution across a set
     /// change: their checkout-local id IS that resolution, and a refresh would clear it for good.
+    /// A chunk binding's id is a checkout-local rowid, so a receiver's own chunk rebind can carry
+    /// the very id the author's chunk anchor names on the author's store. Equal ids say nothing
+    /// about the target: the author's hash must stay off the receiver's chunk.
+    #[test]
+    fn a_local_chunk_sharing_the_authors_chunk_id_keeps_the_authors_hash_off() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        drain_worker(&conn, stream, 1_000);
+        // Rebound here to this store's chunk 42, with its own hash.
+        conn.execute("DELETE FROM repo_memory_bindings WHERE memory_id = 'mem_peer'", []).unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, chunk_id, anchor_status,
+                 created_at_ms)
+             VALUES (?1, 'mem_peer', 'chunk', '42', 42, 'current', 1)",
+            [REPO],
+        )
+        .unwrap();
+        conn.execute("UPDATE repo_memories SET source_text_hash = ?1 WHERE id = 'mem_peer'", [
+            HASH_B,
+        ])
+        .unwrap();
+
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", Some(&[("chunk", "42")]));
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_B.to_string()));
+    }
+
     #[test]
     fn named_bindings_this_store_cannot_seed_keep_their_resolution() {
         let conn = scoped_conn();
