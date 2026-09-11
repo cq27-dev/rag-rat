@@ -727,8 +727,15 @@ fn apply_published_anchors(
     let mut changed = false;
     let digest = anchor_snapshot_digest(&node.node_id, anchors);
     let set_changed = applied.digest.as_deref() != Some(digest.as_str());
+    let held = super::authoring::portable_anchors_of(tx, &node.node_id)?;
+    // A memory holding no binding takes the published set whether or not it changed: an author
+    // cannot publish an unbinding (a rebind needs a target), so an empty memory under a recorded
+    // set lost its rows some other way — a sibling device's quarantine or re-point removing them
+    // through `anchors/1` — and seeding into that vacuum is what heals it.
+    if held.is_empty() && !set_changed {
+        changed |= converge_bindings(tx, repo_id, &node.node_id, anchors, &held, None)?;
+    }
     if set_changed {
-        let held = super::authoring::portable_anchors_of(tx, &node.node_id)?;
         // Bindings held with no digest recorded arrived some other way: the set is recorded
         // against them rather than replacing them.
         if held.is_empty() || (!own && applied.digest.is_some()) {
@@ -2100,6 +2107,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reason.as_deref(), Some(rag_rat_query::memory::RETARGETED_REASON));
+    }
+
+    /// An author cannot publish an unbinding, so a memory whose rows another device removed
+    /// through `anchors/1` — a quarantine on an older binary, a re-point — while the author's set
+    /// stays unchanged is re-seeded from that set, as a first sight would be.
+    #[test]
+    fn bindings_removed_under_an_unchanged_set_are_reseeded() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        drain_worker(&conn, stream, 1_000);
+        conn.execute("DELETE FROM repo_memory_bindings WHERE memory_id = 'mem_peer'", []).unwrap();
+        // Touch the projection without changing the set, so the stream drains again.
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::run".to_string()
+        )]);
     }
 
     /// An edge binding's id is its fingerprint, which names the exact edge, so a republish that
