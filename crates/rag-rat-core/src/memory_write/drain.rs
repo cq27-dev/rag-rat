@@ -736,10 +736,20 @@ fn apply_published_anchors(
             changed |=
                 converge_bindings(tx, repo_id, &node.node_id, anchors, &held, previous.as_ref())?;
         }
+        // The baseline a later set is judged against holds only anchors a held row now matches by
+        // target. A set recorded against rows that are not its own — a stale seed, a local rebind,
+        // a row `anchors/1` has yet to move — must not vouch for them: the author's next republish
+        // would equal the baseline and a retarget those rows still await would go unmarked.
+        let held_now = super::authoring::portable_anchors_of(tx, &node.node_id)?;
+        let matched: Vec<rag_rat_oplog::PortableAnchor> = anchors
+            .iter()
+            .filter(|anchor| held_now.iter().any(|row| same_target(row, anchor)))
+            .cloned()
+            .collect();
         tx.execute(
             "UPDATE repo_memories SET anchors_applied_digest = ?3, anchors_applied_targets = ?4
              WHERE id = ?1 AND repo_id = ?2",
-            params![node.node_id, repo_id, digest, applied_targets_json(anchors)?],
+            params![node.node_id, repo_id, digest, applied_targets_json(&matched)?],
         )?;
     }
     let published = published_source_hash(repo_id, node);
@@ -2017,6 +2027,57 @@ mod tests {
             Some(rag_rat_query::memory::RETARGETED_REASON),
             "a changed signature is"
         );
+    }
+
+    /// A set first recorded against rows that are not its own — here a seed from before the
+    /// drain converged, still on the struct the author has since left — is no baseline for them:
+    /// the author's next republish of the impl must still mark the row, or its struct handle
+    /// wins every pick.
+    #[test]
+    fn a_set_recorded_over_foreign_rows_is_no_baseline_for_them() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node(&conn, stream, "mem_peer", "Invariant", "t", "b", "active", &[]);
+        drain_worker(&conn, stream, 500);
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, symbol_kind, logical_symbol_id,
+                 anchor_status, created_at_ms)
+             VALUES ((SELECT repo_id FROM repo_memories WHERE id = 'mem_peer'), 'mem_peer',
+                     'symbol', 'src/lib.rs::Worker', 'struct', 42, 'current', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE repo_memories SET anchors_applied_digest = NULL, anchors_applied_targets = \
+             NULL
+             WHERE id = 'mem_peer'",
+            [],
+        )
+        .unwrap();
+        let publish = |path: &str| {
+            seed_projected_node_with_anchors(
+                &conn,
+                stream,
+                "mem_peer",
+                Some(&[("symbol", "src/lib.rs::Worker")]),
+            );
+            set_projected_anchor_field(&conn, stream, "mem_peer", "path", path);
+            set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "impl");
+        };
+        publish("src/lib.rs");
+        drain_worker(&conn, stream, 1_000);
+        publish("src/moved.rs");
+        drain_worker(&conn, stream, 2_000);
+
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT relocation_reason FROM repo_memory_bindings WHERE memory_id = 'mem_peer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some(rag_rat_query::memory::RETARGETED_REASON));
     }
 
     /// A chunk binding relocates on every re-chunk without a new snapshot, and on a device of the

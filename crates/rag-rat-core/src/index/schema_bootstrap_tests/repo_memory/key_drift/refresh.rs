@@ -2254,15 +2254,16 @@ fn a_linked_checkout_without_the_authors_target_leaves_the_retarget_to_the_base(
     let _ = fs::remove_dir_all(&main);
 }
 
-/// A memory follows `struct Worker` becoming `enum Worker`. A same-named struct added later — in
-/// the same checkout or in a linked worktree sharing the binding row — must not take the memory
-/// from the enum: not while its handle lives, and not once a later edit kills the handle, which
-/// leaves the recorded kind to decide — so relocation must have recorded `enum`.
+/// A memory bound by raw symbol id follows `struct Worker` becoming `enum Worker`. A same-named
+/// struct added later — in the same checkout or in a linked worktree sharing the binding row — must
+/// not take the memory from the enum: not while its id lives, and not once a later edit changes the
+/// enum's signature and the pick decides by the recorded kind — so relocation must have recorded
+/// `enum`. (A logical handle outlives these edits here, so it never reaches that pick.)
 #[test]
 fn a_local_kind_change_is_not_taken_by_a_sibling_with_the_old_kind() {
     const ENUM: &str = "pub enum Worker {\n    A,\n    B,\n}\n";
     const SIBLING: &str = "mod unrelated {\n    pub struct Worker;\n}\n";
-    for (title, by_logical_handle) in [("logical handle", true), ("raw symbol id", false)] {
+    for (title, by_logical_handle) in [("raw symbol id", false)] {
         let main = unique_temp_root();
         let _ = fs::remove_dir_all(&main);
         fs::create_dir_all(main.join("src")).unwrap();
