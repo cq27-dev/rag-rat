@@ -12,8 +12,14 @@
 //! - node **status** — the last-in-order `NodeStatus`; default `active`.
 //! - node **anchors** — the last-in-order `NodeAnchors`, a FULL-SET replacement; `None` until one
 //!   is folded, which is distinct from an empty set (nobody has said, versus said "no bindings").
-//! - node **source hash** — the last-in-order `NodeSourceHash`: the text its author anchored to, so
-//!   a receiver can tell its own checkout has drifted from what that author meant.
+//! - node **source hash** — the text an author anchored to, so a receiver can tell its own checkout
+//!   has drifted from what that author meant. Not an independent register: it is the latest
+//!   `NodeSourceHash` from the device that wrote the winning anchor set, and the last-in-order one
+//!   from any device only when that device published none. A device publishes its hash beside its
+//!   anchors, so its latest hash describes its latest set — whichever order its binary wrote the
+//!   pair in — while two independent registers split pairs written in opposite orders: `anchors A
+//!   @10, hash A @11` from one device and `hash B @10, anchors B @11` from another would settle on
+//!   anchors B beside hash A.
 //! - edge **presence** — the last-in-order `EdgeAdd`/`EdgeRemove`; present iff the winner is an
 //!   add.
 //! - edge **resolved anchor** — the last-in-order `Rebind`; rides along iff the edge is present,
@@ -81,6 +87,8 @@ struct NodeAccum {
     status: Option<NodeStatus>,
     anchors: Option<(Vec<PortableAnchor>, OpMeta)>,
     source_text_hash: Option<String>,
+    /// Each device's latest `NodeSourceHash`, to pair with that device's anchor set.
+    source_text_hash_by_device: BTreeMap<op::DeviceFingerprint, String>,
 }
 
 /// Per-edge LWW accumulators, resolved into a [`ProjectedEdge`] only if the edge is present.
@@ -163,8 +171,9 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                 edges.entry(edge_key.clone()).or_default().resolved = Some(resolved.clone());
             },
             MemoryOp::NodeSourceHash { node_id, source_text_hash } => {
-                nodes.entry(node_id.clone()).or_default().source_text_hash =
-                    Some(source_text_hash.clone());
+                let node = nodes.entry(node_id.clone()).or_default();
+                node.source_text_hash = Some(source_text_hash.clone());
+                node.source_text_hash_by_device.insert(entry.meta.device, source_text_hash.clone());
             },
             MemoryOp::NodeAnchors { node_id, anchors } => {
                 // Full-set replacement, like content — an anchor set is one register, not a
@@ -205,11 +214,14 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                     Some((anchors, meta)) => (Some(anchors), Some(meta)),
                     None => (None, None),
                 };
+                let source_text_hash = anchors_meta
+                    .and_then(|meta| acc.source_text_hash_by_device.get(&meta.device).cloned())
+                    .or(acc.source_text_hash);
                 Some((id, ProjectedNode {
                     content,
                     status: acc.status.unwrap_or_default(),
                     anchors,
-                    source_text_hash: acc.source_text_hash,
+                    source_text_hash,
                     anchors_meta,
                 }))
             })
@@ -277,11 +289,9 @@ mod tests {
         }
     }
 
-    /// A memory's hash and anchor set are always published as ADJACENT entries of one writer. The
-    /// two registers resolve independently, but adjacent pairs compare the same way on both, so two
-    /// writers' full pairs never split: whoever wins one register wins the other, at any clock
-    /// offset and on a tie. A lone op has no partner and could split a pair, which is why the
-    /// author never publishes one.
+    /// A memory's hash and anchor set are published together by one writer, and the hash is taken
+    /// from the device whose set won, so two writers' full pairs never split, at any clock offset
+    /// and on a tie.
     #[test]
     fn concurrent_full_pairs_never_split_the_anchor_and_hash_registers() {
         let hash = |value: &str| MemoryOp::NodeSourceHash {
@@ -301,6 +311,46 @@ mod tests {
             let hash_from_x = node.source_text_hash.as_deref() == Some("hx");
             assert_eq!(anchors_from_x, hash_from_x, "writers at {x}/{y} split the pair");
         }
+    }
+
+    /// A binary that publishes anchors then hash and one that publishes hash then anchors can meet
+    /// on one memory — an older device, or offline entries arriving after an upgrade. The hash
+    /// comes from the device whose set won, so the pair holds whichever order each wrote.
+    #[test]
+    fn pairs_written_in_opposite_orders_never_split() {
+        let hash = |value: &str| MemoryOp::NodeSourceHash {
+            node_id: NodeId::from("mem_1"),
+            source_text_hash: value.to_string(),
+        };
+        for (x, y) in [(10, 10), (10, 11), (11, 10), (5, 9), (9, 5)] {
+            let state = project(&[
+                at(1, 1, create("mem_1", "t")),
+                at(x, 1, anchors_op("mem_1", &["x"])),
+                at(x + 1, 1, hash("hx")),
+                at(y, 2, hash("hy")),
+                at(y + 1, 2, anchors_op("mem_1", &["y"])),
+            ]);
+            let node = &state.nodes[&NodeId::from("mem_1")];
+            let anchors_from_x = node.anchors.as_ref().unwrap()[0].binding_id == "x";
+            let hash_from_x = node.source_text_hash.as_deref() == Some("hx");
+            assert_eq!(anchors_from_x, hash_from_x, "writers at {x}/{y} split the pair");
+        }
+    }
+
+    /// A set whose device published no hash — anchors from before the hash op existed, hashed
+    /// later from another device — takes the last-in-order hash from any device.
+    #[test]
+    fn a_set_whose_device_published_no_hash_takes_the_latest_one() {
+        let state = project(&[
+            at(1, 1, create("mem_1", "t")),
+            at(2, 1, anchors_op("mem_1", &["x"])),
+            at(3, 2, MemoryOp::NodeSourceHash {
+                node_id: NodeId::from("mem_1"),
+                source_text_hash: "backfilled".to_string(),
+            }),
+        ]);
+        let node = &state.nodes[&NodeId::from("mem_1")];
+        assert_eq!(node.source_text_hash.as_deref(), Some("backfilled"));
     }
 
     /// The anchors register remembers WHICH entry won it — the content projection maps that entry

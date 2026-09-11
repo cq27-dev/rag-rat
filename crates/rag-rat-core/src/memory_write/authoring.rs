@@ -2243,11 +2243,10 @@ pub(crate) fn author_anchors(
 /// memory holds no binding. A memory with no hash publishes an EMPTY one: the register's only
 /// retraction, and the op that keeps the pair a pair.
 ///
-/// Always BOTH, never one alone. The fold resolves the hash and the set as independent registers by
-/// `(lamport, device)`, and one writer's pair sits at adjacent lamports, so two writers' full pairs
-/// compare the same way on both registers and can never split. A lone op has no partner: racing a
-/// concurrent rebind from another device or a grantee, it can win one register and lose the other,
-/// leaving a pair nobody published — for good, since nothing republishes afterwards.
+/// Always BOTH, never one alone. The fold takes a winning set's hash from the device that wrote it
+/// — that device's latest hash — so a device's pair holds against any other writer, whichever order
+/// the other wrote its own in. A set published alone would pair with the device's PREVIOUS hash,
+/// the one describing the target it just left, for good, since nothing republishes afterwards.
 ///
 /// The hash goes FIRST. The two are separate entries on one chain, and a peer accepts a chain in
 /// order, so a pull that stops between them leaves a prefix. Hash-first makes that prefix a newer

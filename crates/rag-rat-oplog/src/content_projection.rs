@@ -54,7 +54,8 @@ use super::stream::StreamId;
 // v5 (#1213): the same, for the source-hash register that carries what a memory's author anchored
 // to, so a receiver can tell its own checkout has drifted from it.
 // v6 (#1243): the node fold records which account authored the winning anchor set, so the drain
-// can leave a set the local account's `anchors/1` already carries to that carrier.
+// can leave a set the local account's `anchors/1` already carries to that carrier, and takes the
+// source hash from the device that wrote that set, so pairs written in opposite orders never split.
 pub(crate) const CONTENT_PROJECTOR_VERSION: i64 = 6;
 
 /// The `oplog_meta` key holding the `/3` projector version the content projection was last folded

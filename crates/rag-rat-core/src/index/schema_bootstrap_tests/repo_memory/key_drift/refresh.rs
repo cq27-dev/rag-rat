@@ -1666,11 +1666,10 @@ fn a_symbol_binding_without_a_logical_handle_keeps_the_deterministic_pick() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// A writer that updates a binding's portable columns in place — `anchors/1`, the synced-memory
-/// drain — keeps its checkout-local ids, so a rebind from a struct to its impl leaves the struct's
-/// ids beside the impl's kind. Validation must not trust an id whose symbol contradicts the
-/// binding's own kind, for the raw symbol id and the logical handle alike, or the memory stays on
-/// the struct.
+/// The synced-memory drain moves a binding in place and keeps its checkout-local ids, so an
+/// author's rebind from a struct to its impl leaves the struct's ids beside the impl's kind. On the
+/// row it marks retargeted, validation must not trust an id whose symbol contradicts the recorded
+/// kind, for the raw symbol id and the logical handle alike, or the memory stays on the struct.
 #[test]
 fn a_cached_id_that_contradicts_the_bindings_kind_is_not_trusted() {
     let root = unique_temp_root();
@@ -1723,13 +1722,14 @@ fn a_cached_id_that_contradicts_the_bindings_kind_is_not_trusted() {
             .unwrap()
             .memory
             .memory_id;
-        // The in-place rebind: the portable kind moves to the impl, the local ids stay the
-        // struct's.
+        // The drain's in-place rebind: the portable kind moves to the impl, the local ids stay
+        // the struct's, and the row is marked retargeted.
         db.storage
             .connection()
             .execute(
-                "UPDATE repo_memory_bindings SET symbol_kind = 'impl' WHERE memory_id = ?1",
-                params![memory_id],
+                "UPDATE repo_memory_bindings SET symbol_kind = 'impl', relocation_reason = ?2
+                  WHERE memory_id = ?1",
+                params![memory_id, rag_rat_query::memory::RETARGETED_REASON],
             )
             .unwrap();
 
@@ -1755,11 +1755,10 @@ fn a_cached_id_that_contradicts_the_bindings_kind_is_not_trusted() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// When the binding records a kind nothing under its name has here — the author rebound to an impl
-/// this checkout has not indexed yet, or a rename changed the kind — the pick lands back on the row
-/// the kind check held back. It must validate that row live: relocating onto it reports
-/// `relocated` on every pass (the logical arm keeps the kind), or rewrites the recorded kind to
-/// this checkout's view (the raw-id arm), which `anchors/1` would then publish over the author's.
+/// When a retargeted binding records a kind nothing under its name has here — the author rebound
+/// to an impl this checkout has not indexed yet — the pick lands back on the row the retarget check
+/// held back. It must validate that row live, keeping the recorded kind for a checkout that has
+/// the target: relocating onto it would report `relocated` on every pass.
 #[test]
 fn a_kind_nothing_here_has_validates_the_held_back_row_live() {
     let root = unique_temp_root();
@@ -1808,8 +1807,9 @@ fn a_kind_nothing_here_has_validates_the_held_back_row_live() {
         db.storage
             .connection()
             .execute(
-                "UPDATE repo_memory_bindings SET symbol_kind = 'impl' WHERE memory_id = ?1",
-                params![memory_id],
+                "UPDATE repo_memory_bindings SET symbol_kind = 'impl', relocation_reason = ?2
+                  WHERE memory_id = ?1",
+                params![memory_id, rag_rat_query::memory::RETARGETED_REASON],
             )
             .unwrap();
 
@@ -2247,6 +2247,130 @@ fn a_linked_checkout_without_the_authors_target_leaves_the_retarget_to_the_base(
 
     let _ = fs::remove_dir_all(&linked);
     let _ = fs::remove_dir_all(&main);
+}
+
+/// Relocation keeps a binding's recorded kind, so a memory that followed `struct Worker` becoming
+/// `enum Worker` still records `struct`. A same-named struct added later — in the same checkout or
+/// in a linked worktree sharing the binding row — must not take the memory from the enum its
+/// handle names: only a row its writer marked retargeted weighs the recorded kind over the handle.
+#[test]
+fn a_local_kind_change_is_not_taken_by_a_sibling_with_the_old_kind() {
+    const ENUM: &str = "pub enum Worker {\n    A,\n    B,\n}\n";
+    const SIBLING: &str = "mod unrelated {\n    pub struct Worker;\n}\n";
+    for (title, by_logical_handle) in [("logical handle", true), ("raw symbol id", false)] {
+        let main = unique_temp_root();
+        let _ = fs::remove_dir_all(&main);
+        fs::create_dir_all(main.join("src")).unwrap();
+        fs::write(main.join("src/lib.rs"), "pub struct Worker {\n    pub a: u8,\n}\n").unwrap();
+        init_git_repo(&main);
+        run_git(&main, &["add", "."]);
+        run_git(&main, &["commit", "-q", "-m", "struct"]);
+        let config = source_config(main.to_path_buf(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let (symbol_id, logical_id): (i64, i64) = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT s.id, m.logical_symbol_id FROM symbols s
+                   JOIN logical_symbol_members m ON m.symbol_id = s.id
+                  WHERE s.name = 'Worker' AND s.kind = 'struct'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let memory_id = db
+            .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: format!("Worker is the job runner ({title})"),
+                body: format!("Bound to Worker by its {title}."),
+                confidence: "high".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: Vec::new(),
+                payload_json: None,
+                bind: if by_logical_handle {
+                    rag_rat_query::memory::RepoMemoryBindTarget {
+                        logical_symbol_id: Some(logical_id),
+                        ..Default::default()
+                    }
+                } else {
+                    rag_rat_query::memory::RepoMemoryBindTarget {
+                        symbol_id: Some(symbol_id),
+                        ..Default::default()
+                    }
+                },
+            })
+            .unwrap()
+            .memory
+            .memory_id;
+        drop(db);
+
+        // The struct becomes an enum; validation follows it, keeping the recorded `struct`.
+        fs::write(main.join("src/lib.rs"), ENUM).unwrap();
+        run_git(&main, &["commit", "-q", "-am", "enum"]);
+        let mut db = IndexDatabase::rebuild(&config).unwrap();
+        db.memory_validate().unwrap();
+        let landed = |db: &IndexDatabase| -> (Option<i64>, Option<String>) {
+            db.storage
+                .connection()
+                .query_row(
+                    "SELECT start_line, symbol_kind FROM repo_memory_bindings WHERE memory_id = ?1",
+                    params![memory_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(landed(&db), (Some(1), Some("struct".to_string())), "bound by {title}");
+
+        // A linked worktree adds an unrelated `struct Worker` under the same qualified name.
+        let linked = unique_temp_root();
+        let _ = fs::remove_dir_all(&linked);
+        run_git(&main, &["worktree", "add", "-q", "-b", "sibling", linked.to_str().unwrap()]);
+        fs::write(linked.join("src/lib.rs"), format!("{ENUM}{SIBLING}")).unwrap();
+        run_git(&linked, &["commit", "-q", "-am", "sibling"]);
+        db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+        db.use_worktree_scope(&main, Some(&linked)).unwrap();
+        let same_name: i64 = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(DISTINCT kind) FROM symbols
+                  WHERE qualified_name_id = (SELECT qualified_name_id FROM symbols
+                                              WHERE name = 'Worker' AND kind = 'enum' LIMIT 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(same_name, 2, "precondition: the sibling struct shares the enum's name");
+        for pass in 0..2 {
+            db.memory_validate().unwrap();
+            assert_eq!(
+                landed(&db).0,
+                Some(1),
+                "bound by {title}, linked pass {pass}: the memory stays on the enum",
+            );
+        }
+        db.use_worktree_scope(&main, None).unwrap();
+        db.memory_validate().unwrap();
+        assert_eq!(landed(&db).0, Some(1), "bound by {title}: and on the base checkout's enum");
+
+        // The same sibling in the base checkout itself.
+        fs::write(main.join("src/lib.rs"), format!("{ENUM}{SIBLING}")).unwrap();
+        run_git(&main, &["commit", "-q", "-am", "sibling in base"]);
+        drop(db);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        for pass in 0..2 {
+            db.memory_validate().unwrap();
+            assert_eq!(
+                landed(&db).0,
+                Some(1),
+                "bound by {title}, base pass {pass}: stays on the enum"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&linked);
+        let _ = fs::remove_dir_all(&main);
+    }
 }
 
 /// Each trait sits on the line AFTER `impl` so both impl symbols capture the same signature text,
