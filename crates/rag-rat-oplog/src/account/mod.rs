@@ -137,7 +137,8 @@ pub use storage::{
     backfill_authority_projection, effective_writer_grant, effective_writer_grantees,
     grant_effective_for_device, grant_effective_in_snapshot, open_writer_grants,
     owned_streams_for_account, owner_control_authority, owner_control_authority_in_snapshot,
-    owner_secrets_authority, roster_content_authority, stream_access_mode, stream_grants_for_owner,
-    stream_owner_account, stream_owner_effective, verify_enrollment_device_add,
+    owner_ever_granted, owner_secrets_authority, roster_content_authority, stream_access_mode,
+    stream_grants_for_owner, stream_owner_account, stream_owner_effective,
+    verify_enrollment_device_add,
 };
 pub(crate) use storage::{device_is_effective_writer, stored_device_pubkeys};

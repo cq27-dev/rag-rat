@@ -11,7 +11,8 @@ use rag_rat_oplog::{
     account_entry_ref, account_ingest, account_is_fully_public, account_signed_entry_exists,
     account_signed_hash, content_entries_for_public_sync, content_entries_for_sync,
     content_entry_ref, content_ingest, content_signed_entry_exists, content_signed_hash,
-    sign_local_node_binding, stream_access_mode, stream_owner_account, verify_node_binding,
+    owner_ever_granted, sign_local_node_binding, stream_access_mode, stream_owner_account,
+    verify_node_binding,
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
@@ -80,7 +81,8 @@ fn local_auth(
 }
 
 /// A [`SyncStore`] over one account's op log on a live connection. Scoped to a single account: a
-/// session syncs one account, and the hello handshake refuses a peer naming a different one.
+/// session syncs one account, and the hello handshake refuses a peer naming a different one. The
+/// only foreign logs it admits are those of accounts its owner granted a stream (#1280).
 pub struct OplogSyncStore<'a> {
     conn: &'a Connection,
     account_id: AccountId,
@@ -146,22 +148,30 @@ impl SyncStore for OplogSyncStore<'_> {
     }
 
     fn ingest(&mut self, signed_bytes: &[u8]) -> anyhow::Result<Ingested> {
-        // Refuse an entry for a DIFFERENT account before it reaches `account_ingest`. This session
-        // is scoped to one account; `account_ingest` would happily store a valid entry for any
-        // account (it is not account-scoped), so a peer could otherwise inject and grow other
-        // accounts through a session that never named them. A structurally undecodable entry is a
-        // peer to distrust, not a session-fatal error — drop it as NoChange.
+        // Refuse an entry for an account this session does not carry before it reaches
+        // `account_ingest`. `account_ingest` would happily store a valid entry for any account (it
+        // is not account-scoped), so a peer could otherwise inject and grow unrelated accounts
+        // through a session that never named them. The session carries its own account and every
+        // account its owner has granted a stream (#1280): an owner relays its grantees' logs so a
+        // peer that syncs only the owner can verify their contributions. The grant is read from
+        // THIS store's fold of the owner, so a relayed log is admitted only once the grant has
+        // landed here; a dropped entry is re-offered next round. A structurally undecodable entry
+        // is a peer to distrust, not a session-fatal error — drop it as NoChange.
         let Ok((entry_account, _entry_hash)) = account_entry_ref(signed_bytes) else {
             return Ok(Ingested::NoChange);
         };
-        if entry_account != self.account_id {
+        if entry_account != self.account_id
+            && !owner_ever_granted(self.conn, self.account_id, entry_account)?
+        {
             return Ok(Ingested::NoChange);
         }
-        // Skip an entry already held — matched by the EXACT signed envelope, not entry_hash: a
-        // distinct signature of the same body is a different entry the peer may need, so it must
-        // still ingest. `account_ingest`'s fast path re-reports `Ingested` for an exact replay, so
-        // without this an idempotent redelivery would inflate "newly stored".
-        if account_signed_entry_exists(self.conn, self.account_id, signed_bytes)? {
+        // Skip an entry already held — matched by the EXACT signed envelope under the entry's OWN
+        // account, not entry_hash: a distinct signature of the same body is a different entry the
+        // peer may need, so it must still ingest. `account_ingest`'s fast path re-reports
+        // `Ingested` for an exact replay, so without this an idempotent redelivery would inflate
+        // "newly stored" — and a relayed entry keyed under the session's account would never read
+        // as held, so the session would never reach a quiet round.
+        if account_signed_entry_exists(self.conn, entry_account, signed_bytes)? {
             return Ok(Ingested::NoChange);
         }
         // `account_ingest` is the SAME entry point a local write uses: it re-verifies from scratch,
@@ -193,9 +203,9 @@ impl SyncStore for OplogSyncStore<'_> {
 ///
 /// Scoped to a single account, like the account-log store: a session restores the account's own
 /// memories onto a fresh sibling. Content authored by OTHER accounts is admitted only on a
-/// `public_read` stream (#407) — private foreign content is still refused here. Received bytes go
-/// through [`content_ingest`], which re-resolves the roster key and re-verifies the signature from
-/// scratch — the transport adds no trust.
+/// `public_read` stream (#407) — which is where every granted contribution lives — and private
+/// foreign content is refused here. Received bytes go through [`content_ingest`], which re-resolves
+/// the roster key and re-verifies the signature from scratch — the transport adds no trust.
 ///
 /// Run this AFTER an account-log session in the same restore: `content_ingest` needs the roster and
 /// grant material the account log carries to ACCEPT (rather than park) a candidate, so the account
@@ -277,6 +287,10 @@ impl SyncStore for OplogContentSyncStore<'_> {
             // resolve the owner/mode (owner not yet synced, a corrupt ownership fact) is treated as
             // "not public" and drops the entry as NoChange — fail-closed AND never session-fatal,
             // matching the undecodable-entry posture above rather than aborting the whole session.
+            //
+            // This also covers content an owner relays from its contributors (#1280): the account
+            // fold lets a `StreamGrant` take effect only on an owned `PublicRead` stream, so every
+            // contribution sits on a public stream.
             let public =
                 stream_owner_account(self.conn, stream).ok().flatten().is_some_and(|owner| {
                     stream_access_mode(self.conn, owner, stream).ok()
@@ -286,11 +300,12 @@ impl SyncStore for OplogContentSyncStore<'_> {
                 return Ok(Ingested::NoChange);
             }
         }
-        // Skip content already held — matched by the EXACT signed envelope, not entry_hash: a
-        // distinct signature of the same body is a different entry the peer may need, so it must
-        // still ingest. `content_ingest` re-reports `Ingested` for an exact replay, so without this
-        // an idempotent redelivery would inflate "newly stored".
-        if content_signed_entry_exists(self.conn, self.account_id, signed_bytes)? {
+        // Skip content already held — matched by the EXACT signed envelope under the entry's OWN
+        // author, not entry_hash: a distinct signature of the same body is a different entry the
+        // peer may need, so it must still ingest. `content_ingest` re-reports `Ingested` for an
+        // exact replay, so without this an idempotent redelivery would inflate "newly stored" —
+        // and foreign content keyed under the session's account would never read as held.
+        if content_signed_entry_exists(self.conn, entry_account, signed_bytes)? {
             return Ok(Ingested::NoChange);
         }
         // `content_ingest` is the SAME entry point untrusted content takes: it re-resolves the
