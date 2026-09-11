@@ -15,7 +15,7 @@ mod drain;
 mod edges;
 #[cfg(test)]
 mod oracle_relocation_tests;
-
+// The drain's in-place retarget, driven against a real index by the relocation tests.
 pub(crate) use api::{create_memory, mark_obsolete, rebind_memory, update_memory};
 // The scope-READING reconcile entry (#541) as index MAINTENANCE runs it: reconciles the active
 // repo's owner stream, reading the repo id from the connection scope, no-oping under an
@@ -36,6 +36,8 @@ pub(crate) use authoring::{
     contribution_targets, ensure_not_mirroring_another_account, reconcile_owner_stream_for_repo,
     subscription_owners,
 };
+#[cfg(test)]
+pub(crate) use drain::refresh_binding;
 // The synced-content drain entries (#691 A1): the per-repo drain (consolidate) and the
 // store-global drain (open/migrate) that materialize accepted synced `/3` content into the
 // local memory tables.
