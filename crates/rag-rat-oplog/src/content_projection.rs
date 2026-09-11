@@ -25,13 +25,13 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::account::{
-    KeyId, content_projected_tables_exist, content_stream_has_pending_refold,
+    AccountId, KeyId, content_projected_tables_exist, content_stream_has_pending_refold,
     decode_content_signed, historical_content_keyring, open_sealed_payload, stream_owner_account,
 };
 use super::identity::load_local_device;
 use super::op::{
-    self, DecodedOp, EdgeSpec, Entry, NodeContent, NodeStatus, OpMeta, PortableAnchor,
-    ResolvedAnchor,
+    self, DecodedOp, DeviceFingerprint, EdgeSpec, Entry, NodeContent, NodeStatus, OpMeta,
+    PortableAnchor, ResolvedAnchor,
 };
 use super::project;
 use super::project::ProjectedState;
@@ -53,7 +53,9 @@ use super::stream::StreamId;
 // including `node_anchors` ops an older binary kept opaque through the unknown-kind seam.
 // v5 (#1213): the same, for the source-hash register that carries what a memory's author anchored
 // to, so a receiver can tell its own checkout has drifted from it.
-pub(crate) const CONTENT_PROJECTOR_VERSION: i64 = 5;
+// v6 (#1243): the node fold records which account authored the winning anchor set, so the drain
+// can leave a set the local account's `anchors/1` already carries to that carrier.
+pub(crate) const CONTENT_PROJECTOR_VERSION: i64 = 6;
 
 /// The `oplog_meta` key holding the `/3` projector version the content projection was last folded
 /// by. DISTINCT from the `/1` `projector_version` (they evolve independently and share one meta
@@ -181,9 +183,9 @@ fn accepted_or_projected_content_streams(conn: &Connection) -> anyhow::Result<Ve
 /// in BOTH `/3` projection tables — another stream's projection is never touched. Carries NO
 /// version logic; the callers own the stamp discipline.
 fn reproject_stream_projection(tx: &Transaction<'_>, stream_id: StreamId) -> anyhow::Result<()> {
-    let entries = load_accepted_entries(tx, stream_id)?;
+    let (entries, authors) = load_accepted_entries(tx, stream_id)?;
     let state = project::project(&entries);
-    write_projection(tx, stream_id, &state)?;
+    write_projection(tx, stream_id, &state, &authors)?;
     // Advance this stream's projection epoch. A consumer that MATERIALIZES the projection (the
     // memory drain, `memory_write::drain`) gates its O(projection) scan on this epoch, so it must
     // move whenever the projection is rewritten — through EITHER path that reaches here (the local
@@ -339,6 +341,7 @@ fn write_projection(
     tx: &Transaction<'_>,
     stream_id: StreamId,
     state: &ProjectedState,
+    authors: &EntryAuthors,
 ) -> anyhow::Result<()> {
     let stream_bytes = stream_id.to_bytes();
     tx.execute("DELETE FROM content_projected_nodes WHERE stream_id = ?1", params![
@@ -362,17 +365,24 @@ fn write_projection(
             })
             .transpose()
             .context("serialize projected /3 node anchors")?;
+        // Which account authored the winning anchor set: the drain leaves a set the local account
+        // authored to `anchors/1`, which already carries it.
+        let anchors_author = node
+            .anchors_meta
+            .and_then(|meta| authors.get(&(meta.lamport, meta.device)).copied().flatten())
+            .map(AccountId::to_bytes);
         tx.execute(
             "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status, \
-             anchors_json, source_text_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             anchors_json, source_text_hash, anchors_author)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 stream_bytes.as_slice(),
                 node_id.as_str(),
                 content_json,
                 node.status.as_db_str(),
                 anchors_json,
-                node.source_text_hash
+                node.source_text_hash,
+                anchors_author.as_ref().map(|bytes| bytes.as_slice())
             ],
         )?;
     }
@@ -412,7 +422,33 @@ fn write_projection(
 /// its `lamport` + `device_fingerprint` (the `(lamport, device)` LWW order), then [`op::decode`]
 /// the body. An `Unknown` op is retained in the log but skipped here (mirrors
 /// [`crate::store`]'s `load_known_entries`), so a forward-version op never breaks the fold.
-fn load_accepted_entries(tx: &Transaction<'_>, stream_id: StreamId) -> anyhow::Result<Vec<Entry>> {
+/// Each accepted entry's author account, keyed by its `(lamport, device)` — the key the fold
+/// reports a register's winner by. A key claimed by two entries with different authors maps to
+/// `None`: acceptance keeps lamports strictly increasing per chain, so a real stream cannot produce
+/// one, and it yields no author rather than a guessed one.
+type EntryAuthors = std::collections::BTreeMap<(u64, DeviceFingerprint), Option<AccountId>>;
+
+/// Record one entry's author under its fold key; see [`EntryAuthors`].
+fn record_entry_author(
+    authors: &mut EntryAuthors,
+    key: (u64, DeviceFingerprint),
+    author: AccountId,
+) {
+    authors
+        .entry(key)
+        .and_modify(|seen| {
+            if *seen != Some(author) {
+                *seen = None;
+            }
+        })
+        .or_insert(Some(author));
+}
+
+fn load_accepted_entries(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+) -> anyhow::Result<(Vec<Entry>, EntryAuthors)> {
+    let mut authors = EntryAuthors::new();
     // Key wraps live in the immutable stream OWNER's secrets log. A granted writer's account is
     // only the content author and may have no copy of those wraps.
     let owner_account = stream_owner_account(tx, stream_id)?;
@@ -483,17 +519,22 @@ fn load_accepted_entries(tx: &Transaction<'_>, stream_id: StreamId) -> anyhow::R
             continue;
         };
         match decoded {
-            DecodedOp::Known(op) => entries.push(Entry {
-                meta: OpMeta {
+            DecodedOp::Known(op) => {
+                let meta = OpMeta {
                     lamport: signed.header.lamport,
                     device: signed.header.device_fingerprint,
-                },
-                op,
-            }),
+                };
+                record_entry_author(
+                    &mut authors,
+                    (meta.lamport, meta.device),
+                    signed.header.author_account_id,
+                );
+                entries.push(Entry { meta, op });
+            },
             DecodedOp::Unknown { .. } => {}, // retained in the log, not projected
         }
     }
-    Ok(entries)
+    Ok((entries, authors))
 }
 
 /// One projected `/3` node, decoded for a projection consumer: the stable node id, the folded
@@ -513,6 +554,10 @@ pub struct ProjectedContentNode {
     /// local checkout; `None` surfaces UNMARKED, since an absent hash is not evidence of
     /// drift.
     pub source_text_hash: Option<String>,
+    /// The account that authored the winning anchor set, or `None` when none was folded. The drain
+    /// leaves a set the local account authored to `anchors/1`, which already carries it, and
+    /// converges only sets another account authored.
+    pub anchors_author: Option<AccountId>,
 }
 
 /// One projected `/3` edge, decoded for a projection consumer: the stable key, the folded spec (the
@@ -533,7 +578,7 @@ pub fn list_projected_content_nodes(
     stream_id: StreamId,
 ) -> anyhow::Result<Vec<ProjectedContentNode>> {
     let mut stmt = conn.prepare(
-        "SELECT node_id, content_json, status, anchors_json, source_text_hash
+        "SELECT node_id, content_json, status, anchors_json, source_text_hash, anchors_author
          FROM content_projected_nodes
          WHERE stream_id = ?1 ORDER BY node_id",
     )?;
@@ -544,11 +589,12 @@ pub fn list_projected_content_nodes(
             row.get::<_, String>(2)?,
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<Vec<u8>>>(5)?,
         ))
     })?;
     let mut nodes = Vec::new();
     for row in rows {
-        let (node_id, content_json, status, anchors_json, source_text_hash) = row?;
+        let (node_id, content_json, status, anchors_json, source_text_hash, anchors_author) = row?;
         let content: NodeContentRow = serde_json::from_str(&content_json)
             .with_context(|| format!("decode projected /3 node content for `{node_id}`"))?;
         let status = NodeStatus::from_db_str(&status).with_context(|| {
@@ -562,12 +608,22 @@ pub fn list_projected_content_nodes(
             })
             .transpose()
             .with_context(|| format!("decode projected /3 node anchors for `{node_id}`"))?;
+        let anchors_author = anchors_author
+            .map(|bytes| {
+                <[u8; 32]>::try_from(bytes.as_slice()).map(AccountId::from_bytes).map_err(|_| {
+                    anyhow::anyhow!(
+                        "projected /3 node `{node_id}` carries a malformed anchors author"
+                    )
+                })
+            })
+            .transpose()?;
         nodes.push(ProjectedContentNode {
             node_id,
             content: NodeContent::from(content),
             status,
             anchors,
             source_text_hash,
+            anchors_author,
         });
     }
     Ok(nodes)
@@ -611,6 +667,25 @@ pub fn list_projected_content_edges(
         });
     }
     Ok(edges)
+}
+
+#[cfg(test)]
+mod entry_author_tests {
+    use super::*;
+
+    /// Two entries claiming one fold key with different authors yield no author rather than a
+    /// guessed one; the same author twice is still that author.
+    #[test]
+    fn a_fold_key_claimed_by_two_authors_yields_none() {
+        let key = (4, DeviceFingerprint::from_bytes([1; 32]));
+        let (first, second) = (AccountId::from_bytes([2; 32]), AccountId::from_bytes([3; 32]));
+        let mut authors = EntryAuthors::new();
+        record_entry_author(&mut authors, key, first);
+        record_entry_author(&mut authors, key, first);
+        assert_eq!(authors[&key], Some(first));
+        record_entry_author(&mut authors, key, second);
+        assert_eq!(authors[&key], None);
+    }
 }
 
 #[cfg(test)]

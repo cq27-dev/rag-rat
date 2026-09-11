@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 120;
+pub const LATEST_SCHEMA_VERSION: u32 = 121;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -864,6 +864,13 @@ const MIGRATION_120_DESCRIPTION: &str =
      anchor set and source hash the drain last applied to a synced memory (#1243), so an author's \
      later rebind replaces them without undoing local relocation. Clears the per-stream drain \
      watermarks once so existing synced memories are revisited";
+const MIGRATION_121_ID: &str = "121_content_projected_node_anchors_author";
+const MIGRATION_121_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-author-v121";
+const MIGRATION_121_DESCRIPTION: &str =
+    "Add the nullable anchors_author column to content_projected_nodes: the account that authored \
+     each node's winning anchor set (#1243). The memory drain leaves a set its own account's \
+     anchors/1 already carries to that carrier, and converges only sets another account authored; \
+     NULL means no node_anchors op has been folded";
 const MIGRATION_118_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-v118";
 const MIGRATION_118_DESCRIPTION: &str =
     "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
@@ -1881,6 +1888,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_120_CHECKSUM,
         description: MIGRATION_120_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_memory_applied_anchor_snapshot),
+    },
+    Migration {
+        id: MIGRATION_121_ID,
+        checksum: MIGRATION_121_CHECKSUM,
+        description: MIGRATION_121_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_content_projected_node_anchors_author),
     },
 ];
 

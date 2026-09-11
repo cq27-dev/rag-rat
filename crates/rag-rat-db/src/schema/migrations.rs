@@ -8544,6 +8544,19 @@ pub(crate) fn apply_content_projected_node_source_hash(conn: &Connection) -> rus
     ensure_content_projection_shape(conn)
 }
 
+/// The `/3` projection records which account authored each node's winning anchor set (#1243).
+/// NULL when no `node_anchors` op has been folded. The memory drain reads it to tell a set its own
+/// account's `anchors/1` already carries — where converging would race that carrier — from one only
+/// the snapshot can deliver.
+///
+/// Delegates to [`ensure_content_projection_shape`] for the reason documented there: a projected
+/// column has two homes, and the refold steps need the projection's final shape.
+pub(crate) fn apply_content_projected_node_anchors_author(
+    conn: &Connection,
+) -> rusqlite::Result<()> {
+    ensure_content_projection_shape(conn)
+}
+
 /// A synced memory records WHICH published anchor set and source hash the drain last applied to it
 /// (#1243). Without that record a receiver can only seed once, so an author's later rebind never
 /// reaches it; with it, the drain replaces bindings when the published set CHANGES and leaves them
@@ -8593,7 +8606,8 @@ pub(crate) fn ensure_content_projection_shape(conn: &Connection) -> rusqlite::Re
         return Ok(());
     }
     add_column_if_missing(conn, "content_projected_nodes", "anchors_json", "TEXT")?;
-    add_column_if_missing(conn, "content_projected_nodes", "source_text_hash", "TEXT")
+    add_column_if_missing(conn, "content_projected_nodes", "source_text_hash", "TEXT")?;
+    add_column_if_missing(conn, "content_projected_nodes", "anchors_author", "BLOB")
 }
 
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {

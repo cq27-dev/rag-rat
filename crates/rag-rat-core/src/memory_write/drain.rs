@@ -248,8 +248,10 @@ fn drain_synced_stream_in_tx(
     // (1) Nodes: converge every projected node into the local tables (INSERT synced if absent,
     // else update content/status/tags preserving origin), so every edge's source node exists
     // before the edge pass.
+    // Whose anchor sets `anchors/1` already carries here: the local account's. Read once per pass.
+    let local_account = rag_rat_oplog::read_local_account(tx)?;
     for node in rag_rat_oplog::list_projected_content_nodes(tx, stream)? {
-        match drain_node(tx, repo_id, &node, now_ms)? {
+        match drain_node(tx, repo_id, &node, local_account.as_ref(), now_ms)? {
             NodeEffect::Written => outcome.nodes_written += 1,
             NodeEffect::Removed => outcome.nodes_removed += 1,
             NodeEffect::Unchanged => {},
@@ -377,6 +379,7 @@ fn drain_node(
     tx: &Transaction<'_>,
     repo_id: &str,
     node: &ProjectedContentNode,
+    local_account: Option<&rag_rat_oplog::AccountId>,
     now_ms: i64,
 ) -> anyhow::Result<NodeEffect> {
     // Quarantine invalid peer content rather than persist a malformed row or wedge the whole drain.
@@ -478,7 +481,7 @@ fn drain_node(
     // `None` and this costs no query at all.
     if node.anchors.is_some() && node_in_repo(tx, &node.node_id, repo_id)? {
         let changed = match applied_snapshot(tx, repo_id, &node.node_id)? {
-            Some(applied) => apply_published_anchors(tx, repo_id, node, applied)?,
+            Some(applied) => apply_published_anchors(tx, repo_id, node, local_account, applied)?,
             None => seed_node_anchors(tx, repo_id, node)? > 0,
         };
         if changed {
@@ -660,19 +663,27 @@ fn applied_snapshot(
 /// arrived while no binding was held. A memory holding no binding is left unstamped: the hash would
 /// describe nothing there.
 ///
-/// On a same-account device the replace also lands in `anchors/1`, whose producer publishes it as
-/// this device's write. Both carriers hold the author's same set, so that authors nothing new —
-/// except when a relocation reached this device first, where one bounce settles it once the
-/// relocating device relocates again.
+/// Which account authored the set decides how far this goes. A set this store's own account
+/// authored also reaches it through `anchors/1`, the carrier of every later rebind and relocation
+/// of it, so converging here would race that carrier: the own path writes bindings only into a
+/// memory holding none, and stamps the published hash. A set another account authored arrives
+/// through the snapshot alone and converges. A receiver with several devices shares the converged
+/// rows between them through its own `anchors/1`, and each converges to the same snapshot sequence.
 fn apply_published_anchors(
     tx: &Transaction<'_>,
     repo_id: &str,
     node: &ProjectedContentNode,
+    local_account: Option<&rag_rat_oplog::AccountId>,
     applied: AppliedSnapshot,
 ) -> anyhow::Result<bool> {
     let Some(anchors) = node.anchors.as_deref() else {
         return Ok(false);
     };
+    // A set this store's own account authored reaches it through `anchors/1` too, the carrier of
+    // every later rebind and relocation of it; converging to the snapshot would race that carrier,
+    // so the own path writes bindings only into a memory holding none. A set another account
+    // authored reaches this store through the snapshot alone.
+    let own = node.anchors_author.is_some() && node.anchors_author.as_ref() == local_account;
     let mut changed = false;
     let digest = anchor_snapshot_digest(&node.node_id, anchors);
     let set_changed = applied.digest.as_deref() != Some(digest.as_str());
@@ -680,7 +691,7 @@ fn apply_published_anchors(
         let held = super::authoring::portable_anchors_of(tx, &node.node_id)?;
         // Bindings held with no digest recorded arrived some other way: the set is recorded
         // against them rather than replacing them.
-        if applied.digest.is_some() || held.is_empty() {
+        if held.is_empty() || (!own && applied.digest.is_some()) {
             changed |= converge_bindings(tx, repo_id, &node.node_id, anchors, &held)?;
         }
         tx.execute(
@@ -700,7 +711,9 @@ fn apply_published_anchors(
         // never by kind: a chunk rebound here is not the author's chunk. A memory holding no
         // binding is left unstamped, since the hash would describe nothing there.
         let held = super::authoring::portable_anchors_of(tx, &node.node_id)?;
-        if held.iter().all(|row| anchors.iter().any(|anchor| same_target(row, anchor))) {
+        // On the own path the held rows are this account's own, converging to the same rebind
+        // through `anchors/1`, so the hash lands even while they catch up.
+        if own || held.iter().all(|row| anchors.iter().any(|anchor| same_target(row, anchor))) {
             let stamp = published.filter(|_| !held.is_empty());
             changed |= tx.execute(
                 "UPDATE repo_memories SET source_text_hash = ?3
@@ -1504,6 +1517,32 @@ mod tests {
         .unwrap();
     }
 
+    /// Record which account authored a projected node's anchor set, as the projection does from
+    /// the winning `NodeAnchors` entry's header.
+    fn set_projected_anchors_author(
+        conn: &Connection,
+        stream: StreamId,
+        node_id: &str,
+        author: &rag_rat_oplog::AccountId,
+    ) {
+        conn.execute(
+            "UPDATE content_projected_nodes SET anchors_author = ?3
+             WHERE stream_id = ?1 AND node_id = ?2",
+            params![stream.to_bytes().as_slice(), node_id, author.to_bytes().as_slice()],
+        )
+        .unwrap();
+    }
+
+    /// Mint this store's own account, and name another one.
+    fn own_and_foreign_accounts(
+        conn: &Connection,
+    ) -> (rag_rat_oplog::AccountId, rag_rat_oplog::AccountId) {
+        (
+            rag_rat_oplog::local_account(conn, 1).unwrap(),
+            rag_rat_oplog::AccountId::from_bytes([9; 32]),
+        )
+    }
+
     fn source_hash_of(conn: &Connection, memory_id: &str) -> Option<String> {
         conn.query_row(
             "SELECT source_text_hash FROM repo_memories WHERE id = ?1",
@@ -2124,6 +2163,167 @@ mod tests {
 
         assert_eq!(bindings_of(&conn, "mem_peer"), vec![("chunk".to_string(), "43".to_string())]);
         assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_B.to_string()));
+    }
+
+    /// A set this store's own account authored reaches it through `anchors/1` too, which carries
+    /// every later rebind and relocation — so the drain converges nothing onto rows it holds. The
+    /// renamed symbol and the re-chunked chunk `anchors/1` delivered are newer than the snapshot
+    /// naming their earlier forms, and a memory holding nothing is still seeded.
+    #[test]
+    fn an_own_authored_set_writes_nothing_over_rows_the_store_holds() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (own, _) = own_and_foreign_accounts(&conn);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_anchors_author(&conn, stream, "mem_peer", &own);
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(
+            bindings_of(&conn, "mem_peer"),
+            vec![("symbol".to_string(), "src/lib.rs::run".to_string())],
+            "a memory holding nothing is seeded",
+        );
+        // `anchors/1` delivers the author's newer rows: a rename and a re-chunk.
+        conn.execute("DELETE FROM repo_memory_bindings WHERE memory_id = 'mem_peer'", []).unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'symbol', 'src/lib.rs::run_renamed', 'current', 1),
+                    (?1, 'mem_peer', 'chunk', '43', 'current', 1)",
+            [REPO],
+        )
+        .unwrap();
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::walk"), ("chunk", "42")]),
+        );
+        set_projected_anchors_author(&conn, stream, "mem_peer", &own);
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![
+            ("chunk".to_string(), "43".to_string()),
+            ("symbol".to_string(), "src/lib.rs::run_renamed".to_string()),
+        ]);
+    }
+
+    /// The own path stamps the author's hash without matching the held rows to the set: they are
+    /// this account's own, converging to the same rebind through `anchors/1`, so the hash lands
+    /// even while they catch up.
+    #[test]
+    fn an_own_authored_set_stamps_its_hash_while_the_rows_catch_up() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (own, _) = own_and_foreign_accounts(&conn);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_anchors_author(&conn, stream, "mem_peer", &own);
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        drain_worker(&conn, stream, 1_000);
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/other.rs::walk")]),
+        );
+        set_projected_anchors_author(&conn, stream, "mem_peer", &own);
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_B));
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::run".to_string()
+        )]);
+        assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_B.to_string()));
+    }
+
+    /// Even on the own path a memory holding no binding takes no hash: a chunk-only set seeds
+    /// nothing here, and the hash would describe nothing.
+    #[test]
+    fn an_own_authored_set_with_no_binding_held_takes_no_hash() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (own, _) = own_and_foreign_accounts(&conn);
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", Some(&[("chunk", "42")]));
+        set_projected_anchors_author(&conn, stream, "mem_peer", &own);
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        drain_worker(&conn, stream, 1_000);
+
+        assert!(bindings_of(&conn, "mem_peer").is_empty());
+        assert_eq!(source_hash_of(&conn, "mem_peer"), None);
+    }
+
+    /// The own path still records the applied digest, so when another account publishes the next
+    /// set the memory converges to it instead of taking the record-only branch.
+    #[test]
+    fn a_foreign_set_after_an_own_one_converges() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (own, foreign) = own_and_foreign_accounts(&conn);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_anchors_author(&conn, stream, "mem_peer", &own);
+        drain_worker(&conn, stream, 1_000);
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/other.rs::walk")]),
+        );
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/other.rs::walk".to_string()
+        )]);
+    }
+
+    /// And the other way: once the winning set is this account's own, the drain leaves the rows
+    /// it converged earlier to `anchors/1`, which carries the rebind that replaced them.
+    #[test]
+    fn an_own_set_after_a_foreign_one_writes_no_bindings() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (own, foreign) = own_and_foreign_accounts(&conn);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        drain_worker(&conn, stream, 1_000);
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/other.rs::walk")]),
+        );
+        set_projected_anchors_author(&conn, stream, "mem_peer", &own);
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::run".to_string()
+        )]);
     }
 
     /// Set one field of the first anchor in a projected node's published snapshot.

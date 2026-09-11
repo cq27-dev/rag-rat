@@ -1666,6 +1666,95 @@ fn a_symbol_binding_without_a_logical_handle_keeps_the_deterministic_pick() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A writer that updates a binding's portable columns in place — `anchors/1`, the synced-memory
+/// drain — keeps its checkout-local ids, so a rebind from a struct to its impl leaves the struct's
+/// ids beside the impl's kind. Validation must not trust an id whose symbol contradicts the
+/// binding's own kind, for the raw symbol id and the logical handle alike, or the memory stays on
+/// the struct.
+#[test]
+fn a_cached_id_that_contradicts_the_bindings_kind_is_not_trusted() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub struct Worker;\nimpl Worker {\n    pub fn run(&self) {}\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let ids = |kind: &str| -> (i64, i64) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT s.id, (SELECT m.logical_symbol_id FROM logical_symbol_members m
+                                WHERE m.symbol_id = s.id LIMIT 1)
+                   FROM symbols s WHERE s.name = 'Worker' AND s.kind = ?1",
+                [kind],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    let (struct_id, struct_logical) = ids("struct");
+    let (impl_id, impl_logical) = ids("impl");
+
+    for (title, bind) in [
+        ("raw symbol id", rag_rat_query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(struct_id),
+            ..Default::default()
+        }),
+        ("logical handle", rag_rat_query::memory::RepoMemoryBindTarget {
+            logical_symbol_id: Some(struct_logical),
+            ..Default::default()
+        }),
+    ] {
+        let memory_id = db
+            .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: format!("Bound to the Worker struct by {title}"),
+                body: format!("Rebound to the impl in place, keeping the {title}."),
+                confidence: "high".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: Vec::new(),
+                payload_json: None,
+                bind,
+            })
+            .unwrap()
+            .memory
+            .memory_id;
+        // The in-place rebind: the portable kind moves to the impl, the local ids stay the
+        // struct's.
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE repo_memory_bindings SET symbol_kind = 'impl' WHERE memory_id = ?1",
+                params![memory_id],
+            )
+            .unwrap();
+
+        db.memory_validate().unwrap();
+
+        let (symbol_id, logical_id): (Option<i64>, Option<i64>) = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT symbol_id, logical_symbol_id FROM repo_memory_bindings
+                  WHERE memory_id = ?1 AND binding_kind IN ('symbol', 'logical_symbol')",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            symbol_id == Some(impl_id) || logical_id == Some(impl_logical),
+            "bound by {title}: the memory must land on the impl, not stay on the struct \
+             ({symbol_id:?}/{logical_id:?})",
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Each trait sits on the line AFTER `impl` so both impl symbols capture the same signature text,
 /// which is what leaves the logical handle as the only discriminator.
 const TWO_TRAIT_IMPLS_FIXTURE: &str = "pub struct Twin;\npub trait Alpha { fn run(&self); }\npub \

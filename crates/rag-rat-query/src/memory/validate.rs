@@ -45,7 +45,8 @@ pub(crate) fn validate_logical_symbol_binding(
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
     if let Some(id) = binding.logical_symbol_id
-        && crate::symbol::lookup_logical_by_id(conn, id)?.is_some()
+        && let Some(hit) = crate::symbol::lookup_logical_by_id(conn, id)?
+        && cached_kind_agrees(binding, &hit.kind)
     {
         // The logical symbol is live. Its id is content-derived and STABLE across reindex, but
         // chunk ids are reassigned on every re-chunk — so the stored `chunk_id` is stale whenever
@@ -146,6 +147,17 @@ pub(crate) fn validate_logical_symbol_binding(
     }
     relocate_via_moniker_or_gone(conn, binding)
 }
+/// Whether a cached id may be trusted for this binding: its symbol's kind does not contradict the
+/// binding's own. Ids are checkout-local and the kind is portable, so a writer that updates a
+/// binding's portable columns in place — `anchors/1`'s row update, the synced-memory drain — keeps
+/// the previous target's ids: after a struct→impl rebind they still name the struct. A contradicted
+/// id is not trusted; the binding falls through to the relocation pick, which discounts a
+/// contradicting handle the same way. A symbol row's kind never changes under one id (ids are
+/// replaced per file on reindex), so this rejects only an id that belongs to another target.
+fn cached_kind_agrees(binding: &RepoMemoryBinding, kind: &str) -> bool {
+    binding.symbol_kind.as_deref().is_none_or(|bound| bound == kind)
+}
+
 /// A live logical-symbol row sharing the dead binding's qualified name — a relocation candidate.
 struct RelocationTwin {
     id: i64,
@@ -209,6 +221,7 @@ pub(crate) fn validate_symbol_binding(
 ) -> anyhow::Result<String> {
     if let Some(id) = binding.symbol_id
         && let Some(hit) = crate::symbol::lookup_by_id(conn, id)?
+        && cached_kind_agrees(binding, &hit.kind)
     {
         // The row id proves WHICH symbol this is; `binding_id` is only the qualified name every
         // later relocation searches by. A rename in place — an index upgrade re-deriving an impl's

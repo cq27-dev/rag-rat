@@ -25,8 +25,8 @@
 use std::collections::BTreeMap;
 
 use super::op::{
-    self, EdgeKey, EdgeSpec, Entry, MemoryOp, NodeContent, NodeId, NodeStatus, PortableAnchor,
-    ResolvedAnchor,
+    self, EdgeKey, EdgeSpec, Entry, MemoryOp, NodeContent, NodeId, NodeStatus, OpMeta,
+    PortableAnchor, ResolvedAnchor,
 };
 
 /// The converged projection: existing nodes (content + status) and present edges (spec + resolved
@@ -58,6 +58,11 @@ pub struct ProjectedNode {
     /// The hash of the source text the author anchored to, or `None` when none was published.
     /// `None` surfaces UNMARKED downstream — an absent hash is not evidence of drift.
     pub source_text_hash: Option<String>,
+    /// The `(lamport, device)` of the entry whose `NodeAnchors` won the anchors register, or
+    /// `None` with no set folded. The content projection maps it to that entry's author
+    /// account, which is how the drain tells a set its own account's `anchors/1` already
+    /// carries from one only the snapshot can deliver.
+    pub anchors_meta: Option<OpMeta>,
 }
 
 /// A projected edge: its winning spec (from the last add) and its last resolved anchor, if any.
@@ -74,7 +79,7 @@ struct NodeAccum {
     exists: bool,
     content: Option<NodeContent>,
     status: Option<NodeStatus>,
-    anchors: Option<Vec<PortableAnchor>>,
+    anchors: Option<(Vec<PortableAnchor>, OpMeta)>,
     source_text_hash: Option<String>,
 }
 
@@ -166,7 +171,7 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                 // per-binding merge, so a later op saying "these two" retires a binding the
                 // earlier one named.
                 nodes.entry(node_id.clone()).or_default().anchors =
-                    Some(canonical_anchors(anchors));
+                    Some((canonical_anchors(anchors), entry.meta));
             },
             // Inert boundary marker this increment (§5.4/C4).
             MemoryOp::Snapshot => {},
@@ -196,11 +201,16 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
             .filter_map(|(id, acc)| {
                 // Exists iff a create was seen; existence guarantees a content register.
                 let content = acc.exists.then_some(acc.content).flatten()?;
+                let (anchors, anchors_meta) = match acc.anchors {
+                    Some((anchors, meta)) => (Some(anchors), Some(meta)),
+                    None => (None, None),
+                };
                 Some((id, ProjectedNode {
                     content,
                     status: acc.status.unwrap_or_default(),
-                    anchors: acc.anchors,
+                    anchors,
                     source_text_hash: acc.source_text_hash,
+                    anchors_meta,
                 }))
             })
             .collect(),
@@ -291,6 +301,25 @@ mod tests {
             let hash_from_x = node.source_text_hash.as_deref() == Some("hx");
             assert_eq!(anchors_from_x, hash_from_x, "writers at {x}/{y} split the pair");
         }
+    }
+
+    /// The anchors register remembers WHICH entry won it — the content projection maps that entry
+    /// to its author account — by the same `(lamport, device)` order as the set itself, the device
+    /// breaking a tie.
+    #[test]
+    fn the_anchors_register_records_its_winning_entry() {
+        let state = project(&[
+            at(1, 1, create("mem_1", "t")),
+            at(4, 2, anchors_op("mem_1", &["b"])),
+            at(4, 3, anchors_op("mem_1", &["c"])),
+            at(3, 9, anchors_op("mem_1", &["a"])),
+        ]);
+        let node = &state.nodes[&NodeId::from("mem_1")];
+        assert_eq!(node.anchors.as_ref().unwrap()[0].binding_id, "c");
+        assert_eq!(node.anchors_meta, Some(OpMeta { lamport: 4, device: device(3) }));
+
+        let unanchored = project(&[at(1, 1, create("mem_2", "t"))]);
+        assert_eq!(unanchored.nodes[&NodeId::from("mem_2")].anchors_meta, None);
     }
 
     fn anchors_op(id: &str, binding_ids: &[&str]) -> MemoryOp {

@@ -1653,7 +1653,7 @@ mod tests {
     #[test]
     fn an_authored_anchor_snapshot_projects_onto_its_node() {
         let conn = db();
-        let (_account, stream) = owned_v2(&conn);
+        let (account, stream) = owned_v2(&conn);
         let anchors = vec![op::PortableAnchor {
             binding_kind: "symbol".to_string(),
             binding_id: "src/lib.rs::run".to_string(),
@@ -1686,6 +1686,11 @@ mod tests {
             .expect("read the projection");
         let node = nodes.iter().find(|node| node.node_id == "n1").expect("the node projects");
         assert_eq!(node.anchors.as_deref(), Some(anchors.as_slice()), "every field survives");
+        assert_eq!(
+            node.anchors_author,
+            Some(account),
+            "the projection records which account authored the winning anchor set",
+        );
 
         // A projector rebuild re-derives the anchors from the RETAINED accepted entries rather than
         // from the projection rows it just cleared — the path an older binary's opaquely-retained
