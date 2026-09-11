@@ -169,6 +169,13 @@ struct RelocationTwin {
 /// `None` evidence on the binding degrades gracefully: every candidate scores equally on the axes
 /// it can't speak to, and the id tiebreak decides, matching the behavior for bindings that predate
 /// the V014 discriminators.
+///
+/// A handle that CONTRADICTS the binding's own kind is stale, not evidence, and earns nothing. The
+/// handle is checkout-local and the kind is portable, so a writer that updates a binding's portable
+/// columns in place — `anchors/1`, or the synced-memory drain moving it to its author's new target
+/// — can leave the previous target's handle behind: a rebind from a struct to its impl keeps the
+/// struct's handle beside the impl's kind, and crediting it would put the binding back on the
+/// struct.
 fn pick_relocation_twin(
     candidates: Vec<RelocationTwin>,
     binding: &RepoMemoryBinding,
@@ -176,11 +183,11 @@ fn pick_relocation_twin(
     candidates
         .into_iter()
         .map(|twin| {
+            let kind_agrees = binding.symbol_kind.as_deref() == Some(twin.kind.as_str());
             let group_agrees = matches!(
                 (binding.logical_symbol_id, twin.logical_symbol_id),
                 (Some(bound), Some(group)) if bound == group
-            );
-            let kind_agrees = binding.symbol_kind.as_deref() == Some(twin.kind.as_str());
+            ) && (binding.symbol_kind.is_none() || kind_agrees);
             let signature_agrees = match (binding.signature_hash.as_deref(), &twin.signature) {
                 (Some(bound), Some(sig)) => bound == hex_sha256(sig.trim().as_bytes()),
                 _ => false,
@@ -1205,6 +1212,50 @@ mod call_path_receiver_type_hint_tests {
         )
         .unwrap();
         symbol_id
+    }
+
+    fn relocation_twin(id: i64, kind: &str, group: i64) -> RelocationTwin {
+        RelocationTwin {
+            id,
+            path: "src/lib.rs".to_string(),
+            kind: kind.to_string(),
+            signature: None,
+            logical_symbol_id: Some(group),
+        }
+    }
+
+    /// A handle that contradicts the binding's own kind is stale, not evidence. A writer that
+    /// updates a binding's portable columns in place keeps its checkout-local handle, so a rebind
+    /// from a struct to its impl leaves the struct's handle beside the impl's kind — crediting it
+    /// would put the binding back on the struct.
+    #[test]
+    fn a_handle_that_contradicts_the_bindings_kind_does_not_pick_its_twin() {
+        let binding = RepoMemoryBinding {
+            symbol_kind: Some("impl".to_string()),
+            logical_symbol_id: Some(7),
+            ..call_path_binding("mem", "seq")
+        };
+        let picked = pick_relocation_twin(
+            vec![relocation_twin(1, "struct", 7), relocation_twin(2, "impl", 8)],
+            &binding,
+        );
+        assert_eq!(picked.map(|(id, _)| id), Some(2));
+    }
+
+    /// Where the handle agrees with the kind it still decides: two impls of different traits for
+    /// one type share the name, the kind and the signature, and only the handle tells them apart.
+    #[test]
+    fn a_handle_that_agrees_with_the_kind_still_separates_trait_impl_twins() {
+        let binding = RepoMemoryBinding {
+            symbol_kind: Some("impl".to_string()),
+            logical_symbol_id: Some(8),
+            ..call_path_binding("mem", "seq")
+        };
+        let picked = pick_relocation_twin(
+            vec![relocation_twin(1, "impl", 7), relocation_twin(2, "impl", 8)],
+            &binding,
+        );
+        assert_eq!(picked.map(|(id, _)| id), Some(2));
     }
 
     fn call_path_binding(memory_id: &str, edge_sequence_hash: &str) -> RepoMemoryBinding {
