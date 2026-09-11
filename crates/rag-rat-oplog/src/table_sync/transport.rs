@@ -214,8 +214,9 @@ pub const OVERLAY_ACCEPTED_RETENTION: u64 = 256;
 
 /// `distill/1` is higher-churn than overlay: one record regeneration authors a burst of entries
 /// across the cluster, so the budget must clear several full-cluster regenerations before the
-/// retained floor advances. A large initial backfill exceeds this immediately and converges through
-/// the retained-floor/compaction path — by design, not loss.
+/// retained floor advances. A large initial backfill is all live rows, which pin their chain over
+/// budget until later regenerations supersede them — retention never drops a row a peer still
+/// needs (#1277).
 pub const DISTILL_ACCEPTED_RETENTION: u64 = 512;
 
 pub fn scope_retention_budget(scope_id: &str) -> Option<u64> {
@@ -226,16 +227,24 @@ pub fn scope_retention_budget(scope_id: &str) -> Option<u64> {
     }
 }
 
+/// The most pins one compaction pass re-authors on a chain: bounds the pass's signing and transfer
+/// cost. A longer paying run moves over later passes.
+const COMPACTION_REAUTHOR_MAX: usize = 64;
+
 /// Compact accepted chain prefixes for scopes whose retention policy bounds them (#1127).
 ///
 /// `retain` answers the per-chain accepted-entry budget for a scope, `None` for full retention
-/// (anchors/1 stays unbounded). A chain with more RECLAIMABLE entries than its budget compacts to
-/// keep its newest; chains within budget are untouched. Entries retained for forward-compat
-/// replay (`pending_reason IS NOT NULL`) are neither counted nor dropped — a chain pinned above
-/// budget by pending entries makes the computed floor not advance, which is a steady-state no-op,
-/// never an error, so the driver is safely re-runnable on any cadence. Each stream compacts in
-/// its own IMMEDIATE transaction, and the caller's authoring pass already ran, so a winner
-/// restamp never disowns an unsent local edit (see the retention module docs).
+/// (anchors/1 stays unbounded). A chain with more RECLAIMABLE entries than its budget compacts
+/// toward keeping its newest; chains within budget are untouched. Entries retained for
+/// forward-compat replay (`pending_reason IS NOT NULL`) are neither counted nor dropped.
+///
+/// Only superseded entries drop (#1277, see the retention module docs): the floor clamps at the
+/// chain's oldest pin. On this device's own chain the driver first re-authors the oldest pins at
+/// the tail — the longest run whose move frees at least twice the entries it authors, at most
+/// [`COMPACTION_REAUTHOR_MAX`] per pass — and re-authors any row a store compacted before the pin
+/// rule left below its floor. A foreign chain is never re-authored. A floor that does not advance
+/// is a steady-state no-op, never an error, so the driver is safely re-runnable on any cadence.
+/// Each stream compacts in its own IMMEDIATE transaction.
 ///
 /// Returns the number of accepted entries reclaimed.
 pub fn table_sync_compact_overdue(
@@ -244,15 +253,48 @@ pub fn table_sync_compact_overdue(
     now_ms: i64,
     retain: &dyn Fn(&str) -> Option<u64>,
 ) -> anyhow::Result<usize> {
-    let streams = supported_streams_against(conn, account_id, SYNCABLE_TABLES)?;
-    let registry = repo_registry(SYNCABLE_TABLES);
+    compact_overdue_against(conn, account_id, now_ms, retain, SYNCABLE_TABLES)
+}
+
+fn compact_overdue_against(
+    conn: &Connection,
+    account_id: AccountId,
+    now_ms: i64,
+    retain: &dyn Fn(&str) -> Option<u64>,
+    registry: &[TableSpec],
+) -> anyhow::Result<usize> {
+    let streams = supported_streams_against(conn, account_id, registry)?;
+    let device = crate::local_device(conn, now_ms)?;
+    let local = device.fingerprint();
+    let writer = account::device_is_effective_writer(conn, account_id, local)?;
+    let _durability = writer.then(|| crate::AuthoredDurability::begin(conn)).transpose()?;
     let mut compacted = 0;
     for stream in streams {
         let Some(keep) = retain(&stream.scope_id) else {
             continue;
         };
         anyhow::ensure!(keep >= 1, "a retention budget of zero keeps no chain tail to build on");
+        let stream_id = StreamId::from_bytes(stream.stream_id);
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let ctx = writer.then(|| SyncCtx {
+            repo_id: &stream.repo_id,
+            account_id,
+            incarnation_ref: stream.incarnation_ref,
+            device: &device,
+            registry,
+            now_ms,
+        });
+        // A store compacted before the pin rule may have dropped the entries carrying live rows
+        // below its floor: peers that folded only the retained suffix never received those rows.
+        // Carrying them to the tail repairs that once; afterwards nothing pins below the floor.
+        // Each moves on its own, so a row that cannot be carried today holds back no other.
+        if let Some(ctx) = &ctx
+            && let Some(floor) = retention::retained_floor(&tx, stream_id, local)?
+        {
+            for pin in retention::chain_pins(&tx, stream_id, local, 0, floor, usize::MAX)? {
+                engine::reauthor_chain_pins(&tx, ctx, &stream.scope_id, stream_id, &[pin])?;
+            }
+        }
         let chains = {
             let mut stmt = tx.prepare(
                 "SELECT device_fingerprint, COUNT(*) FROM table_sync_entries
@@ -269,21 +311,21 @@ pub fn table_sync_compact_overdue(
             if count <= keep {
                 continue;
             }
-            // The floor is the oldest RECLAIMABLE entry to retain: the one at offset
+            let chain = crate::op::DeviceFingerprint::from_bytes(fixed32(device_bytes)?);
+            // The budget floor is the oldest RECLAIMABLE entry to retain: the one at offset
             // (count - keep) in lamport order. compact_chain_prefix drops strictly below it.
-            let floor_lamport: i64 = tx.query_row(
+            let target: i64 = tx.query_row(
                 "SELECT lamport FROM table_sync_entries
                  WHERE stream_id = ?1 AND device_fingerprint = ?2 AND pending_reason IS NULL
                  ORDER BY lamport LIMIT 1 OFFSET ?3",
                 params![
                     stream.stream_id.as_slice(),
-                    device_bytes.as_slice(),
+                    chain.to_bytes().as_slice(),
                     i64::try_from(count - keep)?
                 ],
                 |row| row.get(0),
             )?;
-            let floor_lamport = u64::try_from(floor_lamport)?;
-            let device = crate::op::DeviceFingerprint::from_bytes(fixed32(device_bytes)?);
+            let target = u64::try_from(target)?;
             // A pending entry below the computed floor would survive locally yet become
             // unreachable to floor-adopting peers (served early it parks and is swept; served
             // late it reads as already-present) — silent loss of the forward-compat payload it
@@ -294,36 +336,91 @@ pub fn table_sync_compact_overdue(
                     "SELECT MIN(lamport) FROM table_sync_entries
                      WHERE stream_id = ?1 AND device_fingerprint = ?2
                        AND pending_reason IS NOT NULL",
-                    params![stream.stream_id.as_slice(), device.to_bytes().as_slice()],
+                    params![stream.stream_id.as_slice(), chain.to_bytes().as_slice()],
                     |row| row.get(0),
                 )
                 .optional()?
                 .flatten();
-            let floor_lamport = match lowest_pending {
-                Some(pending) if (pending as u64) < floor_lamport => pending as u64,
-                _ => floor_lamport,
+            let target = match lowest_pending {
+                Some(pending) if (pending as u64) < target => pending as u64,
+                _ => target,
             };
-            // A chain pinned by pending entries (or simply already compacted past this point)
-            // computes a floor that does not advance: steady state, not the caller bug
-            // compact_chain_prefix's refusal exists to catch.
-            if retention::retained_floor(&tx, StreamId::from_bytes(stream.stream_id), device)?
-                .is_some_and(|current| floor_lamport <= current)
-            {
+            let from = retention::retained_floor(&tx, stream_id, chain)?.unwrap_or(0);
+            if target <= from {
                 continue;
             }
-            let report = retention::compact_chain_prefix(
-                &tx,
-                StreamId::from_bytes(stream.stream_id),
-                device,
-                floor_lamport,
-                &registry,
-                now_ms,
-            )?;
-            compacted += report.dropped_entries;
+            // The writer's own chain weighs its whole run of pins; any other needs only the oldest.
+            let reauthor = ctx.as_ref().filter(|_| chain == local);
+            let limit = if reauthor.is_some() { usize::MAX } else { 1 };
+            let pins = retention::chain_pins(&tx, stream_id, chain, from, target, limit)?;
+            let floor = match (reauthor, pins.first()) {
+                (_, None) => target,
+                (Some(ctx), Some(_)) => {
+                    let worth = pins_worth_reauthoring(&tx, stream_id, chain, &pins, target)?;
+                    let moved = engine::reauthor_chain_pins(
+                        &tx,
+                        ctx,
+                        &stream.scope_id,
+                        stream_id,
+                        &pins[..worth.min(COMPACTION_REAUTHOR_MAX)],
+                    )?;
+                    pins.get(moved).map_or(target, |pin| pin.lamport)
+                },
+                (None, Some(oldest)) => oldest.lamport,
+            };
+            // A chain pinned at its bottom (or already compacted past this point) computes a
+            // floor that does not advance: steady state, not the caller bug compact_chain_prefix's
+            // refusal exists to catch.
+            if floor <= from {
+                continue;
+            }
+            compacted += retention::compact_chain_prefix(&tx, stream_id, chain, floor, now_ms)?
+                .dropped_entries;
         }
         tx.commit()?;
     }
     Ok(compacted)
+}
+
+/// How many of the chain's oldest `pins` are worth re-authoring: the largest `k` whose move frees
+/// at least `2k` entries, so every entry authored reclaims at least one more. Zero when no prefix
+/// pays for itself — a chain that is all pins authors nothing, however far over budget.
+///
+/// Weighed over the whole run, not the per-pass cap: a paying move longer than the cap proceeds
+/// over several passes, each one freeing at least the entries it authors. Weighing only the capped
+/// prefix would stall for good behind more cold pins than the cap.
+fn pins_worth_reauthoring(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    chain: crate::op::DeviceFingerprint,
+    pins: &[retention::Pin],
+    target: u64,
+) -> anyhow::Result<usize> {
+    // Everything below `target` is reclaimable (the target clamps at the lowest pending entry).
+    let lamports = tx
+        .prepare(
+            "SELECT lamport FROM table_sync_entries
+             WHERE stream_id = ?1 AND device_fingerprint = ?2 AND lamport < ?3
+             ORDER BY lamport",
+        )?
+        .query_map(
+            params![
+                stream.to_bytes().as_slice(),
+                chain.to_bytes().as_slice(),
+                i64::try_from(target)?
+            ],
+            |row| row.get::<_, i64>(0),
+        )?
+        .map(|lamport| Ok(u64::try_from(lamport?)?))
+        .collect::<anyhow::Result<Vec<u64>>>()?;
+    let mut worth = 0;
+    for k in 1..=pins.len() {
+        let bound = pins.get(k).map_or(target, |pin| pin.lamport);
+        if lamports.partition_point(|&lamport| lamport < bound) >= 2 * k {
+            worth = k;
+        }
+    }
+    Ok(worth)
 }
 
 /// Recompute an advertised route from local current-incarnation authority and the production
@@ -785,6 +882,7 @@ mod tests {
 
     use super::*;
     use crate::table_sync::registry::{ColumnSpec, ValueType};
+    use crate::table_sync::{Cell, RowOp, TypedValue};
 
     const INCARNATION: [u8; 32] = [0x24; 32];
 
@@ -1537,25 +1635,6 @@ mod tests {
 
     #[test]
     fn accepted_transfer_is_idempotent_and_obeys_the_current_roster_write_gate() {
-        fn add_repo_state(conn: &Connection, account: AccountId) {
-            conn.execute_batch(
-                "CREATE TABLE t_transport(
-                     repo_id TEXT NOT NULL,
-                     id TEXT NOT NULL,
-                     title TEXT NOT NULL,
-                     PRIMARY KEY(repo_id, id)
-                 ) STRICT;",
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO account_repo_incarnation_current(
-                     account_id, repository_id, incarnation_ref
-                 ) VALUES (?1, 'repo-a', ?2)",
-                params![account.to_bytes().as_slice(), INCARNATION.as_slice()],
-            )
-            .unwrap();
-        }
-
         let mut source = Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&source, &crate::test_hooks()).unwrap();
         let account = crate::local_account(&source, 0).unwrap();
@@ -1641,5 +1720,484 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM table_sync_entries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(accepted, 0, "a removed writer reaches no accepted table history");
+    }
+
+    /// The synthetic repo table plus a current incarnation for `repo-a`.
+    fn add_repo_state(conn: &Connection, account: AccountId) {
+        conn.execute_batch(
+            "CREATE TABLE t_transport(
+                 repo_id TEXT NOT NULL,
+                 id TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 PRIMARY KEY(repo_id, id)
+             ) STRICT;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_repo_incarnation_current(
+                 account_id, repository_id, incarnation_ref
+             ) VALUES (?1, 'repo-a', ?2)",
+            params![account.to_bytes().as_slice(), INCARNATION.as_slice()],
+        )
+        .unwrap();
+    }
+
+    /// A store whose local device owns a real account, so it is a roster-effective writer and a
+    /// peer can verify its entries.
+    fn writer_store() -> (Connection, AccountId) {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&conn, 0).unwrap();
+        add_repo_state(&conn, account);
+        (conn, account)
+    }
+
+    /// A fresh device that has folded `source`'s account log but holds no table history, and is
+    /// not a writer of that account.
+    fn peer_of(source: &Connection, account: AccountId) -> Connection {
+        let peer = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&peer, &crate::test_hooks()).unwrap();
+        crate::local_device(&peer, 0).unwrap();
+        for entry in crate::account_entries_for_sync(source, account).unwrap() {
+            crate::account_ingest(&peer, &entry.signed_bytes, 0).unwrap();
+        }
+        add_repo_state(&peer, account);
+        peer
+    }
+
+    fn write(conn: &Connection, id: &str, title: &str) {
+        conn.execute(
+            "INSERT OR REPLACE INTO t_transport(repo_id, id, title) VALUES ('repo-a', ?1, ?2)",
+            params![id, title],
+        )
+        .unwrap();
+    }
+
+    fn author(conn: &Connection, account: AccountId) {
+        let local = crate::load_local_device(conn).unwrap().unwrap();
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let ctx = SyncCtx {
+            repo_id: "repo-a",
+            account_id: account,
+            incarnation_ref: INCARNATION,
+            device: &local,
+            registry: &[REPO_SPEC],
+            now_ms: 0,
+        };
+        engine::produce_and_author(&tx, &ctx).unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// `write` then `author`, once per title: successive writes to one row.
+    fn rewrite(conn: &Connection, account: AccountId, id: &str, times: usize) {
+        for i in 0..times {
+            write(conn, id, &format!("v{i}"));
+            author(conn, account);
+        }
+    }
+
+    fn compact(conn: &Connection, account: AccountId, keep: u64) -> usize {
+        compact_overdue_against(conn, account, 9, &|_| Some(keep), &[REPO_SPEC]).unwrap()
+    }
+
+    fn chain_lamports(conn: &Connection) -> Vec<i64> {
+        conn.prepare("SELECT lamport FROM table_sync_entries ORDER BY lamport")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn live_rows(conn: &Connection) -> Vec<(String, String)> {
+        conn.prepare("SELECT id, title FROM t_transport ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Live rows and orphan tombstones whose carrying entry is gone: what a peer folding only the
+    /// retained log can never learn.
+    fn stranded_rows(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT stream_id, device_fingerprint, lamport FROM sync_row_clocks
+                 UNION ALL
+                 SELECT t.stream_id, t.device_fingerprint, t.lamport FROM sync_row_tombstones t
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM sync_row_clocks c
+                     WHERE c.stream_id = t.stream_id AND c.table_name = t.table_name
+                       AND c.row_pk = t.row_pk
+                 )
+             ) p
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM table_sync_entries e
+                 WHERE e.stream_id = p.stream_id AND e.lamport = p.lamport
+                   AND lower(hex(e.device_fingerprint)) = p.device_fingerprint
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Offer every chain of `source` to `peer` as a session planning a fresh or below-floor peer
+    /// does: from the recorded floor (advertised on the floor entry), else from the beginning.
+    /// Re-offers of entries the peer holds read idempotent.
+    fn sync_chains(source: &Connection, peer: &Connection, account: AccountId) {
+        let route = supported_streams_against(source, account, &[REPO_SPEC]).unwrap().remove(0);
+        for head in accepted_chain_page(source, route.stream_id, None, 16).unwrap() {
+            let start =
+                head.floor.map_or(TableSyncEntryStart::Beginning, |(lamport, entry_hash)| {
+                    TableSyncEntryStart::At { lamport, entry_hash }
+                });
+            for entry in accepted_chain_entries(
+                source,
+                route.stream_id,
+                head.device_fingerprint,
+                start,
+                1024,
+            )
+            .unwrap()
+            {
+                let floor = head.floor.filter(|(lamport, _)| *lamport == entry.lamport);
+                ingest_against(
+                    peer,
+                    account,
+                    &route,
+                    head.device_fingerprint,
+                    &entry.signed_bytes,
+                    1,
+                    floor,
+                    &[REPO_SPEC],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// The #1277 probe: more live rows than the budget. Every entry carries a row, so nothing is
+    /// reclaimable and nothing is worth re-authoring — the chain stays honestly over budget.
+    #[test]
+    fn live_rows_past_the_budget_are_kept_and_nothing_is_reauthored() {
+        let (a, account) = writer_store();
+        for i in 0..5 {
+            write(&a, &format!("r{i}"), "v");
+        }
+        author(&a, account);
+        assert_eq!(compact(&a, account, 4), 0);
+        assert_eq!(compact(&a, account, 4), 0, "a second pass authors nothing either");
+        assert_eq!(chain_lamports(&a), vec![0, 1, 2, 3, 4]);
+        let floors: i64 = a
+            .query_row("SELECT COUNT(*) FROM table_sync_retained_floors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(floors, 0, "no floor is recorded for a chain that cannot shrink");
+
+        let peer = peer_of(&a, account);
+        sync_chains(&a, &peer, account);
+        assert_eq!(live_rows(&peer), live_rows(&a));
+    }
+
+    /// The writer's own chain moves its oldest pins to the tail when that pays — here two entries
+    /// authored free eight — and settles once the chain is only its pins.
+    #[test]
+    fn the_writer_reauthors_its_oldest_pins_when_that_frees_twice_as_much() {
+        let (a, account) = writer_store();
+        write(&a, "a", "a");
+        write(&a, "b", "b");
+        author(&a, account); // a@0, b@1
+        rewrite(&a, account, "c", 8); // c@2..9, only c@9 live
+
+        assert_eq!(compact(&a, account, 2), 8, "moving a and b clears the way to the budget floor");
+        assert_eq!(chain_lamports(&a), vec![8, 9, 10, 11]);
+        assert_eq!(stranded_rows(&a), 0);
+
+        assert_eq!(compact(&a, account, 2), 2, "moving c frees c@8 and c@9");
+        assert_eq!(compact(&a, account, 2), 0, "moving a to free one entry does not pay");
+        assert_eq!(chain_lamports(&a), vec![10, 11, 12], "three live rows, three entries");
+        assert_eq!(stranded_rows(&a), 0);
+
+        let peer = peer_of(&a, account);
+        sync_chains(&a, &peer, account);
+        assert_eq!(live_rows(&peer), live_rows(&a), "a fresh peer folds every live row");
+    }
+
+    /// Moving pins is worth it only when every entry authored reclaims at least one more: two
+    /// moved to free three is refused, and the floor clamps at the oldest pin instead.
+    #[test]
+    fn moving_pins_that_free_less_than_twice_their_cost_does_not_pay() {
+        let (a, account) = writer_store();
+        write(&a, "a", "a");
+        write(&a, "b", "b");
+        author(&a, account); // a@0, b@1
+        rewrite(&a, account, "c", 2); // c@2, c@3
+
+        assert_eq!(compact(&a, account, 1), 0);
+        assert_eq!(chain_lamports(&a), vec![0, 1, 2, 3], "nothing authored or dropped");
+    }
+
+    /// A peer compacted before the pin rule may hold a foreign chain whose pins sit below its
+    /// floor, with their entries gone. Nothing can carry those forward, and they must not wedge
+    /// compaction of the region above the floor.
+    #[test]
+    fn a_foreign_chain_stranded_below_an_earlier_floor_still_compacts() {
+        let (a, account) = writer_store();
+        write(&a, "a", "a");
+        author(&a, account); // a@0
+        rewrite(&a, account, "c", 8); // c@1..8, only c@8 live
+        let peer = peer_of(&a, account);
+        sync_chains(&a, &peer, account);
+        let route = supported_streams_against(&peer, account, &[REPO_SPEC]).unwrap().remove(0);
+        let writer = crate::load_local_device(&a).unwrap().unwrap().fingerprint();
+        {
+            let tx = Transaction::new_unchecked(&peer, TransactionBehavior::Immediate).unwrap();
+            let floor_hash: Vec<u8> = tx
+                .query_row(
+                    "SELECT entry_hash FROM table_sync_entries WHERE lamport = 4",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            tx.execute("DELETE FROM table_sync_entries WHERE lamport < 4", []).unwrap();
+            retention::record_adopted_floor(
+                &tx,
+                StreamId::from_bytes(route.stream_id),
+                writer,
+                4,
+                fixed32(floor_hash).unwrap(),
+                0,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(stranded_rows(&peer), 1, "a@0 is gone below the floor");
+
+        assert_eq!(compact(&peer, account, 2), 3, "entries 4, 5 and 6 above the floor drop");
+        assert_eq!(chain_lamports(&peer), vec![7, 8]);
+    }
+
+    /// More cold pins than one pass may carry, under a churning row: the paying move spans several
+    /// passes instead of stalling behind the cap, and the chain reaches its budget.
+    #[test]
+    fn a_run_of_pins_longer_than_the_pass_cap_still_reaches_the_budget() {
+        let (a, account) = writer_store();
+        for i in 0..=COMPACTION_REAUTHOR_MAX {
+            write(&a, &format!("cold{i:03}"), "v");
+        }
+        author(&a, account); // 65 cold rows at 0..=64
+        rewrite(&a, account, "hot", 200); // 65..=264, only the last live
+
+        let mut passes = Vec::new();
+        loop {
+            let reclaimed = compact(&a, account, 100);
+            if reclaimed == 0 {
+                break;
+            }
+            passes.push(reclaimed);
+            assert!(passes.len() < 8, "compaction settles: {passes:?}");
+        }
+        assert_eq!(passes, vec![64, 165, 1], "carry 64, then the last cold pin, then the budget");
+        assert_eq!(chain_lamports(&a).len(), 100, "the chain is at its budget");
+        assert_eq!(stranded_rows(&a), 0);
+
+        let peer = peer_of(&a, account);
+        sync_chains(&a, &peer, account);
+        assert_eq!(live_rows(&peer), live_rows(&a));
+    }
+
+    /// An accepted entry this binary cannot apply yet may be a newer write to a pinned row, on any
+    /// chain. Re-authoring the pin above it would overwrite that write on up-to-date peers, so the
+    /// pin stays until the entry replays.
+    #[test]
+    fn a_parked_newer_write_holds_the_pins_below_it() {
+        let (a, account) = writer_store();
+        write(&a, "a", "a");
+        write(&a, "b", "b");
+        author(&a, account); // a@0, b@1
+        rewrite(&a, account, "c", 8); // c@2..9
+        let route = supported_streams_against(&a, account, &[REPO_SPEC]).unwrap().remove(0);
+        a.execute(
+            "INSERT INTO table_sync_entries(
+                 entry_hash, stream_id, device_fingerprint, lamport, signed_bytes, received_at_ms,
+                 pending_reason
+             ) VALUES (x'77', ?1, ?2, 5, x'00', 0, 'newer_spec_version')",
+            params![route.stream_id.as_slice(), [2u8; 32].as_slice()],
+        )
+        .unwrap();
+
+        assert_eq!(compact(&a, account, 2), 0, "a and b stay below the parked write");
+        assert_eq!(chain_lamports(&a).len(), 11, "ten local entries and the parked one");
+
+        a.execute(
+            "UPDATE table_sync_entries SET pending_reason = NULL WHERE entry_hash = x'77'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(compact(&a, account, 2), 8, "once it replays, the pins move");
+    }
+
+    /// A retained entry at the transport limit grows when re-signed under a predecessor hash. The
+    /// pin it carries cannot move, and must clamp the floor rather than fail every session.
+    #[test]
+    fn a_pin_too_large_to_resign_stays_pinned() {
+        let (a, account) = writer_store();
+        let route = supported_streams_against(&a, account, &[REPO_SPEC]).unwrap().remove(0);
+        let local = crate::load_local_device(&a).unwrap().unwrap();
+        let genesis_len = |title: &str| {
+            let op = RowOp::Upsert {
+                table: "t_transport".to_string(),
+                spec_version: 1,
+                pk: vec![
+                    TypedValue::Text("repo-a".to_string()),
+                    TypedValue::Text("big".to_string()),
+                ],
+                cells: vec![Cell {
+                    column: "title".to_string(),
+                    value: TypedValue::Text(title.to_string()),
+                }],
+            };
+            crate::entry::sign_entry_from_op_bytes(
+                local.secret(),
+                StreamId::from_bytes(route.stream_id),
+                None,
+                0,
+                super::super::row_op::encode(&op),
+            )
+            .signed_bytes
+            .len()
+        };
+        let probe = super::super::TABLE_SYNC_ENTRY_MAX_BYTES - 256;
+        let title = "x".repeat(
+            probe + super::super::TABLE_SYNC_ENTRY_MAX_BYTES - genesis_len(&"x".repeat(probe)),
+        );
+        write(&a, "big", &title);
+        author(&a, account); // big@0, exactly at the limit
+        let stored: i64 = a
+            .query_row(
+                "SELECT length(signed_bytes) FROM table_sync_entries WHERE lamport = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, super::super::TABLE_SYNC_ENTRY_MAX_BYTES as i64);
+        rewrite(&a, account, "c", 8); // c@1..8
+
+        assert_eq!(compact(&a, account, 2), 0, "big cannot move, so it clamps the floor");
+        assert_eq!(chain_lamports(&a), (0..9).collect::<Vec<_>>(), "nothing authored or dropped");
+    }
+
+    /// Only a chain's writer can carry its rows forward: a peer compacting a foreign chain drops
+    /// the superseded prefix below the oldest pin and authors nothing.
+    #[test]
+    fn a_foreign_chain_clamps_at_its_oldest_pin_and_is_never_reauthored() {
+        let (a, account) = writer_store();
+        rewrite(&a, account, "c", 8); // c@0..7, only c@7 live
+        write(&a, "a", "a");
+        write(&a, "b", "b");
+        author(&a, account); // a@8, b@9
+        let peer = peer_of(&a, account);
+        sync_chains(&a, &peer, account);
+
+        assert_eq!(compact(&peer, account, 2), 7, "the prefix below c's winner drops");
+        assert_eq!(chain_lamports(&peer), vec![7, 8, 9], "and the peer authored nothing");
+        assert_eq!(stranded_rows(&peer), 0);
+
+        assert_eq!(compact(&a, account, 2), 8, "the writer moves c instead and reaches the budget");
+        assert_eq!(chain_lamports(&a), vec![8, 9, 10]);
+    }
+
+    /// A pin whose physical row disagrees with its merge state is the producer's to settle, not
+    /// compaction's: re-authoring stops there and the floor clamps at it.
+    #[test]
+    fn a_pin_that_cannot_be_carried_halts_reauthoring_and_clamps_there() {
+        let (a, account) = writer_store();
+        write(&a, "a", "a");
+        write(&a, "b", "b");
+        author(&a, account);
+        rewrite(&a, account, "c", 8);
+        // Deleted but not yet authored: a's clock still names this chain, the row is gone.
+        a.execute("DELETE FROM t_transport WHERE id = 'a'", []).unwrap();
+
+        assert_eq!(compact(&a, account, 2), 0);
+        assert_eq!(chain_lamports(&a), (0..10).collect::<Vec<_>>(), "nothing authored or dropped");
+    }
+
+    /// The re-root case the tombstone pin exists for: a peer offline since before a delete
+    /// rejoins below the writer's floor, and the delete still reaches it.
+    #[test]
+    fn a_peer_rejoining_below_the_floor_still_receives_a_delete() {
+        let (a, account) = writer_store();
+        for id in ["r0", "r1", "r2"] {
+            write(&a, id, id);
+        }
+        author(&a, account); // r0@0, r1@1, r2@2
+        let rejoining = peer_of(&a, account);
+        sync_chains(&a, &rejoining, account);
+
+        a.execute("DELETE FROM t_transport WHERE id = 'r0'", []).unwrap();
+        author(&a, account); // remove r0 @3
+        rewrite(&a, account, "h", 8); // h@4..11, only h@11 live
+        assert_eq!(compact(&a, account, 2), 10);
+        assert_eq!(chain_lamports(&a), vec![10, 11, 12, 13, 14], "r1, r2 and the delete moved");
+        assert_eq!(stranded_rows(&a), 0);
+
+        sync_chains(&a, &rejoining, account);
+        assert_eq!(live_rows(&rejoining), live_rows(&a), "the rejoining peer dropped r0");
+        let fresh = peer_of(&a, account);
+        sync_chains(&a, &fresh, account);
+        assert_eq!(live_rows(&fresh), live_rows(&a));
+    }
+
+    /// A store compacted before the pin rule dropped entries that still carried live rows; the
+    /// driver re-authors those once, whatever the budget, so fresh peers receive them again.
+    #[test]
+    fn rows_stranded_below_an_earlier_floor_are_reauthored_once() {
+        let (a, account) = writer_store();
+        write(&a, "a", "a");
+        write(&a, "b", "b");
+        author(&a, account);
+        rewrite(&a, account, "c", 8);
+        let route = supported_streams_against(&a, account, &[REPO_SPEC]).unwrap().remove(0);
+        let local = crate::load_local_device(&a).unwrap().unwrap().fingerprint();
+        {
+            // What the earlier compaction to floor 8 left behind.
+            let tx = Transaction::new_unchecked(&a, TransactionBehavior::Immediate).unwrap();
+            let floor_hash: Vec<u8> = tx
+                .query_row(
+                    "SELECT entry_hash FROM table_sync_entries WHERE lamport = 8",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            tx.execute("DELETE FROM table_sync_entries WHERE lamport < 8", []).unwrap();
+            retention::record_adopted_floor(
+                &tx,
+                StreamId::from_bytes(route.stream_id),
+                local,
+                8,
+                fixed32(floor_hash).unwrap(),
+                0,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(stranded_rows(&a), 2, "a and b are unreachable from the retained log");
+        // Deleted but not yet authored: a cannot be carried until the producer settles it, and
+        // must not hold b back.
+        a.execute("DELETE FROM t_transport WHERE id = 'a'", []).unwrap();
+
+        assert_eq!(compact(&a, account, 100), 0, "the chain is within budget");
+        assert_eq!(stranded_rows(&a), 1, "b moved to the tail; a waits for its delete");
+        author(&a, account);
+        assert_eq!(stranded_rows(&a), 0, "the producer's delete carries a");
+        assert_eq!(chain_lamports(&a), vec![8, 9, 10, 11]);
+        assert_eq!(compact(&a, account, 100), 0);
+        assert_eq!(chain_lamports(&a), vec![8, 9, 10, 11], "the repair runs once");
+
+        let peer = peer_of(&a, account);
+        sync_chains(&a, &peer, account);
+        assert_eq!(live_rows(&peer), live_rows(&a));
     }
 }

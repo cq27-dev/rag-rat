@@ -2,10 +2,17 @@
 //! a recorded floor (#1127).
 //!
 //! Anchors/1 launches fully retained; the first high-churn scope cannot. Compaction here drops
-//! accepted entries with `lamport < floor` for ONE device chain, after refreshing every row whose
-//! LWW winner is one of those entries — the hard constraint from #1020: without the refresh,
-//! every such row's next producer pass takes the stale-version winner lookup, finds the entry
-//! gone, reads `StaleRow::Unknown`, and the whole table re-authors at once.
+//! accepted entries with `lamport < floor` for ONE device chain — and only SUPERSEDED ones. The
+//! invariant (#1277): every entry that still carries a row's merge state stays retained. Those
+//! are the chain's *pins* ([`chain_pins`]): a live whole-row winner, and a tombstone whose pk has
+//! no live row. A fresh peer folds only the retained suffix, so a dropped live winner is a row it
+//! never receives; a re-rooting peer (below) never sees the region between its old tip and the
+//! floor, so a dropped orphan tombstone is a deleted row it keeps. A tombstone whose pk is live
+//! again is not a pin: anything it would suppress also loses to the live clock.
+//! [`compact_chain_prefix`] refuses a floor above a pin; the driver
+//! (`table_sync_compact_overdue`) clamps its floor at the oldest pin, and on this device's own
+//! chain first re-authors the oldest pins at the tail when that frees at least twice what it
+//! authors.
 //!
 //! The floor is recorded durably (`table_sync_retained_floors`) and advertised on the wire: a
 //! FRESH peer (no local chain) accepts the floor entry as its local root on exact
@@ -13,10 +20,9 @@
 //! is bounded by the chain-tip witness: a purged chain's retained tip is chain state, and a floor
 //! at or below a different witness entry classifies as the equivocation it is. A re-offered entry
 //! below the floor is idempotently ignored instead of classifying as a fork against the retained
-//! tail. The driver (`table_sync_compact_overdue`) counts and floors only reclaimable entries,
-//! clamps at the lowest pending lamport so forward-compat payloads stay offerable, treats a
-//! non-advancing floor as the steady-state no-op, and stays inert for anchors/1 — its production
-//! caller arrives with the first scope whose retention policy bounds it (overlay).
+//! tail. The driver counts and floors only reclaimable entries, clamps at the lowest pending
+//! lamport so forward-compat payloads stay offerable, treats a non-advancing floor as the
+//! steady-state no-op, and stays inert for anchors/1.
 //!
 //! A peer whose accepted TIP fell below the sender's floor (offline while the scope churned
 //! past it) recovers by re-rooting: the session plans the offer AT the floor instead of a suffix
@@ -26,17 +32,16 @@
 //! classification, same as at any other tip. Re-rooting also discards fork evidence in a receiver's
 //! divergent below-floor prefix, even when that receiver had not compacted it.
 //!
-//! Two accepted horizons, named rather than hidden:
+//! Accepted horizons, named rather than hidden:
 //!
-//! - **Spec bumps un-invisibilize refreshed rows.** The refresh restamps the published record but
-//!   the row clock keeps pointing at the dropped winner, so the next table spec-version bump takes
-//!   every refreshed row stale → the winner lookup finds the entry gone → `Unknown` → the producer
-//!   re-authors it: one entry per refreshed row per spec bump. A clock can only point at a live
-//!   entry, so this churn is the accepted cost of reclaiming the prefix — bounded, and far cheaper
-//!   than the table-wide storm the refresh prevents on the uncompacted path. In the window between
-//!   a spec bump and the next producer pass, the refold reads the same `Unknown` as a possible
-//!   unsent edit and defers replay over those rows — the safe direction, and worth knowing when
-//!   diagnosing a deferred entry after an upgrade.
+//! - **Pins are the retention floor.** A chain holds at least its pins, whatever the budget: live
+//!   rows past the budget, or orphan tombstones (nothing collects them yet), keep the chain over
+//!   budget honestly instead of dropping what a peer needs. A foreign chain is never re-authored —
+//!   only its writer can carry its rows forward — so it reclaims only the superseded prefix below
+//!   its oldest pin.
+//! - **A re-authored pin is a new write.** It carries the row's current cells at the tail, so it
+//!   competes under LWW with a concurrent edit to that row this device has not received yet, and
+//!   can win it — the cost re-adoption already accepts.
 //! - **Below-floor equivocations are undetectable after a floor is recorded.** The accept path
 //!   answers `AlreadyPresent` for any entry below the floor, so the peer discards fork evidence a
 //!   peer without that floor would still classify. Accepted: `Fork` is non-storing and a
@@ -45,17 +50,12 @@
 
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use super::apply::{self, SyncedRow};
-use super::registry::TableSpec;
-use super::{row_op, store};
 use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
 
 /// What one prefix compaction did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CompactionReport {
-    /// Rows whose published record was restamped to the current spec before their winner dropped.
-    pub refreshed_rows: usize,
     /// Accepted entries dropped from the chain prefix.
     pub dropped_entries: usize,
     /// Gapped entries swept below the floor — they can never promote once their predecessor is
@@ -125,21 +125,80 @@ pub(crate) fn record_adopted_floor(
     Ok(())
 }
 
+/// A row whose current merge state is carried by one entry on a device chain: a live whole-row
+/// winner, or a tombstone whose pk has no live row. Compaction never drops the entry at `lamport`
+/// while the pin stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Pin {
+    pub table_name: String,
+    pub row_pk: String,
+    pub lamport: u64,
+}
+
+/// The pins on `device`'s chain in `stream` with `from <= lamport < below`, oldest first, at most
+/// `limit` of them.
+pub(crate) fn chain_pins(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    device: DeviceFingerprint,
+    from: u64,
+    below: u64,
+    limit: usize,
+) -> anyhow::Result<Vec<Pin>> {
+    // The merge tables store the winner's fingerprint as the lowercase hex the applier wrote. A
+    // live clock owns its row whatever tombstone sits beside it; a tombstone pins only without one.
+    let mut stmt = tx.prepare(
+        "SELECT table_name, row_pk, lamport FROM sync_row_clocks
+         WHERE stream_id = ?1 AND device_fingerprint = ?2 AND lamport >= ?3 AND lamport < ?4
+         UNION ALL
+         SELECT t.table_name, t.row_pk, t.lamport FROM sync_row_tombstones t
+         WHERE t.stream_id = ?1 AND t.device_fingerprint = ?2 AND t.lamport >= ?3
+           AND t.lamport < ?4
+           AND NOT EXISTS (
+               SELECT 1 FROM sync_row_clocks c
+               WHERE c.stream_id = t.stream_id AND c.table_name = t.table_name
+                 AND c.row_pk = t.row_pk
+           )
+         ORDER BY lamport, table_name, row_pk
+         LIMIT ?5",
+    )?;
+    let pins = stmt
+        .query_map(
+            params![
+                stream.to_bytes().as_slice(),
+                device.to_string(),
+                i64::try_from(from)?,
+                i64::try_from(below)?,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    pins.into_iter()
+        .map(|(table_name, row_pk, lamport)| {
+            Ok(Pin { table_name, row_pk, lamport: u64::try_from(lamport)? })
+        })
+        .collect()
+}
+
 /// Drop every accepted entry on `device`'s chain in `stream` with `lamport < floor_lamport`.
 ///
 /// The floor entry itself is RETAINED and must exist on the chain — an arbitrary lamport cannot
 /// invent a floor that no peer could ever be pointed at. Entries retained for replay
 /// (`pending_reason IS NOT NULL`) are never compacted: their payloads are owed to a later binary,
-/// and dropping them would silently lose the forward-compat contract.
+/// and dropping them would silently lose the forward-compat contract. A floor above a pin is
+/// refused (#1277): only superseded entries are reclaimable. The check covers the window this
+/// compaction reclaims — a store compacted before the pin rule may already hold pins below its
+/// recorded floor, whose entries are gone; the driver re-authors those on the local chain.
 pub(crate) fn compact_chain_prefix(
     tx: &Transaction<'_>,
     stream: StreamId,
     device: DeviceFingerprint,
     floor_lamport: u64,
-    registry: &[TableSpec],
     now_ms: i64,
 ) -> anyhow::Result<CompactionReport> {
-    if let Some(current) = retained_floor(tx, stream, device)?
+    let current = retained_floor(tx, stream, device)?;
+    if let Some(current) = current
         && floor_lamport <= current
     {
         anyhow::bail!(
@@ -165,12 +224,17 @@ pub(crate) fn compact_chain_prefix(
              must be a retained entry a peer can be pointed at"
         );
     };
-
-    let Some(context) = store::stream_context(tx, stream)? else {
-        anyhow::bail!("table-sync compaction needs the stream's apply context");
-    };
-    let refreshed_rows =
-        refresh_winners_below(tx, stream, &context.repo_id, registry, device, floor_lamport)?;
+    if let Some(pin) =
+        chain_pins(tx, stream, device, current.unwrap_or(0), floor_lamport, 1)?.first()
+    {
+        anyhow::bail!(
+            "table-sync compaction floor {floor_lamport} would drop the entry at lamport {} that \
+             still carries `{}` row {} — only superseded entries are reclaimable",
+            pin.lamport,
+            pin.table_name,
+            pin.row_pk
+        );
+    }
     let dropped_entries = tx.execute(
         "DELETE FROM table_sync_entries
          WHERE stream_id = ?1 AND device_fingerprint = ?2 AND lamport < ?3
@@ -210,86 +274,15 @@ pub(crate) fn compact_chain_prefix(
             now_ms,
         ],
     )?;
-    Ok(CompactionReport { refreshed_rows, dropped_entries, swept_gapped })
-}
-
-/// Restamp the published record of every UNTOUCHED row whose whole-row LWW winner is one of the
-/// entries about to drop. After the refresh such a row compares hashes at the CURRENT spec
-/// version and never consults the winner lookup, so the dropped entry is invisible to it.
-///
-/// The `registry` MUST be the full production registry, not the scope's subset: a row whose table
-/// is missing here keeps its stale published record while its winner drops anyway — the
-/// conservative direction (a later pass re-authors it), but a silent one.
-///
-/// The refresh is deliberately verdict-gated on [`apply::StaleRow::Unchanged`]: a raw local write
-/// does not advance the row clock, so restamping to the CURRENT row contents would record an
-/// unsent edit as published — the producer would then see no delta and never author it (the
-/// `StaleRow::Unknown` path it would otherwise take authors, the safe direction), and the replay
-/// guard that keys off the published record would let a remote upsert clobber the edit. A
-/// `LocallyChanged` or `Unknown` row is left alone: the producer authors it at a retained
-/// lamport, exactly as it would without compaction. An unreadable row is skipped for the same
-/// reason it always was — no comparable hash exists to restamp.
-fn refresh_winners_below(
-    tx: &Transaction<'_>,
-    stream: StreamId,
-    repo_id: &str,
-    registry: &[TableSpec],
-    device: DeviceFingerprint,
-    floor_lamport: u64,
-) -> anyhow::Result<usize> {
-    let device_hex = device.to_string();
-    let mut stmt = tx.prepare(
-        "SELECT table_name, row_pk FROM sync_row_clocks
-         WHERE stream_id = ?1 AND repo_id = ?2 AND device_fingerprint = ?3 AND lamport < ?4",
-    )?;
-    let rows = stmt
-        .query_map(
-            params![
-                stream.to_bytes().as_slice(),
-                repo_id,
-                device_hex,
-                i64::try_from(floor_lamport)?
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut refreshed = 0;
-    for (table_name, row_pk) in rows {
-        let Some(spec) = registry.iter().find(|spec| spec.name == table_name) else {
-            continue;
-        };
-        let pk = row_op::row_pk_values(&row_pk)?;
-        let SyncedRow::Cells(cells) = apply::read_synced_cells(tx, spec, &pk)? else {
-            continue;
-        };
-        // The winner still exists at this point (the refresh runs before the drop), so the
-        // disposition is settled against the entry itself — not against the published record,
-        // which is exactly what may be lying about the row being sent.
-        if apply::stale_row_disposition(tx, spec, repo_id, stream, &pk, &cells)?
-            != apply::StaleRow::Unchanged
-        {
-            continue;
-        }
-        apply::record_published(
-            tx,
-            stream,
-            repo_id,
-            spec.name,
-            &row_pk,
-            &row_op::cells_hash(&cells),
-            spec.spec_version,
-        )?;
-        refreshed += 1;
-    }
-    Ok(refreshed)
+    Ok(CompactionReport { dropped_entries, swept_gapped })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::table_sync::registry::{ColumnSpec, ValueType};
-    use crate::table_sync::store::record_stream_context;
-    use crate::table_sync::{Cell, RowOp, TypedValue};
+    use crate::table_sync::registry::{ColumnSpec, TableSpec, ValueType};
+    use crate::table_sync::store::{self, record_stream_context};
+    use crate::table_sync::{Cell, RowOp, TypedValue, apply};
     use crate::{AccountId, LocalDevice};
 
     const SPEC: TableSpec = TableSpec {
@@ -301,7 +294,6 @@ mod tests {
         local_columns: &[],
         repo_column: None,
     };
-    const REGISTRY: &[TableSpec] = &[SPEC];
 
     fn conn() -> rusqlite::Connection {
         let c = rusqlite::Connection::open_in_memory().unwrap();
@@ -344,21 +336,40 @@ mod tests {
         }
     }
 
-    /// Author `n` entries on the device chain (r{i} = v{i}), recording the stream context.
-    fn author_chain(conn: &mut rusqlite::Connection, device: &LocalDevice, n: u64) {
+    fn remove(id: &str) -> RowOp {
+        RowOp::Remove {
+            spec_version: 1,
+            table: "t_demo".to_string(),
+            pk: vec![TypedValue::Text(id.to_string())],
+        }
+    }
+
+    /// Author and self-apply `ops` on the device chain in order, recording the stream context.
+    fn author(conn: &mut rusqlite::Connection, device: &LocalDevice, ops: &[RowOp]) {
         enroll(conn, device);
         let tx = conn.transaction().unwrap();
         record_stream_context(&tx, stream(), "repo", account(), [0x44; 32], "demo/1").unwrap();
-        for i in 0..n {
-            let op = upsert(&format!("r{i}"), &format!("v{i}"));
-            let signed = store::author_row_entry(&tx, stream(), device.secret(), &op, 0).unwrap();
+        for op in ops {
+            let signed = store::author_row_entry(&tx, stream(), device.secret(), op, 0).unwrap();
             let meta = crate::op::OpMeta {
                 lamport: signed.entry.lamport,
                 device: signed.entry.device_fingerprint,
             };
-            apply::apply_row_op_on_stream(&tx, &SPEC, "repo", stream(), &op, meta).unwrap();
+            apply::apply_row_op_on_stream(&tx, &SPEC, "repo", stream(), op, meta).unwrap();
         }
         tx.commit().unwrap();
+    }
+
+    /// Author `n` entries on distinct rows (r{i} = v{i}): every entry carries a live row.
+    fn author_chain(conn: &mut rusqlite::Connection, device: &LocalDevice, n: u64) {
+        let ops: Vec<_> = (0..n).map(|i| upsert(&format!("r{i}"), &format!("v{i}"))).collect();
+        author(conn, device, &ops);
+    }
+
+    /// Author `n` successive writes to ONE row: every entry but the last is superseded.
+    fn author_rewrites(conn: &mut rusqlite::Connection, device: &LocalDevice, n: u64) {
+        let ops: Vec<_> = (0..n).map(|i| upsert("hot", &format!("v{i}"))).collect();
+        author(conn, device, &ops);
     }
 
     fn entry_lamports(conn: &rusqlite::Connection, device: &LocalDevice) -> Vec<i64> {
@@ -378,89 +389,66 @@ mod tests {
     }
 
     #[test]
-    fn compaction_drops_the_prefix_and_keeps_the_rows_authorable() {
+    fn compaction_drops_only_superseded_entries() {
         let mut c = conn();
         let device = crate::local_device(&c, 0).unwrap();
-        author_chain(&mut c, &device, 6);
-        // A second write to r1: its winner is lamport 6 (retained), r0's winner is lamport 0
-        // (about to drop below the floor).
-        {
-            let tx = c.transaction().unwrap();
-            let op = upsert("r1", "v1b");
-            let signed = store::author_row_entry(&tx, stream(), device.secret(), &op, 0).unwrap();
-            let meta = crate::op::OpMeta {
-                lamport: signed.entry.lamport,
-                device: signed.entry.device_fingerprint,
-            };
-            apply::apply_row_op_on_stream(&tx, &SPEC, "repo", stream(), &op, meta).unwrap();
-            tx.commit().unwrap();
-        }
-        // Age the published record so the producer would consult the winner lookup without the
-        // refresh: a differing spec version is exactly the stale path compaction must close.
-        c.execute("UPDATE sync_published_rows SET spec_version = 99", []).unwrap();
+        // 0: r0 (superseded by 3), 1: r1 (superseded by 2), 2: r1, 3: r0, 4: r2.
+        author(&mut c, &device, &[
+            upsert("r0", "v0"),
+            upsert("r1", "v1"),
+            upsert("r1", "v1b"),
+            upsert("r0", "v0b"),
+            upsert("r2", "v2"),
+        ]);
 
         let report = {
             let tx = c.transaction().unwrap();
-            let report =
-                compact_chain_prefix(&tx, stream(), device.fingerprint(), 4, REGISTRY, 0).unwrap();
+            let report = compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, 0).unwrap();
             tx.commit().unwrap();
             report
         };
-        assert_eq!(report.dropped_entries, 4, "entries 0..4 are reclaimed");
-        assert_eq!(
-            report.refreshed_rows, 3,
-            "r0/r2/r3's winners dropped; r1 rewrote at 6 and r4/r5 are retained"
-        );
-        assert_eq!(entry_lamports(&c, &device), vec![4, 5, 6]);
-
+        assert_eq!(report.dropped_entries, 2, "the two superseded entries are reclaimed");
+        {
+            let tx = c.transaction().unwrap();
+            let err = compact_chain_prefix(&tx, stream(), device.fingerprint(), 3, 0).unwrap_err();
+            assert!(err.to_string().contains("would drop"), "r1's winner at 2 pins: {err}");
+        }
+        assert_eq!(entry_lamports(&c, &device), vec![2, 3, 4]);
         let floor = {
             let tx = c.transaction().unwrap();
             retained_floor(&tx, stream(), device.fingerprint()).unwrap()
         };
-        assert_eq!(floor, Some(4));
+        assert_eq!(floor, Some(2));
 
-        // The producer sees no delta: refreshed rows compare at the current spec version, so the
-        // dropped winners never surface as a table-wide re-authoring storm.
+        // Every live row still has its winning entry, so a spec bump after compaction resolves each
+        // stale row against it: the producer re-authors nothing.
+        c.execute("UPDATE sync_published_rows SET spec_version = 99", []).unwrap();
         let tx = c.transaction().unwrap();
         let ops = super::super::produce::produce_row_ops(&tx, &SPEC, "repo", stream()).unwrap();
-        assert!(ops.is_empty(), "refresh-before-drop leaves nothing to re-author");
-        tx.commit().unwrap();
-
-        // Authoring continues on the retained tail.
-        author_chain(&mut c, &device, 0);
-        let tx = c.transaction().unwrap();
-        let op = upsert("r9", "v9");
-        let signed = store::author_row_entry(&tx, stream(), device.secret(), &op, 0).unwrap();
-        assert_eq!(signed.entry.lamport, 7, "the stream clock is based on the retained tail");
+        assert!(ops.is_empty(), "no compacted winner reads as Unknown: {ops:?}");
+        let signed =
+            store::author_row_entry(&tx, stream(), device.secret(), &upsert("r9", "v9"), 0)
+                .unwrap();
+        assert_eq!(signed.entry.lamport, 5, "the stream clock is based on the retained tail");
         tx.commit().unwrap();
     }
 
-    /// A raw local edit on a row whose winner drops below the floor must NOT be restamped as
-    /// published: that would disown the edit (the producer would see no delta) and disarm the
-    /// replay guard that keys off the published record.
+    /// A live winner is a pin: a floor above it is refused, so a raw local edit on that row keeps
+    /// its published record and the producer still authors it.
     #[test]
-    fn an_unsent_local_edit_survives_compaction_and_is_authored() {
+    fn a_live_winner_pins_its_entry_and_an_unsent_edit_is_still_authored() {
         let mut c = conn();
         let device = crate::local_device(&c, 0).unwrap();
         author_chain(&mut c, &device, 4);
-        // Raw local write: no entry, no clock advance, published record still says v0.
         c.execute("UPDATE t_demo SET title = 'local-edit' WHERE id = 'r0'", []).unwrap();
 
-        let report = {
+        {
             let tx = c.transaction().unwrap();
-            let report =
-                compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, REGISTRY, 0).unwrap();
-            tx.commit().unwrap();
-            report
-        };
-        assert_eq!(report.dropped_entries, 2);
-        assert_eq!(
-            report.refreshed_rows, 1,
-            "only the untouched r1 is restamped; r0 is left for the producer"
-        );
+            let err = compact_chain_prefix(&tx, stream(), device.fingerprint(), 1, 0).unwrap_err();
+            assert!(err.to_string().contains("would drop"), "r0's winner pins lamport 0: {err}");
+        }
+        assert_eq!(entry_lamports(&c, &device), vec![0, 1, 2, 3], "the refusal drops nothing");
 
-        // The edit is authored: the published record still names v0, so the producer sees the
-        // delta it must carry — the safe direction the refresh must never close.
         let tx = c.transaction().unwrap();
         let ops = super::super::produce::produce_row_ops(&tx, &SPEC, "repo", stream()).unwrap();
         assert_eq!(ops.len(), 1, "the unsent edit is produced, not disowned");
@@ -471,11 +459,39 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    /// A tombstone whose pk has no live row is a pin — a peer that re-roots past it would keep the
+    /// deleted row — until a later write makes the row live again.
+    #[test]
+    fn an_orphan_tombstone_pins_until_its_row_is_live_again() {
+        let mut c = conn();
+        let device = crate::local_device(&c, 0).unwrap();
+        // 0: r0, 1: remove r0 (orphan tombstone), 2: hot (superseded by 3), 3: hot.
+        author(&mut c, &device, &[
+            upsert("r0", "v0"),
+            remove("r0"),
+            upsert("hot", "v0"),
+            upsert("hot", "v1"),
+        ]);
+        {
+            let tx = c.transaction().unwrap();
+            let err = compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, 0).unwrap_err();
+            assert!(err.to_string().contains("would drop"), "the tombstone at 1 pins: {err}");
+        }
+
+        // r0 is live again at 4: anything the tombstone would suppress loses to that clock.
+        author(&mut c, &device, &[upsert("r0", "v0b")]);
+        let tx = c.transaction().unwrap();
+        let report = compact_chain_prefix(&tx, stream(), device.fingerprint(), 3, 0).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(report.dropped_entries, 3);
+        assert_eq!(entry_lamports(&c, &device), vec![3, 4]);
+    }
+
     #[test]
     fn compaction_never_drops_a_pending_entry_or_invents_a_floor() {
         let mut c = conn();
         let device = crate::local_device(&c, 0).unwrap();
-        author_chain(&mut c, &device, 3);
+        author_rewrites(&mut c, &device, 3);
         c.execute(
             "UPDATE table_sync_entries SET pending_reason = 'unknown_column' WHERE lamport = 1",
             [],
@@ -484,16 +500,14 @@ mod tests {
 
         {
             let tx = c.transaction().unwrap();
-            let err = compact_chain_prefix(&tx, stream(), device.fingerprint(), 9, REGISTRY, 0)
-                .unwrap_err();
+            let err = compact_chain_prefix(&tx, stream(), device.fingerprint(), 9, 0).unwrap_err();
             assert!(err.to_string().contains("names no entry"), "a floor must be a retained entry");
             tx.commit().unwrap();
         }
 
         let report = {
             let tx = c.transaction().unwrap();
-            let report =
-                compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, REGISTRY, 0).unwrap();
+            let report = compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, 0).unwrap();
             tx.commit().unwrap();
             report
         };
@@ -505,17 +519,16 @@ mod tests {
     fn a_second_compaction_advances_the_floor_and_a_retreat_is_refused() {
         let mut c = conn();
         let device = crate::local_device(&c, 0).unwrap();
-        author_chain(&mut c, &device, 6);
+        author_rewrites(&mut c, &device, 6);
 
         {
             let tx = c.transaction().unwrap();
-            compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, REGISTRY, 0).unwrap();
+            compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, 0).unwrap();
             tx.commit().unwrap();
         }
         {
             let tx = c.transaction().unwrap();
-            let report =
-                compact_chain_prefix(&tx, stream(), device.fingerprint(), 4, REGISTRY, 0).unwrap();
+            let report = compact_chain_prefix(&tx, stream(), device.fingerprint(), 4, 0).unwrap();
             tx.commit().unwrap();
             assert_eq!(report.dropped_entries, 2, "entries 2 and 3 drop in the second pass");
         }
@@ -528,8 +541,7 @@ mod tests {
 
         {
             let tx = c.transaction().unwrap();
-            let err = compact_chain_prefix(&tx, stream(), device.fingerprint(), 3, REGISTRY, 0)
-                .unwrap_err();
+            let err = compact_chain_prefix(&tx, stream(), device.fingerprint(), 3, 0).unwrap_err();
             assert!(
                 err.to_string().contains("does not advance"),
                 "a retreating floor is a caller bug, not a silent re-compaction: {err}",
@@ -545,7 +557,7 @@ mod tests {
     fn an_equivocation_at_the_floor_lamport_is_still_a_fork() {
         let mut c = conn();
         let device = crate::local_device(&c, 0).unwrap();
-        author_chain(&mut c, &device, 4);
+        author_rewrites(&mut c, &device, 4);
         let tail_hash: Vec<u8> = c
             .query_row("SELECT entry_hash FROM table_sync_entries WHERE lamport = 1", [], |row| {
                 row.get(0)
@@ -553,7 +565,7 @@ mod tests {
             .unwrap();
         {
             let tx = c.transaction().unwrap();
-            compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, REGISTRY, 0).unwrap();
+            compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, 0).unwrap();
             tx.commit().unwrap();
         }
 
@@ -585,23 +597,18 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    /// The re-adoption candidate set derives from the merge state, which survives compaction:
-    /// compact a writer's prefix, THEN remove the writer, and the drain still repairs the row —
-    /// with the audit naming the slot by lamport alone (the winning entry is gone).
+    /// A store compacted before the pin rule dropped entries that still carried live rows. The
+    /// re-adoption candidate set derives from the merge state, which survived: remove the writer
+    /// and the drain still repairs every row — the audit naming the slot by lamport alone.
     #[test]
-    fn compaction_before_a_removal_does_not_shrink_the_repair_set() {
+    fn a_winner_whose_entry_is_gone_is_still_a_repair_candidate() {
         let mut c = conn();
         let device = crate::local_device(&c, 0).unwrap();
         author_chain(&mut c, &device, 4);
-        {
-            let tx = c.transaction().unwrap();
-            compact_chain_prefix(&tx, stream(), device.fingerprint(), 3, REGISTRY, 0).unwrap();
-            tx.commit().unwrap();
-        }
+        c.execute("DELETE FROM table_sync_entries WHERE lamport < 3", []).unwrap();
         let removed_fp = device.fingerprint();
 
-        // The writer is removed after its prefix was compacted: entries 0..3 named the winners of
-        // r0..r2, and those winners are GONE from the entry log now.
+        // Entries 0..3 named the winners of r0..r2, and those winners are GONE from the entry log.
         let work = {
             let tx = c.transaction().unwrap();
             store::enqueue_readoption_work(&tx, account(), removed_fp, stream(), [9; 32], 9, 10)
@@ -634,7 +641,7 @@ mod tests {
     fn compaction_sweeps_gapped_entries_below_the_floor() {
         let mut c = conn();
         let device = crate::local_device(&c, 0).unwrap();
-        author_chain(&mut c, &device, 4);
+        author_rewrites(&mut c, &device, 4);
         c.execute(
             "INSERT INTO table_sync_gapped_entries(
                  entry_hash, stream_id, device_fingerprint, lamport, prev_hash, signed_bytes,
@@ -647,8 +654,7 @@ mod tests {
 
         let report = {
             let tx = c.transaction().unwrap();
-            let report =
-                compact_chain_prefix(&tx, stream(), device.fingerprint(), 3, REGISTRY, 0).unwrap();
+            let report = compact_chain_prefix(&tx, stream(), device.fingerprint(), 3, 0).unwrap();
             tx.commit().unwrap();
             report
         };
@@ -985,7 +991,7 @@ mod tests {
     fn a_reoffered_entry_below_the_floor_is_idempotent_not_a_fork() {
         let mut c = conn();
         let device = crate::local_device(&c, 0).unwrap();
-        author_chain(&mut c, &device, 3);
+        author_rewrites(&mut c, &device, 3);
         let dropped: Vec<u8> = c
             .query_row("SELECT signed_bytes FROM table_sync_entries WHERE lamport = 0", [], |row| {
                 row.get(0)
@@ -993,7 +999,7 @@ mod tests {
             .unwrap();
         {
             let tx = c.transaction().unwrap();
-            compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, REGISTRY, 0).unwrap();
+            compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, 0).unwrap();
             tx.commit().unwrap();
         }
 

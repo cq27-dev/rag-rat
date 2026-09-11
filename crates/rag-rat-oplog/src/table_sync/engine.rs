@@ -216,56 +216,35 @@ pub(crate) fn process_readoption_work_for_stream(
         else {
             continue;
         };
-        let op = match readoption_repair_op(tx, ctx, spec, stream, &candidate.row_pk, &removed_hex)?
-        {
-            ReadoptionRepair::Skip => continue,
-            ReadoptionRepair::Unrepairable => {
-                unrepairable += 1;
-                continue;
-            },
-            ReadoptionRepair::Repair(op) => op,
+        let op =
+            match row_repair_op(tx, ctx.repo_id, spec, stream, &candidate.row_pk, &removed_hex)? {
+                RowRepair::Skip => continue,
+                RowRepair::Unrepairable => {
+                    unrepairable += 1;
+                    continue;
+                },
+                RowRepair::Repair(op) => op,
+            };
+        let Some(adopted_entry_hash) = author_repair(tx, ctx, spec, stream, &op, "re-adoption")?
+        else {
+            unrepairable += 1;
+            continue;
         };
-        let signed = store::author_row_entry(tx, stream, ctx.device.secret(), &op, ctx.now_ms)?;
-        let meta =
-            OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
-        match apply::apply_row_op_on_stream(tx, spec, ctx.repo_id, stream, &op, meta)? {
-            ApplyOutcome::Applied => {
-                store::record_readoption_audit(tx, store::ReadoptionAudit {
-                    account_id: ctx.account_id,
-                    removed,
-                    adopter: ctx.device.fingerprint(),
-                    stream,
-                    repo_id: context.repo_id.clone(),
-                    scope_id: context.scope_id.clone(),
-                    table_name: spec.name.to_string(),
-                    row_pk: candidate.row_pk.clone(),
-                    original_lamport: candidate.original_lamport,
-                    original_entry_hash: candidate.entry_hash,
-                    adopted_entry_hash: signed.entry.entry_hash,
-                    adopted_at_ms: ctx.now_ms,
-                })?;
-                authored += 1;
-            },
-            ApplyOutcome::Superseded => {
-                // Same diagnosis as the produce path: a locally-authored op takes the stream's
-                // MAX(lamport)+1, so losing its own self-apply means the row's clock carries a
-                // lamport from ANOTHER stream — the shape a scope or account move leaves behind.
-                // Swallowing it would mark the removal complete with the orphan unrepaired and no
-                // retry left. Fail the pass instead: the work item stays pending and the rollback
-                // drops the just-inserted entry.
-                anyhow::bail!(
-                    "table-sync: a re-adoption op lost its own self-apply on `{}` — the row's \
-                     write clock carries a lamport from another stream",
-                    spec.name
-                );
-            },
-            outcome @ (ApplyOutcome::Quarantined(_) | ApplyOutcome::Unprojectable(_)) => {
-                anyhow::bail!(
-                    "table-sync: a re-adoption op did not self-apply on `{}`: {outcome:?}",
-                    spec.name
-                );
-            },
-        }
+        store::record_readoption_audit(tx, store::ReadoptionAudit {
+            account_id: ctx.account_id,
+            removed,
+            adopter: ctx.device.fingerprint(),
+            stream,
+            repo_id: context.repo_id.clone(),
+            scope_id: context.scope_id.clone(),
+            table_name: spec.name.to_string(),
+            row_pk: candidate.row_pk.clone(),
+            original_lamport: candidate.original_lamport,
+            original_entry_hash: candidate.entry_hash,
+            adopted_entry_hash,
+            adopted_at_ms: ctx.now_ms,
+        })?;
+        authored += 1;
     }
     if unrepairable > 0 {
         // A row the pass cannot carry today is NOT written off: completing here would abandon it
@@ -285,63 +264,145 @@ pub(crate) fn process_readoption_work_for_stream(
     Ok(Some(authored))
 }
 
-/// What the drain can do with one candidate row.
-enum ReadoptionRepair {
-    /// Re-author this op under the local key.
-    Repair(RowOp),
-    /// Nothing owed: the row is settled under another writer, or physically consistent with its
-    /// merge state (an absent row under a live clock is the producer's `Remove` to author, not
-    /// this pass's).
-    Skip,
-    /// The physical row exists but a synced column cannot be read as its declared type. NOT
-    /// abandoned: the work item stays pending so a pass after the cell is repaired still
-    /// converges the fresh replica.
-    Unrepairable,
+/// Re-author the oldest `pins` of this device's own chain at its tail, in order, so compaction can
+/// drop the entries that carried them (#1277). Stops at the first pin that cannot be carried today
+/// and returns how many leading pins moved; the rest still pin. A pin cannot be carried while its
+/// physical row disagrees with its merge state (the producer owes that row), a synced column is
+/// unreadable, an accepted entry this binary cannot apply yet sits above it, or its re-signed
+/// entry would not fit the transport limit.
+///
+/// A re-authored pin is a NEW write of the row's current cells. It competes under LWW with any
+/// concurrent edit to the same row this device has not received yet, and can win it — the same
+/// cost re-adoption accepts when it re-authors a removed writer's rows.
+pub(crate) fn reauthor_chain_pins(
+    tx: &Transaction<'_>,
+    ctx: &SyncCtx<'_>,
+    scope_id: &str,
+    stream: crate::stream::StreamId,
+    pins: &[super::retention::Pin],
+) -> anyhow::Result<usize> {
+    if pins.is_empty() {
+        return Ok(0);
+    }
+    // Never author into a store a NEWER projector folded (the producer's gate).
+    refold::assert_projector_not_newer(tx)?;
+    let device_hex = ctx.device.fingerprint().to_string();
+    for (moved, pin) in pins.iter().enumerate() {
+        let Some(spec) = ctx
+            .registry
+            .iter()
+            .find(|spec| spec.scope_id == scope_id && spec.name == pin.table_name)
+        else {
+            return Ok(moved);
+        };
+        let RowRepair::Repair(op) =
+            row_repair_op(tx, ctx.repo_id, spec, stream, &pin.row_pk, &device_hex)?
+        else {
+            return Ok(moved);
+        };
+        if author_repair(tx, ctx, spec, stream, &op, "compaction")?.is_none() {
+            return Ok(moved);
+        }
+    }
+    Ok(pins.len())
 }
 
-/// The physical-table repair for one still-orphaned candidate row.
-fn readoption_repair_op(
+/// Sign `op` under the local key and self-apply it, returning the new entry's hash — `None`, with
+/// nothing stored, when the re-signed entry would not fit the transport limit (the row stays
+/// where it is). A repair that does not self-apply cleanly is a failure, never a settlement: the
+/// caller rolls back and the just-inserted entry goes with it.
+fn author_repair(
     tx: &Transaction<'_>,
     ctx: &SyncCtx<'_>,
     spec: &TableSpec,
     stream: crate::stream::StreamId,
+    op: &RowOp,
+    what: &str,
+) -> anyhow::Result<Option<[u8; 32]>> {
+    let Some(signed) =
+        store::author_row_entry_if_it_fits(tx, stream, ctx.device.secret(), op, ctx.now_ms)?
+    else {
+        return Ok(None);
+    };
+    let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
+    match apply::apply_row_op_on_stream(tx, spec, ctx.repo_id, stream, op, meta)? {
+        ApplyOutcome::Applied => Ok(Some(signed.entry.entry_hash)),
+        // Same diagnosis as the produce path: a locally-authored op takes the stream's
+        // MAX(lamport)+1, so losing its own self-apply means the row's clock carries a lamport
+        // from ANOTHER stream — the shape a scope or account move leaves behind. Swallowing it
+        // would record the repair done with the row unrepaired and no retry left.
+        ApplyOutcome::Superseded => anyhow::bail!(
+            "table-sync: a {what} op lost its own self-apply on `{}` — the row's write clock \
+             carries a lamport from another stream",
+            spec.name
+        ),
+        outcome @ (ApplyOutcome::Quarantined(_) | ApplyOutcome::Unprojectable(_)) => {
+            anyhow::bail!(
+                "table-sync: a {what} op did not self-apply on `{}`: {outcome:?}",
+                spec.name
+            )
+        },
+    }
+}
+
+/// What a repair pass can do with one row it wants to carry under the local key.
+enum RowRepair {
+    /// Re-author this op under the local key.
+    Repair(RowOp),
+    /// Nothing to carry: the row is settled under another writer, or physically inconsistent with
+    /// its merge state (an absent row under a live clock is the producer's `Remove` to author).
+    Skip,
+    /// The row cannot be carried today: a synced column cannot be read as its declared type, or an
+    /// accepted entry this binary cannot apply yet sits above the winner. Retried later, never
+    /// written off.
+    Unrepairable,
+}
+
+/// The physical-table repair for one row while `winner_hex` still owns its merge state.
+fn row_repair_op(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    spec: &TableSpec,
+    stream: crate::stream::StreamId,
     row_pk: &str,
-    removed_hex: &str,
-) -> anyhow::Result<ReadoptionRepair> {
-    let clock = apply::row_clock_winner_on_stream(tx, stream, ctx.repo_id, spec.name, row_pk)?;
-    let tombstone = apply::tombstone_winner_on_stream(tx, stream, ctx.repo_id, spec.name, row_pk)?;
-    Ok(match (clock, tombstone) {
-        // A live clock and a tombstone can only coexist with the clock newer: a remove raises the
-        // tombstone at its own lamport, and a remove that BEATS the clock clears the clock. So a
-        // live clock always owns the row; re-adopt it while the removed writer is that winner.
-        // What the PHYSICAL row allows decides the repair: carried (re-author), absent (the
-        // producer's Remove owns it), or unreadable (stay pending until repaired).
-        (Some((_, winner)), _) if winner == removed_hex => {
-            let pk = row_op::row_pk_values(row_pk)?;
-            match apply::read_synced_cells(tx, spec, &pk)? {
-                apply::SyncedRow::Cells(cells) => ReadoptionRepair::Repair(RowOp::Upsert {
-                    table: spec.name.to_string(),
-                    spec_version: spec.spec_version,
-                    pk,
-                    cells,
-                }),
-                apply::SyncedRow::Absent => ReadoptionRepair::Skip,
-                apply::SyncedRow::Unreadable(_) => ReadoptionRepair::Unrepairable,
-            }
-        },
-        // A tombstone with no live clock owns the deletion. Re-adopt it only while no physical
-        // row exists; otherwise a live local row would be destroyed by a stale repair.
-        (None, Some((_, winner))) if winner == removed_hex => {
-            let pk = row_op::row_pk_values(row_pk)?;
-            match apply::read_synced_cells(tx, spec, &pk)? {
-                apply::SyncedRow::Absent =>
-                    ReadoptionRepair::Repair(apply::readopt_remove(spec, row_pk)?),
-                apply::SyncedRow::Cells(_) => ReadoptionRepair::Skip,
-                apply::SyncedRow::Unreadable(_) => ReadoptionRepair::Unrepairable,
-            }
-        },
-        _ => ReadoptionRepair::Skip,
-    })
+    winner_hex: &str,
+) -> anyhow::Result<RowRepair> {
+    let clock = apply::row_clock_winner_on_stream(tx, stream, repo_id, spec.name, row_pk)?;
+    let tombstone = apply::tombstone_winner_on_stream(tx, stream, repo_id, spec.name, row_pk)?;
+    // A live clock and a tombstone can only coexist with the clock newer: a remove raises the
+    // tombstone at its own lamport, and a remove that BEATS the clock clears the clock. So a live
+    // clock always owns the row, and a tombstone owns the deletion only without one.
+    let (winner_lamport, live) = match (clock, tombstone) {
+        (Some((lamport, winner)), _) if winner == winner_hex => (lamport, true),
+        (None, Some((lamport, winner))) if winner == winner_hex => (lamport, false),
+        _ => return Ok(RowRepair::Skip),
+    };
+    // What the PHYSICAL row allows decides the repair. A live winner is carried while its row is
+    // (an absent one is the producer's Remove to author); a deletion is carried only while no row
+    // exists, or a live local row would be destroyed by a stale repair.
+    let pk = row_op::row_pk_values(row_pk)?;
+    let repair = match (live, apply::read_synced_cells(tx, spec, &pk)?) {
+        (true, apply::SyncedRow::Cells(cells)) => RowRepair::Repair(RowOp::Upsert {
+            table: spec.name.to_string(),
+            spec_version: spec.spec_version,
+            pk,
+            cells,
+        }),
+        (false, apply::SyncedRow::Absent) =>
+            RowRepair::Repair(apply::readopt_remove(spec, row_pk)?),
+        (_, apply::SyncedRow::Unreadable(_)) => RowRepair::Unrepairable,
+        _ => RowRepair::Skip,
+    };
+    // A repair is signed at the stream tail, above every accepted entry. One retained for replay
+    // above the winner (a newer spec version during a rolling upgrade) may be a newer write to
+    // this very row: peers that understand it have applied it, and the repair would beat it there
+    // with the stale cells. Hold the repair until that entry replays.
+    if matches!(repair, RowRepair::Repair(_))
+        && store::pending_entry_at_or_above(tx, stream, winner_lamport)?
+    {
+        return Ok(RowRepair::Unrepairable);
+    }
+    Ok(repair)
 }
 
 /// **The caller MUST roll back on `Err`.** Everything here runs in the caller's transaction and
@@ -864,6 +925,79 @@ mod tests {
         enroll_writer(&d.conn, AccountId::from_bytes([42; 32]), c.local.fingerprint());
         assert_eq!(d.ingest_all(&reauthored, &c.pubkey()), vec![IngestOutcome::Applied]);
         assert_eq!(d.title().as_deref(), Some("distilled"));
+    }
+
+    /// A re-adoption is signed at the stream tail. An accepted entry this binary cannot apply yet,
+    /// above the removed writer's winner, may be a newer write to that row — re-adopting over it
+    /// would overwrite it on up-to-date peers — so the work waits until the entry replays.
+    #[test]
+    fn readoption_waits_while_a_parked_newer_write_sits_above_the_winner() {
+        let mut a = Device::new();
+        let mut c = Device::new();
+        let account = AccountId::from_bytes([42; 32]);
+        let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+        a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'distilled')", []).unwrap();
+        let entry = a.produce();
+        enroll_writer(&c.conn, account, a.pubkey().fingerprint());
+        enroll_writer(&c.conn, account, c.local.fingerprint());
+        assert_eq!(c.ingest_all(&entry, &a.pubkey()), vec![IngestOutcome::Applied]);
+        remove_writer(&c.conn, account, a.pubkey().fingerprint());
+        c.conn
+            .execute(
+                "INSERT INTO table_sync_entries(
+                     entry_hash, stream_id, device_fingerprint, lamport, signed_bytes,
+                     received_at_ms, pending_reason
+                 ) VALUES (x'77', ?1, ?2, 3, x'00', 0, 'newer_spec_version')",
+                rusqlite::params![stream.to_bytes().as_slice(), [2u8; 32].as_slice()],
+            )
+            .unwrap();
+        {
+            let tx = c.conn.transaction().unwrap();
+            store::enqueue_readoption_work(
+                &tx,
+                account,
+                a.pubkey().fingerprint(),
+                stream,
+                [7; 32],
+                9,
+                10,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let drain = |c: &mut Device| {
+            let tx = c.conn.transaction().unwrap();
+            let ctx = SyncCtx {
+                repo_id: "repo",
+                account_id: account,
+                incarnation_ref: [0x44; 32],
+                device: &c.local,
+                registry: REGISTRY,
+                now_ms: 0,
+            };
+            let processed = process_readoption_work_for_stream(&tx, &ctx, stream).unwrap();
+            tx.commit().unwrap();
+            processed
+        };
+
+        assert_eq!(drain(&mut c), None, "the removal cannot drain past the parked write");
+        let own: i64 = c
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM table_sync_entries WHERE device_fingerprint = ?1",
+                [c.local.fingerprint().to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(own, 0, "nothing was re-authored over it");
+
+        c.conn
+            .execute(
+                "UPDATE table_sync_entries SET pending_reason = NULL WHERE entry_hash = x'77'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(drain(&mut c), Some(1), "once it replays, the row is re-adopted");
     }
 
     #[test]

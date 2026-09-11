@@ -1557,7 +1557,7 @@ async fn a_fresh_peer_converges_through_a_compacted_chain_via_the_advertised_flo
         )
         .unwrap();
     rag_rat_oplog::ensure_repo_incarnation(&owner, "repo-a", NOW + 1).unwrap().unwrap();
-    for (memory, path) in [("memory-a", "src/a.rs"), ("memory-b", "src/b.rs")] {
+    let bind = |memory: &str, path: &str| {
         owner
             .execute(
                 "INSERT INTO repo_memory_bindings(
@@ -1568,14 +1568,22 @@ async fn a_fresh_peer_converges_through_a_compacted_chain_via_the_advertised_flo
             )
             .unwrap();
         rag_rat_oplog::table_sync_author_pending(&owner, account, NOW + 2).unwrap();
-    }
-    // Compact the owner's chain below all but its last entry: the first binding's winning entry
-    // drops, and only the floor advertisement lets a fresh peer converge.
+    };
+    // 0: memory-a, 1: memory-a moved (supersedes 0), 2: memory-b.
+    bind("memory-a", "src/a.rs");
+    owner
+        .execute("UPDATE repo_memory_bindings SET start_line = 6 WHERE memory_id = 'memory-a'", [])
+        .unwrap();
+    rag_rat_oplog::table_sync_author_pending(&owner, account, NOW + 2).unwrap();
+    bind("memory-b", "src/b.rs");
+    // Compact the owner's chain to a budget of one: memory-a's live entry moves to the tail, and
+    // everything below memory-b's entry drops. Only the floor advertisement lets a fresh peer
+    // converge.
     let compacted = rag_rat_oplog::table_sync_compact_overdue(&owner, account, NOW + 3, &|scope| {
         (scope == "anchors/1").then_some(1)
     })
     .unwrap();
-    assert_eq!(compacted, 1, "the first binding's entry is reclaimed");
+    assert_eq!(compacted, 2, "memory-a's two entries are reclaimed");
     for entry in account_entries_for_sync(&owner, account).unwrap() {
         rag_rat_oplog::account_ingest(&joiner, &entry.signed_bytes, NOW + 2).unwrap();
     }
@@ -1601,34 +1609,29 @@ async fn a_fresh_peer_converges_through_a_compacted_chain_via_the_advertised_flo
     let client_report = client.unwrap();
     assert_eq!(alpn, TABLE_SYNC_ALPN);
     assert_eq!(
-        client_report.entries_newly_stored, 1,
+        client_report.entries_newly_stored, 2,
         "only the retained suffix transfers — the floor entry roots the fresh chain",
     );
 
-    let surviving: bool = joiner
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM repo_memory_bindings
-                 WHERE repo_id = 'repo-a' AND memory_id = 'memory-b')",
-            [],
-            |row| row.get(0),
+    let bindings: Vec<(String, i64)> = joiner
+        .prepare(
+            "SELECT memory_id, start_line FROM repo_memory_bindings
+             WHERE repo_id = 'repo-a' ORDER BY memory_id",
         )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert!(surviving, "the row whose entry is at/above the floor converges");
-    let compacted_row: bool = joiner
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM repo_memory_bindings
-                 WHERE repo_id = 'repo-a' AND memory_id = 'memory-a')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(!compacted_row, "the reclaimed prefix honestly does not arrive");
+    assert_eq!(
+        bindings,
+        vec![("memory-a".to_string(), 6), ("memory-b".to_string(), 4)],
+        "every live row converges, memory-a at its latest state",
+    );
     let floor: Option<i64> = joiner
         .query_row("SELECT lamport FROM table_sync_retained_floors", [], |row| row.get(0))
         .ok();
-    assert_eq!(floor, Some(1), "the adopted floor is recorded, so re-offers propagate it");
+    assert_eq!(floor, Some(2), "the adopted floor is recorded, so re-offers propagate it");
 }
 
 #[tokio::test]
