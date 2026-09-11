@@ -227,6 +227,41 @@ fn a_contributors_rebind_reaches_the_owners_creating_device() {
     assert_eq!(paths, vec!["src/new.rs".to_string()]);
 }
 
+/// Removing a repository and initializing it again brings its synced memories back: they are
+/// materialized from the stream's projection, which the removal leaves in place.
+#[test]
+fn a_repository_removed_and_initialized_again_gets_its_synced_memories_back() {
+    let conn = scoped_conn();
+    local_account(&conn, NOW).unwrap();
+    create_memory(&conn, concept("own-note")).unwrap();
+    let own_stream = rag_rat_oplog::owned_stream_v2_id(&conn, REPO).unwrap().unwrap();
+    plant_projected_node(&conn, own_stream, "sibling", "sibling-note");
+    crate::drain_synced_memory(&conn).unwrap();
+    assert!(synced_memory_titles(&conn).contains(&"sibling-note".to_string()));
+
+    // `rag-rat rm`: purge and tombstone in one transaction.
+    let tx = conn.unchecked_transaction().unwrap();
+    rag_rat_db::schema::purge_repo_rows(&tx, REPO).unwrap();
+    rag_rat_db::schema::mark_repo_removed(&tx, REPO, NOW).unwrap();
+    tx.commit().unwrap();
+    assert!(memory_titles(&conn).is_empty());
+
+    // `rag-rat init`: clear the tombstone and register the repository again.
+    rag_rat_db::schema::clear_repo_removed(&conn, REPO).unwrap();
+    conn.execute(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
+        [REPO],
+    )
+    .unwrap();
+    crate::drain_synced_memory(&conn).unwrap();
+
+    assert!(
+        synced_memory_titles(&conn).contains(&"sibling-note".to_string()),
+        "{:?}",
+        memory_titles(&conn),
+    );
+}
+
 /// EXACTLY ONE stream materializes a repo. A contributor's own owned stream is NOT it — nothing is
 /// ever authored there, so its projection is a rival authority whose removal anti-join reads every
 /// row the owner's stream materialized as condemned. Draining both would delete the owner's
