@@ -1714,6 +1714,7 @@ mod tests {
             Some(anchors.as_slice()),
             "the rebuild recovers anchors from the accepted entries",
         );
+        assert_eq!(node.anchors_author, Some(account), "and who authored them");
 
         // The other half of the truth table the nullable column exists for: an author publishing an
         // EMPTY set must read back as `Some(vec![])`, never NULL. Without this, normalizing an

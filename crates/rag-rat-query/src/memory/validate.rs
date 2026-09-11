@@ -40,35 +40,48 @@ pub(crate) fn validate_dir_binding(
     }
     Ok(if dir_exists_on_disk(fs_root, &dir) { "current" } else { "gone" }.to_string())
 }
+/// Validate a binding against the live logical symbol `id` it resolves to.
+fn validate_live_logical_symbol(
+    conn: &Connection,
+    binding: &mut RepoMemoryBinding,
+    id: i64,
+) -> anyhow::Result<String> {
+    // The logical symbol is live. Its id is content-derived and STABLE across reindex, but chunk
+    // ids are reassigned on every re-chunk — so the stored `chunk_id` is stale whenever the symbol
+    // shifted lines (an edit ELSEWHERE in the same file leaves the symbol's
+    // name/qualified_name/kind/signature, hence its stable id, unchanged while its chunk moves).
+    // Re-derive the chunk from the live logical symbol before content-validating; trusting the
+    // churned `chunk_id` made `validate_bound_chunk` report `gone` for an unchanged symbol (#154 —
+    // the gone-on-every-reindex symptom was really gone-on-any-line-shift). Falls through to the
+    // stored-chunk check only when the logical symbol resolves to no chunk.
+    if let Some(chunk) = chunk_for_logical_symbol(conn, id)? {
+        binding.symbol_id = chunk.symbol_id;
+        binding.chunk_id = Some(chunk.chunk_id);
+        binding.path = Some(chunk.path);
+        binding.start_line = Some(chunk.start_line);
+        binding.end_line = Some(chunk.end_line);
+        return Ok(match source_hash_for_memory(conn, &binding.memory_id)? {
+            Some(expected) if expected != chunk.text_hash => "stale".to_string(),
+            _ => "current".to_string(),
+        });
+    }
+    validate_bound_chunk(conn, binding)
+}
+
 pub(crate) fn validate_logical_symbol_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
+    // A live handle whose kind contradicts the binding is held back rather than trusted (see
+    // `cached_kind_agrees`), and only rejected if the relocation pick finds something better.
+    let mut held_back = None;
     if let Some(id) = binding.logical_symbol_id
         && let Some(hit) = crate::symbol::lookup_logical_by_id(conn, id)?
-        && cached_kind_agrees(binding, &hit.kind)
     {
-        // The logical symbol is live. Its id is content-derived and STABLE across reindex, but
-        // chunk ids are reassigned on every re-chunk — so the stored `chunk_id` is stale whenever
-        // the symbol shifted lines (an edit ELSEWHERE in the same file leaves the symbol's
-        // name/qualified_name/kind/signature, hence its stable id, unchanged while its chunk
-        // moves). Re-derive the chunk from the live logical symbol before
-        // content-validating; trusting the churned `chunk_id` made `validate_bound_chunk`
-        // report `gone` for an unchanged symbol (#154 — the gone-on-every-reindex symptom
-        // was really gone-on-any-line-shift). Falls through to the stored-chunk check only
-        // when the logical symbol resolves to no chunk.
-        if let Some(chunk) = chunk_for_logical_symbol(conn, id)? {
-            binding.symbol_id = chunk.symbol_id;
-            binding.chunk_id = Some(chunk.chunk_id);
-            binding.path = Some(chunk.path);
-            binding.start_line = Some(chunk.start_line);
-            binding.end_line = Some(chunk.end_line);
-            return Ok(match source_hash_for_memory(conn, &binding.memory_id)? {
-                Some(expected) if expected != chunk.text_hash => "stale".to_string(),
-                _ => "current".to_string(),
-            });
+        if cached_kind_agrees(binding, &hit.kind) {
+            return validate_live_logical_symbol(conn, binding, id);
         }
-        return validate_bound_chunk(conn, binding);
+        held_back = Some(id);
     }
     // Scope the qualified-name relocation to the ACTIVE repo. `logical_symbols` is direct-scoped by
     // `repo_id` (V040) and its ids are repo-distinct, so a consolidated DB can hold the SAME
@@ -109,12 +122,21 @@ pub(crate) fn validate_logical_symbol_binding(
         })?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    // The group axis is inert here by construction: this arm is only reached when the binding's
-    // handle is absent or names a row that no longer exists, and a dead id can never equal a live
-    // candidate's. Impl twins are still separated where it matters — the stable-id arm above
-    // resolves them on its own, since the logical key hashes `scope_path`.
+    // The group axis is nearly inert here: this arm is reached when the binding's handle is absent,
+    // names a row that no longer exists, or names a live row whose kind contradicts the binding —
+    // a handle the pick credits only where the kind agrees. Impl twins are still separated where
+    // it matters — the stable-id arm above resolves them on its own, since the logical key hashes
+    // `scope_path`.
     let relocated = pick_relocation_twin(candidates, binding);
     if let Some((id, path)) = relocated {
+        // The pick came back to the very handle the kind check held back: nothing that matches the
+        // binding better answers to its name, so it is the recorded kind that is out of date, not
+        // the handle. Validate it live — relocating would report `relocated` on every pass, since
+        // this arm does not rewrite the kind, and rewriting it would publish this checkout's view
+        // of the kind back through `anchors/1`.
+        if Some(id) == held_back {
+            return validate_live_logical_symbol(conn, binding, id);
+        }
         binding.logical_symbol_id = Some(id);
         binding.path = Some(path);
         if let Some(chunk) = chunk_for_logical_symbol(conn, id)? {
@@ -215,29 +237,44 @@ fn pick_relocation_twin(
         .map(|(_, _, twin)| (twin.id, twin.path))
 }
 
+/// Validate a binding against the live symbol row `id` it resolves to, named `qualified_name`.
+fn validate_live_symbol(
+    conn: &Connection,
+    binding: &mut RepoMemoryBinding,
+    id: i64,
+    qualified_name: String,
+) -> anyhow::Result<String> {
+    // The row id proves WHICH symbol this is; `binding_id` is only the qualified name every later
+    // relocation searches by. A rename in place — an index upgrade re-deriving an impl's identity
+    // moves the row's name from the trait to the type — leaves the two disagreeing, and nothing
+    // notices until the next reindex churns the row id. Relocation then looks up a name that no
+    // longer belongs to this symbol and attaches the memory to whatever else answers to it, or
+    // calls it gone. Refresh the name while the id still vouches for it.
+    if qualified_name != binding.binding_id {
+        binding.binding_id = qualified_name;
+    }
+    // The row can also be REGROUPED without moving: a key-version rebuild mints a new logical id
+    // for the same impl. The raw id still proves the binding's identity, so re-read the handle
+    // here — leaving the vanished one in place reports `current` forever while every
+    // logical-id-keyed surface stays disconnected from the symbol.
+    binding.logical_symbol_id = logical_symbol_id_for_symbol(conn, id)?;
+    validate_bound_chunk(conn, binding)
+}
+
 pub(crate) fn validate_symbol_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
+    // A live row whose kind contradicts the binding is held back rather than trusted (see
+    // `cached_kind_agrees`), and only rejected if the relocation pick finds something better.
+    let mut held_back = None;
     if let Some(id) = binding.symbol_id
         && let Some(hit) = crate::symbol::lookup_by_id(conn, id)?
-        && cached_kind_agrees(binding, &hit.kind)
     {
-        // The row id proves WHICH symbol this is; `binding_id` is only the qualified name every
-        // later relocation searches by. A rename in place — an index upgrade re-deriving an impl's
-        // identity moves the row's name from the trait to the type — leaves the two disagreeing,
-        // and nothing notices until the next reindex churns the row id. Relocation then looks up a
-        // name that no longer belongs to this symbol and attaches the memory to whatever else
-        // answers to it, or calls it gone. Refresh the name while the id still vouches for it.
-        if hit.qualified_name != binding.binding_id {
-            binding.binding_id = hit.qualified_name;
+        if cached_kind_agrees(binding, &hit.kind) {
+            return validate_live_symbol(conn, binding, id, hit.qualified_name);
         }
-        // The row can also be REGROUPED without moving: a key-version rebuild mints a new logical
-        // id for the same impl. The raw id still proves the binding's identity, so re-read the
-        // handle here — leaving the vanished one in place reports `current` forever while every
-        // logical-id-keyed surface stays disconnected from the symbol.
-        binding.logical_symbol_id = logical_symbol_id_for_symbol(conn, id)?;
-        return validate_bound_chunk(conn, binding);
+        held_back = Some(id);
     }
     // One qualified name can hold several live rows: `{path}::{name}` is shared by a `struct
     // Worker` and its `impl Worker` block, since an impl symbol is named for its self type. A
@@ -270,6 +307,13 @@ pub(crate) fn validate_symbol_binding(
     };
     let relocated = pick_relocation_twin(candidates, binding);
     if let Some((id, path)) = relocated {
+        // Back at the row the kind check held back: nothing better answers to the name, so the
+        // recorded kind is what is out of date. Validate it live rather than relocate onto itself
+        // and rewrite a portable kind that `anchors/1` would publish.
+        if Some(id) == held_back {
+            let qualified_name = binding.binding_id.clone();
+            return validate_live_symbol(conn, binding, id, qualified_name);
+        }
         binding.symbol_id = Some(id);
         binding.logical_symbol_id = logical_symbol_id_for_symbol(conn, id)?;
         binding.path = Some(path);

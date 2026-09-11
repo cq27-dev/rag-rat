@@ -4921,6 +4921,59 @@ mod tests {
         );
     }
 
+    /// The projection records the account that AUTHORED the winning anchor set — a grantee's, when
+    /// a contributor publishes it onto the owner's stream — never the stream owner. That difference
+    /// is the whole point of the column: the owner's devices must converge the grantee's set,
+    /// because the grantee's `anchors/1` never reaches them.
+    #[test]
+    fn a_grantee_authored_anchor_set_projects_the_grantee_as_its_author() {
+        let conn = db();
+        let stream = StreamId::from_bytes(STREAM);
+        let grantee = crate::account::local_account(&conn, NOW).unwrap();
+        let owner = AccountId::from_bytes([0x51; 32]);
+        seed_ownership(&conn, owner);
+        seed_auth_state_live(&conn, owner, 1);
+        let grant_id = [0x71; 32];
+        seed_grant(&conn, grant_id, owner, grantee, "writer");
+
+        let anchors = vec![crate::op::PortableAnchor {
+            binding_kind: "symbol".to_string(),
+            binding_id: "src/lib.rs::run".to_string(),
+            path: Some("src/lib.rs".to_string()),
+            start_line: Some(1),
+            end_line: Some(2),
+            commit_hash: None,
+            tracker: None,
+            project: None,
+            item_key: None,
+            created_at_ms: 7,
+            symbol_kind: None,
+            signature_hash: None,
+            moniker_tool: None,
+            moniker_tool_version: None,
+        }];
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        crate::account::author_grantee_content_batch_in_tx(
+            &tx,
+            stream,
+            owner,
+            grant_id,
+            &[node_create("g1"), crate::op::MemoryOp::NodeAnchors {
+                node_id: crate::op::NodeId::from("g1"),
+                anchors,
+            }],
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let nodes = crate::content_projection::list_projected_content_nodes(&conn, stream).unwrap();
+        let node = nodes.iter().find(|node| node.node_id == "g1").expect("the node projects");
+        assert_eq!(node.anchors_author, Some(grantee), "the grantee authored it, not the owner");
+    }
+
     #[test]
     fn a_contributor_whose_grant_only_reads_is_rejected() {
         let conn = db();

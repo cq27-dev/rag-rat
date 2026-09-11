@@ -418,14 +418,10 @@ fn write_projection(
     Ok(())
 }
 
-/// Load one stream's ACCEPTED `/3` entries as projector [`Entry`]s: decode the content envelope for
-/// its `lamport` + `device_fingerprint` (the `(lamport, device)` LWW order), then [`op::decode`]
-/// the body. An `Unknown` op is retained in the log but skipped here (mirrors
-/// [`crate::store`]'s `load_known_entries`), so a forward-version op never breaks the fold.
-/// Each accepted entry's author account, keyed by its `(lamport, device)` — the key the fold
-/// reports a register's winner by. A key claimed by two entries with different authors maps to
-/// `None`: acceptance keeps lamports strictly increasing per chain, so a real stream cannot produce
-/// one, and it yields no author rather than a guessed one.
+/// Each accepted `NodeAnchors` entry's author account, keyed by its `(lamport, device)` — the key
+/// the fold reports a register's winner by. A key claimed by two entries with different authors
+/// maps to `None`: acceptance keeps lamports strictly increasing per chain, so a real stream cannot
+/// produce one, and it yields no author rather than a guessed one.
 type EntryAuthors = std::collections::BTreeMap<(u64, DeviceFingerprint), Option<AccountId>>;
 
 /// Record one entry's author under its fold key; see [`EntryAuthors`].
@@ -444,6 +440,10 @@ fn record_entry_author(
         .or_insert(Some(author));
 }
 
+/// Load one stream's ACCEPTED `/3` entries as projector [`Entry`]s: decode the content envelope for
+/// its `lamport` + `device_fingerprint` (the `(lamport, device)` LWW order), then [`op::decode`]
+/// the body. An `Unknown` op is retained in the log but skipped here (mirrors
+/// [`crate::store`]'s `load_known_entries`), so a forward-version op never breaks the fold.
 fn load_accepted_entries(
     tx: &Transaction<'_>,
     stream_id: StreamId,
@@ -524,11 +524,14 @@ fn load_accepted_entries(
                     lamport: signed.header.lamport,
                     device: signed.header.device_fingerprint,
                 };
-                record_entry_author(
-                    &mut authors,
-                    (meta.lamport, meta.device),
-                    signed.header.author_account_id,
-                );
+                // Only an anchor set's winner is ever looked up, so only those entries are kept.
+                if matches!(op, op::MemoryOp::NodeAnchors { .. }) {
+                    record_entry_author(
+                        &mut authors,
+                        (meta.lamport, meta.device),
+                        signed.header.author_account_id,
+                    );
+                }
                 entries.push(Entry { meta, op });
             },
             DecodedOp::Unknown { .. } => {}, // retained in the log, not projected

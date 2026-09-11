@@ -1755,6 +1755,84 @@ fn a_cached_id_that_contradicts_the_bindings_kind_is_not_trusted() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// When the binding records a kind nothing under its name has here — the author rebound to an impl
+/// this checkout has not indexed yet, or a rename changed the kind — the pick lands back on the row
+/// the kind check held back. It must validate that row live: relocating onto it reports
+/// `relocated` on every pass (the logical arm keeps the kind), or rewrites the recorded kind to
+/// this checkout's view (the raw-id arm), which `anchors/1` would then publish over the author's.
+#[test]
+fn a_kind_nothing_here_has_validates_the_held_back_row_live() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub struct Worker {\n    pub a: u8,\n}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let (symbol_id, logical_id): (i64, i64) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT s.id, (SELECT m.logical_symbol_id FROM logical_symbol_members m
+                            WHERE m.symbol_id = s.id LIMIT 1)
+               FROM symbols s WHERE s.name = 'Worker' AND s.kind = 'struct'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+
+    for (title, bind) in [
+        ("raw symbol id", rag_rat_query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(symbol_id),
+            ..Default::default()
+        }),
+        ("logical handle", rag_rat_query::memory::RepoMemoryBindTarget {
+            logical_symbol_id: Some(logical_id),
+            ..Default::default()
+        }),
+    ] {
+        let memory_id = db
+            .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: format!("Bound to Worker by {title}"),
+                body: format!("Recorded as an impl this checkout lacks, by {title}."),
+                confidence: "high".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: Vec::new(),
+                payload_json: None,
+                bind,
+            })
+            .unwrap()
+            .memory
+            .memory_id;
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE repo_memory_bindings SET symbol_kind = 'impl' WHERE memory_id = ?1",
+                params![memory_id],
+            )
+            .unwrap();
+
+        for pass in 0..2 {
+            db.memory_validate().unwrap();
+            let (status, kind): (String, Option<String>) = db
+                .storage
+                .connection()
+                .query_row(
+                    "SELECT anchor_status, symbol_kind FROM repo_memory_bindings
+                      WHERE memory_id = ?1 AND binding_kind IN ('symbol', 'logical_symbol')",
+                    params![memory_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_ne!(status, "relocated", "bound by {title}, pass {pass}");
+            assert_eq!(kind.as_deref(), Some("impl"), "bound by {title}: the recorded kind stays");
+        }
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Each trait sits on the line AFTER `impl` so both impl symbols capture the same signature text,
 /// which is what leaves the logical handle as the only discriminator.
 const TWO_TRAIT_IMPLS_FIXTURE: &str = "pub struct Twin;\npub trait Alpha { fn run(&self); }\npub \
