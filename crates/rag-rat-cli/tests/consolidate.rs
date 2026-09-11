@@ -632,7 +632,7 @@ fn consolidate_rebuilds_stale_content_projection_before_reconcile() {
     // Pinned as a literal because the constant is oplog-internal and exporting it would make a
     // projector detail a public commitment for one assertion's sake. Move this with the next
     // CONTENT_PROJECTOR_VERSION bump.
-    assert_eq!(stamp, "5", "consolidate upgraded the store-global projector stamp");
+    assert_eq!(stamp, "6", "consolidate upgraded the store-global projector stamp");
 }
 
 /// Two clones of one repository share its repo id but hold separate legacy indexes, each pinned to

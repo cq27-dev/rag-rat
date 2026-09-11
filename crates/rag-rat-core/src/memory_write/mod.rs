@@ -36,6 +36,10 @@ pub(crate) use authoring::{
     contribution_targets, ensure_not_mirroring_another_account, reconcile_owner_stream_for_repo,
     subscription_owners,
 };
+// The drain's in-place refresh of a held binding, driven against a real index by the
+// relocation tests.
+#[cfg(test)]
+pub(crate) use drain::refresh_binding;
 // The synced-content drain entries (#691 A1): the per-repo drain (consolidate) and the
 // store-global drain (open/migrate) that materialize accepted synced `/3` content into the
 // local memory tables.

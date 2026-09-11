@@ -993,15 +993,9 @@ fn build_reconcile_ops(
         //
         // An unpublishable set is dropped rather than quarantining the node: anchors are
         // decoration, and losing them must never cost a peer the memory itself.
-        if let Some(op) = anchors_op(conn, &row.memory_id)?
-            && content_op_is_authorable(&op, policy)
-        {
-            ops.push(op);
-        }
-        if let Some(op) = source_hash_op(conn, &row.memory_id)?
-            && content_op_is_authorable(&op, policy)
-        {
-            ops.push(op);
+        let publication = anchor_publication_ops(conn, &row.memory_id)?;
+        if publication.iter().all(|op| content_op_is_authorable(op, policy)) {
+            ops.extend(publication);
         }
         if let Some(group) = by_source.remove(row.memory_id.as_str()) {
             for edge in group {
@@ -1178,14 +1172,6 @@ const ANCHOR_BACKFILL_SCAN_PER_PASS: i64 = 512;
 /// cannot heal `some -> different`, and the relocation engine does rewrite portable anchor identity
 /// outside any authoring path, so a renamed symbol leaves a peer holding the pre-rename set until
 /// an explicit rebind re-authors it. Republish-on-drift is a separate mechanism, not this one.
-///
-/// The match set is `anchors_json IS NULL` only. A memory whose anchors were published BEFORE the
-/// source-hash op existed has left it for good, so its hash is never swept and the peer holds the
-/// anchors unmarked. Widening this to also select on `source_text_hash IS NULL` would not fix it:
-/// the receiver applies a hash only where it seeds the anchors (`stamp_seeded_source_hash`), and a
-/// peer that already holds them seeds nothing. Healing the pair needs a republish path that
-/// re-seeds both together. No released version authored anchors, so the exposure is stores that ran
-/// an unreleased build of the anchor op.
 fn read_anchor_backfill_ids(
     conn: &Connection,
     repo_id: &str,
@@ -1265,22 +1251,18 @@ fn read_reconcile_work(
         if swept >= ANCHOR_BACKFILL_PER_PASS {
             break;
         }
-        match anchors_op(conn, &memory_id)? {
-            Some(op) if content_op_is_authorable(&op, policy) => {
-                anchor_backfill_ops.push(op);
-                swept += 1;
-                // The hash describes exactly the anchors this sweep is publishing, and a receiver
-                // applies it only where it seeds them — so it has to ride the same batch, or every
-                // memory in the corpus this leg exists to reach lands on a peer unmarked forever.
-                if let Some(op) = source_hash_op(conn, &memory_id)?
-                    && content_op_is_authorable(&op, policy)
-                {
-                    anchor_backfill_ops.push(op);
-                }
-            },
-            // `None` is unreachable (the query requires a binding), but counting it as quarantined
-            // keeps the partition total rather than silently dropping.
-            _ => quarantined_anchor_ids.push(memory_id),
+        // The hash describes exactly the anchors this sweep publishes, so it rides the same batch,
+        // ahead of them (see `anchor_publication_ops`). An empty publication is unreachable — the
+        // query requires a binding — but counting it as quarantined keeps the partition total
+        // rather than silently dropping.
+        let publication = anchor_publication_ops(conn, &memory_id)?;
+        if !publication.is_empty()
+            && publication.iter().all(|op| content_op_is_authorable(op, policy))
+        {
+            anchor_backfill_ops.extend(publication);
+            swept += 1;
+        } else {
+            quarantined_anchor_ids.push(memory_id);
         }
     }
     Ok(ReconcileWork {
@@ -2180,8 +2162,7 @@ pub(crate) fn author_create(
     let node_id = NodeId::from(memory.memory_id.as_str());
     let mut ops =
         vec![MemoryOp::NodeCreate { node_id: node_id.clone(), content: content_of(memory) }];
-    ops.extend(anchors_op(tx, &memory.memory_id)?);
-    ops.extend(source_hash_op(tx, &memory.memory_id)?);
+    ops.extend(anchor_publication_ops(tx, &memory.memory_id)?);
     author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
 
@@ -2193,23 +2174,44 @@ pub(crate) fn author_anchors(
     prepared: Option<&PreparedOwnerAuthoring>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let mut ops: Vec<MemoryOp> = anchors_op(tx, memory_id)?.into_iter().collect();
     // A rebind re-stamps `source_text_hash` in the same transaction, so the published hash has to
-    // move with the anchors or a peer keeps comparing against the pre-rebind text.
-    ops.extend(source_hash_op(tx, memory_id)?);
+    // move with the anchors or a peer keeps comparing against the pre-rebind text. A target with no
+    // hash publishes an EMPTY one: the register has no other retraction, and a receiver applies the
+    // hash on its own change, so silence would pair the new anchors with the old text.
+    let ops = anchor_publication_ops(tx, memory_id)?;
     author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
 
-/// The `NodeSourceHash` op for a memory's stamped source hash, or `None` when it has none.
+/// The ops that publish a memory's anchor set — its source hash, then the set — or none when the
+/// memory holds no binding. A memory with no hash publishes an EMPTY one: the register's only
+/// retraction, and the op that keeps the pair a pair.
 ///
-/// Like the anchor snapshot, an absent hash authors NOTHING rather than a sentinel: a receiver
-/// treats "nobody published one" as no evidence of drift, so spending a signed entry to say it
-/// would tell that peer nothing it can act on.
+/// Always BOTH, never one alone. The fold takes a winning set's hash from the device that wrote it
+/// — that device's latest hash — so a device's pair holds against any other writer, whichever order
+/// the other wrote its own in. A set published alone would pair with the device's PREVIOUS hash,
+/// the one describing the target it just left, for good, since nothing republishes afterwards.
 ///
-/// That silence has no retraction, so the published register can outlive the hash it was taken
-/// from — an author who rebinds onto a target that carries none (tracker / dir / commit / call
-/// path) nulls the column and publishes nothing. A receiver applies the hash only where it also
-/// installs the anchors it describes, which is what keeps the pair from contradicting each other.
+/// The hash goes FIRST. The two are separate entries on one chain, and a peer accepts a chain in
+/// order, so a pull that stops between them leaves a prefix. Hash-first makes that prefix a newer
+/// hash beside the older set, which the next entry resolves. Set-first would pair the new bindings
+/// with the previous target's hash, and a receiver relocating by hash could move a binding back to
+/// the target its author just left — where the late hash, arriving alone, no longer moves it.
+pub(crate) fn anchor_publication_ops(
+    conn: &Connection,
+    memory_id: &str,
+) -> anyhow::Result<Vec<MemoryOp>> {
+    let Some(anchors) = anchors_op(conn, memory_id)? else {
+        return Ok(Vec::new());
+    };
+    let hash = source_hash_op(conn, memory_id)?.unwrap_or_else(|| MemoryOp::NodeSourceHash {
+        node_id: NodeId::from(memory_id),
+        source_text_hash: String::new(),
+    });
+    Ok(vec![hash, anchors])
+}
+
+/// The `NodeSourceHash` op for a memory's stamped source hash, or `None` when it has none — in
+/// which case [`anchor_publication_ops`] publishes an explicit empty hash in its place.
 fn source_hash_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<MemoryOp>> {
     let mut stmt = conn.prepare("SELECT source_text_hash FROM repo_memories WHERE id = ?1")?;
     let hash: Option<String> = stmt
@@ -2244,7 +2246,7 @@ fn anchors_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<Memor
 
 /// Read a memory's bindings as the portable facts the wire carries — every replicated column, and
 /// no checkout-local resolution state.
-fn portable_anchors_of(
+pub(super) fn portable_anchors_of(
     conn: &Connection,
     memory_id: &str,
 ) -> anyhow::Result<Vec<rag_rat_oplog::PortableAnchor>> {

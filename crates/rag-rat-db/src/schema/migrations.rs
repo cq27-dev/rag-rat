@@ -8544,6 +8544,25 @@ pub(crate) fn apply_content_projected_node_source_hash(conn: &Connection) -> rus
     ensure_content_projection_shape(conn)
 }
 
+/// A synced memory records WHICH published anchor set and source hash the drain last applied to it,
+/// and what that set named for each symbol anchor it still matched; the `/3` projection records
+/// which account authored each node's winning anchor set (#1243). Without the record a receiver can
+/// only seed once, so an author's later rebind never reaches it; with it, the drain replaces
+/// bindings when the published set CHANGES and leaves them alone otherwise — which keeps a local
+/// relocation from being undone on every pass — and tells an author's retarget from a republish of
+/// the same target. The author column lets the drain leave a set its own account's `anchors/1`
+/// already carries to that carrier.
+///
+/// Every column is nullable and starts NULL. The projected one delegates to
+/// [`ensure_content_projection_shape`] for the reason documented there: a projected column has two
+/// homes, and the refold steps need the projection's final shape.
+pub fn apply_memory_applied_anchor_snapshot(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "repo_memories", "anchors_applied_digest", "TEXT")?;
+    add_column_if_missing(conn, "repo_memories", "source_hash_applied", "TEXT")?;
+    add_column_if_missing(conn, "repo_memories", "anchors_applied_targets", "TEXT")?;
+    ensure_content_projection_shape(conn)
+}
+
 /// Every column the CURRENT content projector writes, applied ahead of any migration that replays
 /// the fold.
 ///
@@ -8569,7 +8588,8 @@ pub(crate) fn ensure_content_projection_shape(conn: &Connection) -> rusqlite::Re
         return Ok(());
     }
     add_column_if_missing(conn, "content_projected_nodes", "anchors_json", "TEXT")?;
-    add_column_if_missing(conn, "content_projected_nodes", "source_text_hash", "TEXT")
+    add_column_if_missing(conn, "content_projected_nodes", "source_text_hash", "TEXT")?;
+    add_column_if_missing(conn, "content_projected_nodes", "anchors_author", "BLOB")
 }
 
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {

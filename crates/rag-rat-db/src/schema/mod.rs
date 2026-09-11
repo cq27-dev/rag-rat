@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 119;
+pub const LATEST_SCHEMA_VERSION: u32 = 120;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -857,6 +857,15 @@ const MIGRATION_119_DESCRIPTION: &str =
      the text a memory's author anchored to (#1213). A receiver compares it against its own \
      checkout to demote a drifted anchor; NULL means no node_source_hash op has been folded, \
      which surfaces unmarked rather than as evidence of drift";
+const MIGRATION_120_ID: &str = "120_memory_applied_anchor_snapshot";
+const MIGRATION_120_CHECKSUM: &str = "sha256:rag-rat-memory-applied-anchor-snapshot-v120";
+const MIGRATION_120_DESCRIPTION: &str =
+    "Record what the memory drain last applied to a synced memory (#1243): \
+     repo_memories.anchors_applied_digest and source_hash_applied, so an author's later rebind \
+     replaces them without undoing local relocation, and anchors_applied_targets, the kind and \
+     signature that set named for each symbol anchor, to tell a retarget from a republish. Add \
+     content_projected_nodes.anchors_author, the account that authored each node's winning anchor \
+     set, so the drain leaves a set its own account's anchors/1 carries to that carrier";
 const MIGRATION_118_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-v118";
 const MIGRATION_118_DESCRIPTION: &str =
     "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
@@ -1868,6 +1877,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_119_CHECKSUM,
         description: MIGRATION_119_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_content_projected_node_source_hash),
+    },
+    Migration {
+        id: MIGRATION_120_ID,
+        checksum: MIGRATION_120_CHECKSUM,
+        description: MIGRATION_120_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_memory_applied_anchor_snapshot),
     },
 ];
 

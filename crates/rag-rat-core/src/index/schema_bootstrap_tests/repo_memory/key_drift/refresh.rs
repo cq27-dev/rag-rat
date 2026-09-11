@@ -1666,6 +1666,711 @@ fn a_symbol_binding_without_a_logical_handle_keeps_the_deterministic_pick() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// The synced-memory drain moves a binding in place and keeps its checkout-local ids, so an
+/// author's rebind from a struct to its impl leaves the struct's ids beside the impl's kind. On the
+/// row it marks retargeted, validation must not trust an id whose symbol contradicts the recorded
+/// kind, for the raw symbol id and the logical handle alike, or the memory stays on the struct.
+#[test]
+fn a_cached_id_that_contradicts_the_bindings_kind_is_not_trusted() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub struct Worker;\nimpl Worker {\n    pub fn run(&self) {}\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let ids = |kind: &str| -> (i64, i64) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT s.id, (SELECT m.logical_symbol_id FROM logical_symbol_members m
+                                WHERE m.symbol_id = s.id LIMIT 1)
+                   FROM symbols s WHERE s.name = 'Worker' AND s.kind = ?1",
+                [kind],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    let (struct_id, struct_logical) = ids("struct");
+    let (impl_id, impl_logical) = ids("impl");
+
+    for (title, bind) in [
+        ("raw symbol id", rag_rat_query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(struct_id),
+            ..Default::default()
+        }),
+        ("logical handle", rag_rat_query::memory::RepoMemoryBindTarget {
+            logical_symbol_id: Some(struct_logical),
+            ..Default::default()
+        }),
+    ] {
+        let memory_id = db
+            .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: format!("Bound to the Worker struct by {title}"),
+                body: format!("Rebound to the impl in place, keeping the {title}."),
+                confidence: "high".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: Vec::new(),
+                payload_json: None,
+                bind,
+            })
+            .unwrap()
+            .memory
+            .memory_id;
+        // The drain's in-place rebind: the portable kind moves to the impl, the local ids stay
+        // the struct's, and the row is marked retargeted.
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE repo_memory_bindings SET symbol_kind = 'impl', relocation_reason = ?2
+                  WHERE memory_id = ?1",
+                params![memory_id, rag_rat_query::memory::RETARGETED_REASON],
+            )
+            .unwrap();
+
+        db.memory_validate().unwrap();
+
+        let (symbol_id, logical_id): (Option<i64>, Option<i64>) = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT symbol_id, logical_symbol_id FROM repo_memory_bindings
+                  WHERE memory_id = ?1 AND binding_kind IN ('symbol', 'logical_symbol')",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            symbol_id == Some(impl_id) || logical_id == Some(impl_logical),
+            "bound by {title}: the memory must land on the impl, not stay on the struct \
+             ({symbol_id:?}/{logical_id:?})",
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// When a retargeted binding records a kind nothing under its name has here — the author rebound
+/// to an impl this checkout has not indexed yet — the pick lands back on the row the retarget check
+/// held back. It must validate that row live, keeping the recorded kind for a checkout that has
+/// the target: relocating onto it would report `relocated` on every pass.
+#[test]
+fn a_kind_nothing_here_has_validates_the_held_back_row_live() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub struct Worker {\n    pub a: u8,\n}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let (symbol_id, logical_id): (i64, i64) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT s.id, (SELECT m.logical_symbol_id FROM logical_symbol_members m
+                            WHERE m.symbol_id = s.id LIMIT 1)
+               FROM symbols s WHERE s.name = 'Worker' AND s.kind = 'struct'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+
+    for (title, bind) in [
+        ("raw symbol id", rag_rat_query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(symbol_id),
+            ..Default::default()
+        }),
+        ("logical handle", rag_rat_query::memory::RepoMemoryBindTarget {
+            logical_symbol_id: Some(logical_id),
+            ..Default::default()
+        }),
+    ] {
+        let memory_id = db
+            .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: format!("Bound to Worker by {title}"),
+                body: format!("Recorded as an impl this checkout lacks, by {title}."),
+                confidence: "high".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: Vec::new(),
+                payload_json: None,
+                bind,
+            })
+            .unwrap()
+            .memory
+            .memory_id;
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE repo_memory_bindings SET symbol_kind = 'impl', relocation_reason = ?2
+                  WHERE memory_id = ?1",
+                params![memory_id, rag_rat_query::memory::RETARGETED_REASON],
+            )
+            .unwrap();
+
+        for pass in 0..2 {
+            db.memory_validate().unwrap();
+            let (status, kind): (String, Option<String>) = db
+                .storage
+                .connection()
+                .query_row(
+                    "SELECT anchor_status, symbol_kind FROM repo_memory_bindings
+                      WHERE memory_id = ?1 AND binding_kind IN ('symbol', 'logical_symbol')",
+                    params![memory_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_ne!(status, "relocated", "bound by {title}, pass {pass}");
+            assert_eq!(kind.as_deref(), Some("impl"), "bound by {title}: the recorded kind stays");
+        }
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The drain moves a synced binding to its author's new target IN PLACE, and a rebind between two
+/// impls of one type keeps the binding's identity and kind — only the signature says it moved. The
+/// row keeps the handle of the impl the author left, so the refresh marks it retargeted and the
+/// validator follows the published signature once. A published signature nothing here has (this
+/// checkout's source differs from the author's) names nothing, and the handle stands.
+#[test]
+fn a_published_rebind_between_same_named_impls_follows_the_signature() {
+    use rag_rat_base::hash::hex_sha256;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub struct W;\npub trait Alpha { fn run(&self); }\npub trait Beta { fn run(&self); \
+         }\nimpl Alpha for W { fn run(&self) {} }\nimpl Beta for W { fn run(&self) {} }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    // (symbol id, logical id, signature, start line) of each impl, in declaration order.
+    let impls: Vec<(i64, i64, String, i64)> = {
+        let conn = db.storage.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, (SELECT m.logical_symbol_id FROM logical_symbol_members m
+                                WHERE m.symbol_id = s.id LIMIT 1),
+                        s.signature, c.start_line
+                   FROM symbols s JOIN chunks c ON c.symbol_id = s.id
+                  WHERE s.name = 'W' AND s.kind = 'impl' ORDER BY s.id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let [alpha, beta] = &impls[..] else {
+        panic!("two impl rows expected: {impls:?}");
+    };
+    assert_ne!(alpha.2, beta.2, "the fixture's impls must differ by signature");
+
+    for (title, by_logical_handle) in [("raw symbol id", false), ("logical handle", true)] {
+        let bind_to = |(symbol_id, logical_id, _, _): &(i64, i64, String, i64)| {
+            if by_logical_handle {
+                rag_rat_query::memory::RepoMemoryBindTarget {
+                    logical_symbol_id: Some(*logical_id),
+                    ..Default::default()
+                }
+            } else {
+                rag_rat_query::memory::RepoMemoryBindTarget {
+                    symbol_id: Some(*symbol_id),
+                    ..Default::default()
+                }
+            }
+        };
+        // Create a memory on `from`, validate it, refresh it in place to `published`, validate
+        // again, and read back where it landed and the reason left on it.
+        let retarget = |from, what: &str, published: rag_rat_oplog::PortableAnchor| {
+            let memory_id = db
+                .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+                    kind: "Invariant".to_string(),
+                    title: format!("{what} ({title})"),
+                    body: format!("{what}, bound by {title}."),
+                    confidence: "high".to_string(),
+                    created_by: Some("test-agent".to_string()),
+                    source: Some("agent".to_string()),
+                    tags: Vec::new(),
+                    payload_json: None,
+                    bind: bind_to(from),
+                })
+                .unwrap()
+                .memory
+                .memory_id;
+            db.memory_validate().unwrap();
+            let conn = db.storage.connection();
+            let (repo_id, binding_kind, binding_id): (String, String, String) = conn
+                .query_row(
+                    "SELECT repo_id, binding_kind, binding_id FROM repo_memory_bindings
+                      WHERE memory_id = ?1",
+                    params![memory_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .unwrap();
+            crate::memory_write::refresh_binding(
+                &tx,
+                &repo_id,
+                &memory_id,
+                &rag_rat_oplog::PortableAnchor { binding_kind, binding_id, ..published },
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            db.memory_validate().unwrap();
+            conn.query_row(
+                "SELECT start_line, relocation_reason FROM repo_memory_bindings
+                  WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+        };
+        let published = |signature: &str, start_line: i64| rag_rat_oplog::PortableAnchor {
+            binding_kind: String::new(),
+            binding_id: String::new(),
+            path: Some("src/lib.rs".to_string()),
+            start_line: Some(start_line),
+            end_line: Some(start_line),
+            commit_hash: None,
+            tracker: None,
+            project: None,
+            item_key: None,
+            created_at_ms: 1,
+            symbol_kind: Some("impl".to_string()),
+            signature_hash: Some(hex_sha256(signature.trim().as_bytes())),
+            moniker_tool: None,
+            moniker_tool_version: None,
+        };
+
+        let (line, reason) =
+            retarget(alpha, "Rebound from Alpha to Beta", published(&beta.2, beta.3));
+        assert_eq!(line, Some(beta.3), "bound by {title}: the rebind must land on Beta");
+        assert_eq!(reason, None, "bound by {title}: validation answers the mark once");
+        let (line, _) = retarget(
+            beta,
+            "Republished under a signature this checkout lacks",
+            published("impl Beta for Elsewhere", alpha.3),
+        );
+        assert_eq!(line, Some(beta.3), "bound by {title}: evidence naming nothing here keeps it");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Validation relocates a memory whose symbol's signature was edited but keeps the recorded
+/// signature, so a live handle and a recorded signature disagree for a binding this checkout moved
+/// itself. A sibling that later takes the old signature text under the same name must not take the
+/// memory — not on a validation pass, and not when a foreign author republishes the same target
+/// with the signature it recorded, which is no retarget.
+#[test]
+fn an_edited_symbols_memory_is_not_taken_by_a_sibling_with_its_old_signature() {
+    for (title, by_logical_handle) in [("logical handle", true), ("raw symbol id", false)] {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        let v1 = "pub struct A;\nimpl A {\n    pub fn new() -> Self {\n        A\n    }\n}\n";
+        fs::write(root.join("src/lib.rs"), v1).unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let (symbol_id, logical_id): (i64, i64) = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT s.id, m.logical_symbol_id FROM symbols s
+                   JOIN logical_symbol_members m ON m.symbol_id = s.id
+                  WHERE s.name = 'new' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let memory_id = db
+            .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: format!("A::new takes its capacity up front ({title})"),
+                body: format!("Bound to A::new by its {title}."),
+                confidence: "high".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: Vec::new(),
+                payload_json: None,
+                bind: if by_logical_handle {
+                    rag_rat_query::memory::RepoMemoryBindTarget {
+                        logical_symbol_id: Some(logical_id),
+                        ..Default::default()
+                    }
+                } else {
+                    rag_rat_query::memory::RepoMemoryBindTarget {
+                        symbol_id: Some(symbol_id),
+                        ..Default::default()
+                    }
+                },
+            })
+            .unwrap()
+            .memory
+            .memory_id;
+        // What the binding's writer recorded of `new() -> Self` — the values an author republishes.
+        let (recorded_kind, recorded_signature): (Option<String>, Option<String>) = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT symbol_kind, signature_hash FROM repo_memory_bindings WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        drop(db);
+
+        let v2 = "pub struct A;\nimpl A {\n    pub fn new(cap: usize) -> Self {\n        let _ = \
+                  cap;\n        A\n    }\n}\n";
+        fs::write(root.join("src/lib.rs"), v2).unwrap();
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.memory_validate().unwrap();
+        drop(db);
+
+        let v3 = format!(
+            "{v2}pub struct C;\nimpl C {{\n    pub fn new() -> Self {{\n        C\n    }}\n}}\n"
+        );
+        fs::write(root.join("src/lib.rs"), v3).unwrap();
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let conn = db.storage.connection();
+        let start_line = || -> Option<i64> {
+            conn.query_row(
+                "SELECT start_line FROM repo_memory_bindings WHERE memory_id = ?1",
+                params![memory_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        for pass in 0..2 {
+            db.memory_validate().unwrap();
+            assert_eq!(start_line(), Some(3), "bound by {title}, pass {pass}: stays on A::new");
+        }
+
+        // The author republishes the same target: its lines moved, its kind and signature as it
+        // recorded them.
+        let (repo_id, anchor) = conn
+            .query_row(
+                "SELECT repo_id, binding_kind, binding_id, path, start_line, end_line,
+                        created_at_ms
+                   FROM repo_memory_bindings WHERE memory_id = ?1",
+                params![memory_id],
+                |r| {
+                    Ok((r.get::<_, String>(0)?, rag_rat_oplog::PortableAnchor {
+                        binding_kind: r.get(1)?,
+                        binding_id: r.get(2)?,
+                        path: r.get(3)?,
+                        start_line: r.get::<_, Option<i64>>(4)?.map(|line| line + 20),
+                        end_line: r.get::<_, Option<i64>>(5)?.map(|line| line + 20),
+                        commit_hash: None,
+                        tracker: None,
+                        project: None,
+                        item_key: None,
+                        created_at_ms: r.get::<_, i64>(6)? + 1,
+                        symbol_kind: recorded_kind.clone(),
+                        signature_hash: recorded_signature.clone(),
+                        moniker_tool: None,
+                        moniker_tool_version: None,
+                    }))
+                },
+            )
+            .unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        // The drain compares against what the author published last — the recorded values — not
+        // the row, which relocation refreshed to this checkout's `new(cap)`.
+        let previous = Some((recorded_kind.clone(), recorded_signature.clone()));
+        crate::memory_write::refresh_binding(&tx, &repo_id, &memory_id, &anchor, previous).unwrap();
+        tx.commit().unwrap();
+        db.memory_validate().unwrap();
+        assert_eq!(
+            start_line(),
+            Some(3),
+            "bound by {title}: a same-target republish must leave the memory on A::new",
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// The retarget mark sits on a row every checkout of the repo shares, and the checkout validating
+/// first may not hold the author's new target: here a linked worktree edited it. That checkout
+/// must leave the mark — and the author's kind and signature — for the base checkout, which then
+/// moves the memory to the target the author named.
+#[test]
+fn a_linked_checkout_without_the_authors_target_leaves_the_retarget_to_the_base() {
+    use rag_rat_base::hash::hex_sha256;
+
+    let base_source = "pub struct W;\npub trait Alpha { fn run(&self); }\npub trait Beta { fn \
+                       run(&self); }\nimpl Alpha for W { fn run(&self) {} }\nimpl Beta for W { fn \
+                       run(&self) {} }\n";
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/lib.rs"), base_source).unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.to_path_buf(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    // (symbol id, signature, start line) of each base impl, in declaration order.
+    let impls: Vec<(i64, String, i64)> = {
+        let conn = db.storage.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.signature, c.start_line
+                   FROM symbols s JOIN chunks c ON c.symbol_id = s.id
+                  WHERE s.name = 'W' AND s.kind = 'impl' ORDER BY s.id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let [alpha, beta] = &impls[..] else {
+        panic!("two impl rows expected: {impls:?}");
+    };
+    let memory_id = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Rebound from Alpha to Beta by its author".to_string(),
+            body: "Bound to the Alpha impl by its raw symbol id.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(alpha.0),
+                ..Default::default()
+            },
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+    db.memory_validate().unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(
+        linked.join("src/lib.rs"),
+        base_source.replace("impl Beta for W {", "impl Beta for W where W: Sized {"),
+    )
+    .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    let beta_signature = hex_sha256(beta.1.trim().as_bytes());
+    // The author's rebind to Beta, as the drain applies it; `created_at_ms` tells republishes
+    // apart.
+    let publish_beta = |db: &IndexDatabase, created_at_ms: i64| {
+        let conn = db.storage.connection();
+        let (repo_id, binding_kind, binding_id): (String, String, String) = conn
+            .query_row(
+                "SELECT repo_id, binding_kind, binding_id FROM repo_memory_bindings
+                  WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        crate::memory_write::refresh_binding(
+            &tx,
+            &repo_id,
+            &memory_id,
+            &rag_rat_oplog::PortableAnchor {
+                binding_kind,
+                binding_id,
+                path: Some("src/lib.rs".to_string()),
+                start_line: Some(beta.2),
+                end_line: Some(beta.2),
+                commit_hash: None,
+                tracker: None,
+                project: None,
+                item_key: None,
+                created_at_ms,
+                symbol_kind: Some("impl".to_string()),
+                signature_hash: Some(beta_signature.clone()),
+                moniker_tool: None,
+                moniker_tool_version: None,
+            },
+            None,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    };
+    publish_beta(&db, 1);
+    let read = |db: &IndexDatabase| -> (Option<i64>, Option<String>, Option<String>) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT start_line, signature_hash, relocation_reason FROM repo_memory_bindings
+                  WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    };
+
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    db.memory_validate().unwrap();
+    let (_, signature, reason) = read(&db);
+    assert_eq!(signature.as_deref(), Some(beta_signature.as_str()), "the author's signature stays");
+    assert_eq!(
+        reason.as_deref(),
+        Some(rag_rat_query::memory::RETARGETED_REASON),
+        "a checkout without the author's target leaves the retarget unanswered",
+    );
+    // A republish of the same set before any checkout answers keeps the mark.
+    publish_beta(&db, 2);
+
+    db.use_worktree_scope(&main, None).unwrap();
+    db.memory_validate().unwrap();
+    let (start_line, _, reason) = read(&db);
+    assert_eq!(start_line, Some(beta.2), "the base checkout moves the memory to Beta");
+    assert_eq!(reason, None, "and answers the retarget");
+
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&main);
+}
+
+/// A memory bound by raw symbol id follows `struct Worker` becoming `enum Worker`. A same-named
+/// struct added later — in the same checkout or in a linked worktree sharing the binding row — must
+/// not take the memory from the enum: not while its id lives, and not once a later edit changes the
+/// enum's signature and the pick decides by the recorded kind — so relocation must have recorded
+/// `enum`. (A logical handle outlives these edits here, so it never reaches that pick.)
+#[test]
+fn a_local_kind_change_is_not_taken_by_a_sibling_with_the_old_kind() {
+    const ENUM: &str = "pub enum Worker {\n    A,\n    B,\n}\n";
+    const SIBLING: &str = "mod unrelated {\n    pub struct Worker;\n}\n";
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/lib.rs"), "pub struct Worker {\n    pub a: u8,\n}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "struct"]);
+    let config = source_config(main.to_path_buf(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let symbol_id: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM symbols WHERE name = 'Worker' AND kind = 'struct'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let memory_id = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Worker is the job runner".to_string(),
+            body: "Bound to Worker by its raw symbol id.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(symbol_id),
+                ..Default::default()
+            },
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+    drop(db);
+
+    // The struct becomes an enum; validation follows it.
+    fs::write(main.join("src/lib.rs"), ENUM).unwrap();
+    run_git(&main, &["commit", "-q", "-am", "enum"]);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    db.memory_validate().unwrap();
+    let landed = |db: &IndexDatabase| -> (Option<i64>, Option<String>) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT start_line, symbol_kind FROM repo_memory_bindings WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(landed(&db).0, Some(1), "after the kind change");
+
+    // A linked worktree adds an unrelated `struct Worker` under the same qualified name.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "sibling", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/lib.rs"), format!("{ENUM}{SIBLING}")).unwrap();
+    run_git(&linked, &["commit", "-q", "-am", "sibling"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    let same_name: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(DISTINCT kind) FROM symbols
+              WHERE qualified_name_id = (SELECT qualified_name_id FROM symbols
+                                          WHERE name = 'Worker' AND kind = 'enum' LIMIT 1)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(same_name, 2, "precondition: the sibling struct shares the enum's name");
+    for pass in 0..2 {
+        db.memory_validate().unwrap();
+        assert_eq!(landed(&db).0, Some(1), "linked pass {pass}: the memory stays on the enum",);
+    }
+    db.use_worktree_scope(&main, None).unwrap();
+    db.memory_validate().unwrap();
+    assert_eq!(landed(&db).0, Some(1), "and on the base checkout's enum");
+
+    // The same sibling in the base checkout itself.
+    fs::write(main.join("src/lib.rs"), format!("{ENUM}{SIBLING}")).unwrap();
+    run_git(&main, &["commit", "-q", "-am", "sibling in base"]);
+    drop(db);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    for pass in 0..2 {
+        db.memory_validate().unwrap();
+        assert_eq!(landed(&db).0, Some(1), "base pass {pass}: stays on the enum");
+    }
+
+    // A later edit changes the enum's signature, so its handle dies with the sibling still
+    // there: the pick must credit the enum's recorded kind, not the struct's.
+    fs::write(
+        main.join("src/lib.rs"),
+        format!("pub enum Worker<T> {{\n    A(T),\n    B,\n}}\n{SIBLING}"),
+    )
+    .unwrap();
+    run_git(&main, &["commit", "-q", "-am", "generic enum"]);
+    drop(db);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.memory_validate().unwrap();
+    assert_eq!(landed(&db).0, Some(1), "a dead handle still lands on the enum");
+
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&main);
+}
+
 /// Each trait sits on the line AFTER `impl` so both impl symbols capture the same signature text,
 /// which is what leaves the logical handle as the only discriminator.
 const TWO_TRAIT_IMPLS_FIXTURE: &str = "pub struct Twin;\npub trait Alpha { fn run(&self); }\npub \

@@ -12,8 +12,13 @@
 //! - node **status** — the last-in-order `NodeStatus`; default `active`.
 //! - node **anchors** — the last-in-order `NodeAnchors`, a FULL-SET replacement; `None` until one
 //!   is folded, which is distinct from an empty set (nobody has said, versus said "no bindings").
-//! - node **source hash** — the last-in-order `NodeSourceHash`: the text its author anchored to, so
-//!   a receiver can tell its own checkout has drifted from what that author meant.
+//! - node **source hash** — the text an author anchored to, so a receiver can tell its own checkout
+//!   has drifted from what that author meant. Not an independent register: it is the latest
+//!   `NodeSourceHash` from the device that wrote the winning anchor set, `None` when that device
+//!   published none. A device publishes its hash beside its anchors, so its latest hash describes
+//!   its latest set — whichever order its binary wrote the pair in — while two independent
+//!   registers split pairs written in opposite orders: `anchors A @10, hash A @11` from one device
+//!   and `hash B @10, anchors B @11` from another would settle on anchors B beside hash A.
 //! - edge **presence** — the last-in-order `EdgeAdd`/`EdgeRemove`; present iff the winner is an
 //!   add.
 //! - edge **resolved anchor** — the last-in-order `Rebind`; rides along iff the edge is present,
@@ -25,8 +30,8 @@
 use std::collections::BTreeMap;
 
 use super::op::{
-    self, EdgeKey, EdgeSpec, Entry, MemoryOp, NodeContent, NodeId, NodeStatus, PortableAnchor,
-    ResolvedAnchor,
+    self, EdgeKey, EdgeSpec, Entry, MemoryOp, NodeContent, NodeId, NodeStatus, OpMeta,
+    PortableAnchor, ResolvedAnchor,
 };
 
 /// The converged projection: existing nodes (content + status) and present edges (spec + resolved
@@ -58,6 +63,11 @@ pub struct ProjectedNode {
     /// The hash of the source text the author anchored to, or `None` when none was published.
     /// `None` surfaces UNMARKED downstream — an absent hash is not evidence of drift.
     pub source_text_hash: Option<String>,
+    /// The `(lamport, device)` of the entry whose `NodeAnchors` won the anchors register, or
+    /// `None` with no set folded. The content projection maps it to that entry's author
+    /// account, which is how the drain tells a set its own account's `anchors/1` already
+    /// carries from one only the snapshot can deliver.
+    pub anchors_meta: Option<OpMeta>,
 }
 
 /// A projected edge: its winning spec (from the last add) and its last resolved anchor, if any.
@@ -74,8 +84,9 @@ struct NodeAccum {
     exists: bool,
     content: Option<NodeContent>,
     status: Option<NodeStatus>,
-    anchors: Option<Vec<PortableAnchor>>,
-    source_text_hash: Option<String>,
+    anchors: Option<(Vec<PortableAnchor>, OpMeta)>,
+    /// Each device's latest `NodeSourceHash`, to pair with that device's anchor set.
+    source_text_hash_by_device: BTreeMap<op::DeviceFingerprint, String>,
 }
 
 /// Per-edge LWW accumulators, resolved into a [`ProjectedEdge`] only if the edge is present.
@@ -158,15 +169,18 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                 edges.entry(edge_key.clone()).or_default().resolved = Some(resolved.clone());
             },
             MemoryOp::NodeSourceHash { node_id, source_text_hash } => {
-                nodes.entry(node_id.clone()).or_default().source_text_hash =
-                    Some(source_text_hash.clone());
+                nodes
+                    .entry(node_id.clone())
+                    .or_default()
+                    .source_text_hash_by_device
+                    .insert(entry.meta.device, source_text_hash.clone());
             },
             MemoryOp::NodeAnchors { node_id, anchors } => {
                 // Full-set replacement, like content — an anchor set is one register, not a
                 // per-binding merge, so a later op saying "these two" retires a binding the
                 // earlier one named.
                 nodes.entry(node_id.clone()).or_default().anchors =
-                    Some(canonical_anchors(anchors));
+                    Some((canonical_anchors(anchors), entry.meta));
             },
             // Inert boundary marker this increment (§5.4/C4).
             MemoryOp::Snapshot => {},
@@ -196,11 +210,18 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
             .filter_map(|(id, acc)| {
                 // Exists iff a create was seen; existence guarantees a content register.
                 let content = acc.exists.then_some(acc.content).flatten()?;
+                let (anchors, anchors_meta) = match acc.anchors {
+                    Some((anchors, meta)) => (Some(anchors), Some(meta)),
+                    None => (None, None),
+                };
+                let source_text_hash = anchors_meta
+                    .and_then(|meta| acc.source_text_hash_by_device.get(&meta.device).cloned());
                 Some((id, ProjectedNode {
                     content,
                     status: acc.status.unwrap_or_default(),
-                    anchors: acc.anchors,
-                    source_text_hash: acc.source_text_hash,
+                    anchors,
+                    source_text_hash,
+                    anchors_meta,
                 }))
             })
             .collect(),
@@ -265,6 +286,93 @@ mod tests {
             moniker_tool: None,
             moniker_tool_version: None,
         }
+    }
+
+    /// A memory's hash and anchor set are published together by one writer, and the hash is taken
+    /// from the device whose set won, so two writers' full pairs never split, at any clock offset
+    /// and on a tie.
+    #[test]
+    fn concurrent_full_pairs_never_split_the_anchor_and_hash_registers() {
+        let hash = |value: &str| MemoryOp::NodeSourceHash {
+            node_id: NodeId::from("mem_1"),
+            source_text_hash: value.to_string(),
+        };
+        for (x, y) in [(5, 5), (5, 6), (6, 5), (5, 9), (9, 5)] {
+            let state = project(&[
+                at(1, 1, create("mem_1", "t")),
+                at(x, 1, hash("hx")),
+                at(x + 1, 1, anchors_op("mem_1", &["x"])),
+                at(y, 2, hash("hy")),
+                at(y + 1, 2, anchors_op("mem_1", &["y"])),
+            ]);
+            let node = &state.nodes[&NodeId::from("mem_1")];
+            let anchors_from_x = node.anchors.as_ref().unwrap()[0].binding_id == "x";
+            let hash_from_x = node.source_text_hash.as_deref() == Some("hx");
+            assert_eq!(anchors_from_x, hash_from_x, "writers at {x}/{y} split the pair");
+        }
+    }
+
+    /// A binary that publishes anchors then hash and one that publishes hash then anchors can meet
+    /// on one memory — an older device, or offline entries arriving after an upgrade. The hash
+    /// comes from the device whose set won, so the pair holds whichever order each wrote.
+    #[test]
+    fn pairs_written_in_opposite_orders_never_split() {
+        let hash = |value: &str| MemoryOp::NodeSourceHash {
+            node_id: NodeId::from("mem_1"),
+            source_text_hash: value.to_string(),
+        };
+        for (x, y) in [(10, 10), (10, 11), (11, 10), (5, 9), (9, 5)] {
+            let state = project(&[
+                at(1, 1, create("mem_1", "t")),
+                at(x, 1, anchors_op("mem_1", &["x"])),
+                at(x + 1, 1, hash("hx")),
+                at(y, 2, hash("hy")),
+                at(y + 1, 2, anchors_op("mem_1", &["y"])),
+            ]);
+            let node = &state.nodes[&NodeId::from("mem_1")];
+            let anchors_from_x = node.anchors.as_ref().unwrap()[0].binding_id == "x";
+            let hash_from_x = node.source_text_hash.as_deref() == Some("hx");
+            assert_eq!(anchors_from_x, hash_from_x, "writers at {x}/{y} split the pair");
+        }
+    }
+
+    /// A device's LATEST hash pairs with its set: a device that republished describes its newest
+    /// set with its newest hash, never the one it published beside an earlier set.
+    #[test]
+    fn the_winning_device_s_latest_hash_pairs_with_its_set() {
+        let hash = |value: &str| MemoryOp::NodeSourceHash {
+            node_id: NodeId::from("mem_1"),
+            source_text_hash: value.to_string(),
+        };
+        let state = project(&[
+            at(1, 1, create("mem_1", "t")),
+            at(2, 1, hash("first")),
+            at(3, 1, anchors_op("mem_1", &["a"])),
+            at(4, 1, hash("second")),
+            at(5, 1, anchors_op("mem_1", &["b"])),
+        ]);
+        let node = &state.nodes[&NodeId::from("mem_1")];
+        assert_eq!(node.anchors.as_ref().unwrap()[0].binding_id, "b");
+        assert_eq!(node.source_text_hash.as_deref(), Some("second"));
+    }
+
+    /// The anchors register remembers WHICH entry won it — the content projection maps that entry
+    /// to its author account — by the same `(lamport, device)` order as the set itself, the device
+    /// breaking a tie.
+    #[test]
+    fn the_anchors_register_records_its_winning_entry() {
+        let state = project(&[
+            at(1, 1, create("mem_1", "t")),
+            at(4, 2, anchors_op("mem_1", &["b"])),
+            at(4, 3, anchors_op("mem_1", &["c"])),
+            at(3, 9, anchors_op("mem_1", &["a"])),
+        ]);
+        let node = &state.nodes[&NodeId::from("mem_1")];
+        assert_eq!(node.anchors.as_ref().unwrap()[0].binding_id, "c");
+        assert_eq!(node.anchors_meta, Some(OpMeta { lamport: 4, device: device(3) }));
+
+        let unanchored = project(&[at(1, 1, create("mem_2", "t"))]);
+        assert_eq!(unanchored.nodes[&NodeId::from("mem_2")].anchors_meta, None);
     }
 
     fn anchors_op(id: &str, binding_ids: &[&str]) -> MemoryOp {

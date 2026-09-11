@@ -562,14 +562,15 @@ mod anchor_authoring_tests {
         assert_eq!(projected_source_hash(&conn, &memory_id), Some(sha));
     }
 
-    /// A memory anchored to something with no text behind it publishes NO hash — the absence is
-    /// the honest answer, and a receiver reads it as no evidence of drift rather than a sentinel.
+    /// A memory anchored to something with no text behind it publishes an EMPTY hash beside its
+    /// anchors, never the set alone: a lone op can win one register against a concurrent writer's
+    /// pair and lose the other. A receiver reads the empty hash as no evidence of drift.
     #[test]
-    fn a_create_over_an_unindexed_path_publishes_no_source_hash() {
+    fn a_create_over_an_unindexed_path_publishes_an_empty_source_hash() {
         let conn = scoped_conn();
         let memory_id = bound_create(&conn, "src/lib.rs");
 
-        assert_eq!(projected_source_hash(&conn, &memory_id), None);
+        assert_eq!(projected_source_hash(&conn, &memory_id), Some(String::new()));
     }
 
     /// A rebind re-stamps `source_text_hash` in the same transaction, so the published hash has to
@@ -594,12 +595,11 @@ mod anchor_authoring_tests {
     }
 
     /// A rebind onto a target with no text behind it — a commit, a tracker ref, a directory — nulls
-    /// the local column and therefore publishes nothing, so the register keeps the PRE-rebind hash.
-    /// The op vocabulary has no retraction, which is why a receiver applies a published hash only
-    /// where it also seeds the anchors that hash describes: the pair then goes stale together
-    /// instead of the hash outliving the anchors it claims to be about.
+    /// the local column and publishes an EMPTY hash. The register has no other retraction, and a
+    /// receiver applies the hash on its own change, so staying silent would leave the pre-rebind
+    /// value standing beside the new anchors.
     #[test]
-    fn a_rebind_onto_a_hashless_target_leaves_the_published_hash_standing() {
+    fn a_rebind_onto_a_hashless_target_retracts_the_published_hash() {
         let conn = scoped_conn();
         let before = sha_of("lib");
         indexed_file(&conn, "src/lib.rs", &before);
@@ -621,8 +621,42 @@ mod anchor_authoring_tests {
         assert_eq!(local, None, "the rebind nulled the local hash");
         assert_eq!(
             projected_source_hash(&conn, &memory_id),
-            Some(before),
-            "and published nothing, so the register still holds the pre-rebind value",
+            Some(String::new()),
+            "and retracted the pre-rebind value from the register",
+        );
+    }
+
+    /// A memory's hash and anchor set are separate entries on one chain, and a peer accepts a chain
+    /// in order. The hash goes first, so a pull that stops between them never pairs the new
+    /// bindings with the previous target's hash; a rebind onto a hashless target leads with the
+    /// empty retraction.
+    #[test]
+    fn the_hash_is_published_ahead_of_the_anchor_set() {
+        use rag_rat_oplog::MemoryOp;
+        let conn = scoped_conn();
+        indexed_file(&conn, "src/lib.rs", &sha_of("lib"));
+        let hashed = bound_create(&conn, "src/lib.rs");
+        let unhashed = bound_create(&conn, "src/other.rs");
+        let publication = |memory_id: &str| {
+            crate::memory_write::authoring::anchor_publication_ops(&conn, memory_id).unwrap()
+        };
+
+        let ops = publication(&hashed);
+        assert!(
+            matches!(ops.as_slice(), [
+                MemoryOp::NodeSourceHash { .. },
+                MemoryOp::NodeAnchors { .. }
+            ]),
+            "{ops:?}"
+        );
+        let ops = publication(&unhashed);
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [MemoryOp::NodeSourceHash { source_text_hash, .. }, MemoryOp::NodeAnchors { .. }]
+                    if source_text_hash.is_empty()
+            ),
+            "{ops:?}"
         );
     }
 

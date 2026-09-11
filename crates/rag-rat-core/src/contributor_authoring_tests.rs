@@ -191,6 +191,42 @@ fn a_configured_contributor_authors_onto_the_owners_stream() {
     assert!(titles.contains(&"contributor-note".to_string()), "and still sees its own: {titles:?}",);
 }
 
+/// A contributor's rebind of a memory the owner created is authored by the contributor's account,
+/// so it reaches the owner's creating device — where the memory is a local row — only through the
+/// snapshot. Once the accepted entries travel back, that device takes the contributor's set.
+#[test]
+fn a_contributors_rebind_reaches_the_owners_creating_device() {
+    let (owner, contributor, owner_account) = contribution_pair();
+    let contributor_account = local_account(&contributor, NOW).unwrap();
+    let on_path = |path: &str| rag_rat_query::memory::RepoMemoryBindTarget {
+        path: Some(path.into()),
+        ..Default::default()
+    };
+    let memory_id = create_memory(&owner, RepoMemoryCreate {
+        kind: "Invariant".into(),
+        bind: on_path("src/old.rs"),
+        ..concept("shared-note")
+    })
+    .unwrap()
+    .memory
+    .memory_id;
+    sync_account_into(&contributor, &owner, owner_account);
+    crate::drain_synced_memory(&contributor).unwrap();
+
+    crate::memory_write::rebind_memory(&contributor, &memory_id, on_path("src/new.rs")).unwrap();
+    sync_account_into(&owner, &contributor, contributor_account);
+    crate::drain_synced_memory(&owner).unwrap();
+
+    let paths: Vec<String> = owner
+        .prepare("SELECT binding_id FROM repo_memory_bindings WHERE memory_id = ?1")
+        .unwrap()
+        .query_map([&memory_id], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(paths, vec!["src/new.rs".to_string()]);
+}
+
 /// EXACTLY ONE stream materializes a repo. A contributor's own owned stream is NOT it — nothing is
 /// ever authored there, so its projection is a rival authority whose removal anti-join reads every
 /// row the owner's stream materialized as condemned. Draining both would delete the owner's
