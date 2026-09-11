@@ -480,13 +480,14 @@ fn drain_node(
     // snapshot check comes first because it is free: until anchors are authored, every node answers
     // `None` and this costs no query at all.
     if node.anchors.is_some() && node_in_repo(tx, &node.node_id, repo_id)? {
-        // A local memory's bindings are its own — unless another account authored the winning set:
-        // a contributor rebinding a memory this account created. That set reaches this device
-        // through the snapshot alone, as it does a synced memory.
-        let foreign =
-            node.anchors_author.is_some() && node.anchors_author.as_ref() != local_account;
+        // A memory created here takes a published set by the same provenance rules as a synced one
+        // once its author is known: this account's own set only fills an empty memory and brings
+        // its hash (a sibling device's rebind reaches this one's rows through `anchors/1`, but the
+        // hash only through the snapshot), and another account's set — a contributor rebinding a
+        // memory this account created — reaches it through the snapshot alone. With no author
+        // known it only ever seeds.
         let changed = match applied_snapshot(tx, repo_id, &node.node_id)? {
-            Some(applied) if !applied.local || foreign =>
+            Some(applied) if !applied.local || node.anchors_author.is_some() =>
                 apply_published_anchors(tx, repo_id, node, local_account, applied)?,
             _ => seed_node_anchors(tx, repo_id, node)? > 0,
         };
@@ -621,8 +622,8 @@ fn insert_seedable_anchors(
 
 /// What the drain last applied to a memory of this repo, or `None` when it has no row here.
 struct AppliedSnapshot {
-    /// Whether the memory was created here (`origin = 'local'`): its bindings are its own, taken
-    /// from a published set only when another account authored it.
+    /// Whether the memory was created here (`origin = 'local'`): the bindings it holds are its
+    /// creator's own last set, and it only seeds from a set whose author is unknown.
     local: bool,
     /// The [`anchor_snapshot_digest`] of the set last applied; NULL until one is.
     digest: Option<String>,
@@ -2894,6 +2895,66 @@ mod tests {
             "src/other.rs::new".to_string()
         )]);
         assert_eq!(source_hash_of(&conn, "mem_mine"), Some(HASH_A.to_string()));
+    }
+
+    /// A memory created here keeps the applied-set bookkeeping under its own account's sets too, so
+    /// a later foreign set is judged against the set the rows actually hold: here the owner's
+    /// sibling rebinds the contributor's struct to the impl (rows arriving through `anchors/1`),
+    /// and the contributor's rebind back to the struct must still mark the row. The own set's hash
+    /// lands on the creating device as well, since the hash only travels in the snapshot.
+    #[test]
+    fn a_local_memory_records_its_own_sets_as_the_baseline() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (own, foreign) = own_and_foreign_accounts(&conn);
+        conn.execute(
+            "INSERT INTO repo_memories(
+                 id, kind, title, body, confidence, status, created_at_ms, updated_at_ms, source,
+                 memory_version, repo_id, origin)
+             VALUES ('mem_mine', 'Invariant', 't', 'b', 'high', 'active', 1, 1, 'agent', 'v1', ?1,
+                 'local')",
+            [REPO],
+        )
+        .unwrap();
+        let publish = |author, kind: &str, signature: &str, hash: &str| {
+            seed_projected_node_with_anchors(
+                &conn,
+                stream,
+                "mem_mine",
+                Some(&[("symbol", "src/lib.rs::T")]),
+            );
+            set_projected_anchor_field(&conn, stream, "mem_mine", "symbol_kind", kind);
+            set_projected_anchor_field(&conn, stream, "mem_mine", "signature_hash", signature);
+            set_projected_anchors_author(&conn, stream, "mem_mine", author);
+            set_projected_source_hash(&conn, stream, "mem_mine", Some(hash));
+        };
+        let reason = || -> Option<String> {
+            conn.query_row(
+                "SELECT relocation_reason FROM repo_memory_bindings WHERE memory_id = 'mem_mine'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        publish(&foreign, "struct", "s1", HASH_A);
+        drain_worker(&conn, stream, 1_000);
+        // The owner's sibling rebinds to the impl: `anchors/1` moves the row in place.
+        conn.execute(
+            "UPDATE repo_memory_bindings SET symbol_kind = 'impl', signature_hash = 's2',
+                 relocation_reason = NULL
+             WHERE memory_id = 'mem_mine'",
+            [],
+        )
+        .unwrap();
+        publish(&own, "impl", "s2", HASH_B);
+        drain_worker(&conn, stream, 2_000);
+        assert_eq!(reason(), None, "an own set is carried by `anchors/1`, never marked");
+        assert_eq!(source_hash_of(&conn, "mem_mine"), Some(HASH_B.to_string()));
+
+        publish(&foreign, "struct", "s1", HASH_A);
+        drain_worker(&conn, stream, 3_000);
+        assert_eq!(reason().as_deref(), Some(rag_rat_query::memory::RETARGETED_REASON));
     }
 
     /// The published hash crosses the same untrusted boundary as the content and lands in a column

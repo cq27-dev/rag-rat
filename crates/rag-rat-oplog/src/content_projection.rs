@@ -422,8 +422,8 @@ fn write_projection(
 /// Each accepted `NodeAnchors` entry's author account, keyed by its `(lamport, device)` — the key
 /// the fold reports a register's winner by. One device key can sign under two accounts, so two
 /// accepted entries of a stream can share that key under different authors; the fold cannot say
-/// which of them won, so the key maps to `None` — no author, read downstream as foreign — rather
-/// than a guess.
+/// which of them won, so the key maps to `None` rather than a guess. The drain reads no author as
+/// foreign on a synced memory and as seed-only on a memory created on this device.
 type EntryAuthors = std::collections::BTreeMap<(u64, DeviceFingerprint), Option<AccountId>>;
 
 /// Record one entry's author under its fold key; see [`EntryAuthors`].
