@@ -202,10 +202,13 @@ fn cached_kind_agrees(binding: &RepoMemoryBinding, kind: &str) -> bool {
 /// hand an edited symbol's memory to any same-named sibling that later takes the old text.
 ///
 /// The mark stands until a validation lands on a target agreeing with the recorded kind and
-/// signature, and until then the validator never overwrites them. The row is shared by every
-/// checkout of the repo, and the one validating first may not hold the author's target: a sibling
-/// worktree that edited it must leave the author's evidence for the checkout that has it. (An
-/// `anchors/1` row update also moves a binding in place, but marks nothing.)
+/// signature. The row is shared by every checkout of the repo, and the one validating first may not
+/// hold the author's target: on the raw-id arm, whose candidates are the validating checkout's own,
+/// a linked worktree that edited the target leaves the mark for the checkout that has it (the
+/// logical arm's candidates are repo-wide, so any checkout can answer there). That works because
+/// the name-based arms never overwrite a binding's recorded kind or signature; only an identity
+/// match — content hash, moniker — restates them. (An `anchors/1` row update also moves a binding
+/// in place, but marks nothing.)
 pub const RETARGETED_REASON: &str = "retargeted";
 
 /// Whether the binding carries [`RETARGETED_REASON`].
@@ -405,13 +408,12 @@ pub(crate) fn validate_symbol_binding(
             binding.start_line = Some(chunk.start_line);
             binding.end_line = Some(chunk.end_line);
         }
-        // An unanswered retarget keeps the author's kind and signature: they are what the next
-        // checkout to validate — perhaps one holding the author's target — must answer.
-        if !is_retargeted(binding) {
-            let (kind, sig) = symbol_signal(conn, id)?;
-            binding.symbol_kind = kind;
-            binding.signature_hash = sig;
-        }
+        // The recorded kind and signature are left as the binding's writer stated them, as the
+        // logical arm leaves them: rewritten to this checkout's view they would read, to the
+        // synced-memory drain, as an author's retarget whenever the author republishes, and the
+        // pick would then follow the old signature to a same-named sibling. A stale value costs
+        // nothing here — the pick credits the handle first, and one landing back on a held-back
+        // row validates it live.
         return Ok("relocated".to_string());
     }
     // Cross-file move: qualified_name changed with the path. Match by bare name + content hash.

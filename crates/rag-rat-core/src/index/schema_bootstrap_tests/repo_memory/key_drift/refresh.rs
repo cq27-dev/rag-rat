@@ -1971,121 +1971,137 @@ fn a_published_rebind_between_same_named_impls_follows_the_signature() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// The logical arm relocates a memory whose symbol's signature was edited but keeps the recorded
+/// Validation relocates a memory whose symbol's signature was edited but keeps the recorded
 /// signature, so a live handle and a recorded signature disagree for a binding this checkout moved
 /// itself. A sibling that later takes the old signature text under the same name must not take the
-/// memory: the validator trusts the handle, not the recorded signature.
+/// memory — not on a validation pass, and not when a foreign author republishes the same target
+/// with the signature it recorded, which is no retarget.
 #[test]
 fn an_edited_symbols_memory_is_not_taken_by_a_sibling_with_its_old_signature() {
-    let root = unique_temp_root();
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("src")).unwrap();
-    let v1 = "pub struct A;\nimpl A {\n    pub fn new() -> Self {\n        A\n    }\n}\n";
-    fs::write(root.join("src/lib.rs"), v1).unwrap();
-    let config = source_config(root.clone(), Language::Rust);
-    let db = IndexDatabase::rebuild(&config).unwrap();
-    let logical_id: i64 = db
-        .storage
-        .connection()
-        .query_row(
-            "SELECT m.logical_symbol_id FROM symbols s
-               JOIN logical_symbol_members m ON m.symbol_id = s.id
-              WHERE s.name = 'new' LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let memory_id = db
-        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
-            kind: "Invariant".to_string(),
-            title: "A::new takes its capacity up front".to_string(),
-            body: "Bound to A::new by its logical handle.".to_string(),
-            confidence: "high".to_string(),
-            created_by: Some("test-agent".to_string()),
-            source: Some("agent".to_string()),
-            tags: Vec::new(),
-            payload_json: None,
-            bind: rag_rat_query::memory::RepoMemoryBindTarget {
-                logical_symbol_id: Some(logical_id),
-                ..Default::default()
-            },
-        })
-        .unwrap()
-        .memory
-        .memory_id;
-    drop(db);
-
-    let v2 = "pub struct A;\nimpl A {\n    pub fn new(cap: usize) -> Self {\n        let _ = \
-              cap;\n        A\n    }\n}\n";
-    fs::write(root.join("src/lib.rs"), v2).unwrap();
-    let db = IndexDatabase::rebuild(&config).unwrap();
-    db.memory_validate().unwrap();
-    drop(db);
-
-    let v3 = format!(
-        "{v2}pub struct C;\nimpl C {{\n    pub fn new() -> Self {{\n        C\n    }}\n}}\n"
-    );
-    fs::write(root.join("src/lib.rs"), v3).unwrap();
-    let db = IndexDatabase::rebuild(&config).unwrap();
-    for pass in 0..2 {
-        db.memory_validate().unwrap();
-        let start_line: Option<i64> = db
+    for (title, by_logical_handle) in [("logical handle", true), ("raw symbol id", false)] {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        let v1 = "pub struct A;\nimpl A {\n    pub fn new() -> Self {\n        A\n    }\n}\n";
+        fs::write(root.join("src/lib.rs"), v1).unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let (symbol_id, logical_id): (i64, i64) = db
             .storage
             .connection()
             .query_row(
+                "SELECT s.id, m.logical_symbol_id FROM symbols s
+                   JOIN logical_symbol_members m ON m.symbol_id = s.id
+                  WHERE s.name = 'new' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let memory_id = db
+            .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: format!("A::new takes its capacity up front ({title})"),
+                body: format!("Bound to A::new by its {title}."),
+                confidence: "high".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: Vec::new(),
+                payload_json: None,
+                bind: if by_logical_handle {
+                    rag_rat_query::memory::RepoMemoryBindTarget {
+                        logical_symbol_id: Some(logical_id),
+                        ..Default::default()
+                    }
+                } else {
+                    rag_rat_query::memory::RepoMemoryBindTarget {
+                        symbol_id: Some(symbol_id),
+                        ..Default::default()
+                    }
+                },
+            })
+            .unwrap()
+            .memory
+            .memory_id;
+        // What the binding's writer recorded of `new() -> Self` — the values an author republishes.
+        let (recorded_kind, recorded_signature): (Option<String>, Option<String>) = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT symbol_kind, signature_hash FROM repo_memory_bindings WHERE memory_id = ?1",
+                params![memory_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        drop(db);
+
+        let v2 = "pub struct A;\nimpl A {\n    pub fn new(cap: usize) -> Self {\n        let _ = \
+                  cap;\n        A\n    }\n}\n";
+        fs::write(root.join("src/lib.rs"), v2).unwrap();
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.memory_validate().unwrap();
+        drop(db);
+
+        let v3 = format!(
+            "{v2}pub struct C;\nimpl C {{\n    pub fn new() -> Self {{\n        C\n    }}\n}}\n"
+        );
+        fs::write(root.join("src/lib.rs"), v3).unwrap();
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let conn = db.storage.connection();
+        let start_line = || -> Option<i64> {
+            conn.query_row(
                 "SELECT start_line FROM repo_memory_bindings WHERE memory_id = ?1",
                 params![memory_id],
                 |r| r.get(0),
             )
+            .unwrap()
+        };
+        for pass in 0..2 {
+            db.memory_validate().unwrap();
+            assert_eq!(start_line(), Some(3), "bound by {title}, pass {pass}: stays on A::new");
+        }
+
+        // The author republishes the same target: its lines moved, its kind and signature as it
+        // recorded them.
+        let (repo_id, anchor) = conn
+            .query_row(
+                "SELECT repo_id, binding_kind, binding_id, path, start_line, end_line,
+                        created_at_ms
+                   FROM repo_memory_bindings WHERE memory_id = ?1",
+                params![memory_id],
+                |r| {
+                    Ok((r.get::<_, String>(0)?, rag_rat_oplog::PortableAnchor {
+                        binding_kind: r.get(1)?,
+                        binding_id: r.get(2)?,
+                        path: r.get(3)?,
+                        start_line: r.get::<_, Option<i64>>(4)?.map(|line| line + 20),
+                        end_line: r.get::<_, Option<i64>>(5)?.map(|line| line + 20),
+                        commit_hash: None,
+                        tracker: None,
+                        project: None,
+                        item_key: None,
+                        created_at_ms: r.get::<_, i64>(6)? + 1,
+                        symbol_kind: recorded_kind.clone(),
+                        signature_hash: recorded_signature.clone(),
+                        moniker_tool: None,
+                        moniker_tool_version: None,
+                    }))
+                },
+            )
             .unwrap();
-        assert_eq!(start_line, Some(3), "pass {pass}: the memory stays on A::new");
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        crate::memory_write::refresh_binding(&tx, &repo_id, &memory_id, &anchor).unwrap();
+        tx.commit().unwrap();
+        db.memory_validate().unwrap();
+        assert_eq!(
+            start_line(),
+            Some(3),
+            "bound by {title}: a same-target republish must leave the memory on A::new",
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
-
-    // A foreign author republishing the same target — its lines moved, its kind and signature as
-    // this row already records them — is no retarget, and must not have the validator follow the
-    // recorded (old) signature either.
-    let conn = db.storage.connection();
-    let republished = conn
-        .query_row(
-            "SELECT repo_id, binding_kind, binding_id, path, start_line, end_line, created_at_ms,
-                    symbol_kind, signature_hash
-               FROM repo_memory_bindings WHERE memory_id = ?1",
-            params![memory_id],
-            |r| {
-                Ok((r.get::<_, String>(0)?, rag_rat_oplog::PortableAnchor {
-                    binding_kind: r.get(1)?,
-                    binding_id: r.get(2)?,
-                    path: r.get(3)?,
-                    start_line: r.get::<_, Option<i64>>(4)?.map(|line| line + 20),
-                    end_line: r.get::<_, Option<i64>>(5)?.map(|line| line + 20),
-                    commit_hash: None,
-                    tracker: None,
-                    project: None,
-                    item_key: None,
-                    created_at_ms: r.get::<_, i64>(6)? + 1,
-                    symbol_kind: r.get(7)?,
-                    signature_hash: r.get(8)?,
-                    moniker_tool: None,
-                    moniker_tool_version: None,
-                }))
-            },
-        )
-        .unwrap();
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-        .unwrap();
-    crate::memory_write::refresh_binding(&tx, &republished.0, &memory_id, &republished.1).unwrap();
-    tx.commit().unwrap();
-    db.memory_validate().unwrap();
-    let start_line: Option<i64> = conn
-        .query_row(
-            "SELECT start_line FROM repo_memory_bindings WHERE memory_id = ?1",
-            params![memory_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(start_line, Some(3), "a same-target republish must leave the memory on A::new");
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// The retarget mark sits on a row every checkout of the repo shares, and the checkout validating
