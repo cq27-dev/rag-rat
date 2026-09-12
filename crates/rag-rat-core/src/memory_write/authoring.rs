@@ -359,9 +359,9 @@ fn is_contribution_mode(conn: &Connection, repo_id: &str) -> anyhow::Result<bool
 /// configuration reaches that state. Every operation that reconciles or imports rows into the repo
 /// (legacy consolidation, `sync publish --seed`, memory import) needs the repo's own stream to be
 /// the one [`super::drain::authoritative_content_stream`] honors: a contributor owns no such stream
-/// at all, and a subscriber's is not the authority, so the imported `origin='synced'` rows are
-/// condemned by the very next drain. All of them are irreversible enough that continuing on a
-/// half-applied import is worse than stopping.
+/// at all, and a subscriber's is not the authority, so what the import signs there never becomes
+/// the repo's memory state on any other device. All of them are irreversible enough that
+/// continuing on a half-applied import is worse than stopping.
 pub(crate) fn ensure_not_mirroring_another_account(
     conn: &Connection,
     repo_id: &str,

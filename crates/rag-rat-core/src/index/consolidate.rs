@@ -331,10 +331,10 @@ fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<Cons
     // contributor (it owns none), and it is reached only AFTER `import_from_source` has committed —
     // so failing there would leave exactly the half-applied state it exists to prevent: persisted
     // rows and FTS children with no `NodeCreate`, re-imported and re-failed on every retry. A
-    // SUBSCRIBER owns its stream but the drain does not honor it, so the import's `origin='synced'`
-    // rows (it carries both origins) are condemned by the next drain instead. Stopping here leaves
-    // the legacy file unrenamed and the target untouched, so the run is retryable once the repo is
-    // no longer configured to mirror another account.
+    // SUBSCRIBER owns its stream but the drain does not honor it, so what the reconcile signs there
+    // never becomes the repo's memory state on any other device. Stopping here leaves the legacy
+    // file unrenamed and the target untouched, so the run is retryable once the repo is no longer
+    // configured to mirror another account.
     crate::memory_write::ensure_not_mirroring_another_account(
         target_conn,
         &repo_id,
@@ -609,8 +609,11 @@ struct ImportCounts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImportMode {
     /// Forward-migrate a legacy per-repo DB into the global store. The source is SINGLE-repo by
-    /// construction, so no repo filter; migrate every row (both origins) under the new identity,
-    /// and carry the machine-local model state + embedding cache (same-machine migration).
+    /// construction, so no repo filter; migrate its own rows under the new identity, and carry the
+    /// machine-local model state + embedding cache (same-machine migration). "Its own" means
+    /// `local` rows plus the `synced` ones the source's own account created on another device:
+    /// the reconcile signs every carried row as the target's, so a row ANOTHER account created is
+    /// left to come back through sync (#1284).
     ConsolidateLegacy,
     /// Seed a public knowledge-base node from ONE repo's authored memories in a MULTI-repo global
     /// source. Scope the source read to `repo_id` (else other private repos leak onto a public
@@ -677,8 +680,40 @@ fn import_from_source(
     // legacy memory id colliding with ANOTHER repo's memory in the global store would otherwise
     // have its memory dropped while its tags/bindings/call-paths silently contaminate the other
     // repo's memory.
+    let own = match mode {
+        ImportMode::ConsolidateLegacy => source_created_content(source)?,
+        ImportMode::SeedPublic => rag_rat_oplog::CreatedContent::default(),
+    };
+    // A sealed entry this store cannot open hides which synced rows its account created, and a
+    // successful run archives the legacy file: refuse rather than leave that account's memories
+    // behind.
+    anyhow::ensure!(
+        own.unreadable == 0,
+        "the legacy index holds {} memory entries its own account created that this device cannot \
+         read (sealed without a key here, or corrupt), so consolidation cannot tell which synced \
+         memories are its own; refusing rather than leave them behind (sync with a device that \
+         holds the stream key, then retry)",
+        own.unreadable
+    );
+    // The import drops a synced memory another account created, and everything attached to it.
+    // Work the source's own account did on such a memory — an edit, a rebind, an edge added from
+    // it (signed, or local and not signed yet) — cannot be carried without republishing that
+    // memory as the target's own, and a successful run archives the legacy file: refuse instead.
+    // Seed carries no synced row and archives nothing, and its source is a shared multi-repo store:
+    // the guard is legacy consolidation's alone.
+    let stranded = match mode {
+        ImportMode::ConsolidateLegacy => stranded_own_work(source, &own)?,
+        ImportMode::SeedPublic => 0,
+    };
+    anyhow::ensure!(
+        stranded == 0,
+        "the legacy index holds {stranded} changes its own account made to memories another \
+         account created (edits, rebinds or edges from them); consolidation cannot carry them \
+         without republishing those memories as this store's own, so it refuses rather than drop \
+         them"
+    );
     let CopiedMemories { rows_written: memories, id_map } =
-        copy_memories(source, &tx, repo_id, mode)?;
+        copy_memories(source, &tx, repo_id, mode, &own)?;
     // Mirror invariant: children of EVERY mapped id are replaced, not unioned. Digest the target's
     // child slices before and after — identical slice ⇒ that table reports 0 (an honest no-op).
     let pre = child_slice_digests(&tx, &id_map)?;
@@ -690,7 +725,7 @@ fn import_from_source(
         tags: copy_tags(source, &tx, &id_map)?,
         call_paths: copy_call_paths(source, &tx, &id_map)?,
         call_path_edges: copy_call_path_edges(source, &tx, &id_map)?,
-        edges: copy_node_edges(source, &tx, repo_id, &id_map, mode)?,
+        edges: copy_node_edges(source, &tx, repo_id, &id_map, mode, &own)?,
         // Seed carries NO machine state: the embedding cache is content-derived from other private
         // repos on this box, and the model-state meta names this machine's embedder — the public
         // node runs elsewhere and establishes its own (see `ImportMode::SeedPublic`).
@@ -976,11 +1011,60 @@ fn child_slice_digest(
 ///
 /// After every insert the target row's ownership is VERIFIED (`repo_id` must be ours) — the
 /// structural backstop for the child-ownership invariant in [`import_from_source`].
+/// How many pieces of the source account's own work sit on a synced memory the import leaves out
+/// (#1284): memories that account's ops touch without having created them, plus local edges from
+/// such a memory (added here, possibly not signed yet).
+fn stranded_own_work(
+    source: &Connection,
+    own: &rag_rat_oplog::CreatedContent,
+) -> anyhow::Result<u64> {
+    if !schema::table_exists(source, "repo_memories")? {
+        return Ok(0);
+    }
+    let own_nodes = serde_json::to_string(&own.nodes)?;
+    let touched_foreign: i64 = source.query_row(
+        "SELECT COUNT(*) FROM repo_memories
+         WHERE origin = 'synced' AND id IN (SELECT value FROM json_each(?1))
+           AND id NOT IN (SELECT value FROM json_each(?2))",
+        params![serde_json::to_string(&own.touched)?, own_nodes],
+        |row| row.get(0),
+    )?;
+    let local_edges_from_foreign: i64 = if schema::table_exists(source, "repo_node_edges")? {
+        source.query_row(
+            "SELECT COUNT(*) FROM repo_node_edges e JOIN repo_memories m ON m.id = \
+             e.source_node_id
+             WHERE e.origin = 'local' AND m.origin = 'synced'
+               AND m.id NOT IN (SELECT value FROM json_each(?1))",
+            params![own_nodes],
+            |row| row.get(0),
+        )?
+    } else {
+        0
+    };
+    Ok(u64::try_from(touched_foreign + local_edges_from_foreign)?)
+}
+
+/// What the legacy source's own account created, read from its accepted `/3` content — the
+/// `synced` rows the import may carry as the target's own (#1284). Empty when the source never
+/// minted an account.
+fn source_created_content(source: &Connection) -> anyhow::Result<rag_rat_oplog::CreatedContent> {
+    if !schema::table_exists(source, "content_entries")?
+        || !schema::table_exists(source, "oplog_local_account")?
+    {
+        return Ok(rag_rat_oplog::CreatedContent::default());
+    }
+    match rag_rat_oplog::read_local_account(source)? {
+        Some(account) => rag_rat_oplog::content_created_by(source, account),
+        None => Ok(rag_rat_oplog::CreatedContent::default()),
+    }
+}
+
 fn copy_memories(
     source: &Connection,
     tx: &Connection,
     repo_id: &str,
     mode: ImportMode,
+    own: &rag_rat_oplog::CreatedContent,
 ) -> anyhow::Result<CopiedMemories> {
     if !schema::table_exists(source, "repo_memories")? {
         return Ok(CopiedMemories::default());
@@ -988,16 +1072,20 @@ fn copy_memories(
     const BASE: &str = "SELECT id, kind, title, body, confidence, status, created_by, \
                         created_at_ms, updated_at_ms, source, source_text_hash, input_hash, \
                         memory_version, payload_json FROM repo_memories";
-    // Seed scopes the read to the ONE published repo (a multi-repo source would otherwise leak
-    // other private repos onto a public node) and drops peer-`synced` rows; legacy consolidation's
-    // source is single-repo and migrates everything.
+    // The reconcile signs every imported row onto the target's own stream, so a `synced` row is
+    // carried only when the source's own account created it (`own`, empty for seed): a row another
+    // account created would be republished as the target's authorship (#1284). Seed also scopes
+    // the read to the ONE published repo (a multi-repo source would otherwise leak other private
+    // repos onto a public node); legacy consolidation's source is single-repo.
     let sql = match mode {
-        ImportMode::ConsolidateLegacy => BASE.to_string(),
+        ImportMode::ConsolidateLegacy =>
+            format!("{BASE} WHERE origin = 'local' OR id IN (SELECT value FROM json_each(?1))"),
         ImportMode::SeedPublic => format!("{BASE} WHERE repo_id = ?1 AND origin = 'local'"),
     };
+    let own_nodes = serde_json::to_string(&own.nodes)?;
     let mut stmt = source.prepare(&sql)?;
     let mut rows = match mode {
-        ImportMode::ConsolidateLegacy => stmt.query([])?,
+        ImportMode::ConsolidateLegacy => stmt.query(params![own_nodes])?,
         ImportMode::SeedPublic => stmt.query(params![repo_id])?,
     };
     let mut count = 0u64;
@@ -1252,23 +1340,22 @@ fn copy_node_edges(
     repo_id: &str,
     id_map: &BTreeMap<String, String>,
     mode: ImportMode,
+    own: &rag_rat_oplog::CreatedContent,
 ) -> anyhow::Result<u64> {
     if !schema::table_exists(source, "repo_node_edges")? {
         return Ok(0);
     }
-    // Edges carry their OWN `origin`: a peer's edge onto one of our local memories is `synced` yet
-    // its source node is in `id_map`, so seed must drop it here or it would be re-authored as our
-    // own public `EdgeAdd`. (Repo scope rides `id_map`, already filtered by `copy_memories`.)
-    let sql = match mode {
-        ImportMode::ConsolidateLegacy =>
-            "SELECT source_node_id, relation, target_repo_id, target_kind, target_anchor, \
-             created_at_ms FROM repo_node_edges",
-        ImportMode::SeedPublic =>
-            "SELECT source_node_id, relation, target_repo_id, target_kind, target_anchor, \
-             created_at_ms FROM repo_node_edges WHERE origin = 'local'",
-    };
-    let mut stmt = source.prepare(sql)?;
-    let mut rows = stmt.query([])?;
+    // Edges carry their OWN `origin`: another account's edge onto one of our local memories is
+    // `synced` yet its source node is in `id_map`, so it is dropped here or it would be re-authored
+    // as our own `EdgeAdd`. A synced edge the source's own account added is carried like a local
+    // one (`own`, empty for seed). (Repo scope rides `id_map`, already filtered by
+    // `copy_memories`.)
+    let mut stmt = source.prepare(
+        "SELECT source_node_id, relation, target_repo_id, target_kind, target_anchor, \
+         created_at_ms, repo_id FROM repo_node_edges
+         WHERE origin = 'local' OR edge_key IN (SELECT value FROM json_each(?1))",
+    )?;
+    let mut rows = stmt.query(params![serde_json::to_string(&own.edges)?])?;
     let mut count = 0u64;
     while let Some(row) = rows.next()? {
         // Child-ownership: only edges whose SOURCE this import owns; an unmapped source is dropped.
@@ -1280,23 +1367,28 @@ fn copy_node_edges(
         let target_kind = row.get::<_, String>(3)?;
         let src_target_anchor = row.get::<_, String>(4)?;
         let created_at_ms = row.get::<_, i64>(5)?;
-        let (target_repo_id, target_anchor, target_node_id, anchor_status) = match target_kind
-            .as_str()
-        {
-            "node" => match id_map.get(&src_target_anchor) {
-                Some(mapped) =>
-                    (repo_id.to_string(), mapped.clone(), Some(mapped.clone()), "current"),
-                // A node target outside the imported set. `add_edge` allows explicit cross-repo
-                // node edges, so on a MULTI-repo seed source this points at a DIFFERENT private
-                // repo (id_map holds only the published repo) — carrying its repo_id + node id
-                // would leak that repo onto the public op-log once the edge is authored. Drop
-                // it. Legacy consolidation's source is single-repo, so an unresolved node target
-                // is provably foreign and is KEPT as an explicit cross-repo reference.
-                None if matches!(mode, ImportMode::SeedPublic) => continue,
-                None => (src_target_repo, src_target_anchor.clone(), None, "unresolved"),
-            },
-            _ => (repo_id.to_string(), src_target_anchor.clone(), None, "current"),
-        };
+        let src_repo = row.get::<_, String>(6)?;
+        let (target_repo_id, target_anchor, target_node_id, anchor_status) =
+            match target_kind.as_str() {
+                "node" => match id_map.get(&src_target_anchor) {
+                    Some(mapped) =>
+                        (repo_id.to_string(), mapped.clone(), Some(mapped.clone()), "current"),
+                    // A node target outside the imported set. `add_edge` allows explicit cross-repo
+                    // node edges, so on a MULTI-repo seed source this points at a DIFFERENT private
+                    // repo (id_map holds only the published repo) — carrying its repo_id + node id
+                    // would leak that repo onto the public op-log once the edge is authored. Drop
+                    // it. Legacy consolidation KEEPS it: either an explicit cross-repo reference,
+                    // or a same-repo memory the import left out because another
+                    // account created it, which may come back through sync — so
+                    // a same-repo target is re-homed under the new identity,
+                    // where `resolve_node_target` finds the row if it ever arrives.
+                    None if matches!(mode, ImportMode::SeedPublic) => continue,
+                    None if src_target_repo == src_repo =>
+                        (repo_id.to_string(), src_target_anchor.clone(), None, "unresolved"),
+                    None => (src_target_repo, src_target_anchor.clone(), None, "unresolved"),
+                },
+                _ => (repo_id.to_string(), src_target_anchor.clone(), None, "current"),
+            };
         let key = rag_rat_query::memory::edge_key(
             source_node_id,
             &relation,
@@ -2070,19 +2162,328 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_still_imports_all_repos_and_origins() {
-        // Guards against the seed filters regressing the legacy path: no repo filter, no origin
-        // filter, machine state carried. (Consolidate's real source is single-repo; this reuses the
-        // multi-repo fixture only to prove every row is taken.)
+    fn consolidate_imports_every_repo_but_only_local_rows() {
+        // Guards against the seed filters regressing the legacy path: no repo filter, machine
+        // state carried. (Consolidate's real source is single-repo; this reuses the multi-repo
+        // fixture only to prove every repo's rows are taken.)
         let source = seed_source_multi();
         let target = fresh_target();
         let counts =
             import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
                 .unwrap();
-        assert_eq!(counts.memories, 4, "all repos, both origins");
-        assert_eq!(counts.edges, 4, "every edge: both origins, github + node, cross-repo included");
+        assert_eq!(counts.memories, 3, "all repos, local rows only");
+        assert_eq!(counts.edges, 3, "local edges: github + node, cross-repo included");
         assert_eq!(counts.embedding_cache_rows, 2, "cache carried");
         assert_eq!(counts.meta_keys, 1, "model-state meta carried");
+    }
+
+    /// A legacy store holds memories as `origin='synced'` rows when another device materialized
+    /// them. Consolidation carries the ones the source's own account created — they are its own
+    /// work, local edits included — and leaves those another account created, so the reconcile
+    /// never signs another account's memory or edge as the target's (#1284). A local edge onto a
+    /// left-out memory survives, re-homed under the new repo identity and unresolved until that
+    /// memory arrives through sync.
+    #[test]
+    fn consolidation_carries_only_what_the_source_account_created() {
+        use rag_rat_oplog::{EdgeSpec, MemoryOp, NodeContent, NodeId, SealPolicy};
+        let source = seed_source_multi();
+        // The source's own account created `sib1` and its edge on another device.
+        rag_rat_oplog::local_account(&source, 0).unwrap();
+        let stream = {
+            let tx = rusqlite::Transaction::new_unchecked(
+                &source,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .unwrap();
+            let stream =
+                rag_rat_oplog::ensure_owned_stream_v2_in_tx(&tx, "global-repo", 0).unwrap();
+            tx.commit().unwrap();
+            stream
+        };
+        let sibling_edge = EdgeSpec {
+            source_node_id: NodeId::from("sib1"),
+            relation: rag_rat_query::memory::EdgeRelation::RelatesTo,
+            target_repo_id: "global-repo".to_string(),
+            target_kind: "github".to_string(),
+            target_anchor: "o/r#9".to_string(),
+            owner_repo_id: "global-repo".to_string(),
+        };
+        rag_rat_oplog::author_content_batch(
+            &source,
+            stream,
+            &[
+                MemoryOp::NodeCreate {
+                    node_id: NodeId::from("sib1"),
+                    content: NodeContent {
+                        kind: "Invariant".into(),
+                        title: "sib1".into(),
+                        body: "body".into(),
+                        confidence: "high".into(),
+                        source: "agent".into(),
+                        tags: Vec::new(),
+                        payload: None,
+                    },
+                },
+                MemoryOp::EdgeAdd { edge: sibling_edge.clone() },
+            ],
+            SealPolicy::Plaintext,
+            0,
+        )
+        .unwrap();
+        source
+            .execute(
+                "INSERT INTO repo_memories(id, kind, title, body, confidence, status, \
+                 created_at_ms, updated_at_ms, source, memory_version, origin, repo_id)
+                 VALUES ('sib1', 'Invariant', 'sib1 edited here', 'body', 'high', 'active', 0, 0, \
+                 'agent', 'v1', 'synced', 'global-repo')",
+                [],
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO repo_node_edges(edge_key, repo_id, source_node_id, relation, \
+                 target_repo_id, target_kind, target_anchor, anchor_status, created_at_ms, origin)
+                 VALUES (?1, 'global-repo', 'sib1', 'relates_to', 'global-repo', 'github', \
+                 'o/r#9', 'current', 0, 'synced')",
+                [sibling_edge.edge_key().as_str()],
+            )
+            .unwrap();
+        // A local edge onto `ps1`, which another account created.
+        source
+            .execute(
+                "INSERT INTO repo_node_edges(edge_key, repo_id, source_node_id, relation, \
+                 target_repo_id, target_kind, target_anchor, anchor_status, created_at_ms, origin)
+                 VALUES ('e-onto-synced', '__unassigned__', 'pm2', 'relates_to', '__unassigned__', \
+                 'node', 'ps1', 'current', 0, 'local')",
+                [],
+            )
+            .unwrap();
+        let target = fresh_target();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
+        crate::memory_write::reconcile_owner_stream_for_repo(
+            &target,
+            "global-repo",
+            rag_rat_base::time::now_ms(),
+        )
+        .unwrap();
+
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories WHERE id = 'ps1'"), 0);
+        assert_eq!(
+            count(&target, "SELECT COUNT(*) FROM content_projected_nodes WHERE node_id = 'ps1'"),
+            0
+        );
+        assert_eq!(
+            count(&target, "SELECT COUNT(*) FROM repo_node_edges WHERE target_anchor = 'o/r#8'"),
+            0,
+            "another account's edge onto a local memory is not re-authored as the target's",
+        );
+        assert_eq!(
+            count(
+                &target,
+                "SELECT COUNT(*) FROM repo_memories WHERE id = 'sib1' AND title = 'sib1 edited \
+                 here'"
+            ),
+            1,
+            "the source account's own synced memory is carried with its local edit",
+        );
+        assert_eq!(
+            count(&target, "SELECT COUNT(*) FROM repo_node_edges WHERE target_anchor = 'o/r#9'"),
+            1,
+            "and so is the edge the source account added",
+        );
+        for node in ["pm1", "sib1"] {
+            assert_eq!(
+                count(
+                    &target,
+                    &format!(
+                        "SELECT COUNT(*) FROM content_projected_nodes WHERE node_id = '{node}'"
+                    )
+                ),
+                1,
+                "{node} is reconciled as the target's own",
+            );
+        }
+        let edge: (String, String) = target
+            .query_row(
+                "SELECT target_repo_id, anchor_status FROM repo_node_edges
+                 WHERE source_node_id = 'pm2' AND target_anchor = 'ps1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(edge, ("global-repo".to_string(), "unresolved".to_string()));
+    }
+
+    /// A legacy source on a sealed stream, whose own account created `pm2` as a sealed entry that
+    /// another device of that account would have left as a synced row.
+    fn sealed_source_with_own_synced_memory() -> Connection {
+        let source = seed_source_multi();
+        source
+            .execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+                 VALUES ('global-repo', 'global-repo', 0)",
+                [],
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES ('global-repo', ?1, 'sealed')",
+                [MEMORY_STREAM_SEAL_POLICY_META_KEY],
+            )
+            .unwrap();
+        rag_rat_oplog::local_account(&source, 0).unwrap();
+        crate::memory_write::reconcile_owner_stream_for_repo(
+            &source,
+            "global-repo",
+            rag_rat_base::time::now_ms(),
+        )
+        .unwrap();
+        source.execute("UPDATE repo_memories SET origin = 'synced' WHERE id = 'pm2'", []).unwrap();
+        source
+    }
+
+    /// The ownership scan opens the source account's sealed entries with its own keyring, so a
+    /// synced memory that account created on a sealed stream is carried (#1284).
+    #[test]
+    fn consolidation_reads_the_source_accounts_sealed_entries() {
+        let source = sealed_source_with_own_synced_memory();
+        let target = fresh_target();
+        import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy).unwrap();
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories WHERE id = 'pm2'"), 1);
+    }
+
+    /// A source that cannot open its own account's sealed entries cannot tell which synced rows
+    /// are its own, so the import refuses instead of leaving them behind.
+    #[test]
+    fn consolidation_refuses_a_source_whose_own_sealed_entries_it_cannot_open() {
+        let source = sealed_source_with_own_synced_memory();
+        source.execute("DELETE FROM oplog_device_identity", []).unwrap();
+        let target = fresh_target();
+        let Err(err) =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+        else {
+            panic!("the import refuses a source whose own sealed entries it cannot open");
+        };
+        assert!(err.to_string().contains("sealed"), "{err}");
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories"), 0, "nothing was imported");
+    }
+
+    /// An own-account entry the source cannot even decode hides what that account created, the
+    /// same as a sealed one it cannot open, so the import refuses.
+    #[test]
+    fn consolidation_refuses_a_source_with_an_undecodable_own_entry() {
+        let source = seed_source_multi();
+        let own = rag_rat_oplog::local_account(&source, 0).unwrap();
+        source
+            .execute(
+                "INSERT INTO content_entries(
+                     entry_hash, stream_id, author_account_id, device_fingerprint, seq,
+                     prev_hash, grant_id, roster_ref, owner_auth_len, author_auth_len,
+                     accepted, signed_bytes, received_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?5, ?5, 1, x'00', 0)",
+                params![
+                    [0x31_u8; 32].as_slice(),
+                    [0x41_u8; 32].as_slice(),
+                    own.to_bytes().as_slice(),
+                    [0x12_u8; 32].as_slice(),
+                    0_u64.to_be_bytes().as_slice(),
+                    [0x13_u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+        let target = fresh_target();
+        let Err(err) =
+            import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+        else {
+            panic!("the import refuses a source with an undecodable own entry");
+        };
+        assert!(err.to_string().contains("cannot read"), "{err}");
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories"), 0, "nothing was imported");
+    }
+
+    /// Work the source's own account did on a memory another account created cannot be carried —
+    /// its edge from that memory would be dropped with it — so the import refuses (#1284).
+    #[test]
+    fn consolidation_refuses_to_drop_the_source_accounts_work_on_a_foreign_memory() {
+        use rag_rat_oplog::{EdgeSpec, MemoryOp, NodeId, SealPolicy};
+        for signed in [true, false] {
+            let source = seed_source_multi();
+            rag_rat_oplog::local_account(&source, 0).unwrap();
+            if signed {
+                // An edge this account added from `ps1`, which another account created.
+                let stream = {
+                    let tx = rusqlite::Transaction::new_unchecked(
+                        &source,
+                        rusqlite::TransactionBehavior::Immediate,
+                    )
+                    .unwrap();
+                    let stream =
+                        rag_rat_oplog::ensure_owned_stream_v2_in_tx(&tx, "global-repo", 0).unwrap();
+                    tx.commit().unwrap();
+                    stream
+                };
+                rag_rat_oplog::author_content_batch(
+                    &source,
+                    stream,
+                    &[MemoryOp::EdgeAdd {
+                        edge: EdgeSpec {
+                            source_node_id: NodeId::from("ps1"),
+                            relation: rag_rat_query::memory::EdgeRelation::RelatesTo,
+                            target_repo_id: "global-repo".to_string(),
+                            target_kind: "github".to_string(),
+                            target_anchor: "o/r#10".to_string(),
+                            owner_repo_id: "global-repo".to_string(),
+                        },
+                    }],
+                    SealPolicy::Plaintext,
+                    0,
+                )
+                .unwrap();
+            } else {
+                // The same edge added here and not signed yet.
+                source
+                    .execute(
+                        "INSERT INTO repo_node_edges(edge_key, repo_id, source_node_id, relation, \
+                         target_repo_id, target_kind, target_anchor, anchor_status, \
+                         created_at_ms, origin)
+                         VALUES ('e-from-foreign', 'global-repo', 'ps1', 'relates_to', \
+                         'global-repo', 'github', 'o/r#10', 'current', 0, 'local')",
+                        [],
+                    )
+                    .unwrap();
+            }
+            let target = fresh_target();
+            let Err(err) =
+                import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
+            else {
+                panic!("signed={signed}: the import refuses to drop the account's own work");
+            };
+            assert!(err.to_string().contains("another account created"), "{err}");
+            assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories"), 0);
+        }
+    }
+
+    /// Seeding carries no synced row and archives nothing, so the legacy stranded-work guard does
+    /// not apply: a local edge from a synced memory in the shared source must not block a seed.
+    #[test]
+    fn seed_is_not_blocked_by_local_work_on_synced_memories() {
+        let source = seed_source_multi();
+        source
+            .execute(
+                "INSERT INTO repo_node_edges(edge_key, repo_id, source_node_id, relation, \
+                 target_repo_id, target_kind, target_anchor, anchor_status, created_at_ms, origin)
+                 VALUES ('e-from-synced', 'global-repo', 'ps1', 'relates_to', 'global-repo', \
+                 'github', 'o/r#11', 'current', 0, 'local')",
+                [],
+            )
+            .unwrap();
+        let target = fresh_target();
+        import_from_source(&source, &target, "global-repo", ImportMode::SeedPublic).unwrap();
+        assert_eq!(
+            count(&target, "SELECT COUNT(*) FROM repo_memories"),
+            2,
+            "the seed still takes this repo's local memories",
+        );
     }
 
     #[test]
