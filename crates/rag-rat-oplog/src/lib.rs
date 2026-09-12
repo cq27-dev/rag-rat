@@ -169,9 +169,11 @@ pub use identity::{LocalDevice, load_local_device, local_device};
 // payload: the memory drain digests an anchor set to record which one it applied.
 pub use op::encode as encode_op;
 pub use op::{
-    DeviceFingerprint, EdgeKey, EdgeSpec, MAX_ANCHORS_PER_OP, MemoryOp, NodeContent, NodeId,
-    NodeStatus, ParseDeviceFingerprintError, PortableAnchor, ResolvedAnchor, within_wire_limits,
+    AnchorScope, DeviceFingerprint, EdgeKey, EdgeSpec, MAX_ANCHORS_PER_OP, MemoryOp, NodeContent,
+    NodeId, NodeStatus, ParseDeviceFingerprintError, PortableAnchor, ResolvedAnchor,
+    within_wire_limits,
 };
+pub use project::AnchorScopes;
 // The `/1` shadow-projection read seams (`ProjectedState` / `load_projection`) and the
 // standalone (own-txn) `/1` authoring wrappers (`author_batch` / `author_op`) — test-only
 // scaffolding for the retained `/1` store. The live memory path now authors owner-bound `/3`
