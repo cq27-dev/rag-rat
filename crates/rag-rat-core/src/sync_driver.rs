@@ -1104,52 +1104,74 @@ async fn pull_foreign_accounts(
     let configured_relay = relay_url(config);
     for target in targets {
         let account_hex = hash::hex_lower(&target.to_bytes());
-        // The TARGET account's own routes only: a locator describes how to reach the owner its
-        // repository subscribes to, so another subscription's routes are never tried for this
-        // account, and never allowed to displace a route toward it.
-        let routes = foreign_pull_peers(
-            &config.sync.server_peers,
-            &configured_relay,
-            &crate::memory_write::subscription_routing(conn, &account_hex)?,
-        );
-        if routes.is_empty() {
-            // Discovery cannot stand in: a foreign account's discovery tag derives from that
-            // account's own secret, which only its own devices hold.
+        // A local fault for one account (its routing or memo rows, its roster count) must not cost
+        // the accounts after it their pull, or skip the drain below for content that already
+        // landed — the isolation a failing peer already gets inside `pull_account_via_peers`.
+        if let Err(error) =
+            pull_foreign_account(config, conn, endpoint, target, &account_hex, &configured_relay)
+                .await
+        {
             tracing::warn!(
                 account = %account_hex,
-                "cross-account sync has an account to pull but no peer to pull it from: set \
-                 [sync] server_peers, or subscribe from a `.rag-rat-stream` that names its host"
+                %error,
+                "cross-account pull failed; the next cadence retries"
             );
-            continue;
-        }
-        let memo_key = format!("{PULL_PEER_MEMO_PREFIX}{account_hex}");
-        let order = ordered_pull_peers(conn, &memo_key, &distinct_peers(&routes))?;
-        let ordered: Vec<(String, rag_rat_sync::EndpointAddr)> = route_addrs(
-            &order,
-            &routes,
-            &configured_relay,
-        )
-        .into_iter()
-        .filter_map(|(peer, addr)| match addr {
-            Ok(addr) => Some((peer, addr)),
-            Err(error) => {
-                tracing::warn!(peer, %error, "skipping cross-account peer: invalid node id");
-                None
-            },
-        })
-        .collect();
-        let outcome = pull_account_via_peers(conn, endpoint, target, &ordered).await?;
-        match outcome.peer {
-            Some(peer) => rag_rat_db::meta::set_meta(conn, &memo_key, &peer)?,
-            None => tracing::warn!(
-                account = %account_hex,
-                error = outcome.last_error.as_deref().unwrap_or("no peer reachable"),
-                "cross-account pull did not complete; the next cadence retries"
-            ),
         }
     }
     // Materialize whatever landed, once for the whole pass (idempotent when nothing changed).
     crate::drain_synced_memory(conn)?;
+    Ok(())
+}
+
+/// Pull one foreign `target` from the peers its routes name, and memoize the peer that answered.
+async fn pull_foreign_account(
+    config: &Config,
+    conn: &Connection,
+    endpoint: &iroh::Endpoint,
+    target: rag_rat_oplog::AccountId,
+    account_hex: &str,
+    configured_relay: &str,
+) -> anyhow::Result<()> {
+    // The TARGET account's own routes only: a locator describes how to reach the owner its
+    // repository subscribes to, so another subscription's routes are never tried for this
+    // account, and never allowed to displace a route toward it.
+    let routes = foreign_pull_peers(
+        &config.sync.server_peers,
+        configured_relay,
+        &crate::memory_write::subscription_routing(conn, account_hex)?,
+    );
+    if routes.is_empty() {
+        // Discovery cannot stand in: a foreign account's discovery tag derives from that
+        // account's own secret, which only its own devices hold.
+        tracing::warn!(
+            account = %account_hex,
+            "cross-account sync has an account to pull but no peer to pull it from: set \
+             [sync] server_peers, or subscribe from a `.rag-rat-stream` that names its host"
+        );
+        return Ok(());
+    }
+    let memo_key = format!("{PULL_PEER_MEMO_PREFIX}{account_hex}");
+    let order = ordered_pull_peers(conn, &memo_key, &distinct_peers(&routes))?;
+    let ordered: Vec<(String, rag_rat_sync::EndpointAddr)> =
+        route_addrs(&order, &routes, configured_relay)
+            .into_iter()
+            .filter_map(|(peer, addr)| match addr {
+                Ok(addr) => Some((peer, addr)),
+                Err(error) => {
+                    tracing::warn!(peer, %error, "skipping cross-account peer: invalid node id");
+                    None
+                },
+            })
+            .collect();
+    let outcome = pull_account_via_peers(conn, endpoint, target, &ordered).await?;
+    match outcome.peer {
+        Some(peer) => rag_rat_db::meta::set_meta(conn, &memo_key, &peer)?,
+        None => tracing::warn!(
+            account = %account_hex,
+            error = outcome.last_error.as_deref().unwrap_or("no peer reachable"),
+            "cross-account pull did not complete; the next cadence retries"
+        ),
+    }
     Ok(())
 }
 
@@ -1441,8 +1463,8 @@ mod tests {
         PersistedAdvertisement, RESIDENT_NUDGE, RefusedPublication, account_is_public_kb, can_host,
         can_sync, device_sync_run, discovery_fetch, foreign_pull_hosts, foreign_pull_targets,
         nudge_resident_host, ordered_pull_peers, peer_identity, prepare_advertisement,
-        pull_account_via_peers, read_advertisement, refused_publication_is_due, retry_is_due,
-        write_advertisement,
+        pull_account_via_peers, pull_foreign_accounts, read_advertisement,
+        refused_publication_is_due, retry_is_due, write_advertisement,
     };
 
     fn schema_conn() -> Connection {
@@ -2159,6 +2181,53 @@ mod tests {
         let remaining = vec!["node-a".to_string()];
         assert_eq!(ordered_pull_peers(&conn, &key, &remaining).unwrap(), remaining);
         assert_eq!(rag_rat_db::meta::read_meta(&conn, &key).unwrap(), None, "stale memo cleared");
+    }
+
+    /// One foreign account's local fault must not cost the accounts after it their pull (#1285).
+    /// Both targets hold a memo naming a peer that left the configured set, so each turn clears its
+    /// memo before dialing anything; the first account's clear is made to fail.
+    #[tokio::test]
+    async fn one_accounts_local_fault_does_not_stop_the_next_accounts_pull() {
+        let conn = schema_conn();
+        let local = rag_rat_oplog::local_account(&conn, 1_000).unwrap();
+        let first = rag_rat_oplog::AccountId::from_bytes([0x11; 32]);
+        let second = rag_rat_oplog::AccountId::from_bytes([0x77; 32]);
+        let memo_key = |owner: rag_rat_oplog::AccountId| {
+            format!("{PULL_PEER_MEMO_PREFIX}{}", hash::hex_lower(&owner.to_bytes()))
+        };
+        for (repo, owner) in [("repo-a", first), ("repo-b", second)] {
+            conn.execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
+                [repo],
+            )
+            .unwrap();
+            rag_rat_db::meta::set_repo_meta(
+                &conn,
+                repo,
+                "memory_contribution_owner",
+                &hash::hex_lower(&owner.to_bytes()),
+            )
+            .unwrap();
+            rag_rat_db::meta::set_meta(&conn, &memo_key(owner), "decommissioned-peer").unwrap();
+        }
+        assert_eq!(foreign_pull_targets(&conn, local).unwrap(), vec![first, second]);
+        conn.execute_batch(&format!(
+            "CREATE TEMP TRIGGER injected_fault BEFORE DELETE ON index_meta
+             WHEN OLD.key = '{}' BEGIN SELECT RAISE(ABORT, 'injected fault'); END;",
+            memo_key(first)
+        ))
+        .unwrap();
+        let mut config = Config::minimal_for_database(
+            PathBuf::from("/nonexistent/sync.sqlite"),
+            PathBuf::from("/nonexistent"),
+        );
+        config.sync.server_peers = vec!["not-a-node-id".to_string()];
+        let (endpoint, _other) = loopback_endpoints().await;
+
+        pull_foreign_accounts(&config, &conn, &endpoint, local).await.unwrap();
+        let memo = |owner| rag_rat_db::meta::read_meta(&conn, &memo_key(owner)).unwrap();
+        assert_eq!(memo(first).as_deref(), Some("decommissioned-peer"), "the first turn failed");
+        assert_eq!(memo(second), None, "the second account's turn still ran");
     }
 
     #[test]
