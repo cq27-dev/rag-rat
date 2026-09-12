@@ -1343,37 +1343,46 @@ pub fn account_is_contested(conn: &Connection, account_id: AccountId) -> anyhow:
     Ok(classification.is_some_and(|state| state == "contested"))
 }
 
-/// Measure an asserted control-fold length against our own folded view (§7) — the ONE seam that
-/// reads `auth_len`. Keeping it out of the fact queries above is what stops a counter from acting
-/// as an authority input: facts always answer from the current fold, and the caller applies this
-/// verdict as its own phase, where an `Ahead` author parks rather than pre-empting a decision the
-/// fold has already made. An account we hold nothing for has folded zero effective ops (its facts
-/// resolve `Unknown` long before freshness is consulted).
+/// Measure an asserted control-fold length against the control log we HOLD (§7) — the ONE seam
+/// that reads `auth_len`. Keeping it out of the fact queries above is what stops a counter from
+/// acting as an authority input: facts always answer from the current fold, and the caller applies
+/// this verdict as its own phase, where an `Ahead` author parks rather than pre-empting a decision
+/// the fold has already made. An account we hold nothing for holds zero rows (its facts resolve
+/// `Unknown` long before freshness is consulted).
+///
+/// Held rows, NOT the effective count (#1282). A cut can condemn ops an author had counted, so the
+/// effective count can drop below a length that author legitimately cited; measured against it,
+/// accepted content would park `auth_len_ahead` with nothing left to fetch, and the drain would
+/// remove its memories. Held rows are never deleted, so this measure never shrinks, and it is never
+/// below the effective count an author cites, so a store's own content never parks against it.
+/// Anyone can add candidate rows to an account's log (bounded per account), which can only end an
+/// `Ahead` park early: freshness grants no authority, and every content refold re-decides each
+/// entry, so an early verdict corrects itself when the missing ops arrive.
 pub fn auth_len_freshness(
     conn: &Connection,
     account_id: AccountId,
     asserted_auth_len: u64,
 ) -> anyhow::Result<fold::AuthorityFreshness> {
-    let effective_count: Option<i64> = conn
-        .query_row(
-            "SELECT effective_count FROM account_auth_state WHERE account_id = ?1",
-            [account_id.to_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let effective_count = effective_count.map(u64::try_from).transpose()?.unwrap_or_default();
-    Ok(if asserted_auth_len > effective_count {
-        fold::AuthorityFreshness::Ahead
-    } else {
-        fold::AuthorityFreshness::CurrentOrBehind
-    })
+    Ok(fold::AuthorityFreshness::of(asserted_auth_len, held_control_log_len(conn, account_id)?))
 }
 
-/// This account's current effective control-fold length — the raw `effective_count`
-/// [`auth_len_freshness`] compares against, read from whatever snapshot `conn` is already in. The
-/// in-tx content-author seam stamps it as the `owner_auth_len`/`author_auth_len` it cites so its
-/// own entries never park `auth_len_ahead` against its own fold; it MUST be read in the SAME
-/// snapshot as the authoring txn, or a concurrent control-fold advance would let the citation
+/// The control-log rows held for `account_id` — what [`auth_len_freshness`] measures a cited
+/// length against. A refold that checks many entries reads it once per account and compares each
+/// citation with [`fold::AuthorityFreshness::of`], rather than counting the log per citation.
+pub fn held_control_log_len(conn: &Connection, account_id: AccountId) -> anyhow::Result<u64> {
+    let held: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM account_entries WHERE account_id = ?1 AND log_id = ?2",
+        params![account_id.to_bytes().as_slice(), fold::CONTROL_LOG],
+        |row| row.get(0),
+    )?;
+    Ok(u64::try_from(held)?)
+}
+
+/// This account's current effective control-fold length, read from whatever snapshot `conn` is
+/// already in. The in-tx content-author seam stamps it as the `owner_auth_len`/`author_auth_len`
+/// it cites; [`auth_len_freshness`] measures against the held control log, which is never shorter,
+/// so its own entries never park `auth_len_ahead` against its own store; it MUST be read in the
+/// SAME snapshot as the authoring txn, or a concurrent control-fold advance would let the citation
 /// straddle two folds. Zero for an account we hold nothing for (its facts resolve `Unknown` long
 /// before freshness).
 pub fn account_effective_count(conn: &Connection, account_id: AccountId) -> anyhow::Result<u64> {
@@ -5030,6 +5039,73 @@ mod tests {
         assert_eq!(effective_count, 1, "the prior shadow projection survived intact");
     }
 
+    /// A cut that condemns control ops an author had counted shrinks the effective count below the
+    /// length that author legitimately cited. Freshness measures against the held control log,
+    /// which never shrinks, so the content stays accepted and its memory stays projected (#1282).
+    #[test]
+    fn content_citing_ops_a_later_cut_condemns_stays_accepted() {
+        let conn = db();
+        let (founder, owner, member) = (Dev::new(0x41), Dev::new(0x42), Dev::new(0x43));
+        let (x, y) = (Dev::new(0x44), Dev::new(0x45));
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (stream_id, own) = stream_own(account_id);
+        let (own_bytes, own_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
+        let (add_owner_bytes, add_owner) = op(
+            account_id,
+            &founder,
+            2,
+            Some(own_hash),
+            Some(genesis_hash),
+            &device_add(&owner, DeviceRole::Owner),
+        );
+        account_ingest(&conn, &add_owner_bytes, NOW + 2).unwrap();
+        let (add_member_bytes, add_member) = op(
+            account_id,
+            &founder,
+            3,
+            Some(add_owner),
+            Some(genesis_hash),
+            &device_add(&member, DeviceRole::Member),
+        );
+        account_ingest(&conn, &add_member_bytes, NOW + 3).unwrap();
+        // The added owner authors two ops of its own.
+        let (o1_bytes, o1) =
+            op(account_id, &owner, 0, None, Some(add_owner), &device_add(&x, DeviceRole::Member));
+        account_ingest(&conn, &o1_bytes, NOW + 4).unwrap();
+        let (o2_bytes, _) = op(
+            account_id,
+            &owner,
+            1,
+            Some(o1),
+            Some(add_owner),
+            &device_add(&y, DeviceRole::Member),
+        );
+        account_ingest(&conn, &o2_bytes, NOW + 5).unwrap();
+        assert_eq!(account_effective_count(&conn, account_id).unwrap(), 6);
+
+        let content = signed_member_content(&member, account_id, stream_id, add_member, 6);
+        content_ingest(&conn, &content.signed_bytes, NOW + 6).unwrap();
+        settle_pending_content_refolds(&conn, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+        assert_eq!(content_verdict(&conn, &content.entry_hash), ("accepted".into(), 1));
+
+        // The founder removes the owner and condemns everything it authored.
+        let remove = device_remove(&owner, super::super::cut::Cut::Empty);
+        let (remove_bytes, remove_hash) =
+            op(account_id, &founder, 4, Some(add_member), Some(genesis_hash), &remove);
+        account_ingest(&conn, &remove_bytes, NOW + 7).unwrap();
+        settle_pending_content_refolds(&conn, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+        assert_eq!(status(&conn, &remove_hash).as_deref(), Some("accepted"));
+        assert!(
+            account_effective_count(&conn, account_id).unwrap() < 6,
+            "premise: the cut shrank the effective count below the cited length",
+        );
+        assert_eq!(content_verdict(&conn, &content.entry_hash), ("accepted".into(), 1));
+        assert_eq!(projected_nodes(&conn, stream_id), vec!["remote-node".to_string()]);
+    }
+
     #[test]
     fn remote_revoke_updates_authority_now_but_content_and_projection_only_at_settle() {
         let conn = db();
@@ -5330,11 +5406,6 @@ mod tests {
         )
         .unwrap();
         assert!(stream_owner_effective(&conn, account_id, stream_id).is_err());
-        conn.execute("UPDATE account_auth_state SET effective_count = -1 WHERE account_id = ?1", [
-            account_id.to_bytes().as_slice(),
-        ])
-        .unwrap();
-        assert!(auth_len_freshness(&conn, account_id, 0).is_err());
     }
 
     #[test]

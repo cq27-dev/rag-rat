@@ -2357,7 +2357,7 @@ struct AuthorityCaches {
     roster:
         HashMap<(AccountId, EntryHash, DeviceFingerprint), AuthorityQuery<CitedRosterAuthority>>,
     grant: HashMap<(EntryHash, AccountId, DeviceFingerprint), AuthorityQuery<CitedGrantAuthority>>,
-    freshness: HashMap<(AccountId, u64), AuthorityFreshness>,
+    held_control_log: HashMap<AccountId, u64>,
     contested: HashMap<AccountId, bool>,
 }
 
@@ -2368,12 +2368,15 @@ impl AuthorityCaches {
         account_id: AccountId,
         asserted_auth_len: u64,
     ) -> anyhow::Result<AuthorityFreshness> {
-        if let Some(cached) = self.freshness.get(&(account_id, asserted_auth_len)) {
-            return Ok(*cached);
-        }
-        let state = account_storage::auth_len_freshness(tx, account_id, asserted_auth_len)?;
-        self.freshness.insert((account_id, asserted_auth_len), state);
-        Ok(state)
+        let held = match self.held_control_log.get(&account_id) {
+            Some(held) => *held,
+            None => {
+                let held = account_storage::held_control_log_len(tx, account_id)?;
+                self.held_control_log.insert(account_id, held);
+                held
+            },
+        };
+        Ok(AuthorityFreshness::of(asserted_auth_len, held))
     }
 
     fn contested(&mut self, tx: &Transaction<'_>, account_id: AccountId) -> anyhow::Result<bool> {
@@ -5042,13 +5045,15 @@ mod tests {
         }
     }
 
-    fn seed_auth_state_live(conn: &Connection, account: AccountId, effective_count: i64) {
+    /// A live fold for `account` with no control-log rows held. Freshness measures a cited length
+    /// against held rows, so the consistent effective count here is zero (#1282).
+    fn seed_auth_state_live(conn: &Connection, account: AccountId) {
         conn.execute(
             "INSERT INTO account_auth_state(
                  account_id, classification, contested_depth, successor_account_id, \
              effective_count)
-             VALUES(?1, 'live', NULL, NULL, ?2)",
-            params![account.to_bytes().as_slice(), effective_count],
+             VALUES(?1, 'live', NULL, NULL, 0)",
+            params![account.to_bytes().as_slice()],
         )
         .unwrap();
     }
@@ -5066,7 +5071,7 @@ mod tests {
         let owner = AccountId::from_bytes([0x51; 32]);
         assert_ne!(owner, grantee, "the owner is a separate identity from the contributor");
         seed_ownership(&conn, owner);
-        seed_auth_state_live(&conn, owner, 1);
+        seed_auth_state_live(&conn, owner);
         let grant_id = [0x71; 32];
         seed_grant(&conn, grant_id, owner, grantee, "writer");
 
@@ -5118,7 +5123,7 @@ mod tests {
         let grantee = crate::account::local_account(&conn, NOW).unwrap();
         let owner = AccountId::from_bytes([0x51; 32]);
         seed_ownership(&conn, owner);
-        seed_auth_state_live(&conn, owner, 1);
+        seed_auth_state_live(&conn, owner);
         let grant_id = [0x71; 32];
         seed_grant(&conn, grant_id, owner, grantee, "writer");
 
