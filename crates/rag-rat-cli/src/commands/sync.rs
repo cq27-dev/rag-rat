@@ -847,9 +847,9 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
 /// The escape hatch behind automatic sync (#1174): the resident host runs this same shape after a
 /// HEAD change, and an operator reaches for the command when automation is off. Cross-account
 /// contribution needs it in both directions — a contributor fetches the owner's memories, and an
-/// owner collects a contributor's — because content is offered by AUTHOR
-/// (`content_entries_for_sync` filters `author_account_id`), so each side must sync the OTHER's
-/// account to see what that side wrote.
+/// owner collects a contributor's — because a contribution first leaves its author through the
+/// author's own account. Once the owner has accepted it, the owner's sessions relay it with the
+/// contributor's log (#1280), so everyone else reaches it by syncing the owner alone.
 ///
 /// Deliberately NOT a `sync join`: no enrollment, no `/5` table restore (foreign table streams are
 /// private account data, pinned `Closed`), and no founder-incarnation repair.

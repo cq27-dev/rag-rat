@@ -2247,3 +2247,325 @@ fn a_grantors_session_admits_its_grantees_entries_once_and_drops_strangers() {
         .unwrap();
     assert_eq!(accepted, 1, "the relayed contribution folds accepted on the owner's stream");
 }
+
+fn relay_note(id: &str) -> rag_rat_oplog::MemoryOp {
+    rag_rat_oplog::MemoryOp::NodeCreate {
+        node_id: rag_rat_oplog::NodeId::from(id),
+        content: rag_rat_oplog::NodeContent {
+            kind: "Invariant".into(),
+            title: id.into(),
+            body: "body".into(),
+            confidence: "high".into(),
+            source: "agent".into(),
+            tags: Vec::new(),
+            payload: None,
+        },
+    }
+}
+
+/// An owner with a public stream holding its own `owner-note` and, accepted, a contributor's
+/// `guest-note` — the state the owner reaches after collecting the contribution from the
+/// contributor's account. Returns `(owner, owner_account, contributor, contributor_account,
+/// stream)`.
+fn owner_with_an_accepted_contribution()
+-> (Connection, AccountId, Connection, AccountId, rag_rat_oplog::StreamId) {
+    use rag_rat_oplog::{
+        AccessMode, ContentRefoldBudget, SealPolicy, author_content_batch,
+        author_stream_grant_in_tx, ensure_owned_stream_v2_with_mode_in_tx,
+        settle_pending_content_refolds,
+    };
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    let owner = fresh_db();
+    let owner_account = local_account(&owner, NOW).unwrap();
+    let stream = {
+        let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+        let stream =
+            ensure_owned_stream_v2_with_mode_in_tx(&tx, "repo-relay", AccessMode::PublicRead, NOW)
+                .unwrap();
+        tx.commit().unwrap();
+        stream
+    };
+    author_content_batch(&owner, stream, &[relay_note("owner-note")], SealPolicy::Plaintext, NOW)
+        .unwrap();
+    let contributor = fresh_db();
+    let contributor_account = local_account(&contributor, NOW).unwrap();
+    {
+        let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+        author_stream_grant_in_tx(
+            &tx,
+            stream,
+            contributor_account,
+            rag_rat_oplog::GrantRole::Writer,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    copy_account(&owner, &contributor, owner_account);
+    contribute(&contributor, owner_account, stream, "guest-note");
+    copy_account(&contributor, &owner, contributor_account);
+    settle_pending_content_refolds(&owner, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+    assert_eq!(accepted_notes(&owner, stream), vec!["guest-note", "owner-note"]);
+    (owner, owner_account, contributor, contributor_account, stream)
+}
+
+/// Author `title` as a contribution from `contributor` onto `owner_account`'s `stream`.
+fn contribute(
+    contributor: &Connection,
+    owner_account: AccountId,
+    stream: rag_rat_oplog::StreamId,
+    title: &str,
+) {
+    use rusqlite::{Transaction, TransactionBehavior};
+    let contributor_account = local_account(contributor, NOW).unwrap();
+    let grant_id = rag_rat_oplog::effective_writer_grant(
+        contributor,
+        owner_account,
+        stream,
+        contributor_account,
+    )
+    .unwrap()
+    .expect("the grant reached the contributor");
+    let tx = Transaction::new_unchecked(contributor, TransactionBehavior::Immediate).unwrap();
+    rag_rat_oplog::author_grantee_content_batch_in_tx(
+        &tx,
+        stream,
+        owner_account,
+        grant_id,
+        &[relay_note(title)],
+        NOW,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+/// Replicate `account`'s log and own content from `src` into `dst` directly — the state a pull of
+/// that account leaves.
+fn copy_account(src: &Connection, dst: &Connection, account: AccountId) {
+    for entry in account_entries_for_sync(src, account).unwrap() {
+        rag_rat_oplog::account_ingest(dst, &entry.signed_bytes, NOW).unwrap();
+    }
+    for entry in rag_rat_oplog::content_entries_for_sync(src, account).unwrap() {
+        rag_rat_oplog::content_ingest(dst, &entry.signed_bytes, NOW).unwrap();
+    }
+}
+
+/// Titles of the accepted notes on `stream`, sorted.
+fn accepted_notes(conn: &Connection, stream: rag_rat_oplog::StreamId) -> Vec<String> {
+    let mut titles: Vec<String> = conn
+        .prepare(
+            "SELECT json_extract(content_json, '$.title') FROM content_projected_nodes
+             WHERE stream_id = ?1",
+        )
+        .unwrap()
+        .query_map([stream.to_bytes().as_slice()], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    titles.sort();
+    titles
+}
+
+/// What `owner` serves under `scope`: its account snapshot and its content snapshot.
+fn served(
+    owner: &Connection,
+    owner_account: AccountId,
+    scope: rag_rat_sync::ServeScope,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    use rag_rat_sync::{OplogContentSyncStore, SyncStore};
+    let mut accounts = OplogSyncStore::new(owner, owner_account, || NOW);
+    accounts.set_serve_scope(scope);
+    let mut contents = OplogContentSyncStore::new(owner, owner_account, || NOW);
+    contents.set_serve_scope(scope);
+    let bytes = |set: Vec<([u8; 32], Vec<u8>)>| set.into_iter().map(|(_, b)| b).collect();
+    (bytes(accounts.snapshot().unwrap()), bytes(contents.snapshot().unwrap()))
+}
+
+/// Fold a served set into `receiver` through sessions named for the owner, as a pull would.
+fn fold_served(
+    receiver: &Connection,
+    owner_account: AccountId,
+    served: &(Vec<Vec<u8>>, Vec<Vec<u8>>),
+) {
+    use rag_rat_oplog::{ContentRefoldBudget, settle_pending_content_refolds};
+    use rag_rat_sync::{OplogContentSyncStore, SyncStore};
+    let mut accounts = OplogSyncStore::new(receiver, owner_account, || NOW);
+    for bytes in &served.0 {
+        accounts.ingest(bytes).unwrap();
+    }
+    let mut contents = OplogContentSyncStore::new(receiver, owner_account, || NOW);
+    for bytes in &served.1 {
+        contents.ingest(bytes).unwrap();
+    }
+    settle_pending_content_refolds(receiver, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+}
+
+/// An owner's sessions relay its contributors (#1280): under either serve scope, a peer that syncs
+/// only the owner receives the contributor's log and accepts the contribution with no other input.
+#[test]
+fn an_owners_serve_relays_its_contributors_log_and_memory_under_both_scopes() {
+    use rag_rat_sync::ServeScope;
+    let (owner, owner_account, _contributor, contributor_account, stream) =
+        owner_with_an_accepted_contribution();
+    for scope in [ServeScope::Full, ServeScope::PublicOnly] {
+        let receiver = fresh_db();
+        fold_served(&receiver, owner_account, &served(&owner, owner_account, scope));
+        assert_eq!(
+            accepted_notes(&receiver, stream),
+            vec!["guest-note", "owner-note"],
+            "{scope:?}"
+        );
+        assert!(
+            !account_entries_for_sync(&receiver, contributor_account).unwrap().is_empty(),
+            "{scope:?}: the contributor's log came with it",
+        );
+    }
+}
+
+/// A receiver takes acceptance from its own fold, never from the relay. A departed contributor's
+/// pre-revocation memory stays accepted everywhere; what it authors after the cut is relayed like
+/// any held entry, and every receiver condemns it from the same revocation in the owner's log.
+#[test]
+fn a_revoked_contributors_later_memory_is_condemned_wherever_it_is_relayed() {
+    use rag_rat_oplog::{
+        ContentRefoldBudget, RevokeReason, author_stream_revoke_in_tx,
+        settle_pending_content_refolds,
+    };
+    use rag_rat_sync::ServeScope;
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    let (owner, owner_account, contributor, contributor_account, stream) =
+        owner_with_an_accepted_contribution();
+    {
+        let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+        author_stream_revoke_in_tx(
+            &tx,
+            stream,
+            contributor_account,
+            RevokeReason::Departed,
+            None,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    contribute(&contributor, owner_account, stream, "late-note");
+    copy_account(&contributor, &owner, contributor_account);
+    settle_pending_content_refolds(&owner, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+    assert_eq!(accepted_notes(&owner, stream), vec!["guest-note", "owner-note"]);
+    let held_at_owner: i64 = owner
+        .query_row(
+            "SELECT COUNT(*) FROM content_entries WHERE author_account_id = ?1",
+            [contributor_account.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(held_at_owner, 2, "premise: the owner holds the late entry, condemned by the cut");
+
+    let receiver = fresh_db();
+    let set = served(&owner, owner_account, ServeScope::Full);
+    fold_served(&receiver, owner_account, &set);
+    assert_eq!(accepted_notes(&receiver, stream), vec!["guest-note", "owner-note"]);
+    let held_at_receiver: i64 = receiver
+        .query_row(
+            "SELECT COUNT(*) FROM content_entries WHERE author_account_id = ?1",
+            [contributor_account.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(held_at_receiver, 2, "the late entry was relayed, and condemned on arrival");
+}
+
+/// The anonymous serve relays a grantee's log only if that account owns no non-public stream — a
+/// control log cannot be op-subset, so relaying it would reveal the private `StreamOwn`. Its
+/// contributions are withheld with it, since they could not verify without it. A roster peer still
+/// receives both.
+#[test]
+fn the_public_serve_skips_a_grantee_that_owns_a_private_stream() {
+    use rag_rat_oplog::ensure_owned_stream_v2_in_tx;
+    use rag_rat_sync::ServeScope;
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    let (owner, owner_account, contributor, contributor_account, stream) =
+        owner_with_an_accepted_contribution();
+    {
+        let tx = Transaction::new_unchecked(&contributor, TransactionBehavior::Immediate).unwrap();
+        ensure_owned_stream_v2_in_tx(&tx, "repo-own", NOW).unwrap();
+        tx.commit().unwrap();
+    }
+    copy_account(&contributor, &owner, contributor_account);
+    let contributor_log: Vec<Vec<u8>> = account_entries_for_sync(&owner, contributor_account)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.signed_bytes)
+        .collect();
+
+    let (public_log, public_content) = served(&owner, owner_account, ServeScope::PublicOnly);
+    assert!(
+        contributor_log.iter().all(|entry| !public_log.contains(entry)),
+        "no entry of the contributor's log is served anonymously",
+    );
+    let receiver = fresh_db();
+    fold_served(&receiver, owner_account, &(public_log, public_content.clone()));
+    assert_eq!(accepted_notes(&receiver, stream), vec!["owner-note"]);
+    assert_eq!(public_content.len(), 1, "the contribution is withheld with its author's log");
+
+    let (full_log, _) = served(&owner, owner_account, ServeScope::Full);
+    assert!(contributor_log.iter().all(|entry| full_log.contains(entry)), "a roster peer gets it");
+}
+
+/// Over real dispatch: an anonymous subscriber pulls only the owner, and a second pull of each
+/// stream is fully quiet before it has even refolded — relayed entries read as held while still
+/// unaccepted. It then accepts the contribution.
+#[tokio::test]
+async fn an_anonymous_pull_of_an_owner_converges_on_its_contributions() {
+    use rag_rat_oplog::{ContentRefoldBudget, settle_pending_content_refolds};
+    use rag_rat_sync::{
+        AuthPolicy, CONTENT_SYNC_ALPN, OplogContentSyncStore, SYNC_ALPN, SessionReport,
+        accept_and_dispatch, connect_and_sync,
+    };
+
+    let (owner, owner_account, _contributor, _contributor_account, stream) =
+        owner_with_an_accepted_contribution();
+    let subscriber = fresh_db();
+    let (owner_ep, sub_ep) = loopback_endpoints().await;
+    let policy = AuthPolicy::PublicRead;
+
+    let mut reports: Vec<SessionReport> = Vec::new();
+    for _ in 0..2 {
+        for alpn in [SYNC_ALPN, CONTENT_SYNC_ALPN] {
+            let mut owner_acc = OplogSyncStore::new(&owner, owner_account, || NOW);
+            let mut owner_cont = OplogContentSyncStore::new(&owner, owner_account, || NOW);
+            let server =
+                accept_and_dispatch(&owner_ep, &mut owner_acc, &mut owner_cont, policy, || NOW);
+            let report = if alpn == SYNC_ALPN {
+                let mut pull = OplogSyncStore::new(&subscriber, owner_account, || NOW);
+                let client =
+                    connect_and_sync(&sub_ep, direct_addr(&owner_ep), alpn, &mut pull, policy, NOW);
+                let (s, c) = tokio::join!(server, client);
+                assert_eq!(s.unwrap().0, alpn);
+                c.unwrap()
+            } else {
+                let mut pull = OplogContentSyncStore::new(&subscriber, owner_account, || NOW);
+                let client =
+                    connect_and_sync(&sub_ep, direct_addr(&owner_ep), alpn, &mut pull, policy, NOW);
+                let (s, c) = tokio::join!(server, client);
+                assert_eq!(s.unwrap().0, alpn);
+                c.unwrap()
+            };
+            reports.push(report);
+        }
+    }
+    // Only now does the subscriber refold: until then the relayed rows it holds are unaccepted,
+    // and the second pull must still see them as held.
+    settle_pending_content_refolds(&subscriber, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+    assert_eq!(accepted_notes(&subscriber, stream), vec!["guest-note", "owner-note"]);
+    for report in &reports[2..] {
+        assert_eq!(
+            (report.entries_sent, report.entries_received, report.entries_newly_stored),
+            (0, 0, 0),
+            "the second pull is quiet: {report:?}",
+        );
+    }
+}

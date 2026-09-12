@@ -11,8 +11,8 @@ use rag_rat_oplog::{
     account_entry_ref, account_ingest, account_is_fully_public, account_signed_entry_exists,
     account_signed_hash, content_entries_for_public_sync, content_entries_for_sync,
     content_entry_ref, content_ingest, content_signed_entry_exists, content_signed_hash,
-    owner_ever_granted, sign_local_node_binding, stream_access_mode, stream_owner_account,
-    verify_node_binding,
+    ever_granted_accounts, owner_ever_granted, sign_local_node_binding, stream_access_mode,
+    stream_owner_account, verify_node_binding,
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
@@ -124,8 +124,21 @@ impl SyncStore for OplogSyncStore<'_> {
         // not relay forged candidates to anonymous readers. For a fully-public account (the only
         // account served `PublicOnly`) this is the whole control + secrets log, exactly what a
         // subscriber needs to verify the content.
+        //
+        // After the owner's own log come the authenticated logs of every account it has granted a
+        // stream (#1280): a peer that syncs only the owner needs them to verify the contributions
+        // the content session relays. Owner entries go first so the grant folds before the rows it
+        // admits arrive. Each grantee's log is relayed whole — a control log is one hash chain per
+        // device and cannot be op-subset — so under `PublicOnly` a grantee that owns any
+        // non-public stream is skipped entirely, by the same fully-public gate as the owner.
         let entries = match self.serve_scope {
-            ServeScope::Full => account_entries_for_sync(self.conn, self.account_id)?,
+            ServeScope::Full => {
+                let mut entries = account_entries_for_sync(self.conn, self.account_id)?;
+                for grantee in ever_granted_accounts(self.conn, self.account_id)? {
+                    entries.extend(account_entries_for_enrollment(self.conn, grantee)?);
+                }
+                entries
+            },
             ServeScope::PublicOnly => {
                 // Fail-closed, co-located guard: never serve an account that holds ANY private
                 // stream to an anonymous reader, whatever selected the policy. Aborts the session
@@ -138,7 +151,13 @@ impl SyncStore for OplogSyncStore<'_> {
                     account_is_fully_public(&tx, self.account_id)?,
                     "refusing PublicOnly serve: account holds a non-public stream",
                 );
-                account_entries_for_enrollment(&tx, self.account_id)?
+                let mut entries = account_entries_for_enrollment(&tx, self.account_id)?;
+                for grantee in ever_granted_accounts(&tx, self.account_id)? {
+                    if account_is_fully_public(&tx, grantee)? {
+                        entries.extend(account_entries_for_enrollment(&tx, grantee)?);
+                    }
+                }
+                entries
             },
         };
         Ok(entries
