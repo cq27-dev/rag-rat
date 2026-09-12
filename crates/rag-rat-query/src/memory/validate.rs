@@ -1936,6 +1936,35 @@ mod call_path_receiver_type_hint_tests {
         assert_eq!(confirmed, ("gone".to_string(), None, None));
     }
 
+    /// A binding whose memory row is gone — the drain keeps a removed synced memory's bindings for
+    /// `anchors/1` to carry — is neither counted nor rewritten: this pass relocates portable
+    /// columns, which would publish for a memory this device cannot show. A missing path would
+    /// otherwise arm the `gone` downgrade.
+    #[test]
+    fn a_binding_without_its_memory_is_left_out_of_validation() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path,
+                    start_line, end_line, anchor_status, created_at_ms, repo_id)
+             VALUES ('gone', 'path', 'src/missing.rs', 'src/missing.rs', 1, 1, 'current', 0, 'r')",
+            [],
+        )
+        .unwrap();
+
+        let report = validate_memories(&c, None).unwrap();
+        assert_eq!(report.checked, 0, "an orphan binding is not part of the report");
+        let persisted: (String, Option<i64>) = c
+            .query_row(
+                "SELECT anchor_status, downgrade_pending_at_ms
+                   FROM repo_memory_bindings WHERE memory_id = 'gone'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, ("current".to_string(), None), "and is left as it was");
+    }
+
     #[test]
     fn active_scope_validation_preserves_a_linked_worktree_edge_id_as_pending() {
         let c = mem_db();

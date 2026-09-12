@@ -893,6 +893,10 @@ pub fn validate_memories(
     // nor CONFIRM a downgrade. Positive observations still stamp: evidence of presence is real
     // in any window.
     let staged_window = staged_generation_exists(conn, &scope)?;
+    // Only bindings whose memory is materialized here. The drain keeps a removed synced memory's
+    // bindings for `anchors/1` to carry (#1298); this pass rewrites portable columns, so an orphan
+    // would be counted in the report and relocated — publishing an Upsert, or on a key collision
+    // a Remove, for a memory this device cannot show. It re-enters the sweep when the memory does.
     let mut stmt = conn.prepare(&format!(
         "
         SELECT memory_id, binding_kind, binding_id, path, start_line, end_line,
@@ -902,6 +906,9 @@ pub fn validate_memories(
                downgrade_pending_at_ms
         FROM repo_memory_bindings
         WHERE 1=1{repo_clause}
+          AND EXISTS (SELECT 1 FROM repo_memories m
+                       WHERE m.id = repo_memory_bindings.memory_id
+                         AND m.repo_id = repo_memory_bindings.repo_id)
         ORDER BY CASE WHEN binding_kind = 'scip_moniker' THEN 1 ELSE 0 END,
                  memory_id, binding_kind, binding_id
         "

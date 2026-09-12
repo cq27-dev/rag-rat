@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 121;
+pub const LATEST_SCHEMA_VERSION: u32 = 122;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -872,6 +872,14 @@ const MIGRATION_121_DESCRIPTION: &str =
     "Queue every /3 content stream for an acceptance refold and refold every account, so content \
      and secrets-log wraps parked auth_len_ahead after a cut lowered the cited account's \
      effective count are re-judged against the held control log (#1282)";
+const MIGRATION_122_ID: &str = "122_memory_parked_anchor_baselines";
+const MIGRATION_122_CHECKSUM: &str = "sha256:rag-rat-memory-parked-anchor-baselines-v122";
+const MIGRATION_122_DESCRIPTION: &str =
+    "Add repo_memory_parked_baselines, where the memory drain parks a condemned or quarantined \
+     synced memory's applied-anchor baseline while its row is gone (#1298). Its bindings stay, \
+     since they replicate on anchors/1 and deleting them would remove them from every device the \
+     memory is still live on; the parked baseline lets a returning memory converge on a rebind \
+     published while it was away";
 const MIGRATION_118_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-v118";
 const MIGRATION_118_DESCRIPTION: &str =
     "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
@@ -1902,6 +1910,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_121_CHECKSUM,
         description: MIGRATION_121_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_refold_for_held_control_log_freshness),
+    },
+    Migration {
+        id: MIGRATION_122_ID,
+        checksum: MIGRATION_122_CHECKSUM,
+        description: MIGRATION_122_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_memory_parked_anchor_baselines),
     },
 ];
 
