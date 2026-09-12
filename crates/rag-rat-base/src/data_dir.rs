@@ -47,25 +47,29 @@ pub fn global_database_path() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join("rag-rat.sqlite"))
 }
 
+/// Serializes every test that reads or writes the data-dir cascade variables. `set_var` /
+/// `remove_var` mutate PROCESS-global state, so under a thread-based runner (`cargo test`) a test
+/// that reads [`data_dir`] while another rewrites the variables flakes; nextest's
+/// process-per-test isolation hides it, and the lock keeps both runners honest. Hold the guard for
+/// the whole test.
+#[cfg(test)]
+pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, PoisonError};
-
     use super::*;
-
-    /// Serializes the env-mutating tests. `set_var`/`remove_var` mutate PROCESS-global state, so
-    /// under a thread-based runner (`cargo test`) two of these racing would flake; nextest's
-    /// process-per-test isolation makes it moot there, but the mutex keeps both runners honest.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Run `body` with the four cascade vars forced to `values` (`None` = removed), restoring the
     /// prior environment afterward so tests never leak state into each other.
     fn with_env(values: &[(&str, Option<&str>)], body: impl FnOnce()) {
         const KEYS: [&str; 4] = ["RAG_RAT_DATA_DIR", "XDG_DATA_HOME", "HOME", "APPDATA"];
-        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _guard = env_guard();
         let saved: Vec<(&str, Option<String>)> =
             KEYS.iter().map(|&key| (key, std::env::var(key).ok())).collect();
-        // SAFETY: env access is serialized by ENV_LOCK for the duration of this call.
+        // SAFETY: env access is serialized by `env_guard` for the duration of this call.
         unsafe {
             for &key in &KEYS {
                 std::env::remove_var(key);

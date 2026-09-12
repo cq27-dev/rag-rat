@@ -350,6 +350,7 @@ fn git_commit_all(dir: &Path) {
 /// so this never touches a developer's real global store.
 #[test]
 fn config_load_without_a_database_key_resolves_to_the_global_database() {
+    let _env = crate::data_dir::env_guard();
     let tmp = scratch("globaldb");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
@@ -746,6 +747,7 @@ fn config_load_governs_from_main_even_when_a_branch_only_root_defeats_anchoring(
 /// environment (no env mutation ⇒ parallel-safe); `load` only resolves, never writes there.
 #[test]
 fn config_load_refuses_an_identity_less_pin_at_the_global_store() {
+    let _env = crate::data_dir::env_guard();
     let Some(global) = crate::data_dir::global_database_path() else {
         return; // no resolvable data dir on this platform — the gate cannot trigger
     };
@@ -859,6 +861,7 @@ fn config_load_anchors_the_database_key_to_the_main_worktree() {
 /// imports and renames it, after which resolution falls through to the global store.
 #[test]
 fn config_load_without_a_database_key_prefers_an_existing_legacy_index() {
+    let _env = crate::data_dir::env_guard();
     let tmp = scratch("legacydb");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::create_dir_all(tmp.join(".rag-rat")).unwrap();
@@ -908,6 +911,7 @@ fn config_load_without_a_database_key_prefers_an_existing_legacy_index() {
 /// commit mints a real id. Two identity-less roots therefore NEVER share a database.
 #[test]
 fn config_load_without_a_database_key_stays_per_root_for_identity_less_roots() {
+    let _env = crate::data_dir::env_guard();
     let keyless_config = |tag: &str| {
         let tmp = scratch(&format!("noident-{tag}"));
         std::fs::create_dir_all(tmp.join("src")).unwrap();
