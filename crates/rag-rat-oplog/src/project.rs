@@ -19,6 +19,13 @@
 //!   its latest set — whichever order its binary wrote the pair in — while two independent
 //!   registers split pairs written in opposite orders: `anchors A @10, hash A @11` from one device
 //!   and `hash B @10, anchors B @11` from another would settle on anchors B beside hash A.
+//! - node **anchor scopes** — the scope of each symbol anchor's target, paired with the anchor set
+//!   by device like the source hash, but positionally: the latest `NodeAnchorScopes` the winning
+//!   set's device wrote SINCE ITS PRECEDING SET and at or before this one, empty when it wrote none
+//!   there. An author publishes its scopes ahead of its set, so a pull torn after a later scopes op
+//!   (`scopes A, anchors A, scopes B`) still pairs set A with scopes A — the device's latest would
+//!   pair it with B's, and the set B that follows would then read as no change — and a set the
+//!   device published without scopes takes none rather than an earlier publication's.
 //! - edge **presence** — the last-in-order `EdgeAdd`/`EdgeRemove`; present iff the winner is an
 //!   add.
 //! - edge **resolved anchor** — the last-in-order `Rebind`; rides along iff the edge is present,
@@ -27,12 +34,17 @@
 //! "Tombstones never resurrect" is EMERGENT, not an absorbing flag: an out-of-order or duplicated
 //! older `EdgeAdd` sorts before a newer `EdgeRemove` and loses. `Snapshot` is inert this increment.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use super::op::{
-    self, EdgeKey, EdgeSpec, Entry, MemoryOp, NodeContent, NodeId, NodeStatus, OpMeta,
+    self, AnchorScope, EdgeKey, EdgeSpec, Entry, MemoryOp, NodeContent, NodeId, NodeStatus, OpMeta,
     PortableAnchor, ResolvedAnchor,
 };
+
+/// A node's anchor scopes, keyed by the anchor identity `(binding_kind, binding_id)` each
+/// describes: the value is the target's scope hash (see [`AnchorScope`]).
+pub type AnchorScopes = BTreeMap<(String, String), String>;
 
 /// The converged projection: existing nodes (content + status) and present edges (spec + resolved
 /// anchor), each keyed for a stable, sorted, byte-reproducible ordering.
@@ -63,6 +75,10 @@ pub struct ProjectedNode {
     /// The hash of the source text the author anchored to, or `None` when none was published.
     /// `None` surfaces UNMARKED downstream — an absent hash is not evidence of drift.
     pub source_text_hash: Option<String>,
+    /// The scope of each symbol anchor's target in the winning set, from the device that wrote it;
+    /// empty when it published none. Absence is not evidence — a drain compares scopes only where
+    /// both the previous and the new set carry one.
+    pub anchor_scopes: AnchorScopes,
     /// The `(lamport, device)` of the entry whose `NodeAnchors` won the anchors register, or
     /// `None` with no set folded. The content projection maps it to that entry's author
     /// account, which is how the drain tells a set its own account's `anchors/1` already
@@ -87,6 +103,12 @@ struct NodeAccum {
     anchors: Option<(Vec<PortableAnchor>, OpMeta)>,
     /// Each device's latest `NodeSourceHash`, to pair with that device's anchor set.
     source_text_hash_by_device: BTreeMap<op::DeviceFingerprint, String>,
+    /// Each device's `NodeAnchorScopes` by Lamport, so a set pairs with the latest scopes its
+    /// device wrote within its own publication (see the module docs).
+    anchor_scopes_by_device: BTreeMap<op::DeviceFingerprint, BTreeMap<u64, AnchorScopes>>,
+    /// The Lamport of every `NodeAnchors` each device wrote — the publication boundaries the
+    /// scopes lookup is bounded by.
+    anchor_set_lamports_by_device: BTreeMap<op::DeviceFingerprint, BTreeSet<u64>>,
 }
 
 /// Per-edge LWW accumulators, resolved into a [`ProjectedEdge`] only if the edge is present.
@@ -179,8 +201,30 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                 // Full-set replacement, like content — an anchor set is one register, not a
                 // per-binding merge, so a later op saying "these two" retires a binding the
                 // earlier one named.
-                nodes.entry(node_id.clone()).or_default().anchors =
-                    Some((canonical_anchors(anchors), entry.meta));
+                let node = nodes.entry(node_id.clone()).or_default();
+                node.anchors = Some((canonical_anchors(anchors), entry.meta));
+                node.anchor_set_lamports_by_device
+                    .entry(entry.meta.device)
+                    .or_default()
+                    .insert(entry.meta.lamport);
+            },
+            MemoryOp::NodeAnchorScopes { node_id, scopes } => {
+                // A full set per publication: the set that follows on the same chain takes the
+                // latest one at or before it, and an empty set retracts.
+                let scopes: AnchorScopes = scopes
+                    .iter()
+                    .map(|scope| {
+                        let AnchorScope { binding_kind, binding_id, scope_hash } = scope.clone();
+                        ((binding_kind, binding_id), scope_hash)
+                    })
+                    .collect();
+                nodes
+                    .entry(node_id.clone())
+                    .or_default()
+                    .anchor_scopes_by_device
+                    .entry(entry.meta.device)
+                    .or_default()
+                    .insert(entry.meta.lamport, scopes);
             },
             // Inert boundary marker this increment (§5.4/C4).
             MemoryOp::Snapshot => {},
@@ -216,11 +260,29 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                 };
                 let source_text_hash = anchors_meta
                     .and_then(|meta| acc.source_text_hash_by_device.get(&meta.device).cloned());
+                let anchor_scopes = anchors_meta
+                    .and_then(|meta| {
+                        let by_lamport = acc.anchor_scopes_by_device.get(&meta.device)?;
+                        // This publication's companion only: reaching back past the device's
+                        // preceding set would attach an earlier publication's scopes to a set
+                        // published without any.
+                        let preceding = acc
+                            .anchor_set_lamports_by_device
+                            .get(&meta.device)
+                            .and_then(|sets| sets.range(..meta.lamport).next_back().copied());
+                        let from = preceding.map_or(Bound::Unbounded, Bound::Excluded);
+                        by_lamport
+                            .range((from, Bound::Included(meta.lamport)))
+                            .next_back()
+                            .map(|(_, scopes)| scopes.clone())
+                    })
+                    .unwrap_or_default();
                 Some((id, ProjectedNode {
                     content,
                     status: acc.status.unwrap_or_default(),
                     anchors,
                     source_text_hash,
+                    anchor_scopes,
                     anchors_meta,
                 }))
             })
@@ -354,6 +416,83 @@ mod tests {
         let node = &state.nodes[&NodeId::from("mem_1")];
         assert_eq!(node.anchors.as_ref().unwrap()[0].binding_id, "b");
         assert_eq!(node.source_text_hash.as_deref(), Some("second"));
+    }
+
+    /// A device's anchor scopes pair with ITS set exactly as its hash does: the winning set's
+    /// device supplies them, a device that published none supplies an empty map, and a later
+    /// empty set from the winning device retracts.
+    #[test]
+    fn anchor_scopes_pair_with_the_winning_set_s_device() {
+        let scopes = |dev: u8, hash: &str| MemoryOp::NodeAnchorScopes {
+            node_id: NodeId::from("mem_1"),
+            scopes: vec![AnchorScope {
+                binding_kind: "symbol".to_string(),
+                binding_id: dev.to_string(),
+                scope_hash: hash.to_string(),
+            }],
+        };
+        let key = |dev: u8| ("symbol".to_string(), dev.to_string());
+        // Device 2 publishes scopes beside its set; device 1 (an older binary) publishes none.
+        for (x, y) in [(5, 6), (6, 5), (5, 9), (9, 5)] {
+            let state = project(&[
+                at(1, 1, create("mem_1", "t")),
+                at(x, 1, anchors_op("mem_1", &["1"])),
+                at(y, 2, scopes(2, "s2")),
+                at(y + 1, 2, anchors_op("mem_1", &["2"])),
+            ]);
+            let node = &state.nodes[&NodeId::from("mem_1")];
+            let set_from_2 = node.anchors.as_ref().unwrap()[0].binding_id == "2";
+            if set_from_2 {
+                assert_eq!(node.anchor_scopes.get(&key(2)).map(String::as_str), Some("s2"));
+            } else {
+                assert!(node.anchor_scopes.is_empty(), "writers at {x}/{y}: device 1 has none");
+            }
+        }
+        let retracted = project(&[
+            at(1, 2, create("mem_1", "t")),
+            at(2, 2, scopes(2, "s2")),
+            at(3, 2, anchors_op("mem_1", &["2"])),
+            at(4, 2, MemoryOp::NodeAnchorScopes { node_id: NodeId::from("mem_1"), scopes: vec![] }),
+            at(5, 2, anchors_op("mem_1", &["2"])),
+        ]);
+        assert!(retracted.nodes[&NodeId::from("mem_1")].anchor_scopes.is_empty());
+    }
+
+    /// An author publishes its scopes AHEAD of its set on one chain, and a pull can stop between
+    /// them. The set pairs with the latest scopes its device wrote since its preceding set, so a
+    /// prefix torn after the next publication's scopes still describes the set it holds — the
+    /// device's latest would pair set A with B's scopes, and set B arriving next would read as no
+    /// change at all — and a set the device later publishes without scopes (an older binary on the
+    /// same device) takes none, not an earlier publication's.
+    #[test]
+    fn a_set_pairs_with_the_scopes_published_at_or_before_it_not_the_device_s_latest() {
+        let scopes = |hash: &str| MemoryOp::NodeAnchorScopes {
+            node_id: NodeId::from("mem_1"),
+            scopes: vec![AnchorScope {
+                binding_kind: "symbol".to_string(),
+                binding_id: "twin".to_string(),
+                scope_hash: hash.to_string(),
+            }],
+        };
+        let key = ("symbol".to_string(), "twin".to_string());
+        let torn = [
+            at(1, 1, create("mem_1", "t")),
+            at(2, 1, scopes("alpha")),
+            at(3, 1, anchors_op("mem_1", &["twin"])),
+            at(4, 1, scopes("beta")),
+        ];
+        let node = &project(&torn).nodes[&NodeId::from("mem_1")];
+        assert_eq!(node.anchor_scopes.get(&key).map(String::as_str), Some("alpha"));
+
+        let mut complete = torn.to_vec();
+        complete.push(at(5, 1, anchors_op("mem_1", &["twin"])));
+        let node = &project(&complete).nodes[&NodeId::from("mem_1")];
+        assert_eq!(node.anchor_scopes.get(&key).map(String::as_str), Some("beta"));
+
+        let mut without_scopes = complete.clone();
+        without_scopes.push(at(6, 1, anchors_op("mem_1", &["twin"])));
+        let node = &project(&without_scopes).nodes[&NodeId::from("mem_1")];
+        assert!(node.anchor_scopes.is_empty(), "a set published without scopes takes none");
     }
 
     /// The anchors register remembers WHICH entry won it — the content projection maps that entry

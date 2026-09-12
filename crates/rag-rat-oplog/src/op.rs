@@ -294,6 +294,31 @@ impl PortableAnchor {
     }
 }
 
+/// The scope of one symbol anchor's target, hashed — the part of a symbol's identity the anchor
+/// leaves out. An anchor carries a symbol's path, qualified name, kind and signature; its
+/// enclosing scope is the fifth component of the index's logical key, and the only one that tells
+/// apart two symbols agreeing on the other four — in Rust, two impls of different traits for one
+/// type with the trait on a later line (`Twin as Alpha` / `Twin as Beta`), whose kind and captured
+/// signature are both `impl` (#1276).
+///
+/// Keyed by the row it describes, `(binding_kind, binding_id)`, so it rides beside a `node_anchors`
+/// set rather than inside it: `PortableAnchor` is a byte-canonical fixed-arity array, and widening
+/// it would cost every older binary the anchors themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorScope {
+    pub binding_kind: String,
+    pub binding_id: String,
+    /// `hex_sha256` of the target's scope path, as the author's index derives it.
+    pub scope_hash: String,
+}
+
+impl AnchorScope {
+    /// The anchor this scope describes — the same identity a `node_anchors` set is keyed by.
+    pub(crate) fn identity(&self) -> (&str, &str) {
+        (self.binding_kind.as_str(), self.binding_id.as_str())
+    }
+}
+
 /// The most anchors one `node_anchors` op may carry. A memory holds a handful of bindings in
 /// practice (its own, plus an auto-moniker), so this is a generous structural bound rather than a
 /// budget.
@@ -343,6 +368,15 @@ pub fn within_wire_limits(op: &MemoryOp) -> bool {
             identities.sort_unstable();
             identities.windows(2).all(|pair| pair[0] != pair[1])
         },
+        MemoryOp::NodeAnchorScopes { scopes, .. } => {
+            if scopes.len() > MAX_ANCHORS_PER_OP {
+                return false;
+            }
+            let mut identities: Vec<(&str, &str)> =
+                scopes.iter().map(AnchorScope::identity).collect();
+            identities.sort_unstable();
+            identities.windows(2).all(|pair| pair[0] != pair[1])
+        },
         // Listed rather than wildcarded ON PURPOSE: this seam's contract is "reject exactly what
         // `decode` rejects", so the next op kind that grows a count cap or an ordering rule must
         // fail to compile here instead of silently answering `true` — the same under-approximation
@@ -384,6 +418,14 @@ pub enum MemoryOp {
     /// binary retains an unknown kind opaque, which under that shape would cost it the ANCHORS.
     /// Split, the same binary keeps its anchors and loses only the staleness marking.
     NodeSourceHash { node_id: NodeId, source_text_hash: String },
+    /// The scope of each symbol anchor's target in a node's anchor set (see [`AnchorScope`]) — a
+    /// FULL-SET statement, keyed by anchor identity; an empty set retracts.
+    ///
+    /// A sibling of `node_anchors` for the same reason `node_source_hash` is, and paired with it
+    /// the same way: the fold takes a node's scopes from the device that wrote the winning
+    /// anchor set, so an older binary that never publishes them contributes none, and an older
+    /// receiver retains this kind opaque and keeps the anchors it already understands.
+    NodeAnchorScopes { node_id: NodeId, scopes: Vec<AnchorScope> },
     /// A converged-state boundary marker; inert in the fold this increment (§5.4/C4).
     Snapshot,
 }
@@ -400,6 +442,7 @@ impl MemoryOp {
             Self::Rebind { .. } => "rebind",
             Self::NodeAnchors { .. } => "node_anchors",
             Self::NodeSourceHash { .. } => "node_source_hash",
+            Self::NodeAnchorScopes { .. } => "node_anchor_scopes",
             Self::Snapshot => "snapshot",
         }
     }
@@ -480,6 +523,11 @@ fn encode_payload(enc: &mut VecEncoder<'_>, op: &MemoryOp) {
             enc.str(node_id.as_str()).expect(INFALLIBLE);
             enc.str(source_text_hash).expect(INFALLIBLE);
         },
+        MemoryOp::NodeAnchorScopes { node_id, scopes } => {
+            enc.array(2).expect(INFALLIBLE);
+            enc.str(node_id.as_str()).expect(INFALLIBLE);
+            encode_anchor_scopes(enc, scopes);
+        },
         MemoryOp::Snapshot => {
             // Inert boundary marker: a strictly-null payload. A future snapshot that carries a
             // coverage manifest (§5.4/C4) is a NEW op kind — NOT a non-null payload under this kind
@@ -544,6 +592,20 @@ fn encode_anchors(enc: &mut VecEncoder<'_>, anchors: &[PortableAnchor]) {
     enc.array(ordered.len() as u64).expect(INFALLIBLE);
     for anchor in ordered {
         encode_anchor(enc, anchor);
+    }
+}
+
+/// Encode the scope SET in identity order, under the same rules as [`encode_anchors`]: the sort
+/// canonicalizes, and `decode`'s strictly-increasing check is what rejects a duplicated identity.
+fn encode_anchor_scopes(enc: &mut VecEncoder<'_>, scopes: &[AnchorScope]) {
+    let mut ordered: Vec<&AnchorScope> = scopes.iter().collect();
+    ordered.sort_by(|a, b| a.identity().cmp(&b.identity()));
+    enc.array(ordered.len() as u64).expect(INFALLIBLE);
+    for scope in ordered {
+        enc.array(3).expect(INFALLIBLE);
+        enc.str(&scope.binding_kind).expect(INFALLIBLE);
+        enc.str(&scope.binding_id).expect(INFALLIBLE);
+        enc.str(&scope.scope_hash).expect(INFALLIBLE);
     }
 }
 
@@ -626,6 +688,12 @@ fn decode_envelope(bytes: &[u8]) -> Result<DecodedOp, CborError> {
             cbor::expect_array(&mut d, 2)?;
             let node_id = NodeId::from(d.str()?);
             Some(MemoryOp::NodeSourceHash { node_id, source_text_hash: d.str()?.to_string() })
+        },
+        "node_anchor_scopes" => {
+            cbor::expect_array(&mut d, 2)?;
+            let node_id = NodeId::from(d.str()?);
+            let scopes = decode_anchor_scopes(&mut d)?;
+            Some(MemoryOp::NodeAnchorScopes { node_id, scopes })
         },
         "snapshot" => {
             d.null()?;
@@ -751,6 +819,35 @@ fn decode_anchors(d: &mut Decoder<'_>) -> Result<Vec<PortableAnchor>, CborError>
             ));
         }
         out.push(anchor);
+    }
+    Ok(out)
+}
+
+/// The scope-set twin of [`decode_anchors`]: the count is judged from the header, and the set must
+/// be strictly increasing by identity, which rejects both an unsorted payload and a duplicate.
+fn decode_anchor_scopes(d: &mut Decoder<'_>) -> Result<Vec<AnchorScope>, CborError> {
+    let len = cbor::expect_definite_len(d)?;
+    if len > MAX_ANCHORS_PER_OP as u64 {
+        return Err(CborError::message(format!(
+            "node_anchor_scopes carries {len} scopes, over the {MAX_ANCHORS_PER_OP} limit"
+        )));
+    }
+    let mut out: Vec<AnchorScope> = Vec::new();
+    for _ in 0..len {
+        cbor::expect_array(d, 3)?;
+        let scope = AnchorScope {
+            binding_kind: d.str()?.to_string(),
+            binding_id: d.str()?.to_string(),
+            scope_hash: d.str()?.to_string(),
+        };
+        if let Some(previous) = out.last()
+            && previous.identity() >= scope.identity()
+        {
+            return Err(CborError::message(
+                "node_anchor_scopes must be strictly increasing by (binding_kind, binding_id)",
+            ));
+        }
+        out.push(scope);
     }
     Ok(out)
 }
@@ -974,8 +1071,21 @@ mod tests {
                 source_text_hash:
                     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
             }),
+            ("node_anchor_scopes", MemoryOp::NodeAnchorScopes {
+                node_id: NodeId::from("mem_1"),
+                scopes: scopes(),
+            }),
             ("snapshot", MemoryOp::Snapshot),
         ]
+    }
+
+    /// One scope, for the symbol anchor in [`anchors`]. Already in identity order.
+    fn scopes() -> Vec<AnchorScope> {
+        vec![AnchorScope {
+            binding_kind: "symbol".to_string(),
+            binding_id: "crates/x/src/lib.rs::run".to_string(),
+            scope_hash: "5c0p3".to_string(),
+        }]
     }
 
     #[test]
@@ -1011,6 +1121,10 @@ mod tests {
             (
                 "node_source_hash",
                 "836c7261672d7261742f6f702f31706e6f64655f736f757263655f6861736882656d656d5f31784065336230633434323938666331633134396166626634633839393666623932343237616534316534363439623933346361343935393931623738353262383535",
+            ),
+            (
+                "node_anchor_scopes",
+                "836c7261672d7261742f6f702f31726e6f64655f616e63686f725f73636f70657382656d656d5f3181836673796d626f6c78186372617465732f782f7372632f6c69622e72733a3a72756e653563307033",
             ),
             ("snapshot", "836c7261672d7261742f6f702f3168736e617073686f74f6"),
         ];
@@ -1106,6 +1220,41 @@ mod tests {
             anchors: anchors(),
         }));
         assert!(every_variant().iter().all(|(_, op)| within_wire_limits(op)));
+    }
+
+    /// The scope set is bounded and keyed like the anchor set it describes: a duplicated identity
+    /// and an over-cap count are refused before signing, and `decode` refuses the same bytes.
+    #[test]
+    fn anchor_scopes_share_the_anchor_set_s_wire_limits() {
+        let scope = |index: usize| AnchorScope {
+            binding_id: format!("id_{index:03}"),
+            ..scopes()[0].clone()
+        };
+        let duplicated = vec![scope(1), scope(1)];
+        let op = MemoryOp::NodeAnchorScopes { node_id: NodeId::from("mem_1"), scopes: duplicated };
+        assert!(!within_wire_limits(&op));
+        let err = decode(&encode(&op)).unwrap_err().to_string();
+        assert!(err.contains("strictly increasing"), "{err}");
+
+        let over_cap: Vec<AnchorScope> = (0..=MAX_ANCHORS_PER_OP).map(scope).collect();
+        let op = MemoryOp::NodeAnchorScopes { node_id: NodeId::from("mem_1"), scopes: over_cap };
+        assert!(!within_wire_limits(&op));
+        let err = decode(&encode(&op)).unwrap_err().to_string();
+        assert!(err.contains(&format!("over the {MAX_ANCHORS_PER_OP} limit")), "{err}");
+
+        // A set is a SET: the wire bytes ignore the caller's order, and an empty set is a
+        // retraction that round-trips.
+        let sorted = MemoryOp::NodeAnchorScopes {
+            node_id: NodeId::from("mem_1"),
+            scopes: vec![scope(1), scope(2)],
+        };
+        let reversed = MemoryOp::NodeAnchorScopes {
+            node_id: NodeId::from("mem_1"),
+            scopes: vec![scope(2), scope(1)],
+        };
+        assert_eq!(encode(&sorted), encode(&reversed));
+        let empty = MemoryOp::NodeAnchorScopes { node_id: NodeId::from("mem_1"), scopes: vec![] };
+        assert_eq!(decode(&encode(&empty)).unwrap(), DecodedOp::Known(empty));
     }
 
     #[test]

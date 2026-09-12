@@ -645,6 +645,7 @@ mod anchor_authoring_tests {
         assert!(
             matches!(ops.as_slice(), [
                 MemoryOp::NodeSourceHash { .. },
+                MemoryOp::NodeAnchorScopes { .. },
                 MemoryOp::NodeAnchors { .. }
             ]),
             "{ops:?}"
@@ -653,8 +654,11 @@ mod anchor_authoring_tests {
         assert!(
             matches!(
                 ops.as_slice(),
-                [MemoryOp::NodeSourceHash { source_text_hash, .. }, MemoryOp::NodeAnchors { .. }]
-                    if source_text_hash.is_empty()
+                [
+                    MemoryOp::NodeSourceHash { source_text_hash, .. },
+                    MemoryOp::NodeAnchorScopes { scopes, .. },
+                    MemoryOp::NodeAnchors { .. }
+                ] if source_text_hash.is_empty() && scopes.is_empty()
             ),
             "{ops:?}"
         );

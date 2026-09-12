@@ -76,12 +76,19 @@ pub(crate) fn validate_logical_symbol_binding(
     // target contradicts the recorded kind or signature (see `RETARGETED_REASON`); then it is held
     // back, and only rejected if the relocation pick finds something better.
     let retargeted = is_retargeted(binding);
+    let published_scope = if retargeted { published_scope_for(conn, binding)? } else { None };
     let mut held_back = None;
     if let Some(id) = binding.logical_symbol_id
         && let Some(hit) = crate::symbol::lookup_logical_by_id(conn, id)?
     {
         let trusted = !retargeted
-            || target_agrees(binding, &hit.kind, logical_symbol_signature(conn, id)?.as_deref());
+            || target_agrees(
+                binding,
+                &hit.kind,
+                logical_symbol_signature(conn, id)?.as_deref(),
+                logical_symbol_scope(conn, id)?.as_deref(),
+                published_scope.as_deref(),
+            );
         if trusted {
             answer_retarget_mark(binding);
             return validate_live_logical_symbol(conn, binding, id);
@@ -109,7 +116,10 @@ pub(crate) fn validate_logical_symbol_binding(
                    (SELECT s.signature FROM logical_symbol_members m
                       JOIN symbols s ON s.id = m.symbol_id
                      WHERE m.logical_symbol_id = ls.id LIMIT 1),
-                   ls.id
+                   ls.id,
+                   (SELECT s.scope_path FROM logical_symbol_members m
+                      JOIN symbols s ON s.id = m.symbol_id
+                     WHERE m.logical_symbol_id = ls.id LIMIT 1)
             FROM logical_symbols ls
             WHERE ls.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
               AND ls.repo_id = ?2
@@ -123,6 +133,7 @@ pub(crate) fn validate_logical_symbol_binding(
                 kind: row.get(2)?,
                 signature: row.get(3)?,
                 logical_symbol_id: row.get(4)?,
+                scope: row.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<_>>()?
@@ -131,8 +142,9 @@ pub(crate) fn validate_logical_symbol_binding(
     // names a row that no longer exists, or — on a retargeted row — names a live row that
     // contradicts the binding. Impl twins are still separated where it matters — the stable-id arm
     // above resolves them on its own, since the logical key hashes `scope_path`.
-    let relocated = pick_relocation_twin(candidates, binding, retargeted);
-    if let Some(RelocationTwin { id, path, kind, signature, .. }) = relocated {
+    let relocated =
+        pick_relocation_twin(candidates, binding, retargeted, published_scope.as_deref());
+    if let Some(RelocationTwin { id, path, kind, signature, scope, .. }) = relocated {
         // The pick came back to the very handle the retarget check held back: nothing that matches
         // the author's evidence answers to its name here. Validate it live — relocating would
         // report `relocated` on every pass, since this arm does not rewrite the recorded
@@ -140,7 +152,13 @@ pub(crate) fn validate_logical_symbol_binding(
         if Some(id) == held_back {
             return validate_live_logical_symbol(conn, binding, id);
         }
-        if target_agrees(binding, &kind, signature.as_deref()) {
+        if target_agrees(
+            binding,
+            &kind,
+            signature.as_deref(),
+            scope.as_deref(),
+            published_scope.as_deref(),
+        ) {
             answer_retarget_mark(binding);
         }
         binding.logical_symbol_id = Some(id);
@@ -204,6 +222,123 @@ fn is_retargeted(binding: &RepoMemoryBinding) -> bool {
     binding.relocation_reason.as_deref() == Some(RETARGETED_REASON)
 }
 
+/// What a published anchor set said a symbol anchor's target is: the kind, the signature hash and
+/// the scope hash its author recorded. The drain records these per anchor identity as the memory's
+/// `anchors_applied_targets` — the baseline a later set is compared against to tell a retarget from
+/// a republish of the same target — and the validator reads the scope back on a
+/// [`RETARGETED_REASON`] row, where it is the author's evidence of which same-named twin the row
+/// moved to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AppliedTarget {
+    pub symbol_kind: Option<String>,
+    pub signature_hash: Option<String>,
+    /// `hex_sha256` of the target's scope path as the AUTHOR's index derives it, from the
+    /// `node_anchor_scopes` register; `None` when the author published none for this anchor.
+    pub scope_hash: Option<String>,
+}
+
+/// The applied targets of one memory, keyed by anchor identity `(binding_kind, binding_id)`.
+pub type AppliedTargets = std::collections::BTreeMap<(String, String), AppliedTarget>;
+
+/// One serialized applied target: `(kind, id, symbol_kind, signature_hash, scope_hash)`.
+type AppliedTargetRow<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+
+/// Serialize [`AppliedTargets`] for `repo_memories.anchors_applied_targets`: one
+/// [`AppliedTargetRow`] per anchor.
+pub fn encode_applied_targets(targets: &AppliedTargets) -> anyhow::Result<String> {
+    let rows: Vec<AppliedTargetRow<'_>> = targets
+        .iter()
+        .map(|((kind, id), target)| {
+            (
+                kind.as_str(),
+                id.as_str(),
+                target.symbol_kind.as_deref(),
+                target.signature_hash.as_deref(),
+                target.scope_hash.as_deref(),
+            )
+        })
+        .collect();
+    Ok(serde_json::to_string(&rows)?)
+}
+
+/// Parse [`encode_applied_targets`]'s output, or the four-tuple rows written before the scope
+/// existed; `None` when nothing was recorded or it does not parse, which leaves the retarget
+/// decision to the row's own values.
+pub fn decode_applied_targets(json: Option<&str>) -> Option<AppliedTargets> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Row {
+        WithScope(String, String, Option<String>, Option<String>, Option<String>),
+        Legacy(String, String, Option<String>, Option<String>),
+    }
+    let rows: Vec<Row> = serde_json::from_str(json?).ok()?;
+    Some(
+        rows.into_iter()
+            .map(|row| match row {
+                Row::WithScope(kind, id, symbol_kind, signature_hash, scope_hash) =>
+                    ((kind, id), AppliedTarget { symbol_kind, signature_hash, scope_hash }),
+                Row::Legacy(kind, id, symbol_kind, signature_hash) =>
+                    ((kind, id), AppliedTarget { symbol_kind, signature_hash, scope_hash: None }),
+            })
+            .collect(),
+    )
+}
+
+/// The scope the author published for a [`RETARGETED_REASON`] row's target, from the memory's
+/// applied targets; `None` when none was recorded for this anchor.
+fn published_scope_for(
+    conn: &Connection,
+    binding: &RepoMemoryBinding,
+) -> anyhow::Result<Option<String>> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT anchors_applied_targets FROM repo_memories WHERE id = ?1",
+            [&binding.memory_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(decode_applied_targets(json.as_deref())
+        .and_then(|targets| {
+            targets.get(&(binding.binding_kind.clone(), binding.binding_id.clone())).cloned()
+        })
+        .and_then(|target| target.scope_hash))
+}
+
+/// Whether a live target's scope path agrees with the scope the author published: yes when either
+/// side is unknown (the author published none, or the row predates the scope column), else by
+/// hash.
+fn scope_agrees(live_scope: Option<&str>, published_scope: Option<&str>) -> bool {
+    match (live_scope.filter(|scope| !scope.is_empty()), published_scope) {
+        (Some(live), Some(published)) => hex_sha256(live.as_bytes()) == published,
+        _ => true,
+    }
+}
+
+/// A symbol row's scope path; `None` for a row that predates the column, as for a missing row.
+fn symbol_scope(conn: &Connection, id: i64) -> anyhow::Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT scope_path FROM symbols WHERE id = ?1", [id], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten())
+}
+
+/// The scope path a logical symbol's members share (it is part of the logical key).
+fn logical_symbol_scope(conn: &Connection, id: i64) -> anyhow::Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT s.scope_path FROM logical_symbol_members m
+               JOIN symbols s ON s.id = m.symbol_id
+              WHERE m.logical_symbol_id = ?1 LIMIT 1",
+            [id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 /// Clear [`RETARGETED_REASON`]: validation found a target agreeing with the author's evidence.
 fn answer_retarget_mark(binding: &mut RepoMemoryBinding) {
     if is_retargeted(binding) {
@@ -211,11 +346,19 @@ fn answer_retarget_mark(binding: &mut RepoMemoryBinding) {
     }
 }
 
-/// Whether a symbol of `kind` and `signature` agrees with everything the binding records of its
-/// target — the evidence a retargeted row must be answered with.
-fn target_agrees(binding: &RepoMemoryBinding, kind: &str, signature: Option<&str>) -> bool {
+/// Whether a symbol of `kind`, `signature` and `scope` agrees with everything the binding records
+/// of its target — the evidence a retargeted row must be answered with. `published_scope` is the
+/// author's, read from the memory's applied targets; the row itself records no scope.
+fn target_agrees(
+    binding: &RepoMemoryBinding,
+    kind: &str,
+    signature: Option<&str>,
+    scope: Option<&str>,
+    published_scope: Option<&str>,
+) -> bool {
     binding.symbol_kind.as_deref().is_none_or(|bound| bound == kind)
         && binding_signature_agrees(binding, signature).unwrap_or(true)
+        && scope_agrees(scope, published_scope)
 }
 
 /// Whether `signature` hashes to the binding's recorded signature hash; `None` when either side has
@@ -246,6 +389,8 @@ struct RelocationTwin {
     signature: Option<String>,
     /// The logical group this twin belongs to — for a logical-symbol candidate, itself.
     logical_symbol_id: Option<i64>,
+    /// Its scope path — for a logical-symbol candidate, the one its members share.
+    scope: Option<String>,
 }
 
 /// Choose which same-qualified-name twin a gone binding relocates onto (#491): the stored
@@ -264,12 +409,16 @@ struct RelocationTwin {
 ///
 /// On a row its writer marked [`RETARGETED_REASON`] the recorded kind and signature outrank the
 /// handle instead: the writer set them, while the handle can be the one it left (a rebind from a
-/// struct to its impl keeps the struct's handle beside the impl's kind). The handle still decides
-/// where they tie — including evidence no candidate matches, which names nothing here.
+/// struct to its impl keeps the struct's handle beside the impl's kind). The author's published
+/// scope (`published_scope`) ranks next, below both: it separates twins that agree on kind and
+/// signature — two impls of different traits for one type — and never overrides the evidence those
+/// already give. The handle still decides where all three tie — including evidence no candidate
+/// matches, which names nothing here — so a held-back handle keeps its row over an equal twin.
 fn pick_relocation_twin(
     candidates: Vec<RelocationTwin>,
     binding: &RepoMemoryBinding,
     retargeted: bool,
+    published_scope: Option<&str>,
 ) -> Option<RelocationTwin> {
     candidates
         .into_iter()
@@ -281,12 +430,15 @@ fn pick_relocation_twin(
             );
             let signature_agrees =
                 binding_signature_agrees(binding, twin.signature.as_deref()).unwrap_or(false);
+            let scope_matches = published_scope.is_some_and(|published| {
+                twin.scope.as_deref().is_some_and(|scope| hex_sha256(scope.as_bytes()) == published)
+            });
             // Candidates arrive id-ascending; max_by_key keeps the LAST maximum, so compare on
             // (score, negated id) to keep the lowest-id winner among evidence ties.
-            let [kind, signature, group] =
-                [kind_agrees, signature_agrees, group_agrees].map(u8::from);
+            let [kind, signature, group, scope] =
+                [kind_agrees, signature_agrees, group_agrees, scope_matches].map(u8::from);
             let score = if retargeted {
-                (kind << 2) | (signature << 1) | group
+                (kind << 3) | (signature << 2) | (scope << 1) | group
             } else {
                 (group << 2) | (kind << 1) | signature
             };
@@ -326,11 +478,19 @@ pub(crate) fn validate_symbol_binding(
 ) -> anyhow::Result<String> {
     // As on the logical path: a contradicting live row is held back, not trusted.
     let retargeted = is_retargeted(binding);
+    let published_scope = if retargeted { published_scope_for(conn, binding)? } else { None };
     let mut held_back = None;
     if let Some(id) = binding.symbol_id
         && let Some(hit) = crate::symbol::lookup_by_id(conn, id)?
     {
-        let trusted = !retargeted || target_agrees(binding, &hit.kind, hit.signature.as_deref());
+        let trusted = !retargeted
+            || target_agrees(
+                binding,
+                &hit.kind,
+                hit.signature.as_deref(),
+                symbol_scope(conn, id)?.as_deref(),
+                published_scope.as_deref(),
+            );
         if trusted {
             answer_retarget_mark(binding);
             return validate_live_symbol(conn, binding, id, hit.qualified_name);
@@ -348,7 +508,8 @@ pub(crate) fn validate_symbol_binding(
             "
             SELECT symbols.id, files.path, symbols.kind, symbols.signature,
                    (SELECT m.logical_symbol_id FROM logical_symbol_members m
-                     WHERE m.symbol_id = symbols.id LIMIT 1)
+                     WHERE m.symbol_id = symbols.id LIMIT 1),
+                   symbols.scope_path
             FROM symbols
             JOIN files ON files.id = symbols.file_id
             WHERE symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
@@ -362,12 +523,14 @@ pub(crate) fn validate_symbol_binding(
                 kind: row.get(2)?,
                 signature: row.get(3)?,
                 logical_symbol_id: row.get(4)?,
+                scope: row.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    let relocated = pick_relocation_twin(candidates, binding, retargeted);
-    if let Some(RelocationTwin { id, path, kind, signature, .. }) = relocated {
+    let relocated =
+        pick_relocation_twin(candidates, binding, retargeted, published_scope.as_deref());
+    if let Some(RelocationTwin { id, path, kind, signature, scope, .. }) = relocated {
         // Back at the row the retarget check held back: nothing that matches the author's evidence
         // answers to the name here. Validate it live rather than relocate onto itself; the mark
         // stays for a checkout that holds the author's target.
@@ -375,7 +538,13 @@ pub(crate) fn validate_symbol_binding(
             let qualified_name = binding.binding_id.clone();
             return validate_live_symbol(conn, binding, id, qualified_name);
         }
-        if target_agrees(binding, &kind, signature.as_deref()) {
+        if target_agrees(
+            binding,
+            &kind,
+            signature.as_deref(),
+            scope.as_deref(),
+            published_scope.as_deref(),
+        ) {
             answer_retarget_mark(binding);
         }
         binding.symbol_id = Some(id);
@@ -1350,6 +1519,7 @@ mod call_path_receiver_type_hint_tests {
             kind: kind.to_string(),
             signature: None,
             logical_symbol_id: Some(group),
+            scope: None,
         }
     }
 
@@ -1367,6 +1537,7 @@ mod call_path_receiver_type_hint_tests {
             vec![relocation_twin(1, "struct", 7), relocation_twin(2, "impl", 8)],
             &binding,
             true,
+            None,
         );
         assert_eq!(picked.map(|twin| twin.id), Some(2));
     }
@@ -1385,6 +1556,7 @@ mod call_path_receiver_type_hint_tests {
             vec![relocation_twin(1, "struct", 8), relocation_twin(2, "enum", 7)],
             &binding,
             false,
+            None,
         );
         assert_eq!(picked.map(|twin| twin.id), Some(2));
     }
@@ -1402,8 +1574,68 @@ mod call_path_receiver_type_hint_tests {
             vec![relocation_twin(1, "impl", 7), relocation_twin(2, "impl", 8)],
             &binding,
             false,
+            None,
         );
         assert_eq!(picked.map(|twin| twin.id), Some(2));
+    }
+
+    /// On a retargeted row the author's published scope separates twins that agree on kind and
+    /// signature — two impls of different traits for one type — and outranks the handle, which
+    /// names the impl the author left. It never outranks the kind or the signature, and where no
+    /// candidate carries it the handle still decides.
+    #[test]
+    fn on_a_retargeted_row_the_published_scope_breaks_a_kind_and_signature_tie() {
+        let scoped = |id: i64, kind: &str, group: i64, scope: &str| RelocationTwin {
+            scope: Some(scope.to_string()),
+            ..relocation_twin(id, kind, group)
+        };
+        let binding = RepoMemoryBinding {
+            symbol_kind: Some("impl".to_string()),
+            logical_symbol_id: Some(7),
+            ..call_path_binding("mem", "seq")
+        };
+        let beta = hex_sha256(b"Twin as Beta");
+        let twins =
+            || vec![scoped(1, "impl", 7, "Twin as Alpha"), scoped(2, "impl", 8, "Twin as Beta")];
+        let pick = |retargeted: bool, scope: Option<&str>| {
+            pick_relocation_twin(twins(), &binding, retargeted, scope).map(|twin| twin.id)
+        };
+        assert_eq!(pick(true, Some(&beta)), Some(2), "the scope names Beta over the Alpha handle");
+        assert_eq!(pick(true, Some(&hex_sha256(b"Twin as Gamma"))), Some(1), "unmatched: handle");
+        assert_eq!(pick(true, None), Some(1), "no scope published: handle");
+        assert_eq!(pick(false, Some(&beta)), Some(1), "an unmarked row never reads the scope");
+
+        let mut struct_binding = binding;
+        struct_binding.symbol_kind = Some("struct".to_string());
+        let picked = pick_relocation_twin(
+            vec![scoped(1, "struct", 8, "Twin as Alpha"), scoped(2, "impl", 9, "Twin as Beta")],
+            &struct_binding,
+            true,
+            Some(&beta),
+        );
+        assert_eq!(picked.map(|twin| twin.id), Some(1), "the kind outranks the scope");
+    }
+
+    /// The applied-targets codec round-trips the scope and still reads rows written before it.
+    #[test]
+    fn applied_targets_decode_both_tuple_shapes() {
+        let key = ("symbol".to_string(), "src/lib.rs::Twin".to_string());
+        let target = AppliedTarget {
+            symbol_kind: Some("impl".to_string()),
+            signature_hash: Some("sig".to_string()),
+            scope_hash: Some("scope".to_string()),
+        };
+        let targets: AppliedTargets = [(key.clone(), target.clone())].into_iter().collect();
+        let json = encode_applied_targets(&targets).unwrap();
+        assert_eq!(decode_applied_targets(Some(&json)).unwrap()[&key], target);
+
+        let legacy = r#"[["symbol","src/lib.rs::Twin","impl","sig"]]"#;
+        assert_eq!(decode_applied_targets(Some(legacy)).unwrap()[&key], AppliedTarget {
+            scope_hash: None,
+            ..target
+        });
+        assert_eq!(decode_applied_targets(None), None);
+        assert_eq!(decode_applied_targets(Some("not json")), None);
     }
 
     fn call_path_binding(memory_id: &str, edge_sequence_hash: &str) -> RepoMemoryBinding {

@@ -1928,6 +1928,7 @@ fn a_published_rebind_between_same_named_impls_follows_the_signature() {
                 &memory_id,
                 &rag_rat_oplog::PortableAnchor { binding_kind, binding_id, ..published },
                 None,
+                None,
             )
             .unwrap();
             tx.commit().unwrap();
@@ -2094,8 +2095,13 @@ fn an_edited_symbols_memory_is_not_taken_by_a_sibling_with_its_old_signature() {
                 .unwrap();
         // The drain compares against what the author published last — the recorded values — not
         // the row, which relocation refreshed to this checkout's `new(cap)`.
-        let previous = Some((recorded_kind.clone(), recorded_signature.clone()));
-        crate::memory_write::refresh_binding(&tx, &repo_id, &memory_id, &anchor, previous).unwrap();
+        let previous = Some(rag_rat_query::memory::AppliedTarget {
+            symbol_kind: recorded_kind.clone(),
+            signature_hash: recorded_signature.clone(),
+            scope_hash: None,
+        });
+        crate::memory_write::refresh_binding(&tx, &repo_id, &memory_id, &anchor, previous, None)
+            .unwrap();
         tx.commit().unwrap();
         db.memory_validate().unwrap();
         assert_eq!(
@@ -2214,6 +2220,7 @@ fn a_linked_checkout_without_the_authors_target_leaves_the_retarget_to_the_base(
                 moniker_tool: None,
                 moniker_tool_version: None,
             },
+            None,
             None,
         )
         .unwrap();
@@ -2369,6 +2376,396 @@ fn a_local_kind_change_is_not_taken_by_a_sibling_with_the_old_kind() {
 
     let _ = fs::remove_dir_all(&linked);
     let _ = fs::remove_dir_all(&main);
+}
+
+/// `(logical id, start line, signature hash, scope path)` of a symbol row.
+fn twin_facts(db: &IndexDatabase, symbol_id: i64) -> (i64, i64, Option<String>, String) {
+    db.storage
+        .connection()
+        .query_row(
+            "SELECT (SELECT m.logical_symbol_id FROM logical_symbol_members m
+                      WHERE m.symbol_id = s.id LIMIT 1),
+                    c.start_line, s.signature, s.scope_path
+               FROM symbols s JOIN chunks c ON c.symbol_id = s.id
+              WHERE s.id = ?1",
+            [symbol_id],
+            |r| {
+                let signature: Option<String> = r.get(2)?;
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    signature.map(|sig| rag_rat_base::hash::hex_sha256(sig.trim().as_bytes())),
+                    r.get(3)?,
+                ))
+            },
+        )
+        .unwrap()
+}
+
+/// Apply a foreign author's rebind of `memory_id` to the impl at `start_line` as the drain does:
+/// the row refreshed in place against the baseline the previous set recorded (`previous_scope`),
+/// and the new set's kind, signature and scope recorded as the memory's applied targets.
+fn apply_scoped_rebind(
+    db: &IndexDatabase,
+    memory_id: &str,
+    start_line: i64,
+    signature_hash: Option<String>,
+    previous_scope: Option<&str>,
+    published_scope: Option<&str>,
+) {
+    use rag_rat_query::memory::{AppliedTarget, encode_applied_targets};
+
+    let conn = db.storage.connection();
+    let (repo_id, binding_kind, binding_id): (String, String, String) = conn
+        .query_row(
+            "SELECT repo_id, binding_kind, binding_id FROM repo_memory_bindings
+              WHERE memory_id = ?1",
+            params![memory_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    let anchor = rag_rat_oplog::PortableAnchor {
+        binding_kind: binding_kind.clone(),
+        binding_id: binding_id.clone(),
+        path: Some("src/lib.rs".to_string()),
+        start_line: Some(start_line),
+        end_line: Some(start_line),
+        commit_hash: None,
+        tracker: None,
+        project: None,
+        item_key: None,
+        created_at_ms: 1,
+        symbol_kind: Some("impl".to_string()),
+        signature_hash: signature_hash.clone(),
+        moniker_tool: None,
+        moniker_tool_version: None,
+    };
+    let target = |scope: Option<&str>| AppliedTarget {
+        symbol_kind: Some("impl".to_string()),
+        signature_hash: signature_hash.clone(),
+        scope_hash: scope.map(str::to_string),
+    };
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    crate::memory_write::refresh_binding(
+        &tx,
+        &repo_id,
+        memory_id,
+        &anchor,
+        Some(target(previous_scope)),
+        published_scope,
+    )
+    .unwrap();
+    let targets = [((binding_kind, binding_id), target(published_scope))].into_iter().collect();
+    tx.execute(
+        "UPDATE repo_memories SET anchors_applied_targets = ?2, source_text_hash = NULL
+          WHERE id = ?1",
+        params![memory_id, encode_applied_targets(&targets).unwrap()],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+/// `(start line, relocation reason, verdict)` of a memory's one binding.
+fn landed_binding(db: &IndexDatabase, memory_id: &str) -> (Option<i64>, Option<String>, String) {
+    db.storage
+        .connection()
+        .query_row(
+            "SELECT start_line, relocation_reason, anchor_status FROM repo_memory_bindings
+              WHERE memory_id = ?1",
+            params![memory_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+}
+
+/// A memory bound to the Alpha impl of [`TWO_TRAIT_IMPLS_FIXTURE`], by raw id or logical handle.
+fn memory_on_alpha(db: &IndexDatabase, alpha: i64, by_logical_handle: bool, title: &str) -> String {
+    let (alpha_group, ..) = twin_facts(db, alpha);
+    let bind = if by_logical_handle {
+        rag_rat_query::memory::RepoMemoryBindTarget {
+            logical_symbol_id: Some(alpha_group),
+            ..Default::default()
+        }
+    } else {
+        rag_rat_query::memory::RepoMemoryBindTarget { symbol_id: Some(alpha), ..Default::default() }
+    };
+    let memory_id = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: title.to_string(),
+            body: format!("{title}, bound to the Alpha impl."),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind,
+        })
+        .unwrap()
+        .memory
+        .memory_id;
+    db.memory_validate().unwrap();
+    memory_id
+}
+
+/// Two impls of one type with the trait on a later line agree on the qualified name, the kind and
+/// the captured signature, so a published rebind between them changes nothing the anchor carries
+/// (#1276). The author publishes each symbol anchor's SCOPE beside the set; the drain marks the row
+/// when it changed, and the validator follows it to Beta over the handle that still names Alpha. A
+/// republish of the same scope is no retarget, and a scope nothing here has names nothing: the
+/// handle stands and the mark waits for a checkout that holds the author's target.
+#[test]
+fn a_published_rebind_between_identical_signature_twins_follows_the_scope() {
+    use rag_rat_base::hash::hex_sha256;
+    use rag_rat_query::memory::RETARGETED_REASON;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), TWO_TRAIT_IMPLS_FIXTURE).unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let (alpha, beta) = trait_impl_twins(&db);
+    let (_, _, signature, alpha_scope) = twin_facts(&db, alpha);
+    let (_, beta_line, _, beta_scope) = twin_facts(&db, beta);
+    let (alpha_hash, beta_hash) =
+        (hex_sha256(alpha_scope.as_bytes()), hex_sha256(beta_scope.as_bytes()));
+
+    for (title, by_logical_handle) in [("raw symbol id", false), ("logical handle", true)] {
+        let memory_id = memory_on_alpha(&db, alpha, by_logical_handle, title);
+        let validated = |previous: &str, published: &str| {
+            apply_scoped_rebind(
+                &db,
+                &memory_id,
+                beta_line,
+                signature.clone(),
+                Some(previous),
+                Some(published),
+            );
+            db.memory_validate().unwrap();
+            db.memory_validate().unwrap();
+            landed_binding(&db, &memory_id)
+        };
+
+        let (line, reason, status) = validated(&alpha_hash, &beta_hash);
+        assert_eq!(line, Some(beta_line), "bound by {title}: the scope names Beta");
+        assert_eq!(reason, None, "bound by {title}: landing on it answers the mark");
+        assert_eq!(status, "current", "bound by {title}");
+
+        let (line, reason, _) = validated(&beta_hash, &beta_hash);
+        assert_eq!(line, Some(beta_line), "bound by {title}: the same scope is a republish");
+        assert_eq!(reason, None, "bound by {title}: and marks nothing");
+
+        let gamma_hash = hex_sha256(b"Twin as Gamma");
+        let (line, reason, status) = validated(&beta_hash, &gamma_hash);
+        assert_eq!(line, Some(beta_line), "bound by {title}: a scope nothing here has keeps it");
+        assert_eq!(reason.as_deref(), Some(RETARGETED_REASON), "bound by {title}: mark waits");
+        assert_ne!(status, "gone", "bound by {title}: the handle is validated live");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The retarget mark sits on a row every checkout of the repo shares. A linked worktree that does
+/// not hold the author's twin (it renamed Beta's trait, which changes the scope) must leave the
+/// mark and the handle for the base checkout, which then moves the memory to Beta and answers.
+#[test]
+fn a_linked_checkout_without_the_authors_twin_leaves_the_scope_retarget_to_the_base() {
+    use rag_rat_base::hash::hex_sha256;
+    use rag_rat_query::memory::RETARGETED_REASON;
+
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/lib.rs"), TWO_TRAIT_IMPLS_FIXTURE).unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.to_path_buf(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    let (alpha, beta) = trait_impl_twins(&db);
+    let (_, alpha_line, signature, alpha_scope) = twin_facts(&db, alpha);
+    let (_, beta_line, _, beta_scope) = twin_facts(&db, beta);
+    let memory_id = memory_on_alpha(&db, alpha, false, "Rebound from Alpha to Beta by its author");
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(
+        linked.join("src/lib.rs"),
+        TWO_TRAIT_IMPLS_FIXTURE.replace("Beta for Twin {", "Gamma for Twin {"),
+    )
+    .unwrap();
+    run_git(&linked, &["commit", "-q", "-am", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    apply_scoped_rebind(
+        &db,
+        &memory_id,
+        beta_line,
+        signature,
+        Some(&hex_sha256(alpha_scope.as_bytes())),
+        Some(&hex_sha256(beta_scope.as_bytes())),
+    );
+
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    for pass in 0..2 {
+        db.memory_validate().unwrap();
+        let (line, reason, _) = landed_binding(&db, &memory_id);
+        assert_eq!(line, Some(alpha_line), "linked pass {pass}: no Beta here, the handle stands");
+        assert_eq!(
+            reason.as_deref(),
+            Some(RETARGETED_REASON),
+            "linked pass {pass}: the mark is left for the base checkout",
+        );
+    }
+
+    db.use_worktree_scope(&main, None).unwrap();
+    db.memory_validate().unwrap();
+    let (line, reason, _) = landed_binding(&db, &memory_id);
+    assert_eq!(line, Some(beta_line), "the base checkout moves the memory to Beta");
+    assert_eq!(reason, None, "and answers the retarget");
+
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&main);
+}
+
+/// A linked worktree that holds the author's twin (it edited only Beta's body, so Beta keeps its
+/// logical identity) answers the scope retarget itself, and the base checkout then lands on its own
+/// Beta through the shared logical handle rather than being pulled back to Alpha.
+#[test]
+fn a_linked_checkout_holding_the_authors_twin_answers_the_scope_retarget_for_both() {
+    use rag_rat_base::hash::hex_sha256;
+
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/lib.rs"), TWO_TRAIT_IMPLS_FIXTURE).unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.to_path_buf(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    let (alpha, beta) = trait_impl_twins(&db);
+    let (_, _, signature, alpha_scope) = twin_facts(&db, alpha);
+    let (_, beta_line, _, beta_scope) = twin_facts(&db, beta);
+    let memory_id = memory_on_alpha(&db, alpha, false, "Rebound to Beta, answered on a branch");
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(
+        linked.join("src/lib.rs"),
+        TWO_TRAIT_IMPLS_FIXTURE.replace(
+            "Beta for Twin { fn run(&self) {} }",
+            "Beta for Twin { fn run(&self) { let _ = 1; } }",
+        ),
+    )
+    .unwrap();
+    run_git(&linked, &["commit", "-q", "-am", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    apply_scoped_rebind(
+        &db,
+        &memory_id,
+        beta_line,
+        signature,
+        Some(&hex_sha256(alpha_scope.as_bytes())),
+        Some(&hex_sha256(beta_scope.as_bytes())),
+    );
+
+    db.use_worktree_scope(&main, Some(&linked)).unwrap();
+    db.memory_validate().unwrap();
+    let (line, reason, _) = landed_binding(&db, &memory_id);
+    assert_eq!(line, Some(beta_line), "the linked checkout holds Beta and follows the scope");
+    assert_eq!(reason, None, "and answers the retarget");
+
+    db.use_worktree_scope(&main, None).unwrap();
+    for pass in 0..2 {
+        db.memory_validate().unwrap();
+        let (line, reason, _) = landed_binding(&db, &memory_id);
+        assert_eq!(line, Some(beta_line), "base pass {pass}: lands on its own Beta, never Alpha");
+        assert_eq!(reason, None, "base pass {pass}");
+    }
+
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&main);
+}
+
+/// The author publishes each symbol anchor's scope, hashed, beside the set — read through the
+/// row's own handle, raw or logical.
+#[test]
+fn the_author_publishes_each_symbol_anchor_s_scope_beside_the_set() {
+    use rag_rat_base::hash::hex_sha256;
+    use rag_rat_oplog::MemoryOp;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), TWO_TRAIT_IMPLS_FIXTURE).unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let (_, beta) = trait_impl_twins(&db);
+    let (beta_group, _, _, beta_scope) = twin_facts(&db, beta);
+    let struct_twin: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM symbols WHERE name = 'Twin' AND kind = 'struct'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let bound_to = |title: &str, bind: rag_rat_query::memory::RepoMemoryBindTarget| {
+        db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: title.to_string(),
+            body: "b".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind,
+        })
+        .unwrap()
+        .memory
+        .memory_id
+    };
+    let published_scopes = |memory_id: &str| -> Vec<(String, String)> {
+        let ops = crate::memory_write::anchor_publication_ops(db.storage.connection(), memory_id)
+            .unwrap();
+        let [
+            MemoryOp::NodeSourceHash { .. },
+            MemoryOp::NodeAnchorScopes { scopes, .. },
+            MemoryOp::NodeAnchors { .. },
+        ] = ops.as_slice()
+        else {
+            panic!("hash, scopes, anchors expected: {ops:?}");
+        };
+        scopes.iter().map(|s| (s.binding_kind.clone(), s.scope_hash.clone())).collect()
+    };
+    let beta_hash = hex_sha256(beta_scope.as_bytes());
+
+    let by_raw = bound_to("By raw id", rag_rat_query::memory::RepoMemoryBindTarget {
+        symbol_id: Some(beta),
+        ..Default::default()
+    });
+    assert_eq!(published_scopes(&by_raw), vec![("symbol".to_string(), beta_hash.clone())]);
+
+    let by_logical = bound_to("By logical handle", rag_rat_query::memory::RepoMemoryBindTarget {
+        logical_symbol_id: Some(beta_group),
+        ..Default::default()
+    });
+    assert_eq!(published_scopes(&by_logical), vec![("logical_symbol".to_string(), beta_hash)]);
+
+    // A scope path always ends in the symbol's own segment, so even a top-level type carries one.
+    let top_level = bound_to("Top level", rag_rat_query::memory::RepoMemoryBindTarget {
+        symbol_id: Some(struct_twin),
+        ..Default::default()
+    });
+    assert_eq!(published_scopes(&top_level), vec![("symbol".to_string(), hex_sha256(b"Twin"))]);
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// Each trait sits on the line AFTER `impl` so both impl symbols capture the same signature text,

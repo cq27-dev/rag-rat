@@ -33,8 +33,7 @@ use super::op::{
     self, DecodedOp, DeviceFingerprint, EdgeSpec, Entry, NodeContent, NodeStatus, OpMeta,
     PortableAnchor, ResolvedAnchor,
 };
-use super::project;
-use super::project::ProjectedState;
+use super::project::{self, AnchorScopes, ProjectedState};
 use super::store::{EdgeSpecRow, NodeContentRow, PortableAnchorRow, ResolvedAnchorRow};
 use super::stream::StreamId;
 
@@ -56,7 +55,10 @@ use super::stream::StreamId;
 // v6 (#1243): the node fold records which account authored the winning anchor set, so the drain
 // can leave a set the local account's `anchors/1` already carries to that carrier, and takes the
 // source hash from the device that wrote that set, so pairs written in opposite orders never split.
-pub(crate) const CONTENT_PROJECTOR_VERSION: i64 = 6;
+// v7 (#1276): the node fold gains the anchor-scopes register, paired with the winning set like the
+// hash, so `anchors_json` rows carry each symbol anchor's `scope_hash`. The bump re-folds every
+// stream, `node_anchor_scopes` ops an older binary kept opaque included.
+pub(crate) const CONTENT_PROJECTOR_VERSION: i64 = 7;
 
 /// The `oplog_meta` key holding the `/3` projector version the content projection was last folded
 /// by. DISTINCT from the `/1` `projector_version` (they evolve independently and share one meta
@@ -360,8 +362,15 @@ fn write_projection(
             .anchors
             .as_ref()
             .map(|anchors| {
-                let rows: Vec<PortableAnchorRow> =
-                    anchors.iter().map(PortableAnchorRow::from).collect();
+                let rows: Vec<PortableAnchorRow> = anchors
+                    .iter()
+                    .map(|anchor| {
+                        let mut row = PortableAnchorRow::from(anchor);
+                        let identity = (anchor.binding_kind.clone(), anchor.binding_id.clone());
+                        row.scope_hash = node.anchor_scopes.get(&identity).cloned();
+                        row
+                    })
+                    .collect();
                 serde_json::to_string(&rows)
             })
             .transpose()
@@ -559,6 +568,10 @@ pub struct ProjectedContentNode {
     /// local checkout; `None` surfaces UNMARKED, since an absent hash is not evidence of
     /// drift.
     pub source_text_hash: Option<String>,
+    /// The scope of each symbol anchor's target, keyed by anchor identity, from the device that
+    /// wrote the winning set; empty when it published none. The drain records it beside the kind
+    /// and signature it judges a retarget by (#1276).
+    pub anchor_scopes: AnchorScopes,
     /// The account that authored the winning anchor set, or `None` when none was folded. The drain
     /// leaves a set the local account authored to `anchors/1`, which already carries it, and
     /// converges only sets another account authored.
@@ -605,14 +618,19 @@ pub fn list_projected_content_nodes(
         let status = NodeStatus::from_db_str(&status).with_context(|| {
             format!("projected /3 node `{node_id}` carries unknown status `{status}`")
         })?;
-        let anchors = anchors_json
-            .map(|json| {
-                serde_json::from_str::<Vec<PortableAnchorRow>>(&json).map(|rows| {
-                    rows.into_iter().map(PortableAnchor::from).collect::<Vec<PortableAnchor>>()
-                })
-            })
+        let rows = anchors_json
+            .map(|json| serde_json::from_str::<Vec<PortableAnchorRow>>(&json))
             .transpose()
             .with_context(|| format!("decode projected /3 node anchors for `{node_id}`"))?;
+        let anchor_scopes: AnchorScopes = rows
+            .iter()
+            .flatten()
+            .filter_map(|row| {
+                let scope_hash = row.scope_hash.clone()?;
+                Some(((row.binding_kind.clone(), row.binding_id.clone()), scope_hash))
+            })
+            .collect();
+        let anchors = rows.map(|rows| rows.into_iter().map(PortableAnchor::from).collect());
         let anchors_author = anchors_author
             .map(|bytes| {
                 <[u8; 32]>::try_from(bytes.as_slice()).map(AccountId::from_bytes).map_err(|_| {
@@ -628,6 +646,7 @@ pub fn list_projected_content_nodes(
             status,
             anchors,
             source_text_hash,
+            anchor_scopes,
             anchors_author,
         });
     }

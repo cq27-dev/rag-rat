@@ -56,7 +56,9 @@
 //! simply re-materializes on the next pass.
 
 use rag_rat_oplog::{self, ProjectedContentEdge, ProjectedContentNode, StreamId};
-use rag_rat_query::memory;
+use rag_rat_query::memory::{
+    self, AppliedTarget, AppliedTargets, decode_applied_targets, encode_applied_targets,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 /// The `repo_memories.memory_version` a synced row is stamped with — the author-side constant the
@@ -629,45 +631,9 @@ struct AppliedSnapshot {
     digest: Option<String>,
     /// The published hash last applied, as stored; NULL until one is, or when it was none.
     hash: Option<String>,
-    /// What that set named for each symbol anchor (see [`applied_targets_json`]); NULL until a set
-    /// is applied.
+    /// What that set named for each symbol anchor (see [`encode_applied_targets`]); NULL until a
+    /// set is applied.
     targets: Option<String>,
-}
-
-/// What an applied set named for each symbol anchor: identity `(binding_kind, binding_id)` to the
-/// `(symbol_kind, signature_hash)` its author recorded — the baseline a later set's anchors are
-/// compared against to tell a retarget from a republish of the same target.
-type AppliedTargets =
-    std::collections::BTreeMap<(String, String), (Option<String>, Option<String>)>;
-
-/// Serialize the [`AppliedTargets`] of `anchors` for `repo_memories.anchors_applied_targets`.
-fn applied_targets_json(anchors: &[rag_rat_oplog::PortableAnchor]) -> anyhow::Result<String> {
-    let targets: Vec<(&str, &str, Option<&str>, Option<&str>)> = anchors
-        .iter()
-        .filter(|anchor| matches!(anchor.binding_kind.as_str(), "symbol" | "logical_symbol"))
-        .map(|anchor| {
-            (
-                anchor.binding_kind.as_str(),
-                anchor.binding_id.as_str(),
-                anchor.symbol_kind.as_deref(),
-                anchor.signature_hash.as_deref(),
-            )
-        })
-        .collect();
-    Ok(serde_json::to_string(&targets)?)
-}
-
-/// Parse [`applied_targets_json`]'s output; `None` when nothing was recorded or it does not parse,
-/// which leaves the retarget decision to the row's own values.
-fn parse_applied_targets(json: Option<&str>) -> Option<AppliedTargets> {
-    let targets: Vec<(String, String, Option<String>, Option<String>)> =
-        serde_json::from_str(json?).ok()?;
-    Some(
-        targets
-            .into_iter()
-            .map(|(kind, id, symbol_kind, signature)| ((kind, id), (symbol_kind, signature)))
-            .collect(),
-    )
 }
 
 fn applied_snapshot(
@@ -751,16 +717,24 @@ fn apply_published_anchors(
     // set lost its rows some other way — a sibling device's quarantine or re-point removing them
     // through `anchors/1` — and seeding into that vacuum is what heals it.
     if held.is_empty() && !set_changed {
-        changed |= converge_bindings(tx, repo_id, &node.node_id, anchors, &held, None)?;
+        changed |= converge_bindings(tx, repo_id, &node.node_id, anchors, &held, None, &[])?;
     }
     if set_changed {
         // Bindings held with no digest recorded arrived some other way: the set is recorded
         // against them rather than replacing them. A local memory's held bindings are its creator's
         // own last set, which another account's set supersedes on first sight.
         if held.is_empty() || (!own && (applied.digest.is_some() || applied.local)) {
-            let previous = parse_applied_targets(applied.targets.as_deref());
-            changed |=
-                converge_bindings(tx, repo_id, &node.node_id, anchors, &held, previous.as_ref())?;
+            let previous = decode_applied_targets(applied.targets.as_deref());
+            let scopes = published_anchor_scopes(repo_id, node);
+            changed |= converge_bindings(
+                tx,
+                repo_id,
+                &node.node_id,
+                anchors,
+                &held,
+                previous.as_ref(),
+                &scopes,
+            )?;
         }
         // The baseline a later set is judged against holds only anchors a held row now matches by
         // target. A set recorded against rows that are not its own — a stale seed, a local rebind,
@@ -772,11 +746,64 @@ fn apply_published_anchors(
             .filter(|anchor| held_now.iter().any(|row| same_target(row, anchor)))
             .cloned()
             .collect();
+        let targets = encode_applied_targets(&applied_targets_of(
+            &matched,
+            &published_anchor_scopes(repo_id, node),
+        ))?;
         tx.execute(
             "UPDATE repo_memories SET anchors_applied_digest = ?3, anchors_applied_targets = ?4
              WHERE id = ?1 AND repo_id = ?2",
-            params![node.node_id, repo_id, digest, applied_targets_json(&matched)?],
+            params![node.node_id, repo_id, digest, targets],
         )?;
+    } else if let Some(mut targets) = decode_applied_targets(applied.targets.as_deref()) {
+        // The scopes paired with a set can move without the set's bytes changing: an upgrade
+        // re-folds the `node_anchor_scopes` ops an older binary retained opaque, an author
+        // upgrading republishes its unchanged set with scopes beside it, and a writer may publish
+        // new scopes ahead of an identical set. The paired scopes are therefore judged on their
+        // own: a scope the baseline lacks is filled in, so the author's next rebind between
+        // twins has a recorded scope to differ from, and a known scope that changed is the
+        // retarget itself, refreshed the way a set change would refresh the row.
+        let scopes = published_anchor_scopes(repo_id, node);
+        let converges = !own && (applied.digest.is_some() || applied.local);
+        let mut moved = false;
+        for ((kind, id), target) in targets.iter_mut() {
+            let Some((_, _, scope)) = scopes.iter().find(|(k, i, _)| k == kind && i == id) else {
+                // A scope the publication no longer carries is withdrawn evidence: cleared without
+                // a mark, as a set change would record it.
+                if target.scope_hash.take().is_some() {
+                    moved = true;
+                }
+                continue;
+            };
+            if target.scope_hash.as_deref() == Some(scope.as_str()) {
+                continue;
+            }
+            if target.scope_hash.is_some()
+                && converges
+                && let Some(anchor) = anchors
+                    .iter()
+                    .find(|anchor| anchor.binding_kind == *kind && anchor.binding_id == *id)
+            {
+                refresh_binding(
+                    tx,
+                    repo_id,
+                    &node.node_id,
+                    anchor,
+                    Some(target.clone()),
+                    Some(scope),
+                )?;
+                changed = true;
+            }
+            target.scope_hash = Some(scope.clone());
+            moved = true;
+        }
+        if moved {
+            tx.execute(
+                "UPDATE repo_memories SET anchors_applied_targets = ?3
+                 WHERE id = ?1 AND repo_id = ?2",
+                params![node.node_id, repo_id, encode_applied_targets(&targets)?],
+            )?;
+        }
     }
     let published = published_source_hash(repo_id, node);
     // Reconsidered when the SET changes, not only the hash: a new set can give an unchanged hash
@@ -853,6 +880,55 @@ fn anchor_snapshot_digest(node_id: &str, anchors: &[rag_rat_oplog::PortableAncho
     ))
 }
 
+/// What a published set names for each symbol anchor — the kind and signature the anchor carries,
+/// and the scope its `node_anchor_scopes` companion carries for it — as the baseline a later set is
+/// judged against.
+fn applied_targets_of(
+    anchors: &[rag_rat_oplog::PortableAnchor],
+    scopes: &[(String, String, String)],
+) -> AppliedTargets {
+    anchors
+        .iter()
+        .filter(|anchor| matches!(anchor.binding_kind.as_str(), "symbol" | "logical_symbol"))
+        .map(|anchor| {
+            let scope_hash = scopes
+                .iter()
+                .find(|(kind, id, _)| *kind == anchor.binding_kind && *id == anchor.binding_id)
+                .map(|(_, _, scope)| scope.clone());
+            ((anchor.binding_kind.clone(), anchor.binding_id.clone()), AppliedTarget {
+                symbol_kind: anchor.symbol_kind.clone(),
+                signature_hash: anchor.signature_hash.clone(),
+                scope_hash,
+            })
+        })
+        .collect()
+}
+
+/// The published anchor scopes this store will record: each a lowercase-hex sha256, as
+/// `(binding_kind, binding_id, scope_hash)` for [`encode_applied_targets`]. An off-shape value is a
+/// peer's this binary cannot read and is dropped here, where it would be stored — never in the
+/// content gate, for the same reason as the hash.
+fn published_anchor_scopes(
+    repo_id: &str,
+    node: &ProjectedContentNode,
+) -> Vec<(String, String, String)> {
+    node.anchor_scopes
+        .iter()
+        .filter_map(|((kind, id), scope_hash)| {
+            if is_hex_sha256(scope_hash) {
+                return Some((kind.clone(), id.clone(), scope_hash.clone()));
+            }
+            tracing::debug!(
+                repo_id,
+                node_id = %node.node_id,
+                binding_kind = %kind,
+                "not recording a published anchor scope outside the lowercase-hex-sha256 shape",
+            );
+            None
+        })
+        .collect()
+}
+
 /// The published hash as this store holds it: a lowercase-hex sha256, or `None`. An empty string is
 /// an author's explicit retraction. Any other off-shape value is a peer's this binary cannot read,
 /// so it is dropped — here, where it would be stored, and not in the content gate, where failing
@@ -892,6 +968,7 @@ fn converge_bindings(
     anchors: &[rag_rat_oplog::PortableAnchor],
     held: &[rag_rat_oplog::PortableAnchor],
     previous: Option<&AppliedTargets>,
+    scopes: &[(String, String, String)],
 ) -> anyhow::Result<bool> {
     let mut changed = false;
     for row in held.iter().filter(|row| SEEDABLE_BINDING_KINDS.contains(&row.binding_kind.as_str()))
@@ -903,7 +980,11 @@ fn converge_bindings(
                         targets.get(&(row.binding_kind.clone(), row.binding_id.clone()))
                     })
                     .cloned();
-                refresh_binding(tx, repo_id, memory_id, anchor, previous)?
+                let published_scope = scopes
+                    .iter()
+                    .find(|(kind, id, _)| *kind == row.binding_kind && *id == row.binding_id)
+                    .map(|(_, _, scope)| scope.as_str());
+                refresh_binding(tx, repo_id, memory_id, anchor, previous, published_scope)?
             },
             None => {
                 tx.execute(
@@ -948,12 +1029,20 @@ fn converge_bindings(
 /// The baseline is the author's last statement, not the row: relocation refreshes the row's kind
 /// and signature to this checkout's view, so after a local edit an unchanged republish would read
 /// as a retarget, and the validator would follow the old signature to a same-named sibling.
+///
+/// The target's published scope (`published_scope`, see `rag_rat_oplog::AnchorScope`) is judged the
+/// same way, against the scope the baseline recorded — and only where BOTH are known. Two impls of
+/// different traits for one type can agree on the kind and the captured signature, so the scope is
+/// what says a rebind between them moved (#1276). A scope missing on either side is no evidence:
+/// an older author publishes none, and marking on its absence would retarget every symbol row on
+/// the first publication after an upgrade.
 pub(crate) fn refresh_binding(
     tx: &Transaction<'_>,
     repo_id: &str,
     memory_id: &str,
     anchor: &rag_rat_oplog::PortableAnchor,
-    previous: Option<(Option<String>, Option<String>)>,
+    previous: Option<AppliedTarget>,
+    published_scope: Option<&str>,
 ) -> anyhow::Result<()> {
     let held: Option<(Option<String>, Option<String>, Option<String>)> = tx
         .query_row(
@@ -966,10 +1055,19 @@ pub(crate) fn refresh_binding(
     let retarget = rag_rat_query::memory::RETARGETED_REASON;
     let retargeted = matches!(anchor.binding_kind.as_str(), "symbol" | "logical_symbol")
         && held.is_some_and(|(kind, signature, reason)| {
-            let (kind, signature) = previous.unwrap_or((kind, signature));
+            let previous = previous.unwrap_or(AppliedTarget {
+                symbol_kind: kind,
+                signature_hash: signature,
+                scope_hash: None,
+            });
+            let scope_moved = match (previous.scope_hash.as_deref(), published_scope) {
+                (Some(recorded), Some(published)) => recorded != published,
+                _ => false,
+            };
             reason.as_deref() == Some(retarget)
-                || kind != anchor.symbol_kind
-                || signature != anchor.signature_hash
+                || previous.symbol_kind != anchor.symbol_kind
+                || previous.signature_hash != anchor.signature_hash
+                || scope_moved
         });
     tx.execute(
         "UPDATE repo_memory_bindings
@@ -2075,6 +2173,143 @@ mod tests {
             Some(rag_rat_query::memory::RETARGETED_REASON),
             "a changed signature is"
         );
+    }
+
+    /// Two impls of different traits for one type can agree on the kind and the captured
+    /// signature, so a rebind between them changes only the target's SCOPE, published beside the
+    /// set (#1276). A changed scope marks the row `retargeted`; the same scope does not; and a
+    /// scope missing on either side is no evidence, so an older author's set never marks on its
+    /// absence. The baseline records the scope beside the kind and signature.
+    #[test]
+    fn a_changed_published_scope_marks_a_retarget_and_a_missing_one_never_does() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let publish = |path: &str, scope: Option<&str>| {
+            seed_projected_node_with_anchors(
+                &conn,
+                stream,
+                "mem_peer",
+                Some(&[("symbol", "src/lib.rs::Twin")]),
+            );
+            set_projected_anchor_field(&conn, stream, "mem_peer", "path", path);
+            set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "impl");
+            set_projected_anchor_field(&conn, stream, "mem_peer", "signature_hash", "sig");
+            if let Some(scope) = scope {
+                set_projected_anchor_field(&conn, stream, "mem_peer", "scope_hash", scope);
+            }
+        };
+        let reason = || -> Option<String> {
+            conn.query_row(
+                "SELECT relocation_reason FROM repo_memory_bindings WHERE memory_id = 'mem_peer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let recorded_scope = || -> Option<String> {
+            let json: Option<String> = conn
+                .query_row(
+                    "SELECT anchors_applied_targets FROM repo_memories WHERE id = 'mem_peer'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            decode_applied_targets(json.as_deref())
+                .and_then(|t| {
+                    t.get(&("symbol".to_string(), "src/lib.rs::Twin".to_string())).cloned()
+                })
+                .and_then(|target| target.scope_hash)
+        };
+        let alpha = rag_rat_base::hash::hex_sha256(b"Twin as Alpha");
+        let beta = rag_rat_base::hash::hex_sha256(b"Twin as Beta");
+
+        publish("src/lib.rs", Some(&alpha));
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(reason(), None, "a first sight marks nothing");
+        assert_eq!(recorded_scope().as_deref(), Some(alpha.as_str()), "the baseline records it");
+
+        publish("src/moved.rs", Some(&alpha));
+        drain_worker(&conn, stream, 2_000);
+        assert_eq!(reason(), None, "the same scope is a republish of the same target");
+
+        publish("src/twins.rs", Some(&beta));
+        drain_worker(&conn, stream, 3_000);
+        assert_eq!(
+            reason().as_deref(),
+            Some(rag_rat_query::memory::RETARGETED_REASON),
+            "a changed scope under an unchanged kind and signature is a retarget",
+        );
+        assert_eq!(recorded_scope().as_deref(), Some(beta.as_str()));
+
+        // Answered, then republished by an older author that publishes no scopes.
+        conn.execute(
+            "UPDATE repo_memory_bindings SET relocation_reason = NULL WHERE memory_id = 'mem_peer'",
+            [],
+        )
+        .unwrap();
+        publish("src/older.rs", None);
+        drain_worker(&conn, stream, 4_000);
+        assert_eq!(reason(), None, "a scope missing on the new side is no evidence");
+        assert_eq!(recorded_scope(), None);
+
+        publish("src/newer.rs", Some(&alpha));
+        drain_worker(&conn, stream, 5_000);
+        assert_eq!(reason(), None, "nor is one missing on the recorded side");
+
+        // A malformed scope from a peer is dropped where it would be stored, never quarantined.
+        publish("src/odd.rs", Some("not-a-hash"));
+        drain_worker(&conn, stream, 6_000);
+        assert_eq!(reason(), None);
+        assert_eq!(recorded_scope(), None, "an off-shape scope is not recorded");
+        assert_eq!(status_of(&conn, "mem_peer"), "active", "and the memory survives");
+
+        // Scopes exposed for the SAME set — an upgrade re-folding retained scope ops, or an author
+        // republishing an unchanged set with scopes — fill the baseline in, so the next twin rebind
+        // has a recorded scope to differ from.
+        set_projected_anchor_field(&conn, stream, "mem_peer", "scope_hash", &alpha);
+        drain_worker(&conn, stream, 7_000);
+        assert_eq!(reason(), None, "filling the baseline marks nothing");
+        assert_eq!(recorded_scope().as_deref(), Some(alpha.as_str()), "the baseline gains it");
+        publish("src/twins-again.rs", Some(&beta));
+        drain_worker(&conn, stream, 8_000);
+        assert_eq!(
+            reason().as_deref(),
+            Some(rag_rat_query::memory::RETARGETED_REASON),
+            "and the rebind that follows is a retarget",
+        );
+
+        // A known scope that changes under an unchanged set is the retarget itself.
+        conn.execute(
+            "UPDATE repo_memory_bindings SET relocation_reason = NULL WHERE memory_id = 'mem_peer'",
+            [],
+        )
+        .unwrap();
+        let gamma = rag_rat_base::hash::hex_sha256(b"Twin as Gamma");
+        set_projected_anchor_field(&conn, stream, "mem_peer", "scope_hash", &gamma);
+        drain_worker(&conn, stream, 9_000);
+        assert_eq!(reason().as_deref(), Some(rag_rat_query::memory::RETARGETED_REASON));
+        assert_eq!(recorded_scope().as_deref(), Some(gamma.as_str()));
+
+        // A scope withdrawn under an unchanged set is cleared without a mark, so the rebind that
+        // follows compares against nothing.
+        conn.execute(
+            "UPDATE repo_memory_bindings SET relocation_reason = NULL WHERE memory_id = 'mem_peer'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE content_projected_nodes
+             SET anchors_json = json_remove(anchors_json, '$[0].scope_hash')
+             WHERE stream_id = ?1 AND node_id = 'mem_peer'",
+            params![stream.to_bytes().as_slice()],
+        )
+        .unwrap();
+        drain_worker(&conn, stream, 10_000);
+        assert_eq!(reason(), None, "a withdrawal marks nothing");
+        assert_eq!(recorded_scope(), None, "and clears the baseline");
+        publish("src/after-withdrawal.rs", Some(&beta));
+        drain_worker(&conn, stream, 11_000);
+        assert_eq!(reason(), None, "the next scope compares against nothing");
     }
 
     /// A set first recorded against rows that are not its own — here a seed from before the

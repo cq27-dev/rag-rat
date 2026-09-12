@@ -679,6 +679,7 @@ pub fn load_projection(conn: &Connection, stream: StreamId) -> anyhow::Result<Pr
                 // is an explicit schema change, not a silent assumption.
                 anchors: None,
                 source_text_hash: None,
+                anchor_scopes: Default::default(),
                 anchors_meta: None,
             });
         }
@@ -783,13 +784,14 @@ impl From<NodeContentRow> for NodeContent {
     }
 }
 
-/// One anchor of a node's projected anchor set. Mirrors `op::PortableAnchor` field for field; the
-/// op type stays serde-free because its wire is minicbor, and this row shape is local and rebuilt
-/// wholesale like its siblings.
+/// One anchor of a node's projected anchor set. Mirrors `op::PortableAnchor` field for field, plus
+/// the target's scope hash from the paired `node_anchor_scopes` register; the op type stays
+/// serde-free because its wire is minicbor, and this row shape is local and rebuilt wholesale like
+/// its siblings.
 #[derive(Serialize, Deserialize)]
 pub(super) struct PortableAnchorRow {
-    binding_kind: String,
-    binding_id: String,
+    pub(super) binding_kind: String,
+    pub(super) binding_id: String,
     path: Option<String>,
     start_line: Option<i64>,
     end_line: Option<i64>,
@@ -802,6 +804,10 @@ pub(super) struct PortableAnchorRow {
     signature_hash: Option<String>,
     moniker_tool: Option<String>,
     moniker_tool_version: Option<String>,
+    /// From the scopes register, not the anchor; absent in rows written before it existed, which
+    /// a rebuild refolds anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) scope_hash: Option<String>,
 }
 
 impl From<&PortableAnchor> for PortableAnchorRow {
@@ -821,6 +827,7 @@ impl From<&PortableAnchor> for PortableAnchorRow {
             signature_hash: anchor.signature_hash.clone(),
             moniker_tool: anchor.moniker_tool.clone(),
             moniker_tool_version: anchor.moniker_tool_version.clone(),
+            scope_hash: None,
         }
     }
 }

@@ -2039,6 +2039,13 @@ fn reject_unauthorable_content_op(op: &MemoryOp, policy: StreamSealPolicy) -> an
                 anchors.len(),
                 rag_rat_oplog::MAX_ANCHORS_PER_OP
             ),
+            MemoryOp::NodeAnchorScopes { node_id, scopes } => anyhow::bail!(
+                "memory `{}` cannot store its {} anchor scopes: a scope set holds at most {} \
+                 entries and must not name one binding twice",
+                node_id.as_str(),
+                scopes.len(),
+                rag_rat_oplog::MAX_ANCHORS_PER_OP
+            ),
             // No other op kind has a structural limit today; this arm keeps the branch total.
             _ => anyhow::bail!("this memory operation has a shape the op log cannot encode"),
         }
@@ -2182,20 +2189,22 @@ pub(crate) fn author_anchors(
     author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
 
-/// The ops that publish a memory's anchor set — its source hash, then the set — or none when the
-/// memory holds no binding. A memory with no hash publishes an EMPTY one: the register's only
-/// retraction, and the op that keeps the pair a pair.
+/// The ops that publish a memory's anchor set — its source hash, its anchor scopes, then the set —
+/// or none when the memory holds no binding. A memory with no hash publishes an EMPTY one, and one
+/// whose symbol anchors have no scope publishes an EMPTY scope set: each register's only
+/// retraction, and the ops that keep the triple a triple.
 ///
-/// Always BOTH, never one alone. The fold takes a winning set's hash from the device that wrote it
-/// — that device's latest hash — so a device's pair holds against any other writer, whichever order
-/// the other wrote its own in. A set published alone would pair with the device's PREVIOUS hash,
-/// the one describing the target it just left, for good, since nothing republishes afterwards.
+/// Always ALL THREE, never one alone. The fold takes a winning set's hash and scopes from the
+/// device that wrote it — that device's latest of each — so a device's triple holds against any
+/// other writer, whichever order the other wrote its own in. A set published alone would pair with
+/// the device's PREVIOUS hash and scopes, the ones describing the target it just left, for good,
+/// since nothing republishes afterwards.
 ///
-/// The hash goes FIRST. The two are separate entries on one chain, and a peer accepts a chain in
-/// order, so a pull that stops between them leaves a prefix. Hash-first makes that prefix a newer
-/// hash beside the older set, which the next entry resolves. Set-first would pair the new bindings
-/// with the previous target's hash, and a receiver relocating by hash could move a binding back to
-/// the target its author just left — where the late hash, arriving alone, no longer moves it.
+/// The set goes LAST. The three are separate entries on one chain, and a peer accepts a chain in
+/// order, so a pull that stops between them leaves a prefix. Set-last makes that prefix newer
+/// companions beside the older set, which the next entry resolves. Set-first would pair the new
+/// bindings with the previous target's hash and scopes, and a receiver could read the new set as
+/// a retarget away from the target its author just moved to.
 pub(crate) fn anchor_publication_ops(
     conn: &Connection,
     memory_id: &str,
@@ -2207,7 +2216,52 @@ pub(crate) fn anchor_publication_ops(
         node_id: NodeId::from(memory_id),
         source_text_hash: String::new(),
     });
-    Ok(vec![hash, anchors])
+    let scopes = anchor_scopes_op(conn, memory_id)?;
+    Ok(vec![hash, scopes, anchors])
+}
+
+/// The `NodeAnchorScopes` op for a memory's symbol bindings: each one's live target's scope path,
+/// hashed — the identity component the anchor itself leaves out, and the only one that tells two
+/// impls of different traits for one type apart when their kind and captured signature agree
+/// (#1276). Read through the row's own handle, so a binding whose handle is dead, or whose target
+/// row predates the scope column, contributes nothing: a scope is published only where it is
+/// known, never guessed.
+fn anchor_scopes_op(conn: &Connection, memory_id: &str) -> anyhow::Result<MemoryOp> {
+    let mut stmt = conn.prepare(
+        "SELECT b.binding_kind, b.binding_id,
+                COALESCE(
+                    (SELECT s.scope_path FROM symbols s WHERE s.id = b.symbol_id),
+                    (SELECT s.scope_path FROM logical_symbol_members m
+                       JOIN symbols s ON s.id = m.symbol_id
+                      WHERE m.logical_symbol_id = b.logical_symbol_id
+                      ORDER BY m.start_line LIMIT 1))
+         FROM repo_memory_bindings b
+         WHERE b.memory_id = ?1
+           AND b.repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
+           AND b.binding_kind IN ('symbol', 'logical_symbol')
+         ORDER BY b.binding_kind, b.binding_id",
+    )?;
+    let scopes = stmt
+        .query_map(params![memory_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .filter_map(|row| {
+            row.map(|(binding_kind, binding_id, scope_path)| {
+                let scope_path = scope_path.filter(|scope| !scope.is_empty())?;
+                Some(rag_rat_oplog::AnchorScope {
+                    binding_kind,
+                    binding_id,
+                    scope_hash: rag_rat_base::hash::hex_sha256(scope_path.as_bytes()),
+                })
+            })
+            .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(MemoryOp::NodeAnchorScopes { node_id: NodeId::from(memory_id), scopes })
 }
 
 /// The `NodeSourceHash` op for a memory's stamped source hash, or `None` when it has none — in
@@ -2584,8 +2638,8 @@ mod tests {
         assert_eq!(work.quarantined_anchor_ids, vec!["mem_fat".to_string()]);
         assert_eq!(
             work.anchor_backfill_ops.len(),
-            2,
-            "the publishable one is still authored, anchors and the hash describing them",
+            3,
+            "the publishable one is still authored: anchors, the hash describing them, scopes",
         );
         assert!(work.has_authorable_work(), "progress is available despite the quarantined head");
     }
@@ -2624,15 +2678,16 @@ mod tests {
             .iter()
             .map(|op| match op {
                 MemoryOp::NodeAnchors { node_id, .. }
-                | MemoryOp::NodeSourceHash { node_id, .. } => node_id.as_str().to_string(),
-                other => panic!("the sweep authors anchors and hashes only, got {other:?}"),
+                | MemoryOp::NodeSourceHash { node_id, .. }
+                | MemoryOp::NodeAnchorScopes { node_id, .. } => node_id.as_str().to_string(),
+                other => panic!("the sweep authors anchors, hashes and scopes only, got {other:?}"),
             })
             .collect();
         assert_eq!(swept.len(), ANCHOR_BACKFILL_PER_PASS, "a full budget of memories");
         assert_eq!(
             work.anchor_backfill_ops.len(),
-            ANCHOR_BACKFILL_PER_PASS * 2,
-            "each swept memory owes its anchors and the hash describing them",
+            ANCHOR_BACKFILL_PER_PASS * 3,
+            "each swept memory owes its anchors, the hash describing them and their scopes",
         );
         assert!(
             !swept.contains(&format!("mem_{ANCHOR_BACKFILL_PER_PASS:04}")),
