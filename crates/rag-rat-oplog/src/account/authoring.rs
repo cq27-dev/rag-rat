@@ -213,7 +213,8 @@ fn author_account_op_in_tx(
     // Cite our own CURRENT effective control-fold length as `auth_len`, read BEFORE authoring: the
     // fold parks an entry whose asserted `auth_len` runs ahead of the fold it lands in (§7), so
     // citing the count as-of now means our own entry never parks `auth_len_ahead` against our own
-    // fold. Mirrors the `/3` content seam's freshness citation.
+    // fold — a revoking cut included, since the fold credits it the entries it condemns. Mirrors
+    // the `/3` content seam's freshness citation.
     let auth_len = storage::account_effective_count(tx, account_id)?;
 
     let header = AccountEntryHeader {
