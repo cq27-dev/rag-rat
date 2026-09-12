@@ -241,6 +241,45 @@ pub(crate) fn author_row_entry(
     op: &RowOp,
     now_ms: i64,
 ) -> anyhow::Result<SignedEntry> {
+    let signed = sign_next_row_entry(tx, stream, secret, op)?;
+    anyhow::ensure!(
+        signed.signed_bytes.len() <= super::TABLE_SYNC_ENTRY_MAX_BYTES,
+        "table-sync signed entry is {} bytes, over the {}-byte transport limit",
+        signed.signed_bytes.len(),
+        super::TABLE_SYNC_ENTRY_MAX_BYTES,
+    );
+    // A locally-authored op is projected by construction: the producer builds it from THIS
+    // registry, so it can never carry a column or op-kind this binary does not understand.
+    insert_entry(tx, &signed.entry, &signed.signed_bytes, now_ms, None)?;
+    Ok(signed)
+}
+
+/// [`author_row_entry`] for a repair that re-signs a row already carried: `None`, storing nothing,
+/// when the entry would exceed the transport limit. A retained entry at the limit grows when
+/// re-signed under a predecessor hash, and a repair that cannot fit must leave the row where it is
+/// rather than fail the pass.
+pub(crate) fn author_row_entry_if_it_fits(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    secret: &DeviceSecret,
+    op: &RowOp,
+    now_ms: i64,
+) -> anyhow::Result<Option<SignedEntry>> {
+    let signed = sign_next_row_entry(tx, stream, secret, op)?;
+    if signed.signed_bytes.len() > super::TABLE_SYNC_ENTRY_MAX_BYTES {
+        return Ok(None);
+    }
+    insert_entry(tx, &signed.entry, &signed.signed_bytes, now_ms, None)?;
+    Ok(Some(signed))
+}
+
+/// Sign `op` as the next entry on this device's chain in `stream`, without storing it.
+fn sign_next_row_entry(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    secret: &DeviceSecret,
+    op: &RowOp,
+) -> anyhow::Result<SignedEntry> {
     let device = secret.public().fingerprint();
     let stored_tail = chain_tail(tx, stream, device)?;
     if let Some(witness) = chain_witness(tx, stream, device)?
@@ -253,18 +292,24 @@ pub(crate) fn author_row_entry(
     }
     let lamport = next_stream_lamport(tx, stream)?;
     let prev_hash = stored_tail.map(|(_, entry_hash)| entry_hash);
-    let signed =
-        entry::sign_entry_from_op_bytes(secret, stream, prev_hash, lamport, row_op::encode(op));
-    anyhow::ensure!(
-        signed.signed_bytes.len() <= super::TABLE_SYNC_ENTRY_MAX_BYTES,
-        "table-sync signed entry is {} bytes, over the {}-byte transport limit",
-        signed.signed_bytes.len(),
-        super::TABLE_SYNC_ENTRY_MAX_BYTES,
-    );
-    // A locally-authored op is projected by construction: the producer builds it from THIS
-    // registry, so it can never carry a column or op-kind this binary does not understand.
-    insert_entry(tx, &signed.entry, &signed.signed_bytes, now_ms, None)?;
-    Ok(signed)
+    Ok(entry::sign_entry_from_op_bytes(secret, stream, prev_hash, lamport, row_op::encode(op)))
+}
+
+/// Whether `stream` holds an accepted entry retained for replay (`pending_reason IS NOT NULL`) at
+/// or above `lamport`, on any device chain — a write this binary accepted but cannot apply yet.
+pub(crate) fn pending_entry_at_or_above(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    lamport: u64,
+) -> anyhow::Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM table_sync_entries
+             WHERE stream_id = ?1 AND pending_reason IS NOT NULL AND lamport >= ?2
+         )",
+        params![stream.to_bytes().as_slice(), i64::try_from(lamport)?],
+        |row| row.get(0),
+    )?)
 }
 
 /// One past the highest lamport on `stream` across all devices — the next Lamport-clock tick. `0`

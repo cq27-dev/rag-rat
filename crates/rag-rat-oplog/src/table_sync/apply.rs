@@ -815,8 +815,8 @@ pub(crate) fn stale_row_disposition(
         return Ok(StaleRow::Unknown);
     };
     let Some(op) = super::store::winning_entry_op(tx, stream, &device_hex, lamport)? else {
-        // The entry is gone. Nothing prunes today; when retention lands it must refresh a row
-        // before dropping that row's winner, or this arm becomes a permanent stale state.
+        // The entry is gone. Retention never drops a live winner (the pin rule, #1277), so only a
+        // store compacted before that rule reaches this arm — and re-authoring repairs it.
         return Ok(StaleRow::Unknown);
     };
     // The entry is located by `(stream, device, lamport)`, which identifies it uniquely WITHIN a
