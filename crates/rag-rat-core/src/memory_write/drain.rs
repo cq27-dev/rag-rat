@@ -757,45 +757,35 @@ fn apply_published_anchors(
         )?;
     } else if let Some(mut targets) = decode_applied_targets(applied.targets.as_deref()) {
         // The scopes paired with a set can move without the set's bytes changing: an upgrade
-        // re-folds the `node_anchor_scopes` ops an older binary retained opaque, an author
-        // upgrading republishes its unchanged set with scopes beside it, and a writer may publish
-        // new scopes ahead of an identical set. The paired scopes are therefore judged on their
-        // own: a scope the baseline lacks is filled in, so the author's next rebind between
-        // twins has a recorded scope to differ from, and a known scope that changed is the
-        // retarget itself, refreshed the way a set change would refresh the row.
+        // re-folds the `node_anchor_scopes` ops an older binary retained opaque, and an author
+        // upgrading republishes its unchanged set with scopes beside it (the sweep in
+        // `read_anchor_backfill_ids`). The baseline follows the paired scopes — a missing one is
+        // filled in, so the author's next rebind between twins has a recorded scope to differ
+        // from; a withdrawn one is cleared; a changed one replaces the old — and marks nothing: a
+        // rebind always changes the set's bytes, so a scope moving under identical ones is a
+        // change of derivation, not of target, and a mark would hold back every such row at once.
+        // Only for anchors a held row still matches by target, as the set-changed path records
+        // its baseline: a row relocated here since must not have a scope recorded on its behalf.
         let scopes = published_anchor_scopes(repo_id, node);
-        let converges = !own && (applied.digest.is_some() || applied.local);
+        let held_now = super::authoring::portable_anchors_of(tx, &node.node_id)?;
         let mut moved = false;
         for ((kind, id), target) in targets.iter_mut() {
-            let Some((_, _, scope)) = scopes.iter().find(|(k, i, _)| k == kind && i == id) else {
-                // A scope the publication no longer carries is withdrawn evidence: cleared without
-                // a mark, as a set change would record it.
-                if target.scope_hash.take().is_some() {
-                    moved = true;
-                }
-                continue;
-            };
-            if target.scope_hash.as_deref() == Some(scope.as_str()) {
+            let matched = anchors.iter().any(|anchor| {
+                anchor.binding_kind == *kind
+                    && anchor.binding_id == *id
+                    && held_now.iter().any(|row| same_target(row, anchor))
+            });
+            if !matched {
                 continue;
             }
-            if target.scope_hash.is_some()
-                && converges
-                && let Some(anchor) = anchors
-                    .iter()
-                    .find(|anchor| anchor.binding_kind == *kind && anchor.binding_id == *id)
-            {
-                refresh_binding(
-                    tx,
-                    repo_id,
-                    &node.node_id,
-                    anchor,
-                    Some(target.clone()),
-                    Some(scope),
-                )?;
-                changed = true;
+            let published = scopes
+                .iter()
+                .find(|(k, i, _)| k == kind && i == id)
+                .map(|(_, _, scope)| scope.clone());
+            if target.scope_hash != published {
+                target.scope_hash = published;
+                moved = true;
             }
-            target.scope_hash = Some(scope.clone());
-            moved = true;
         }
         if moved {
             tx.execute(
@@ -2278,7 +2268,8 @@ mod tests {
             "and the rebind that follows is a retarget",
         );
 
-        // A known scope that changes under an unchanged set is the retarget itself.
+        // A known scope that changes under an unchanged set replaces the recorded one without a
+        // mark: a rebind always changes the set's bytes, so this is a change of derivation.
         conn.execute(
             "UPDATE repo_memory_bindings SET relocation_reason = NULL WHERE memory_id = 'mem_peer'",
             [],
@@ -2287,8 +2278,28 @@ mod tests {
         let gamma = rag_rat_base::hash::hex_sha256(b"Twin as Gamma");
         set_projected_anchor_field(&conn, stream, "mem_peer", "scope_hash", &gamma);
         drain_worker(&conn, stream, 9_000);
-        assert_eq!(reason().as_deref(), Some(rag_rat_query::memory::RETARGETED_REASON));
-        assert_eq!(recorded_scope().as_deref(), Some(gamma.as_str()));
+        assert_eq!(reason(), None, "a scope moving under identical bytes marks nothing");
+        assert_eq!(recorded_scope().as_deref(), Some(gamma.as_str()), "but is recorded");
+
+        // A row relocated here since the set was applied is not the author's target any more, so
+        // no scope is recorded on its behalf under an unchanged set.
+        conn.execute(
+            "UPDATE repo_memory_bindings SET signature_hash = 'sig-local' WHERE memory_id = \
+             'mem_peer'",
+            [],
+        )
+        .unwrap();
+        let delta = rag_rat_base::hash::hex_sha256(b"Twin as Delta");
+        set_projected_anchor_field(&conn, stream, "mem_peer", "scope_hash", &delta);
+        drain_worker(&conn, stream, 9_500);
+        assert_eq!(recorded_scope().as_deref(), Some(gamma.as_str()), "a relocated row is skipped");
+        conn.execute(
+            "UPDATE repo_memory_bindings SET signature_hash = 'sig' WHERE memory_id = 'mem_peer'",
+            [],
+        )
+        .unwrap();
+        drain_worker(&conn, stream, 9_600);
+        assert_eq!(recorded_scope().as_deref(), Some(delta.as_str()), "matched again, recorded");
 
         // A scope withdrawn under an unchanged set is cleared without a mark, so the rebind that
         // follows compares against nothing.

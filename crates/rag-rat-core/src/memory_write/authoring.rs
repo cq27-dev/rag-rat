@@ -1177,24 +1177,65 @@ fn read_anchor_backfill_ids(
     repo_id: &str,
     stream: StreamId,
 ) -> anyhow::Result<Vec<String>> {
-    let mut stmt = conn.prepare(
+    // The scope leg republishes this device's bindings as the memory's set, so it is confined to
+    // sets THIS account authored whose bindings still equal the projected set by target: a
+    // contributor's set on an owner-created memory, or a sibling device's newer rebind the local
+    // rows have yet to catch up with, must not be re-signed here as this device's own.
+    let local_account = rag_rat_oplog::read_local_account(conn)?.map(|account| account.to_bytes());
+    let mut stmt = conn.prepare(&format!(
         // `origin = 'local'` for the same load-bearing reason as the node anti-join above: a
         // synced row is a peer's to publish, never this device's to author.
+        //
+        // The second leg is the scope backfill (#1276): a set published before the scope op
+        // existed projects symbol anchors with no `scope_hash`. Where such an anchor's binding
+        // still resolves a scope, the memory is swept again, so an upgraded author republishes its
+        // unchanged set with scopes beside it and a receiver's baseline gains them before the next
+        // rebind. It converges: the republished scope lands in the projection, and an anchor whose
+        // handle resolves nothing is never selected. Only for a set this account authored whose
+        // bindings still equal the projected set by target (see `ANCHOR_MATCHES_BINDING_SQL`).
         "SELECT m.id
          FROM repo_memories m
          JOIN content_projected_nodes p ON p.stream_id = ?2 AND p.node_id = m.id
          WHERE m.repo_id = ?1
            AND m.origin = 'local'
-           AND p.anchors_json IS NULL
            AND EXISTS (
                  SELECT 1 FROM repo_memory_bindings b
                  WHERE b.memory_id = m.id AND b.repo_id = m.repo_id)
+           AND (p.anchors_json IS NULL
+                OR (p.anchors_author = ?4
+                    AND EXISTS (
+                         SELECT 1 FROM json_each(p.anchors_json) a
+                         JOIN repo_memory_bindings b
+                           ON b.memory_id = m.id AND b.repo_id = m.repo_id
+                          AND b.binding_kind = json_extract(a.value, '$.binding_kind')
+                          AND b.binding_id = json_extract(a.value, '$.binding_id')
+                         WHERE json_extract(a.value, '$.binding_kind')
+                                   IN ('symbol', 'logical_symbol')
+                           AND json_extract(a.value, '$.scope_hash') IS NULL
+                           AND COALESCE({BOUND_SCOPE_PATH_SQL}, '') != '')
+                    AND NOT EXISTS (
+                         SELECT 1 FROM repo_memory_bindings b
+                         WHERE b.memory_id = m.id AND b.repo_id = m.repo_id
+                           AND NOT EXISTS (
+                                 SELECT 1 FROM json_each(p.anchors_json) a
+                                 WHERE {ANCHOR_MATCHES_BINDING_SQL}))
+                    AND NOT EXISTS (
+                         SELECT 1 FROM json_each(p.anchors_json) a
+                         WHERE NOT EXISTS (
+                                 SELECT 1 FROM repo_memory_bindings b
+                                 WHERE b.memory_id = m.id AND b.repo_id = m.repo_id
+                                   AND {ANCHOR_MATCHES_BINDING_SQL}))))
          ORDER BY m.created_at_ms, m.id
-         LIMIT ?3",
-    )?;
+         LIMIT ?3"
+    ))?;
     let ids = stmt
         .query_map(
-            params![repo_id, stream.to_bytes().as_slice(), ANCHOR_BACKFILL_SCAN_PER_PASS],
+            params![
+                repo_id,
+                stream.to_bytes().as_slice(),
+                ANCHOR_BACKFILL_SCAN_PER_PASS,
+                local_account.as_ref().map(|bytes| bytes.as_slice()),
+            ],
             |row| row.get::<_, String>(0),
         )?
         .collect::<Result<Vec<_>, _>>()?;
@@ -2220,27 +2261,55 @@ pub(crate) fn anchor_publication_ops(
     Ok(vec![hash, scopes, anchors])
 }
 
+/// The scope path a symbol binding `b` resolves to through its own handle, as a SQL expression: the
+/// raw symbol row first, else the logical group's first member. Either is trusted only if it still
+/// answers to the binding's qualified name — a raw symbol id is a rowid reassigned on reindex and
+/// carries no foreign key, so a stale one can name an unrelated live symbol, whose scope would then
+/// be published as this target's. NULL, or empty, when the handle is dead or predates the column.
+const BOUND_SCOPE_PATH_SQL: &str = "COALESCE(
+    (SELECT s.scope_path FROM symbols s
+      WHERE s.id = b.symbol_id
+        AND s.qualified_name_id = (SELECT id FROM name_strings WHERE value = b.binding_id)),
+    (SELECT s.scope_path FROM logical_symbol_members m
+       JOIN symbols s ON s.id = m.symbol_id
+       JOIN logical_symbols ls ON ls.id = m.logical_symbol_id
+      WHERE m.logical_symbol_id = b.logical_symbol_id
+        AND ls.qualified_name_id = (SELECT id FROM name_strings WHERE value = b.binding_id)
+      ORDER BY m.start_line LIMIT 1))";
+
+/// Whether a projected anchor `a` (a `json_each` row over `anchors_json`) and a binding row `b`
+/// name the same row, the same target AND the same publication, as a SQL predicate. The target is
+/// compared as the drain's `same_target` compares it — on what identifies it, not where it sits,
+/// since the validate loop rewrites `path` and the line span for the same target. The publication
+/// is `created_at_ms`: each rebind restamps it and `anchors/1` carries it verbatim, so it tells a
+/// row a sibling device's newer rebind has yet to reach from the set that device published —
+/// which the target columns cannot, when the rebind was between twins agreeing on all of them.
+const ANCHOR_MATCHES_BINDING_SQL: &str = "json_extract(a.value, '$.binding_kind') = b.binding_kind
+    AND json_extract(a.value, '$.binding_id') = b.binding_id
+    AND json_extract(a.value, '$.created_at_ms') = b.created_at_ms
+    AND json_extract(a.value, '$.symbol_kind') IS b.symbol_kind
+    AND json_extract(a.value, '$.signature_hash') IS b.signature_hash
+    AND json_extract(a.value, '$.moniker_tool') IS b.moniker_tool
+    AND json_extract(a.value, '$.commit_hash') IS b.commit_hash
+    AND json_extract(a.value, '$.tracker') IS b.tracker
+    AND json_extract(a.value, '$.project') IS b.project
+    AND json_extract(a.value, '$.item_key') IS b.item_key";
+
 /// The `NodeAnchorScopes` op for a memory's symbol bindings: each one's live target's scope path,
 /// hashed — the identity component the anchor itself leaves out, and the only one that tells two
 /// impls of different traits for one type apart when their kind and captured signature agree
-/// (#1276). Read through the row's own handle, so a binding whose handle is dead, or whose target
-/// row predates the scope column, contributes nothing: a scope is published only where it is
-/// known, never guessed.
+/// (#1276). Read through the row's own handle ([`BOUND_SCOPE_PATH_SQL`]), so a binding whose
+/// handle is dead, or whose target row predates the scope column, contributes nothing: a scope is
+/// published only where it is known, never guessed.
 fn anchor_scopes_op(conn: &Connection, memory_id: &str) -> anyhow::Result<MemoryOp> {
-    let mut stmt = conn.prepare(
-        "SELECT b.binding_kind, b.binding_id,
-                COALESCE(
-                    (SELECT s.scope_path FROM symbols s WHERE s.id = b.symbol_id),
-                    (SELECT s.scope_path FROM logical_symbol_members m
-                       JOIN symbols s ON s.id = m.symbol_id
-                      WHERE m.logical_symbol_id = b.logical_symbol_id
-                      ORDER BY m.start_line LIMIT 1))
+    let mut stmt = conn.prepare(&format!(
+        "SELECT b.binding_kind, b.binding_id, {BOUND_SCOPE_PATH_SQL}
          FROM repo_memory_bindings b
          WHERE b.memory_id = ?1
            AND b.repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
            AND b.binding_kind IN ('symbol', 'logical_symbol')
-         ORDER BY b.binding_kind, b.binding_id",
-    )?;
+         ORDER BY b.binding_kind, b.binding_id"
+    ))?;
     let scopes = stmt
         .query_map(params![memory_id], |row| {
             Ok((
@@ -2642,6 +2711,112 @@ mod tests {
             "the publishable one is still authored: anchors, the hash describing them, scopes",
         );
         assert!(work.has_authorable_work(), "progress is available despite the quarantined head");
+    }
+
+    /// A memory whose projected set predates the scope op — a symbol anchor with no `scope_hash`
+    /// — is swept again once its binding can supply one, so an upgraded author republishes its
+    /// unchanged set with scopes beside it. A set that already carries the scope, or a binding
+    /// that no longer resolves one, is left alone, so the sweep converges; a set another account
+    /// authored, or one the local rows no longer match by target, is never re-signed as this
+    /// device's own.
+    #[test]
+    fn the_anchor_sweep_republishes_a_projected_set_whose_symbol_anchor_lacks_a_scope() {
+        let (conn, stream) = conn_with_stream();
+        let own = rag_rat_oplog::read_local_account(&conn).unwrap().unwrap().to_bytes();
+        conn.execute(
+            "INSERT INTO files(repo_id, path, language, kind, sha256, modified_at_ms, \
+             indexed_at_ms)
+             VALUES (?1, 'src/lib.rs', 'rust', 'code', 'sha', 1, 1)",
+            [REPO],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES ('src/lib.rs::Twin')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, kind,
+                    start_byte, end_byte, start_line, end_line)
+             VALUES (?1, 'rust', 'Twin', (SELECT id FROM name_strings WHERE value = \
+             'src/lib.rs::Twin'),
+                     'Twin as Beta', 'impl', 0, 1, 1, 1)",
+            [file_id],
+        )
+        .unwrap();
+        let symbol_id = conn.last_insert_rowid();
+        let seed = |id: &str, symbol_id: Option<i64>, scope_hash: Option<&str>| {
+            insert_memory(&conn, id, "active", 1);
+            conn.execute(
+                "INSERT INTO repo_memory_bindings(
+                     repo_id, memory_id, binding_kind, binding_id, symbol_id, symbol_kind,
+                     anchor_status, created_at_ms)
+                 VALUES (?1, ?2, 'symbol', 'src/lib.rs::Twin', ?3, 'impl', 'current', 1)",
+                params![REPO, id, symbol_id],
+            )
+            .unwrap();
+            let anchors = serde_json::json!([{
+                "binding_kind": "symbol", "binding_id": "src/lib.rs::Twin",
+                "path": "src/lib.rs", "start_line": 1, "end_line": 1,
+                "commit_hash": null, "tracker": null, "project": null, "item_key": null,
+                "created_at_ms": 1, "symbol_kind": "impl", "signature_hash": null,
+                "moniker_tool": null, "moniker_tool_version": null, "scope_hash": scope_hash,
+            }]);
+            conn.execute(
+                "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status, \
+                 anchors_json, anchors_author)
+                 VALUES (?1, ?2, '{}', 'active', ?3, ?4)",
+                params![stream.to_bytes().as_slice(), id, anchors.to_string(), own.as_slice()],
+            )
+            .unwrap();
+        };
+        seed("mem_unscoped", Some(symbol_id), None);
+        seed("mem_scoped", Some(symbol_id), Some("already"));
+        seed("mem_dead", None, None);
+        // A set another account authored on this memory — a contributor's rebind — is that
+        // account's to publish: re-signing it here would outlive the contributor's revocation.
+        seed("mem_foreign", Some(symbol_id), None);
+        conn.execute(
+            "UPDATE content_projected_nodes SET anchors_author = ?1 WHERE node_id = 'mem_foreign'",
+            [[9u8; 32].as_slice()],
+        )
+        .unwrap();
+        // A local row that no longer matches the projected set by target — a sibling device's
+        // newer rebind the rows have yet to catch up with — must not be republished over it.
+        seed("mem_behind", Some(symbol_id), None);
+        conn.execute(
+            "UPDATE repo_memory_bindings SET signature_hash = 'newer' WHERE memory_id = \
+             'mem_behind'",
+            [],
+        )
+        .unwrap();
+        // The same, when the sibling's rebind was between twins the target columns cannot tell
+        // apart: only the rebind stamp says the local row is not the published one.
+        seed("mem_sibling", Some(symbol_id), None);
+        conn.execute(
+            "UPDATE repo_memory_bindings SET created_at_ms = 2 WHERE memory_id = 'mem_sibling'",
+            [],
+        )
+        .unwrap();
+
+        let work = read_reconcile_work(&conn, REPO, stream, StreamSealPolicy::Plaintext).unwrap();
+        let swept: BTreeSet<String> = work
+            .anchor_backfill_ops
+            .iter()
+            .map(|op| match op {
+                MemoryOp::NodeAnchors { node_id, .. }
+                | MemoryOp::NodeSourceHash { node_id, .. }
+                | MemoryOp::NodeAnchorScopes { node_id, .. } => node_id.as_str().to_string(),
+                other => panic!("unexpected sweep op {other:?}"),
+            })
+            .collect();
+        assert_eq!(swept, BTreeSet::from(["mem_unscoped".to_string()]));
+        let scopes = work.anchor_backfill_ops.iter().find_map(|op| match op {
+            MemoryOp::NodeAnchorScopes { scopes, .. } => Some(scopes.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            scopes.map(|scopes| scopes.into_iter().map(|s| s.scope_hash).collect::<Vec<_>>()),
+            Some(vec![rag_rat_base::hash::hex_sha256(b"Twin as Beta")]),
+        );
     }
 
     /// The publish budget counts MEMORIES, not ops. Each swept memory owes up to two ops — its

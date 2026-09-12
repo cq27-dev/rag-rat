@@ -2570,6 +2570,9 @@ fn a_published_rebind_between_identical_signature_twins_follows_the_scope() {
 /// The retarget mark sits on a row every checkout of the repo shares. A linked worktree that does
 /// not hold the author's twin (it renamed Beta's trait, which changes the scope) must leave the
 /// mark and the handle for the base checkout, which then moves the memory to Beta and answers.
+/// That is the raw-id arm, whose candidates are the validating checkout's own. The logical arm's
+/// candidates are repo-wide, so the linked checkout answers there itself, moving the handle to
+/// Beta's logical group; the base checkout then validates it live on its Beta.
 #[test]
 fn a_linked_checkout_without_the_authors_twin_leaves_the_scope_retarget_to_the_base() {
     use rag_rat_base::hash::hex_sha256;
@@ -2586,8 +2589,9 @@ fn a_linked_checkout_without_the_authors_twin_leaves_the_scope_retarget_to_the_b
     let mut db = IndexDatabase::rebuild(&config).unwrap();
     let (alpha, beta) = trait_impl_twins(&db);
     let (_, alpha_line, signature, alpha_scope) = twin_facts(&db, alpha);
-    let (_, beta_line, _, beta_scope) = twin_facts(&db, beta);
-    let memory_id = memory_on_alpha(&db, alpha, false, "Rebound from Alpha to Beta by its author");
+    let (beta_group, beta_line, _, beta_scope) = twin_facts(&db, beta);
+    let by_raw = memory_on_alpha(&db, alpha, false, "Rebound to Beta, bound by raw id");
+    let by_logical = memory_on_alpha(&db, alpha, true, "Rebound to Beta, bound by logical handle");
 
     let linked = unique_temp_root();
     let _ = fs::remove_dir_all(&linked);
@@ -2600,32 +2604,50 @@ fn a_linked_checkout_without_the_authors_twin_leaves_the_scope_retarget_to_the_b
     run_git(&linked, &["commit", "-q", "-am", "branch"]);
     db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
 
-    apply_scoped_rebind(
-        &db,
-        &memory_id,
-        beta_line,
-        signature,
-        Some(&hex_sha256(alpha_scope.as_bytes())),
-        Some(&hex_sha256(beta_scope.as_bytes())),
-    );
+    for memory_id in [&by_raw, &by_logical] {
+        apply_scoped_rebind(
+            &db,
+            memory_id,
+            beta_line,
+            signature.clone(),
+            Some(&hex_sha256(alpha_scope.as_bytes())),
+            Some(&hex_sha256(beta_scope.as_bytes())),
+        );
+    }
+    let logical_handle = |db: &IndexDatabase, memory_id: &str| -> Option<i64> {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT logical_symbol_id FROM repo_memory_bindings WHERE memory_id = ?1",
+                params![memory_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
 
     db.use_worktree_scope(&main, Some(&linked)).unwrap();
     for pass in 0..2 {
         db.memory_validate().unwrap();
-        let (line, reason, _) = landed_binding(&db, &memory_id);
+        let (line, reason, _) = landed_binding(&db, &by_raw);
         assert_eq!(line, Some(alpha_line), "linked pass {pass}: no Beta here, the handle stands");
         assert_eq!(
             reason.as_deref(),
             Some(RETARGETED_REASON),
             "linked pass {pass}: the mark is left for the base checkout",
         );
+        let (_, reason, _) = landed_binding(&db, &by_logical);
+        assert_eq!(reason, None, "linked pass {pass}: the logical arm answers repo-wide");
+        assert_eq!(logical_handle(&db, &by_logical), Some(beta_group), "linked pass {pass}");
     }
 
     db.use_worktree_scope(&main, None).unwrap();
     db.memory_validate().unwrap();
-    let (line, reason, _) = landed_binding(&db, &memory_id);
+    let (line, reason, _) = landed_binding(&db, &by_raw);
     assert_eq!(line, Some(beta_line), "the base checkout moves the memory to Beta");
     assert_eq!(reason, None, "and answers the retarget");
+    let (line, reason, status) = landed_binding(&db, &by_logical);
+    assert_eq!(line, Some(beta_line), "the base checkout validates the handle live on Beta");
+    assert_eq!((reason, status.as_str()), (None, "current"));
 
     let _ = fs::remove_dir_all(&linked);
     let _ = fs::remove_dir_all(&main);
@@ -2704,6 +2726,10 @@ fn the_author_publishes_each_symbol_anchor_s_scope_beside_the_set() {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), TWO_TRAIT_IMPLS_FIXTURE).unwrap();
+    // A git root, so the memory scope is stable and a create authors into the op-log.
+    init_git_repo(&root);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "base"]);
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let (_, beta) = trait_impl_twins(&db);
@@ -2745,18 +2771,41 @@ fn the_author_publishes_each_symbol_anchor_s_scope_beside_the_set() {
         scopes.iter().map(|s| (s.binding_kind.clone(), s.scope_hash.clone())).collect()
     };
     let beta_hash = hex_sha256(beta_scope.as_bytes());
+    // The scope a create actually published, read back from the PROJECTION: through the op, the
+    // fold's pairing and `anchors_json`, as a peer would see it.
+    let projected_scope = |memory_id: &str, binding_kind: &str| -> Option<String> {
+        let conn = db.storage.connection();
+        let repo_id: String = conn
+            .query_row("SELECT repo_id FROM repo_memories WHERE id = ?1", [memory_id], |r| r.get(0))
+            .unwrap();
+        let stream = rag_rat_oplog::owned_stream_v2_id(conn, &repo_id).unwrap().unwrap();
+        rag_rat_oplog::list_projected_content_nodes(conn, stream)
+            .unwrap()
+            .into_iter()
+            .find(|node| node.node_id == memory_id)
+            .expect("the memory projects as a node")
+            .anchor_scopes
+            .into_iter()
+            .find(|((kind, _), _)| kind == binding_kind)
+            .map(|(_, scope)| scope)
+    };
 
     let by_raw = bound_to("By raw id", rag_rat_query::memory::RepoMemoryBindTarget {
         symbol_id: Some(beta),
         ..Default::default()
     });
     assert_eq!(published_scopes(&by_raw), vec![("symbol".to_string(), beta_hash.clone())]);
+    assert_eq!(projected_scope(&by_raw, "symbol"), Some(beta_hash.clone()), "projected");
 
     let by_logical = bound_to("By logical handle", rag_rat_query::memory::RepoMemoryBindTarget {
         logical_symbol_id: Some(beta_group),
         ..Default::default()
     });
-    assert_eq!(published_scopes(&by_logical), vec![("logical_symbol".to_string(), beta_hash)]);
+    assert_eq!(published_scopes(&by_logical), vec![(
+        "logical_symbol".to_string(),
+        beta_hash.clone()
+    )]);
+    assert_eq!(projected_scope(&by_logical, "logical_symbol"), Some(beta_hash), "projected");
 
     // A scope path always ends in the symbol's own segment, so even a top-level type carries one.
     let top_level = bound_to("Top level", rag_rat_query::memory::RepoMemoryBindTarget {
