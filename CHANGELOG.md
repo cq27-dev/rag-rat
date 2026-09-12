@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.2](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.23.1...rag-rat-base-v0.23.2) - 2026-09-12
+
+### Other
+
+- *(base)* hold the data-dir env lock in the config tests that read the global store path ([#1290](https://github.com/cq27-dev/rag-rat/pull/1290))
+
 ## [0.23.1](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.23.0...rag-rat-base-v0.23.1) - 2026-09-10
 
 ### Added
