@@ -122,6 +122,129 @@ fn a_partial_pass_heals_without_stamping_the_key_version() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A binding whose memory row is gone — the drain keeps a removed synced memory's bindings for
+/// `anchors/1` to carry (#1298) — is realigned AND has its discriminators refreshed like any
+/// other: the heal runs once per key derivation and nothing repeats it when the memory returns, so
+/// a row skipped here would carry legacy evidence into every later relocation of that memory.
+#[test]
+fn a_drift_heal_refreshes_the_discriminators_of_a_binding_without_its_memory() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn orphan_fn(a: u8) -> u8 { a }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let orphan_id: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM logical_symbols WHERE logical_name = 'orphan_fn'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let created = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Left alone by the heal".to_string(),
+            body: "A binding without its memory keeps its discriminators.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: Some(orphan_id),
+                symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                tracker: None,
+                project: None,
+                item_key: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+                edge_path: None,
+                dir: None,
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+    drop(db);
+
+    let fake_id: i64 = 424246;
+    {
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute("UPDATE logical_symbols SET id = ?1 WHERE id = ?2", params![
+            fake_id, orphan_id
+        ])
+        .unwrap();
+        conn.execute(
+            "UPDATE logical_symbol_members SET logical_symbol_id = ?1
+              WHERE logical_symbol_id = ?2",
+            params![fake_id, orphan_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE repo_memory_bindings
+                SET logical_symbol_id = ?1, binding_id = 'legacy::orphan_fn',
+                    symbol_kind = 'legacy_kind', signature_hash = 'stale-hash'
+              WHERE memory_id = ?2",
+            params![fake_id, memory_id],
+        )
+        .unwrap();
+        // The memory row goes; its binding stays, as after a condemn.
+        conn.execute("DELETE FROM repo_memory_fts WHERE memory_id = ?1", params![memory_id])
+            .unwrap();
+        conn.execute("DELETE FROM repo_memories WHERE id = ?1", params![memory_id]).unwrap();
+        conn.execute("DELETE FROM repo_meta WHERE key = 'logical_key_version'", []).unwrap();
+    }
+
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn orphan_fn(a: u8) -> u8 { a }\n\npub fn orphan_appendix() {}\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let (bound, binding_id, symbol_kind, signature_hash): (i64, String, String, String) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT logical_symbol_id, binding_id, symbol_kind, signature_hash
+               FROM repo_memory_bindings WHERE memory_id = ?1",
+            params![memory_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(bound, orphan_id, "the local rowid is realigned like any other");
+    let (live_qual, live_kind, live_sig): (String, String, String) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT (SELECT value FROM name_strings WHERE id = ls.qualified_name_id),
+                    ls.kind,
+                    (SELECT s.signature FROM logical_symbol_members m
+                       JOIN symbols s ON s.id = m.symbol_id
+                      WHERE m.logical_symbol_id = ls.id LIMIT 1)
+               FROM logical_symbols ls WHERE ls.id = ?1",
+            params![orphan_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (binding_id, symbol_kind, signature_hash),
+        (live_qual, live_kind, rag_rat_base::hash::hex_sha256(live_sig.trim().as_bytes())),
+        "the discriminators of a binding without its memory are refreshed like any other",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// #493 review: a realigned reference keeps its bind-time relocation discriminators —
 /// `binding_id` (the qualified name), `symbol_kind`, `signature_hash` — unless the heal rewrites
 /// them. Validation treats the live id as current and never repairs those fields, so a LATER

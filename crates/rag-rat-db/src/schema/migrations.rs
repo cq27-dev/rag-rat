@@ -8631,6 +8631,29 @@ pub fn apply_memory_applied_anchor_snapshot(conn: &Connection) -> rusqlite::Resu
     ensure_content_projection_shape(conn)
 }
 
+/// A condemned or quarantined synced memory's applied-anchor baseline, parked while its
+/// `repo_memories` row is gone (#1298). The row's bindings stay: they replicate on `anchors/1`, so
+/// deleting them would publish a `Remove` to every device of the account, including ones where the
+/// memory is still live. The baseline is what lets the memory converge on a rebind published while
+/// it was away once it returns; it lived on the row, so it is parked here and restored when the
+/// drain materializes the memory again, together with the memory's own `source_text_hash`, which
+/// the drain stamps only beside bindings that match the published set — a row relocated here would
+/// otherwise return without one. The applied source hash is not part of it: a returning row reads
+/// that as absent, which is what makes the drain run the stamp again. Keyed and swept by `repo_id`
+/// like every repo-scoped table.
+pub fn apply_memory_parked_anchor_baselines(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS repo_memory_parked_baselines(
+             repo_id TEXT NOT NULL,
+             memory_id TEXT NOT NULL,
+             anchors_applied_digest TEXT,
+             anchors_applied_targets TEXT,
+             source_text_hash TEXT,
+             PRIMARY KEY (repo_id, memory_id)
+         ) STRICT;",
+    )
+}
+
 /// Every column the CURRENT content projector writes, applied ahead of any migration that replays
 /// the fold.
 ///

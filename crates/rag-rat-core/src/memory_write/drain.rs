@@ -482,6 +482,12 @@ fn drain_node(
     // snapshot check comes first because it is free: until anchors are authored, every node answers
     // `None` and this costs no query at all.
     if node.anchors.is_some() && node_in_repo(tx, &node.node_id, repo_id)? {
+        // A memory that was condemned or quarantined here and has since returned kept its
+        // bindings; give it back the baseline parked with them, ahead of the snapshot read below,
+        // so its author's rebinds since then land instead of being recorded as applied. Done here,
+        // on a pass that carries anchors, rather than on the insert: a memory can return ahead of
+        // its anchors, and a baseline restored then would be consumed with nothing to act on it.
+        let returned = restore_parked_anchor_baseline(tx, repo_id, &node.node_id)?;
         // A memory created here takes a published set by the same provenance rules as a synced one
         // once its author is known: this account's own set only fills an empty memory and brings
         // its hash (a sibling device's rebind reaches this one's rows through `anchors/1`, but the
@@ -490,7 +496,10 @@ fn drain_node(
         // known it only ever seeds.
         let changed = match applied_snapshot(tx, repo_id, &node.node_id)? {
             Some(applied) if !applied.local || node.anchors_author.is_some() =>
-                apply_published_anchors(tx, repo_id, node, local_account, applied)?,
+                apply_published_anchors(tx, repo_id, node, local_account, AppliedSnapshot {
+                    returned,
+                    ..applied
+                })?,
             _ => seed_node_anchors(tx, repo_id, node)? > 0,
         };
         if changed {
@@ -634,6 +643,11 @@ struct AppliedSnapshot {
     /// What that set named for each symbol anchor (see [`encode_applied_targets`]); NULL until a
     /// set is applied.
     targets: Option<String>,
+    /// Whether the row was materialized again this pass with a parked baseline restored (see
+    /// [`restore_parked_anchor_baseline`]): the set last applied is known, but the hash beside it
+    /// is the one the row carried away, so the stamp is reconsidered whatever the author published
+    /// since — a hash withdrawn while the memory was away must not come back with it.
+    returned: bool,
 }
 
 fn applied_snapshot(
@@ -653,6 +667,7 @@ fn applied_snapshot(
                 digest: row.get(0)?,
                 hash: row.get(1)?,
                 targets: row.get(2)?,
+                returned: false,
             })
         },
     )
@@ -714,8 +729,8 @@ fn apply_published_anchors(
     let held = super::authoring::portable_anchors_of(tx, &node.node_id)?;
     // A memory holding no binding takes the published set whether or not it changed: an author
     // cannot publish an unbinding (a rebind needs a target), so an empty memory under a recorded
-    // set lost its rows some other way — a sibling device's quarantine or re-point removing them
-    // through `anchors/1` — and seeding into that vacuum is what heals it.
+    // set lost its rows some other way — a sibling device's re-point, or an older binary's
+    // removal, reaching it through `anchors/1` — and seeding into that vacuum is what heals it.
     if held.is_empty() && !set_changed {
         changed |= converge_bindings(tx, repo_id, &node.node_id, anchors, &held, None, &[])?;
     }
@@ -799,8 +814,10 @@ fn apply_published_anchors(
     // Reconsidered when the SET changes, not only the hash: a new set can give an unchanged hash
     // its first binding. A memory bound only to a chunk (never seeded here) takes no stamp, and a
     // rebind to the symbol over the same text republishes the same hash — gating on the hash alone
-    // would leave that memory without one for good.
-    if set_changed || published != applied.hash.as_deref() {
+    // would leave that memory without one for good. A memory materialized again with its parked
+    // baseline is reconsidered too: the hash on it is the one it carried away, whether or not the
+    // author still publishes one.
+    if set_changed || applied.returned || published != applied.hash.as_deref() {
         // Stamped only beside the author's bindings: every row held must be one the published set
         // names, with the same target. Checked on EVERY pass that would stamp, a hash-only one
         // included — a pull can deliver the author's new hash ahead of its set — and by target,
@@ -1136,8 +1153,11 @@ fn write_node_children(tx: &Transaction<'_>, node_id: &str, tags: &[String]) -> 
 /// (a retro-condemn / revocation vacated it). The `origin='synced'` gate leaves a genuine local
 /// ghost of the same id untouched. Returns the removal count.
 ///
-/// Bindings and the contentless FTS shadow have no parent FK, so both are deleted explicitly before
-/// the parent. The remaining tag / call-path / edge children still cascade.
+/// The contentless FTS shadow has no parent FK, so it is deleted explicitly before the parent; the
+/// tag / call-path / edge children cascade. The bindings are KEPT (see
+/// [`park_anchor_baselines`]): every user-facing reader joins `repo_memories`, so a binding whose
+/// memory is gone is invisible, and deleting it would publish a `Remove` on `anchors/1` to every
+/// device of the account, the ones where the memory is still live included (#1298).
 fn remove_vanished_synced_nodes(
     tx: &Transaction<'_>,
     repo_id: &str,
@@ -1152,12 +1172,7 @@ fn remove_vanished_synced_nodes(
         repo_id,
         stream.to_bytes().as_slice()
     ])?;
-    tx.execute(
-        &format!(
-            "DELETE FROM repo_memory_bindings WHERE repo_id = ?1 AND memory_id IN ({CONDEMNED})"
-        ),
-        params![repo_id, stream.to_bytes().as_slice()],
-    )?;
+    park_anchor_baselines(tx, CONDEMNED, params![repo_id, stream.to_bytes().as_slice()])?;
     let removed = tx.execute(
         "DELETE FROM repo_memories
          WHERE repo_id = ?1 AND origin = 'synced'
@@ -1168,8 +1183,8 @@ fn remove_vanished_synced_nodes(
 }
 
 /// Drop an existing `origin='synced'` mirror of `node_id` under `repo_id` (FTS shadow first — it
-/// has no FK to cascade; bindings are also deleted explicitly, while the other children cascade).
-/// Used
+/// has no FK to cascade; the other children cascade, and the bindings are KEPT with their baseline
+/// parked, as [`remove_vanished_synced_nodes`] keeps them). Used
 /// when a projected UPDATE to an already-materialized synced row fails the local validity gates:
 /// the accepted value cannot be persisted, but the STALE prior value must not stay searchable
 /// either (it is no longer the projection, so [`remove_vanished_synced_nodes`] — which only fires
@@ -1189,9 +1204,9 @@ fn remove_quarantined_synced_node(
              SELECT id FROM repo_memories WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced')",
         params![node_id, repo_id],
     )?;
-    tx.execute(
-        "DELETE FROM repo_memory_bindings WHERE repo_id = ?2 AND memory_id IN (
-             SELECT id FROM repo_memories WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced')",
+    park_anchor_baselines(
+        tx,
+        "SELECT id FROM repo_memories WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced'",
         params![node_id, repo_id],
     )?;
     let removed = tx.execute(
@@ -1199,6 +1214,70 @@ fn remove_quarantined_synced_node(
         params![node_id, repo_id],
     )?;
     Ok(removed > 0)
+}
+
+/// Park the applied-anchor baseline of every memory `condemned` selects (a `SELECT id` over
+/// `repo_memories`, taking `params`), ahead of deleting their rows. The bindings those rows leave
+/// behind replicate on `anchors/1` and stay; the baseline — which set the drain last applied, and
+/// what that set named per anchor — lived on the row, and without it a returning memory would take
+/// its held bindings for the published set and never converge on a rebind made while it was away.
+/// The memory's own `source_text_hash` is parked with it: the stamp lands only beside bindings that
+/// match the published set by target, so a row relocated here would return without one for good.
+/// The applied HASH is deliberately left behind: the returning row reads it as absent, which is
+/// what makes [`apply_published_anchors`] run the stamp again (the INSERT leaves the column
+/// `NULL`) — on a return with the set unchanged included, where nothing else would. Only a memory
+/// with an applied set has anything to park.
+fn park_anchor_baselines(
+    tx: &Transaction<'_>,
+    condemned: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> anyhow::Result<()> {
+    tx.execute(
+        &format!(
+            "INSERT OR REPLACE INTO repo_memory_parked_baselines(
+                 repo_id, memory_id, anchors_applied_digest, anchors_applied_targets,
+                 source_text_hash)
+             SELECT repo_id, id, anchors_applied_digest, anchors_applied_targets, source_text_hash
+               FROM repo_memories
+              WHERE id IN ({condemned}) AND anchors_applied_digest IS NOT NULL"
+        ),
+        params,
+    )?;
+    Ok(())
+}
+
+/// Give a synced memory the drain has materialized again the baseline parked when its row was
+/// removed, so `apply_published_anchors` sees the set it last applied and converges the kept
+/// bindings on what its author published since. Returns whether one was restored; a memory never
+/// parked is left as it is. The `origin='synced'` gate leaves a local row of the same id — the
+/// ghost the removal itself steps around — without a baseline that was never its own; its parked
+/// row waits for the repo purge. A rebind made here between the memory's return and the pass that
+/// carries its anchors has its hash overwritten by the parked one for that pass alone: the set the
+/// rebind published is this account's own, and its next fold stamps the hash back.
+fn restore_parked_anchor_baseline(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    memory_id: &str,
+) -> anyhow::Result<bool> {
+    const PARKED: &str = "FROM repo_memory_parked_baselines p
+         WHERE p.memory_id = repo_memories.id AND p.repo_id = repo_memories.repo_id";
+    let restored = tx.execute(
+        &format!(
+            "UPDATE repo_memories
+                SET anchors_applied_digest = (SELECT p.anchors_applied_digest {PARKED}),
+                    anchors_applied_targets = (SELECT p.anchors_applied_targets {PARKED}),
+                    source_text_hash = (SELECT p.source_text_hash {PARKED})
+              WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced' AND EXISTS (SELECT 1 {PARKED})"
+        ),
+        params![memory_id, repo_id],
+    )?;
+    if restored > 0 {
+        tx.execute(
+            "DELETE FROM repo_memory_parked_baselines WHERE memory_id = ?1 AND repo_id = ?2",
+            params![memory_id, repo_id],
+        )?;
+    }
+    Ok(restored > 0)
 }
 
 /// Whether a projected edge's DURABLE spec passes the SAME length caps the local `add_edge` write
@@ -3705,6 +3784,274 @@ mod tests {
             memory_by_id(&conn, "mem_local").unwrap().is_some(),
             "a local row of an absent id survives the origin gate",
         );
+    }
+
+    /// Removing a condemned synced memory keeps its bindings: they replicate on `anchors/1`, and a
+    /// delete would publish a `Remove` to every device of the account, the ones where the memory
+    /// is still live included. The applied-anchor baseline the row carried is parked with them, so
+    /// when the memory returns a rebind its author published while it was away lands rather than
+    /// being recorded as already applied (#1298).
+    #[test]
+    fn a_condemned_memory_keeps_its_bindings_and_takes_a_rebind_published_while_away() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
+        let publish = |symbol_kind: &str| {
+            seed_projected_node_with_anchors(
+                &conn,
+                stream,
+                "mem_peer",
+                Some(&[("symbol", "src/lib.rs::Run")]),
+            );
+            set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", symbol_kind);
+            set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+            set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        };
+        publish("struct");
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(binding_of(&conn, "mem_peer"), Some((Some("struct".to_string()), None)));
+        assert_eq!(source_hash_of(&conn, "mem_peer").as_deref(), Some(HASH_A));
+
+        // Retro-condemned: the projection row vanishes, and the mirror goes with it.
+        conn.execute("DELETE FROM content_projected_nodes WHERE node_id = 'mem_peer'", []).unwrap();
+        let outcome = drain_worker(&conn, stream, 2_000);
+        assert_eq!(outcome.nodes_removed, 1);
+        assert!(memory_by_id(&conn, "mem_peer").unwrap().is_none(), "the row is removed");
+        assert!(!fts_row_exists(&conn, "mem_peer"), "and its FTS shadow with it");
+        assert_eq!(
+            binding_of(&conn, "mem_peer"),
+            Some((Some("struct".to_string()), None)),
+            "the binding stays, for anchors/1 to carry",
+        );
+        assert!(parked_digest(&conn, "mem_peer").is_some(), "the baseline is parked");
+
+        // The author rebinds to the impl while the memory is away; then the memory returns.
+        publish("impl");
+        drain_worker(&conn, stream, 3_000);
+        assert!(memory_by_id(&conn, "mem_peer").unwrap().is_some(), "the memory is back");
+        assert_eq!(
+            binding_of(&conn, "mem_peer"),
+            Some((
+                Some("impl".to_string()),
+                Some(rag_rat_query::memory::RETARGETED_REASON.to_string())
+            )),
+            "the rebind published while it was away lands as a retarget",
+        );
+        assert_eq!(
+            source_hash_of(&conn, "mem_peer").as_deref(),
+            Some(HASH_A),
+            "and the published hash is stamped beside it again",
+        );
+        assert!(parked_digest(&conn, "mem_peer").is_none(), "the parked baseline is consumed");
+    }
+
+    /// The quarantine removal — a peer's accepted edit failing local validation — keeps the
+    /// bindings and parks the baseline the same way. Here the memory returns with its set
+    /// UNCHANGED: nothing is retargeted, and the published hash — which the insert leaves off the
+    /// returning row — is stamped beside the kept binding again rather than counted as applied.
+    #[test]
+    fn a_quarantined_memory_keeps_its_bindings_and_converges_when_it_returns_valid() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
+        let publish = || {
+            seed_projected_node_with_anchors(
+                &conn,
+                stream,
+                "mem_peer",
+                Some(&[("symbol", "src/lib.rs::Run")]),
+            );
+            set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "struct");
+            set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+            set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        };
+        publish();
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(source_hash_of(&conn, "mem_peer").as_deref(), Some(HASH_A));
+
+        conn.execute(
+            "UPDATE content_projected_nodes
+             SET content_json = json_set(content_json, '$.kind', 'NotAValidKind')
+             WHERE node_id = 'mem_peer'",
+            [],
+        )
+        .unwrap();
+        let outcome = drain_worker(&conn, stream, 2_000);
+        assert_eq!(outcome.nodes_removed, 1, "the stale mirror is removed");
+        assert_eq!(binding_of(&conn, "mem_peer"), Some((Some("struct".to_string()), None)));
+        assert!(parked_digest(&conn, "mem_peer").is_some());
+
+        // Valid again, the set as it was.
+        publish();
+        drain_worker(&conn, stream, 3_000);
+        assert!(memory_by_id(&conn, "mem_peer").unwrap().is_some());
+        assert_eq!(
+            binding_of(&conn, "mem_peer"),
+            Some((Some("struct".to_string()), None)),
+            "an unchanged set retargets nothing",
+        );
+        assert_eq!(
+            source_hash_of(&conn, "mem_peer").as_deref(),
+            Some(HASH_A),
+            "the hash is stamped again on a return with the set unchanged",
+        );
+        assert!(parked_digest(&conn, "mem_peer").is_none());
+    }
+
+    /// A binding relocated here — the validate loop rewrote its qualified name — no longer matches
+    /// the published set by target, so the stamp is refused on its return; the hash it carried
+    /// comes back with the parked baseline instead of being lost.
+    #[test]
+    fn a_relocated_binding_keeps_its_source_hash_across_removal() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
+        let publish = || {
+            seed_projected_node_with_anchors(
+                &conn,
+                stream,
+                "mem_peer",
+                Some(&[("symbol", "src/lib.rs::Run")]),
+            );
+            set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+            set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        };
+        publish();
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(source_hash_of(&conn, "mem_peer").as_deref(), Some(HASH_A));
+        conn.execute(
+            "UPDATE repo_memory_bindings SET binding_id = 'src/lib.rs::Moved'
+             WHERE memory_id = 'mem_peer'",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM content_projected_nodes WHERE node_id = 'mem_peer'", []).unwrap();
+        drain_worker(&conn, stream, 2_000);
+        assert!(memory_by_id(&conn, "mem_peer").unwrap().is_none());
+
+        publish();
+        drain_worker(&conn, stream, 3_000);
+        let binding_id: String = conn
+            .query_row(
+                "SELECT binding_id FROM repo_memory_bindings WHERE memory_id = 'mem_peer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(binding_id, "src/lib.rs::Moved", "an unchanged set leaves the relocation");
+        assert_eq!(
+            source_hash_of(&conn, "mem_peer").as_deref(),
+            Some(HASH_A),
+            "the hash the row carried survives the removal",
+        );
+    }
+
+    /// A memory can return ahead of its anchors — a revocation vacates content and set together,
+    /// and a new author's content can fold before their set does. The parked baseline waits for
+    /// the pass that carries anchors, and the rebind lands then.
+    #[test]
+    fn a_memory_returning_ahead_of_its_anchors_converges_when_they_arrive() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
+        let publish = |symbol_kind: &str| {
+            seed_projected_node_with_anchors(
+                &conn,
+                stream,
+                "mem_peer",
+                Some(&[("symbol", "src/lib.rs::Run")]),
+            );
+            set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", symbol_kind);
+            set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        };
+        publish("struct");
+        drain_worker(&conn, stream, 1_000);
+
+        conn.execute("DELETE FROM content_projected_nodes WHERE node_id = 'mem_peer'", []).unwrap();
+        drain_worker(&conn, stream, 2_000);
+        assert!(parked_digest(&conn, "mem_peer").is_some());
+
+        // Content only, no anchors yet: the memory is back, the baseline stays parked.
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", None);
+        drain_worker(&conn, stream, 3_000);
+        assert!(memory_by_id(&conn, "mem_peer").unwrap().is_some());
+        assert!(parked_digest(&conn, "mem_peer").is_some(), "nothing to act on it yet");
+        assert_eq!(binding_of(&conn, "mem_peer"), Some((Some("struct".to_string()), None)));
+
+        publish("impl");
+        drain_worker(&conn, stream, 4_000);
+        assert_eq!(
+            binding_of(&conn, "mem_peer"),
+            Some((
+                Some("impl".to_string()),
+                Some(rag_rat_query::memory::RETARGETED_REASON.to_string())
+            )),
+            "the rebind lands on the pass that carries the anchors",
+        );
+        assert!(parked_digest(&conn, "mem_peer").is_none());
+    }
+
+    /// The hash comes back with the parked baseline, but not past its author: a memory returning
+    /// with its set unchanged and the hash withdrawn meanwhile is reconsidered and cleared, as a
+    /// live memory would be on the withdrawal. The content returns a pass ahead of the anchors:
+    /// the reconsideration belongs to the pass that carries them, whichever that is.
+    #[test]
+    fn a_hash_withdrawn_while_a_memory_was_away_does_not_return_with_it() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
+        let publish = |hash: Option<&str>| {
+            seed_projected_node_with_anchors(
+                &conn,
+                stream,
+                "mem_peer",
+                Some(&[("symbol", "src/lib.rs::Run")]),
+            );
+            set_projected_source_hash(&conn, stream, "mem_peer", hash);
+            set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        };
+        publish(Some(HASH_A));
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(source_hash_of(&conn, "mem_peer").as_deref(), Some(HASH_A));
+
+        conn.execute("DELETE FROM content_projected_nodes WHERE node_id = 'mem_peer'", []).unwrap();
+        drain_worker(&conn, stream, 2_000);
+
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", None);
+        drain_worker(&conn, stream, 3_000);
+        publish(None);
+        drain_worker(&conn, stream, 4_000);
+        assert!(memory_by_id(&conn, "mem_peer").unwrap().is_some());
+        assert_eq!(
+            source_hash_of(&conn, "mem_peer"),
+            None,
+            "the withdrawn hash does not come back with the baseline",
+        );
+    }
+
+    /// `(symbol_kind, relocation_reason)` of a memory's one binding, or `None` without one.
+    fn binding_of(conn: &Connection, memory_id: &str) -> Option<(Option<String>, Option<String>)> {
+        conn.query_row(
+            "SELECT symbol_kind, relocation_reason FROM repo_memory_bindings
+             WHERE memory_id = ?1",
+            [memory_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    /// The digest parked for a removed memory, or `None` when nothing is parked.
+    fn parked_digest(conn: &Connection, memory_id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT anchors_applied_digest FROM repo_memory_parked_baselines WHERE memory_id = ?1",
+            [memory_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .unwrap()
+        .flatten()
     }
 
     /// A projected edge carrying a PEER's `Rebind` resolution must NOT import it: the durable

@@ -110,6 +110,9 @@ const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
     "repo_memories",
     "repo_memory_bindings",
     "repo_memory_fts",
+    // The baseline the drain parks for a removed synced memory (#1298), keyed by the memory it
+    // belongs to; it follows the memories wherever their repo id goes.
+    "repo_memory_parked_baselines",
     // Dream-v2 siblings — repo_id-scoped like `dream_findings`; a LocalOnly→Portable adoption
     // must re-point their rows too. Guarded by `column_exists` in the re-point loop, so an older
     // partial-schema fixture (table/column absent) is a no-op.
@@ -675,9 +678,10 @@ fn acquire_dual_repo_locks(
 }
 
 /// The direct-scoped tables whose rows the LATE-upgrade merge DELETES under the retiring `local:`
-/// id (its DERIVED data): the A5 periphery list minus 7 entries. Four are AUTHORED and are MOVED
-/// onto the target id instead — `repo_memories`, `repo_memory_bindings`, `repo_memory_fts`, and
-/// `repo_node_edges`. The remaining three are the dream-v2 verification siblings
+/// id (its DERIVED data): the A5 periphery list minus 8 entries. Five are AUTHORED and are MOVED
+/// onto the target id instead — `repo_memories`, `repo_memory_bindings`, `repo_memory_fts`,
+/// `repo_memory_parked_baselines`, and `repo_node_edges`. The remaining three are the dream-v2
+/// verification siblings
 /// (`memory_reality`, `memory_summaries`, `memory_model_failures`): this merge neither moves nor
 /// deletes them (parked pending a ruling — see `LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED`).
 /// Children fall via `ON DELETE CASCADE` (`clone_edges`/`clone_subblock_postings` off
@@ -725,12 +729,15 @@ fn late_upgrade_is_proven(
 /// paths/commits — and a wholesale re-point would collide on the widened UNIQUE keys and the
 /// generation axis. So the merge takes the consolidate-shaped split:
 ///
-///  * AUTHORED data MOVES: `repo_memories` (+ bindings / FTS mirror) re-point to `target_id` — the
-///    memory `id` is the bare PK, so a re-point can never collide. The bindings' LOCAL rowid
-///    columns and the call-paths' logical-symbol endpoints are NULLed (they reference the retiring
-///    id's derived rows, deleted below); the validate loop re-resolves them from the portable
-///    anchor after the next index pass — exactly the consolidate posture. Tags/call-paths follow
-///    via `memory_id`.
+///  * AUTHORED data MOVES: `repo_memories` (+ bindings / FTS mirror / parked baselines) re-point to
+///    `target_id` — the memory `id` is the bare PK, so a memory re-point never collides. A binding
+///    can outlive its memory (the drain keeps a removed synced memory's bindings for `anchors/1` to
+///    carry), so the SAME binding may sit under both ids; the owner's row wins (`UPDATE OR
+///    REPLACE`), as the parked baseline does — an arbitrary but safe pick, since both rows are the
+///    same portable anchor and the rest is re-derived. The bindings' LOCAL rowid columns and the
+///    call-paths' logical-symbol endpoints are NULLed (they reference the retiring id's derived
+///    rows, deleted below); the validate loop re-resolves them from the portable anchor after the
+///    next index pass — exactly the consolidate posture. Tags/call-paths follow via `memory_id`.
 ///  * DERIVED data is DROPPED, not migrated: files (cascading chunks/symbols/edges), git history,
 ///    papertrail, clones, oracle, reconcile, dream rows under `owner` are deleted — a fresh index
 ///    of this root re-derives them under `target_id`, and the carried `embedding_cache`
@@ -789,8 +796,8 @@ fn merge_local_incumbent_into_registered(
         [owner],
     )?;
     tx.execute(
-        "UPDATE main.repo_memory_bindings SET repo_id = ?1, logical_symbol_id = NULL, symbol_id = \
-         NULL, chunk_id = NULL, edge_id = NULL WHERE repo_id = ?2",
+        "UPDATE OR REPLACE main.repo_memory_bindings SET repo_id = ?1, logical_symbol_id = NULL, \
+         symbol_id = NULL, chunk_id = NULL, edge_id = NULL WHERE repo_id = ?2",
         params![identity.repo_id, owner],
     )?;
     tx.execute("UPDATE main.repo_memories SET repo_id = ?1 WHERE repo_id = ?2", params![
@@ -802,6 +809,21 @@ fn merge_local_incumbent_into_registered(
             identity.repo_id,
             owner
         ])?;
+    }
+    // The baselines the drain parked for removed synced memories (#1298) move with the memories
+    // they belong to. The key is `(repo_id, memory_id)`, so a memory parked under BOTH ids keeps
+    // the owner's. Guarded for a partial-schema fixture.
+    if adoption_table_present(&tx, "repo_memory_parked_baselines")? {
+        tx.execute(
+            "INSERT OR REPLACE INTO main.repo_memory_parked_baselines(
+                 repo_id, memory_id, anchors_applied_digest, anchors_applied_targets,
+                 source_text_hash)
+             SELECT ?1, memory_id, anchors_applied_digest, anchors_applied_targets,
+                    source_text_hash
+               FROM main.repo_memory_parked_baselines WHERE repo_id = ?2",
+            params![identity.repo_id, owner],
+        )?;
+        tx.execute("DELETE FROM main.repo_memory_parked_baselines WHERE repo_id = ?1", [owner])?;
     }
     // Node edges (#464) are AUTHORED — move the owner's edges onto the target id, else they orphan
     // under a `repo_id` whose `repos` row is about to be deleted (no FK cascades them). Re-point
@@ -1475,6 +1497,11 @@ mod repo_id_scope_coverage {
         ),
         ("repo_memory_fts", "AUTHORED: the memories' FTS mirror, moved with them"),
         (
+            "repo_memory_parked_baselines",
+            "AUTHORED: the baselines parked for removed synced memories, moved with them; a \
+             memory parked under both ids keeps the owner's",
+        ),
+        (
             "repo_node_edges",
             "AUTHORED: explicitly moved — owner `repo_id` plus any SAME-repo `target_repo_id` (a \
              cross-repo target names a sibling and stays)",
@@ -1531,7 +1558,7 @@ mod repo_id_scope_coverage {
     /// Floor on the number of `repo_id`-scoped tables [`scoped_tables`] must see — a bootstrap that
     /// produced a near-empty schema would enumerate nothing, and "every enumerated table is
     /// declared" is vacuously true over an empty set: the coverage tests would go green precisely
-    /// when they check nothing. The live count is 50, so the floor leaves room for a retired table
+    /// when they check nothing. The live count is 51, so the floor leaves room for a retired table
     /// without going soft.
     const MIN_REPO_SCOPED_TABLES: usize = 40;
 
