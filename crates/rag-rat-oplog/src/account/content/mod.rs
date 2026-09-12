@@ -61,6 +61,7 @@ pub(super) use storage::{
     ContentPromotionOutcome, accepted_chain_tails, accepted_entry_at, affected_streams_for_account,
     finalize_affected_streams, promote_pre_verify_for_account, queue_account_changed_streams,
 };
+pub use storage::{CreatedContent, content_created_by};
 // The phase-D (#406) content sync read seams: offer the account's own /3 candidates to a peer
 // and dedup received ones by signed-envelope hash. Consumed by the transport crate's content
 // SyncStore, so these are plain (un-frozen) re-exports.

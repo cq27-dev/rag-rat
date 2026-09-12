@@ -2929,6 +2929,108 @@ fn relayed_content_entries(
         .collect()
 }
 
+/// What one account created in the `/3` content this store accepted: the node ids its
+/// `NodeCreate` ops name and the edge keys its `EdgeAdd` ops add. A memory belongs to the account
+/// that created it, whichever device materialized it here, so this is what a consolidation checks
+/// before signing a synced row as the target account's own (#1284). Sealed entries are opened with
+/// this store's historical keyring for their stream, the same way the projection opens them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CreatedContent {
+    pub nodes: std::collections::HashSet<String>,
+    pub edges: std::collections::HashSet<String>,
+    /// Every node an op by this author touches: the nodes its `NodeCreate`, `NodeUpdate`,
+    /// `NodeStatus`, `NodeAnchors` and `NodeSourceHash` ops name, and the source of each edge its
+    /// `EdgeAdd` ops add. A caller that drops a node can tell whether it drops this author's work.
+    pub touched: std::collections::HashSet<String>,
+    /// Entries by this author that this store cannot read: sealed with no key for them here, or
+    /// undecodable. Their ops are unknown, so a caller that must account for everything the author
+    /// created refuses on a nonzero count rather than guess.
+    pub unreadable: usize,
+}
+
+/// The [`CreatedContent`] of `author_account_id` in this store's accepted `/3` content.
+pub fn content_created_by(
+    conn: &Connection,
+    author_account_id: AccountId,
+) -> anyhow::Result<CreatedContent> {
+    let mut stmt = conn.prepare(
+        "SELECT signed_bytes FROM content_entries WHERE author_account_id = ?1 AND accepted = 1",
+    )?;
+    let rows = stmt
+        .query_map(params![author_account_id.to_bytes().as_slice()], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let device = crate::load_local_device(conn)?;
+    let mut keyrings: HashMap<StreamId, Option<crate::account::ContentKeyring>> = HashMap::new();
+    let mut created = CreatedContent::default();
+    for signed_bytes in rows {
+        let Ok(entry) = envelope::decode_content_signed(&signed_bytes) else {
+            created.unreadable += 1;
+            continue;
+        };
+        let plaintext;
+        let op_bytes = match entry.header.crypto_suite {
+            0 => entry.payload.as_slice(),
+            1 => {
+                let stream = entry.header.stream_id;
+                if let std::collections::hash_map::Entry::Vacant(slot) = keyrings.entry(stream) {
+                    let owner = account_storage::stream_owner_account(conn, stream)?;
+                    slot.insert(match (owner, device.as_ref()) {
+                        (Some(owner), Some(device)) =>
+                            Some(crate::account::historical_content_keyring(
+                                conn, owner, stream, device,
+                            )?),
+                        _ => None,
+                    });
+                }
+                let opened = entry
+                    .header
+                    .key_id
+                    .and_then(|key_id| {
+                        keyrings[&stream].as_ref()?.get(crate::KeyId::from_bytes(key_id))
+                    })
+                    .and_then(|key| {
+                        envelope::open_sealed_payload(key, &entry.payload, &entry.header_bytes).ok()
+                    });
+                let Some(opened) = opened else {
+                    created.unreadable += 1;
+                    continue;
+                };
+                plaintext = opened;
+                plaintext.as_slice()
+            },
+            _ => {
+                created.unreadable += 1;
+                continue;
+            },
+        };
+        match crate::op::decode(op_bytes) {
+            Ok(crate::op::DecodedOp::Known(crate::op::MemoryOp::NodeCreate {
+                node_id, ..
+            })) => {
+                created.touched.insert(node_id.as_str().to_string());
+                created.nodes.insert(node_id.as_str().to_string());
+            },
+            Ok(crate::op::DecodedOp::Known(
+                crate::op::MemoryOp::NodeUpdate { node_id, .. }
+                | crate::op::MemoryOp::NodeStatus { node_id, .. }
+                | crate::op::MemoryOp::NodeAnchors { node_id, .. }
+                | crate::op::MemoryOp::NodeSourceHash { node_id, .. },
+            )) => {
+                created.touched.insert(node_id.as_str().to_string());
+            },
+            Ok(crate::op::DecodedOp::Known(crate::op::MemoryOp::EdgeAdd { edge })) => {
+                created.touched.insert(edge.source_node_id.as_str().to_string());
+                created.edges.insert(edge.edge_key().as_str().to_string());
+            },
+            Ok(_) => {},
+            Err(_) => created.unreadable += 1,
+        }
+    }
+    Ok(created)
+}
+
 fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
     bytes.try_into().map_err(|_| anyhow::anyhow!("expected {N} bytes, got {}", bytes.len()))
 }
