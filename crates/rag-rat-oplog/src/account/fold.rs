@@ -241,8 +241,15 @@ pub enum AuthorityQuery<T> {
 pub enum AuthorityFreshness {
     /// The author cites a control log no longer than the one we hold.
     CurrentOrBehind,
-    /// The author cites effective ops we have not folded yet.
+    /// The author cites a control log longer than the one we hold.
     Ahead,
+}
+
+impl AuthorityFreshness {
+    /// A cited control-log length measured against a held log of `held` rows.
+    pub fn of(asserted_auth_len: u64, held: u64) -> Self {
+        if asserted_auth_len > held { Self::Ahead } else { Self::CurrentOrBehind }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

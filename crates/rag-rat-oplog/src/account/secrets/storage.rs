@@ -329,7 +329,7 @@ fn resolve_secrets_entries(
 struct Caches {
     owner: HashMap<(EntryHash, crate::op::DeviceFingerprint), AuthorityQuery<OwnerChainAuthority>>,
     ownership: HashMap<crate::stream::StreamId, AuthorityQuery<EntryHash>>,
-    freshness: HashMap<u64, AuthorityFreshness>,
+    held_control_log: Option<u64>,
 }
 
 /// Resolve one entry to its `WrapFacts` — `None` when the entry is NOT an evaluable `StreamKeyWrap`
@@ -386,14 +386,15 @@ fn secrets_facts(
     } else {
         None
     };
-    let state = match caches.freshness.get(&header.auth_len) {
-        Some(cached) => *cached,
+    let held = match caches.held_control_log {
+        Some(held) => held,
         None => {
-            let state = storage::auth_len_freshness(tx, account_id, header.auth_len)?;
-            caches.freshness.insert(header.auth_len, state);
-            state
+            let held = storage::held_control_log_len(tx, account_id)?;
+            caches.held_control_log = Some(held);
+            held
         },
     };
+    let state = AuthorityFreshness::of(header.auth_len, held);
     Ok((
         Some(WrapFacts {
             authority_ref: header.authority_ref,

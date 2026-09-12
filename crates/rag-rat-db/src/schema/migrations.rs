@@ -6720,6 +6720,53 @@ mod syncable_overlay_migration_tests {
         assert_eq!(rows, vec![(vec![0x41; 32], 3, 7), (vec![0x42; 32], 1, 0)]);
     }
 
+    /// V121 queues every stream that holds content for a refold, ORing into an existing queue row,
+    /// and is idempotent on replay (#1282). The all-account refold it also triggers is a hook,
+    /// exercised in the op-log crate.
+    #[test]
+    fn v121_queues_every_content_stream_for_a_refold() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        for (entry, stream) in [([0x31_u8; 32], [0x41_u8; 32]), ([0x32; 32], [0x42; 32])] {
+            conn.execute(
+                "INSERT INTO content_entries(
+                     entry_hash, stream_id, author_account_id, device_fingerprint, seq,
+                     prev_hash, grant_id, roster_ref, owner_auth_len, author_auth_len,
+                     accepted, signed_bytes, received_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?5, ?5, 1, x'00', 0)",
+                rusqlite::params![
+                    entry.as_slice(),
+                    stream.as_slice(),
+                    [0x11_u8; 32].as_slice(),
+                    [0x12_u8; 32].as_slice(),
+                    0_u64.to_be_bytes().as_slice(),
+                    [0x13_u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO content_streams_pending_refold(
+                 stream_id, reason_mask, first_enqueued_at_ms, last_enqueued_at_ms)
+             VALUES(?1, 2, 7, 7)",
+            [[0x41_u8; 32].as_slice()],
+        )
+        .unwrap();
+        super::apply_refold_for_held_control_log_freshness(&conn).unwrap();
+        super::apply_refold_for_held_control_log_freshness(&conn).unwrap();
+        let rows: Vec<(Vec<u8>, i64, i64)> = conn
+            .prepare(
+                "SELECT stream_id, reason_mask, first_enqueued_at_ms
+                 FROM content_streams_pending_refold ORDER BY stream_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![(vec![0x41; 32], 3, 7), (vec![0x42; 32], 1, 0)]);
+    }
+
     /// V114 adds the nullable denormalized lamport column and its partial accepted-rows index,
     /// and is idempotent on replay. The backfill itself is a hook (the lamport lives in the
     /// signed CBOR envelope), exercised in the op-log crate; with noop hooks the column simply
@@ -8421,6 +8468,27 @@ pub(crate) fn apply_refold_account_authority_projections(
     _conn: &Connection,
 ) -> rusqlite::Result<()> {
     Ok(())
+}
+
+/// V121 (#1282): re-judge persisted verdicts once freshness measures a cited control-log length
+/// against the held log instead of the effective count.
+///
+/// Freshness is re-derived only when a stream or an account refolds. Content an older binary parked
+/// `auth_len_ahead` after a cut lowered its author's effective count — and whose memories the drain
+/// then removed — would otherwise stay parked until unrelated entries arrived. Queue every stream
+/// that holds content for the next settle (the V113 shape: mask 1, zero timestamps so they settle
+/// first, ORed into an existing queue row). `apply_and_record_migration` also runs the all-account
+/// refold hook for this id, which re-judges secrets-log wraps parked the same way.
+pub(crate) fn apply_refold_for_held_control_log_freshness(
+    conn: &Connection,
+) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "INSERT INTO content_streams_pending_refold(
+             stream_id, reason_mask, first_enqueued_at_ms, last_enqueued_at_ms)
+         SELECT DISTINCT stream_id, 1, 0, 0 FROM content_entries WHERE true
+         ON CONFLICT(stream_id) DO UPDATE SET
+             reason_mask = content_streams_pending_refold.reason_mask | 1;",
+    )
 }
 
 /// V116 (#1179): rebuild `sync_invites` for cross-account WRITER invites.

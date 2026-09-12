@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 120;
+pub const LATEST_SCHEMA_VERSION: u32 = 121;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -866,6 +866,12 @@ const MIGRATION_120_DESCRIPTION: &str =
      signature that set named for each symbol anchor, to tell a retarget from a republish. Add \
      content_projected_nodes.anchors_author, the account that authored each node's winning anchor \
      set, so the drain leaves a set its own account's anchors/1 carries to that carrier";
+const MIGRATION_121_ID: &str = "121_refold_for_held_control_log_freshness";
+const MIGRATION_121_CHECKSUM: &str = "sha256:rag-rat-refold-for-held-control-log-freshness-v121";
+const MIGRATION_121_DESCRIPTION: &str =
+    "Queue every /3 content stream for an acceptance refold and refold every account, so content \
+     and secrets-log wraps parked auth_len_ahead after a cut lowered the cited account's \
+     effective count are re-judged against the held control log (#1282)";
 const MIGRATION_118_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-v118";
 const MIGRATION_118_DESCRIPTION: &str =
     "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
@@ -1135,6 +1141,7 @@ const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[
     MIGRATION_113_ID,
     MIGRATION_114_ID,
     MIGRATION_115_ID,
+    MIGRATION_121_ID,
 ];
 
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
@@ -1154,8 +1161,14 @@ fn apply_and_record_migration(
     // The account refold is the projection migrations' own requirement, not the ledger's: it
     // rebuilds what V064 creates/V065 bounds and projects V099's newly-known secrets artifact, off
     // a domain builder this crate cannot link.
-    if matches!(step.id, MIGRATION_064_ID | MIGRATION_065_ID | MIGRATION_099_ID | MIGRATION_115_ID)
-    {
+    if matches!(
+        step.id,
+        MIGRATION_064_ID
+            | MIGRATION_065_ID
+            | MIGRATION_099_ID
+            | MIGRATION_115_ID
+            | MIGRATION_121_ID
+    ) {
         // The hook runs the CURRENT fold, so it writes whatever columns today's projector writes —
         // not the ones that existed when the migration was written. A refold step therefore depends
         // on the projection's final shape even though its own body says nothing about it, and a
@@ -1884,6 +1897,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_120_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_memory_applied_anchor_snapshot),
     },
+    Migration {
+        id: MIGRATION_121_ID,
+        checksum: MIGRATION_121_CHECKSUM,
+        description: MIGRATION_121_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_refold_for_held_control_log_freshness),
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -2119,6 +2138,7 @@ mod ledger_atomicity {
         MIGRATION_113_ID,
         MIGRATION_114_ID,
         MIGRATION_115_ID,
+        MIGRATION_121_ID,
     ];
 
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.
