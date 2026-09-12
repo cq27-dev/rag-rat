@@ -2114,3 +2114,133 @@ async fn an_owner_collects_a_contributors_memory_by_pulling_the_contributors_acc
         .unwrap();
     assert_eq!(accepted, 1, "the contributor's memory reached the owner over the wire, accepted");
 }
+
+/// A session named for an owner carries the logs and content of the accounts that owner granted
+/// (#1280). A relayed entry is admitted once and dedupes by its own signed envelope, so a relaying
+/// session reaches a quiet round; an account the owner never granted is dropped, and so is its
+/// private content.
+#[test]
+fn a_grantors_session_admits_its_grantees_entries_once_and_drops_strangers() {
+    use rag_rat_oplog::{
+        AccessMode, ContentRefoldBudget, MemoryOp, NodeContent, NodeId, SealPolicy,
+        author_content_batch, author_grantee_content_batch_in_tx, author_stream_grant_in_tx,
+        content_entries_for_sync, effective_writer_grant, ensure_owned_stream_v2_with_mode_in_tx,
+        settle_pending_content_refolds,
+    };
+    use rag_rat_sync::{Ingested, OplogContentSyncStore, SyncStore};
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    let note = |id: &str| MemoryOp::NodeCreate {
+        node_id: NodeId::from(id),
+        content: NodeContent {
+            kind: "Invariant".into(),
+            title: id.into(),
+            body: "body".into(),
+            confidence: "high".into(),
+            source: "agent".into(),
+            tags: Vec::new(),
+            payload: None,
+        },
+    };
+    let own_stream = |conn: &Connection, mode: AccessMode| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let stream = ensure_owned_stream_v2_with_mode_in_tx(&tx, "repo-relay", mode, NOW).unwrap();
+        tx.commit().unwrap();
+        stream
+    };
+    let log = |conn: &Connection, account: AccountId| -> Vec<Vec<u8>> {
+        account_entries_for_sync(conn, account)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.signed_bytes)
+            .collect()
+    };
+    let content = |conn: &Connection, account: AccountId| -> Vec<Vec<u8>> {
+        content_entries_for_sync(conn, account)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.signed_bytes)
+            .collect()
+    };
+
+    // OWNER with a public stream (the only kind a grant folds on), granting a contributor Writer.
+    let owner = fresh_db();
+    let owner_account = local_account(&owner, NOW).unwrap();
+    let stream = own_stream(&owner, AccessMode::PublicRead);
+    let contributor = fresh_db();
+    let contributor_account = local_account(&contributor, NOW).unwrap();
+    {
+        let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+        author_stream_grant_in_tx(
+            &tx,
+            stream,
+            contributor_account,
+            rag_rat_oplog::GrantRole::Writer,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    for entry in log(&owner, owner_account) {
+        rag_rat_oplog::account_ingest(&contributor, &entry, NOW).unwrap();
+    }
+    let grant_id = effective_writer_grant(&contributor, owner_account, stream, contributor_account)
+        .unwrap()
+        .expect("the grant reached the contributor");
+    {
+        let tx = Transaction::new_unchecked(&contributor, TransactionBehavior::Immediate).unwrap();
+        author_grantee_content_batch_in_tx(
+            &tx,
+            stream,
+            owner_account,
+            grant_id,
+            &[note("c1")],
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    // A STRANGER the owner never granted, with content on its own stream.
+    let stranger = fresh_db();
+    let stranger_account = local_account(&stranger, NOW).unwrap();
+    let stranger_stream = own_stream(&stranger, AccessMode::Private);
+    author_content_batch(&stranger, stranger_stream, &[note("s1")], SealPolicy::Plaintext, NOW)
+        .unwrap();
+
+    // A receiver that holds the owner's log, syncing a session named for the owner.
+    let receiver = fresh_db();
+    for entry in log(&owner, owner_account) {
+        rag_rat_oplog::account_ingest(&receiver, &entry, NOW).unwrap();
+    }
+    let mut accounts = OplogSyncStore::new(&receiver, owner_account, || NOW);
+    for entry in log(&contributor, contributor_account) {
+        assert_eq!(accounts.ingest(&entry).unwrap(), Ingested::Stored, "the grantee's log lands");
+        assert_eq!(accounts.ingest(&entry).unwrap(), Ingested::NoChange, "and dedupes");
+    }
+    for entry in log(&stranger, stranger_account) {
+        assert_eq!(accounts.ingest(&entry).unwrap(), Ingested::NoChange, "a stranger is dropped");
+    }
+    assert!(account_entries_for_sync(&receiver, stranger_account).unwrap().is_empty());
+
+    let mut contents = OplogContentSyncStore::new(&receiver, owner_account, || NOW);
+    for entry in content(&contributor, contributor_account) {
+        assert_eq!(contents.ingest(&entry).unwrap(), Ingested::Stored, "the contribution lands");
+        assert_eq!(contents.ingest(&entry).unwrap(), Ingested::NoChange, "and dedupes");
+    }
+    for entry in content(&stranger, stranger_account) {
+        assert_eq!(contents.ingest(&entry).unwrap(), Ingested::NoChange, "a stranger is dropped");
+    }
+    settle_pending_content_refolds(&receiver, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+    let accepted: i64 = receiver
+        .query_row(
+            "SELECT COUNT(*) FROM content_entries
+             WHERE stream_id = ?1 AND author_account_id = ?2 AND accepted = 1",
+            rusqlite::params![
+                stream.to_bytes().as_slice(),
+                contributor_account.to_bytes().as_slice()
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(accepted, 1, "the relayed contribution folds accepted on the owner's stream");
+}

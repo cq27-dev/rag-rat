@@ -984,6 +984,25 @@ pub fn effective_writer_grantees(
     Ok(grantees)
 }
 
+/// Whether `owner_account_id` has ever granted `grantee_account_id` a stream — open or closed, any
+/// role (#1280). The relay admission question: an owner's session may carry the logs of the
+/// accounts it granted. A closed grant still counts, because its cut leaves the history before it
+/// accepted and a peer must still be able to verify that history.
+pub fn owner_ever_granted(
+    conn: &Connection,
+    owner_account_id: AccountId,
+    grantee_account_id: AccountId,
+) -> anyhow::Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM account_stream_grants
+             WHERE owner_account_id = ?1 AND grantee_account_id = ?2
+         )",
+        params![owner_account_id.to_bytes().as_slice(), grantee_account_id.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?)
+}
+
 /// Whether `grantee_account_id` holds an effective (not-closed) Writer grant on a stream that
 /// resolves **`PublicRead`**. Unlike [`effective_writer_grant`], which answers "may this account
 /// write to THIS stream", this answers "is this account a public contributor at all" — the question
@@ -4798,7 +4817,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_writer_grantees_lists_open_writer_grants_only() {
+    fn writer_grantees_list_open_grants_and_every_grantee_stays_ever_granted() {
         let conn = db();
         let founder = Dev::new(1);
         let writer = AccountId::from_bytes([0x44; 32]);
@@ -4827,6 +4846,10 @@ mod tests {
             op(account_id, &founder, 3, Some(grant_id), Some(genesis_hash), &reader_op);
         account_ingest(&conn, &reader_bytes, NOW + 3).unwrap();
         assert_eq!(effective_writer_grantees(&conn, account_id).unwrap(), vec![writer]);
+        let stranger = AccountId::from_bytes([0x66; 32]);
+        assert!(owner_ever_granted(&conn, account_id, writer).unwrap());
+        assert!(owner_ever_granted(&conn, account_id, reader).unwrap(), "any role counts");
+        assert!(!owner_ever_granted(&conn, account_id, stranger).unwrap());
 
         let revoke_op = AccountOp::StreamRevoke {
             stream_id,
@@ -4843,6 +4866,10 @@ mod tests {
             op(account_id, &founder, 4, Some(reader_hash), Some(genesis_hash), &revoke_op);
         account_ingest(&conn, &revoke_bytes, NOW + 4).unwrap();
         assert!(effective_writer_grantees(&conn, account_id).unwrap().is_empty());
+        assert!(
+            owner_ever_granted(&conn, account_id, writer).unwrap(),
+            "a revoked grantee's pre-cut history must stay verifiable, so it is still relayed",
+        );
     }
 
     #[test]
