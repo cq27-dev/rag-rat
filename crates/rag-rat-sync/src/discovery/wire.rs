@@ -135,16 +135,9 @@ pub enum DecodedErrorCode {
 }
 
 /// A malformed frame from the service. Never fatal to a discovery pass — see [`super`].
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("malformed discovery frame: {0}")]
 pub struct WireError(String);
-
-impl std::fmt::Display for WireError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "malformed discovery frame: {}", self.0)
-    }
-}
-
-impl std::error::Error for WireError {}
 
 impl From<minicbor::decode::Error> for WireError {
     fn from(error: minicbor::decode::Error) -> Self {

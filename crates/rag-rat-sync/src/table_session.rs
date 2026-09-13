@@ -70,26 +70,17 @@ pub struct TableSessionReport {
     pub continuation_pending: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TableSessionError {
+    #[error("table-sync session transport: {0}")]
     Codec(TableCodecError),
+    #[error("table-sync protocol violation: {0}")]
     Protocol(String),
+    #[error("read-only peer attempted to push table entries")]
     UnauthorizedPush,
+    #[error("table-sync session store: {0}")]
     Store(anyhow::Error),
 }
-
-impl std::fmt::Display for TableSessionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Codec(error) => write!(f, "table-sync session transport: {error}"),
-            Self::Protocol(message) => write!(f, "table-sync protocol violation: {message}"),
-            Self::UnauthorizedPush => write!(f, "read-only peer attempted to push table entries"),
-            Self::Store(error) => write!(f, "table-sync session store: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for TableSessionError {}
 
 pub async fn run_table_session<S, R, W>(
     store: &mut S,

@@ -16,38 +16,21 @@ use crate::wire::{Frame, WireError};
 pub const MAX_FRAME_BYTES: u32 = 24 * 1024 * 1024;
 
 /// What can go wrong moving a frame over the wire.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     /// The underlying stream failed or closed mid-frame.
+    #[error("sync stream io: {0}")]
     Io(std::io::Error),
     /// A frame's declared length exceeded [`MAX_FRAME_BYTES`].
+    #[error("sync frame declared {0} bytes, over {max}", max = MAX_FRAME_BYTES)]
     FrameTooLarge(u32),
     /// The frame bytes were not a valid protocol frame.
-    Wire(WireError),
+    #[error(transparent)]
+    Wire(#[from] WireError),
     /// The stream ended cleanly at a frame boundary — not an error, but distinguished so the
     /// session can tell "peer hung up" from "peer sent garbage".
+    #[error("sync stream closed at a frame boundary")]
     Eof,
-}
-
-impl std::fmt::Display for CodecError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CodecError::Io(e) => write!(f, "sync stream io: {e}"),
-            CodecError::FrameTooLarge(n) => {
-                write!(f, "sync frame declared {n} bytes, over {MAX_FRAME_BYTES}")
-            },
-            CodecError::Wire(e) => write!(f, "{e}"),
-            CodecError::Eof => write!(f, "sync stream closed at a frame boundary"),
-        }
-    }
-}
-
-impl std::error::Error for CodecError {}
-
-impl From<WireError> for CodecError {
-    fn from(e: WireError) -> Self {
-        CodecError::Wire(e)
-    }
 }
 
 /// Write one frame: a 4-byte big-endian length prefix, then the CBOR body.

@@ -196,32 +196,22 @@ pub trait NodeAuth {
 }
 
 /// A node-authorization handshake that did not admit the connection.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     /// The transport failed or the peer sent an unreadable frame.
+    #[error("sync auth transport: {0}")]
     Codec(CodecError),
     /// The peer's binding did not satisfy our admission policy — the UNIFORM refusal (cause
     /// hidden).
+    #[error("peer is not authorized for this account")]
     Unauthorized,
     /// The peer sent no expected auth-phase frame within the pre-auth deadline.
+    #[error("peer did not complete authentication before the deadline")]
     Timeout,
     /// The peer sent something other than an auth frame to open, or a policy we cannot serve.
+    #[error("sync auth protocol violation: {0}")]
     Protocol(String),
 }
-
-impl std::fmt::Display for AuthError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AuthError::Codec(e) => write!(f, "sync auth transport: {e}"),
-            AuthError::Unauthorized => write!(f, "peer is not authorized for this account"),
-            AuthError::Timeout =>
-                write!(f, "peer did not complete authentication before the deadline"),
-            AuthError::Protocol(m) => write!(f, "sync auth protocol violation: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for AuthError {}
 
 /// A hosted account chosen for a connection by [`run_auth_phase_selected`], from the account the
 /// dialer named in its opening auth frame. Carries that account's authorizer and its PER-ACCOUNT

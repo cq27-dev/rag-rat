@@ -116,22 +116,13 @@ mod tag {
     pub const ACK: u8 = 7;
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TableWireError {
+    #[error("malformed table-sync frame: {0}")]
     Malformed(String),
+    #[error("table-sync frame over cap: {0}")]
     OverCap(String),
 }
-
-impl std::fmt::Display for TableWireError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Malformed(message) => write!(f, "malformed table-sync frame: {message}"),
-            Self::OverCap(message) => write!(f, "table-sync frame over cap: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for TableWireError {}
 
 impl TableFrame {
     pub fn encode(&self) -> Vec<u8> {

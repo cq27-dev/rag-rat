@@ -96,24 +96,15 @@ mod tag {
 
 /// A frame that failed to decode. Kept distinct from an I/O error so the session can treat a
 /// protocol violation (drop the peer) differently from a transport hiccup.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum WireError {
     /// The bytes are not a well-formed frame of this protocol.
+    #[error("malformed sync frame: {0}")]
     Malformed(String),
     /// A field exceeded its hard cap — a bounded-frame violation, treated as hostile.
+    #[error("sync frame over cap: {0}")]
     OverCap(String),
 }
-
-impl std::fmt::Display for WireError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WireError::Malformed(m) => write!(f, "malformed sync frame: {m}"),
-            WireError::OverCap(m) => write!(f, "sync frame over cap: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for WireError {}
 
 impl Frame {
     /// Encode to canonical CBOR. Infallible for the in-memory shapes the session builds (the caps

@@ -7,27 +7,17 @@ use crate::table_wire::{TableFrame, TableWireError};
 /// Hard frame cap, checked from the length prefix before allocating the body.
 pub const MAX_TABLE_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TableCodecError {
+    #[error("table-sync stream io: {0}")]
     Io(std::io::Error),
+    #[error("table-sync frame declared {0} bytes, over {max}", max = MAX_TABLE_FRAME_BYTES)]
     FrameTooLarge(u32),
+    #[error(transparent)]
     Wire(TableWireError),
+    #[error("table-sync stream closed at a frame boundary")]
     Eof,
 }
-
-impl std::fmt::Display for TableCodecError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "table-sync stream io: {error}"),
-            Self::FrameTooLarge(bytes) =>
-                write!(f, "table-sync frame declared {bytes} bytes, over {MAX_TABLE_FRAME_BYTES}"),
-            Self::Wire(error) => write!(f, "{error}"),
-            Self::Eof => write!(f, "table-sync stream closed at a frame boundary"),
-        }
-    }
-}
-
-impl std::error::Error for TableCodecError {}
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,

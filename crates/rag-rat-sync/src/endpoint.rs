@@ -52,30 +52,21 @@ use crate::table_wire::TABLE_SYNC_ALPN;
 use crate::wire::{CONTENT_SYNC_ALPN, SYNC_ALPN};
 
 /// Endpoint construction or connection setup failed, before a session could run.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum EndpointError {
     /// The configured relay URL did not parse.
+    #[error("invalid relay url: {0}")]
     RelayUrl(String),
     /// Binding the endpoint failed (socket, TLS, relay handshake).
+    #[error("binding the sync endpoint failed: {0}")]
     Bind(String),
     /// Dialling a peer, or accepting an inbound connection, failed.
+    #[error("sync connection setup failed: {0}")]
     Connect(String),
     /// A configured peer node id did not parse.
+    #[error("invalid peer node id: {0}")]
     PeerId(String),
 }
-
-impl std::fmt::Display for EndpointError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EndpointError::RelayUrl(m) => write!(f, "invalid relay url: {m}"),
-            EndpointError::Bind(m) => write!(f, "binding the sync endpoint failed: {m}"),
-            EndpointError::Connect(m) => write!(f, "sync connection setup failed: {m}"),
-            EndpointError::PeerId(m) => write!(f, "invalid peer node id: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for EndpointError {}
 
 /// How long an ACCEPTOR waits for the dialer to close the connection before closing from its own
 /// side. A QUIC `close()` discards in-flight stream data, so the side that STREAMED a response must
@@ -1292,30 +1283,21 @@ fn enrollment_database_matches(
 
 /// A sync attempt that failed setting up the connection, authorizing the peer, or running the
 /// session.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SyncFailure {
+    #[error(transparent)]
     Endpoint(EndpointError),
     /// The dedicated owner-side enrollment exchange failed.
+    #[error(transparent)]
     Enrollment(InviteError),
     /// The node-authorization handshake refused the peer (or we could not authorize to it).
+    #[error(transparent)]
     Auth(crate::auth::AuthError),
+    #[error(transparent)]
     Session(SessionError),
+    #[error(transparent)]
     TableSession(TableSessionError),
 }
-
-impl std::fmt::Display for SyncFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SyncFailure::Endpoint(e) => write!(f, "{e}"),
-            SyncFailure::Enrollment(e) => write!(f, "{e}"),
-            SyncFailure::Auth(e) => write!(f, "{e}"),
-            SyncFailure::Session(e) => write!(f, "{e}"),
-            SyncFailure::TableSession(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for SyncFailure {}
 
 #[cfg(test)]
 mod tests {

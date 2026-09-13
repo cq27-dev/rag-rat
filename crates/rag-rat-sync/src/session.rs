@@ -117,32 +117,21 @@ pub struct SessionReport {
 }
 
 /// A session that could not complete.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     /// The transport failed or the peer sent an unreadable frame.
+    #[error("sync session transport: {0}")]
     Codec(CodecError),
     /// The peer opened with something other than a hello, or named a different account.
+    #[error("sync session protocol violation: {0}")]
     Protocol(String),
     /// Authentication admitted the peer for reads, but it attempted to push entries.
+    #[error("read-only peer attempted to push sync entries")]
     UnauthorizedPush,
     /// Reading the local entry snapshot failed.
+    #[error("sync session store: {0}")]
     Store(anyhow::Error),
 }
-
-impl std::fmt::Display for SessionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SessionError::Codec(e) => write!(f, "sync session transport: {e}"),
-            SessionError::Protocol(m) => write!(f, "sync session protocol violation: {m}"),
-            SessionError::UnauthorizedPush => {
-                write!(f, "read-only peer attempted to push sync entries")
-            },
-            SessionError::Store(e) => write!(f, "sync session store: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for SessionError {}
 
 /// Run one session to completion over `send`/`recv`, syncing account entries with the peer while
 /// enforcing the directional capabilities returned by the preceding auth phase.
