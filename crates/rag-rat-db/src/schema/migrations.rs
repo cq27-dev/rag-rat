@@ -8654,6 +8654,34 @@ pub fn apply_memory_parked_anchor_baselines(conn: &Connection) -> rusqlite::Resu
     )
 }
 
+/// This store's resolution of each memory binding, beside the authored anchor (#1297). The
+/// portable columns of `repo_memory_bindings` — `binding_id`, `path`, the span, `symbol_kind`,
+/// `signature_hash`, `moniker_tool_version` — are what the author bound, and replicate on
+/// `anchors/1` and in the `/3` anchor set. Validation used to rewrite them in place as the
+/// checkout moved, so every relocation replicated, and devices on different checkouts overwrote
+/// each other's rows every pass. Relocation now writes these local shadows instead. `resolved`
+/// says whether the store has resolved the row at all: once set, the seven shadows ARE its view,
+/// NULL included (a target with no signature, a match with no span); unset, readers fall back to
+/// the authored columns. Local (never replicated), nullable, additive.
+pub fn apply_memory_binding_resolution(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "repo_memory_bindings", "resolved", "INTEGER")?;
+    add_column_if_missing(conn, "repo_memory_bindings", "resolved_binding_id", "TEXT")?;
+    add_column_if_missing(conn, "repo_memory_bindings", "resolved_path", "TEXT")?;
+    add_column_if_missing(conn, "repo_memory_bindings", "resolved_start_line", "INTEGER")?;
+    add_column_if_missing(conn, "repo_memory_bindings", "resolved_end_line", "INTEGER")?;
+    add_column_if_missing(conn, "repo_memory_bindings", "resolved_symbol_kind", "TEXT")?;
+    add_column_if_missing(conn, "repo_memory_bindings", "resolved_signature_hash", "TEXT")?;
+    add_column_if_missing(conn, "repo_memory_bindings", "resolved_moniker_tool_version", "TEXT")?;
+    // The path readers look a binding up by where this store resolved it, falling back to the
+    // authored path; the expression index keeps that lookup off a table scan, as
+    // `idx_repo_memory_bindings_path` does for the authored column. The expression must match the
+    // readers' text exactly for SQLite to use it.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_resolved_path
+             ON repo_memory_bindings(IIF(resolved, resolved_path, path));",
+    )
+}
+
 /// Every column the CURRENT content projector writes, applied ahead of any migration that replays
 /// the fold.
 ///

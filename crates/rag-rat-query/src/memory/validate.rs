@@ -34,7 +34,7 @@ pub(crate) fn validate_dir_binding(
     binding: &mut RepoMemoryBinding,
     fs_root: Option<&Path>,
 ) -> anyhow::Result<String> {
-    let dir = binding.path.clone().unwrap_or_else(|| binding.binding_id.clone());
+    let dir = binding.path.clone().unwrap_or_else(|| binding.current_binding_id().to_string());
     if dir_has_files(conn, &dir)? {
         return Ok("current".to_string());
     }
@@ -45,15 +45,12 @@ fn validate_live_logical_symbol(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
     id: i64,
+    qualified_name: String,
 ) -> anyhow::Result<String> {
-    // The logical symbol is live. Its id is content-derived and STABLE across reindex, but chunk
-    // ids are reassigned on every re-chunk — so the stored `chunk_id` is stale whenever the symbol
-    // shifted lines (an edit ELSEWHERE in the same file leaves the symbol's
-    // name/qualified_name/kind/signature, hence its stable id, unchanged while its chunk moves).
-    // Re-derive the chunk from the live logical symbol before content-validating; trusting the
-    // churned `chunk_id` made `validate_bound_chunk` report `gone` for an unchanged symbol (#154 —
-    // the gone-on-every-reindex symptom was really gone-on-any-line-shift). Falls through to the
-    // stored-chunk check only when the logical symbol resolves to no chunk.
+    // The handle proves WHICH group this is; record the name it carries as this store's
+    // resolution, so a row whose resolution was reset — or whose authored name a stranger now
+    // reuses — answers to the name of the target it actually points at (#1297).
+    binding.set_resolved_binding_id(qualified_name);
     if let Some(chunk) = chunk_for_logical_symbol(conn, id)? {
         binding.symbol_id = chunk.symbol_id;
         binding.chunk_id = Some(chunk.chunk_id);
@@ -74,7 +71,7 @@ pub(crate) fn validate_logical_symbol_binding(
 ) -> anyhow::Result<String> {
     // A live handle is trusted — unless its writer marked the row retargeted and the handle's
     // target contradicts the recorded kind or signature (see `RETARGETED_REASON`); then it is held
-    // back, and only rejected if the relocation pick finds something better.
+    // back and the twins below are searched with the author's evidence first.
     let retargeted = is_retargeted(binding);
     let published_scope = if retargeted { published_scope_for(conn, binding)? } else { None };
     let mut held_back = None;
@@ -91,7 +88,7 @@ pub(crate) fn validate_logical_symbol_binding(
             );
         if trusted {
             answer_retarget_mark(binding);
-            return validate_live_logical_symbol(conn, binding, id);
+            return validate_live_logical_symbol(conn, binding, id, hit.qualified_name);
         }
         held_back = Some(id);
     }
@@ -99,58 +96,23 @@ pub(crate) fn validate_logical_symbol_binding(
     // `repo_id` (V040) and its ids are repo-distinct, so a consolidated DB can hold the SAME
     // qualified name under a sibling repo. Without the predicate, validating repo A's memory (whose
     // remembered symbol was deleted/renamed) could rebind it to repo B's logical id/path and report
-    // `relocated` instead of `gone`/`stale`. The `files`-view queries elsewhere in this module are
-    // repo-scoped for free through the scope view; `logical_symbols` is a direct table, so it needs
-    // the explicit filter.
+    // `relocated` instead of `gone`/`stale`.
     let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-    // #491: one qualified name can hold several live twins (a struct and its impl block;
-    // overloads with distinct signatures), so a bare `LIMIT 1` is a plan-order coin flip that
-    // can land a struct-bound memory on the impl row. The binding stores the V014 relocation
-    // discriminators (`symbol_kind`, `signature_hash`) — fetch every twin (with a member
-    // signature: all members of a group share it, since the signature is part of the logical
-    // key) and prefer the one that agrees, tiebreaking deterministically by id.
-    let candidates: Vec<RelocationTwin> = {
-        let mut stmt = conn.prepare(
-            "
-            SELECT ls.id, ls.path, ls.kind,
-                   (SELECT s.signature FROM logical_symbol_members m
-                      JOIN symbols s ON s.id = m.symbol_id
-                     WHERE m.logical_symbol_id = ls.id LIMIT 1),
-                   ls.id,
-                   (SELECT s.scope_path FROM logical_symbol_members m
-                      JOIN symbols s ON s.id = m.symbol_id
-                     WHERE m.logical_symbol_id = ls.id LIMIT 1)
-            FROM logical_symbols ls
-            WHERE ls.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
-              AND ls.repo_id = ?2
-            ORDER BY ls.id
-            ",
-        )?;
-        let rows = stmt.query_map(params![&binding.binding_id, active_repo_id], |row| {
-            Ok(RelocationTwin {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                kind: row.get(2)?,
-                signature: row.get(3)?,
-                logical_symbol_id: row.get(4)?,
-                scope: row.get(5)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    // The group axis is nearly inert here: this arm is reached when the binding's handle is absent,
-    // names a row that no longer exists, or — on a retargeted row — names a live row that
-    // contradicts the binding. Impl twins are still separated where it matters — the stable-id arm
-    // above resolves them on its own, since the logical key hashes `scope_path`.
-    let relocated =
-        pick_relocation_twin(candidates, binding, retargeted, published_scope.as_deref());
-    if let Some(RelocationTwin { id, path, kind, signature, scope, .. }) = relocated {
-        // The pick came back to the very handle the retarget check held back: nothing that matches
-        // the author's evidence answers to its name here. Validate it live — relocating would
-        // report `relocated` on every pass, since this arm does not rewrite the recorded
-        // kind, and the mark stays for a checkout that holds the author's target.
+    // Land on the twin among those answering to `name` that the binding's discriminators pick
+    // (#491: one qualified name can hold several live twins — a struct and its impl block,
+    // overloads with distinct signatures — so a bare `LIMIT 1` is a plan-order coin flip).
+    let land = |binding: &mut RepoMemoryBinding, name: &str| -> anyhow::Result<Option<String>> {
+        let candidates = logical_twins_named(conn, name, &active_repo_id)?;
+        let picked =
+            pick_relocation_twin(candidates, binding, retargeted, published_scope.as_deref());
+        let Some(RelocationTwin { id, path, kind, signature, scope, .. }) = picked else {
+            return Ok(None);
+        };
+        // Back at the row the retarget check held back: nothing that matches the author's evidence
+        // answers to the name. Validate it live rather than relocate onto itself; the mark stays
+        // for a checkout that holds the author's target.
         if Some(id) == held_back {
-            return validate_live_logical_symbol(conn, binding, id);
+            return validate_live_logical_symbol(conn, binding, id, name.to_string()).map(Some);
         }
         if target_agrees(
             binding,
@@ -161,6 +123,7 @@ pub(crate) fn validate_logical_symbol_binding(
         ) {
             answer_retarget_mark(binding);
         }
+        binding.set_resolved_binding_id(name.to_string());
         binding.logical_symbol_id = Some(id);
         binding.path = Some(path);
         if let Some(chunk) = chunk_for_logical_symbol(conn, id)? {
@@ -169,17 +132,22 @@ pub(crate) fn validate_logical_symbol_binding(
             binding.start_line = Some(chunk.start_line);
             binding.end_line = Some(chunk.end_line);
         }
-        return Ok("relocated".to_string());
+        Ok(Some("relocated".to_string()))
+    };
+    // The name this store last found the target under.
+    let current = binding.current_binding_id().to_string();
+    if let Some(status) = land(binding, &current)? {
+        return Ok(status);
     }
     // Cross-file move: bare name + content hash fallback (same path as symbol binding).
     if let Some(hash) = source_hash_for_memory(conn, &binding.memory_id)? {
-        let short = short_symbol_name(&binding.binding_id, binding.path.as_deref()).to_string();
+        let short = short_symbol_name(&current, binding.path.as_deref()).to_string();
         if let Some(m) = relocate_symbol_by_name(conn, &short, &hash)? {
-            // binding_id becomes the relocated member symbol's qualified_name, not a
+            // The resolution becomes the relocated member symbol's qualified_name, not a
             // logical_symbols.qualified_name. The stable logical_symbol_id arm re-matches on the
             // next reindex; if that ever goes stale this bare-name fallback recovers it — the
             // logical-qualified-name arm above intentionally won't re-match this binding again.
-            binding.binding_id = m.binding_id;
+            binding.set_resolved_binding_id(m.binding_id);
             binding.logical_symbol_id = m.logical_symbol_id;
             binding.symbol_id = Some(m.symbol_id);
             binding.path = Some(m.path);
@@ -188,12 +156,53 @@ pub(crate) fn validate_logical_symbol_binding(
             binding.end_line = m.end_line;
             binding.symbol_kind = m.symbol_kind;
             binding.signature_hash = m.signature_hash;
-            // A content-hash match is identity: it answers a pending retarget.
             answer_retarget_mark(binding);
             return Ok("relocated".to_string());
         }
     }
-    relocate_via_moniker_or_gone(conn, binding)
+    if relocate_by_moniker(conn, binding)? {
+        return Ok("relocated".to_string());
+    }
+    // The authored name is identity, not evidence: once this store has resolved the row elsewhere
+    // it is never searched again, since a stranger can reuse it while the target sits somewhere
+    // the hash and the moniker could not place (#1297).
+    Ok("gone".to_string())
+}
+
+/// The live logical symbols of the active repo answering to `name`, each with its group's member
+/// signature and scope (all members of a group share them, since both are part of the logical key).
+fn logical_twins_named(
+    conn: &Connection,
+    name: &str,
+    active_repo_id: &str,
+) -> anyhow::Result<Vec<RelocationTwin>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT ls.id, ls.path, ls.kind,
+               (SELECT s.signature FROM logical_symbol_members m
+                  JOIN symbols s ON s.id = m.symbol_id
+                 WHERE m.logical_symbol_id = ls.id LIMIT 1),
+               ls.id,
+               (SELECT s.scope_path FROM logical_symbol_members m
+                  JOIN symbols s ON s.id = m.symbol_id
+                 WHERE m.logical_symbol_id = ls.id LIMIT 1)
+        FROM logical_symbols ls
+        WHERE ls.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
+          AND ls.repo_id = ?2
+        ORDER BY ls.id
+        ",
+    )?;
+    let rows = stmt.query_map(params![name, active_repo_id], |row| {
+        Ok(RelocationTwin {
+            id: row.get(0)?,
+            path: row.get(1)?,
+            kind: row.get(2)?,
+            signature: row.get(3)?,
+            logical_symbol_id: row.get(4)?,
+            scope: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 /// The `relocation_reason` the synced-memory drain stamps on a symbol binding it moved IN PLACE to
 /// a target another store published, when the published kind or signature differs from the row's.
@@ -455,15 +464,14 @@ fn validate_live_symbol(
     id: i64,
     qualified_name: String,
 ) -> anyhow::Result<String> {
-    // The row id proves WHICH symbol this is; `binding_id` is only the qualified name every later
-    // relocation searches by. A rename in place — an index upgrade re-deriving an impl's identity
-    // moves the row's name from the trait to the type — leaves the two disagreeing, and nothing
-    // notices until the next reindex churns the row id. Relocation then looks up a name that no
-    // longer belongs to this symbol and attaches the memory to whatever else answers to it, or
-    // calls it gone. Refresh the name while the id still vouches for it.
-    if qualified_name != binding.binding_id {
-        binding.binding_id = qualified_name;
-    }
+    // The row id proves WHICH symbol this is; the name is only what every later relocation
+    // searches by. A rename in place — an index upgrade re-deriving an impl's identity moves the
+    // row's name from the trait to the type — leaves the two disagreeing, and nothing notices
+    // until the next reindex churns the row id. Relocation then looks up a name that no longer
+    // belongs to this symbol and attaches the memory to whatever else answers to it, or calls it
+    // gone. Record the live name as this store's resolution while the id still vouches for it;
+    // the authored name stays what the author bound (#1297).
+    binding.set_resolved_binding_id(qualified_name);
     // The row can also be REGROUPED without moving: a key-version rebuild mints a new logical id
     // for the same impl. The raw id still proves the binding's identity, so re-read the handle
     // here — leaving the vanished one in place reports `current` forever while every
@@ -476,7 +484,6 @@ pub(crate) fn validate_symbol_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
-    // As on the logical path: a contradicting live row is held back, not trusted.
     let retargeted = is_retargeted(binding);
     let published_scope = if retargeted { published_scope_for(conn, binding)? } else { None };
     let mut held_back = None;
@@ -503,40 +510,18 @@ pub(crate) fn validate_symbol_binding(
     // pick — the same rule, and the same helper, the logical-symbol path uses. Each candidate
     // carries its logical group, keyed on its own row id so the correlated read adds no scope
     // surface, because the group is what separates two impls of different traits for one type.
-    let candidates: Vec<RelocationTwin> = {
-        let mut stmt = conn.prepare(
-            "
-            SELECT symbols.id, files.path, symbols.kind, symbols.signature,
-                   (SELECT m.logical_symbol_id FROM logical_symbol_members m
-                     WHERE m.symbol_id = symbols.id LIMIT 1),
-                   symbols.scope_path
-            FROM symbols
-            JOIN files ON files.id = symbols.file_id
-            WHERE symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
-            ORDER BY symbols.id
-            ",
-        )?;
-        let rows = stmt.query_map([&binding.binding_id], |row| {
-            Ok(RelocationTwin {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                kind: row.get(2)?,
-                signature: row.get(3)?,
-                logical_symbol_id: row.get(4)?,
-                scope: row.get(5)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    let relocated =
-        pick_relocation_twin(candidates, binding, retargeted, published_scope.as_deref());
-    if let Some(RelocationTwin { id, path, kind, signature, scope, .. }) = relocated {
+    let land = |binding: &mut RepoMemoryBinding, name: &str| -> anyhow::Result<Option<String>> {
+        let candidates = symbol_twins_named(conn, name)?;
+        let picked =
+            pick_relocation_twin(candidates, binding, retargeted, published_scope.as_deref());
+        let Some(RelocationTwin { id, path, kind, signature, scope, .. }) = picked else {
+            return Ok(None);
+        };
         // Back at the row the retarget check held back: nothing that matches the author's evidence
         // answers to the name here. Validate it live rather than relocate onto itself; the mark
         // stays for a checkout that holds the author's target.
         if Some(id) == held_back {
-            let qualified_name = binding.binding_id.clone();
-            return validate_live_symbol(conn, binding, id, qualified_name);
+            return validate_live_symbol(conn, binding, id, name.to_string()).map(Some);
         }
         if target_agrees(
             binding,
@@ -547,10 +532,11 @@ pub(crate) fn validate_symbol_binding(
         ) {
             answer_retarget_mark(binding);
         }
+        binding.set_resolved_binding_id(name.to_string());
         binding.symbol_id = Some(id);
         binding.logical_symbol_id = logical_symbol_id_for_symbol(conn, id)?;
         binding.path = Some(path);
-        if let Some(chunk) = chunk_for_symbol(conn, id, &binding.binding_id)? {
+        if let Some(chunk) = chunk_for_symbol(conn, id, name)? {
             binding.chunk_id = Some(chunk.chunk_id);
             binding.start_line = Some(chunk.start_line);
             binding.end_line = Some(chunk.end_line);
@@ -564,13 +550,18 @@ pub(crate) fn validate_symbol_binding(
             binding.symbol_kind = kind;
             binding.signature_hash = sig;
         }
-        return Ok("relocated".to_string());
+        Ok(Some("relocated".to_string()))
+    };
+    // The name this store last found the target under.
+    let current = binding.current_binding_id().to_string();
+    if let Some(status) = land(binding, &current)? {
+        return Ok(status);
     }
     // Cross-file move: qualified_name changed with the path. Match by bare name + content hash.
     if let Some(hash) = source_hash_for_memory(conn, &binding.memory_id)? {
-        let short = short_symbol_name(&binding.binding_id, binding.path.as_deref()).to_string();
+        let short = short_symbol_name(&current, binding.path.as_deref()).to_string();
         if let Some(m) = relocate_symbol_by_name(conn, &short, &hash)? {
-            binding.binding_id = m.binding_id;
+            binding.set_resolved_binding_id(m.binding_id);
             binding.symbol_id = Some(m.symbol_id);
             binding.logical_symbol_id = m.logical_symbol_id;
             binding.path = Some(m.path);
@@ -579,25 +570,56 @@ pub(crate) fn validate_symbol_binding(
             binding.end_line = m.end_line;
             binding.symbol_kind = m.symbol_kind;
             binding.signature_hash = m.signature_hash;
-            // A content-hash match is identity: it answers a pending retarget.
             answer_retarget_mark(binding);
             return Ok("relocated".to_string());
         }
     }
-    relocate_via_moniker_or_gone(conn, binding)
+    if relocate_by_moniker(conn, binding)? {
+        return Ok("relocated".to_string());
+    }
+    // The authored name is identity, not evidence: once this store has resolved the row elsewhere
+    // it is never searched again, since a stranger can reuse it while the target sits somewhere
+    // the hash and the moniker could not place (#1297).
+    Ok("gone".to_string())
 }
 
-/// Last-resort relocation for a symbol/logical_symbol binding whose qualified-name and
-/// name+content-hash anchors are exhausted: re-resolve the memory's recorded SCIP moniker against
-/// current oracle data (#70). A unique live match — semantic identity, robust to content edits the
-/// hash fallback can't survive — relocates with `relocation_reason = "moniker-match"`; otherwise
-/// the binding is gone.
-fn relocate_via_moniker_or_gone(
-    conn: &Connection,
-    binding: &mut RepoMemoryBinding,
-) -> anyhow::Result<String> {
+/// The live symbol rows answering to `name`, each with its logical group, kind, signature and
+/// scope — the discriminators the pick weighs.
+fn symbol_twins_named(conn: &Connection, name: &str) -> anyhow::Result<Vec<RelocationTwin>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT symbols.id, files.path, symbols.kind, symbols.signature,
+               (SELECT m.logical_symbol_id FROM logical_symbol_members m
+                 WHERE m.symbol_id = symbols.id LIMIT 1),
+               symbols.scope_path
+        FROM symbols
+        JOIN files ON files.id = symbols.file_id
+        WHERE symbols.qualified_name_id = (SELECT id FROM name_strings WHERE value = ?1)
+        ORDER BY symbols.id
+        ",
+    )?;
+    let rows = stmt.query_map([name], |row| {
+        Ok(RelocationTwin {
+            id: row.get(0)?,
+            path: row.get(1)?,
+            kind: row.get(2)?,
+            signature: row.get(3)?,
+            logical_symbol_id: row.get(4)?,
+            scope: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Relocation for a symbol/logical_symbol binding whose qualified-name and name+content-hash
+/// anchors are exhausted: re-resolve the memory's recorded SCIP moniker against current oracle
+/// data (#70). A unique live match — semantic identity, robust to content edits the hash fallback
+/// can't survive — relocates with `relocation_reason = "moniker-match"`. Returns whether it did;
+/// the authored-name fallback and `gone` come after it, since a reused name is weaker evidence
+/// than a retained semantic identity.
+fn relocate_by_moniker(conn: &Connection, binding: &mut RepoMemoryBinding) -> anyhow::Result<bool> {
     if let Some(m) = relocate_binding_by_moniker(conn, binding)? {
-        binding.binding_id = m.binding_id;
+        binding.set_resolved_binding_id(m.binding_id);
         binding.symbol_id = Some(m.symbol_id);
         binding.logical_symbol_id = m.logical_symbol_id;
         binding.path = Some(m.path);
@@ -607,9 +629,9 @@ fn relocate_via_moniker_or_gone(
         binding.symbol_kind = m.symbol_kind;
         binding.signature_hash = m.signature_hash;
         binding.relocation_reason = Some(MONIKER_MATCH_REASON.to_string());
-        return Ok("relocated".to_string());
+        return Ok(true);
     }
-    Ok("gone".to_string())
+    Ok(false)
 }
 pub(crate) fn validate_chunk_binding(
     conn: &Connection,
@@ -625,7 +647,7 @@ pub(crate) fn validate_chunk_binding(
     let Some(chunk) = relocate_chunk_by_hash(conn, &hash)? else {
         return Ok("gone".to_string());
     };
-    binding.binding_id = chunk.chunk_id.to_string();
+    binding.set_resolved_binding_id(chunk.chunk_id.to_string());
     binding.chunk_id = Some(chunk.chunk_id);
     binding.path = Some(chunk.path);
     binding.start_line = Some(chunk.start_line);
@@ -649,7 +671,7 @@ pub(crate) fn validate_edge_binding(
     // honest answer — instead of `current`.
     if let Some(edge_id) = binding.edge_id
         && let Some(edge) = edge_by_id(conn, edge_id)?
-        && edge.fingerprint == binding.binding_id
+        && edge.fingerprint == binding.current_binding_id()
     {
         binding.path = Some(edge.path);
         binding.start_line = Some(edge.start_line);
@@ -658,16 +680,20 @@ pub(crate) fn validate_edge_binding(
         binding.logical_symbol_id = None;
         return validate_bound_edge_source_hash(conn, binding, &edge.source_hash);
     }
-    let Some(edge) = edge_by_fingerprint(conn, &binding.binding_id)? else {
+    // The fingerprint this store last resolved to — and only that one. The authored fingerprint is
+    // not retried once a resolution exists: a pre-versioned digest omits the identity fields, so
+    // after a callee or receiver change it would match the replacement callee and reattach the
+    // memory there, where the versioned identity it converged to says the edge is gone (#1297).
+    let Some(edge) = edge_by_fingerprint(conn, binding.current_binding_id())? else {
         // A row id may survive an in-place re-resolution or be reused after rebuild. Once the
         // stable fingerprint no longer exists, retaining that id would surface this memory on the
         // replacement edge through edge-id lookups.
         binding.edge_id = None;
         return Ok("gone".to_string());
     };
-    // Compatibility matches return the live current fingerprint. Converge the binding identity so
-    // the next validation takes the current fast path instead of reporting `relocated` forever.
-    binding.binding_id = edge.fingerprint.clone();
+    // Compatibility matches return the live current fingerprint. Converge the resolution so the
+    // next validation takes the current fast path instead of reporting `relocated` forever.
+    binding.set_resolved_binding_id(edge.fingerprint.clone());
     binding.edge_id = Some(edge.edge_id);
     binding.path = Some(edge.path);
     binding.start_line = Some(edge.start_line);
@@ -680,6 +706,22 @@ pub(crate) fn validate_call_path_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
+    // The row's resolution as the table holds it NOW, not as this pass hydrated it: converging a
+    // sibling binding of the same memory re-points every binding resolving to the old hash and
+    // moves the local rows with them, and a binding hydrated before that would otherwise look the
+    // rows up under the old hash and stamp that hash back over the re-point.
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT IIF(resolved, resolved_binding_id, binding_id) FROM repo_memory_bindings
+             WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
+               AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)",
+            params![binding.memory_id, binding.binding_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(current) = current {
+        binding.set_resolved_binding_id(current);
+    }
     // Re-check each stored edge behind the server-derived hash (#38). Exact-fingerprint match →
     // the edge is unchanged; loose name/kind/target match → it moved lines (relocated); neither →
     // that edge is gone.
@@ -693,7 +735,7 @@ pub(crate) fn validate_call_path_binding(
         ",
     )?;
     let edges = stmt
-        .query_map(params![binding.memory_id, binding.binding_id], |row| {
+        .query_map(params![binding.memory_id, binding.current_binding_id()], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -713,7 +755,7 @@ pub(crate) fn validate_call_path_binding(
         let exists = conn.query_row(
             "SELECT COUNT(*) FROM repo_memory_call_paths
              WHERE memory_id = ?1 AND edge_sequence_hash = ?2",
-            params![binding.memory_id, binding.binding_id],
+            params![binding.memory_id, binding.current_binding_id()],
             |row| row.get::<_, i64>(0),
         )?;
         return Ok(if exists > 0 { "unverified" } else { "gone" }.to_string());
@@ -787,8 +829,9 @@ pub(crate) fn validate_call_path_binding(
 /// re-derives its own id, and `call_path_memories_for_crossed` (which looks memories up by the
 /// hash it computes from LIVE fingerprints) would keep missing it: the memory would validate
 /// `current` yet never surface on the traversal it was recorded for. So both move together, and
-/// `binding.binding_id` is re-pointed as well — `stamp_validated_binding` writes it back, the
-/// same mechanism a relocated symbol binding uses.
+/// the binding's RESOLUTION is re-pointed as well — `stamp_validated_binding` writes it back, the
+/// same mechanism a relocated symbol binding uses. The authored hash is the author's and stays
+/// (#1297).
 ///
 /// Runs only when every edge of the path matched a live edge, so the recomputed hash describes
 /// the same call path the binding already named.
@@ -799,20 +842,47 @@ fn converge_call_path_identity(
 ) -> anyhow::Result<()> {
     let converged =
         compute_edge_sequence_hash(live_fingerprints.iter().map(|(_, value, _)| value.as_str()));
-    if converged == binding.binding_id {
+    let current = binding.current_binding_id().to_string();
+    if converged == current {
         return Ok(());
     }
-    // Both tables are keyed `(memory_id, edge_sequence_hash)`. If the memory already carries a
-    // binding under the converged hash — the same path re-bound after the upgrade — re-keying
-    // would collide with it, so leave the legacy row alone rather than trade one broken identity
-    // for a constraint failure. Rebinding is the way out of that (rare) duplicate.
-    let taken: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM repo_memory_call_paths WHERE memory_id = ?1 AND edge_sequence_hash \
-         = ?2",
-        params![binding.memory_id, converged],
-        |row| row.get(0),
+    // The local rows under `current` are shared by every binding of the memory resolving to it —
+    // this one and any sibling authored under another hash — so all of them move together, ahead
+    // of the rows (`stamp_validated_binding` writes this one again, identically).
+    conn.execute(
+        &format!(
+            "UPDATE repo_memory_bindings
+                SET resolved_binding_id = ?1, {BINDING_RESOLUTION_CARRY_SQL}
+              WHERE memory_id = ?2 AND binding_kind = 'call_path'
+                AND IIF(resolved, resolved_binding_id, binding_id) = ?3
+                AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)"
+        ),
+        params![converged, binding.memory_id, current],
     )?;
-    if taken > 0 {
+    // Both local tables are keyed `(memory_id, edge_sequence_hash)`. When the memory already
+    // carries the converged hash — another authored binding of the same path re-derived here
+    // first — the rows under `current` go: the rows under the converged hash describe the same
+    // path, and two sets would be two competing derivations of one thing. That holds only when
+    // the destination carries an EDGE sequence: a client-supplied hash creates a parent without
+    // edges, and dropping this row's verified edges for that would leave both bindings
+    // unverifiable, so those edges move under the converged hash instead and only the parent
+    // yields.
+    let (taken_parent, taken_edges): (i64, i64) = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM repo_memory_call_paths
+                  WHERE memory_id = ?1 AND edge_sequence_hash = ?2),
+                (SELECT COUNT(*) FROM repo_memory_call_path_edges
+                  WHERE memory_id = ?1 AND edge_sequence_hash = ?2)",
+        params![binding.memory_id, converged],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if taken_parent > 0 && taken_edges > 0 {
+        for table in ["repo_memory_call_path_edges", "repo_memory_call_paths"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE memory_id = ?1 AND edge_sequence_hash = ?2"),
+                params![binding.memory_id, current],
+            )?;
+        }
+        binding.set_resolved_binding_id(converged);
         return Ok(());
     }
     for (ordinal, fingerprint, callee_logical_symbol_id) in live_fingerprints {
@@ -826,18 +896,25 @@ fn converge_call_path_identity(
                 converged,
                 callee_logical_symbol_id,
                 binding.memory_id,
-                binding.binding_id,
+                current,
                 ordinal
             ],
         )?;
     }
-    conn.execute(
-        "UPDATE repo_memory_call_paths
-         SET edge_sequence_hash = ?1
-         WHERE memory_id = ?2 AND edge_sequence_hash = ?3",
-        params![converged, binding.memory_id, binding.binding_id],
-    )?;
-    binding.binding_id = converged;
+    if taken_parent > 0 {
+        conn.execute(
+            "DELETE FROM repo_memory_call_paths WHERE memory_id = ?1 AND edge_sequence_hash = ?2",
+            params![binding.memory_id, current],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE repo_memory_call_paths
+             SET edge_sequence_hash = ?1
+             WHERE memory_id = ?2 AND edge_sequence_hash = ?3",
+            params![converged, binding.memory_id, current],
+        )?;
+    }
+    binding.set_resolved_binding_id(converged);
     Ok(())
 }
 
@@ -902,6 +979,12 @@ pub(crate) fn validate_bound_chunk(
     let Some(chunk) = chunk_by_id(conn, chunk_id)? else {
         return Ok("gone".to_string());
     };
+    // A chunk binding's name IS its chunk id: record the live one as this store's resolution, so
+    // a row whose resolution was reset answers to the chunk it points at, not to the authored id
+    // (#1297). A symbol binding validated through its chunk keeps its qualified name.
+    if binding.binding_kind == "chunk" {
+        binding.set_resolved_binding_id(chunk_id.to_string());
+    }
     binding.path = Some(chunk.path);
     binding.start_line = Some(chunk.start_line);
     binding.end_line = Some(chunk.end_line);
@@ -1643,6 +1726,7 @@ mod call_path_receiver_type_hint_tests {
             memory_id: memory_id.to_string(),
             binding_kind: "call_path".to_string(),
             binding_id: edge_sequence_hash.to_string(),
+            resolved_binding_id: None,
             path: None,
             start_line: None,
             end_line: None,
@@ -1702,6 +1786,7 @@ mod call_path_receiver_type_hint_tests {
         let mut binding = RepoMemoryBinding {
             binding_kind: "edge".to_string(),
             binding_id: legacy,
+            resolved_binding_id: None,
             // The reused row id the rebuild handed back.
             edge_id: Some(edge_id),
             ..call_path_binding("m1", "unused")
@@ -1746,13 +1831,18 @@ mod call_path_receiver_type_hint_tests {
         let mut binding = RepoMemoryBinding {
             binding_kind: "edge".to_string(),
             binding_id: legacy.clone(),
+            resolved_binding_id: None,
             ..call_path_binding("m1", "unused")
         };
         binding.memory_id = "m1".to_string();
 
         assert_eq!(validate_edge_binding(&c, &mut binding).unwrap(), "relocated");
         assert!(binding.edge_id.is_some(), "the relocated binding adopts the live edge row");
-        assert_ne!(binding.binding_id, legacy, "the binding converges to the current fingerprint");
+        assert_ne!(
+            binding.current_binding_id(),
+            legacy,
+            "the binding converges to the current fingerprint"
+        );
         assert_eq!(
             validate_edge_binding(&c, &mut binding).unwrap(),
             "current",
@@ -1762,6 +1852,7 @@ mod call_path_receiver_type_hint_tests {
         let mut missing = RepoMemoryBinding {
             binding_kind: "edge".to_string(),
             binding_id: "not-a-fingerprint".to_string(),
+            resolved_binding_id: None,
             ..call_path_binding("m1", "unused")
         };
         assert_eq!(validate_edge_binding(&c, &mut missing).unwrap(), "gone");
@@ -1789,7 +1880,11 @@ mod call_path_receiver_type_hint_tests {
         // hash OF those fingerprints, so a half-migrated row would no longer re-derive its own id,
         // and `call_path_memories_for_crossed` — which looks memories up by the hash it computes
         // from LIVE fingerprints — would never surface this memory again.
-        assert_ne!(call_path.binding_id, "legacy-path", "the binding id re-points to the v3 hash");
+        assert_ne!(
+            call_path.current_binding_id(),
+            "legacy-path",
+            "the binding id re-points to the v3 hash"
+        );
         let (upgraded, key): (String, String) = c
             .query_row(
                 "SELECT edge_fingerprint, edge_sequence_hash FROM repo_memory_call_path_edges
@@ -1799,17 +1894,21 @@ mod call_path_receiver_type_hint_tests {
             )
             .unwrap();
         assert_ne!(upgraded, legacy, "validation converges the stored identity to v3");
-        assert_eq!(key, call_path.binding_id, "the edge rows follow the binding to its new key");
+        assert_eq!(
+            key,
+            call_path.current_binding_id(),
+            "the edge rows follow the binding to its new key"
+        );
         assert_eq!(
             compute_edge_sequence_hash([upgraded.as_str()]),
-            call_path.binding_id,
+            call_path.current_binding_id(),
             "the converged binding re-derives its own id from its stored fingerprints"
         );
         let reachable: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM repo_memory_call_paths
                  WHERE memory_id = 'm1' AND edge_sequence_hash = ?1",
-                [call_path.binding_id.as_str()],
+                [call_path.current_binding_id()],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1845,6 +1944,7 @@ mod call_path_receiver_type_hint_tests {
             memory_id: "m1".to_string(),
             binding_kind: "edge".to_string(),
             binding_id: original.fingerprint.clone(),
+            resolved_binding_id: None,
             edge_id: Some(edge_id),
             ..call_path_binding("m1", "unused")
         };
@@ -1965,6 +2065,52 @@ mod call_path_receiver_type_hint_tests {
         assert_eq!(persisted, ("current".to_string(), None), "and is left as it was");
     }
 
+    /// Once a row is `resolved`, its shadows are this store's view NULL included: a relocation
+    /// onto a target with no signature must clear that evidence, not leave the author's in force
+    /// (a same-named twin still carrying it would win the next pick). Unresolved, the authored
+    /// values show through.
+    #[test]
+    fn a_resolved_rows_cleared_shadow_is_its_view_and_an_unresolved_row_shows_the_authored_one() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_memory(&c, "m1", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path,
+                    start_line, end_line, symbol_kind, signature_hash, anchor_status,
+                    created_at_ms, repo_id)
+             VALUES ('m1', 'symbol', 'src/a.rs::run', 'src/a.rs', 3, 9, 'function', 'sig',
+                     'current', 0, 'r')",
+            [],
+        )
+        .unwrap();
+        let binding = |c: &Connection| memory_by_id(c, "m1").unwrap().unwrap().bindings.remove(0);
+        let unresolved = binding(&c);
+        assert_eq!(
+            (
+                unresolved.path.as_deref(),
+                unresolved.signature_hash.as_deref(),
+                unresolved.resolved_binding_id
+            ),
+            (Some("src/a.rs"), Some("sig"), None),
+        );
+        c.execute(
+            "UPDATE repo_memory_bindings
+                SET resolved = 1, resolved_binding_id = 'src/b.rs::run', resolved_path = \
+             'src/b.rs',
+                    resolved_start_line = 30, resolved_end_line = 40,
+                    resolved_symbol_kind = 'function', resolved_signature_hash = NULL
+              WHERE memory_id = 'm1'",
+            [],
+        )
+        .unwrap();
+        let resolved = binding(&c);
+        assert_eq!(resolved.binding_id, "src/a.rs::run", "the authored identity stays");
+        assert_eq!(resolved.resolved_binding_id.as_deref(), Some("src/b.rs::run"));
+        assert_eq!(resolved.path.as_deref(), Some("src/b.rs"));
+        assert_eq!((resolved.start_line, resolved.end_line), (Some(30), Some(40)));
+        assert_eq!(resolved.signature_hash, None, "a cleared shadow is not the authored value");
+    }
+
     #[test]
     fn active_scope_validation_preserves_a_linked_worktree_edge_id_as_pending() {
         let c = mem_db();
@@ -2081,6 +2227,86 @@ mod call_path_receiver_type_hint_tests {
             )
             .unwrap();
         assert_eq!(stored, legacy, "no member is converged while the path is incomplete");
+    }
+
+    /// Two authored call-path bindings of one memory resolving to one legacy hash: the first one
+    /// validated converges the shared local rows onto the v3 hash and re-points every binding
+    /// resolving to the legacy one. The second was hydrated before that, so it must re-read its
+    /// resolution rather than look the rows up under — and stamp back — the hash it was loaded
+    /// with, which would leave it `gone` for good.
+    #[test]
+    fn a_sibling_hydrated_before_its_twin_converged_follows_the_converged_hash() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint, \
+             receiver_type_hint, source_file_id, source_start_line, source_end_line) VALUES \
+             ('caller','run','calls_name','exact','recv','Alpha',?1,10,10)",
+            [file_id],
+        )
+        .unwrap();
+        let legacy =
+            crate::memory::resolve::legacy_edge_fingerprint(crate::memory::EdgeFingerprintParts {
+                path: "src/lib.rs",
+                start_line: 10,
+                end_line: 10,
+                from_name: Some("caller"),
+                to_name: Some("run"),
+                edge_kind: "calls_name",
+                target_qualified_name: None,
+                receiver_hint: Some("recv"),
+                receiver_type_hint: None,
+                callee_logical_symbol_id: None,
+            });
+        seed_memory(&c, "m1", "r");
+        c.execute(
+            "INSERT INTO repo_memory_call_paths(memory_id, edge_sequence_hash, path_summary, \
+             created_at_ms) VALUES ('m1', 'legacy-path', 'caller -> run', 0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, receiver_hint) VALUES ('m1', \
+             'legacy-path', 0, ?1, 'caller', 'run', 'calls_name', 'recv')",
+            [legacy.as_str()],
+        )
+        .unwrap();
+        for authored in ["h-a", "h-b"] {
+            c.execute(
+                "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, \
+                 anchor_status, created_at_ms, repo_id, resolved, resolved_binding_id) VALUES \
+                 ('m1', 'call_path', ?1, 'current', 0, 'r', 1, 'legacy-path')",
+                [authored],
+            )
+            .unwrap();
+        }
+
+        let report = validate_memories(&c, None).unwrap();
+        assert_eq!((report.gone, report.checked), (0, 2), "{report:?}");
+        let rows: Vec<(String, String, String)> = c
+            .prepare(
+                "SELECT binding_id, IIF(resolved, resolved_binding_id, binding_id), anchor_status
+                 FROM repo_memory_bindings WHERE memory_id = 'm1' ORDER BY binding_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].1, "legacy-path", "the first sibling converged: {rows:?}");
+        assert_eq!(rows[0].1, rows[1].1, "both siblings resolve to the converged hash: {rows:?}");
+        let under_converged: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM repo_memory_call_path_edges
+                 WHERE memory_id = 'm1' AND edge_sequence_hash = ?1",
+                [rows[0].1.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(under_converged, 1, "the local rows moved once, under the converged hash");
     }
 
     #[test]

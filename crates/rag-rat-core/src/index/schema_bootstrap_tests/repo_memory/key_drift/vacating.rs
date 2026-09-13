@@ -771,14 +771,13 @@ fn a_vanished_call_path_reference_with_no_winner_is_nulled() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// #493 review: `refresh_logical_binding_discriminators` renames each realigned binding's
-/// `binding_id` to the live qualified name, but that column is part of the PK. When the SAME
-/// memory already carries a sibling logical binding at the target qualified name, the rename
-/// collides — a plain `UPDATE OR IGNORE` would silently SKIP the stale row, leaving it on a live
-/// id with stale discriminators that validate as current forever. The refresh must delete the
-/// stale duplicate, exactly as `validate_memories` does on the same collision shape.
+/// Two authored logical bindings of one memory realigned onto one re-derived row — the SAME
+/// memory bound to the anchor under two derivations — both stay, and both RESOLVE to the live
+/// qualified name (#1297). The authored `binding_id` is the key and the author's, so nothing is
+/// renamed, nothing collides, and nothing is deleted or published; a rebind is what collapses
+/// them.
 #[test]
-fn a_refresh_collision_deletes_the_stale_duplicate_binding() {
+fn a_refresh_collision_keeps_both_bindings_resolving_to_the_live_name() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -887,37 +886,38 @@ fn a_refresh_collision_deletes_the_stale_duplicate_binding() {
             r.get(0)
         })
         .unwrap();
-    let rows: Vec<(String, i64)> = {
+    let rows: Vec<(String, Option<String>, i64)> = {
         let conn = db.storage.connection();
         let mut stmt = conn
             .prepare(
-                "SELECT binding_id, logical_symbol_id FROM repo_memory_bindings
+                "SELECT binding_id, resolved_binding_id, logical_symbol_id
+                   FROM repo_memory_bindings
                   WHERE memory_id = ?1 AND binding_kind = 'logical_symbol'
                   ORDER BY binding_id",
             )
             .unwrap();
-        stmt.query_map(params![memory_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        stmt.query_map(params![memory_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect()
     };
     assert_eq!(
         rows,
-        vec![(live_qual.clone(), fresh_id)],
-        "the stale 'legacy::dup_anchor' duplicate must be deleted, leaving one binding at the \
-         live qualified name and re-derived id"
+        vec![
+            ("legacy::dup_anchor".to_string(), Some(live_qual.clone()), fresh_id),
+            (live_qual.clone(), Some(live_qual.clone()), fresh_id),
+        ],
+        "both authored bindings stay and resolve to the live qualified name, both are realigned \
+         onto the re-derived id, and nothing is deleted"
     );
 
     let _ = fs::remove_dir_all(&root);
 }
 
 /// The same collision on a binding whose memory row is gone — the drain keeps a removed synced
-/// memory's bindings for `anchors/1` to carry (#1298) — deletes nothing: the delete would publish
-/// a `Remove` for a memory this device cannot show, and which rows collapse here need not be
-/// which collapse on a device where the memory is live. The loser's checkout-local handle is
-/// cleared instead, so that when the memory returns validation re-enters it into the relocation
-/// ladder — here it relocates by the source hash, the rename collides, and the duplicate is taken
-/// — rather than trusting the live handle and leaving the stale name in place for good.
+/// memory's bindings for `anchors/1` to carry (#1298) — is no different: nothing is deleted (a
+/// delete would publish a `Remove` for a memory this device cannot show), both rows resolve to the
+/// live name, and when the memory returns validation finds two resolved rows and leaves them so.
 #[test]
 fn a_refresh_collision_on_a_binding_without_its_memory_deletes_nothing() {
     let root = unique_temp_root();
@@ -1029,33 +1029,36 @@ fn a_refresh_collision_on_a_binding_without_its_memory_deletes_nothing() {
             r.get(0)
         })
         .unwrap();
-    let bindings_of = |db: &IndexDatabase| -> Vec<(String, Option<i64>, String)> {
+    let bindings_of = |db: &IndexDatabase| -> Vec<(String, String, Option<i64>, String)> {
         let conn = db.storage.connection();
         let mut stmt = conn
             .prepare(
-                "SELECT binding_id, logical_symbol_id, anchor_status FROM repo_memory_bindings
+                "SELECT binding_id, IIF(resolved, resolved_binding_id, binding_id), \
+                 logical_symbol_id,
+                        anchor_status
+                   FROM repo_memory_bindings
                   WHERE memory_id = ?1 AND binding_kind = 'logical_symbol'
                   ORDER BY binding_id",
             )
             .unwrap();
-        stmt.query_map(params![memory_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        stmt.query_map(params![memory_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .unwrap()
             .map(Result::unwrap)
             .collect()
     };
-    let mut expected = vec![
-        ("legacy::gone_anchor".to_string(), None, "unverified".to_string()),
-        (live_qual.clone(), Some(fresh_id), "current".to_string()),
+    let expected = vec![
+        (
+            "legacy::gone_anchor".to_string(),
+            live_qual.clone(),
+            Some(fresh_id),
+            "current".to_string(),
+        ),
+        (live_qual.clone(), live_qual.clone(), Some(fresh_id), "current".to_string()),
     ];
-    expected.sort();
-    assert_eq!(
-        bindings_of(&db),
-        expected,
-        "the winner is realigned; the loser is kept with its handle cleared, not deleted"
-    );
+    assert_eq!(bindings_of(&db), expected, "both rows are kept, realigned, and resolve alike");
 
-    // The memory returns; validation re-derives the handle-less row, renames it onto the live
-    // qualified name, and takes the duplicate on that collision.
+    // The memory returns; validation trusts both live handles and leaves the two rows as they
+    // are — two authored facts resolving alike, for a rebind to collapse.
     db.storage
         .connection()
         .execute_batch(
@@ -1064,11 +1067,7 @@ fn a_refresh_collision_on_a_binding_without_its_memory_deletes_nothing() {
         )
         .unwrap();
     db.memory_validate().unwrap();
-    assert_eq!(
-        bindings_of(&db),
-        vec![(live_qual, Some(fresh_id), "current".to_string())],
-        "one binding at the live qualified name once the memory is back"
-    );
+    assert_eq!(bindings_of(&db), expected, "the return changes nothing about the two rows");
 
     let _ = fs::remove_dir_all(&root);
 }

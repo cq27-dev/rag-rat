@@ -348,9 +348,10 @@ fn list_file_memory_rows(
          ),
          matching AS (
              SELECT m.id, m.kind, m.title, m.body, m.confidence,
-                    b.binding_kind, b.path, b.anchor_status,
+                    b.binding_kind, IIF(b.resolved, b.resolved_path, b.path) AS path, \
+         b.anchor_status,
                     COALESCE(
-                        b.start_line,
+                        IIF(b.resolved, b.resolved_start_line, b.start_line),
                         direct_symbol.start_line,
                         (SELECT MIN(member.start_line)
                          FROM logical_symbol_members lsm
@@ -372,8 +373,9 @@ fn list_file_memory_rows(
              WHERE m.repo_id = ?2 AND m.status = 'active'
                AND EXISTS (SELECT 1 FROM requested)
                AND (
-                   b.path = ?1
-                   OR (b.binding_kind = 'dir' AND b.path IN ({marks}))
+                   IIF(b.resolved, b.resolved_path, b.path) = ?1
+                   OR (b.binding_kind = 'dir' AND IIF(b.resolved, b.resolved_path, b.path) IN \
+         ({marks}))
                    OR direct_symbol.id IS NOT NULL
                    OR bound_chunk.id IS NOT NULL
                    OR EXISTS (

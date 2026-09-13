@@ -83,7 +83,8 @@ impl IndexDatabase {
                  GROUP BY source_file.id
              ),
              active_bindings AS MATERIALIZED (
-                 SELECT binding.memory_id, binding.binding_kind, binding.path,
+                 SELECT binding.memory_id, binding.binding_kind,
+                        IIF(binding.resolved, binding.resolved_path, binding.path) AS path,
                         binding.symbol_id, binding.chunk_id, binding.logical_symbol_id
                  FROM repo_memories memory
                  JOIN repo_memory_bindings binding

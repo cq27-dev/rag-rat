@@ -708,7 +708,8 @@ fn memory_counts(conn: &Connection, path: Option<&str>) -> anyhow::Result<RepoBr
             FROM repo_memories
             JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
              AND repo_memory_bindings.repo_id = repo_memories.repo_id
-            WHERE repo_memory_bindings.path = ?1{repo_clause}
+            WHERE IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
+             repo_memory_bindings.path) = ?1{repo_clause}
             GROUP BY repo_memories.status
             "
         ))?;
@@ -796,14 +797,16 @@ fn memory_counts_by_path(
     let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "repo_memories");
     let mut stmt = conn.prepare(&format!(
         "
-        SELECT repo_memory_bindings.path,
+        SELECT IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
+         repo_memory_bindings.path) AS path,
                repo_memories.status,
                COUNT(DISTINCT repo_memories.id)
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
          AND repo_memory_bindings.repo_id = repo_memories.repo_id
-        WHERE repo_memory_bindings.path IS NOT NULL{repo_clause}
-        GROUP BY repo_memory_bindings.path, repo_memories.status
+        WHERE IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
+         repo_memory_bindings.path) IS NOT NULL{repo_clause}
+        GROUP BY 1, repo_memories.status
         "
     ))?;
     let rows = stmt.query_map([], |row| {

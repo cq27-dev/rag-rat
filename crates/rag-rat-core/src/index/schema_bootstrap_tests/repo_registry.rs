@@ -2522,7 +2522,7 @@ fn unshallow_upgrades_a_shallow_clone_index_from_local_to_portable_in_place() {
         .connection()
         .query_row(
             "SELECT e.callee_logical_symbol_id, e.edge_fingerprint, e.edge_sequence_hash,
-                    p.edge_sequence_hash, b.binding_id
+                    p.edge_sequence_hash, IIF(b.resolved, b.resolved_binding_id, b.binding_id)
                FROM repo_memory_call_path_edges e
                JOIN repo_memory_call_paths p ON p.memory_id = e.memory_id
                JOIN repo_memory_bindings b ON b.memory_id = e.memory_id

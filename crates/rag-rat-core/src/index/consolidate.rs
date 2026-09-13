@@ -1233,6 +1233,24 @@ fn copy_bindings(
     let moniker_tool = source_column_or_null(source, "moniker_tool")?;
     let moniker_tool_version = source_column_or_null(source, "moniker_tool_version")?;
     let relocation_reason = source_column_or_null(source, "relocation_reason")?;
+    // This store's resolution of the anchor (#1297): the import takes the source's local
+    // call-path tables wholesale, keyed by the hash the source resolved, so it takes the
+    // resolution with them — all of it, since a resolved row's shadows are one view. A source
+    // from before the columns contributes NULLs, i.e. no resolution beyond the authored one.
+    let resolution: Vec<String> = [
+        "resolved",
+        "resolved_binding_id",
+        "resolved_path",
+        "resolved_start_line",
+        "resolved_end_line",
+        "resolved_symbol_kind",
+        "resolved_signature_hash",
+        "resolved_moniker_tool_version",
+    ]
+    .iter()
+    .map(|column| source_column_or_null(source, column))
+    .collect::<anyhow::Result<_>>()?;
+    let resolution = resolution.join(", ");
     // The tracker columns exist per source VINTAGE: a post-V060 source carries
     // tracker/project/item_key, a pre-V060 source carries github_owner/github_repo/github_number
     // — probe both shapes and convert legacy `github` bindings to the `tracker` kind below (the
@@ -1248,7 +1266,7 @@ fn copy_bindings(
         "SELECT memory_id, binding_kind, binding_id, path, start_line, end_line, commit_hash, \
          {tracker_col}, {project_col}, {item_key_col}, {github_owner}, {github_repo}, \
          {github_number}, anchor_status, created_at_ms, {symbol_kind}, {signature_hash}, \
-         {moniker_tool}, {moniker_tool_version}, {relocation_reason}
+         {moniker_tool}, {moniker_tool_version}, {relocation_reason}, {resolution}
          FROM repo_memory_bindings",
     ))?;
     let mut rows = stmt.query([])?;
@@ -1283,9 +1301,12 @@ fn copy_bindings(
             "INSERT OR IGNORE INTO repo_memory_bindings(memory_id, binding_kind, binding_id, \
              path, start_line, end_line, logical_symbol_id, symbol_id, chunk_id, edge_id, \
              commit_hash, tracker, project, item_key, anchor_status, created_at_ms, symbol_kind, \
-             signature_hash, moniker_tool, moniker_tool_version, relocation_reason, repo_id)
+             signature_hash, moniker_tool, moniker_tool_version, relocation_reason, repo_id, \
+             resolved, resolved_binding_id, resolved_path, resolved_start_line, \
+             resolved_end_line, resolved_symbol_kind, resolved_signature_hash, \
+             resolved_moniker_tool_version)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, ?8, ?9, ?10, ?11, ?12, \
-             ?13, ?14, ?15, ?16, ?17, ?18)",
+             ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
             params![
                 memory_id,
                 binding_kind,
@@ -1305,6 +1326,14 @@ fn copy_bindings(
                 row.get::<_, Option<String>>(18)?,
                 row.get::<_, Option<String>>(19)?,
                 repo_id,
+                row.get::<_, Option<i64>>(20)?,
+                row.get::<_, Option<String>>(21)?,
+                row.get::<_, Option<String>>(22)?,
+                row.get::<_, Option<i64>>(23)?,
+                row.get::<_, Option<i64>>(24)?,
+                row.get::<_, Option<String>>(25)?,
+                row.get::<_, Option<String>>(26)?,
+                row.get::<_, Option<String>>(27)?,
             ],
         )?;
         count += changed as u64;
@@ -1932,10 +1961,13 @@ mod tests {
             "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
              start_line, end_line, logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, \
              tracker, project, item_key, anchor_status, created_at_ms, symbol_kind, \
-             signature_hash, moniker_tool, moniker_tool_version, relocation_reason, repo_id)
+             signature_hash, moniker_tool, moniker_tool_version, relocation_reason, repo_id, \
+             resolved, resolved_binding_id, resolved_path, resolved_start_line, \
+             resolved_end_line, resolved_symbol_kind, resolved_signature_hash, \
+             resolved_moniker_tool_version)
              VALUES ('m1', 'path', 'b1', 'src/x.rs', 10, 20, 111, 222, 333, 444, 'abc', 'github', \
              'o/r', '7', 'current', 0, 'function', 'sighash', 'scip-rust', '0.4', 'moved', \
-             'legacy-repo')",
+             'legacy-repo', 1, 'b1-resolved', 'src/y.rs', 11, 21, 'method', NULL, '0.5')",
             [],
         )
         .unwrap();
@@ -2692,7 +2724,7 @@ mod tests {
         ) = target
             .query_row(
                 "SELECT e.callee_logical_symbol_id, e.edge_fingerprint, e.edge_sequence_hash,
-                        p.edge_sequence_hash, b.binding_id
+                        p.edge_sequence_hash, IIF(b.resolved, b.resolved_binding_id, b.binding_id)
                    FROM repo_memory_call_path_edges e
                    JOIN repo_memory_call_paths p ON p.memory_id = e.memory_id
                    JOIN repo_memory_bindings b ON b.memory_id = e.memory_id
@@ -2767,7 +2799,8 @@ mod tests {
     }
 
     /// The relocation-provenance columns (`symbol_kind`, `signature_hash`, `moniker_tool`,
-    /// `moniker_tool_version`, `relocation_reason`) survive the import verbatim — dropping them
+    /// `moniker_tool_version`, `relocation_reason`) and the source's resolution (`resolved` and
+    /// the `resolved_*` shadows) survive the import verbatim — dropping them
     /// would strip imported `scip_moniker` bindings of validation (`unverified` without
     /// `moniker_tool`) and of the oracle-backed relocation path (which requires both tool fields).
     #[test]
@@ -2790,6 +2823,16 @@ mod tests {
         assert_eq!(provenance("moniker_tool").as_deref(), Some("scip-rust"));
         assert_eq!(provenance("moniker_tool_version").as_deref(), Some("0.4"));
         assert_eq!(provenance("relocation_reason").as_deref(), Some("moved"));
+        // The source's resolution comes along too: the import takes the source's local call-path
+        // tables wholesale, keyed by the hash the source resolved, so the rows must keep resolving
+        // to them (#1297). A cleared shadow stays cleared.
+        assert_eq!(provenance("CAST(resolved AS TEXT)").as_deref(), Some("1"));
+        assert_eq!(provenance("resolved_binding_id").as_deref(), Some("b1-resolved"));
+        assert_eq!(provenance("resolved_path").as_deref(), Some("src/y.rs"));
+        assert_eq!(provenance("CAST(resolved_start_line AS TEXT)").as_deref(), Some("11"));
+        assert_eq!(provenance("resolved_symbol_kind").as_deref(), Some("method"));
+        assert_eq!(provenance("resolved_signature_hash"), None);
+        assert_eq!(provenance("resolved_moniker_tool_version").as_deref(), Some("0.5"));
     }
 
     /// Imported memories are reachable through KEYWORD search: `memory_search` retrieves

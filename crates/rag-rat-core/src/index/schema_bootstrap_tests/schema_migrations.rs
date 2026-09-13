@@ -1839,7 +1839,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 122, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 123, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
@@ -1887,7 +1887,15 @@ fn migration_103_syncable_memory_bindings() {
              PRIMARY KEY(memory_id, binding_kind, binding_id),
              FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
          );
-         INSERT INTO repo_memory_bindings SELECT * FROM repo_memory_bindings_v103_shape;
+         INSERT INTO repo_memory_bindings(repo_id, memory_id, binding_kind, binding_id, path, \
+         start_line, end_line, logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, \
+         tracker, project, item_key, anchor_status, created_at_ms, symbol_kind, signature_hash, \
+         moniker_tool, moniker_tool_version, relocation_reason, downgrade_pending_at_ms)
+             SELECT repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line, \
+         logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, tracker, project, \
+         item_key, anchor_status, created_at_ms, symbol_kind, signature_hash, moniker_tool, \
+         moniker_tool_version, relocation_reason, downgrade_pending_at_ms
+             FROM repo_memory_bindings_v103_shape;
          DROP TABLE repo_memory_bindings_v103_shape;
          CREATE TRIGGER memory_bindings_lens_revision_insert
              AFTER INSERT ON repo_memory_bindings BEGIN SELECT 1; END;",
@@ -2025,6 +2033,67 @@ fn migration_122_memory_parked_anchor_baselines() {
     let recorded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM schema_version WHERE id = '122_memory_parked_anchor_baselines'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
+}
+
+/// V123 (#1297) adds this store's resolution of each memory binding beside the authored anchor:
+/// seven nullable local columns, so relocation writes them and the authored, replicated columns
+/// stay the author's. A replay over a current store is a no-op.
+#[test]
+fn migration_123_memory_binding_resolution() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let columns: Vec<(String, i64)> = conn
+        .prepare(
+            "SELECT name, \"notnull\" FROM pragma_table_info('repo_memory_bindings')
+             WHERE name LIKE 'resolved_%' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        columns,
+        [
+            "resolved_binding_id",
+            "resolved_end_line",
+            "resolved_moniker_tool_version",
+            "resolved_path",
+            "resolved_signature_hash",
+            "resolved_start_line",
+            "resolved_symbol_kind",
+        ]
+        .map(|name| (name.to_string(), 0))
+        .to_vec(),
+        "the seven resolution columns exist and are nullable",
+    );
+    let flag_not_null: i64 = conn
+        .query_row(
+            "SELECT \"notnull\" FROM pragma_table_info('repo_memory_bindings')
+             WHERE name = 'resolved'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(flag_not_null, 0, "the `resolved` flag exists and is nullable");
+    let indexed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_repo_memory_bindings_resolved_path'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed, 1, "the resolved-path lookup is indexed");
+    schema::migrations::apply_memory_binding_resolution(&conn).unwrap();
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '123_memory_binding_resolution'",
             [],
             |row| row.get(0),
         )

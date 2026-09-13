@@ -1256,8 +1256,9 @@ pub fn bound_file_paths(
 ) -> rusqlite::Result<Vec<String>> {
     let bind_clause = schema::periphery_repo_scope_clause(scope, "repo_memory_bindings");
     conn.prepare(&format!(
-        "SELECT DISTINCT path FROM repo_memory_bindings WHERE memory_id = ?1 AND path IS NOT \
-         NULL{bind_clause} ORDER BY path"
+        "SELECT DISTINCT IIF(resolved, resolved_path, path) AS path FROM repo_memory_bindings
+         WHERE memory_id = ?1 AND IIF(resolved, resolved_path, path) IS NOT NULL{bind_clause}
+         ORDER BY path"
     ))?
     .query_map([memory_id], |r| r.get::<_, String>(0))?
     .collect()
@@ -1455,16 +1456,17 @@ fn memory_binding_is_index_covered(
     }
     let has_pathless: bool = conn
         .prepare(&format!(
-            "SELECT EXISTS(SELECT 1 FROM repo_memory_bindings WHERE memory_id = ?1 AND path IS \
-             NULL AND binding_kind != 'call_path'{bind_clause})"
+            "SELECT EXISTS(SELECT 1 FROM repo_memory_bindings WHERE memory_id = ?1
+                AND IIF(resolved, resolved_path, path) IS NULL
+                AND binding_kind != 'call_path'{bind_clause})"
         ))?
         .query_row([memory_id], |r| r.get(0))?;
     if has_pathless {
         return Ok(false);
     }
     let mut call_path_stmt = conn.prepare(&format!(
-        "SELECT binding_id FROM repo_memory_bindings WHERE memory_id = ?1 AND binding_kind = \
-         'call_path'{bind_clause}"
+        "SELECT IIF(resolved, resolved_binding_id, binding_id) FROM repo_memory_bindings
+         WHERE memory_id = ?1 AND binding_kind = 'call_path'{bind_clause}"
     ))?;
     let call_path_hashes = call_path_stmt
         .query_map([memory_id], |r| r.get::<_, String>(0))?

@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 122;
+pub const LATEST_SCHEMA_VERSION: u32 = 123;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -880,6 +880,14 @@ const MIGRATION_122_DESCRIPTION: &str =
      since they replicate on anchors/1 and deleting them would remove them from every device the \
      memory is still live on; the parked baseline lets a returning memory converge on a rebind \
      published while it was away";
+const MIGRATION_123_ID: &str = "123_memory_binding_resolution";
+const MIGRATION_123_CHECKSUM: &str = "sha256:rag-rat-memory-binding-resolution-v123";
+const MIGRATION_123_DESCRIPTION: &str =
+    "Add this store's resolution of each memory binding beside the authored anchor \
+     (resolved_binding_id, resolved_path, resolved_start_line, resolved_end_line, \
+     resolved_symbol_kind, resolved_signature_hash, resolved_moniker_tool_version on \
+     repo_memory_bindings), so relocation writes local columns and no longer republishes the row \
+     on anchors/1 (#1297)";
 const MIGRATION_118_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-v118";
 const MIGRATION_118_DESCRIPTION: &str =
     "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
@@ -1916,6 +1924,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_122_CHECKSUM,
         description: MIGRATION_122_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_memory_parked_anchor_baselines),
+    },
+    Migration {
+        id: MIGRATION_123_ID,
+        checksum: MIGRATION_123_CHECKSUM,
+        description: MIGRATION_123_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_memory_binding_resolution),
     },
 ];
 

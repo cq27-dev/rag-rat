@@ -186,7 +186,66 @@ const MEMORY_BINDING_LOCAL_COLUMNS: &[&str] = &[
     "anchor_status",
     "relocation_reason",
     "downgrade_pending_at_ms",
+    // This store's resolution of the authored anchor (#1297): where validation found the target
+    // last, and the discriminators it landed on. `resolved` set means the seven shadows are this
+    // store's view, NULL included. The authored columns they shadow never change except by
+    // authoring; relocation writes these, so a checkout that differs from its siblings publishes
+    // nothing.
+    "resolved",
+    "resolved_binding_id",
+    "resolved_path",
+    "resolved_start_line",
+    "resolved_end_line",
+    "resolved_symbol_kind",
+    "resolved_signature_hash",
+    "resolved_moniker_tool_version",
 ];
+
+/// The local columns a winning remote upsert that CHANGES a `repo_memory_bindings` row's authored
+/// columns resets to NULL: a new authored statement invalidates whatever this store had resolved
+/// for the old one — the location and discriminators relocation recorded describe the anchor as
+/// it was, and would otherwise outlive the author's change as this store's view and evidence.
+/// What the reset does NOT decide is a same-key rebind between twins (struct → impl under one
+/// qualified name): an `anchors/1` rebind is unmarked, so validation keeps trusting the retained
+/// handle; only the drain's `refresh_binding` marks a row `retargeted` and makes the author's kind
+/// and signature outrank it. The drain resets the same columns; an upsert restating the row this
+/// store already holds resets nothing. The handles
+/// (`logical_symbol_id`, `symbol_id`, `chunk_id`, `edge_id`) stay: they are what validation
+/// re-derives the target from, and a chunk handle in particular has no other way back (a missing
+/// one validates `unverified` without the hash fallback). A handle a restatement made stale is
+/// what the next validate pass exists to find out.
+const MEMORY_BINDING_RESET_ON_UPSERT: &[&str] = &[
+    "resolved",
+    "resolved_binding_id",
+    "resolved_path",
+    "resolved_start_line",
+    "resolved_end_line",
+    "resolved_symbol_kind",
+    "resolved_signature_hash",
+    "resolved_moniker_tool_version",
+];
+
+/// The local columns the applier nulls when a winning upsert changes a held row's synced
+/// columns (see [`MEMORY_BINDING_RESET_ON_UPSERT`]); empty for every other table. Every name
+/// must be one of the table's `local_columns` and nullable, which the registry tests pin.
+pub(crate) fn reset_on_upsert(spec: &TableSpec) -> &'static [&'static str] {
+    match spec.name {
+        "repo_memory_bindings" => MEMORY_BINDING_RESET_ON_UPSERT,
+        _ => &[],
+    }
+}
+
+/// A row predicate under which [`reset_on_upsert`] does NOT apply. A call-path binding's
+/// resolution is not evidence but the KEY of its local `repo_memory_call_paths`/`_edges` rows
+/// (they follow the hash this store derived); clearing it on an authored restatement would leave
+/// those rows unreachable and the anchor `gone`. Validation re-derives the path against the live
+/// graph every pass regardless.
+pub(crate) fn reset_on_upsert_keeps(spec: &TableSpec) -> Option<&'static str> {
+    match spec.name {
+        "repo_memory_bindings" => Some("binding_kind = 'call_path'"),
+        _ => None,
+    }
+}
 
 const MEMORY_BINDINGS: TableSpec = TableSpec {
     name: "repo_memory_bindings",
@@ -3420,6 +3479,36 @@ mod tests {
             err.contains("does not match the table's primary key"),
             "the pk mismatch is named: {err}"
         );
+    }
+
+    /// The columns the applier nulls on a changed upsert must be local (never replicated, so the
+    /// null never crosses the wire) and nullable (so the null is storable) on the shipped schema.
+    #[test]
+    fn reset_on_upsert_names_nullable_local_columns_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let mut any = false;
+        for spec in SYNCABLE_TABLES {
+            let columns = schema_facts::physical_column_info(&conn, spec.name).unwrap();
+            for name in reset_on_upsert(spec) {
+                any = true;
+                assert!(
+                    spec.local_columns.contains(name),
+                    "{}: `{name}` is reset on upsert but is not a local column",
+                    spec.name
+                );
+                let column = columns
+                    .iter()
+                    .find(|column| column.name == *name)
+                    .unwrap_or_else(|| panic!("{}: `{name}` is not a column", spec.name));
+                assert!(
+                    !column.not_null,
+                    "{}: `{name}` is reset on upsert but NOT NULL",
+                    spec.name
+                );
+            }
+        }
+        assert!(any, "the anchors spec declares a reset set");
     }
 
     #[test]
