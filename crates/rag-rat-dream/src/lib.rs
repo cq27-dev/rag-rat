@@ -303,7 +303,7 @@ pub fn model_work_pending(
         let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
         let repo_id = scope.as_deref().unwrap_or("__unassigned__");
         let mut considered = 0usize;
-        for entry in verify::verification_queue(conn, opts.now_ms, usize::MAX)? {
+        for entry in verify::verification_queue(conn, opts.now_ms)? {
             if considered >= budget {
                 break;
             }

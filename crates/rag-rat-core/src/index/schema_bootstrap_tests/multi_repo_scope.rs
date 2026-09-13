@@ -1598,7 +1598,7 @@ fn verification_queue_never_surfaces_a_sibling_repos_memories() {
     .unwrap();
 
     a5_set_active_repo(&conn, A5_REPO_A);
-    let queue = verification_queue(&conn, 1_000, 50).unwrap();
+    let queue = verification_queue(&conn, 1_000).unwrap();
     let ids: Vec<&str> = queue.iter().map(|e| e.memory_id.as_str()).collect();
     assert_eq!(ids, vec!["a_mem"], "the queue holds ONLY the active repo's memory: {ids:?}");
 }

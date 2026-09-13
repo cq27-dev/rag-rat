@@ -333,8 +333,9 @@ pub struct FileExcerpt {
     pub text: String,
 }
 
-/// Active memories that need (re)verification, ranked (broken anchors first) and capped at
-/// `budget`. A memory is enqueued when it has no `memory_reality` row, its note content changed
+/// Active memories that need (re)verification, ranked (broken anchors first). Uncapped: the verdict
+/// runner enforces its budget itself, after skipping entries a current model failure blocks. A
+/// memory is enqueued when it has no `memory_reality` row, its note content changed
 /// (`content_hash`, covering title+body), or its evidence changed (`checked_inputs_hash`); a
 /// stale/gone anchor (the doctor
 /// predicate) raises the RANK of such a memory to the top but does NOT by itself enqueue one whose
@@ -346,7 +347,6 @@ pub struct FileExcerpt {
 pub fn verification_queue(
     conn: &Connection,
     now_ms: i64,
-    budget: usize,
 ) -> rusqlite::Result<Vec<VerificationQueueEntry>> {
     let _ = now_ms;
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
@@ -377,14 +377,13 @@ pub fn verification_queue(
             });
         }
     }
-    // Deterministic order: rank desc, then memory_id asc; then cap by budget.
+    // Deterministic order: rank desc, then memory_id asc.
     queue.sort_by(|a, b| {
         b.rank
             .partial_cmp(&a.rank)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.memory_id.cmp(&b.memory_id))
     });
-    queue.truncate(budget);
     Ok(queue)
 }
 
@@ -2039,7 +2038,7 @@ mod tests {
             .unwrap();
         }
 
-        let queue = verification_queue(&c, 2000, 10).unwrap();
+        let queue = verification_queue(&c, 2000).unwrap();
         assert!(
             queue.is_empty(),
             "unrelated legacy rows requeued (m-present, m-prose): {:?}",
@@ -2078,14 +2077,14 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(verification_queue(&c, 2000, 10).unwrap().is_empty(), "baseline row is current");
+        assert!(verification_queue(&c, 2000).unwrap().is_empty(), "baseline row is current");
 
         c.execute(
             "UPDATE repo_memory_bindings SET anchor_status = 'current' WHERE memory_id = 'm1'",
             [],
         )
         .unwrap();
-        let queue = verification_queue(&c, 2000, 10).unwrap();
+        let queue = verification_queue(&c, 2000).unwrap();
         assert_eq!(queue.len(), 1, "a live-bound absence pack must be re-evaluated");
         assert_eq!(queue[0].reason, VerificationReason::InputsChanged);
     }
@@ -2104,7 +2103,7 @@ mod tests {
             rusqlite::params![content_hash("t", "a plain note"), inputs],
         )
         .unwrap();
-        let q = verification_queue(&c, 2000, 10).unwrap();
+        let q = verification_queue(&c, 2000).unwrap();
         assert_eq!(q.len(), 1, "a stale-prompt-version row re-queues");
         assert_eq!(q[0].reason, VerificationReason::PromptChanged);
     }
@@ -2974,15 +2973,17 @@ mod tests {
     }
 
     #[test]
-    fn queue_caps_at_budget_in_deterministic_order() {
+    fn queue_is_in_deterministic_order() {
         let c = mem_db();
         set_repo(&c, "r");
-        // Four never-checked memories (same reason/rank) → ordered by memory_id, capped at 2.
+        // Four never-checked memories (same reason/rank) → ordered by memory_id.
         for id in ["m4", "m1", "m3", "m2"] {
             seed_memory(&c, id, "t", "note", "r");
         }
-        let q = verification_queue(&c, 1, 2).unwrap();
-        assert_eq!(q.iter().map(|e| e.memory_id.as_str()).collect::<Vec<_>>(), vec!["m1", "m2"]);
+        let q = verification_queue(&c, 1).unwrap();
+        assert_eq!(q.iter().map(|e| e.memory_id.as_str()).collect::<Vec<_>>(), vec![
+            "m1", "m2", "m3", "m4"
+        ]);
     }
 
     #[test]

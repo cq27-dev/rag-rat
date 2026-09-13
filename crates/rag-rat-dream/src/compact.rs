@@ -66,7 +66,7 @@ pub(super) fn run_compact_pass(
     pass: CompactPass<'_>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let queue = compaction_queue(conn, usize::MAX)?;
+    let queue = compaction_queue(conn)?;
     if queue.is_empty() {
         return Ok(());
     }
@@ -138,8 +138,9 @@ pub(super) fn run_compact_pass(
 /// ([`evidence::note_is_shown_whole`]) and with no `memory_summaries` row keyed on their CURRENT
 /// `content_hash`. A title or body edit changes the key and re-enqueues (the summary
 /// self-invalidates); an unchanged, already-summarized memory churn-skips, so re-running is cheap.
-/// Repo-scoped, ordered by `memory_id`, capped at `budget`.
-fn compaction_queue(conn: &Connection, budget: usize) -> rusqlite::Result<Vec<CompactionEntry>> {
+/// Repo-scoped and ordered by `memory_id`; uncapped — the pass budget is enforced by the runner,
+/// which skips failure-blocked entries before counting.
+fn compaction_queue(conn: &Connection) -> rusqlite::Result<Vec<CompactionEntry>> {
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
     let mem_clause = schema::periphery_repo_scope_clause(&scope, "repo_memories");
     let summary_clause = schema::periphery_repo_scope_clause(&scope, "memory_summaries");
@@ -189,7 +190,6 @@ fn compaction_queue(conn: &Connection, budget: usize) -> rusqlite::Result<Vec<Co
             queue.push(CompactionEntry { memory_id, title, body });
         }
     }
-    queue.truncate(budget);
     Ok(queue)
 }
 
@@ -206,7 +206,7 @@ pub(super) fn compaction_pending(
     }
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
     let repo_id = scope.as_deref().unwrap_or("__unassigned__");
-    for entry in compaction_queue(conn, usize::MAX)? {
+    for entry in compaction_queue(conn)? {
         let content_hash = super::verify::note_content_hash(&entry.title, &entry.body);
         let failure_stamp = FailureStamp {
             memory_id: &entry.memory_id,
@@ -967,18 +967,24 @@ mod tests {
     }
 
     #[test]
-    fn queue_caps_at_budget_in_memory_id_order() {
+    fn queue_is_in_memory_id_order_and_the_runner_caps_it_at_the_budget() {
         let c = mem_db();
         set_repo(&c, "r");
         for id in ["m4", "m1", "m3", "m2"] {
             seed_memory(&c, id, "note", &long_body("body"), "r");
         }
-        let queue = compaction_queue(&c, 2).unwrap();
+        let queue = compaction_queue(&c).unwrap();
         assert_eq!(
             queue.iter().map(|e| e.memory_id.as_str()).collect::<Vec<_>>(),
-            vec!["m1", "m2"],
-            "the queue is ordered by memory_id and capped at the budget"
+            vec!["m1", "m2", "m3", "m4"],
+            "the queue is ordered by memory_id"
         );
+        let model = MockChatModel::new([GOOD_SUMMARY, GOOD_SUMMARY]);
+        run_compact_pass(&c, CompactPass { model: &model, budget: 2 }, 1000).unwrap();
+        assert_eq!(model.calls(), 2, "the runner stops at the budget");
+        assert_eq!(summary_rows(&c, "m1").len(), 1);
+        assert_eq!(summary_rows(&c, "m2").len(), 1);
+        assert!(summary_rows(&c, "m3").is_empty(), "past the budget, in memory_id order");
     }
 
     #[test]
@@ -1003,7 +1009,7 @@ mod tests {
         assert!(wide.chars().count() > evidence::SUMMARY_MAX_CHARS);
         seed_memory(&c, "m3", "note", &wide, "r");
 
-        let queue = compaction_queue(&c, 10).unwrap();
+        let queue = compaction_queue(&c).unwrap();
         assert_eq!(
             queue.iter().map(|e| e.memory_id.as_str()).collect::<Vec<_>>(),
             vec!["m2", "m3"],
@@ -1031,7 +1037,7 @@ mod tests {
         c.execute("UPDATE repo_memories SET status='stale' WHERE id='m2'", []).unwrap();
         c.execute("UPDATE repo_memories SET status='obsolete' WHERE id='m3'", []).unwrap();
 
-        let queue = compaction_queue(&c, 10).unwrap();
+        let queue = compaction_queue(&c).unwrap();
         assert_eq!(
             queue.iter().map(|e| e.memory_id.as_str()).collect::<Vec<_>>(),
             vec!["m1", "m2"],
@@ -1052,7 +1058,7 @@ mod tests {
         seed_memory(&c, "m2", "note", &long_body("repo two body"), "r2");
 
         // The queue under r1 holds only r1's memory.
-        let queue = compaction_queue(&c, 10).unwrap();
+        let queue = compaction_queue(&c).unwrap();
         assert_eq!(
             queue.iter().map(|e| e.memory_id.as_str()).collect::<Vec<_>>(),
             vec!["m1"],

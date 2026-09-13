@@ -46,7 +46,8 @@ use super::verify::{
 const DIVERGENCE_RANK: f64 = 0.8;
 
 /// The verdict-pass configuration handed to [`run_verdict_pass`]: the model to ask and how many
-/// queued memories it may check this run (the budget the queue is capped at). Separate from
+/// queued memories it may check this run (the runner stops once that many entries reach the model
+/// or the uncitable short-circuit). Separate from
 /// [`DreamOptions`] because it carries a borrow (the model) — `DreamOptions` stays `Copy`.
 pub struct VerdictPass<'a> {
     pub model: &'a dyn ChatModel,
@@ -159,7 +160,7 @@ pub(super) fn run_verdict_pass(
     pass: VerdictPass<'_>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let queue = verification_queue(conn, now_ms, usize::MAX)?;
+    let queue = verification_queue(conn, now_ms)?;
     if queue.is_empty() {
         return Ok(());
     }
@@ -1935,11 +1936,8 @@ mod tests {
         assert!(rendered_a.contains("NOT FOUND"), "the exact-file-domain miss is rendered");
         assert!(rendered_a.contains("src/lib.rs:1: fn real_symbol()"), "excerpt line present");
 
-        let entry = verification_queue(&c, 1, 10)
-            .unwrap()
-            .into_iter()
-            .find(|e| e.memory_id == "m1")
-            .unwrap();
+        let entry =
+            verification_queue(&c, 1).unwrap().into_iter().find(|e| e.memory_id == "m1").unwrap();
         let prompt = render_verdict_prompt(&entry, "src/lib.rs", &rendered_a);
         assert!(prompt.contains("VERDICT: current | diverged"), "the verdict format is stated");
         assert!(prompt.contains("CLAIM:"), "the grounded-claim format is stated");

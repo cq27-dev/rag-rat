@@ -1364,7 +1364,7 @@ mod evidence_dream_tests {
             [],
         )
         .unwrap();
-        let q = verification_queue(&c, 1000, 10).unwrap();
+        let q = verification_queue(&c, 1000).unwrap();
         assert_eq!(q.len(), 1, "the anchor-gone memory is enqueued");
         assert_eq!(q[0].reason, VerificationReason::AnchorBroken);
 
@@ -1386,7 +1386,7 @@ mod evidence_dream_tests {
             ],
         )
         .unwrap();
-        let q = verification_queue(&c, 2000, 10).unwrap();
+        let q = verification_queue(&c, 2000).unwrap();
         assert!(q.is_empty(), "a verified + unchanged memory is churn-skipped: {q:?}");
     }
 
@@ -1419,7 +1419,7 @@ mod evidence_dream_tests {
 
         // Second run: unchanged → churn-skipped (empty queue), so it never re-consumes budget.
         assert!(
-            verification_queue(&c, 2000, 10).unwrap().is_empty(),
+            verification_queue(&c, 2000).unwrap().is_empty(),
             "the uncitable memory churn-skips after its terminal row"
         );
     }
@@ -1455,7 +1455,7 @@ mod evidence_dream_tests {
         seed_memory(&c, "m2", "t", "never checked one", "r");
         seed_memory(&c, "m3", "t", "never checked two", "r");
 
-        let q = verification_queue(&c, 1000, 10).unwrap();
+        let q = verification_queue(&c, 1000).unwrap();
         let ids: Vec<&str> = q.iter().map(|e| e.memory_id.as_str()).collect();
         assert!(
             !ids.contains(&"m1"),
@@ -1492,14 +1492,11 @@ mod evidence_dream_tests {
             ],
         )
         .unwrap();
-        assert!(
-            verification_queue(&c, 1, 10).unwrap().is_empty(),
-            "baseline: verified + unchanged"
-        );
+        assert!(verification_queue(&c, 1).unwrap().is_empty(), "baseline: verified + unchanged");
 
         // Body edit → content_hash mismatch re-enqueues.
         c.execute("UPDATE repo_memories SET body = 'a rewritten note' WHERE id='m1'", []).unwrap();
-        let q = verification_queue(&c, 1, 10).unwrap();
+        let q = verification_queue(&c, 1).unwrap();
         assert_eq!(q.iter().map(|e| e.reason).collect::<Vec<_>>(), vec![
             VerificationReason::ContentChanged
         ]);
@@ -1509,7 +1506,7 @@ mod evidence_dream_tests {
             .unwrap();
         c.execute("UPDATE main.files SET sha256 = 'sha-CHANGED' WHERE path='src/lib.rs'", [])
             .unwrap();
-        let q = verification_queue(&c, 1, 10).unwrap();
+        let q = verification_queue(&c, 1).unwrap();
         assert_eq!(q.iter().map(|e| e.reason).collect::<Vec<_>>(), vec![
             VerificationReason::InputsChanged
         ]);
@@ -1534,14 +1531,11 @@ mod evidence_dream_tests {
             ],
         )
         .unwrap();
-        assert!(
-            verification_queue(&c, 1, 10).unwrap().is_empty(),
-            "baseline: verified + unchanged"
-        );
+        assert!(verification_queue(&c, 1).unwrap().is_empty(), "baseline: verified + unchanged");
 
         c.execute("UPDATE repo_memories SET title = 'a corrected title' WHERE id='m1'", [])
             .unwrap();
-        let q = verification_queue(&c, 1, 10).unwrap();
+        let q = verification_queue(&c, 1).unwrap();
         assert_eq!(q.iter().map(|e| e.reason).collect::<Vec<_>>(), vec![
             VerificationReason::ContentChanged
         ]);
