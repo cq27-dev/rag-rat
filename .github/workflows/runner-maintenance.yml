@@ -7,9 +7,14 @@ name: runner-maintenance
 # uses, so what goes is what nothing has needed for longest) and prunes dangling Docker layers left
 # by bench image rebuilds. Runs on any `ci` runner: they share one home, so one job reaches every
 # runner's dir. Age-based sweeping does not work here — a busy day touches everything.
+#
+# Every six hours, not weekly: three runners at ~50 GB a day each outgrew the disk inside a day,
+# well before a weekly sweep could run, and a sweep only deletes, so running it often costs
+# nothing. 20 GB per dir holds the current toolchain's debug and release artifacts for every
+# feature set CI builds; what a lower cap would evict is rebuilt on the next job anyway.
 on:
   schedule:
-    - cron: '17 3 * * 1'
+    - cron: '17 */6 * * *'
   workflow_dispatch:
 
 permissions:
@@ -41,7 +46,7 @@ jobs:
             for lock in "$dir"/*/.cargo-lock "$dir"/*/*/.cargo-lock; do
               [ -e "$lock" ] && locks+=("$lock")
             done
-            local cmd=(bash -c "$guard || { echo '   skipped: a sibling started meanwhile'; exit 0; }; CARGO_TARGET_DIR=\"\$0\" cargo sweep --maxsize 30GB" "$dir")
+            local cmd=(bash -c "$guard || { echo '   skipped: a sibling started meanwhile'; exit 0; }; CARGO_TARGET_DIR=\"\$0\" cargo sweep --maxsize 20GB" "$dir")
             for lock in "${locks[@]}"; do cmd=(flock "$lock" "${cmd[@]}"); done
             "${cmd[@]}"
           }
@@ -75,7 +80,7 @@ jobs:
           # The coverage dir's lock spans its whole build-and-test cycle, so it needs no guard.
           if [ -d "$HOME/cargo-target-coverage" ]; then
             echo "== coverage: $(du -sh "$HOME/cargo-target-coverage" | cut -f1) before"
-            flock "$HOME/cargo-target-coverage.lock" env CARGO_TARGET_DIR="$HOME/cargo-target-coverage" cargo sweep --maxsize 30GB
+            flock "$HOME/cargo-target-coverage.lock" env CARGO_TARGET_DIR="$HOME/cargo-target-coverage" cargo sweep --maxsize 20GB
             echo "== coverage: $(du -sh "$HOME/cargo-target-coverage" | cut -f1) after"
           fi
       - name: Prune dangling Docker layers
