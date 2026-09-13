@@ -5,10 +5,8 @@ use std::str::FromStr;
 
 use super::raw::RawIndex;
 use super::{
-    self as config, Config, ConfigError, DistillLlmConfig, DreamLlmConfig, EmbeddingConfig,
-    LlmConfig, LogConfig, MemoryConfig, OracleConfig, PapertrailConfig, RawConfig, RawTarget,
-    ResolvedTarget, SearchConfig, SyncConfig, TargetKind, TrackerConfig, VersionCheckConfig,
-    WatchConfig,
+    self as config, Config, ConfigError, LlmConfig, LogConfig, MemoryConfig, PapertrailConfig,
+    RawConfig, RawTarget, ResolvedTarget, TargetKind, TrackerConfig,
 };
 use crate::language::Language;
 
@@ -187,29 +185,7 @@ impl Config {
     /// to their defaults; the command is expected to only use `database`, `root`, and
     /// `repo_id_override`.
     pub fn minimal_for_database(database: PathBuf, root: PathBuf) -> Self {
-        Self {
-            root,
-            database,
-            targets: Vec::new(),
-            llm: LlmConfig {
-                embedding: EmbeddingConfig::default(),
-                dream: DreamLlmConfig::default(),
-                distill: DistillLlmConfig::default(),
-            },
-            watch: WatchConfig::default(),
-            log: LogConfig::default(),
-            version_check: VersionCheckConfig::default(),
-            oracle: OracleConfig::default(),
-            search: SearchConfig::default(),
-            memory: MemoryConfig::default(),
-            trackers: Vec::new(),
-            papertrail: PapertrailConfig::default(),
-            sync: SyncConfig::default(),
-            repo_id_override: None,
-            database_key_pinned: false,
-            source_root_reanchored_from: None,
-            allow_empty: false,
-        }
+        Self { root, database, ..Self::default() }
     }
 }
 

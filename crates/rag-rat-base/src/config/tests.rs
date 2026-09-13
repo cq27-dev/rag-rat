@@ -3172,10 +3172,6 @@ fn target_directories_deduplicates_across_targets() {
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::create_dir_all(dir.path().join("extra")).unwrap();
     let cfg = Config {
-        trackers: Vec::new(),
-        papertrail: Default::default(),
-        sync: Default::default(),
-        repo_id_override: None,
         database_key_pinned: true,
         root: dir.path().to_path_buf(),
         database: dir.path().join(".rag-rat/index.sqlite"),
@@ -3197,15 +3193,7 @@ fn target_directories_deduplicates_across_targets() {
                 kind: TargetKind::Docs,
             },
         ],
-        llm: LlmConfig::default(),
-        watch: WatchConfig::default(),
-        version_check: Default::default(),
-        oracle: Default::default(),
-        search: Default::default(),
-        memory: Default::default(),
-        log: Default::default(),
-        source_root_reanchored_from: None,
-        allow_empty: false,
+        ..Config::default()
     };
     std::fs::create_dir_all(dir.path().join("docs")).unwrap();
 

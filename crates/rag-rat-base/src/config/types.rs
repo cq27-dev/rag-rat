@@ -10,7 +10,10 @@ use crate::embedding_models::{
 };
 use crate::language::Language;
 
-#[derive(Debug, Clone)]
+/// A resolved `rag-rat.toml`. `Default` exists for struct-update syntax only
+/// (`Config { root, database, ..Config::default() }`): its empty `root` and `database` name
+/// nothing, so a caller always sets both; every other field is what an absent table resolves to.
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     pub root: PathBuf,
     pub database: PathBuf,
