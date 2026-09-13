@@ -261,7 +261,7 @@ mod tests {
     /// exist yet, both stay quiet.
     #[test]
     fn same_identity_join_note_fires_for_a_second_checkout_and_not_the_first() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if !rag_rat_base::test_git::available() {
             return; // no git on PATH — skip rather than fail.
         }
         let root_a = unique_temp_root("adopt-join-a");
@@ -323,7 +323,7 @@ mod tests {
     /// `false` and an empty clone can't prune A's shared scope.
     #[test]
     fn is_root_already_indexed_tracks_indexing_not_the_shared_identity() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if !rag_rat_base::test_git::available() {
             return; // no git on PATH — skip rather than fail.
         }
         let root_a = unique_temp_root("adopt-indexed-a");
@@ -389,7 +389,7 @@ mod tests {
     /// read-registered into A's shared DB but never indexed, so it stays first-time-empty.
     #[test]
     fn a_read_only_open_does_not_make_an_unindexed_repo_look_indexed() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if !rag_rat_base::test_git::available() {
             return; // identity resolution needs git; skip rather than fail.
         }
         // Repo A: a committed git repo, actually indexed into a shared DB (persists A's
@@ -474,7 +474,7 @@ mod tests {
     /// first upgrade run.
     #[test]
     fn is_root_already_indexed_recognizes_a_legacy_placeholder_index() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if !rag_rat_base::test_git::available() {
             return; // needs git for the (unregistered) identity; skip rather than fail.
         }
         let root = unique_temp_root("adopt-placeholder");
@@ -509,7 +509,7 @@ mod tests {
     /// none of the `[index] repo_id` guidance.
     #[test]
     fn same_identity_join_warns_even_after_a_read_only_open_of_the_clone() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if !rag_rat_base::test_git::available() {
             return;
         }
         let root_a = unique_temp_root("adopt-join-read-a");
@@ -547,7 +547,7 @@ mod tests {
     /// first-time-empty.
     #[test]
     fn a_sibling_index_does_not_steal_an_earlier_checkouts_prune_right() {
-        if std::process::Command::new("git").arg("--version").output().is_err() {
+        if !rag_rat_base::test_git::available() {
             return;
         }
         // A: committed git repo, indexed into a shared DB.
