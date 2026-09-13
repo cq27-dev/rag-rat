@@ -338,8 +338,7 @@ fn infer_explicit_self_type_hint(node: Node<'_>, text: &str) -> Option<String> {
     while let Some(ancestor) = current {
         if ancestor.kind() == "function_item" {
             let parameters = ancestor.child_by_field_name("parameters")?;
-            let mut cursor = parameters.walk();
-            for parameter in parameters.named_children(&mut cursor) {
+            for parameter in named_children(parameters) {
                 if parameter.kind() != "parameter" {
                     continue;
                 }
@@ -441,8 +440,7 @@ fn nameable_type_node(mut node: Node<'_>) -> Option<Node<'_>> {
         match node.kind() {
             "reference_type" => node = node.child_by_field_name("type")?,
             "tuple_type" if redundant_parenthesized_type(node) => {
-                let mut cursor = node.walk();
-                node = node.named_children(&mut cursor).next()?;
+                node = named_children(node).next()?;
             },
             "identifier"
             | "type_identifier"
@@ -627,8 +625,7 @@ fn infer_local_var_type_hint(call_node: Node<'_>, text: &str, recv: &str) -> Opt
     }
 
     if let Some(params_node) = function_node.child_by_field_name("parameters") {
-        let mut cursor = params_node.walk();
-        for param in params_node.named_children(&mut cursor) {
+        for param in named_children(params_node) {
             if param.kind() != "parameter" {
                 continue;
             }
@@ -774,8 +771,7 @@ fn scope_declares_item(
     text: &str,
     occupies: impl Fn(Node<'_>) -> bool,
 ) -> bool {
-    let mut cursor = scope.walk();
-    scope.named_children(&mut cursor).any(|item| {
+    named_children(scope).any(|item| {
         occupies(item)
             && child_name_text(item, text)
                 .is_some_and(|declared| super::identifiers_equal(&declared, name))
@@ -858,8 +854,7 @@ fn same_file_declared_return(
     let mut tail_matched: Vec<(Node<'_>, String)> = Vec::new();
     let mut stack = vec![root];
     while let Some(current) = stack.pop() {
-        let mut cursor = current.walk();
-        for child in current.named_children(&mut cursor) {
+        for child in named_children(current) {
             match child.kind() {
                 "impl_item" => {
                     let Some(type_node) = child.child_by_field_name("type") else { continue };
@@ -940,8 +935,7 @@ fn classify_declared_return(
     impl_canonical: Option<&str>,
 ) -> Option<DeclaredReturn> {
     let body = impl_node.child_by_field_name("body")?;
-    let mut cursor = body.walk();
-    for item in body.named_children(&mut cursor) {
+    for item in named_children(body) {
         if item.kind() != "function_item" || child_name_text(item, text).as_deref() != Some(callee)
         {
             continue;
@@ -1091,8 +1085,7 @@ fn lexical_scope_binds_name(context: Node<'_>, name: &str, text: &str) -> bool {
 }
 
 fn scope_binds_name(scope: Node<'_>, name: &str, text: &str) -> bool {
-    let mut cursor = scope.walk();
-    scope.named_children(&mut cursor).any(|item| {
+    named_children(scope).any(|item| {
         if item.kind() != "use_declaration" {
             return false;
         }
@@ -1152,8 +1145,7 @@ fn let_condition_binds(condition: Node<'_>, text: &str, recv: &str) -> bool {
                 .child_by_field_name("pattern")
                 .is_some_and(|pattern| pattern_binds_name(pattern, text, recv));
         }
-        let mut cursor = condition.walk();
-        condition.named_children(&mut cursor).any(|child| let_condition_binds(child, text, recv))
+        named_children(condition).any(|child| let_condition_binds(child, text, recv))
     })
 }
 
@@ -1164,8 +1156,7 @@ fn pattern_binds_name(pattern: Node<'_>, text: &str, recv: &str) -> bool {
         {
             return true;
         }
-        let mut cursor = pattern.walk();
-        pattern.named_children(&mut cursor).any(|child| pattern_binds_name(child, text, recv))
+        named_children(pattern).any(|child| pattern_binds_name(child, text, recv))
     })
 }
 

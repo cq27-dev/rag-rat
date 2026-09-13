@@ -16,7 +16,7 @@
 
 use tree_sitter::Node;
 
-use crate::index::edges::{child_name_text, node_text};
+use crate::index::edges::{child_name_text, named_children, node_text};
 
 /// Whether `name` is a generic parameter bound by any item enclosing `at` (inclusive).
 ///
@@ -46,8 +46,7 @@ pub(super) fn binds_name(at: Node<'_>, name: &str, text: &str) -> bool {
 /// constrained/optional kind (verified against tree-sitter-rust: `constrained_type_parameter` and
 /// `optional_type_parameter` are not node kinds), so one arm is the whole type-parameter story.
 fn parameter_list_binds(parameters: Node<'_>, name: &str, text: &str) -> bool {
-    let mut cursor = parameters.walk();
-    parameters.named_children(&mut cursor).any(|parameter| match parameter.kind() {
+    named_children(parameters).any(|parameter| match parameter.kind() {
         // `r#T` and `T` are one parameter, and the occurrence side strips the prefix before
         // matching — so this has to strip it too, or a raw-spelled binder is substituted by the
         // owner renderer and missed by this membership test.

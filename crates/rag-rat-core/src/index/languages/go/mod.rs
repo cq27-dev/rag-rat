@@ -3,6 +3,7 @@ use std::path::Path;
 use tree_sitter::Node;
 
 use super::{ParserBackend, SymbolMatch};
+use crate::index::edges::named_children;
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
@@ -129,10 +130,8 @@ fn symbol_node(node: Node<'_>) -> Option<SymbolMatch<'_>> {
 /// bare `type_identifier`.
 fn receiver_type_name(node: Node<'_>, text: &str) -> Option<String> {
     let receiver = node.child_by_field_name("receiver")?;
-    let mut cursor = receiver.walk();
-    let declaration = receiver
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "parameter_declaration")?;
+    let declaration =
+        named_children(receiver).find(|child| child.kind() == "parameter_declaration")?;
     let mut current = declaration.child_by_field_name("type")?;
     // Bounded: each step strips exactly one wrapper and a receiver type nests at most a couple
     // deep (`*Server[T]`), so this cannot spin on a malformed tree.
@@ -153,6 +152,7 @@ mod tests {
     use tree_sitter::Parser;
 
     use super::{Go, SUPPORT};
+    use crate::index::edges::named_children;
     use crate::index::languages::ParserBackend;
     use crate::index::parser::{self, ParserKind};
 
@@ -186,8 +186,7 @@ mod tests {
             });
             // Children are pushed in REVERSE so the LIFO stack pops them in document order —
             // the same traversal `parser::collect_symbols` runs, so `found` needs no later sort.
-            let mut cursor = node.walk();
-            let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+            let children = named_children(node).collect::<Vec<_>>();
             stack.extend(children.into_iter().rev());
         }
         found
@@ -371,8 +370,7 @@ mod tests {
             .set_language(&parser::grammar_for(ParserKind::Go).expect("go grammar"))
             .expect("set go language");
         let tree = parser.parse(source, None).expect("parse go source");
-        let mut cursor = tree.root_node().walk();
-        let children = tree.root_node().named_children(&mut cursor).collect::<Vec<_>>();
+        let children = named_children(tree.root_node()).collect::<Vec<_>>();
 
         // Act
         let plumbing = children

@@ -3,6 +3,7 @@ use std::path::Path;
 use tree_sitter::Node;
 
 use super::{ParserBackend, ReceiverFallback, ResolutionPolicy, SymbolMatch};
+use crate::index::edges::named_children;
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
@@ -42,8 +43,7 @@ impl ParserBackend for Kotlin {
     }
 
     fn is_test_symbol(&self, text: &str, node: Node<'_>, _scope_path: &str, _name: &str) -> bool {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).any(|child| {
+        named_children(node).any(|child| {
             child.kind() == "modifiers"
                 && parser::node_text(child, text)
                     .as_deref()
@@ -75,8 +75,7 @@ fn companion_name(node: Node<'_>) -> Option<Node<'_>> {
             return Some(child);
         }
     }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+    named_children(node)
         .find(|child| matches!(child.kind(), "simple_identifier" | "type_identifier"))
 }
 
@@ -86,8 +85,7 @@ fn property_name(node: Node<'_>) -> Option<Node<'_>> {
 
 fn variable_declaration(node: Node<'_>) -> Option<Node<'_>> {
     rag_rat_base::stack::grow_stack(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).find_map(|child| {
+        named_children(node).find_map(|child| {
             if child.kind() == "variable_declaration" {
                 Some(child)
             } else if matches!(child.kind(), "modifiers" | "type_parameters" | "type_constraints") {

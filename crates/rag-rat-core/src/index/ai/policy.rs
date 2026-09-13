@@ -1,4 +1,5 @@
 use super::*;
+use crate::index::edges::named_children;
 
 #[cfg(test)]
 thread_local! {
@@ -315,8 +316,7 @@ pub(crate) fn is_low_signal_chunk(
     let root = parsed.root();
     // Low-signal iff EVERY top-level statement is plumbing (vacuously true for an empty/`}`-only
     // chunk that parses to no statements). Any definition/expression/other node is signal.
-    let mut cursor = root.walk();
-    root.named_children(&mut cursor).all(|child| is_plumbing_node(lang, child))
+    named_children(root).all(|child| is_plumbing_node(lang, child))
 }
 
 /// Span-based twin of [`is_low_signal_chunk`] (#516): classify a chunk's byte span against the
@@ -345,8 +345,7 @@ fn span_is_plumbing(
     // grow_stack: this recurses into container children to full subtree depth; a hostile
     // deeply-nested chunk must grow the stack, not overflow it (#543).
     rag_rat_base::stack::grow_stack(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).all(|child| {
+        named_children(node).all(|child| {
             if child.end_byte() <= start_byte || child.start_byte() >= end_byte {
                 return true;
             }

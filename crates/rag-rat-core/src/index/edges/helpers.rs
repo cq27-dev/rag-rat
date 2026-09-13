@@ -124,6 +124,24 @@ fn containing_symbol(symbols: &[IndexedSymbol], byte: usize) -> Option<&IndexedS
     let smallest = smallest?;
     if is_special(smallest) { smallest_non_special.or(Some(smallest)) } else { Some(smallest) }
 }
+/// A node's named children, in order, owning the cursor that tree-sitter's
+/// [`Node::named_children`] borrows — so a child scan reads as one expression. Whole-tree walks
+/// that deliberately reuse ONE cursor across every node keep calling the method directly.
+pub(crate) fn named_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+    let mut cursor = node.walk();
+    let mut on_child = cursor.goto_first_child();
+    std::iter::from_fn(move || {
+        while on_child {
+            let child = cursor.node();
+            on_child = cursor.goto_next_sibling();
+            if child.is_named() {
+                return Some(child);
+            }
+        }
+        None
+    })
+}
+
 /// A trailing turbofish (`f::<T>`) wraps the callee path in a `generic_function`; unwrap it so the
 /// type arguments' identifiers / byte ranges aren't mistaken for the callee.
 pub(crate) fn unwrap_generic_function(function: Node<'_>) -> Node<'_> {
@@ -180,8 +198,7 @@ pub(crate) fn first_identifier_text(node: Node<'_>, text: &str) -> Option<String
     // grow_stack: this recurses to full subtree depth; a hostile deeply-nested callee must grow
     // the stack, not overflow it (#543).
     rag_rat_base::stack::grow_stack(|| {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
+        for child in named_children(node) {
             if is_identifier_kind(child.kind()) {
                 return child.utf8_text(text.as_bytes()).ok().map(ToOwned::to_owned);
             }
@@ -264,8 +281,7 @@ fn collect_identifier_segments<'tree>(
     // grow_stack: full-subtree recursion; keep the same hostile-input guard as the legacy
     // text-only and node-only collectors.
     rag_rat_base::stack::grow_stack(|| {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
+        for child in named_children(node) {
             collect_identifier_segments(child, text, out);
         }
     });
@@ -304,8 +320,7 @@ pub(crate) fn identifiers_under(node: Node<'_>, text: &str) -> Vec<String> {
 /// returns is exactly the token whose text [`first_identifier_text`] would have produced.
 pub(crate) fn first_identifier_node(node: Node<'_>) -> Option<Node<'_>> {
     rag_rat_base::stack::grow_stack(|| {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
+        for child in named_children(node) {
             if is_identifier_kind(child.kind()) {
                 return Some(child);
             }
@@ -335,8 +350,7 @@ fn collect_identifier_nodes<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>
         return;
     }
     rag_rat_base::stack::grow_stack(|| {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
+        for child in named_children(node) {
             collect_identifier_nodes(child, out);
         }
     });

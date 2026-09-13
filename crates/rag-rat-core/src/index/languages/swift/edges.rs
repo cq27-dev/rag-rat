@@ -734,8 +734,7 @@ fn swift_call_edge_context(identifiers: &[String]) -> EdgeContext {
 }
 
 fn swift_call_target(node: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).find(|child| child.kind() != "call_suffix")
+    named_children(node).find(|child| child.kind() != "call_suffix")
 }
 
 /// Swift binary-operator expressions that can end up holding a call's CALLEE.
@@ -767,8 +766,7 @@ const BINARY_OPERATOR_EXPRESSIONS: &[&str] = &[
 fn swift_callee_operand(target: Node<'_>) -> Node<'_> {
     let mut current = target;
     while BINARY_OPERATOR_EXPRESSIONS.contains(&current.kind()) {
-        let mut cursor = current.walk();
-        let Some(rightmost) = current.named_children(&mut cursor).last() else {
+        let Some(rightmost) = named_children(current).last() else {
             break;
         };
         current = rightmost;
@@ -824,8 +822,7 @@ fn swift_operator_stripped_path(target: Node<'_>) -> Option<Vec<Node<'_>>> {
         return rag_rat_base::stack::grow_stack(|| swift_operator_stripped_path(inner));
     }
     if target.kind() == "navigation_expression" {
-        let mut cursor = target.walk();
-        let children = target.named_children(&mut cursor).collect::<Vec<_>>();
+        let children = named_children(target).collect::<Vec<_>>();
         let (&receiver, &suffix) = (children.first()?, children.last()?);
         // A pathological left-leaning navigation chain (`a.b.c.d…` thousands deep) recurses to full
         // depth; grow the stack rather than overflow the indexer on hostile input.
@@ -919,9 +916,8 @@ fn swift_callable_is_static_path(root: Node<'_>) -> bool {
             },
             _ => return false,
         }
-        let mut cursor = node.walk();
         children.clear();
-        children.extend(node.named_children(&mut cursor));
+        children.extend(named_children(node));
         for &child in children.iter().rev() {
             stack.push(child);
         }
@@ -930,15 +926,13 @@ fn swift_callable_is_static_path(root: Node<'_>) -> bool {
 }
 
 fn swift_subscript_suffix<'tree>(node: Node<'tree>, text: &str) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+    named_children(node)
         .filter(|child| child.kind() == "call_suffix")
         .find(|suffix| node_text(*suffix, text).trim_start().starts_with('['))
 }
 
 fn swift_import_identifiers(node: Node<'_>, text: &str) -> Vec<String> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+    named_children(node)
         .filter(|child| child.kind() == "identifier")
         .map(|child| node_text(child, text))
         .collect()
@@ -979,8 +973,7 @@ fn swift_node_is_type_parameter_reference(node: Node<'_>, text: &str) -> bool {
 fn swift_name_is_type_parameter_in_scope(reference_name: &str, node: Node<'_>, text: &str) -> bool {
     let mut ancestor = node.parent();
     while let Some(scope) = ancestor {
-        let mut cursor = scope.walk();
-        for parameters in scope.named_children(&mut cursor).filter(|child| {
+        for parameters in named_children(scope).filter(|child| {
             matches!(
                 child.kind(),
                 "type_parameters" | "enum_type_parameters" | "lambda_function_type_parameters"
@@ -1038,10 +1031,8 @@ fn swift_inheritance_is_enum_raw_type(node: Node<'_>, text: &str) -> bool {
     {
         return false;
     }
-    let mut cursor = declaration.walk();
-    let first_inheritance = declaration
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "inheritance_specifier");
+    let first_inheritance =
+        named_children(declaration).find(|child| child.kind() == "inheritance_specifier");
     first_inheritance == Some(node)
         && (swift_inheritance_is_builtin_raw_type(node, text)
             || swift_enum_has_explicit_raw_value(declaration))
@@ -1092,9 +1083,8 @@ fn swift_enum_has_explicit_raw_value(declaration: Node<'_>) -> bool {
         if node != declaration && node.kind() == "class_declaration" {
             continue;
         }
-        let mut cursor = node.walk();
         children.clear();
-        children.extend(node.named_children(&mut cursor));
+        children.extend(named_children(node));
         stack.extend(children.iter().copied());
     }
     false

@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use rag_rat_base::language::Language;
 use tree_sitter::{Node, ParseOptions, ParseState, Parser, Tree};
 
+use crate::index::edges::named_children;
+
 /// Wall-clock budget for a single file's tree-sitter parse. A normal file parses in well under this
 /// (tens of ms even for thousands of lines); a pathological input that drives tree-sitter into
 /// super-linear parsing — a grammar-ambiguity blowup, e.g. some Kotlin files (#210) — would
@@ -346,15 +348,11 @@ pub(super) fn child_name(node: Node<'_>) -> Option<Node<'_>> {
         return Some(name);
     }
 
-    let mut cursor = node.walk();
-    if let Some(name) =
-        node.named_children(&mut cursor).find(|child| NAME_KINDS.contains(&child.kind()))
-    {
+    if let Some(name) = named_children(node).find(|child| NAME_KINDS.contains(&child.kind())) {
         return Some(name);
     }
 
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).find_map(|child| first_descendant_node(child, NAME_KINDS))
+    named_children(node).find_map(|child| first_descendant_node(child, NAME_KINDS))
 }
 
 pub(super) fn first_descendant_node<'tree>(
@@ -364,8 +362,7 @@ pub(super) fn first_descendant_node<'tree>(
     // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep subtree
     // (#543).
     rag_rat_base::stack::grow_stack(|| {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
+        for child in named_children(node) {
             if kinds.contains(&child.kind()) {
                 return Some(child);
             }
@@ -410,9 +407,8 @@ pub(super) fn last_descendant_node<'tree>(
     kinds: &[&str],
 ) -> Option<Node<'tree>> {
     rag_rat_base::stack::grow_stack(|| {
-        let mut cursor = node.walk();
         let mut last = None;
-        for child in node.named_children(&mut cursor) {
+        for child in named_children(node) {
             if kinds.contains(&child.kind()) {
                 last = Some(child);
             }

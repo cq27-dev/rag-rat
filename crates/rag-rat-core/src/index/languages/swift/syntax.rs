@@ -1,5 +1,7 @@
 use tree_sitter::Node;
 
+use crate::index::edges::named_children;
+
 /// Swift source paths use `.` while the graph's canonical scope paths use `::`. Extract only the
 /// lexical path segments, excluding generic arguments, so declarations and edges share one
 /// representation (`API::Request`, never `API.Request` or `API::Request::Element`).
@@ -22,9 +24,8 @@ pub(crate) fn identifier_nodes(root: Node<'_>) -> Vec<Node<'_>> {
             identifiers.push(node);
             continue;
         }
-        let mut cursor = node.walk();
         children.clear();
-        children.extend(node.named_children(&mut cursor));
+        children.extend(named_children(node));
         for &child in children.iter().rev() {
             stack.push(child);
         }

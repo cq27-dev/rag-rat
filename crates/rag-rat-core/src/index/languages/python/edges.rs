@@ -53,8 +53,7 @@ pub(in crate::index::languages) fn python_edges(
             // rebinding of the alias name (#174 review) — see `python_import_target`.
             let module_root = record_alias.then(|| python_module_root(node)).flatten();
             let module_id = module.map(|m| m.id());
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
+            for child in named_children(node) {
                 if Some(child.id()) == module_id {
                     continue;
                 }
@@ -71,12 +70,10 @@ pub(in crate::index::languages) fn python_edges(
         },
         // `import <module>` / `import <module> as alias` — Imports edge to the module, not the
         // alias.
-        "import_statement" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
+        "import_statement" =>
+            for child in named_children(node) {
                 python_import_target(child, text, path, false, node.start_byte(), None, out);
-            }
-        },
+            },
         // Function / method / constructor call. Mirror the C handler: the callee is the LAST
         // identifier under the `function` child (`f()` → `f`, `obj.method()` → `method`), the
         // receiver is the first (recorded only as a NameOnly hint — never claimed as exact;
@@ -114,8 +111,7 @@ pub(in crate::index::languages) fn python_edges(
         // superclasses, and a parameterized base resolves to its head (`Generic`, not `T`).
         "class_definition" =>
             if let Some(supers) = node.child_by_field_name("superclasses") {
-                let mut cursor = supers.walk();
-                for base in supers.named_children(&mut cursor) {
+                for base in named_children(supers) {
                     if matches!(base.kind(), "keyword_argument" | "list_splat" | "dictionary_splat")
                     {
                         continue;
@@ -228,8 +224,7 @@ fn emit_python_type_refs(
             // grow_stack: a deeply-nested annotation (a PEP 604 union `A|A|…`, nested generics)
             // recurses to full subtree depth here — grow rather than overflow (#543).
             rag_rat_base::stack::grow_stack(|| {
-                let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
+                for child in named_children(node) {
                     emit_python_type_refs(child, locator, text, out);
                 }
             });
@@ -407,8 +402,7 @@ fn python_next_module_binding(
     text: &str,
 ) -> Option<usize> {
     let mut best: Option<usize> = None;
-    let mut cursor = module.walk();
-    for child in module.named_children(&mut cursor) {
+    for child in named_children(module) {
         if let Some(byte) = python_rebinding_effective_byte(child, name, text)
             && byte > after_byte
         {
@@ -448,12 +442,9 @@ fn python_rebinding_effective_byte(node: Node<'_>, name: &str, text: &str) -> Op
         // `del Account` at module scope removes the binding, so the alias is dead from there (#174
         // review). `del Account.attr` / `del Account[i]` do NOT unbind `Account` itself —
         // `python_assignment_target_binds` returns false for attribute/subscript targets.
-        "delete_statement" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .any(|target| python_assignment_target_binds(target, name, text))
-                .then(|| node.start_byte())
-        },
+        "delete_statement" => named_children(node)
+            .any(|target| python_assignment_target_binds(target, name, text))
+            .then(|| node.start_byte()),
         _ => None,
     }
 }
@@ -468,9 +459,7 @@ fn python_assignment_target_binds(target: Node<'_>, name: &str, text: &str) -> b
         "pattern_list" | "tuple_pattern" | "list_pattern" | "splat_pattern"
         | "list_splat_pattern" | "expression_list" => rag_rat_base::stack::grow_stack(|| {
             // grow_stack: nested unpacking (`a, (b, (c, …))`) recurses to full depth (#543).
-            let mut cursor = target.walk();
-            target
-                .named_children(&mut cursor)
+            named_children(target)
                 .any(|element| python_assignment_target_binds(element, name, text))
         }),
         _ => false,
@@ -487,8 +476,7 @@ fn python_import_binds_name(node: Node<'_>, name: &str, text: &str) -> bool {
     // grow_stack: uniform depth guard for a tree descender (#543); `import_list` doesn't nest
     // deeply today, so this is a no-op fast path.
     rag_rat_base::stack::grow_stack(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).any(|child| {
+        named_children(node).any(|child| {
             if Some(child.id()) == module_id {
                 return false;
             }
@@ -524,8 +512,7 @@ fn python_import_target(
         // grow_stack: uniform depth guard for a tree descender (#543); `import_list` doesn't nest
         // deeply today, so this is a no-op fast path, but the invariant stays uniform.
         rag_rat_base::stack::grow_stack(|| {
-            let mut cursor = child.walk();
-            for clause in child.named_children(&mut cursor) {
+            for clause in named_children(child) {
                 python_import_target(
                     clause,
                     text,

@@ -174,15 +174,13 @@ fn enclosing_impl_type_name(node: Node<'_>, text: &str) -> Option<String> {
 fn pattern_enum_variant_keys<'a>(pattern: Node<'a>, text: &str) -> Vec<(String, Node<'a>)> {
     // Unwrap `match_pattern` (which also wraps any `if`-guard) to the actual pattern / or_pattern.
     let inner = if pattern.kind() == "match_pattern" {
-        let mut cursor = pattern.walk();
-        pattern.named_children(&mut cursor).next().unwrap_or(pattern)
+        named_children(pattern).next().unwrap_or(pattern)
     } else {
         pattern
     };
     let mut alternatives = Vec::new();
     if inner.kind() == "or_pattern" {
-        let mut cursor = inner.walk();
-        alternatives.extend(inner.named_children(&mut cursor));
+        alternatives.extend(named_children(inner));
     } else {
         alternatives.push(inner);
     }
@@ -251,10 +249,7 @@ fn arm_rebinds_local(node: Node<'_>) -> bool {
         return true;
     }
     // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep arm (#543).
-    rag_rat_base::stack::grow_stack(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).any(arm_rebinds_local)
-    })
+    rag_rat_base::stack::grow_stack(|| named_children(node).any(arm_rebinds_local))
 }
 
 /// Whether `node`'s subtree contains an `identifier` — used to decide if an assignment target can
@@ -263,10 +258,7 @@ fn subtree_has_identifier(node: Node<'_>) -> bool {
     if node.kind() == "identifier" {
         return true;
     }
-    rag_rat_base::stack::grow_stack(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).any(subtree_has_identifier)
-    })
+    rag_rat_base::stack::grow_stack(|| named_children(node).any(subtree_has_identifier))
 }
 
 /// See [`collect_handler_calls`]. `scope` maps an in-scope binding name to the ALREADY-RESOLVED
@@ -305,9 +297,7 @@ fn result_handler_calls_impl<'a>(
             // args we can't tell which is the response (`Resp::X(handler(), metric())`). Comments
             // are NAMED children, so filter them before counting.
                 if let Some(args) = node.child_by_field_name("arguments") {
-                    let mut cursor = args.walk();
-                    let arguments: Vec<Node<'a>> = args
-                        .named_children(&mut cursor)
+                    let arguments: Vec<Node<'a>> = named_children(args)
                         .filter(|arg| !matches!(arg.kind(), "line_comment" | "block_comment"))
                         .collect();
                     if let [only] = arguments.as_slice() {
@@ -326,9 +316,7 @@ fn result_handler_calls_impl<'a>(
         "block" => {
             // Skip comments: tree-sitter exposes `line_comment`/`block_comment` as NAMED children,
             // so a trailing comment would otherwise masquerade as the block's tail expression.
-            let mut cursor = node.walk();
-            let children: Vec<Node<'a>> = node
-                .named_children(&mut cursor)
+            let children: Vec<Node<'a>> = named_children(node)
                 .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
                 .collect();
             let Some((tail, statements)) = children.split_last() else {
@@ -481,9 +469,7 @@ fn result_handler_calls_impl<'a>(
             // one field value — a multi-field struct can't attribute which field is the
             // returned response (`Resp { ok: handler(), metric: m() }`), so emit
             // nothing (no false edge, #208 review).
-            let mut cursor = node.walk();
-            let Some(fields) =
-                node.named_children(&mut cursor).find(|c| c.kind() == "field_initializer_list")
+            let Some(fields) = named_children(node).find(|c| c.kind() == "field_initializer_list")
             else {
                 return;
             };
@@ -517,8 +503,7 @@ fn result_handler_calls_impl<'a>(
         "index_expression" => {
             // A projection `r[i]` of a result — trace ONLY the indexed receiver (`r`), never the
             // index expression (`choose_index()` selects, it doesn't produce the response).
-            let mut cursor = node.walk();
-            if let Some(receiver) = node.named_children(&mut cursor).next() {
+            if let Some(receiver) = named_children(node).next() {
                 result_handler_calls(receiver, text, scope, out);
             }
         },
@@ -526,8 +511,7 @@ fn result_handler_calls_impl<'a>(
             // A SINGLE-element container is a transparent wrapper (`(x,)`, `[x]`); a multi-element
             // one can't attribute which element is the returned response (`(handler(), metric())`),
             // so emit nothing rather than credit a discarded sibling (#208 review).
-            let mut cursor = node.walk();
-            let elements: Vec<Node<'a>> = node.named_children(&mut cursor).collect();
+            let elements: Vec<Node<'a>> = named_children(node).collect();
             if let [only] = elements.as_slice() {
                 result_handler_calls(*only, text, scope, out);
             }
@@ -546,12 +530,10 @@ fn result_handler_calls_impl<'a>(
         | "parenthesized_expression"
         | "unsafe_block"
         | "try_expression"
-        | "await_expression" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
+        | "await_expression" =>
+            for child in named_children(node) {
                 result_handler_calls(child, text, scope, out);
-            }
-        },
+            },
         _ => {},
     }
 }
@@ -563,10 +545,7 @@ fn simple_binding_name(pattern: Node<'_>, text: &str) -> Option<String> {
         "identifier" => pattern,
         // `let mut x`: the `mut_pattern`'s first named child is the `mutable_specifier`, so find
         // the identifier child rather than taking `named_child(0)` (#208 review round 10).
-        "mut_pattern" => {
-            let mut cursor = pattern.walk();
-            pattern.named_children(&mut cursor).find(|node| node.kind() == "identifier")?
-        },
+        "mut_pattern" => named_children(pattern).find(|node| node.kind() == "identifier")?,
         _ => return None,
     };
     identifier.utf8_text(text.as_bytes()).ok().map(str::to_string)
@@ -616,8 +595,7 @@ fn pattern_binding_names_impl(pattern: Node<'_>, text: &str, out: &mut Vec<Strin
             // A guarded arm's `pattern` is `match_pattern` = the pattern + an `if <guard>` whose
             // `condition` holds READS, not bindings — recurse the pattern, skip the guard (#208).
             let guard = pattern.child_by_field_name("condition");
-            let mut cursor = pattern.walk();
-            for child in pattern.named_children(&mut cursor) {
+            for child in named_children(pattern) {
                 if Some(child) != guard {
                     pattern_binding_names(child, text, out);
                 }
@@ -628,8 +606,7 @@ fn pattern_binding_names_impl(pattern: Node<'_>, text: &str, out: &mut Vec<Strin
             // module segment there is NOT a binding and must not mask an outer `let` of
             // that name (#208).
             let type_field = pattern.child_by_field_name("type");
-            let mut cursor = pattern.walk();
-            for child in pattern.named_children(&mut cursor) {
+            for child in named_children(pattern) {
                 if Some(child) != type_field {
                     pattern_binding_names(child, text, out);
                 }
@@ -638,12 +615,10 @@ fn pattern_binding_names_impl(pattern: Node<'_>, text: &str, out: &mut Vec<Strin
         // A bare `scoped_identifier` pattern is a UNIT-VARIANT / const path (`status::Ready`,
         // `Mod::CONST`); its segments are a qualifier + variant, never bindings (#208 review).
         "scoped_identifier" => {},
-        _ => {
-            let mut cursor = pattern.walk();
-            for child in pattern.named_children(&mut cursor) {
+        _ =>
+            for child in named_children(pattern) {
                 pattern_binding_names(child, text, out);
-            }
-        },
+            },
     }
 }
 

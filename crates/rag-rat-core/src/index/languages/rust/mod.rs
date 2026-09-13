@@ -6,7 +6,7 @@ use super::{
     ParserBackend, QualifiedRoot, ReceiverFallback, ReferenceDisposition, ResolutionPolicy,
     SymbolMatch, TypeBinding,
 };
-use crate::index::edges::{EdgeKind, scope_grammar};
+use crate::index::edges::{EdgeKind, named_children, scope_grammar};
 use crate::index::parser::{self, ParsedSymbolFact, ParserKind};
 
 mod binders;
@@ -165,8 +165,7 @@ fn declared_binders(node: Node<'_>, text: &str) -> Vec<String> {
     let Some(parameters) = node.child_by_field_name("type_parameters") else {
         return names;
     };
-    let mut cursor = parameters.walk();
-    for parameter in parameters.named_children(&mut cursor) {
+    for parameter in named_children(parameters) {
         if matches!(parameter.kind(), "type_parameter" | "const_parameter")
             && let Some(name) = crate::index::edges::child_name_text(parameter, text)
         {
@@ -289,8 +288,7 @@ fn a_type_of_that_name_is_in_scope(from: Node<'_>, name: &str, text: &str) -> bo
         return true;
     }
     binding_scopes(from).any(|scope| {
-        let mut cursor = scope.walk();
-        scope.named_children(&mut cursor).any(|item| {
+        named_children(scope).any(|item| {
             if matches!(
                 item.kind(),
                 "struct_item" | "enum_item" | "union_item" | "type_item" | "trait_item"
@@ -482,8 +480,7 @@ fn print_type_inner(
             }
         },
         "tuple_type" => {
-            let mut cursor = node.walk();
-            let members = node.named_children(&mut cursor).count();
+            let members = named_children(node).count();
             // `(W)` is `W`; `(W,)` is a one-tuple. The grammar gives both ONE child, so the
             // trailing comma is the only thing that tells them apart.
             let one_tuple = members == 1 && has_kind(node, ",");
@@ -556,8 +553,7 @@ fn print_type_inner(
             },
         "bracketed_type" => {
             out.push('<');
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
+            for child in named_children(node) {
                 print_type(child, text, binders, Position::Type, out);
             }
             out.push('>');
@@ -579,8 +575,7 @@ fn print_type_inner(
                 print_type(name, text, binders, Position::Name, out);
             }
             out.push('!');
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
+            for child in named_children(node) {
                 if child.kind() == "token_tree" {
                     render_opaque(child, text, binders, false, out);
                 }
@@ -619,9 +614,8 @@ fn print_joined(
     out: &mut String,
     bracketed: bool,
 ) {
-    let mut cursor = node.walk();
     let mut parts = Vec::new();
-    for child in node.named_children(&mut cursor) {
+    for child in named_children(node) {
         let mut part = String::new();
         print_type(child, text, binders, Position::Type, &mut part);
         if !part.is_empty() {
@@ -747,8 +741,7 @@ fn collect_binder_spans(
         // Every other field is a real type position, including a qualified path's ROOT: in
         // `T::Assoc` the `T` IS the binder, and rustc renders that conflict `<_ as Bound>::Assoc`.
         let named = current.child_by_field_name("name");
-        let mut cursor = current.walk();
-        stack.extend(current.named_children(&mut cursor).filter(|child| Some(*child) != named));
+        stack.extend(named_children(current).filter(|child| Some(*child) != named));
     }
     spans.sort_unstable();
     spans
@@ -761,8 +754,7 @@ fn shadowed_before(occurrence: Node<'_>, name: &str, text: &str) -> bool {
     let mut current = occurrence.parent();
     while let Some(scope) = current {
         if scope.kind() == "block" {
-            let mut cursor = scope.walk();
-            let shadows = scope.named_children(&mut cursor).any(|child| {
+            let shadows = named_children(scope).any(|child| {
                 child.kind() == "let_declaration"
                     && child.start_byte() < at
                     && child.child_by_field_name("pattern").is_some_and(|pattern| {
@@ -790,8 +782,7 @@ fn pattern_binds_any(pattern: Node<'_>, text: &str, binders: &[String]) -> bool 
         {
             return true;
         }
-        let mut cursor = current.walk();
-        stack.extend(current.named_children(&mut cursor));
+        stack.extend(named_children(current));
     }
     false
 }
@@ -810,8 +801,7 @@ fn impl_name(node: Node<'_>) -> Option<Node<'_>> {
     }
     // No `type` field at all (a partial parse): scan positionally, but never adopt the trait.
     let trait_id = node.child_by_field_name("trait").map(|node| node.id());
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
+    named_children(node)
         .find(|child| is_impl_type_node(child.kind()) && Some(child.id()) != trait_id)
 }
 
@@ -857,8 +847,7 @@ fn in_cfg_test_module(node: Node<'_>, text: &str) -> bool {
 
 fn attribute_items(text: &str, node: Node<'_>) -> Vec<String> {
     let mut attributes = Vec::new();
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
+    for child in named_children(node) {
         if child.kind() == "attribute_item" {
             attributes.push(parser::node_text(child, text).unwrap_or_default());
         }
