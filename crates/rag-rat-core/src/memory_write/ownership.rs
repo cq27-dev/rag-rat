@@ -70,8 +70,6 @@ impl StreamSealPolicy {
 /// id, set by `sync contribute`). Absent = this store authors its own owner stream.
 pub(crate) const CONTRIBUTION_OWNER_META_KEY: &str = "memory_contribution_owner";
 
-/// The configured contribution-owner account for `repo_id`, or `None`. Stored as a 64-hex account
-/// id.
 /// Every `(repo_id, owner)` this store is configured to contribute to. Small by construction — one
 /// entry per contributing repo — and the input to both the serve predicate (which grant matters)
 /// and the private-stream guard (whether ANY repo is contributing).
@@ -98,6 +96,8 @@ struct UnparseableOwnerKey {
     meta_key: &'static str,
 }
 
+/// The configured contribution-owner account for `repo_id`, or `None`. Stored as a 64-hex account
+/// id.
 pub(super) fn contribution_owner_account(
     conn: &Connection,
     repo_id: &str,
