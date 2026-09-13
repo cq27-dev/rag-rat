@@ -1,3 +1,4 @@
+use super::hydrate::BINDING_ROW_COLUMNS;
 use super::*;
 
 /// Max chars for a memory title (a one-line summary) and body. The body cap is generous on purpose:

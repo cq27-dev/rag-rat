@@ -30,7 +30,7 @@
 use std::collections::HashSet;
 
 use anyhow::Context;
-use rag_rat_query::memory::hydrate::tags_for_memory;
+use rag_rat_query::memory::tags_for_memory;
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 /// Scoped durability bump for an AUTHORED write (#560). The index connection runs

@@ -1,13 +1,20 @@
 mod api;
 pub mod edges;
 pub mod evidence;
-pub mod hydrate;
+mod hydrate;
 mod moniker;
 mod resolve;
 mod validate;
 use std::collections::BTreeSet;
 
-pub use api::{memory_evidence_for_symbol, *};
+pub(crate) use api::memory_ids_with_broken_anchors;
+pub use api::{
+    MAX_EDGE_ANCHOR_LEN, MAX_MEMORY_BODY_LEN, MAX_MEMORY_PAYLOAD_LEN, MAX_MEMORY_TITLE_LEN,
+    MemoryDoctorEntry, MemorySummary, anchor_health_counts, doctor_attention_count, doctor_report,
+    list_memories, memories_for_call_path_hash, memories_for_chunk, memories_for_edges,
+    memories_for_path, memories_for_symbol, memory_by_id, memory_evidence_for_symbol,
+    memory_evidence_for_symbol_and_edges, memory_search, memory_search_scored, validate_memories,
+};
 pub use edges::{
     EDGE_SELECT, edge_by_key, edge_key, edge_row, edges_from, edges_into,
     periphery_edge_scope_clause, repo_is_registered, reresolve_on_read, resolve_node_target,
@@ -16,14 +23,40 @@ pub use edges::{
 // The typed-edge public surface (#464): the boundary types cross the FFI/MCP/CLI edge, so they
 // are `pub`; the query fns stay crate-internal.
 pub use edges::{EdgeRelation, EdgeTarget, NodeEdge};
-pub use hydrate::*;
-pub use moniker::*;
+pub use hydrate::{
+    CurrentDreamState, current_dream_state, current_summary_and_verdict, duplicate_memory_id,
+    heal_repo_memory_fts, mark_drive_by_drift, normalize_tags, replace_tags, split_active_stale,
+    tags_for_memory, upsert_memory_fts,
+};
+pub(crate) use hydrate::{
+    attach_memory_children, binding_row, drive_by_memory, ids_to_memories, memory_row,
+};
+pub(crate) use moniker::{
+    MONIKER_MATCH_REASON, SCIP_MONIKER_BINDING_KIND, relocate_binding_by_moniker,
+    validate_moniker_binding,
+};
+pub use moniker::{MonikerResolution, insert_auto_moniker_binding, resolve_moniker};
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::time::now_ms;
-pub use resolve::*;
+pub(crate) use resolve::{
+    RelocateMatch, call_path_edge_by_id, chunk_by_id, chunk_for_logical_symbol, chunk_for_symbol,
+    chunk_ids_for_symbol, compute_edge_sequence_hash, dir_has_files, edge_by_fingerprint,
+    edge_by_id, edge_id_matches_fingerprint_in_linked_worktree, logical_symbol_id_for_symbol,
+    relocate_chunk_by_hash, relocate_symbol_by_name, short_symbol_name, symbol_signal,
+};
+pub use resolve::{
+    insert_binding, logical_symbol_id_for_chunk, remap_call_path_callee_logical_symbol_ids,
+    resolve_binding, stamp_bindings_from_parent_repo,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-pub use validate::*;
+pub use validate::{
+    AppliedTarget, AppliedTargets, RETARGETED_REASON, decode_applied_targets,
+    encode_applied_targets, is_polymorphic_node_kind, memory_id, memory_input_hash,
+    validate_confidence, validate_edge_len, validate_kind, validate_len, validate_payload,
+    validate_source, validate_status,
+};
+pub(crate) use validate::{effective_fs_root, fts_query, validate_binding};
 
 /// The active `repo_id` scope for the memory tables, or `None` on the pre-A5 schema (the memory
 /// tables are still repo-global until the periphery-scoping migration lands). Every memory
