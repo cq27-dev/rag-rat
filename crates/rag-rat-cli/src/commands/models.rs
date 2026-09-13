@@ -183,14 +183,16 @@ pub(crate) fn benchmark_embedding(
     };
 
     let measured = rag_rat_llm::throughput_tune::benchmark_remote_concurrency(
-        &provisioned.endpoint,
-        provisioned.auth_token.as_deref(),
-        &remote,
-        &selected_model_id,
-        dim,
-        max_embedding_chars,
-        &candidates,
-        budget_ms,
+        rag_rat_llm::throughput_tune::BenchmarkParams {
+            endpoint: &provisioned.endpoint,
+            auth_token: provisioned.auth_token.as_deref(),
+            remote: &remote,
+            selected_model_id: &selected_model_id,
+            dim,
+            max_embedding_chars,
+            candidates: &candidates,
+            budget_ms,
+        },
     );
 
     // Surface any REQUESTED candidates the sweep did NOT measure. `measure_candidates` drops a

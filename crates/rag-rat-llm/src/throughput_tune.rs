@@ -87,21 +87,37 @@ struct TuneCacheFile {
     entries: std::collections::HashMap<String, TuneCacheEntry>,
 }
 
+/// Inputs to [`tune_remote_concurrency`].
+pub(crate) struct TuneRequestParams<'a> {
+    /// The index connection holding the tune cache.
+    pub(crate) conn: &'a Connection,
+    /// The cookbook spec, folded into the cache key (`gpu` comes from `remote`).
+    pub(crate) provider: &'a str,
+    /// The box's serving endpoint and bearer token, from the cookbook handshake.
+    pub(crate) endpoint: &'a str,
+    pub(crate) auth_token: Option<&'a str>,
+    pub(crate) remote: &'a RemoteEmbeddingConfig,
+    pub(crate) spec: &'a EmbeddingModelSpec,
+    /// The live per-chunk char cap, so probe texts weigh what reconcile sends.
+    pub(crate) max_embedding_chars: usize,
+    /// Whether a cache miss may run a fresh sweep (see `sweep_is_worthwhile`).
+    pub(crate) allow_sweep: bool,
+}
+
 /// Tune the CLIENT concurrency (the ollama fan-out) for a provisioned box, returning the knee
-/// clamped to the user's cap. `provider`/`gpu` come from the cookbook config;
-/// `endpoint`/`auth_token` from the handshake. Never errors — any failure falls back to the cap
-/// (tuning is best-effort).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn tune_remote_concurrency(
-    conn: &Connection,
-    provider: &str,
-    endpoint: &str,
-    auth_token: Option<&str>,
-    remote: &RemoteEmbeddingConfig,
-    spec: &EmbeddingModelSpec,
-    max_embedding_chars: usize,
-    allow_sweep: bool,
-) -> u32 {
+/// clamped to the user's cap. Never errors — any failure falls back to the cap (tuning is
+/// best-effort).
+pub(crate) fn tune_remote_concurrency(params: TuneRequestParams<'_>) -> u32 {
+    let TuneRequestParams {
+        conn,
+        provider,
+        endpoint,
+        auth_token,
+        remote,
+        spec,
+        max_embedding_chars,
+        allow_sweep,
+    } = params;
     let cap = remote.bounded_concurrency();
     if tuning_disabled() {
         return cap;
@@ -161,15 +177,15 @@ pub(crate) fn tune_remote_concurrency(
     // probe request matches a real `/api/embed` request's weight.
     let request_texts =
         effective_request_texts(batch_size, remote.max_batch_chars, max_embedding_chars);
-    match run_sweep(
-        sweep_candidates(cap),
-        cap,
+    let sweep = MeasureParams {
+        candidates: sweep_candidates(cap),
         per_text_chars,
         request_texts,
-        remote.request_timeout_s,
-        tune_budget_ms(),
+        request_timeout_s: remote.request_timeout_s,
+        budget_ms: tune_budget_ms(),
         build,
-    ) {
+    };
+    match run_sweep(sweep, cap) {
         SweepOutcome::Knee { knee, texts_per_second, complete } => {
             // Only cache a COMPLETE sweep — one where every candidate was measured. If the budget
             // truncated the loop, or high candidates were skipped for allocation, the knee is still
@@ -209,6 +225,24 @@ pub struct MeasuredCandidate {
     pub aborted: bool,
 }
 
+/// Inputs to [`benchmark_remote_concurrency`].
+#[cfg(feature = "eval")]
+pub struct BenchmarkParams<'a> {
+    /// The box's serving endpoint and bearer token, from the cookbook handshake.
+    pub endpoint: &'a str,
+    pub auth_token: Option<&'a str>,
+    pub remote: &'a RemoteEmbeddingConfig,
+    /// The model identity the probes embed as (see [`benchmark_remote_concurrency`]).
+    pub selected_model_id: &'a str,
+    pub dim: usize,
+    /// The live per-chunk char cap, so probe texts weigh what reconcile sends.
+    pub max_embedding_chars: usize,
+    /// The concurrency ladder to measure, ascending.
+    pub candidates: &'a [u32],
+    /// The whole sweep's time budget, split evenly across candidates.
+    pub budget_ms: u64,
+}
+
 /// EVAL-ONLY (#346): benchmark a provisioned box at every concurrency candidate and return the FULL
 /// per-candidate throughput table — no knee selection, no caching. The measured counterpart to
 /// [`tune_remote_concurrency`]: it builds the probe params + per-candidate `build` closure the SAME
@@ -223,17 +257,17 @@ pub struct MeasuredCandidate {
 /// `'static` fields can't carry a runtime-chosen model id/dim. For a registry model the caller
 /// passes `spec.model_id` / `spec.dim`.
 #[cfg(feature = "eval")]
-#[allow(clippy::too_many_arguments)]
-pub fn benchmark_remote_concurrency(
-    endpoint: &str,
-    auth_token: Option<&str>,
-    remote: &RemoteEmbeddingConfig,
-    selected_model_id: &str,
-    dim: usize,
-    max_embedding_chars: usize,
-    candidates: &[u32],
-    budget_ms: u64,
-) -> Vec<MeasuredCandidate> {
+pub fn benchmark_remote_concurrency(params: BenchmarkParams<'_>) -> Vec<MeasuredCandidate> {
+    let BenchmarkParams {
+        endpoint,
+        auth_token,
+        remote,
+        selected_model_id,
+        dim,
+        max_embedding_chars,
+        candidates,
+        budget_ms,
+    } = params;
     // Mirror `tune_remote_concurrency`'s probe construction so a benchmarked candidate embeds the
     // SAME per-request weight the live reconcile would: `batch_size` normalized to >=1 like the
     // embedder, probe texts sized to the live chunk cap, request texts split by BOTH the count and
@@ -450,26 +484,14 @@ fn measure_candidates<E: Embedder>(
 /// request_timeout_s)` gets a per-request HTTP timeout bounded by the tune budget so no single
 /// probe can hold the box past the budget.
 fn run_sweep<E: Embedder>(
-    candidates: Vec<u32>,
+    params: MeasureParams<E, impl Fn(u32, u64) -> E>,
     cap: u32,
-    per_text_chars: usize,
-    request_texts: u32,
-    request_timeout_s: u64,
-    budget_ms: u64,
-    build: impl Fn(u32, u64) -> E,
 ) -> SweepOutcome {
-    if budget_ms < MIN_TUNE_BUDGET_MS {
+    if params.budget_ms < MIN_TUNE_BUDGET_MS {
         return SweepOutcome::NotRun;
     }
-    let total_candidates = candidates.len();
-    let results = measure_candidates(MeasureParams {
-        candidates,
-        per_text_chars,
-        request_texts,
-        request_timeout_s,
-        budget_ms,
-        build,
-    });
+    let total_candidates = params.candidates.len();
+    let results = measure_candidates(params);
     // Every attempted candidate pushes exactly one result (nothing between `attempted += 1` and the
     // push in the loop short-circuits), so the measured-row count IS the attempt count — the gate
     // `select_knee`'s caller uses to decide `complete` (a budget-truncated / allocation-skipped
@@ -924,10 +946,17 @@ mod tests {
     #[test]
     fn run_sweep_does_not_run_below_min_budget() {
         // Budget under the minimum → the sweep is skipped entirely (caller uses the cap).
-        let outcome =
-            run_sweep(sweep_candidates(4), 4, 16, 4, 1, 1_000, |concurrency, _timeout| {
-                FakeEmbedder { concurrency, fail_above: 8 }
-            });
+        let outcome = run_sweep(
+            MeasureParams {
+                candidates: sweep_candidates(4),
+                per_text_chars: 16,
+                request_texts: 4,
+                request_timeout_s: 1,
+                budget_ms: 1_000,
+                build: |concurrency, _timeout| FakeEmbedder { concurrency, fail_above: 8 },
+            },
+            4,
+        );
         assert!(matches!(outcome, SweepOutcome::NotRun));
     }
 
@@ -936,13 +965,15 @@ mod tests {
         // cap 4 → candidates [1, 2, 4]; the box fails above concurrency 2, so 4 aborts and the knee
         // is a stable low value. All candidates fit the budget → complete → cacheable.
         let outcome = run_sweep(
-            sweep_candidates(4),
+            MeasureParams {
+                candidates: sweep_candidates(4),
+                per_text_chars: 16,
+                request_texts: 4,
+                request_timeout_s: 1,
+                budget_ms: MIN_TUNE_BUDGET_MS,
+                build: |concurrency, _timeout| FakeEmbedder { concurrency, fail_above: 2 },
+            },
             4,
-            16, // per_text_chars (tiny)
-            4,  // batch_size (tiny window)
-            1,  // request_timeout_s
-            MIN_TUNE_BUDGET_MS,
-            |concurrency, _timeout| FakeEmbedder { concurrency, fail_above: 2 },
         );
         match outcome {
             SweepOutcome::Knee { knee, complete, .. } => {
@@ -1001,16 +1032,16 @@ mod tests {
         )
         .unwrap();
         let candidates = [1u32, 2, 4];
-        let measured = benchmark_remote_concurrency(
-            "http://127.0.0.1:1",
-            None,
-            &remote,
-            spec.model_id,
-            spec.dim,
-            4_000,
-            &candidates,
-            MIN_TUNE_BUDGET_MS,
-        );
+        let measured = benchmark_remote_concurrency(BenchmarkParams {
+            endpoint: "http://127.0.0.1:1",
+            auth_token: None,
+            remote: &remote,
+            selected_model_id: spec.model_id,
+            dim: spec.dim,
+            max_embedding_chars: 4_000,
+            candidates: &candidates,
+            budget_ms: MIN_TUNE_BUDGET_MS,
+        });
         assert_eq!(
             measured.iter().map(|m| m.concurrency).collect::<Vec<_>>(),
             candidates.to_vec(),
@@ -1045,6 +1076,25 @@ mod tests {
         }
     }
 
+    /// A `modal` tune against a closed local port with a 4000-char chunk cap.
+    fn unreachable_tune<'a>(
+        conn: &'a Connection,
+        remote: &'a RemoteEmbeddingConfig,
+        spec: &'a EmbeddingModelSpec,
+        allow_sweep: bool,
+    ) -> TuneRequestParams<'a> {
+        TuneRequestParams {
+            conn,
+            provider: "modal",
+            endpoint: "http://127.0.0.1:1",
+            auth_token: None,
+            remote,
+            spec,
+            max_embedding_chars: 4_000,
+            allow_sweep,
+        }
+    }
+
     #[test]
     fn tune_remote_concurrency_returns_a_fresh_cached_knee_without_probing() {
         let conn = mem_conn();
@@ -1068,16 +1118,7 @@ mod tests {
         });
         write_cached_knee(&conn, &key, 6, 32, 100.0);
         // The endpoint is never contacted: the cache hits first, even with `allow_sweep = false`.
-        let knee = tune_remote_concurrency(
-            &conn,
-            "modal",
-            "http://127.0.0.1:1",
-            None,
-            &remote,
-            spec,
-            4_000,
-            false,
-        );
+        let knee = tune_remote_concurrency(unreachable_tune(&conn, &remote, spec, false));
         assert_eq!(knee, 6);
     }
 
@@ -1091,16 +1132,7 @@ mod tests {
         .unwrap();
         // No cache entry + `allow_sweep = false` (a bounded / non-fan-out run) → the raw cap, and
         // the unreachable endpoint is never probed (no sweep runs).
-        let knee = tune_remote_concurrency(
-            &conn,
-            "modal",
-            "http://127.0.0.1:1",
-            None,
-            &remote,
-            spec,
-            4_000,
-            false,
-        );
+        let knee = tune_remote_concurrency(unreachable_tune(&conn, &remote, spec, false));
         assert_eq!(knee, 8);
         assert!(read_cache(&conn).entries.is_empty());
     }
@@ -1115,16 +1147,7 @@ mod tests {
             rag_rat_base::embedding_models::FASTEMBED_MODEL_ID,
         )
         .unwrap();
-        let knee = tune_remote_concurrency(
-            &conn,
-            "modal",
-            "http://127.0.0.1:1",
-            None,
-            &remote,
-            spec,
-            4_000,
-            true,
-        );
+        let knee = tune_remote_concurrency(unreachable_tune(&conn, &remote, spec, true));
         assert_eq!(knee, SWEEP_FALLBACK_CONCURRENCY);
         // A failed sweep is never cached (nothing to reuse next time).
         assert!(read_cache(&conn).entries.is_empty());

@@ -646,14 +646,16 @@ fn provision_and_build_cancellable(
     let cap = remote.bounded_concurrency();
     let client_concurrency = match tune {
         Some(t) => crate::throughput_tune::tune_remote_concurrency(
-            t.conn,
-            remote.cookbook.as_deref().unwrap_or("cookbook"),
-            &provisioned.endpoint,
-            provisioned.auth_token.as_deref(),
-            remote,
-            spec,
-            t.max_embedding_chars,
-            t.allow_sweep,
+            crate::throughput_tune::TuneRequestParams {
+                conn: t.conn,
+                provider: remote.cookbook.as_deref().unwrap_or("cookbook"),
+                endpoint: &provisioned.endpoint,
+                auth_token: provisioned.auth_token.as_deref(),
+                remote,
+                spec,
+                max_embedding_chars: t.max_embedding_chars,
+                allow_sweep: t.allow_sweep,
+            },
         ),
         None => cap,
     };
