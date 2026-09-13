@@ -98,6 +98,25 @@ impl MirrorCursor {
         }
         MirrorContinuation::None
     }
+
+    /// Drop the resumable progress shared by every restart-from-the-top: backfill, item-delta and
+    /// comment page state, the thread cursor, and the processed-key sets. The high-water marks,
+    /// filter fingerprint and item-delta window are left to the caller — a filter change and a
+    /// full rewalk reset different ones.
+    fn reset_walk_progress(&mut self) {
+        self.low_mark_at = None;
+        self.backfill_done = false;
+        self.comment_page_token = None;
+        self.comment_scan_since = None;
+        self.comment_stream_cursors.clear();
+        self.item_delta_page_token = None;
+        self.item_delta_in_progress = false;
+        self.item_delta_replay_required = false;
+        self.backfill_page_cursor = None;
+        self.item_thread_cursor = None;
+        self.delta_processed_keys.clear();
+        self.backfill_processed_keys.clear();
+    }
 }
 
 pub(crate) fn load_mirror_continuation(
@@ -150,21 +169,12 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
         reset_for_full_rewalk(conn, binding, &mut cursor)?;
     }
     if filter_changed {
-        cursor.low_mark_at = None;
-        cursor.backfill_done = false;
+        cursor.reset_walk_progress();
         cursor.filter_fingerprint = fingerprint;
-        cursor.comment_page_token = None;
-        cursor.comment_scan_since = None;
-        cursor.comment_stream_cursors.clear();
-        cursor.item_delta_page_token = None;
+        // Unlike a full rewalk, a filter change also drops the item-delta window and keeps the
+        // item and comment high-water marks.
         cursor.item_delta_scan_since = None;
         cursor.item_delta_high_mark_at = None;
-        cursor.item_delta_in_progress = false;
-        cursor.item_delta_replay_required = false;
-        cursor.backfill_page_cursor = None;
-        cursor.item_thread_cursor = None;
-        cursor.delta_processed_keys.clear();
-        cursor.backfill_processed_keys.clear();
         if cursor.full_rewalk {
             reset_full_seen(conn, binding)?;
         }
@@ -909,20 +919,11 @@ fn reset_for_full_rewalk(
     binding: &ResolvedTracker,
     cursor: &mut MirrorCursor,
 ) -> anyhow::Result<()> {
+    cursor.reset_walk_progress();
+    // Unlike a filter change, a full rewalk also drops the item and comment high-water marks and
+    // keeps the item-delta window.
     cursor.high_mark_at = None;
     cursor.comment_high_mark_at = None;
-    cursor.comment_page_token = None;
-    cursor.comment_scan_since = None;
-    cursor.comment_stream_cursors.clear();
-    cursor.low_mark_at = None;
-    cursor.backfill_done = false;
-    cursor.item_delta_page_token = None;
-    cursor.item_delta_in_progress = false;
-    cursor.item_delta_replay_required = false;
-    cursor.backfill_page_cursor = None;
-    cursor.item_thread_cursor = None;
-    cursor.delta_processed_keys.clear();
-    cursor.backfill_processed_keys.clear();
     cursor.full_rewalk = true;
     reset_full_seen(conn, binding)?;
     // A full rewalk re-caches every closed issue; clear the attested watermark so their
