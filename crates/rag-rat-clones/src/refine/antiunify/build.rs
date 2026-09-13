@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
 
 use super::super::RefineMember;
 use super::super::budget::{ALIGN_AGGREGATE_CELLS_BUDGET, CellBudget};
@@ -10,7 +11,6 @@ use super::spans::{
     any_member_inserts_within, direct_children, subtree_is_indel, subtree_token_count,
     variation_runs,
 };
-use super::statement::emit_block_statement_indel;
 use super::types::{
     ClassAlignment, EmittedSpan, MetavarKind, OccSpan, RunMetavar, Template, VariationPoint,
 };
@@ -118,22 +118,12 @@ pub(super) fn anti_unify_with_budget(
     // more exact `lcs_align`) draws from the shared per-class budget; `redescent_sampled`
     // latches when the re-descent left a matched statement whole-fixed because the budget was
     // exhausted.
-    let mut spans: Vec<EmittedSpan> = Vec::new();
-    let mut redescent_sampled = false;
+    let mut descent = Descent::new(members, alignment, &is_fixed, budget);
     if spine_len > 0 {
         let root_end = subtree_token_count(anchor, 0) - 1;
-        emit_metavar_spans(
-            members,
-            alignment,
-            anchor,
-            &is_fixed,
-            0,
-            root_end,
-            budget,
-            &mut redescent_sampled,
-            &mut spans,
-        );
+        descent.emit_metavar_spans(0..=root_end);
     }
+    let Descent { sampled: redescent_sampled, out: mut spans, .. } = descent;
     spans.sort_by_key(EmittedSpan::lo);
 
     // ── Build a candidate metavar per span (values + classify) ───────────────────────────────────
@@ -302,117 +292,119 @@ pub(super) fn anti_unify_with_budget(
     }
 }
 
-/// Recursive anchor-subtree descent that appends metavar spans for the subtree `[lo..=hi]` (a
-/// single anchor node's whole pre-order span).
-///
-/// Decision per node:
-/// 1. **Fixed-for-all & insert-free** — every column fixed and no member inserts inside
-///    `[lo..=hi]`: emit nothing (verbatim template text).
-/// 2. **Indel** — some member contributes zero tokens to `[lo..=hi]` while another contributes
-///    some: emit ONE metavar over `[lo..=hi]` (a gapped subtree); don't descend.
-/// 3. **Leaf** — emit ONE metavar over the leaf (`[lo..=lo]`).
-/// 4. **Header varies** — the node's header column `lo` is itself non-fixed, or a member inserts
-///    extra structure right at the node root (keyed at `lo`): the node identity differs across
-///    members. Snap ONE metavar over the whole node (`a + b + c` vs `m * n`) — descending would
-///    mis-attribute the spuriously-matched header.
-/// 5. **Block-statement indel (Type-3 statement snap)** — the node is a statement container
-///    (`block` / `declaration_list` / …) and the members differ by a WHOLE inserted/removed
-///    statement. The token LCS tangles closing punctuation (`( ) ;` `}`) across the statement
-///    boundary, so the raw col_map can't be trusted here: re-derive via clean statement-level
-///    structural alignment ([`emit_block_statement_indel`]). Emits whole-statement gapped metavars
-///    with balanced, ordinal-correct per-member values and leaves matched statements fixed.
-/// 6. **Decomposable** — otherwise coalesce the node's variation into contiguous runs and route
-///    each: a run contained in ONE direct child recurses into that child (a clean leaf swap bottoms
-///    out at rule 3 / a differing sub-subtree at rule 4); a run that STRADDLES ≥2 children is an
-///    LCS-tangled edit — emit it as ONE raw span rather than splitting it across the straddled
-///    siblings.
-#[allow(clippy::too_many_arguments)] // the descent threads the shared cell budget + sample flag.
-fn emit_metavar_spans(
-    members: &[RefineMember],
-    alignment: &ClassAlignment,
-    anchor: &RefineMember,
-    is_fixed: &[bool],
-    lo: usize,
-    hi: usize,
-    budget: &mut CellBudget,
-    redescent_sampled: &mut bool,
-    out: &mut Vec<EmittedSpan>,
-) {
-    // (1) Fixed-for-all subtree with no interior inserts → fixed text.
-    if (lo..=hi).all(|c| is_fixed[c]) && !any_member_inserts_within(alignment, lo, hi) {
-        return;
+/// The recursive anchor-subtree descent's shared state: the class being anti-unified with its
+/// per-column fixedness, the per-class [`CellBudget`] the matched-statement re-descent draws from,
+/// and the two accumulators every level writes into.
+pub(super) struct Descent<'a> {
+    pub(super) members: &'a [RefineMember],
+    pub(super) alignment: &'a ClassAlignment,
+    /// `members[alignment.anchor_idx]` — the spine the descent walks.
+    pub(super) anchor: &'a RefineMember,
+    pub(super) is_fixed: &'a [bool],
+    pub(super) budget: &'a mut CellBudget,
+    /// Latches when a matched-statement re-descent was cut short (or degraded) by the budget.
+    pub(super) sampled: bool,
+    /// The metavar spans emitted so far.
+    pub(super) out: Vec<EmittedSpan>,
+}
+
+impl<'a> Descent<'a> {
+    pub(super) fn new(
+        members: &'a [RefineMember],
+        alignment: &'a ClassAlignment,
+        is_fixed: &'a [bool],
+        budget: &'a mut CellBudget,
+    ) -> Self {
+        let anchor = &members[alignment.anchor_idx];
+        Descent { members, alignment, anchor, is_fixed, budget, sampled: false, out: Vec::new() }
     }
 
-    // (2) Indel: a member gaps the whole subtree while another fills it → one gapped metavar.
-    if subtree_is_indel(members, alignment, lo, hi) {
-        out.push(EmittedSpan::Raw(lo, hi));
-        return;
-    }
+    /// Recursive anchor-subtree descent that appends metavar spans for the subtree `[lo..=hi]` (a
+    /// single anchor node's whole pre-order span).
+    ///
+    /// Decision per node:
+    /// 1. **Fixed-for-all & insert-free** — every column fixed and no member inserts inside
+    ///    `[lo..=hi]`: emit nothing (verbatim template text).
+    /// 2. **Indel** — some member contributes zero tokens to `[lo..=hi]` while another contributes
+    ///    some: emit ONE metavar over `[lo..=hi]` (a gapped subtree); don't descend.
+    /// 3. **Leaf** — emit ONE metavar over the leaf (`[lo..=lo]`).
+    /// 4. **Header varies** — the node's header column `lo` is itself non-fixed, or a member
+    ///    inserts extra structure right at the node root (keyed at `lo`): the node identity differs
+    ///    across members. Snap ONE metavar over the whole node (`a + b + c` vs `m * n`) —
+    ///    descending would mis-attribute the spuriously-matched header.
+    /// 5. **Block-statement indel (Type-3 statement snap)** — the node is a statement container
+    ///    (`block` / `declaration_list` / …) and the members differ by a WHOLE inserted/removed
+    ///    statement. The token LCS tangles closing punctuation (`( ) ;` `}`) across the statement
+    ///    boundary, so the raw col_map can't be trusted here: re-derive via clean statement-level
+    ///    structural alignment ([`emit_block_statement_indel`]). Emits whole-statement gapped
+    ///    metavars with balanced, ordinal-correct per-member values and leaves matched statements
+    ///    fixed.
+    /// 6. **Decomposable** — otherwise coalesce the node's variation into contiguous runs and route
+    ///    each: a run contained in ONE direct child recurses into that child (a clean leaf swap
+    ///    bottoms out at rule 3 / a differing sub-subtree at rule 4); a run that STRADDLES ≥2
+    ///    children is an LCS-tangled edit — emit it as ONE raw span rather than splitting it across
+    ///    the straddled siblings.
+    fn emit_metavar_spans(&mut self, span: RangeInclusive<usize>) {
+        let (lo, hi) = (*span.start(), *span.end());
+        let (members, alignment, anchor, is_fixed) =
+            (self.members, self.alignment, self.anchor, self.is_fixed);
+        // (1) Fixed-for-all subtree with no interior inserts → fixed text.
+        if (lo..=hi).all(|c| is_fixed[c]) && !any_member_inserts_within(alignment, lo, hi) {
+            return;
+        }
 
-    // (3) Leaf node → one metavar over the leaf.
-    if anchor.node_spans[lo].is_leaf {
-        out.push(EmittedSpan::Raw(lo, lo));
-        return;
-    }
+        // (2) Indel: a member gaps the whole subtree while another fills it → one gapped metavar.
+        if subtree_is_indel(members, alignment, lo, hi) {
+            self.out.push(EmittedSpan::Raw(lo, hi));
+            return;
+        }
 
-    // (4) Header varies (the node root itself differs / carries extra structure) → snap whole node.
-    let header_varies =
-        !is_fixed[lo] || alignment.member_inserts.iter().any(|ins| ins.get(&lo).is_some());
-    if header_varies {
-        out.push(EmittedSpan::Raw(lo, hi));
-        return;
-    }
+        // (3) Leaf node → one metavar over the leaf.
+        if anchor.node_spans[lo].is_leaf {
+            self.out.push(EmittedSpan::Raw(lo, lo));
+            return;
+        }
 
-    // (5) Block-statement indel: the node holds statement-like children and some member adds/drops
-    // a whole statement. The flat token LCS tangles the inserted statement's `( ) ;`/`}` across
-    // the statement boundary (the headline Type-3 defect), so the raw col_map is unusable here.
-    // Snap to statement boundaries and recover whole-statement values via structural alignment
-    // instead.
-    if is_statement_container(anchor.node_spans[lo].kind)
-        && emit_block_statement_indel(
-            members,
-            alignment,
-            anchor,
-            is_fixed,
-            lo,
-            hi,
-            budget,
-            redescent_sampled,
-            out,
-        )
-    {
-        return;
-    }
+        // (4) Header varies (the node root itself differs / carries extra structure) → snap whole
+        // node.
+        let header_varies =
+            !is_fixed[lo] || alignment.member_inserts.iter().any(|ins| ins.get(&lo).is_some());
+        if header_varies {
+            self.out.push(EmittedSpan::Raw(lo, hi));
+            return;
+        }
 
-    // (6) Decomposable: coalesce variation into contiguous runs and route each to a child or emit
-    // it.
-    let children = direct_children(anchor, lo, hi);
-    let runs = variation_runs(alignment, is_fixed, lo + 1, hi);
-    let mut recursed_children: Vec<(usize, usize)> = Vec::new();
-    for (rlo, rhi) in runs {
-        // The direct children this run touches (overlaps).
-        let touched: Vec<(usize, usize)> =
-            children.iter().copied().filter(|&(clo, chi)| clo <= rhi && rlo <= chi).collect();
-        if touched.len() == 1 {
-            // Contained in one child → recurse into it (once, even if several runs touch it).
-            let child = touched[0];
-            if !recursed_children.contains(&child) {
-                recursed_children.push(child);
-                emit_metavar_spans(
-                    members,
-                    alignment,
-                    anchor,
-                    is_fixed,
-                    child.0,
-                    child.1,
-                    budget,
-                    redescent_sampled,
-                    out,
-                );
+        // (5) Block-statement indel: the node holds statement-like children and some member
+        // adds/drops a whole statement. The flat token LCS tangles the inserted statement's
+        // `( ) ;`/`}` across the statement boundary (the headline Type-3 defect), so the
+        // raw col_map is unusable here. Snap to statement boundaries and recover
+        // whole-statement values via structural alignment instead.
+        if is_statement_container(anchor.node_spans[lo].kind)
+            && self.emit_block_statement_indel(lo..=hi)
+        {
+            return;
+        }
+
+        // (6) Decomposable: coalesce variation into contiguous runs and route each to a child or
+        // emit it.
+        let children = direct_children(anchor, lo, hi);
+        let runs = variation_runs(alignment, is_fixed, lo + 1, hi);
+        let mut recursed_children: Vec<(usize, usize)> = Vec::new();
+        for (rlo, rhi) in runs {
+            // The direct children this run touches (overlaps).
+            let touched: Vec<(usize, usize)> =
+                children.iter().copied().filter(|&(clo, chi)| clo <= rhi && rlo <= chi).collect();
+            if touched.len() == 1 {
+                // Contained in one child → recurse into it (once, even if several runs touch it).
+                let child = touched[0];
+                if !recursed_children.contains(&child) {
+                    recursed_children.push(child);
+                    self.emit_metavar_spans(child.0..=child.1);
+                }
+            } else {
+                // Straddles ≥2 children (or no child — defensive) → emit the run as one raw span.
+                self.out.push(EmittedSpan::Raw(rlo, rhi));
             }
-        } else {
-            // Straddles ≥2 children (or no child — defensive) → emit the run as one raw span.
-            out.push(EmittedSpan::Raw(rlo, rhi));
         }
     }
 }
