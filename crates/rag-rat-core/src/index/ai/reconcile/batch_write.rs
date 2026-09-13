@@ -49,7 +49,7 @@ pub(crate) fn empty_current_reconcile_report(
         chunks_per_sec: 0.0,
         chars_per_sec: 0.0,
         avg_chars_per_chunk: 0.0,
-        status: "Current".to_string(),
+        status: ReconcileStatus::Current,
         message: None,
     }
 }
@@ -501,6 +501,21 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_status_tokens_are_the_persisted_and_serialized_names() {
+        for (status, token) in [
+            (ReconcileStatus::Current, "Current"),
+            (ReconcileStatus::Blocked, "Blocked"),
+            (ReconcileStatus::Partial, "Partial"),
+            (ReconcileStatus::Failed, "Failed"),
+        ] {
+            assert_eq!(status.as_db_str(), token);
+            assert_eq!(ReconcileStatus::from_db_str(token), Some(status));
+            assert_eq!(serde_json::to_string(&status).unwrap(), format!("\"{token}\""));
+        }
+        assert_eq!(ReconcileStatus::from_db_str("Running"), None);
+    }
+
+    #[test]
     fn empty_current_reconcile_report_reflects_options() {
         let options = ReconcileOptions {
             force: true,
@@ -517,7 +532,7 @@ mod tests {
             8_000,
             &options,
         );
-        assert_eq!(report.status, "Current");
+        assert_eq!(report.status, ReconcileStatus::Current);
         assert_eq!(report.model_id, "model");
         assert_eq!(report.model_version, "v1");
         assert!(report.forced);

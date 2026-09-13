@@ -187,7 +187,7 @@ pub(crate) fn embedding_reconcile_plan(
         }
         let metadata_current = {
             let job = &candidate.chunk;
-            job.embedding_status.as_deref() == Some("Current")
+            job.embedding_status.as_deref() == Some(ArtifactStatus::Current.as_str())
                 && job.source_text_hash.as_deref() == Some(job.text_hash.as_str())
                 && job.model_version.as_deref() == Some(model_version)
                 && job.embedding_dim == Some(i64::try_from(dim).unwrap_or(i64::MAX))
@@ -219,12 +219,12 @@ pub(crate) fn embedding_reconcile_plan(
             ReconcileReason::Forced => missing += 1,
         }
         *missing_by_priority.entry(priority_label(policy.priority).to_string()).or_default() += 1;
-        if job.embedding_status.as_deref() == Some("Failed")
+        if job.embedding_status.as_deref() == Some(ArtifactStatus::Failed.as_str())
             && job.next_retry_after_ms.unwrap_or(0) > now_ms()
         {
             failed_waiting += 1;
         }
-        if job.embedding_status.as_deref() == Some("Blocked") {
+        if job.embedding_status.as_deref() == Some(ArtifactStatus::Blocked.as_str()) {
             blocked += 1;
         }
         Ok(())

@@ -106,6 +106,27 @@ impl ArtifactStatus {
     }
 }
 
+/// How one embedding reconcile ended. Persisted as `reconcile_attempts.status` via
+/// [`Self::as_db_str`] and serialized by variant name, so the tokens are schema. (An attempt row
+/// reads `Running` until it finishes; that token is written by the attempt INSERT, never here.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumString, strum::IntoStaticStr)]
+pub enum ReconcileStatus {
+    Current,
+    Blocked,
+    Partial,
+    Failed,
+}
+
+impl ReconcileStatus {
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    pub fn from_db_str(token: &str) -> Option<Self> {
+        token.parse().ok()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LlmStatus {
     pub embedding: CapabilityStatus,
@@ -217,7 +238,7 @@ pub struct ReconcileReport {
     pub chunks_per_sec: f64,
     pub chars_per_sec: f64,
     pub avg_chars_per_chunk: f64,
-    pub status: String,
+    pub status: ReconcileStatus,
     pub message: Option<String>,
 }
 
@@ -416,7 +437,7 @@ impl CurrentChunk {
         if self.embedding_dim != Some(i64::try_from(dim).unwrap_or(i64::MAX)) {
             return ReconcileReason::DimChanged;
         }
-        if self.embedding_status.as_deref() == Some("Failed")
+        if self.embedding_status.as_deref() == Some(ArtifactStatus::Failed.as_str())
             && self.next_retry_after_ms.unwrap_or(0) <= now_ms
         {
             return ReconcileReason::RetryAfterFailure;

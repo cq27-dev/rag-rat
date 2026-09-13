@@ -167,7 +167,7 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     assert_eq!(blocked.blocked_chunks, 0);
     assert_eq!(blocked.model_id, HASH_MODEL_ID);
     assert_eq!(blocked.batch_size, 8);
-    assert_eq!(blocked.status, "Blocked");
+    assert_eq!(blocked.status, ai::ReconcileStatus::Blocked);
 
     let status = db.llm_status().unwrap();
     assert_eq!(status.embedding.state, "MissingModel");
@@ -182,7 +182,7 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     assert_eq!(current.model_id, HASH_MODEL_ID);
     assert_eq!(current.model_version, "hash-v1");
     assert_eq!(current.embedding_dim, HASH_EMBEDDING_DIM);
-    assert_eq!(current.status, "Current");
+    assert_eq!(current.status, ai::ReconcileStatus::Current);
     assert_eq!(current.work_reasons.get("Missing"), Some(&1));
     let noop = db.reconcile(None, Some(8)).unwrap();
     assert_eq!(noop.processed_chunks, 0);
@@ -445,7 +445,11 @@ fn force_reconcile_progress_is_honest_and_terminates_without_limit() {
         )
         .unwrap();
 
-    assert_eq!(report.status, "Current", "did not terminate naturally: {report:?}");
+    assert_eq!(
+        report.status,
+        ai::ReconcileStatus::Current,
+        "did not terminate naturally: {report:?}"
+    );
     assert_eq!(report.processed_chunks, 2);
 
     let started_total = events.iter().find_map(|event| match event {
@@ -898,7 +902,7 @@ fn blocked_fastembed_reconcile_still_reports_policy_skips() {
 
     let report = db.reconcile(None, Some(8)).unwrap();
 
-    assert_eq!(report.status, "Blocked");
+    assert_eq!(report.status, ai::ReconcileStatus::Blocked);
     assert_eq!(report.skipped_by_policy.get("SkipTooSmall"), Some(&1));
 
     let _ = fs::remove_dir_all(&root);

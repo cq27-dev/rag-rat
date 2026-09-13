@@ -712,7 +712,7 @@ fn run_maintenance_pass(
     {
         Some(options) => {
             let report = db.reconcile_with_options_progress(options, render_reconcile_progress)?;
-            tracing::info!(target: "rag_rat_core::maintenance", phase = "reconcile", ran = true, status = %report.status, "phase complete");
+            tracing::info!(target: "rag_rat_core::maintenance", phase = "reconcile", ran = true, status = %report.status.as_db_str(), "phase complete");
             Some(report)
         },
         None => {

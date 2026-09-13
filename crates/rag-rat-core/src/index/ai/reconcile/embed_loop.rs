@@ -144,7 +144,7 @@ pub(crate) fn reconcile_with_options_progress(
             }
             let (status, message) = match skip {
                 ChunkEmbedder::SkipEphemeral => (
-                    "Blocked",
+                    ReconcileStatus::Blocked,
                     Some(
                         "ephemeral remote embedding needs an explicit `rag-rat reconcile`, or a \
                          REACHABLE local `[remote] query_endpoint` server to embed incremental \
@@ -153,10 +153,10 @@ pub(crate) fn reconcile_with_options_progress(
                     ),
                 ),
                 // Already current → nothing to embed; no paid box was provisioned.
-                _ => ("Current", None),
+                _ => (ReconcileStatus::Current, None),
             };
             let report = ReconcileReport {
-                status: status.to_string(),
+                status,
                 message,
                 ..batch_write::empty_current_reconcile_report(
                     active_model_id.clone(),
@@ -218,7 +218,7 @@ pub(crate) fn reconcile_with_options_progress(
             // a remote outage isn't swallowed; the report keeps the actionable "install" hint AND
             // the policy-skip counts already computed above.
             eprintln!("rag-rat: chunk embedder unavailable: {err:#}");
-            report.status = "Blocked".to_string();
+            report.status = ReconcileStatus::Blocked;
             report.message = Some(format!(
                 "{active_model_id} model is not ready; run `rag-rat models install \
                  {active_model_id}`"
@@ -284,7 +284,7 @@ pub(crate) fn reconcile_with_options_progress(
             break;
         }
         if options.max_seconds.is_some_and(|seconds| timer.elapsed().as_secs() >= seconds) {
-            report.status = "Partial".to_string();
+            report.status = ReconcileStatus::Partial;
             report.message = Some(format!(
                 "max_seconds={} reached; rerun reconcile to continue",
                 options.max_seconds.unwrap_or_default()
@@ -394,7 +394,7 @@ pub(crate) fn reconcile_with_options_progress(
         });
     }
     if report.failed_chunks > 0 {
-        report.status = "Failed".to_string();
+        report.status = ReconcileStatus::Failed;
         report.message =
             Some(format!("{} chunks failed; retry after backoff", report.failed_chunks));
     }
@@ -420,7 +420,7 @@ pub(crate) fn reconcile_with_options_progress(
     // deferred follow-up — it needs a conn-level scope introspection helper.
     tracing::info!(
         target: "rag_rat_core::index::ai::reconcile",
-        status = %report.status,
+        status = %report.status.as_db_str(),
         embedded = report.embeddings_written,
         processed = report.processed_chunks,
         failed = report.failed_chunks,
@@ -456,7 +456,7 @@ pub(crate) fn finish_reconcile_attempt(
             i64::try_from(report.processed_chunks).unwrap_or(i64::MAX),
             i64::try_from(report.embeddings_written).unwrap_or(i64::MAX),
             i64::try_from(report.blocked_chunks).unwrap_or(i64::MAX),
-            report.status,
+            report.status.as_db_str(),
             report.message,
             i64::try_from(report.elapsed_ms).unwrap_or(i64::MAX),
             i64::try_from(report.input_chars).unwrap_or(i64::MAX),
@@ -985,7 +985,7 @@ mod freshness_version_tests {
         )
         .unwrap();
 
-        assert_eq!(report.status, "Current");
+        assert_eq!(report.status, ReconcileStatus::Current);
         assert_eq!(report.processed_chunks, 0);
         assert_eq!(report.embeddings_written, 0);
         assert_eq!(
@@ -1325,7 +1325,7 @@ mod freshness_version_tests {
         let report =
             reconcile_with_options_progress(&conn, ReconcileOptions::default(), |_| {}).unwrap();
 
-        assert_eq!(report.status, "Blocked");
+        assert_eq!(report.status, ReconcileStatus::Blocked);
         let attempt_status: String = conn
             .query_row(
                 "SELECT status FROM reconcile_attempts ORDER BY id DESC LIMIT 1",
@@ -1619,7 +1619,7 @@ mod freshness_version_tests {
         )
         .expect("reconcile returns a report (skips, does not error)");
 
-        assert_eq!(report.status, "Blocked");
+        assert_eq!(report.status, ReconcileStatus::Blocked);
         assert_eq!(report.embeddings_written, 0);
         assert!(
             report.message.as_deref().unwrap_or_default().contains("explicit `rag-rat reconcile`"),
@@ -1740,7 +1740,11 @@ mod freshness_version_tests {
         )
         .expect("reconcile returns a report (no provision attempt, no error)");
 
-        assert_eq!(report.status, "Current", "no pending work → Current, not Blocked: {report:?}");
+        assert_eq!(
+            report.status,
+            ReconcileStatus::Current,
+            "no pending work → Current, not Blocked: {report:?}"
+        );
         assert_eq!(report.embeddings_written, 0);
         assert_eq!(report.processed_chunks, 0);
         assert!(

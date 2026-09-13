@@ -534,7 +534,9 @@ fn run_pass(
     // no-op. This is the long-running-process backstop so a pull after open surfaces without a
     // reopen; open + consolidate drain at their own seams.
     let _ = timings.stage("memory_drain", || db.drain_synced_memory());
-    if shutdown_reconcile_pending && base_reconcile_status.as_deref() == Some("Current") {
+    if shutdown_reconcile_pending
+        && base_reconcile_status == Some(crate::index::ai::ReconcileStatus::Current)
+    {
         db.clear_watch_shutdown_reconcile_pending()?;
     }
     timings.stage("wal", || maybe_checkpoint_wal(&db, crate::index::WAL_CHECKPOINT_MIN_BYTES));
