@@ -139,6 +139,12 @@ pub(crate) fn run_in_tx(
     // compares against `candidate.file_sha`, which already IS the join-time indexed sha).
     let indexed_shas =
         store::indexed_file_shas_in_scope(conn, input.commit_sha, input.worktree_id)?;
+    let gates = DriftGates {
+        disk_sha: &disk_sha,
+        indexed_shas: &indexed_shas,
+        production_sha: input.production_sha,
+        pre_spawn_sha: input.pre_spawn_sha,
+    };
 
     // Cache symbol spans per source path (resolve_symbol is called per candidate). RefCell so the
     // resolver closure stays `Fn` (the join expects `&dyn Fn`) while lazily populating the cache.
@@ -199,46 +205,11 @@ pub(crate) fn run_in_tx(
             continue;
         };
 
-        // Content-integrity gate (finding 2): the occurrence byte ranges in `occurrences` were
-        // derived from the document's CURRENT disk bytes, but this candidate's callee byte range
-        // was recorded against `file_sha` (the indexed content). If those disagree, the file
-        // drifted between the index build and now — joining the two byte spaces yields a
-        // silently-wrong verdict. Skip the candidate and tally it as drifted so `eval` can
-        // warn. A file with no computed hash (unreadable) already produced no occurrences,
-        // so it never reaches here.
-        let disk = disk_sha.get(&candidate.source_path).map(String::as_str);
-        if disk != Some(&candidate.file_sha) {
-            report.skipped_drifted += 1;
-            drifted_paths.insert(candidate.source_path.clone());
-            continue;
-        }
-
-        // scip-vs-disk gate (#82 TOCTOU): the index-vs-disk check above only proves the EDGE and
-        // the disk agree — both could be the NEW content the watcher reindexed in the
-        // lock-free window after the tool built the `.scip` against the OLD content. For a
-        // tool-driven run we also hold the disk hash captured at production time; require
-        // it to still match disk, so the `.scip`'s occurrence offsets describe the very
-        // bytes the join reads. A drifted document is skipped (tallied as drifted), exactly
-        // like index-vs-disk drift. A pre-built `--scip` (`production_sha == None`) has no
-        // production moment to pin, so it keeps the index-vs-disk gate only.
-        if let Some(production_sha) = input.production_sha
-            && production_sha.get(&candidate.source_path).map(String::as_str) != disk
-        {
-            report.skipped_drifted += 1;
-            drifted_paths.insert(candidate.source_path.clone());
-            continue;
-        }
-
-        // Pre-spawn gate, CALL-SITE side (#83): the two gates above only prove the edge, the
-        // disk, and the post-exit production snapshot agree — all three can be the NEW content
-        // when a file was edited DURING the subprocess and the watcher reindexed it before the
-        // join, while the `.scip` still describes the old bytes. Requiring the join-time indexed
-        // sha (`candidate.file_sha`) to equal the snapshot taken BEFORE the spawn asserts no
-        // reindex happened across the entire spawn → join window.
-        if let Some(pre_spawn) = input.pre_spawn_sha
-            && pre_spawn.get(&candidate.source_path).map(String::as_str)
-                != Some(candidate.file_sha.as_str())
-        {
+        // Call-site drift gates (#82 / #83): the disk bytes, the indexed callee range, and the
+        // production and pre-spawn snapshots must all describe the same document — see
+        // `DriftGates::call_site_is_pinned`. A drifted document is skipped and tallied, never
+        // joined across mismatched coordinate spaces.
+        if !gates.call_site_is_pinned(&candidate.source_path, &candidate.file_sha) {
             report.skipped_drifted += 1;
             drifted_paths.insert(candidate.source_path.clone());
             continue;
@@ -260,35 +231,11 @@ pub(crate) fn run_in_tx(
             continue;
         };
 
-        // scip-vs-disk gate, DEFINITION side (#82 TOCTOU, def-document variant). The call-site gate
-        // above only pins the document the occurrence lives in. But an in-corpus verdict also
-        // depends on the DEFINITION document: the resolved symbol comes from converting the `.scip`
-        // def occurrence's offsets against the def file's join-time disk bytes, then mapping that
-        // byte range to a current indexed symbol. If the watcher reindexed the DEF file in the
-        // lock-free window, that conversion lands on the wrong bytes and resolves the wrong symbol
-        // (a mis-targeted `Upgrade`/`Contradict`, or a false external when it maps to
-        // nothing). Pin the def document the same way — its hash is already in the
-        // production snapshot. An external symbol with no in-corpus definition entry has no
-        // def document to pin, so it's unaffected.
-        if let Some(production_sha) = input.production_sha
-            && let Some(def) = index.definitions.get(&verdict.scip_symbol)
-            && production_sha.get(&def.path).map(String::as_str)
-                != disk_sha.get(&def.path).map(String::as_str)
-        {
-            report.skipped_drifted += 1;
-            drifted_paths.insert(def.path.clone());
-            continue;
-        }
-
-        // Pre-spawn gate, DEFINITION side (#83): the same mid-subprocess hole applies to the
-        // resolved symbol's defining document — a def file edited during the subprocess and
-        // reindexed before the join resolves the byte-converted def range against the wrong
-        // symbol while every post-exit gate passes. The join-time indexed sha of the def file
-        // must equal the pre-spawn snapshot.
-        if let Some(pre_spawn) = input.pre_spawn_sha
-            && let Some(def) = index.definitions.get(&verdict.scip_symbol)
-            && pre_spawn.get(&def.path).map(String::as_str)
-                != indexed_shas.get(&def.path).map(String::as_str)
+        // Definition-side drift gates (#82 / #83): an in-corpus verdict also depends on the
+        // DEFINITION document's bytes — see `DriftGates::definition_is_pinned`. An external
+        // symbol with no in-corpus definition entry has no def document to pin.
+        if let Some(def) = index.definitions.get(&verdict.scip_symbol)
+            && !gates.definition_is_pinned(&def.path)
         {
             report.skipped_drifted += 1;
             drifted_paths.insert(def.path.clone());
@@ -339,22 +286,187 @@ pub(crate) fn run_in_tx(
     }
     report.covered_calls = covered_call_occurrences.len() as u64;
 
-    // Moniker pass (#70 phase 3): for every SCIP definition that maps to an in-corpus symbol,
-    // record the SCIP symbol string as that logical symbol's moniker. Same drift discipline as the
-    // edge join, applied to the DEFINITION document: the def occurrence's byte range was converted
-    // against live disk bytes, so the indexed content (the symbol spans we map against) and — for
-    // a tool-driven run — the production snapshot must both still match those bytes, or the
-    // mapping landed in the wrong coordinate space and would anchor the moniker to the wrong
-    // symbol. `local N` symbols never reach here (dropped at parse).
-    //
-    // SEVERAL defs can containment-map to ONE logical symbol: a struct's fields / consts / enum
-    // variants have no symbol row of their own, so their def occurrences map up to the enclosing
-    // symbol alongside the symbol's own def. The stored moniker must be DETERMINISTIC — a binding
-    // records it at create time and relocation later re-matches it against a fresh run's rows, so
-    // a last-writer-wins over HashMap iteration order would silently break relocation whenever the
-    // arbitrary winner changed between runs. Pick the best moniker per logical symbol instead:
-    // shortest, then lexicographic. SCIP member monikers extend the parent's descriptor chain
-    // (`…Struct#field.` vs `…Struct#`), so shortest selects the symbol's own moniker.
+    report.monikers_written = write_monikers(conn, input, &index, &gates, &resolve_symbol)?;
+
+    report.external_symbols_written = write_external_symbols(conn, input, &index)?;
+
+    report.oracle_only_calls = count_recall_gap(
+        conn,
+        input,
+        &index,
+        &matched_occurrences,
+        &drifted_paths,
+        &resolve_symbol,
+    )?;
+
+    report.status = "Completed".to_string();
+    store::record_oracle_run_at(
+        conn,
+        input.tool,
+        input.tool_version,
+        input.commit_sha,
+        input.worktree_id,
+        input.started_at_ms,
+        &report.status,
+        &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
+    )?;
+
+    // The run rewrote the `edge_oracle` moniker evidence, and NOTHING in a scip-mode clone
+    // refinement's cache key changes when a moniker changes (#275 finding 3) — invalidate every
+    // scip-mode row so the next refine pass recomputes against the fresh verdicts. Baseline rows
+    // are oracle-independent and spared.
+    rag_rat_clones::refine::cache::invalidate_scip_refinements(conn)?;
+
+    Ok(report)
+}
+
+/// The document-hash snapshots every drift gate compares, keyed by repo-relative path. The join
+/// converts `.scip` occurrence offsets against the disk bytes and maps them onto indexed symbol
+/// spans, and trusts both only while every snapshot below still names the same bytes (#82 /
+/// #83 TOCTOU).
+struct DriftGates<'a> {
+    /// Hash of the disk bytes the `.scip` occurrences were converted against.
+    disk_sha: &'a HashMap<String, String>,
+    /// The join-time indexed `files.sha256` for the active checkout.
+    indexed_shas: &'a HashMap<String, String>,
+    /// The disk hash captured when the tool produced the `.scip`; `None` for a pre-built `--scip`.
+    production_sha: Option<&'a HashMap<String, String>>,
+    /// The indexed hash snapshotted before the tool spawned; `None` for a pre-built `--scip`.
+    pre_spawn_sha: Option<&'a HashMap<String, String>>,
+}
+
+impl DriftGates<'_> {
+    fn disk(&self, path: &str) -> Option<&str> {
+        self.disk_sha.get(path).map(String::as_str)
+    }
+
+    /// Whether a candidate's CALL-SITE document is pinned: its disk bytes are the indexed
+    /// `file_sha` its callee range was recorded against and, for a tool-driven run, also the
+    /// production and pre-spawn snapshots.
+    fn call_site_is_pinned(&self, path: &str, file_sha: &str) -> bool {
+        let disk = self.disk(path);
+        // Content-integrity gate (finding 2): the occurrence byte ranges in `occurrences` were
+        // derived from the document's CURRENT disk bytes, but this candidate's callee byte range
+        // was recorded against `file_sha` (the indexed content). If those disagree, the file
+        // drifted between the index build and now — joining the two byte spaces yields a
+        // silently-wrong verdict. Skip the candidate and tally it as drifted so `eval` can
+        // warn. A file with no computed hash (unreadable) already produced no occurrences,
+        // so it never reaches here.
+        if disk != Some(file_sha) {
+            return false;
+        }
+
+        // scip-vs-disk gate (#82 TOCTOU): the index-vs-disk check above only proves the EDGE and
+        // the disk agree — both could be the NEW content the watcher reindexed in the
+        // lock-free window after the tool built the `.scip` against the OLD content. For a
+        // tool-driven run we also hold the disk hash captured at production time; require
+        // it to still match disk, so the `.scip`'s occurrence offsets describe the very
+        // bytes the join reads. A drifted document is skipped (tallied as drifted), exactly
+        // like index-vs-disk drift. A pre-built `--scip` (`production_sha == None`) has no
+        // production moment to pin, so it keeps the index-vs-disk gate only.
+        if let Some(production_sha) = self.production_sha
+            && production_sha.get(path).map(String::as_str) != disk
+        {
+            return false;
+        }
+
+        // Pre-spawn gate, CALL-SITE side (#83): the two gates above only prove the edge, the
+        // disk, and the post-exit production snapshot agree — all three can be the NEW content
+        // when a file was edited DURING the subprocess and the watcher reindexed it before the
+        // join, while the `.scip` still describes the old bytes. Requiring the join-time indexed
+        // sha (`candidate.file_sha`) to equal the snapshot taken BEFORE the spawn asserts no
+        // reindex happened across the entire spawn → join window.
+        if let Some(pre_spawn) = self.pre_spawn_sha
+            && pre_spawn.get(path).map(String::as_str) != Some(file_sha)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Whether a verdict's DEFINITION document is pinned: the production snapshot still matches
+    /// the disk bytes the def offsets were converted against, and the pre-spawn snapshot the
+    /// indexed sha the def maps onto.
+    fn definition_is_pinned(&self, def_path: &str) -> bool {
+        // scip-vs-disk gate, DEFINITION side (#82 TOCTOU, def-document variant). The call-site gate
+        // above only pins the document the occurrence lives in. But an in-corpus verdict also
+        // depends on the DEFINITION document: the resolved symbol comes from converting the `.scip`
+        // def occurrence's offsets against the def file's join-time disk bytes, then mapping that
+        // byte range to a current indexed symbol. If the watcher reindexed the DEF file in the
+        // lock-free window, that conversion lands on the wrong bytes and resolves the wrong symbol
+        // (a mis-targeted `Upgrade`/`Contradict`, or a false external when it maps to
+        // nothing). Pin the def document the same way — its hash is already in the
+        // production snapshot. An external symbol with no in-corpus definition entry has no
+        // def document to pin, so it's unaffected.
+        if let Some(production_sha) = self.production_sha
+            && production_sha.get(def_path).map(String::as_str) != self.disk(def_path)
+        {
+            return false;
+        }
+
+        // Pre-spawn gate, DEFINITION side (#83): the same mid-subprocess hole applies to the
+        // resolved symbol's defining document — a def file edited during the subprocess and
+        // reindexed before the join resolves the byte-converted def range against the wrong
+        // symbol while every post-exit gate passes. The join-time indexed sha of the def file
+        // must equal the pre-spawn snapshot.
+        if let Some(pre_spawn) = self.pre_spawn_sha
+            && pre_spawn.get(def_path).map(String::as_str)
+                != self.indexed_shas.get(def_path).map(String::as_str)
+        {
+            return false;
+        }
+        true
+    }
+
+    /// The moniker pass's definition gate, on its own operands: the indexed spans the moniker
+    /// maps against must match the disk bytes directly, and both snapshots are compared to disk.
+    fn moniker_definition_is_pinned(&self, def_path: &str) -> bool {
+        let disk = self.disk(def_path);
+        if disk.is_none() || self.indexed_shas.get(def_path).map(String::as_str) != disk {
+            return false;
+        }
+        if let Some(production_sha) = self.production_sha
+            && production_sha.get(def_path).map(String::as_str) != disk
+        {
+            return false;
+        }
+        // Pre-spawn gate (#83): same mid-subprocess discipline as the verdict join — a def file
+        // reindexed during the subprocess maps the moniker to the wrong symbol while every
+        // post-exit gate passes. (`disk` equals the join-time indexed sha here, per the first
+        // check above.)
+        if let Some(pre_spawn) = self.pre_spawn_sha
+            && pre_spawn.get(def_path).map(String::as_str) != disk
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// Moniker pass (#70 phase 3): for every SCIP definition that maps to an in-corpus symbol,
+/// record the SCIP symbol string as that logical symbol's moniker. Same drift discipline as the
+/// edge join, applied to the DEFINITION document: the def occurrence's byte range was converted
+/// against live disk bytes, so the indexed content (the symbol spans we map against) and — for
+/// a tool-driven run — the production snapshot must both still match those bytes, or the
+/// mapping landed in the wrong coordinate space and would anchor the moniker to the wrong
+/// symbol. `local N` symbols never reach here (dropped at parse).
+///
+/// SEVERAL defs can containment-map to ONE logical symbol: a struct's fields / consts / enum
+/// variants have no symbol row of their own, so their def occurrences map up to the enclosing
+/// symbol alongside the symbol's own def. The stored moniker must be DETERMINISTIC — a binding
+/// records it at create time and relocation later re-matches it against a fresh run's rows, so
+/// a last-writer-wins over HashMap iteration order would silently break relocation whenever the
+/// arbitrary winner changed between runs. Pick the best moniker per logical symbol instead:
+/// shortest, then lexicographic. SCIP member monikers extend the parent's descriptor chain
+/// (`…Struct#field.` vs `…Struct#`), so shortest selects the symbol's own moniker.
+fn write_monikers(
+    conn: &Connection,
+    input: &OracleRunInput<'_>,
+    index: &ScipIndex,
+    gates: &DriftGates<'_>,
+    resolve_symbol: &dyn Fn(&str, usize, usize) -> Option<i64>,
+) -> anyhow::Result<u64> {
+    let mut written = 0u64;
     let mut best_monikers: HashMap<i64, &str> = HashMap::new();
     for (scip_symbol, def) in &index.definitions {
         // A namespace/module/file symbol (ends in `/`) is never a code symbol's moniker. Skipping
@@ -364,22 +476,7 @@ pub(crate) fn run_in_tx(
         if scip::symbol_is_module(scip_symbol) {
             continue;
         }
-        let disk = disk_sha.get(&def.path).map(String::as_str);
-        if disk.is_none() || indexed_shas.get(&def.path).map(String::as_str) != disk {
-            continue;
-        }
-        if let Some(production_sha) = input.production_sha
-            && production_sha.get(&def.path).map(String::as_str) != disk
-        {
-            continue;
-        }
-        // Pre-spawn gate (#83): same mid-subprocess discipline as the verdict join — a def file
-        // reindexed during the subprocess maps the moniker to the wrong symbol while every
-        // post-exit gate passes. (`disk` equals the join-time indexed sha here, per the first
-        // check above.)
-        if let Some(pre_spawn) = input.pre_spawn_sha
-            && pre_spawn.get(&def.path).map(String::as_str) != disk
-        {
+        if !gates.moniker_definition_is_pinned(&def.path) {
             continue;
         }
         let Some(symbol_id) = resolve_symbol(&def.path, def.start_byte, def.end_byte) else {
@@ -409,15 +506,23 @@ pub(crate) fn run_in_tx(
             *logical_symbol_id,
             &moniker,
         )?;
-        report.monikers_written += 1;
+        written += 1;
     }
+    Ok(written)
+}
 
-    // External dependency contracts (#114): persist the `SymbolInformation` parsed from
-    // `index.external_symbols` — the kind/signature/docs/deprecation `check_library_usage` joins to
-    // `resolved-external` call sites. Unlike the moniker pass these describe OUT-of-corpus symbols
-    // with no local file, so no content-drift gate applies; write each verbatim (the authoritative
-    // clear ran up front). The moniker is stored RAW (never `stabilize_moniker_version`'d) so it
-    // exact-joins `edge_oracle.scip_symbol`, which is likewise the occurrence symbol unstabilized.
+/// External dependency contracts (#114): persist the `SymbolInformation` parsed from
+/// `index.external_symbols` — the kind/signature/docs/deprecation `check_library_usage` joins to
+/// `resolved-external` call sites. Unlike the moniker pass these describe OUT-of-corpus symbols
+/// with no local file, so no content-drift gate applies; write each verbatim (the authoritative
+/// clear ran up front). The moniker is stored RAW (never `stabilize_moniker_version`'d) so it
+/// exact-joins `edge_oracle.scip_symbol`, which is likewise the occurrence symbol unstabilized.
+fn write_external_symbols(
+    conn: &Connection,
+    input: &OracleRunInput<'_>,
+    index: &ScipIndex,
+) -> anyhow::Result<u64> {
+    let mut written = 0u64;
     for (moniker, info) in &index.external_symbol_info {
         store::write_external_symbol(
             conn,
@@ -435,44 +540,34 @@ pub(crate) fn run_in_tx(
                 deprecated: info.deprecated,
             },
         )?;
-        report.external_symbols_written += 1;
+        written += 1;
     }
+    Ok(written)
+}
 
-    // Recall gap: in-corpus *reference* occurrences whose symbol resolves inside the corpus but
-    // that no edge candidate covered — calls the heuristic never emitted. Two scope filters, both
-    // required: (1) the resolver maps each SCIP *definition* back to a scoped DB symbol, so a
-    // `.scip` def in a file rag-rat didn't index is excluded; (2) `indexed_paths` restricts the
-    // *occurrence* (call site) to a file rag-rat indexed in THIS checkout — no edge candidate
-    // can cover a call from an unindexed source file, so those occurrences are out of scope,
-    // not misses.
-    let indexed_paths = store::indexed_paths_in_scope(conn, commit_sha, worktree_id)?;
-    report.oracle_only_calls = count_uncovered_calls(
-        &index,
-        &matched_occurrences,
+/// Recall gap: in-corpus *reference* occurrences whose symbol resolves inside the corpus but
+/// that no edge candidate covered — calls the heuristic never emitted. Two scope filters, both
+/// required: (1) the resolver maps each SCIP *definition* back to a scoped DB symbol, so a
+/// `.scip` def in a file rag-rat didn't index is excluded; (2) `indexed_paths` restricts the
+/// *occurrence* (call site) to a file rag-rat indexed in THIS checkout — no edge candidate
+/// can cover a call from an unindexed source file, so those occurrences are out of scope,
+/// not misses.
+fn count_recall_gap(
+    conn: &Connection,
+    input: &OracleRunInput<'_>,
+    index: &ScipIndex,
+    matched_occurrences: &HashSet<(String, usize, usize)>,
+    drifted_paths: &HashSet<String>,
+    resolve_symbol: &dyn Fn(&str, usize, usize) -> Option<i64>,
+) -> anyhow::Result<u64> {
+    let indexed_paths = store::indexed_paths_in_scope(conn, input.commit_sha, input.worktree_id)?;
+    Ok(count_uncovered_calls(
+        index,
+        matched_occurrences,
         &indexed_paths,
-        &drifted_paths,
-        &resolve_symbol,
-    );
-
-    report.status = "Completed".to_string();
-    store::record_oracle_run_at(
-        conn,
-        input.tool,
-        input.tool_version,
-        input.commit_sha,
-        input.worktree_id,
-        input.started_at_ms,
-        &report.status,
-        &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
-    )?;
-
-    // The run rewrote the `edge_oracle` moniker evidence, and NOTHING in a scip-mode clone
-    // refinement's cache key changes when a moniker changes (#275 finding 3) — invalidate every
-    // scip-mode row so the next refine pass recomputes against the fresh verdicts. Baseline rows
-    // are oracle-independent and spared.
-    rag_rat_clones::refine::cache::invalidate_scip_refinements(conn)?;
-
-    Ok(report)
+        drifted_paths,
+        resolve_symbol,
+    ))
 }
 
 /// Count *call-like* reference occurrences whose symbol is defined inside **rag-rat's indexed set**
