@@ -404,6 +404,24 @@ pub fn roster_ref_effective(
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     let conn: &Connection = &read_tx;
+    let Some((authority, effective_at, closed_at)) =
+        load_roster_fact(conn, account_id, &roster_ref)?
+    else {
+        return missing_reference(conn, account_id, &roster_ref);
+    };
+    if authority.device_fingerprint != device_fingerprint {
+        return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
+    }
+    validated_open_fact(authority, effective_at, closed_at)
+}
+
+/// The roster fact `roster_ref` minted, as its authority plus the raw `(effective_at, closed_at)`
+/// window, or `None` when this store holds no such fact.
+fn load_roster_fact(
+    conn: &Connection,
+    account_id: AccountId,
+    roster_ref: &EntryHash,
+) -> anyhow::Result<Option<(fold::RosterAuthority, i64, Option<i64>)>> {
     let row: Option<(Vec<u8>, String, i64, Option<i64>)> = conn
         .query_row(
             "SELECT device_fingerprint, role, effective_at, closed_at
@@ -413,16 +431,13 @@ pub fn roster_ref_effective(
         )
         .optional()?;
     let Some((device, role, effective_at, closed_at)) = row else {
-        return missing_reference(conn, account_id, &roster_ref);
+        return Ok(None);
     };
     let authority = fold::RosterAuthority {
         device_fingerprint: DeviceFingerprint::from_bytes(fixed(&device)?),
         current_role: DeviceRole::from_db_str(&role)?,
     };
-    if authority.device_fingerprint != device_fingerprint {
-        return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
-    }
-    validated_open_fact(authority, effective_at, closed_at)
+    Ok(Some((authority, effective_at, closed_at)))
 }
 
 pub fn roster_content_authority(
@@ -455,24 +470,15 @@ pub fn roster_content_authority_in_snapshot(
     device_fingerprint: DeviceFingerprint,
     stream_id: StreamId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterContentAuthority>> {
-    let row: Option<(Vec<u8>, String, i64, Option<i64>)> = conn
-        .query_row(
-            "SELECT device_fingerprint, role, effective_at, closed_at
-             FROM account_roster_history WHERE account_id = ?1 AND roster_ref = ?2",
-            params![account_id.to_bytes().as_slice(), roster_ref.as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    let Some((device, role, effective_at, closed_at)) = row else {
+    let Some((roster, effective_at, closed_at)) = load_roster_fact(conn, account_id, &roster_ref)?
+    else {
         return missing_reference(conn, account_id, &roster_ref);
-    };
-    let roster = fold::RosterAuthority {
-        device_fingerprint: DeviceFingerprint::from_bytes(fixed(&device)?),
-        current_role: DeviceRole::from_db_str(&role)?,
     };
     if roster.device_fingerprint != device_fingerprint {
         return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
     }
+    // Range-validate the stored window: both bounds must be non-negative (a u64 fold clock). The
+    // values themselves are not needed here — the per-stream cut row carries the boundary.
     let _ = (u64::try_from(effective_at)?, closed_at.map(u64::try_from).transpose()?);
     let cut: Option<(Vec<u8>, Vec<u8>)> = conn
         .query_row(
