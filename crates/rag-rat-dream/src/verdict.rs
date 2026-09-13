@@ -57,18 +57,24 @@ pub struct VerdictPass<'a> {
 /// The model's verdict for a note vs. the current code. Persisted through [`Verdict::as_db_str`] —
 /// `unverifiable` is deliberately ABSENT (pass 0 decides it deterministically; a stray model
 /// `unverifiable` is discarded by [`parse_verdict`], never stored).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum Verdict {
     Current,
     Diverged,
 }
 
 impl Verdict {
+    #[cfg(test)]
+    const ALL: [Self; 2] = [Self::Current, Self::Diverged];
+
     fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Current => "current",
-            Self::Diverged => "diverged",
-        }
+        self.into()
+    }
+
+    #[cfg(test)]
+    fn from_db_str(value: &str) -> Option<Self> {
+        value.parse().ok()
     }
 
     /// Parse the VERDICT word. `None` for `unverifiable` (pass-0 territory), anything
@@ -98,7 +104,8 @@ impl Verdict {
 
 /// Advisory direction of a divergence (which side is newer). Never load-bearing — a hint for the
 /// human review flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum Direction {
     CodeAhead,
     NoteAhead,
@@ -106,12 +113,16 @@ enum Direction {
 }
 
 impl Direction {
+    #[cfg(test)]
+    const ALL: [Self; 3] = [Self::CodeAhead, Self::NoteAhead, Self::Unknown];
+
     fn as_db_str(self) -> &'static str {
-        match self {
-            Self::CodeAhead => "code_ahead",
-            Self::NoteAhead => "note_ahead",
-            Self::Unknown => "unknown",
-        }
+        self.into()
+    }
+
+    #[cfg(test)]
+    fn from_db_str(value: &str) -> Option<Self> {
+        value.parse().ok()
     }
 
     /// Parse the DIRECTION word, defaulting to `unknown` for a missing/unrecognized value.
@@ -931,11 +942,11 @@ pub(super) fn divergence_findings(conn: &Connection) -> rusqlite::Result<Vec<Dre
     let mut stmt = conn.prepare(&format!(
         "SELECT mr.memory_id, mr.direction, mr.evidence_json, mr.content_hash, \
          mr.checked_inputs_hash, mr.prompt_version, m.title, m.body FROM memory_reality mr JOIN \
-         repo_memories m ON m.id = mr.memory_id{mem_clause} WHERE mr.verdict = 'diverged' AND \
-         m.status = 'active'{reality_clause} ORDER BY mr.memory_id"
+         repo_memories m ON m.id = mr.memory_id{mem_clause} WHERE mr.verdict = ?1 AND m.status = \
+         'active'{reality_clause} ORDER BY mr.memory_id"
     ))?;
     let rows: Vec<DivergenceRow> = stmt
-        .query_map([], |r| {
+        .query_map([Verdict::Diverged.as_db_str()], |r| {
             Ok(DivergenceRow {
                 memory_id: r.get(0)?,
                 direction: r.get(1)?,
@@ -966,7 +977,9 @@ pub(super) fn divergence_findings(conn: &Connection) -> rusqlite::Result<Vec<Dre
         if row.stored_inputs_hash.as_deref() != Some(current_inputs.as_str()) {
             continue;
         }
-        let direction = row.direction.unwrap_or_else(|| "unknown".to_string());
+        // A stored token passes through verbatim (it may come from a peer's newer build); only a
+        // missing one takes this build's `unknown`.
+        let direction = row.direction.unwrap_or_else(|| Direction::Unknown.as_db_str().to_string());
         let cited = compact_evidence(row.evidence_json.as_deref());
         out.push(DreamFinding {
             kind: "memory_divergence".into(),
@@ -1008,6 +1021,21 @@ mod tests {
     use super::super::tests::{mem_db, set_repo};
     use super::*;
     use crate::mock_chat::MockChatModel;
+
+    #[test]
+    fn persisted_verdict_and_direction_tokens_round_trip() {
+        for (verdict, token) in Verdict::ALL.into_iter().zip(["current", "diverged"]) {
+            assert_eq!(verdict.as_db_str(), token);
+            assert_eq!(Verdict::from_db_str(token), Some(verdict));
+        }
+        for (direction, token) in
+            Direction::ALL.into_iter().zip(["code_ahead", "note_ahead", "unknown"])
+        {
+            assert_eq!(direction.as_db_str(), token);
+            assert_eq!(Direction::from_db_str(token), Some(direction));
+        }
+        assert_eq!(Verdict::from_db_str("unverifiable"), None);
+    }
 
     fn seed_memory(c: &Connection, id: &str, title: &str, body: &str, repo_id: &str) {
         c.execute(
