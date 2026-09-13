@@ -60,21 +60,82 @@ use crate::schema::rebuild_commit_fts;
 struct TransitiveTable {
     table: &'static str,
     id_column: &'static str,
-    /// The temp table (one of the [`PurgeIds`] captures) holding the parent id set this child
-    /// scopes through.
-    parent_ids: &'static str,
+    /// The captured id set this child scopes through.
+    parent_ids: PurgeIdSet,
 }
 
 /// The captured id sets a purge scopes its transitively-owned children through. Each is a
 /// single-column temp table of the repo's ids, snapshotted BEFORE any delete so a child delete is
 /// correct regardless of ordering (and regardless of FK cascade firing).
-mod purge_ids {
-    pub const FILES: &str = "temp.rmp_file_ids";
-    pub const CHUNKS: &str = "temp.rmp_chunk_ids";
-    pub const SYMBOLS: &str = "temp.rmp_symbol_ids";
-    pub const MEMORIES: &str = "temp.rmp_memory_ids";
-    pub const GENERATIONS: &str = "temp.rmp_generation_ids";
-    pub const STREAMS: &str = "temp.rmp_stream_ids";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PurgeIdSet {
+    Files,
+    Chunks,
+    Symbols,
+    Memories,
+    Generations,
+    Streams,
+}
+
+impl PurgeIdSet {
+    const ALL: [Self; 6] = [
+        Self::Files,
+        Self::Chunks,
+        Self::Symbols,
+        Self::Memories,
+        Self::Generations,
+        Self::Streams,
+    ];
+
+    /// The `temp.`-qualified capture table every read names.
+    fn qualified(self) -> &'static str {
+        match self {
+            Self::Files => "temp.rmp_file_ids",
+            Self::Chunks => "temp.rmp_chunk_ids",
+            Self::Symbols => "temp.rmp_symbol_ids",
+            Self::Memories => "temp.rmp_memory_ids",
+            Self::Generations => "temp.rmp_generation_ids",
+            Self::Streams => "temp.rmp_stream_ids",
+        }
+    }
+
+    /// The bare table name for a `CREATE TEMP TABLE`, which names the table unqualified while
+    /// later reads qualify it `temp.<name>`.
+    fn temp_name(self) -> &'static str {
+        &self.qualified()["temp.".len()..]
+    }
+
+    /// The live read-path subquery for this id set, mirroring the temp-table capture in
+    /// [`capture_purge_ids`] but evaluated inline against the current rows (used only by
+    /// [`count_repo_rows`], which runs before any delete).
+    fn id_select(self) -> &'static str {
+        match self {
+            Self::Files => "SELECT id FROM files WHERE repo_id = ?1",
+            Self::Chunks =>
+                "SELECT id FROM chunks WHERE file_id IN (SELECT id FROM files WHERE repo_id = ?1)",
+            Self::Symbols =>
+                "SELECT id FROM symbols WHERE file_id IN (SELECT id FROM files WHERE repo_id = ?1)",
+            Self::Memories => "SELECT id FROM repo_memories WHERE repo_id = ?1",
+            Self::Generations =>
+                "SELECT generation FROM clone_graph_generations WHERE repo_id = ?1",
+            Self::Streams => "SELECT stream_id FROM table_sync_streams WHERE repo_id = ?1",
+        }
+    }
+
+    /// The `repo_id`-bearing table this id set reads from — the PARENT half of the count-path
+    /// existence check. A child can outlive its parent's introduction: `table_sync_entries` arrived
+    /// in V087 and the `table_sync_streams` directory that scopes it only in V093, so on a store in
+    /// between, the child exists while the subquery's table does not. `count_repo_rows` runs on
+    /// exactly such a store (planning is read-only and pre-migration, so `--dry-run` never writes),
+    /// and an unguarded reference there fails the plan before the destructive path can migrate.
+    fn parent_table(self) -> &'static str {
+        match self {
+            Self::Files | Self::Chunks | Self::Symbols => "files",
+            Self::Memories => "repo_memories",
+            Self::Generations => "clone_graph_generations",
+            Self::Streams => "table_sync_streams",
+        }
+    }
 }
 
 /// Every transitively-scoped child, child-first (a child appears before the parent whose id set it
@@ -85,77 +146,77 @@ mod purge_ids {
 /// a plain `DELETE ... WHERE id_column IN`).
 const TRANSITIVE_SCOPED_TABLES: &[TransitiveTable] = &[
     // chunk children (chunks.id → chunk_id)
-    TransitiveTable { table: "chunk_text", id_column: "chunk_id", parent_ids: purge_ids::CHUNKS },
+    TransitiveTable { table: "chunk_text", id_column: "chunk_id", parent_ids: PurgeIdSet::Chunks },
     TransitiveTable {
         table: "chunk_embeddings",
         id_column: "chunk_id",
-        parent_ids: purge_ids::CHUNKS,
+        parent_ids: PurgeIdSet::Chunks,
     },
     TransitiveTable {
         table: "chunk_summaries",
         id_column: "chunk_id",
-        parent_ids: purge_ids::CHUNKS,
+        parent_ids: PurgeIdSet::Chunks,
     },
     TransitiveTable {
         table: "git_chunk_blame",
         id_column: "chunk_id",
-        parent_ids: purge_ids::CHUNKS,
+        parent_ids: PurgeIdSet::Chunks,
     },
     // symbol children (symbols.id → symbol_id)
     TransitiveTable {
         table: "symbol_facts",
         id_column: "symbol_id",
-        parent_ids: purge_ids::SYMBOLS,
+        parent_ids: PurgeIdSet::Symbols,
     },
     TransitiveTable {
         table: "symbol_fingerprints",
         id_column: "symbol_id",
-        parent_ids: purge_ids::SYMBOLS,
+        parent_ids: PurgeIdSet::Symbols,
     },
     TransitiveTable {
         table: "logical_symbol_members",
         id_column: "symbol_id",
-        parent_ids: purge_ids::SYMBOLS,
+        parent_ids: PurgeIdSet::Symbols,
     },
     // file children (files.id → source_file_id / file_id)
     TransitiveTable {
         table: "edges_data",
         id_column: "source_file_id",
-        parent_ids: purge_ids::FILES,
+        parent_ids: PurgeIdSet::Files,
     },
-    TransitiveTable { table: "symbols", id_column: "file_id", parent_ids: purge_ids::FILES },
-    TransitiveTable { table: "chunks", id_column: "file_id", parent_ids: purge_ids::FILES },
+    TransitiveTable { table: "symbols", id_column: "file_id", parent_ids: PurgeIdSet::Files },
+    TransitiveTable { table: "chunks", id_column: "file_id", parent_ids: PurgeIdSet::Files },
     // memory children (repo_memories.id → memory_id)
     TransitiveTable {
         table: "repo_memory_tags",
         id_column: "memory_id",
-        parent_ids: purge_ids::MEMORIES,
+        parent_ids: PurgeIdSet::Memories,
     },
     TransitiveTable {
         table: "repo_memory_call_paths",
         id_column: "memory_id",
-        parent_ids: purge_ids::MEMORIES,
+        parent_ids: PurgeIdSet::Memories,
     },
     TransitiveTable {
         table: "repo_memory_call_path_edges",
         id_column: "memory_id",
-        parent_ids: purge_ids::MEMORIES,
+        parent_ids: PurgeIdSet::Memories,
     },
     // clone postings (clone_graph_generations.generation → build_generation)
     TransitiveTable {
         table: "clone_edges",
         id_column: "build_generation",
-        parent_ids: purge_ids::GENERATIONS,
+        parent_ids: PurgeIdSet::Generations,
     },
     TransitiveTable {
         table: "clone_subblock_postings",
         id_column: "build_generation",
-        parent_ids: purge_ids::GENERATIONS,
+        parent_ids: PurgeIdSet::Generations,
     },
     TransitiveTable {
         table: "clone_df_epoch",
         id_column: "build_generation",
-        parent_ids: purge_ids::GENERATIONS,
+        parent_ids: PurgeIdSet::Generations,
     },
     // The table-sync entry log (table_sync_streams.stream_id → stream_id). Captured through the
     // directory because the stream id is a one-way hash and cannot be re-derived once the
@@ -163,7 +224,7 @@ const TRANSITIVE_SCOPED_TABLES: &[TransitiveTable] = &[
     TransitiveTable {
         table: "table_sync_entries",
         id_column: "stream_id",
-        parent_ids: purge_ids::STREAMS,
+        parent_ids: PurgeIdSet::Streams,
     },
     // Re-adoption work for removed writers on this repo's streams. It must not survive the
     // directory: stream identity is derived, so a re-registered repo must never let an old
@@ -171,14 +232,14 @@ const TRANSITIVE_SCOPED_TABLES: &[TransitiveTable] = &[
     TransitiveTable {
         table: "table_sync_readoption_work",
         id_column: "stream_id",
-        parent_ids: purge_ids::STREAMS,
+        parent_ids: PurgeIdSet::Streams,
     },
     // Re-adoption provenance for those same streams, retained only while the repo's accepted
     // history is retained.
     TransitiveTable {
         table: "table_sync_readoption_audit",
         id_column: "stream_id",
-        parent_ids: purge_ids::STREAMS,
+        parent_ids: PurgeIdSet::Streams,
     },
     // The per-chain retained floor an accepted-entry compaction recorded. It rides the same
     // derived stream identity as the log it bounds, so it is swept with the directory for exactly
@@ -186,7 +247,7 @@ const TRANSITIVE_SCOPED_TABLES: &[TransitiveTable] = &[
     TransitiveTable {
         table: "table_sync_retained_floors",
         id_column: "stream_id",
-        parent_ids: purge_ids::STREAMS,
+        parent_ids: PurgeIdSet::Streams,
     },
     // Entries held awaiting a chain predecessor. Same reasoning as the accepted log above, and for
     // the same reason it must not be exempted: these are signed operations on a stream whose id is
@@ -195,7 +256,7 @@ const TRANSITIVE_SCOPED_TABLES: &[TransitiveTable] = &[
     TransitiveTable {
         table: "table_sync_gapped_entries",
         id_column: "stream_id",
-        parent_ids: purge_ids::STREAMS,
+        parent_ids: PurgeIdSet::Streams,
     },
 ];
 
@@ -256,11 +317,11 @@ pub fn count_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<RepoR
     // taking the write lock) where every listed table exists.
     //
     // BOTH halves are guarded, not just the child: a child can predate the parent that scopes it
-    // (see [`parent_table`]), and an unguarded subquery against a missing parent fails the whole
-    // plan on a store the preview is explicitly meant to tolerate.
+    // (see [`PurgeIdSet::parent_table`]), and an unguarded subquery against a missing parent fails
+    // the whole plan on a store the preview is explicitly meant to tolerate.
     for transitive in TRANSITIVE_SCOPED_TABLES {
         if !crate::schema::table_exists(conn, transitive.table)?
-            || !crate::schema::table_exists(conn, parent_table(transitive.parent_ids))?
+            || !crate::schema::table_exists(conn, transitive.parent_ids.parent_table())?
         {
             continue;
         }
@@ -269,7 +330,7 @@ pub fn count_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<RepoR
                 "SELECT COUNT(*) FROM \"{}\" WHERE {} IN ({})",
                 transitive.table,
                 transitive.id_column,
-                parent_id_select(transitive.parent_ids)
+                transitive.parent_ids.id_select()
             ),
             params![repo_id],
             |row| row.get(0),
@@ -285,7 +346,7 @@ pub fn count_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<RepoR
             &format!(
                 "SELECT COUNT(*) FROM edges_data WHERE source_file_id IS NULL AND (from_symbol_id \
                  IN ({symbols}) OR to_symbol_id IN ({symbols}))",
-                symbols = parent_id_select(purge_ids::SYMBOLS),
+                symbols = PurgeIdSet::Symbols.id_select(),
             ),
             params![repo_id],
             |row| row.get(0),
@@ -297,7 +358,7 @@ pub fn count_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<RepoR
         let chunk_fts: i64 = conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM chunk_fts WHERE rowid IN ({})",
-                parent_id_select(purge_ids::CHUNKS)
+                PurgeIdSet::Chunks.id_select()
             ),
             params![repo_id],
             |row| row.get(0),
@@ -305,40 +366,6 @@ pub fn count_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<RepoR
         counts.record("chunk_fts", chunk_fts);
     }
     Ok(counts)
-}
-
-/// The live read-path subquery for a transitive parent's id set, mirroring the temp-table capture
-/// in [`capture_purge_ids`] but evaluated inline against the current rows (used only by
-/// [`count_repo_rows`], which runs before any delete).
-fn parent_id_select(parent_ids: &str) -> &'static str {
-    match parent_ids {
-        purge_ids::FILES => "SELECT id FROM files WHERE repo_id = ?1",
-        purge_ids::CHUNKS =>
-            "SELECT id FROM chunks WHERE file_id IN (SELECT id FROM files WHERE repo_id = ?1)",
-        purge_ids::SYMBOLS =>
-            "SELECT id FROM symbols WHERE file_id IN (SELECT id FROM files WHERE repo_id = ?1)",
-        purge_ids::MEMORIES => "SELECT id FROM repo_memories WHERE repo_id = ?1",
-        purge_ids::GENERATIONS =>
-            "SELECT generation FROM clone_graph_generations WHERE repo_id = ?1",
-        purge_ids::STREAMS => "SELECT stream_id FROM table_sync_streams WHERE repo_id = ?1",
-        other => unreachable!("unknown purge id set {other}"),
-    }
-}
-
-/// The `repo_id`-bearing table each id set reads from — the PARENT half of the count-path existence
-/// check. A child can outlive its parent's introduction: `table_sync_entries` arrived in V087 and
-/// the `table_sync_streams` directory that scopes it only in V093, so on a store in between, the
-/// child exists while the subquery's table does not. `count_repo_rows` runs on exactly such a store
-/// (planning is read-only and pre-migration, so `--dry-run` never writes), and an unguarded
-/// reference there fails the plan before the destructive path can migrate.
-fn parent_table(parent_ids: &str) -> &'static str {
-    match parent_ids {
-        purge_ids::FILES | purge_ids::CHUNKS | purge_ids::SYMBOLS => "files",
-        purge_ids::MEMORIES => "repo_memories",
-        purge_ids::GENERATIONS => "clone_graph_generations",
-        purge_ids::STREAMS => "table_sync_streams",
-        other => unreachable!("unknown purge id set {other}"),
-    }
 }
 
 /// Purge EVERY row `repo_id` owns. MUST run inside an IMMEDIATE transaction the caller opened
@@ -364,7 +391,7 @@ pub fn purge_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
         &format!(
             "DELETE FROM edges_data WHERE source_file_id IS NULL AND (from_symbol_id IN (SELECT \
              id FROM {symbols}) OR to_symbol_id IN (SELECT id FROM {symbols}))",
-            symbols = purge_ids::SYMBOLS,
+            symbols = PurgeIdSet::Symbols.qualified(),
         ),
         [],
     )?;
@@ -375,7 +402,9 @@ pub fn purge_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
         conn.execute(
             &format!(
                 "DELETE FROM \"{}\" WHERE {} IN (SELECT id FROM {})",
-                transitive.table, transitive.id_column, transitive.parent_ids
+                transitive.table,
+                transitive.id_column,
+                transitive.parent_ids.qualified()
             ),
             [],
         )?;
@@ -386,7 +415,7 @@ pub fn purge_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
     // removal it records is already folded into every peer's roster. Scoped to the accounts that
     // hold incarnation authority for THIS repository: a parked row is account-scoped, and an
     // unrelated account's repair must not be collateral of this purge. Rows already copied into a
-    // real stream were handled above through purge_ids::STREAMS.
+    // real stream were handled above through `PurgeIdSet::Streams`.
     if crate::schema::table_exists(conn, "table_sync_readoption_work")?
         && crate::schema::table_exists(conn, "account_repo_incarnation_current")?
     {
@@ -403,7 +432,10 @@ pub fn purge_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
     // chunk_fts is contentless FTS5 keyed by chunk.id: delete by rowid from the captured chunk set
     // (it carries no repo_id and no FK, so neither the sweep nor a cascade would ever reach it).
     conn.execute(
-        &format!("DELETE FROM chunk_fts WHERE rowid IN (SELECT id FROM {})", purge_ids::CHUNKS),
+        &format!(
+            "DELETE FROM chunk_fts WHERE rowid IN (SELECT id FROM {})",
+            PurgeIdSet::Chunks.qualified()
+        ),
         [],
     )?;
 
@@ -432,7 +464,7 @@ pub fn purge_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Snapshot the repo's id sets into temp tables (see [`purge_ids`]). Captured BEFORE any delete so
+/// Snapshot the repo's id sets into temp tables (see [`PurgeIdSet`]). Captured BEFORE any delete so
 /// the transitive-child deletes are correct no matter the order or FK cascade behavior.
 fn capture_purge_ids(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
     // Dropped first so a reused connection (a second purge on one process) starts clean.
@@ -440,30 +472,30 @@ fn capture_purge_ids(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
     conn.execute(
         &format!(
             "CREATE TEMP TABLE {} AS SELECT id FROM files WHERE repo_id = ?1",
-            temp_name(purge_ids::FILES)
+            PurgeIdSet::Files.temp_name()
         ),
         params![repo_id],
     )?;
     conn.execute(
         &format!(
             "CREATE TEMP TABLE {} AS SELECT id FROM chunks WHERE file_id IN (SELECT id FROM {})",
-            temp_name(purge_ids::CHUNKS),
-            purge_ids::FILES
+            PurgeIdSet::Chunks.temp_name(),
+            PurgeIdSet::Files.qualified()
         ),
         [],
     )?;
     conn.execute(
         &format!(
             "CREATE TEMP TABLE {} AS SELECT id FROM symbols WHERE file_id IN (SELECT id FROM {})",
-            temp_name(purge_ids::SYMBOLS),
-            purge_ids::FILES
+            PurgeIdSet::Symbols.temp_name(),
+            PurgeIdSet::Files.qualified()
         ),
         [],
     )?;
     conn.execute(
         &format!(
             "CREATE TEMP TABLE {} AS SELECT id FROM repo_memories WHERE repo_id = ?1",
-            temp_name(purge_ids::MEMORIES)
+            PurgeIdSet::Memories.temp_name()
         ),
         params![repo_id],
     )?;
@@ -473,7 +505,7 @@ fn capture_purge_ids(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
         &format!(
             "CREATE TEMP TABLE {} AS SELECT generation AS id FROM clone_graph_generations WHERE \
              repo_id = ?1",
-            temp_name(purge_ids::GENERATIONS)
+            PurgeIdSet::Generations.temp_name()
         ),
         params![repo_id],
     )?;
@@ -485,7 +517,7 @@ fn capture_purge_ids(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
         &format!(
             "CREATE TEMP TABLE {} AS SELECT stream_id AS id FROM table_sync_streams WHERE repo_id \
              = ?1",
-            temp_name(purge_ids::STREAMS)
+            PurgeIdSet::Streams.temp_name()
         ),
         params![repo_id],
     )?;
@@ -493,23 +525,10 @@ fn capture_purge_ids(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
 }
 
 fn drop_purge_ids(conn: &Connection) -> anyhow::Result<()> {
-    for temp in [
-        purge_ids::FILES,
-        purge_ids::CHUNKS,
-        purge_ids::SYMBOLS,
-        purge_ids::MEMORIES,
-        purge_ids::GENERATIONS,
-        purge_ids::STREAMS,
-    ] {
-        conn.execute(&format!("DROP TABLE IF EXISTS {temp}"), [])?;
+    for set in PurgeIdSet::ALL {
+        conn.execute(&format!("DROP TABLE IF EXISTS {}", set.qualified()), [])?;
     }
     Ok(())
-}
-
-/// The bare table name (without the `temp.` schema qualifier) for a `CREATE TEMP TABLE`, which
-/// names the table unqualified while later reads qualify it `temp.<name>`.
-fn temp_name(qualified: &str) -> &str {
-    qualified.strip_prefix("temp.").unwrap_or(qualified)
 }
 
 #[cfg(test)]
