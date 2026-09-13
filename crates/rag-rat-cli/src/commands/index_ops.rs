@@ -336,6 +336,49 @@ fn vacuum(config: &Config) -> anyhow::Result<()> {
     }))
 }
 
+/// The `status` a maintenance-hook report section carries — one vocabulary shared by the pass
+/// itself and its papertrail and device-sync triggers. Serialized as the snake_case token the
+/// reports have always carried; nothing parses it back.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum HookStatus {
+    Complete,
+    Skipped,
+    Deferred,
+    Disabled,
+    Coalesced,
+    Nudged,
+    Ran,
+    Error,
+}
+
+/// The report for a hook step that failed. The failure is folded into the report rather than
+/// returned: a broken mirror or peer must never fail the git hook.
+fn hook_error(error: &impl std::fmt::Display) -> serde_json::Value {
+    serde_json::json!({"status": HookStatus::Error, "error": error.to_string()})
+}
+
+#[cfg(test)]
+mod hook_status_tests {
+    use super::HookStatus;
+
+    #[test]
+    fn hook_statuses_serialize_to_their_report_tokens() {
+        for (status, token) in [
+            (HookStatus::Complete, "complete"),
+            (HookStatus::Skipped, "skipped"),
+            (HookStatus::Deferred, "deferred"),
+            (HookStatus::Disabled, "disabled"),
+            (HookStatus::Coalesced, "coalesced"),
+            (HookStatus::Nudged, "nudged"),
+            (HookStatus::Ran, "ran"),
+            (HookStatus::Error, "error"),
+        ] {
+            assert_eq!(serde_json::to_value(status).unwrap(), token);
+        }
+    }
+}
+
 pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Result<()> {
     let trigger = args.trigger.clone().unwrap_or_else(|| "manual".to_string());
     let branch_checkout = args.branch_checkout.clone();
@@ -350,7 +393,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     if trigger == "post-checkout" && branch_checkout.as_deref() == Some("0") {
         print_output(&serde_json::json!({
             "trigger": trigger,
-            "status": "skipped",
+            "status": HookStatus::Skipped,
             "reason": "file checkout",
             "old_head": old_head,
             "new_head": new_head,
@@ -376,7 +419,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         let device_sync = sync_hook_trigger(config);
         print_output(&serde_json::json!({
             "trigger": trigger,
-            "status": "skipped",
+            "status": HookStatus::Skipped,
             "reason": "watcher live — deferring to the watcher's pass",
             "old_head": old_head,
             "new_head": new_head,
@@ -410,7 +453,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         rag_rat_base::single_flight::FlightOutcome::Coalesced => {
             let mut skip_report = serde_json::json!({
                 "trigger": trigger,
-                "status": "skipped",
+                "status": HookStatus::Skipped,
                 "reason": "another maintenance pass is in flight (coalesced, #267)",
                 "old_head": old_head,
                 "new_head": new_head,
@@ -437,7 +480,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         papertrail_hook_trigger(config)
     } else {
         serde_json::json!({
-            "status": "skipped",
+            "status": HookStatus::Skipped,
             "reason": "papertrail auto-sync rides git-hook triggers only; run `rag-rat \
                        papertrail sync` for an explicit mirror pass",
         })
@@ -449,7 +492,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         sync_hook_trigger(config)
     } else {
         serde_json::json!({
-            "status": "skipped",
+            "status": HookStatus::Skipped,
             "reason": "device-side sync rides git-hook triggers only",
         })
     };
@@ -471,18 +514,18 @@ fn papertrail_hook_trigger(config: &Config) -> serde_json::Value {
     use rag_rat_papertrail::AutosyncRequest;
     match autosync::run(config, AutosyncRequest::Incremental) {
         Ok(autosync::AutosyncOutcome::Disabled) => {
-            serde_json::json!({"status": "disabled", "reason": "no tracker bindings"})
+            serde_json::json!({"status": HookStatus::Disabled, "reason": "no tracker bindings"})
         },
         Ok(autosync::AutosyncOutcome::NotIndexed) => serde_json::json!({
-            "status": "deferred",
+            "status": HookStatus::Deferred,
             "reason": "repo is not indexed yet; automatic sync starts after the first index pass",
         }),
         Ok(autosync::AutosyncOutcome::Coalesced) => serde_json::json!({
-            "status": "coalesced",
+            "status": HookStatus::Coalesced,
             "reason": "another papertrail flight is in the air; request queued",
         }),
         Ok(autosync::AutosyncOutcome::Ran(report)) => serde_json::json!({
-            "status": "ran",
+            "status": HookStatus::Ran,
             "synced_items": report.synced_items,
             "bindings": report.bindings.len(),
             "errors": report.errors.len(),
@@ -493,7 +536,7 @@ fn papertrail_hook_trigger(config: &Config) -> serde_json::Value {
                 error = %error,
                 "papertrail auto-sync failed; a later trigger retries"
             );
-            serde_json::json!({"status": "error", "error": error.to_string()})
+            hook_error(&error)
         },
     }
 }
@@ -510,12 +553,12 @@ fn sync_hook_trigger(config: &Config) -> serde_json::Value {
     // Compatible store needs no migration, so this is cheap — the same shape autosync uses.
     let db = match crate::open_index(config) {
         Ok(db) => db,
-        Err(error) => return serde_json::json!({"status": "error", "error": error.to_string()}),
+        Err(error) => return hook_error(&error),
     };
     match rag_rat_core::sync_driver::nudge_resident_host(db.connection()) {
         Ok(true) => {
             return serde_json::json!({
-                "status": "nudged",
+                "status": HookStatus::Nudged,
                 "reason": "the active MCP resident sync host will reconcile this database",
             });
         },
@@ -528,19 +571,19 @@ fn sync_hook_trigger(config: &Config) -> serde_json::Value {
     }
     match device_sync_run(config, db.connection()) {
         Ok(DeviceSyncOutcome::Disabled) => serde_json::json!({
-            "status": "disabled",
+            "status": HookStatus::Disabled,
             "reason": "no local account, or this device is not roster-effective",
         }),
         Ok(DeviceSyncOutcome::Skipped) => serde_json::json!({
-            "status": "skipped",
+            "status": HookStatus::Skipped,
             "reason": "within push_interval_secs since the last device sync",
         }),
         Ok(DeviceSyncOutcome::Deferred) => serde_json::json!({
-            "status": "deferred",
+            "status": HookStatus::Deferred,
             "reason": "this database's node identity is busy (a serve peer or another sync)",
         }),
         Ok(DeviceSyncOutcome::Ran { peers, ok, errors }) => serde_json::json!({
-            "status": "ran",
+            "status": HookStatus::Ran,
             "peers": peers,
             "ok": ok,
             "errors": errors,
@@ -551,7 +594,7 @@ fn sync_hook_trigger(config: &Config) -> serde_json::Value {
                 error = %error,
                 "device sync failed; a later trigger retries"
             );
-            serde_json::json!({"status": "error", "error": error.to_string()})
+            hook_error(&error)
         },
     }
 }
@@ -590,7 +633,7 @@ fn run_maintenance_pass(
             tracing::info!(target: "rag_rat_core::maintenance", "deferred: no discoverable files (first-time empty index)");
             return Ok(serde_json::json!({
                 "trigger": trigger,
-                "status": "deferred",
+                "status": HookStatus::Deferred,
                 "reason": "no discoverable files (first-time empty index)",
             }));
         },
@@ -747,7 +790,7 @@ fn run_maintenance_pass(
         .ok();
     Ok(serde_json::json!({
         "trigger": trigger,
-        "status": "complete",
+        "status": HookStatus::Complete,
         "old_head": args.old_head,
         "new_head": args.new_head,
         "branch_checkout": args.branch_checkout,

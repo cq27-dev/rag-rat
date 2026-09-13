@@ -191,6 +191,27 @@ fn grants(db: &IndexDatabase) -> anyhow::Result<()> {
 // path runs one. Reporting the new configuration while `memory search` still shows the old
 // contents reads as a failed command.
 
+/// The operator guidance the re-pointing commands report, kept out of their report literals so each
+/// report's shape reads at a glance.
+const CONTRIBUTE_NOTE: &str = "memory changes for this repo now target the owner's stream; the \
+                               owner must `sync grant` this account, and this store needs the \
+                               owner's log — automatic sync pulls it once the owner's host is in \
+                               [sync] server_peers, or run `sync pull <owner>` now";
+const UNSUBSCRIBE_NOTE: &str = "this repo's memories materialize from its own account's stream \
+                                again: what its other devices had synced here is restored and the \
+                                owner's goes in turn. Local binding work is not restored — a \
+                                `memory rebind` made on a memory the subscription removed, and \
+                                any local edge onto it, went with the row";
+const UNCONTRIBUTE_NOTE: &str =
+    "memory changes for this repo target this store's own stream again, and its own stream \
+     materializes it in the owner's place. Contributions already authored onto the owner's stream \
+     stay there, and the owner's grant stays open until it runs `sync revoke` — so until then \
+     this index still may not hold a private memory stream in any repo, or those contributions \
+     become unfetchable. What that blocks is memory AUTHORING (`memory create`/`update`/`rebind`, \
+     and `sync enable`) in any repo of this index that is not published: those refuse, naming the \
+     conflict, and write nothing. Indexing, search and reconcile are unaffected. Publish the repo \
+     with `sync publish`, re-run `sync contribute`, or index it in a separate database";
+
 fn contribute(db: &IndexDatabase, account: &str) -> anyhow::Result<()> {
     db.sync_contribute(account)?;
     let effects = rag_rat_core::drain_synced_memory(db.connection())?;
@@ -201,7 +222,7 @@ fn contribute(db: &IndexDatabase, account: &str) -> anyhow::Result<()> {
         "owner_account_id": account,
         "memories_added": effects.nodes_written,
         "memories_removed": effects.nodes_removed,
-        "note": "memory changes for this repo now target the owner's stream; the owner must `sync grant` this account, and this store needs the owner's log — automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
+        "note": CONTRIBUTE_NOTE,
     }))
 }
 
@@ -272,7 +293,7 @@ fn unsubscribe(db: &IndexDatabase) -> anyhow::Result<()> {
         "repo_id": db.active_repo_id,
         "memories_restored": effects.nodes_written,
         "memories_removed": effects.nodes_removed,
-        "note": "this repo's memories materialize from its own account's stream again: what its other devices had synced here is restored and the owner's goes in turn. Local binding work is not restored — a `memory rebind` made on a memory the subscription removed, and any local edge onto it, went with the row",
+        "note": UNSUBSCRIBE_NOTE,
     }))
 }
 
@@ -285,7 +306,7 @@ fn uncontribute(db: &IndexDatabase) -> anyhow::Result<()> {
         "repo_id": db.active_repo_id,
         "memories_restored": effects.nodes_written,
         "memories_removed": effects.nodes_removed,
-        "note": "memory changes for this repo target this store's own stream again, and its own stream materializes it in the owner's place. Contributions already authored onto the owner's stream stay there, and the owner's grant stays open until it runs `sync revoke` — so until then this index still may not hold a private memory stream in any repo, or those contributions become unfetchable. What that blocks is memory AUTHORING (`memory create`/`update`/`rebind`, and `sync enable`) in any repo of this index that is not published: those refuse, naming the conflict, and write nothing. Indexing, search and reconcile are unaffected. Publish the repo with `sync publish`, re-run `sync contribute`, or index it in a separate database",
+        "note": UNCONTRIBUTE_NOTE,
     }))
 }
 
