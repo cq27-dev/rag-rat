@@ -606,23 +606,12 @@ fn compute_typedness(
 
 fn compute_confidence(template: &Template, unresolved_type_slots: &[String]) -> Confidence {
     // Start from the minimum confidence across all variation points.
-    let min_vp_conf = template
-        .variation_points
-        .iter()
-        .map(|vp| vp.confidence)
-        .min_by_key(|c| match c {
-            Confidence::High => 2u8,
-            Confidence::Medium => 1,
-            Confidence::Low => 0,
-        })
-        .unwrap_or(Confidence::High);
+    let min_vp_conf =
+        template.variation_points.iter().map(|vp| vp.confidence).min().unwrap_or(Confidence::High);
 
     // Cap at Medium if there are unresolved (gapped) type slots.
     if !unresolved_type_slots.is_empty() {
-        return match min_vp_conf {
-            Confidence::High => Confidence::Medium,
-            other => other,
-        };
+        return min_vp_conf.min(Confidence::Medium);
     }
     min_vp_conf
 }
@@ -1194,12 +1183,6 @@ mod tests {
     fn confidence_v2_never_exceeds_v1_property() {
         use super::super::score::{MetavarProfile, confidence_v1, confidence_v2};
 
-        let confidence_ord = |c: Confidence| match c {
-            Confidence::High => 2u32,
-            Confidence::Medium => 1,
-            Confidence::Low => 0,
-        };
-
         let ratios = [0.0f64, 0.5, 0.65, 0.80, 0.90, 0.95, 1.0];
         let gapped_flags = [0usize, 1];
         let callee_flags = [false, true];
@@ -1223,7 +1206,7 @@ mod tests {
                             let v1 = confidence_v1(r, s);
                             let v2 = confidence_v2(r, s, &profile);
                             assert!(
-                                confidence_ord(v2) <= confidence_ord(v1),
+                                v2 <= v1,
                                 "confidence_v2 {:?} > confidence_v1 {:?} at r={r} s={s}",
                                 v2,
                                 v1

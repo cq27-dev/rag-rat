@@ -10,18 +10,36 @@
 /// `serde` serializes to the same lower-case band (`high`/`medium`/`low`) as
 /// [`Confidence::as_db_str`] so the band reads identically whether it comes from the dedicated
 /// column or the embedded `variation_points_json` / `proposed_signature_json` payloads.
+///
+/// Declared lowest to highest so the derived `Ord` ranks the bands (`Low < Medium < High`); the
+/// stored and serialized tokens are by name, so the declaration order is free to carry the rank.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, strum::EnumString, strum::IntoStaticStr,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Confidence {
-    High,
-    Medium,
     Low,
+    Medium,
+    High,
 }
 
 impl Confidence {
+    /// The band `steps` bands below this one, clamped at `Low`.
+    pub(crate) fn downgraded_by(self, steps: u32) -> Self {
+        const BANDS: [Confidence; 3] = [Confidence::Low, Confidence::Medium, Confidence::High];
+        BANDS[(self as usize).saturating_sub(steps as usize)]
+    }
+
     pub fn as_db_str(&self) -> &'static str {
         (*self).into()
     }
@@ -169,18 +187,7 @@ pub(crate) fn confidence_v2(
         downgrades += 1;
     }
 
-    // Map Confidence to an integer band (High=2, Medium=1, Low=0), apply downgrades, clamp.
-    let band = match base {
-        Confidence::High => 2i32,
-        Confidence::Medium => 1,
-        Confidence::Low => 0,
-    };
-    let result_band = (band - downgrades as i32).max(0);
-    match result_band {
-        2 => Confidence::High,
-        1 => Confidence::Medium,
-        _ => Confidence::Low,
-    }
+    base.downgraded_by(downgrades)
 }
 
 /// 4b refactorability: starts from [`refactorability_v1`] then multiplies by penalty factors
@@ -260,6 +267,15 @@ mod tests {
         assert_eq!(Confidence::from_db_str("bogus"), Confidence::Low);
     }
 
+    #[test]
+    fn confidence_ranks_low_to_high_and_downgrades_clamp_at_low() {
+        assert!(Confidence::Low < Confidence::Medium && Confidence::Medium < Confidence::High);
+        assert_eq!(Confidence::High.downgraded_by(0), Confidence::High);
+        assert_eq!(Confidence::High.downgraded_by(1), Confidence::Medium);
+        assert_eq!(Confidence::Medium.downgraded_by(1), Confidence::Low);
+        assert_eq!(Confidence::High.downgraded_by(4), Confidence::Low);
+    }
+
     // ── v2 scoring tests ─────────────────────────────────────────────────────────────────────────
 
     fn clean_profile() -> MetavarProfile {
@@ -276,11 +292,6 @@ mod tests {
     #[test]
     fn confidence_v2_never_upgrades_above_v1() {
         // Property: across many (lcs_ratio, similarity_min, profile) combinations, v2 ≤ v1.
-        let confidence_ord = |c: Confidence| match c {
-            Confidence::High => 2u32,
-            Confidence::Medium => 1,
-            Confidence::Low => 0,
-        };
         let ratios = [0.0, 0.5, 0.65, 0.70, 0.80, 0.90, 0.95, 1.0];
         let profiles = [
             clean_profile(),
@@ -295,12 +306,7 @@ mod tests {
                 for p in &profiles {
                     let v1 = confidence_v1(r, s);
                     let v2 = confidence_v2(r, s, p);
-                    assert!(
-                        confidence_ord(v2) <= confidence_ord(v1),
-                        "v2 {:?} > v1 {:?} at lcs={r} sim={s}",
-                        v2,
-                        v1
-                    );
+                    assert!(v2 <= v1, "v2 {:?} > v1 {:?} at lcs={r} sim={s}", v2, v1);
                 }
             }
         }
