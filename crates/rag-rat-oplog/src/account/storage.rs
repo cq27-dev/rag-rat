@@ -507,7 +507,7 @@ pub fn owner_control_authority(
     owner_id: EntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
-    owner_chain_authority(conn, account_id, owner_id, device_fingerprint, "control")
+    owner_chain_authority(conn, account_id, owner_id, device_fingerprint, AuthorityChain::Control)
 }
 
 /// Snapshot-safe counterpart of [`owner_control_authority`]. Callers that already own a
@@ -519,7 +519,13 @@ pub fn owner_control_authority_in_snapshot(
     owner_id: EntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
-    owner_chain_authority_in_snapshot(conn, account_id, owner_id, device_fingerprint, "control")
+    owner_chain_authority_in_snapshot(
+        conn,
+        account_id,
+        owner_id,
+        device_fingerprint,
+        AuthorityChain::Control,
+    )
 }
 
 pub fn owner_secrets_authority(
@@ -528,7 +534,7 @@ pub fn owner_secrets_authority(
     owner_id: EntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
-    owner_chain_authority(conn, account_id, owner_id, device_fingerprint, "secrets")
+    owner_chain_authority(conn, account_id, owner_id, device_fingerprint, AuthorityChain::Secrets)
 }
 
 /// The body of [`owner_secrets_authority`], reading whatever snapshot `conn` is already in — the
@@ -541,7 +547,30 @@ pub fn owner_secrets_authority_in_snapshot(
     owner_id: EntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
-    owner_chain_authority_in_snapshot(conn, account_id, owner_id, device_fingerprint, "secrets")
+    owner_chain_authority_in_snapshot(
+        conn,
+        account_id,
+        owner_id,
+        device_fingerprint,
+        AuthorityChain::Secrets,
+    )
+}
+
+/// Which authority chain an owner-incarnation lookup reads — each has its own `{chain}_boundary`,
+/// `{chain}_seq`, `{chain}_hash` column triple on both the incarnation and roster tables.
+#[derive(Clone, Copy)]
+enum AuthorityChain {
+    Control,
+    Secrets,
+}
+
+impl AuthorityChain {
+    fn column_prefix(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Secrets => "secrets",
+        }
+    }
 }
 
 fn owner_chain_authority(
@@ -549,7 +578,7 @@ fn owner_chain_authority(
     account_id: AccountId,
     owner_id: EntryHash,
     device_fingerprint: DeviceFingerprint,
-    chain: &str,
+    chain: AuthorityChain,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     owner_chain_authority_in_snapshot(&read_tx, account_id, owner_id, device_fingerprint, chain)
@@ -561,8 +590,9 @@ fn owner_chain_authority_in_snapshot(
     account_id: AccountId,
     owner_id: EntryHash,
     device_fingerprint: DeviceFingerprint,
-    chain: &str,
+    chain: AuthorityChain,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
+    let chain = chain.column_prefix();
     let sql = format!(
         "SELECT o.device_fingerprint, o.effective_at, o.closed_at,
                 o.{chain}_boundary, o.{chain}_seq, o.{chain}_hash,
