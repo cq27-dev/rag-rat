@@ -2,6 +2,12 @@
 //! (by symbol / path / call-path), rebind, and the validate/doctor anchor-health passes.
 
 use anyhow::Context as _;
+use rag_rat_query::memory::{
+    self, EdgeRelation, EdgeTarget, MemoryDoctorEntry, MemorySummary, NodeEdge, RepoMemory,
+    RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryCreateResult, RepoMemoryEvidence,
+    RepoMemoryUpdate, RepoMemoryValidationReport,
+};
+use rag_rat_query::symbol::SymbolHit;
 
 use super::*;
 
@@ -51,7 +57,7 @@ impl IndexDatabase {
     /// recoverable by re-running.
     pub fn sync_publish_seed(&self, source: &std::path::Path) -> anyhow::Result<PublishSeedReport> {
         let conn = self.storage.connection();
-        let repo_id = rag_rat_query::memory::memory_repo_scope(conn)?
+        let repo_id = memory::memory_repo_scope(conn)?
             .context("sync publish requires an active repo scope")?;
         crate::index::consolidate::ensure_source_unsealed(source, &repo_id)?;
         // BEFORE publishing: publishing establishes this store's own PublicRead stream and is a
@@ -248,22 +254,16 @@ impl IndexDatabase {
 
     pub fn memory_create(
         &self,
-        request: rag_rat_query::memory::RepoMemoryCreate,
-    ) -> anyhow::Result<rag_rat_query::memory::RepoMemoryCreateResult> {
+        request: RepoMemoryCreate,
+    ) -> anyhow::Result<RepoMemoryCreateResult> {
         crate::memory_write::create_memory(self.storage.connection(), request)
     }
 
-    pub fn memory_update(
-        &self,
-        update: rag_rat_query::memory::RepoMemoryUpdate,
-    ) -> anyhow::Result<rag_rat_query::memory::RepoMemory> {
+    pub fn memory_update(&self, update: RepoMemoryUpdate) -> anyhow::Result<RepoMemory> {
         crate::memory_write::update_memory(self.storage.connection(), update)
     }
 
-    pub fn memory_mark_obsolete(
-        &self,
-        memory_id: &str,
-    ) -> anyhow::Result<rag_rat_query::memory::RepoMemory> {
+    pub fn memory_mark_obsolete(&self, memory_id: &str) -> anyhow::Result<RepoMemory> {
         crate::memory_write::mark_obsolete(self.storage.connection(), memory_id)
     }
 
@@ -272,9 +272,9 @@ impl IndexDatabase {
         &self,
         source_node_id: &str,
         relation: &str,
-        target: rag_rat_query::memory::EdgeTarget,
-    ) -> anyhow::Result<rag_rat_query::memory::NodeEdge> {
-        let relation = rag_rat_query::memory::EdgeRelation::from_db_str(relation)?;
+        target: EdgeTarget,
+    ) -> anyhow::Result<NodeEdge> {
+        let relation = EdgeRelation::from_db_str(relation)?;
         crate::memory_write::add_edge(self.storage.connection(), source_node_id, relation, &target)
     }
 
@@ -284,20 +284,14 @@ impl IndexDatabase {
     }
 
     /// Every edge OUT of a node — its outgoing graph (deps / mind-map links / tracks) (#464).
-    pub fn memory_edges_from(
-        &self,
-        source_node_id: &str,
-    ) -> anyhow::Result<Vec<rag_rat_query::memory::NodeEdge>> {
-        rag_rat_query::memory::edges_from(self.storage.connection(), source_node_id)
+    pub fn memory_edges_from(&self, source_node_id: &str) -> anyhow::Result<Vec<NodeEdge>> {
+        memory::edges_from(self.storage.connection(), source_node_id)
     }
 
     /// Every edge INTO a target — the reverse traversal (e.g. tasks tracking a github issue)
     /// (#464).
-    pub fn memory_edges_into(
-        &self,
-        target: rag_rat_query::memory::EdgeTarget,
-    ) -> anyhow::Result<Vec<rag_rat_query::memory::NodeEdge>> {
-        rag_rat_query::memory::edges_into(self.storage.connection(), &target)
+    pub fn memory_edges_into(&self, target: EdgeTarget) -> anyhow::Result<Vec<NodeEdge>> {
+        memory::edges_into(self.storage.connection(), &target)
     }
 
     pub fn memory_search(
@@ -305,15 +299,15 @@ impl IndexDatabase {
         query: &str,
         limit: u32,
         surface: rag_rat_base::config::MemorySurface,
-    ) -> anyhow::Result<Vec<rag_rat_query::memory::RepoMemory>> {
+    ) -> anyhow::Result<Vec<RepoMemory>> {
         let conn = self.storage.connection();
         // #582: both the MATCH and the surface hydration (whose Summary path runs a RANKED
         // chunk_fts query) can hit FTS shadow corruption; heal-and-retry rather than surfacing
         // a bare "database disk image is malformed" forever.
         crate::index::retry_once_on_fts_corruption(
             || {
-                let mut memories = rag_rat_query::memory::memory_search(conn, query, limit)?;
-                rag_rat_query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                let mut memories = memory::memory_search(conn, query, limit)?;
+                memory::apply_memory_surface(conn, &mut memories, surface)?;
                 Ok(memories)
             },
             || self.heal_corrupt_fts(),
@@ -322,16 +316,16 @@ impl IndexDatabase {
 
     pub fn memory_for_symbol(
         &self,
-        symbol: &rag_rat_query::symbol::SymbolHit,
+        symbol: &SymbolHit,
         limit: u32,
         surface: rag_rat_base::config::MemorySurface,
-    ) -> anyhow::Result<Vec<rag_rat_query::memory::RepoMemory>> {
+    ) -> anyhow::Result<Vec<RepoMemory>> {
         let conn = self.storage.connection();
         // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
         crate::index::retry_once_on_fts_corruption(
             || {
-                let mut memories = rag_rat_query::memory::memories_for_symbol(conn, symbol, limit)?;
-                rag_rat_query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                let mut memories = memory::memories_for_symbol(conn, symbol, limit)?;
+                memory::apply_memory_surface(conn, &mut memories, surface)?;
                 Ok(memories)
             },
             || self.heal_corrupt_fts(),
@@ -343,7 +337,7 @@ impl IndexDatabase {
     /// the facet gate + cap live in `rag_rat_papertrail::records_for_symbol`.
     pub fn records_for_symbol(
         &self,
-        symbol: &rag_rat_query::symbol::SymbolHit,
+        symbol: &SymbolHit,
         limit: usize,
     ) -> anyhow::Result<Vec<rag_rat_papertrail::DriveByRecord>> {
         self.drive_by_records_for_logical_id(symbol.logical_symbol_id, limit)
@@ -362,7 +356,7 @@ impl IndexDatabase {
     ) -> anyhow::Result<Vec<rag_rat_papertrail::DriveByRecord>> {
         let conn = self.storage.connection();
         let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-        let logical_symbol_id = rag_rat_query::memory::logical_symbol_id_for_chunk(conn, chunk_id)?;
+        let logical_symbol_id = memory::logical_symbol_id_for_chunk(conn, chunk_id)?;
         Self::drive_by_records_scoped(conn, &repo_id, logical_symbol_id, limit)
     }
 
@@ -396,8 +390,7 @@ impl IndexDatabase {
         let mut by_logical: std::collections::HashMap<i64, Vec<rag_rat_papertrail::DriveByRecord>> =
             std::collections::HashMap::new();
         for hit in hits.iter_mut() {
-            let Some(logical_symbol_id) =
-                rag_rat_query::memory::logical_symbol_id_for_chunk(conn, hit.chunk_id)?
+            let Some(logical_symbol_id) = memory::logical_symbol_id_for_chunk(conn, hit.chunk_id)?
             else {
                 continue;
             };
@@ -449,13 +442,13 @@ impl IndexDatabase {
         path: &str,
         limit: u32,
         surface: rag_rat_base::config::MemorySurface,
-    ) -> anyhow::Result<Vec<rag_rat_query::memory::RepoMemory>> {
+    ) -> anyhow::Result<Vec<RepoMemory>> {
         let conn = self.storage.connection();
         // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
         crate::index::retry_once_on_fts_corruption(
             || {
-                let mut memories = rag_rat_query::memory::memories_for_path(conn, path, limit)?;
-                rag_rat_query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                let mut memories = memory::memories_for_path(conn, path, limit)?;
+                memory::apply_memory_surface(conn, &mut memories, surface)?;
                 Ok(memories)
             },
             || self.heal_corrupt_fts(),
@@ -467,14 +460,13 @@ impl IndexDatabase {
         edge_ids: &[i64],
         limit: u32,
         surface: rag_rat_base::config::MemorySurface,
-    ) -> anyhow::Result<Vec<rag_rat_query::memory::RepoMemory>> {
+    ) -> anyhow::Result<Vec<RepoMemory>> {
         let conn = self.storage.connection();
         // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
         crate::index::retry_once_on_fts_corruption(
             || {
-                let mut memories =
-                    rag_rat_query::memory::memories_for_edges(conn, edge_ids, limit)?;
-                rag_rat_query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                let mut memories = memory::memories_for_edges(conn, edge_ids, limit)?;
+                memory::apply_memory_surface(conn, &mut memories, surface)?;
                 Ok(memories)
             },
             || self.heal_corrupt_fts(),
@@ -483,12 +475,12 @@ impl IndexDatabase {
 
     pub fn memory_evidence_for_symbol_and_edges(
         &self,
-        symbol: &rag_rat_query::symbol::SymbolHit,
+        symbol: &SymbolHit,
         caller_edge_ids: &[i64],
         callee_edge_ids: &[i64],
         limit: u32,
         surface: rag_rat_base::config::MemorySurface,
-    ) -> anyhow::Result<rag_rat_query::memory::RepoMemoryEvidence> {
+    ) -> anyhow::Result<RepoMemoryEvidence> {
         // This wrapper exposes only the evidence; the impact builder consumes the truncation flag
         // directly from the core fn. `find_callers` / `trace_callees` emit the evidence FULL (not
         // compact), so honor `[memory] surface` here by deferring each lane's bodies under
@@ -497,7 +489,7 @@ impl IndexDatabase {
         // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
         crate::index::retry_once_on_fts_corruption(
             || {
-                let mut evidence = rag_rat_query::memory::memory_evidence_for_symbol_and_edges(
+                let mut evidence = memory::memory_evidence_for_symbol_and_edges(
                     conn,
                     symbol,
                     caller_edge_ids,
@@ -517,17 +509,14 @@ impl IndexDatabase {
         edge_sequence_hash: &str,
         limit: u32,
         surface: rag_rat_base::config::MemorySurface,
-    ) -> anyhow::Result<Vec<rag_rat_query::memory::RepoMemory>> {
+    ) -> anyhow::Result<Vec<RepoMemory>> {
         let conn = self.storage.connection();
         // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
         crate::index::retry_once_on_fts_corruption(
             || {
-                let mut memories = rag_rat_query::memory::memories_for_call_path_hash(
-                    conn,
-                    edge_sequence_hash,
-                    limit,
-                )?;
-                rag_rat_query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                let mut memories =
+                    memory::memories_for_call_path_hash(conn, edge_sequence_hash, limit)?;
+                memory::apply_memory_surface(conn, &mut memories, surface)?;
                 Ok(memories)
             },
             || self.heal_corrupt_fts(),
@@ -537,18 +526,13 @@ impl IndexDatabase {
     pub fn memory_rebind(
         &self,
         memory_id: &str,
-        bind: rag_rat_query::memory::RepoMemoryBindTarget,
-    ) -> anyhow::Result<rag_rat_query::memory::RepoMemory> {
+        bind: RepoMemoryBindTarget,
+    ) -> anyhow::Result<RepoMemory> {
         crate::memory_write::rebind_memory(self.storage.connection(), memory_id, bind)
     }
 
-    pub fn memory_validate(
-        &self,
-    ) -> anyhow::Result<rag_rat_query::memory::RepoMemoryValidationReport> {
-        rag_rat_query::memory::validate_memories(
-            self.storage.connection(),
-            self.storage.source_root(),
-        )
+    pub fn memory_validate(&self) -> anyhow::Result<RepoMemoryValidationReport> {
+        memory::validate_memories(self.storage.connection(), self.storage.source_root())
     }
 
     /// Materialize any accepted SYNCED `/3` content into the local memory tables — the reverse of
@@ -566,24 +550,18 @@ impl IndexDatabase {
         Ok(())
     }
 
-    pub fn memory_doctor(&self) -> anyhow::Result<Vec<rag_rat_query::memory::MemoryDoctorEntry>> {
-        rag_rat_query::memory::doctor_report(self.storage.connection())
+    pub fn memory_doctor(&self) -> anyhow::Result<Vec<MemoryDoctorEntry>> {
+        memory::doctor_report(self.storage.connection())
     }
 
     /// Read-only list of active+stale memories, optionally filtered by binding_kind.
     /// `kind` filters by binding kind (e.g. `Some("dir")`); `None` returns all.
-    pub fn memory_list(
-        &self,
-        kind: Option<&str>,
-    ) -> anyhow::Result<Vec<rag_rat_query::memory::MemorySummary>> {
-        rag_rat_query::memory::list_memories(self.storage.connection(), kind)
+    pub fn memory_list(&self, kind: Option<&str>) -> anyhow::Result<Vec<MemorySummary>> {
+        memory::list_memories(self.storage.connection(), kind)
     }
 
     /// Fetch a single memory by id, returning `None` when not found.
-    pub fn memory_get(
-        &self,
-        memory_id: &str,
-    ) -> anyhow::Result<Option<rag_rat_query::memory::RepoMemory>> {
-        rag_rat_query::memory::memory_by_id(self.storage.connection(), memory_id)
+    pub fn memory_get(&self, memory_id: &str) -> anyhow::Result<Option<RepoMemory>> {
+        memory::memory_by_id(self.storage.connection(), memory_id)
     }
 }

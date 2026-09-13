@@ -2,7 +2,12 @@
 //! seed resolution for personalization) and the load-bearing-callee enrichment of search/symbol/
 //! neighbor hits.
 
-use rag_rat_query::pagerank::ImportantSymbolsResult;
+use rag_rat_query::graph::GraphHop;
+use rag_rat_query::pagerank::{
+    self, EdgeOracleEffect, ImportanceOptions, ImportantSymbolsResult, RankedImportance,
+    SkippedSeeds,
+};
+use rag_rat_query::symbol::{self, SymbolHit};
 use rusqlite::OptionalExtension;
 
 use super::*;
@@ -30,7 +35,7 @@ struct DiffSeed {
     symbol_ids: Vec<i64>,
     changed_paths: u64,
     indexed_paths: u64,
-    skipped: rag_rat_query::pagerank::SkippedSeeds,
+    skipped: SkippedSeeds,
 }
 
 /// What one changed path contributed to the diff seed.
@@ -72,24 +77,20 @@ impl IndexDatabase {
         &self,
         request: ImportantSymbolsRequest,
     ) -> anyhow::Result<ImportantSymbolsResult> {
-        use rag_rat_query::pagerank::{ImportanceMode, SeedKind, SeedSource, SkippedSeeds};
+        use rag_rat_query::pagerank::{ImportanceMode, SeedKind, SeedSource};
 
         let oracle_effects = self.symbol_importance_oracle_effects()?;
         // Heuristic-only ranking (no oracle run for this checkout) earns a one-line nudge that
         // compiler-grade ranking is available. The config-unaware wording lives here; CLI/MCP swap
         // in the auto-run variant when `[oracle] auto_run` is on.
-        let ranking_hint: Option<String> = oracle_effects
-            .is_none()
-            .then(|| rag_rat_query::pagerank::RANKING_HINT_RUN_ORACLE.to_string());
-        let rank = |seed: &[i64]| -> anyhow::Result<rag_rat_query::pagerank::RankedImportance> {
-            rag_rat_query::pagerank::important_symbols(
-                self.storage.connection(),
-                rag_rat_query::pagerank::ImportanceOptions {
-                    limit: request.limit,
-                    personalize_to: seed,
-                    oracle_effects: oracle_effects.as_ref(),
-                },
-            )
+        let ranking_hint: Option<String> =
+            oracle_effects.is_none().then(|| pagerank::RANKING_HINT_RUN_ORACLE.to_string());
+        let rank = |seed: &[i64]| -> anyhow::Result<RankedImportance> {
+            pagerank::important_symbols(self.storage.connection(), ImportanceOptions {
+                limit: request.limit,
+                personalize_to: seed,
+                oracle_effects: oracle_effects.as_ref(),
+            })
         };
 
         // Explicit names/paths/ids win over the auto-diff default.
@@ -249,12 +250,9 @@ impl IndexDatabase {
                 // nodes here, so keep them (`include_generated: true`) — the #202 filter is for
                 // user-facing symbol search, not PageRank seeds. (A logical-id selector isn't
                 // filtered anyway, but pass it explicitly so the intent survives a refactor.)
-                let members = rag_rat_query::symbol::lookup_candidates(
-                    self.storage.connection(),
-                    &by_handle,
-                    true,
-                )?
-                .candidates;
+                let members =
+                    symbol::lookup_candidates(self.storage.connection(), &by_handle, true)?
+                        .candidates;
                 if members.is_empty() {
                     unresolved += 1;
                 } else {
@@ -293,7 +291,7 @@ impl IndexDatabase {
             // Use the UNENRICHED lookup: seed resolution only needs `symbol_id`, and the enriched
             // `symbol_candidates` would fetch the oracle effect map + run a fan-in query per hit —
             // a whole-graph oracle scan per seed name, repeated, all discarded here (#142 review).
-            let candidates = rag_rat_query::symbol::lookup_candidates(
+            let candidates = symbol::lookup_candidates(
                 self.storage.connection(),
                 &by_name,
                 true, // whole-graph seeding keeps generated nodes (see by_handle note above)
@@ -403,11 +401,8 @@ impl IndexDatabase {
     ///   — #82 finding 2).
     fn symbol_importance_oracle_effects(
         &self,
-    ) -> anyhow::Result<
-        Option<std::collections::HashMap<i64, rag_rat_query::pagerank::EdgeOracleEffect>>,
-    > {
+    ) -> anyhow::Result<Option<std::collections::HashMap<i64, EdgeOracleEffect>>> {
         use rag_rat_oracle::OracleResolutionKind as Kind;
-        use rag_rat_query::pagerank::EdgeOracleEffect;
         // CPU gate: one scoped existence query, so the dominant "no oracle ever" path skips the
         // per-tool version lookups and the whole-graph verdict scan entirely.
         if !rag_rat_oracle::any_run_in_scope(
@@ -487,9 +482,7 @@ impl IndexDatabase {
     /// scan. The returned owned map is borrowed into an [`OracleContext`] per symbol below.
     pub(super) fn load_bearing_oracle_effects(
         &self,
-    ) -> anyhow::Result<
-        Option<std::collections::HashMap<i64, rag_rat_query::pagerank::EdgeOracleEffect>>,
-    > {
+    ) -> anyhow::Result<Option<std::collections::HashMap<i64, EdgeOracleEffect>>> {
         self.symbol_importance_oracle_effects()
     }
 
@@ -499,8 +492,8 @@ impl IndexDatabase {
     /// The oracle effect map is fetched ONCE and reused across every hop.
     pub(super) fn enrich_neighbors_with_load_bearing(
         &self,
-        callers: &mut [rag_rat_query::graph::GraphHop],
-        callees: &mut [rag_rat_query::graph::GraphHop],
+        callers: &mut [GraphHop],
+        callees: &mut [GraphHop],
     ) -> anyhow::Result<()> {
         use rag_rat_query::load_bearing::{self, OracleContext};
         // Nothing to enrich → don't pay the oracle lookup. (#142 review)
@@ -509,9 +502,7 @@ impl IndexDatabase {
         }
         let effects = self.load_bearing_oracle_effects()?;
         let oracle = OracleContext { effects: effects.as_ref() };
-        let enrich = |hop: &mut rag_rat_query::graph::GraphHop,
-                      neighbor: Option<&str>|
-         -> anyhow::Result<()> {
+        let enrich = |hop: &mut GraphHop, neighbor: Option<&str>| -> anyhow::Result<()> {
             let Some(name) = neighbor else { return Ok(()) };
             let Some(symbol_id) = self.active_symbol_id_for_qualified_name(name)? else {
                 return Ok(());
@@ -569,7 +560,7 @@ impl IndexDatabase {
     /// `symbol_id`). One oracle fetch for the whole batch.
     pub(super) fn enrich_symbol_hits_with_load_bearing(
         &self,
-        hits: &mut [rag_rat_query::symbol::SymbolHit],
+        hits: &mut [SymbolHit],
     ) -> anyhow::Result<()> {
         use rag_rat_query::load_bearing::{self, OracleContext};
         // Nothing to enrich → don't pay the oracle lookup. (#142 review)
