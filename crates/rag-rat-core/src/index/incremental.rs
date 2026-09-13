@@ -240,6 +240,113 @@ impl IndexDatabase {
         let _write_lock =
             rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
 
+        let (mut db, effective_mode) = Self::open_and_scope(config, mode)?;
+        let Some(effective_mode) = effective_mode else {
+            // A bootstrap full rebuild reindexed the whole corpus and rebuilt the clone graph from
+            // scratch, so there is no incremental changed-set to hint — `None` forces the delta's
+            // self-healing full scan next pass (#830).
+            return Self::rebuild_with_progress(config, progress).map(|db| {
+                (db, IncrementalPassReport { content_changed: true, clone_delta_hint: None })
+            });
+        };
+        progress(IndexProgress::Started {
+            database: config.database.clone(),
+            mode: effective_mode,
+        });
+        // Gate + spawn the git-history reload BEFORE `BEGIN IMMEDIATE` (unchanged gate). Unchanged
+        // HEAD/root/shallow skips it entirely; a fast-forward HEAD prepares only the new range
+        // (`old..new`); uncertainty, shallow history, root drift, and non-fast-forward rewrites
+        // prepare the full history. The prepared append plan is revalidated at APPLY time (inside
+        // the terminal txn, via `apply_prepared`), so preparing — and now joining — off the SQLite
+        // lock is safe.
+        let git_history_handle = if db.git_history_is_current(&config.root) {
+            None
+        } else {
+            progress(IndexProgress::IndexingGitHistory);
+            let plan = git_history::prepare_plan(db.storage.connection(), &config.root);
+            Some(spawn_git_history_prepare_with_plan(&config.root, plan))
+        };
+
+        // PREPARE — OUTSIDE the SQLite write transaction (#560): filesystem walk,
+        // `git_changed_paths`, discovery snapshot (a pure DB read), tree-sitter parse. This
+        // is the work the audit found holding the writer lock for time proportional to repo
+        // size (unbounded in Discover mode); hoisting it is the entire point of the patch.
+        let prepare_started = std::time::Instant::now();
+        let prepared =
+            match db.prepare_incremental_pass(config, effective_mode, explicit_paths, progress) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    // Prepare failed off the lock (e.g. an unreadable changed file). JOIN the
+                    // pending git-history worker before bailing, so its
+                    // (possibly full `git log`) scan does not detach and keep
+                    // burning CPU/IO after the failed pass — matching the pre-hoist
+                    // error path, which joined the handle before returning.
+                    if let Some(handle) = git_history_handle {
+                        let _ = join_git_history_prepare(handle);
+                    }
+                    return Err(err);
+                },
+            };
+        // Join the git-history prepare thread OUTSIDE the write lock too — a thread `join()` must
+        // not sit inside `BEGIN IMMEDIATE`. The apply below still revalidates the append plan under
+        // the lock, preserving the git-history freshness invariant.
+        let prepared_git_history = match git_history_handle {
+            Some(handle) => Some(join_git_history_prepare(handle)?),
+            None => None,
+        };
+        let prepare_ms = prepare_started.elapsed().as_millis() as u64;
+        // #830: the clone-delta changed-set hint — the base paths this pass reindexes or deletes —
+        // captured from the prepared plan before the write txn (a pure read of `prepared`). Whether
+        // it is offered to the delta is decided after apply, once `healed` is known: a
+        // stale-overlay heal touches `files` rows NOT in this set, so a healed pass falls
+        // back to the full scan.
+        let touched_base_paths = prepared.touched_base_paths();
+
+        let write_started = std::time::Instant::now();
+        let PassEffects { indexed, healed, carried, .. } =
+            db.apply_pass(config, &prepared, effective_mode, prepared_git_history, progress)?;
+        // Report whether index *content* changed (files added / edited / removed, or stale
+        // overlays healed — symbols move scope), so the watch loop can skip the reconcile /
+        // memory-validate tail on an idle sweep.
+        let content_changed = indexed > 0 || healed > 0;
+        // #560 measurement: prepare (reads/parse) vs write (BEGIN IMMEDIATE..COMMIT) durations +
+        // row counts, so the write-lock hold time is observable independently of the hoisted reads.
+        tracing::debug!(
+            target: "rag_rat::index::incremental",
+            mode = ?effective_mode,
+            prepare_ms,
+            write_ms = write_started.elapsed().as_millis() as u64,
+            files = indexed,
+            carried,
+            healed,
+            "incremental pass (reads hoisted out of the write transaction)"
+        );
+        // Settle any pending overlay-batch logical rebuild before returning (#819 review): an
+        // interrupted Deferred overlay batch leaves its obligation committed, and this pass's
+        // own rebuild is gated on its row changes — an IDLE pass closes its empty transaction
+        // above and would otherwise exit past the marker, leaving branch-only symbols
+        // unresolvable until an unrelated pass rebuilt. Its own `BEGIN IMMEDIATE` (the pass's
+        // transaction is closed by now); write-free when nothing is pending (one meta read),
+        // so the #63 idle-pass posture holds. On failure the marker survives for the next pass.
+        db.apply_pending_logical_rebuild()?;
+        // #830: offer the changed-set hint ONLY when the pass's content change is fully captured by
+        // the reindexed/deleted set. A stale-overlay heal (`healed > 0`) mutates `files` rows that
+        // are NOT in `touched_base_paths`, so a healed pass yields `None` and the delta self-heals
+        // via its full DB scan.
+        let clone_delta_hint = (healed == 0).then_some(touched_base_paths);
+        Ok((db, IncrementalPassReport { content_changed, clone_delta_hint }))
+    }
+
+    /// Open the index for an incremental pass (under the caller's write flock), adopt the config's
+    /// repo, install its scope, run the deferred open-time heals, and pick the pass's effective
+    /// mode. The mode is `None` when the repo has no rows yet and a bootstrap full rebuild is owed
+    /// (a `Paths` pass defers with [`EmptyIndexRefused`](crate::index::EmptyIndexRefused)
+    /// instead); the handle is returned either way, so the caller keeps it open across that
+    /// rebuild and its Drop-time WAL fold runs after it.
+    fn open_and_scope(
+        config: &Config,
+        mode: IndexMode,
+    ) -> anyhow::Result<(Self, Option<IndexMode>)> {
         // Open in ADOPTION-PENDING mode: the multi-repo fail-fast must not fire (the config below
         // supplies the scope, unlike a genuinely config-less `Self::open`), and the graph check is
         // DEFERRED — its `ensure_graph_index_current` is a repo-scoped edge DELETE+rebuild keyed
@@ -324,12 +431,7 @@ impl IndexDatabase {
                 }
                 .into());
             }
-            // A bootstrap full rebuild reindexed the whole corpus and rebuilt the clone graph from
-            // scratch, so there is no incremental changed-set to hint — `None` forces the delta's
-            // self-healing full scan next pass (#830).
-            return Self::rebuild_with_progress(config, progress).map(|db| {
-                (db, IncrementalPassReport { content_changed: true, clone_delta_hint: None })
-            });
+            return Ok((db, None));
         }
         // A commit advances HEAD before committed-scope rows have been stamped for it. Likewise, a
         // target-set change can make the active scope marker stale even when the old rows still
@@ -352,72 +454,32 @@ impl IndexDatabase {
             } else {
                 mode
             };
-        progress(IndexProgress::Started {
-            database: config.database.clone(),
-            mode: effective_mode,
-        });
-        // Gate + spawn the git-history reload BEFORE `BEGIN IMMEDIATE` (unchanged gate). Unchanged
-        // HEAD/root/shallow skips it entirely; a fast-forward HEAD prepares only the new range
-        // (`old..new`); uncertainty, shallow history, root drift, and non-fast-forward rewrites
-        // prepare the full history. The prepared append plan is revalidated at APPLY time (inside
-        // the terminal txn, via `apply_prepared`), so preparing — and now joining — off the SQLite
-        // lock is safe.
-        let git_history_handle = if db.git_history_is_current(&config.root) {
-            None
-        } else {
-            progress(IndexProgress::IndexingGitHistory);
-            let plan = git_history::prepare_plan(db.storage.connection(), &config.root);
-            Some(spawn_git_history_prepare_with_plan(&config.root, plan))
-        };
+        Ok((db, Some(effective_mode)))
+    }
 
-        // PREPARE — OUTSIDE the SQLite write transaction (#560): filesystem walk,
-        // `git_changed_paths`, discovery snapshot (a pure DB read), tree-sitter parse. This
-        // is the work the audit found holding the writer lock for time proportional to repo
-        // size (unbounded in Discover mode); hoisting it is the entire point of the patch.
-        let prepare_started = std::time::Instant::now();
-        let prepared =
-            match db.prepare_incremental_pass(config, effective_mode, explicit_paths, progress) {
-                Ok(prepared) => prepared,
-                Err(err) => {
-                    // Prepare failed off the lock (e.g. an unreadable changed file). JOIN the
-                    // pending git-history worker before bailing, so its
-                    // (possibly full `git log`) scan does not detach and keep
-                    // burning CPU/IO after the failed pass — matching the pre-hoist
-                    // error path, which joined the handle before returning.
-                    if let Some(handle) = git_history_handle {
-                        let _ = join_git_history_prepare(handle);
-                    }
-                    return Err(err);
-                },
-            };
-        // Join the git-history prepare thread OUTSIDE the write lock too — a thread `join()` must
-        // not sit inside `BEGIN IMMEDIATE`. The apply below still revalidates the append plan under
-        // the lock, preserving the git-history freshness invariant.
-        let prepared_git_history = match git_history_handle {
-            Some(handle) => Some(join_git_history_prepare(handle)?),
-            None => None,
-        };
-        let prepare_ms = prepare_started.elapsed().as_millis() as u64;
-        // #830: the clone-delta changed-set hint — the base paths this pass reindexes or deletes —
-        // captured from the prepared plan before the write txn (a pure read of `prepared`). Whether
-        // it is offered to the delta is decided after apply, once `healed` is known: a
-        // stale-overlay heal touches `files` rows NOT in this set, so a healed pass falls
-        // back to the full scan.
-        let touched_base_paths = prepared.touched_base_paths();
-
-        // WRITE — ONE `BEGIN IMMEDIATE` .. COMMIT (#560). The incremental path writes the LIVE
-        // generation directly (no staging, no pointer flip — unlike the full rebuild), so every
-        // write must land ATOMICALLY: a reader sees the pre-pass or the post-pass state, never a
-        // half-applied change set. That is why these writes are NOT split into per-wave commits the
-        // way the staged rebuild's are — a rebuild wave is invisible until the flip, but a
-        // live-generation wave commit would publish a partially-updated generation. Every effect
-        // here is publication authority and stays in this one transaction; the expensive reads are
-        // already hoisted above, so the writer lock now covers only DB mutation.
-        let write_started = std::time::Instant::now();
+    /// WRITE — ONE `BEGIN IMMEDIATE` .. COMMIT (#560). The incremental path writes the LIVE
+    /// generation directly (no staging, no pointer flip — unlike the full rebuild), so every
+    /// write must land ATOMICALLY: a reader sees the pre-pass or the post-pass state, never a
+    /// half-applied change set. That is why these writes are NOT split into per-wave commits the
+    /// way the staged rebuild's are — a rebuild wave is invisible until the flip, but a
+    /// live-generation wave commit would publish a partially-updated generation. Every effect
+    /// here is publication authority and stays in this one transaction; the expensive reads are
+    /// already hoisted above, so the writer lock now covers only DB mutation.
+    fn apply_pass<F>(
+        &mut self,
+        config: &Config,
+        prepared: &PreparedIncrementalPass,
+        effective_mode: IndexMode,
+        prepared_git_history: Option<git_history::PreparedGitHistory>,
+        progress: &mut F,
+    ) -> anyhow::Result<PassEffects>
+    where
+        F: FnMut(IndexProgress),
+    {
         let result = (|| -> anyhow::Result<PassEffects> {
             // BEGIN IMMEDIATE: take the write lock up front so a racing writer waits out
             // busy_timeout instead of failing a deferred read→write upgrade with SQLITE_BUSY.
-            db.storage.execute_batch("BEGIN IMMEDIATE")?;
+            self.storage.execute_batch("BEGIN IMMEDIATE")?;
             // #827: arm scoped-edge-rewrite capture for the whole pass — BEFORE the file removals /
             // inserts below, so `remove_file_in_scope` can stage the source files of the in-edges
             // it NULLs and the incremental file insert can stage the changed files.
@@ -425,32 +487,32 @@ impl IndexDatabase {
             // apply, once the row counts are known (see the resolve gate below); arming
             // unconditionally only writes the `temp` schema, so it costs an idle pass
             // nothing on the main DB (#63).
-            db.begin_scoped_edge_rewrite()?;
+            self.begin_scoped_edge_rewrite()?;
             // #826: likewise arm scoped LOGICAL re-derive capture — `remove_file_in_scope` and the
             // incremental file insert stage the changed PATHS, so the logical-symbol rebuild below
             // can re-derive only those paths' groups instead of the whole repo.
-            db.begin_scoped_logical_rederive()?;
+            self.begin_scoped_logical_rederive()?;
             // Write meta only when it actually changed, and track whether this pass mutated
             // anything at all. A periodic sweep or a spurious event over an unchanged
             // tree must NOT churn the WAL with a timestamp-only write + COMMIT (issue
             // #63) — that idle write is also the false signal the watcher-loop
             // diagnostic keys on (indexed_at_ms advancing while content is unchanged).
             let source_root_changed =
-                db.set_repo_meta_if_changed("source_root", &config.root.display().to_string())?;
-            db.storage.set_source_root(config.root.clone());
-            let git_meta_changed = db.write_git_meta(&config.root)?;
+                self.set_repo_meta_if_changed("source_root", &config.root.display().to_string())?;
+            self.storage.set_source_root(config.root.clone());
+            let git_meta_changed = self.write_git_meta(&config.root)?;
             // Heal the active embedding model from config INSIDE the txn (#394): a failed pass
             // rolls the reseed back with everything else rather than stranding the
             // active model on a possibly-uninstalled configured model. A no-op unless a
             // seed is owed (preserving the #63 idle-pass no-write invariant); when owed
             // it counts as a mutation so COMMIT persists it.
             let embedding_model_seeded = ai::active_embedding_model_seed_owed(
-                db.storage.connection(),
+                self.storage.connection(),
                 config.llm.embedding.backend.model_id(),
             )?;
             if embedding_model_seeded {
                 ai::seed_active_embedding_model(
-                    db.storage.connection(),
+                    self.storage.connection(),
                     config.llm.embedding.backend.model_id(),
                 )?;
             }
@@ -462,9 +524,9 @@ impl IndexDatabase {
             // idempotent against any intervening lockless overlay heal; and the flock has excluded
             // the only writer that could flip `active_generation`.
             let IncrementalFilesOutcome { indexed, manifest_in_change_set, carried, logical } =
-                db.apply_prepared_incremental_pass(&prepared, effective_mode, progress)?;
+                self.apply_prepared_incremental_pass(prepared, effective_mode, progress)?;
             let base_scope_discovery_marked = if effective_mode == IndexMode::Discover {
-                db.mark_active_base_scope_discovered(&config.targets)?
+                self.mark_active_base_scope_discovered(&config.targets)?
             } else {
                 false
             };
@@ -473,7 +535,7 @@ impl IndexDatabase {
             // window or the BEGIN wait cannot be mis-healed (#561). Read-only +
             // walk-free when there are no overlay candidates (#63).
             let healed =
-                db.heal_stale_overlay_rows(&config.root, &prepared.reindexed_base_paths())?;
+                self.heal_stale_overlay_rows(&config.root, &prepared.reindexed_base_paths())?;
             let mut effects = PassEffects { indexed, healed, carried, roots_changed: false };
             let mut mutated = effects.any_rows_written()
                 || source_root_changed
@@ -484,7 +546,7 @@ impl IndexDatabase {
             // the lock; `apply_prepared` revalidates the append plan here, under the lock, so a
             // history rewrite between prepare and now is caught (git-history freshness invariant).
             if let Some(prepared_history) = prepared_git_history {
-                db.apply_joined_git_history(&config.root, prepared_history)?;
+                self.apply_joined_git_history(&config.root, prepared_history)?;
                 mutated = true;
             }
             // Per-package import scope (#61, salvaging #95): rewrite `packages` + refresh the
@@ -494,7 +556,7 @@ impl IndexDatabase {
             // map is keyed by `(commit_sha, worktree_id)`. `refresh_packages` returns
             // whether the map changed, forcing a re-resolve.
             effects.roots_changed = if effects.any_rows_written() || manifest_in_change_set {
-                db.refresh_packages(&config.root)?
+                self.refresh_packages(&config.root)?
             } else {
                 false
             };
@@ -521,7 +583,7 @@ impl IndexDatabase {
                     _ => None,
                 };
                 match key_stable_relinks {
-                    Some(relinks) => db.apply_logical_member_relinks(&relinks)?,
+                    Some(relinks) => self.apply_logical_member_relinks(&relinks)?,
                     None => {
                         progress(IndexProgress::RebuildingLogicalSymbols);
                         // #826: re-derive ONLY the changed paths' logical groups (staged in
@@ -535,10 +597,10 @@ impl IndexDatabase {
                         // a correct no-op; a heal's removed paths ARE captured (via
                         // `remove_file_in_scope`), so they regroup. Defer: a partial pass must not
                         // stamp the logical-key version — untouched files' drift is still future.
-                        if db.can_scope_logical_rederive()? {
-                            db.rederive_changed_logical_symbols()?;
+                        if self.can_scope_logical_rederive()? {
+                            self.rederive_changed_logical_symbols()?;
                         } else {
-                            db.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+                            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
                         }
                     },
                 }
@@ -555,67 +617,37 @@ impl IndexDatabase {
                 // from an unchanged source is deferred to the next full pass.
                 let scoped_resolve = indexed > 0 && effects.base_files_only();
                 if scoped_resolve {
-                    db.resolve_changed_edges()?;
+                    self.resolve_changed_edges()?;
                 } else {
-                    db.resolve_edges()?;
+                    self.resolve_edges()?;
                 }
-                db.mark_graph_index_current()?;
+                self.mark_graph_index_current()?;
                 progress(IndexProgress::SyncingFts);
-                db.sync_fts()?;
+                self.sync_fts()?;
             }
             // #827: disarm capture for this connection (the staged rows are consumed by the resolve
             // above; the next pass's `begin_scoped_edge_rewrite` clears them). Runs whether or not
             // the resolve branch was entered, so an idle or non-narrowed pass leaves
             // the flag clean.
-            db.finish_scoped_edge_rewrite();
+            self.finish_scoped_edge_rewrite();
             // #826: disarm scoped logical re-derive capture (staged paths consumed above; the next
             // pass's `begin_scoped_logical_rederive` clears them).
-            db.finish_scoped_logical_rederive();
+            self.finish_scoped_logical_rederive();
             if mutated {
-                db.set_repo_meta("indexed_at_ms", &now_ms().to_string())?;
-                db.storage.execute_batch("COMMIT")?;
+                self.set_repo_meta("indexed_at_ms", &now_ms().to_string())?;
+                self.storage.execute_batch("COMMIT")?;
             } else {
                 // Nothing changed since the last pass — close the (empty) transaction without
                 // writing, so an idle server does not touch the DB (#63).
-                db.storage.execute_batch("ROLLBACK")?;
+                self.storage.execute_batch("ROLLBACK")?;
             }
             progress(IndexProgress::Finished { files: indexed });
             Ok(effects)
         })();
         if result.is_err() {
-            let _ = db.storage.execute_batch("ROLLBACK");
+            let _ = self.storage.execute_batch("ROLLBACK");
         }
-        let PassEffects { indexed, healed, carried, .. } = result?;
-        // Report whether index *content* changed (files added / edited / removed, or stale
-        // overlays healed — symbols move scope), so the watch loop can skip the reconcile /
-        // memory-validate tail on an idle sweep.
-        let content_changed = indexed > 0 || healed > 0;
-        // #560 measurement: prepare (reads/parse) vs write (BEGIN IMMEDIATE..COMMIT) durations +
-        // row counts, so the write-lock hold time is observable independently of the hoisted reads.
-        tracing::debug!(
-            target: "rag_rat::index::incremental",
-            mode = ?effective_mode,
-            prepare_ms,
-            write_ms = write_started.elapsed().as_millis() as u64,
-            files = indexed,
-            carried,
-            healed,
-            "incremental pass (reads hoisted out of the write transaction)"
-        );
-        // Settle any pending overlay-batch logical rebuild before returning (#819 review): an
-        // interrupted Deferred overlay batch leaves its obligation committed, and this pass's
-        // own rebuild is gated on its row changes — an IDLE pass closes its empty transaction
-        // above and would otherwise exit past the marker, leaving branch-only symbols
-        // unresolvable until an unrelated pass rebuilt. Its own `BEGIN IMMEDIATE` (the pass's
-        // transaction is closed by now); write-free when nothing is pending (one meta read),
-        // so the #63 idle-pass posture holds. On failure the marker survives for the next pass.
-        db.apply_pending_logical_rebuild()?;
-        // #830: offer the changed-set hint ONLY when the pass's content change is fully captured by
-        // the reindexed/deleted set. A stale-overlay heal (`healed > 0`) mutates `files` rows that
-        // are NOT in `touched_base_paths`, so a healed pass yields `None` and the delta self-heals
-        // via its full DB scan.
-        let clone_delta_hint = (healed == 0).then_some(touched_base_paths);
-        Ok((db, IncrementalPassReport { content_changed, clone_delta_hint }))
+        result
     }
 
     /// Standalone full-corpus indexing into the CURRENT context — no generation staging, no

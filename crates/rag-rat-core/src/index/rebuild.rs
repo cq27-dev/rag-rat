@@ -24,6 +24,14 @@ pub(super) enum StagedSweep {
     DeadGeneration,
 }
 
+/// The two generations a full rebuild publishes between: `old_live`, which readers see until
+/// the flip, and the freshly staged `target` the flip makes live.
+#[derive(Debug, Clone, Copy)]
+struct GenerationFlip {
+    target: i64,
+    old_live: i64,
+}
+
 impl IndexDatabase {
     pub fn rebuild(config: &Config) -> anyhow::Result<Self> {
         Self::rebuild_with_progress(config, |_| {})
@@ -177,153 +185,13 @@ impl IndexDatabase {
             db.storage.execute_batch("COMMIT")?;
             mem_trace("after phase 2 (chunk_text store)");
 
-            // Phase 3: the TERMINAL transaction. The pointer flip is the LAST fallible step of a
-            // rebuild — everything a reader treats as AUTHORITY or that must be CONSISTENT with the
-            // published generation completes INSIDE this one transaction, with
-            // `live_files_generation` written last. A failure anywhere here rolls the WHOLE tail
-            // back — the pointer never moves, readers stay on the complete old generation, and a
-            // retry stages a fresh target. Its writes are uncommitted until the flip, so a
-            // concurrent reader/heal never observes any of the GENERATION-LESS ones (base package
-            // roots, re-keyed overlay packages, git-history rows, clone df) in front of the
-            // still-live OLD generation. TXN-SIZE TRADEOFF (batch 6): the terminal txn now also
-            // carries base-edge resolution (O(edges), formerly its own Phase-1 tail txn) and the
-            // git-history rows + external-content `commit_fts` rebuild (O(commits) on a
-            // deep-history repo). Both are the price of atomicity and stay proportional
-            // to symbol/edge/history counts, NOT the file bytes — the whole-file
-            // indexing bulk stays in Phase 1's waves.
-            db.storage.execute_batch("BEGIN IMMEDIATE")?;
-            // Carry every live row OUTSIDE the base scope (linked-worktree overlays, other-commit
-            // leftovers) forward onto `target` — the rebuild only re-emits the base scope, so
-            // they must ride along to stay visible after the flip.
-            let carried_rows = db.carry_forward_live_overlays(target, old_live)?;
-            let carried_overlays = db.carried_overlay_worktrees(target)?;
-            // Carry each carried overlay's PACKAGE ROOTS onto the new base scope (batch 6 #3): the
-            // overlay FILE rows carried above are matched into the scope view by `worktree_id`
-            // alone, but `load_package_roots_into_scope` reads `packages` by `(commit_sha,
-            // worktree_id)`, so an overlay keyed to the OLD base HEAD finds NO package map under
-            // the re-resolution view (installed at the NEW base commit) and resolves
-            // its imports fall-open. Re-key their `commit_sha` to the rebuilt HEAD
-            // BEFORE the re-resolution.
-            db.carry_forward_overlay_packages(&carried_overlays)?;
-            // Base package roots + base-edge resolution, folded into the flip (batch 6 #4):
-            // `finalize_base_edges` writes the generation-less `packages`/`local_crate_roots` and
-            // resolves every accumulated base edge against them. Runs INSIDE the terminal txn so
-            // those authority writes are invisible to a concurrent reader/heal until the pointer
-            // moves and roll back with a failed tail; the resolve reads the package rows back from
-            // this same uncommitted transaction.
-            db.finalize_base_edges(config, graph)?;
-            // Re-resolve each carried overlay's OWN edges against the freshly staged base (P2
-            // review): the base re-emit re-minted every base `symbols.id`, so a carried overlay
-            // edge's `to_symbol_id` still points at the OLD generation's symbol row — dead the
-            // moment gc sweeps it. `resolve_overlay_edges` writes only the overlay's own rows
-            // (targets span the overlay view), exactly as `finalize_overlay_refresh` uses it; the
-            // view is swapped per overlay and restored to the base scope after.
-            for worktree_id in &carried_overlays {
-                db.install_view_for_scope(&db.active_commit_sha, worktree_id, target)?;
-                db.resolve_overlay_edges(worktree_id)?;
-            }
-            if !carried_overlays.is_empty() {
-                db.install_view_for_scope(&db.active_commit_sha, &db.active_worktree_id, target)?;
-            }
-            // Logical symbols fold the generation being published (base scope + carried
-            // overlays), scoped to `self.active_generation == target` — the carried overlays are
-            // already at `target` within this transaction, so the fold sees them (the A6 handoff
-            // note, now satisfied PRE-flip inside the same atomic write).
-            progress(IndexProgress::RebuildingLogicalSymbols);
-            // FullRederive ONLY when the published set is EXACTLY what this rebuild re-parsed.
-            // Any row `carry_forward_live_overlays` moved forward — a linked-worktree overlay OR
-            // an other-commit committed leftover (`worktree_id = ''`, carried when this rebuild
-            // runs from a linked worktree) — rode along WITHOUT a reparse, so its symbols still
-            // carry the old derivation. Stamping over them would let a later heal of THOSE rows
-            // see a current key version, skip the drift snapshot, and strand their references.
-            // Gate on the carried-row COUNT, not `carried_overlays.is_empty()`:
-            // `carried_overlay_worktrees` returns only `worktree_id != ''` overlays, a NARROWER
-            // set than what was actually carried, so it would miss carried committed leftovers
-            // (#493 review). Carries are transient, so the stamp lands on the next carry-free
-            // rebuild while every pass keeps healing what it can see.
-            let stamp = if carried_rows == 0 {
-                graph_index::KeyVersionStamp::FullRederive
-            } else {
-                graph_index::KeyVersionStamp::Defer
-            };
-            db.rebuild_logical_symbols(stamp)?;
-            // Publish the STAGED `parser_failures` state (upserts for paths that failed this
-            // pass, clears for clean re-parses, an orphan sweep for paths removed from the tree)
-            // atomically with the flip: the waves staged these mutations in a temp table instead
-            // of writing the generation-less table mid-pass, so readers see the OLD failure state
-            // until the pointer moves and a tail failure rolls the whole reconciliation back with
-            // it. Generation-dead gc deliberately never touches this table.
-            db.apply_staged_parser_failures(target)?;
-            // Recompute clone-token df over the FINAL published set (batch 6 #2): it reads
-            // `symbol_fingerprints` at `active_generation == target`, which AFTER the overlay
-            // carry-forward above is exactly the generation about to go live (base + carried
-            // overlays). Recomputing in Phase 2 (before carry-forward) either omitted carried
-            // overlay fingerprints from the df on success, or on a tail failure left the OLD
-            // generation's clone queries reading a df computed from the never-published target —
-            // and the df drives sub-block-postings selection + persisted-postings
-            // invalidation, so it is consumed as authority w.r.t. the published set,
-            // not merely a drift-tolerated hint.
-            db.refresh_clone_token_df()?;
-            // Git-history ROWS + external-content `commit_fts` fold into the flip too (batch 6 #1):
-            // `git_commits`/`git_file_changes` are read DIRECTLY by
-            // `query::orientation::recent_commit_subjects`, lexical churn, and commit search — not
-            // only through the deferred `git_history_indexed_*` cursors — so landing them in Phase
-            // 2 let a rebuild that observed changed/cleared history then failed
-            // pre-flip strand the NEW history rows in front of the still-live OLD file
-            // generation. The reload-gate CURSORS still write cursors-last below; the
-            // ROWS + `commit_fts` now ride the same atomic transaction as the file
-            // generation, so orientation/search can never mix new history with the old
-            // files.
-            let history_cursors = db.apply_prepared_git_history_deferring_cursors(
-                &config.root,
-                git_history
-                    .take()
-                    .ok_or_else(|| anyhow::anyhow!("git history preparation was already used"))?,
+            db.publish_generation(
+                config,
+                graph,
+                GenerationFlip { target, old_live },
+                &mut git_history,
+                &mut progress,
             )?;
-            progress(IndexProgress::RebuildingFts);
-            // chunk_fts was written inline during chunk insert; only the external-content
-            // commit_fts needs the bulk 'rebuild' here (#77 Phase 2), now atomic with
-            // the git rows it indexes.
-            db.finalize_full_rebuild_fts()?;
-            progress(IndexProgress::ResolvingGraph);
-            db.mark_graph_index_current()?;
-            // Full rebuild writes correct `files.generated`, so stamp the flags version current and
-            // skip a redundant re-derive on next open (#202).
-            db.mark_generated_flags_current()?;
-            // A full rebuild (re)derived every chunk's `embedding_policy` with the current
-            // classifier, so certify the column current for this repo — the reconcile skip-summary
-            // then reads it via GROUP BY instead of re-parsing every file (#530). Gate on
-            // `carried_rows == 0` for the SAME reason as the logical-key version stamp above: a
-            // carried overlay / other-commit leftover rode along WITHOUT a reparse, so its column
-            // still holds the OLD-classifier policy — a repo-wide stamp would wrongly certify it. A
-            // repo with live overlays keeps recomputing (correct) until a carry-free rebuild; the
-            // reconcile self-heal is likewise gated on the active scope covering the whole live
-            // set. NOT stamped on the incremental path, which restamps only changed
-            // files.
-            if carried_rows == 0 {
-                db.mark_embedding_policy_current()?;
-            }
-            // The git AUTHORITY writes ride the flip (batch-4 P2): `git_commit`/`git_dirty` meta
-            // and the history reload-gate cursors say "this index reflects commit H" — true only
-            // once the generation built at H is published. Deferring them here means a tail
-            // failure leaves status()/`is_history_current` honestly reporting the OLD state (a
-            // reload stays owed), and the retry publishes files + git authority together.
-            db.set_repo_meta("source_root", &config.root.display().to_string())?;
-            db.write_git_meta(&config.root)?;
-            db.mark_active_base_scope_discovered(&config.targets)?;
-            if let Some(cursors) = &history_cursors {
-                db.record_git_history_cursors(cursors)?;
-            }
-            // Publish: `live_files_generation` LAST, so a concurrent reader sees either the whole
-            // old generation or the whole new one, never a mix. The active-model seed rides the
-            // flip (#394): it is advanced only when the fresh generation actually goes live.
-            db.set_repo_meta(schema::LIVE_FILES_GENERATION_META_KEY, &target.to_string())?;
-            db.set_repo_meta("indexed_at_ms", &rag_rat_base::time::now_ms().to_string())?;
-            ai::seed_active_embedding_model(
-                db.storage.connection(),
-                config.llm.embedding.backend.model_id(),
-            )?;
-            db.storage.execute_batch("COMMIT")?;
             mem_trace("after terminal flip (overlay edges + logical symbols + pointer)");
             progress(IndexProgress::Finished { files: indexed });
             Ok(indexed)
@@ -373,6 +241,181 @@ impl IndexDatabase {
         #[cfg(test)]
         crate::index::poison_sibling::seed_if_enabled(db.storage.connection())?;
         Ok(db)
+    }
+
+    /// Phase 3: the TERMINAL transaction. The pointer flip is the LAST fallible step of a
+    /// rebuild — everything a reader treats as AUTHORITY or that must be CONSISTENT with the
+    /// published generation completes INSIDE this one transaction, with
+    /// `live_files_generation` written last. A failure anywhere here rolls the WHOLE tail
+    /// back — the pointer never moves, readers stay on the complete old generation, and a
+    /// retry stages a fresh target. Its writes are uncommitted until the flip, so a
+    /// concurrent reader/heal never observes any of the GENERATION-LESS ones (base package
+    /// roots, re-keyed overlay packages, git-history rows, clone df) in front of the
+    /// still-live OLD generation. TXN-SIZE TRADEOFF (batch 6): the terminal txn now also
+    /// carries base-edge resolution (O(edges), formerly its own Phase-1 tail txn) and the
+    /// git-history rows + external-content `commit_fts` rebuild (O(commits) on a
+    /// deep-history repo). Both are the price of atomicity and stay proportional
+    /// to symbol/edge/history counts, NOT the file bytes — the whole-file
+    /// indexing bulk stays in Phase 1's waves.
+    fn publish_generation<F>(
+        &self,
+        config: &Config,
+        graph: edges::FullRebuildGraph,
+        flip: GenerationFlip,
+        git_history: &mut Option<
+            std::thread::JoinHandle<anyhow::Result<git_history::PreparedGitHistory>>,
+        >,
+        progress: &mut F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(IndexProgress),
+    {
+        let GenerationFlip { target, old_live } = flip;
+        self.storage.execute_batch("BEGIN IMMEDIATE")?;
+        // Carry every live row OUTSIDE the base scope (linked-worktree overlays,
+        // other-commit leftovers) forward onto `target` — the rebuild only
+        // re-emits the base scope, so they must ride along to stay visible
+        // after the flip.
+        let carried_rows = self.carry_forward_live_overlays(target, old_live)?;
+        let carried_overlays = self.carried_overlay_worktrees(target)?;
+        // Carry each carried overlay's PACKAGE ROOTS onto the new base scope (batch 6 #3):
+        // the overlay FILE rows carried above are matched into the scope
+        // view by `worktree_id` alone, but `load_package_roots_into_scope`
+        // reads `packages` by `(commit_sha, worktree_id)`, so an overlay
+        // keyed to the OLD base HEAD finds NO package map under
+        // the re-resolution view (installed at the NEW base commit) and resolves
+        // its imports fall-open. Re-key their `commit_sha` to the rebuilt HEAD
+        // BEFORE the re-resolution.
+        self.carry_forward_overlay_packages(&carried_overlays)?;
+        // Base package roots + base-edge resolution, folded into the flip (batch 6 #4):
+        // `finalize_base_edges` writes the generation-less `packages`/`local_crate_roots`
+        // and resolves every accumulated base edge against them. Runs
+        // INSIDE the terminal txn so those authority writes are invisible
+        // to a concurrent reader/heal until the pointer moves and roll back
+        // with a failed tail; the resolve reads the package rows back from
+        // this same uncommitted transaction.
+        self.finalize_base_edges(config, graph)?;
+        // Re-resolve each carried overlay's OWN edges against the freshly staged base (P2
+        // review): the base re-emit re-minted every base `symbols.id`, so a carried overlay
+        // edge's `to_symbol_id` still points at the OLD generation's symbol row — dead the
+        // moment gc sweeps it. `resolve_overlay_edges` writes only the overlay's own rows
+        // (targets span the overlay view), exactly as `finalize_overlay_refresh` uses it;
+        // the view is swapped per overlay and restored to the base scope
+        // after.
+        for worktree_id in &carried_overlays {
+            self.install_view_for_scope(&self.active_commit_sha, worktree_id, target)?;
+            self.resolve_overlay_edges(worktree_id)?;
+        }
+        if !carried_overlays.is_empty() {
+            self.install_view_for_scope(&self.active_commit_sha, &self.active_worktree_id, target)?;
+        }
+        // Logical symbols fold the generation being published (base scope + carried
+        // overlays), scoped to `self.active_generation == target` — the carried overlays
+        // are already at `target` within this transaction, so the fold sees
+        // them (the A6 handoff note, now satisfied PRE-flip inside the same
+        // atomic write).
+        progress(IndexProgress::RebuildingLogicalSymbols);
+        // FullRederive ONLY when the published set is EXACTLY what this rebuild re-parsed.
+        // Any row `carry_forward_live_overlays` moved forward — a linked-worktree overlay
+        // OR an other-commit committed leftover (`worktree_id = ''`,
+        // carried when this rebuild runs from a linked worktree) — rode
+        // along WITHOUT a reparse, so its symbols still carry the old
+        // derivation. Stamping over them would let a later heal of THOSE rows
+        // see a current key version, skip the drift snapshot, and strand their references.
+        // Gate on the carried-row COUNT, not `carried_overlays.is_empty()`:
+        // `carried_overlay_worktrees` returns only `worktree_id != ''` overlays, a NARROWER
+        // set than what was actually carried, so it would miss carried committed leftovers
+        // (#493 review). Carries are transient, so the stamp lands on the next carry-free
+        // rebuild while every pass keeps healing what it can see.
+        let stamp = if carried_rows == 0 {
+            graph_index::KeyVersionStamp::FullRederive
+        } else {
+            graph_index::KeyVersionStamp::Defer
+        };
+        self.rebuild_logical_symbols(stamp)?;
+        // Publish the STAGED `parser_failures` state (upserts for paths that failed this
+        // pass, clears for clean re-parses, an orphan sweep for paths removed from the
+        // tree) atomically with the flip: the waves staged these mutations
+        // in a temp table instead of writing the generation-less table
+        // mid-pass, so readers see the OLD failure state until the pointer
+        // moves and a tail failure rolls the whole reconciliation back with
+        // it. Generation-dead gc deliberately never touches this table.
+        self.apply_staged_parser_failures(target)?;
+        // Recompute clone-token df over the FINAL published set (batch 6 #2): it reads
+        // `symbol_fingerprints` at `active_generation == target`, which AFTER the overlay
+        // carry-forward above is exactly the generation about to go live (base + carried
+        // overlays). Recomputing in Phase 2 (before carry-forward) either omitted carried
+        // overlay fingerprints from the df on success, or on a tail failure left the OLD
+        // generation's clone queries reading a df computed from the never-published target
+        // — and the df drives sub-block-postings selection +
+        // persisted-postings invalidation, so it is consumed as authority
+        // w.r.t. the published set, not merely a drift-tolerated hint.
+        self.refresh_clone_token_df()?;
+        // Git-history ROWS + external-content `commit_fts` fold into the flip too (batch 6
+        // #1): `git_commits`/`git_file_changes` are read DIRECTLY by
+        // `query::orientation::recent_commit_subjects`, lexical churn, and commit search —
+        // not only through the deferred `git_history_indexed_*` cursors —
+        // so landing them in Phase 2 let a rebuild that observed
+        // changed/cleared history then failed pre-flip strand the NEW
+        // history rows in front of the still-live OLD file generation. The
+        // reload-gate CURSORS still write cursors-last below; the
+        // ROWS + `commit_fts` now ride the same atomic transaction as the file
+        // generation, so orientation/search can never mix new history with the old
+        // files.
+        let history_cursors = self.apply_prepared_git_history_deferring_cursors(
+            &config.root,
+            git_history
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("git history preparation was already used"))?,
+        )?;
+        progress(IndexProgress::RebuildingFts);
+        // chunk_fts was written inline during chunk insert; only the external-content
+        // commit_fts needs the bulk 'rebuild' here (#77 Phase 2), now atomic with
+        // the git rows it indexes.
+        self.finalize_full_rebuild_fts()?;
+        progress(IndexProgress::ResolvingGraph);
+        self.mark_graph_index_current()?;
+        // Full rebuild writes correct `files.generated`, so stamp the flags version current
+        // and skip a redundant re-derive on next open (#202).
+        self.mark_generated_flags_current()?;
+        // A full rebuild (re)derived every chunk's `embedding_policy` with the current
+        // classifier, so certify the column current for this repo — the reconcile
+        // skip-summary then reads it via GROUP BY instead of re-parsing
+        // every file (#530). Gate on `carried_rows == 0` for the SAME
+        // reason as the logical-key version stamp above: a carried overlay
+        // / other-commit leftover rode along WITHOUT a reparse, so its column
+        // still holds the OLD-classifier policy — a repo-wide stamp would wrongly certify
+        // it. A repo with live overlays keeps recomputing (correct) until a
+        // carry-free rebuild; the reconcile self-heal is likewise gated on
+        // the active scope covering the whole live set. NOT stamped on the
+        // incremental path, which restamps only changed files.
+        if carried_rows == 0 {
+            self.mark_embedding_policy_current()?;
+        }
+        // The git AUTHORITY writes ride the flip (batch-4 P2): `git_commit`/`git_dirty`
+        // meta and the history reload-gate cursors say "this index reflects
+        // commit H" — true only once the generation built at H is
+        // published. Deferring them here means a tail failure leaves
+        // status()/`is_history_current` honestly reporting the OLD state (a
+        // reload stays owed), and the retry publishes files + git authority together.
+        self.set_repo_meta("source_root", &config.root.display().to_string())?;
+        self.write_git_meta(&config.root)?;
+        self.mark_active_base_scope_discovered(&config.targets)?;
+        if let Some(cursors) = &history_cursors {
+            self.record_git_history_cursors(cursors)?;
+        }
+        // Publish: `live_files_generation` LAST, so a concurrent reader sees either the
+        // whole old generation or the whole new one, never a mix. The
+        // active-model seed rides the flip (#394): it is advanced only when
+        // the fresh generation actually goes live.
+        self.set_repo_meta(schema::LIVE_FILES_GENERATION_META_KEY, &target.to_string())?;
+        self.set_repo_meta("indexed_at_ms", &rag_rat_base::time::now_ms().to_string())?;
+        ai::seed_active_embedding_model(
+            self.storage.connection(),
+            config.llm.embedding.backend.model_id(),
+        )?;
+        self.storage.execute_batch("COMMIT")?;
+        Ok(())
     }
 
     /// The generation a full rebuild stages into (A6): STRICTLY ABOVE both every generation the
