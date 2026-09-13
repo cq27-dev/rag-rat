@@ -1,5 +1,16 @@
 use super::*;
 
+/// The `repo_meta` key holding `worktree_id`'s overlay refresh basis.
+fn overlay_basis_meta_key(worktree_id: &str) -> String {
+    format!("{WORKTREE_OVERLAY_BASIS_META_PREFIX}{worktree_id}")
+}
+
+/// The worktree id an overlay-basis `repo_meta` key names — the inverse of
+/// [`overlay_basis_meta_key`]; `None` for any other key.
+fn worktree_id_from_basis_key(key: &str) -> Option<&str> {
+    key.strip_prefix(WORKTREE_OVERLAY_BASIS_META_PREFIX)
+}
+
 impl IndexDatabase {
     /// The parsed refresh-basis value for `worktree_id`, or `None` when never refreshed (or
     /// written by a pre-#577 build). The single parse under both projection readers below.
@@ -7,8 +18,7 @@ impl IndexDatabase {
         &self,
         worktree_id: &str,
     ) -> anyhow::Result<Option<RecordedOverlayBasis>> {
-        let key = format!("{WORKTREE_OVERLAY_BASIS_META_PREFIX}{worktree_id}");
-        Ok(self.repo_meta(&key)?.and_then(|value| {
+        Ok(self.repo_meta(&overlay_basis_meta_key(worktree_id))?.and_then(|value| {
             let mut lines = value.splitn(3, '\n');
             let base_sha = lines.next()?.to_string();
             let linked_head_sha = lines.next()?.to_string();
@@ -54,9 +64,8 @@ impl IndexDatabase {
         linked_head_sha: &str,
         refreshed_at_ms: i64,
     ) -> anyhow::Result<()> {
-        let key = format!("{WORKTREE_OVERLAY_BASIS_META_PREFIX}{worktree_id}");
         self.set_repo_meta_if_changed(
-            &key,
+            &overlay_basis_meta_key(worktree_id),
             &format!("{base_sha}\n{linked_head_sha}\n{refreshed_at_ms}"),
         )?;
         Ok(())
@@ -82,7 +91,7 @@ impl IndexDatabase {
             .query_map(params![self.active_repo_id, pattern], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         for key in keys {
-            let Some(worktree_id) = key.strip_prefix(WORKTREE_OVERLAY_BASIS_META_PREFIX) else {
+            let Some(worktree_id) = worktree_id_from_basis_key(&key) else {
                 continue;
             };
             if !live_worktrees.iter().any(|live| live == worktree_id) {
@@ -97,8 +106,11 @@ impl IndexDatabase {
     /// basis would keep matching and scoped passes would skip the stale overlay until an `All`
     /// pass (#577 review).
     pub(crate) fn clear_worktree_overlay_basis(&self, worktree_id: &str) -> anyhow::Result<()> {
-        let key = format!("{WORKTREE_OVERLAY_BASIS_META_PREFIX}{worktree_id}");
-        rag_rat_db::meta::delete_repo_meta(self.storage.connection(), &self.active_repo_id, &key)?;
+        rag_rat_db::meta::delete_repo_meta(
+            self.storage.connection(),
+            &self.active_repo_id,
+            &overlay_basis_meta_key(worktree_id),
+        )?;
         Ok(())
     }
 
