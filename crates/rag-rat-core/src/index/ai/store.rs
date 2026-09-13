@@ -1,6 +1,7 @@
 use rag_rat_db::text_compression::{ChunkTextDecoder, ChunkTextRow};
 
 use super::*;
+use crate::index::collect_rows;
 
 #[cfg(test)]
 thread_local! {

@@ -162,11 +162,7 @@ fn recent_commit_subjects(conn: &Connection, limit: usize) -> anyhow::Result<Vec
          LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![limit as i64, repo_id], |row| row.get::<_, String>(0))?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// READ: paths of non-generated source files most recently changed, newest first.
@@ -191,11 +187,7 @@ fn recently_changed_source_files(conn: &Connection, limit: usize) -> anyhow::Res
          LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![limit as i64, repo_id], |row| row.get::<_, String>(0))?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// READ: titles of active repo memories NOT bound to a directory (`binding_kind != 'dir'`),
@@ -225,11 +217,7 @@ fn active_non_dir_memory_titles(conn: &Connection, limit: usize) -> anyhow::Resu
          LIMIT ?1"
     ))?;
     let rows = stmt.query_map([limit as i64], |row| row.get::<_, String>(0))?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// READ: total count of active repo memories NOT bound to a directory.

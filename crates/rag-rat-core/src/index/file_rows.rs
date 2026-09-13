@@ -437,11 +437,7 @@ impl IndexDatabase {
             self.storage.connection().prepare("SELECT path, sha256 FROM files ORDER BY path")?;
         let rows =
             stmt.query_map([], |row| Ok(IndexedFile { path: row.get(0)?, sha256: row.get(1)? }))?;
-        let mut files = Vec::new();
-        for row in rows {
-            files.push(row?);
-        }
-        Ok(files)
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Re-derive `files.generated` from the current [`is_generated_path`] heuristic (the single

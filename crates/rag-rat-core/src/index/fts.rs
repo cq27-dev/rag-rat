@@ -77,11 +77,7 @@ impl IndexDatabase {
                     dict_version: row.get(3)?,
                 }))
             })?;
-            let mut out = Vec::new();
-            for row in mapped {
-                out.push(row?);
-            }
-            out
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut insert = conn.prepare("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)")?;
         for (chunk_id, text_row) in rows {

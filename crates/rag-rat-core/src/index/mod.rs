@@ -117,7 +117,8 @@ pub use schema::RegisteredRepo;
 #[cfg(test)]
 pub(crate) use util::table_row_count;
 pub(crate) use util::{
-    file_metadata_ms, path_string_for_seed, scoped_chunk_row_count, text_has_test_marker,
+    collect_rows, file_metadata_ms, path_string_for_seed, scoped_chunk_row_count,
+    text_has_test_marker,
 };
 pub(crate) use worktree_overlay::linked_source_root;
 pub use worktree_overlay::{

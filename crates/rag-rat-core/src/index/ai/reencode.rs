@@ -1,6 +1,7 @@
 use rag_rat_db::meta::{read_meta, set_meta};
 
 use super::*;
+use crate::index::collect_rows;
 
 /// Meta key marking the one-time legacy-f32 → int8 vector re-encode as done. Once set to `"1"`,
 /// [`reencode_legacy_vectors_if_needed`] skips the (full-table) detect query on every later

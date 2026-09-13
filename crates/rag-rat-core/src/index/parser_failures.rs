@@ -158,10 +158,6 @@ impl IndexDatabase {
         let rows = stmt.query_map([&self.active_repo_id], |row| {
             Ok(ParserFailure { path: row.get(0)?, language: row.get(1)?, message: row.get(2)? })
         })?;
-        let mut failures = Vec::new();
-        for row in rows {
-            failures.push(row?);
-        }
-        Ok(failures)
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }

@@ -122,11 +122,7 @@ fn symbols_in_file(
     let rows = stmt.query_map(rusqlite::params![path, limit as i64], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
     })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[cfg(test)]

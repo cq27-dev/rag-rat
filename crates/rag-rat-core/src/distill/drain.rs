@@ -237,10 +237,7 @@ fn load_prepared_jobs(
             row.get::<_, Option<String>>(10)?,
         ))
     })?;
-    let mut identities = Vec::new();
-    for row in rows {
-        identities.push(row?);
-    }
+    let identities = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
     identities
         .into_iter()
@@ -357,10 +354,7 @@ fn load_sources(
             })
         },
     )?;
-    let mut sources = Vec::new();
-    for row in rows {
-        sources.push(row?);
-    }
+    let sources = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     for (expected, source) in sources.iter().enumerate() {
         anyhow::ensure!(source.ordinal == expected, "distill source ordinals are not contiguous");
     }
@@ -442,11 +436,7 @@ fn load_anchors(
             })
         },
     )?;
-    let mut anchors = Vec::new();
-    for row in rows {
-        anchors.push(row?);
-    }
-    Ok(anchors)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn load_commits(
@@ -476,11 +466,7 @@ fn load_commits(
             Ok(FixCommit { sha, message })
         },
     )?;
-    let mut commits = Vec::new();
-    for row in rows {
-        commits.push(row?);
-    }
-    Ok(commits)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// The snapshotted per-file patches (#800), concatenated in deterministic (commit, path) order —
@@ -535,11 +521,7 @@ fn load_xrefs(
             })
         },
     )?;
-    let mut xrefs = Vec::new();
-    for row in rows {
-        xrefs.push(row?);
-    }
-    Ok(xrefs)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn build_prompt_input(

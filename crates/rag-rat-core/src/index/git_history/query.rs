@@ -1,4 +1,5 @@
 use super::*;
+use crate::index::collect_rows;
 
 /// One commit-replay eval case (#120): the commit message is the QUERY and the diff's changed paths
 /// are the GOLD ("the diff is the gold"). Built from the indexed `git_commits` / `git_file_changes`
@@ -261,16 +262,6 @@ pub(super) fn blame_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkBlameS
         commit_counts,
         evidence_kind: "historical",
     })
-}
-
-fn collect_rows<T>(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
-) -> anyhow::Result<Vec<T>> {
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
 }
 
 fn fts_query(query: &str) -> String {

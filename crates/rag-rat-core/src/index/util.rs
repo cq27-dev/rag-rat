@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// Drain a mapped row iterator into a `Vec`, surfacing the first row error.
+pub(crate) fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> anyhow::Result<Vec<T>> {
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Whole-table row count — DELIBERATELY UNSCOPED, so on a consolidated multi-repo DB it reports
 /// the union across every repo. TEST-ONLY, structurally: the A7 sweep converted every production
 /// reporting caller to [`scoped_table_row_count`] (direct `repo_id` tables) or

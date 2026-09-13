@@ -2,7 +2,7 @@ use rag_rat_db::text_compression::{self, ChunkTextRow};
 use rusqlite::{Connection, params};
 
 use super::{SearchHit, query, scoring};
-use crate::index::ai;
+use crate::index::{ai, collect_rows};
 
 /// The bm25 candidate statement. `files` is the per-connection scope VIEW (a two-branch UNION ALL
 /// over `main.files`; see `lifecycle::write_scope_view`), which SQLite otherwise flattens into a
@@ -218,14 +218,4 @@ pub(super) fn vector_candidates(
         hits.push((hit, similarity));
     }
     Ok(hits)
-}
-
-fn collect_rows<T>(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
-) -> anyhow::Result<Vec<T>> {
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
 }

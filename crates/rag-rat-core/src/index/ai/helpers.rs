@@ -394,16 +394,6 @@ pub(crate) fn set_reconcile_meta(conn: &Connection, key: &str, value: &str) -> a
     Ok(())
 }
 
-pub(crate) fn collect_rows<T>(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
-) -> anyhow::Result<Vec<T>> {
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
 /// Reuse an existing vector for content we've already embedded. Reads the CONTENT-ADDRESSED
 /// `embedding_cache` (keyed by `input_hash`, which folds model id + model version + the exact
 /// embedding input text), NOT `chunk_embeddings` — so a vector survives its chunk's deletion on

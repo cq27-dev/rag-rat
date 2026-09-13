@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use super::*;
+use crate::index::collect_rows;
 
 pub(crate) fn target_qualified_name(node: Node<'_>, text: &str) -> Option<String> {
     let function = node.child_by_field_name("function").unwrap_or(node);
@@ -637,15 +638,6 @@ pub(crate) fn span_for_node(node: Node<'_>) -> EdgeSpan {
         start_byte: i64::try_from(node.start_byte()).unwrap_or(i64::MAX),
         end_byte: i64::try_from(node.end_byte()).unwrap_or(i64::MAX),
     }
-}
-pub(crate) fn collect_rows<T>(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
-) -> anyhow::Result<Vec<T>> {
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

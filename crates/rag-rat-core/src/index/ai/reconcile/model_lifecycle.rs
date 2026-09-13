@@ -9,6 +9,7 @@ use rag_rat_base::embedding_models::{FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID
 use rag_rat_llm::serving::fastembed_cache_dir;
 
 use super::super::*;
+use crate::index::collect_rows;
 
 pub(crate) fn recover_cached_fastembed_model(conn: &Connection) -> anyhow::Result<()> {
     recover_cached_fastembed_model_from(conn, &fastembed_cache_dir())

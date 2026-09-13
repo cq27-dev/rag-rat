@@ -983,11 +983,7 @@ fn load_items(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<ItemRow>> 
             created_at_ms: row.get(11)?,
         })
     })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 struct ClosingEdgeRow {
@@ -1016,11 +1012,7 @@ fn load_closing_edges(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<Cl
             source: row.get(6)?,
         })
     })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 struct CommentRow {
@@ -1063,11 +1055,7 @@ fn load_comments(
                 created_at_ms: row.get(6)?,
             })
         })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn changed_paths_for(
@@ -1484,11 +1472,7 @@ fn revert_commit_shas(
         .query_map(params![repo_id, tracker, project, key, kind.as_db_str()], |row| {
             row.get::<_, String>(0)
         })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// The state of a thread's existing distill record relative to a freshly computed identity.
@@ -1587,11 +1571,7 @@ fn load_keys_from(conn: &Connection, repo_id: &str, table: &str) -> anyhow::Resu
     ))?;
     let rows =
         stmt.query_map([repo_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 // ── Writers ────────────────────────────────────────────────────────────────────────────────────
