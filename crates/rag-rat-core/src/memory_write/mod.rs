@@ -6,6 +6,8 @@
 //! crate extracts.
 
 mod api;
+#[cfg(test)]
+mod contributor_authoring_tests;
 // The live op-log authoring seam: the `author_*` helpers the memory mutations call
 // in-transaction, their preparation, and the whole-op authorability guard (#532).
 mod authoring;
