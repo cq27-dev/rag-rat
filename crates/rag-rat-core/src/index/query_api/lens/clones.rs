@@ -730,7 +730,11 @@ mod tests {
             .unwrap();
             ids.push(conn.last_insert_rowid());
         }
-        crate::index::install_scope_view(&conn, "c", "").unwrap();
+        crate::index::install_scope_view(&conn, rag_rat_base::checkout::CheckoutRef {
+            commit_sha: "c",
+            worktree_id: "",
+        })
+        .unwrap();
         let inserted = ids.len();
         ids.extend(10_000..50_000);
 

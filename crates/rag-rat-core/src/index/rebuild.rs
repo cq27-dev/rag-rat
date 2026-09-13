@@ -2,6 +2,7 @@
 // module stays last — clippy::items_after_test_module). `incremental.rs`'s wave loop calls
 // `run_after_wave_commit`; the reader-consistency tests register a database-keyed hook via
 // `set_after_wave_commit` and hold the returned guard.
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_clones as clones;
 use rag_rat_db::schema;
 #[cfg(test)]
@@ -114,10 +115,10 @@ impl IndexDatabase {
         // `target`; the flip publishes it.
         let old_live = schema::live_files_generation(db.storage.connection(), &db.active_repo_id)?;
         let target = db.next_files_generation(old_live)?;
-        let (commit_sha, worktree_id) = resolve_git_context(&config.root);
+        let checkout = resolve_git_context(&config.root);
         // Install the scope view + writer stamp at the WRITE generation, so every insert lands on
         // `target` and the rebuild's own edge-resolution / logical-symbol reads see only it.
-        db.set_context_at_generation(&commit_sha, &worktree_id, target)?;
+        db.set_context_at_generation(checkout.borrowed(), target)?;
         ai::ensure_model_manifest(db.storage.connection())?;
         progress(IndexProgress::IndexingGitHistory);
         let mut git_history = Some(spawn_git_history_prepare(&config.root));
@@ -303,11 +304,14 @@ impl IndexDatabase {
         // the view is swapped per overlay and restored to the base scope
         // after.
         for worktree_id in &carried_overlays {
-            self.install_view_for_scope(&self.active_commit_sha, worktree_id, target)?;
+            self.install_view_for_scope(
+                CheckoutRef { worktree_id, ..self.active_checkout() },
+                target,
+            )?;
             self.resolve_overlay_edges(worktree_id)?;
         }
         if !carried_overlays.is_empty() {
-            self.install_view_for_scope(&self.active_commit_sha, &self.active_worktree_id, target)?;
+            self.install_view_for_scope(self.active_checkout(), target)?;
         }
         // Logical symbols fold the generation being published (base scope + carried
         // overlays), scoped to `self.active_generation == target` — the carried overlays

@@ -486,7 +486,11 @@ fn status_counts_only_active_context_chunks() {
     // Point the connection at a context that matches no indexed rows. The active set
     // (temp.files) is now empty, so status must report 0 chunks. Pre-fix the counts ran
     // over main.chunks (every indexed commit) and ignored the active context entirely.
-    db.set_context("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "ghost-worktree").unwrap();
+    db.set_context(rag_rat_base::checkout::CheckoutRef {
+        commit_sha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        worktree_id: "ghost-worktree",
+    })
+    .unwrap();
     let scoped = db.llm_status().unwrap().artifacts;
     assert_eq!(scoped.total_chunks, 0, "status ignored active context scope");
     assert_eq!(scoped.current, 0);

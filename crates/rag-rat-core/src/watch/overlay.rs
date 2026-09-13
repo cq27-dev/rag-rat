@@ -225,8 +225,10 @@ pub fn refresh_worktree_overlays(
         // The linked HEAD is read BEFORE the refresh, so a commit racing the refresh records the
         // pre-commit head — mismatching (and re-refreshing) next pass rather than skipping.
         let linked_head = crate::index::head_sha(Path::new(&worktree));
-        let basis_unchanged = db.worktree_overlay_basis(&worktree).ok().flatten()
-            == Some((base_sha.clone(), linked_head.clone()));
+        let basis_unchanged =
+            db.worktree_overlay_basis(&worktree).ok().flatten().is_some_and(|basis| {
+                basis.base_sha == base_sha && basis.linked_head_sha == linked_head
+            });
         if basis_unchanged && !scope.lists(&worktree) {
             continue; // not implicated by events and the diff basis is unchanged (#577)
         }
@@ -542,8 +544,7 @@ where
     // The overlay passes / the manifest refresh leave the connection scoped to the LAST overlay;
     // restore the base scope so the returned db reads base-scoped status.
     if !linked.is_empty() {
-        let (base_sha, base_id) = crate::index::resolve_git_context(&config.root);
-        db.set_context(&base_sha, &base_id)?;
+        db.set_context(crate::index::resolve_git_context(&config.root).borrowed())?;
     }
     Ok(db)
 }

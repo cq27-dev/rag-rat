@@ -55,11 +55,13 @@ fn overlay_quiet_window_skips_a_dirty_only_listed_worktree_inside_the_window() {
     // The window elapsing re-arms the refresh: backdate the recorded timestamp past the window.
     set_base_scope(&mut db, &main);
     let worktree_id = crate::index::worktree_id_of(&linked);
-    let (base_sha, linked_head) = db.worktree_overlay_basis(&worktree_id).unwrap().unwrap();
+    let basis = db.worktree_overlay_basis(&worktree_id).unwrap().unwrap();
     db.record_worktree_overlay_basis(
         &worktree_id,
-        &base_sha,
-        &linked_head,
+        crate::index::OverlayBasisUpdate {
+            base_sha: &basis.base_sha,
+            linked_head_sha: &basis.linked_head_sha,
+        },
         rag_rat_base::time::now_ms() - 301_000,
     )
     .unwrap();
@@ -236,9 +238,14 @@ fn overlay_basis_value_parses_stamped_and_legacy_shapes() {
     // disarmed — and a malformed timestamp degrades the same way instead of poisoning the pair.
     let (main, linked, _config, db) = quiet_window_fixture();
 
-    db.record_worktree_overlay_basis("wt-stamped", "base-1", "linked-1", 42).unwrap();
+    db.record_worktree_overlay_basis(
+        "wt-stamped",
+        crate::index::OverlayBasisUpdate { base_sha: "base-1", linked_head_sha: "linked-1" },
+        42,
+    )
+    .unwrap();
     assert_eq!(
-        db.worktree_overlay_basis("wt-stamped").unwrap(),
+        db.worktree_overlay_basis("wt-stamped").unwrap().map(|b| (b.base_sha, b.linked_head_sha)),
         Some(("base-1".to_string(), "linked-1".to_string()))
     );
     assert_eq!(db.worktree_overlay_basis_refreshed_at_ms("wt-stamped").unwrap(), Some(42));
@@ -246,7 +253,7 @@ fn overlay_basis_value_parses_stamped_and_legacy_shapes() {
     // A legacy value written by a pre-#822 build.
     db.set_repo_meta_if_changed("worktree_overlay_basis:wt-legacy", "base-2\nlinked-2").unwrap();
     assert_eq!(
-        db.worktree_overlay_basis("wt-legacy").unwrap(),
+        db.worktree_overlay_basis("wt-legacy").unwrap().map(|b| (b.base_sha, b.linked_head_sha)),
         Some(("base-2".to_string(), "linked-2".to_string())),
         "the pair survives a pre-#822 value"
     );
@@ -259,7 +266,7 @@ fn overlay_basis_value_parses_stamped_and_legacy_shapes() {
     db.set_repo_meta_if_changed("worktree_overlay_basis:wt-garbage", "base-3\nlinked-3\nnot-ms")
         .unwrap();
     assert_eq!(
-        db.worktree_overlay_basis("wt-garbage").unwrap(),
+        db.worktree_overlay_basis("wt-garbage").unwrap().map(|b| (b.base_sha, b.linked_head_sha)),
         Some(("base-3".to_string(), "linked-3".to_string()))
     );
     assert_eq!(db.worktree_overlay_basis_refreshed_at_ms("wt-garbage").unwrap(), None);

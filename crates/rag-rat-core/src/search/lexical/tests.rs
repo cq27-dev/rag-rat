@@ -253,7 +253,11 @@ fn fts_scan_count(conn: &Connection, sql: &str) -> usize {
 #[test]
 fn bm25_materialized_scope_view_runs_the_fts_pipeline_once() {
     let conn = seeded_conn();
-    crate::index::install_scope_view(&conn, "somecommit", "someworktree").unwrap();
+    crate::index::install_scope_view(&conn, rag_rat_base::checkout::CheckoutRef {
+        commit_sha: "somecommit",
+        worktree_id: "someworktree",
+    })
+    .unwrap();
 
     let legacy_scans = fts_scan_count(&conn, &legacy_bm25_sql(false));
     let new_scans = fts_scan_count(&conn, &bm25_candidates_sql(false));
@@ -356,7 +360,11 @@ fn bm25_materialized_is_byte_identical_to_the_legacy_query() {
     // sibling repo.
     let _sibling = seed_scoped_chunk(&conn, "sib.rs", "repo-b", commit, "", 0, false, "alpha");
 
-    crate::index::install_scope_view(&conn, commit, worktree).unwrap();
+    crate::index::install_scope_view(&conn, rag_rat_base::checkout::CheckoutRef {
+        commit_sha: commit,
+        worktree_id: worktree,
+    })
+    .unwrap();
 
     // include_generated = false: the visible set is exactly the non-generated in-scope chunks,
     // ordered by bm25 (shortest doc first), and the equal-score tie pair breaks by chunks.id

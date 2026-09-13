@@ -200,7 +200,7 @@ pub(super) fn resolve_overlay_scope(
             config.root.display(),
         )
     })?;
-    let (base_sha, worktree_id) =
+    let CheckoutKey { commit_sha: base_sha, worktree_id } =
         git_context::resolve_worktree_scope(&config.root, Some(linked_path));
     if worktree_id == git_context::worktree_id_of(&config.root) {
         return Ok(None);

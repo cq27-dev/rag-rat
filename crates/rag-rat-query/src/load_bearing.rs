@@ -319,11 +319,14 @@ pub fn scoped_weighted_fan_in_many(
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_base::checkout::CheckoutRef;
     use rag_rat_core::index::install_scope_view;
     use rag_rat_db::schema;
     use rusqlite::params;
 
     use super::*;
+
+    const SCOPE: CheckoutRef<'static> = CheckoutRef { commit_sha: "c", worktree_id: "" };
 
     /// #142 review: the wire label for the oracle tier must match `as_str()` and the documented
     /// contract (`"compiler"`), not the variant name `"Compiler"` — MCP/CLI consumers key off the
@@ -439,7 +442,7 @@ mod tests {
         }
         // weak: one name-only call in-edge (1 × 1.0 × 0.4 = 0.4).
         add_edge(&conn, f, callers[0], weak, "calls_name", "NameOnly");
-        install_scope_view(&conn, "c", "").unwrap();
+        install_scope_view(&conn, SCOPE).unwrap();
 
         let hub_score = fan_in(&conn, hub).unwrap();
         let weak_score = fan_in(&conn, weak).unwrap();
@@ -464,7 +467,7 @@ mod tests {
         // confidence.
         add_edge(&conn, f, caller, called, "calls_name", "Exact");
         add_edge(&conn, f, caller, imported, "imports", "Exact");
-        install_scope_view(&conn, "c", "").unwrap();
+        install_scope_view(&conn, SCOPE).unwrap();
 
         let called = fan_in(&conn, called).unwrap();
         let imported = fan_in(&conn, imported).unwrap();
@@ -479,7 +482,7 @@ mod tests {
         let conn = scoped_conn();
         let f = add_file(&conn, "a.rs", "c", "");
         let leaf = add_symbol(&conn, f, "leaf", "a::leaf");
-        install_scope_view(&conn, "c", "").unwrap();
+        install_scope_view(&conn, SCOPE).unwrap();
         assert!(fan_in(&conn, leaf).is_none(), "a symbol nothing depends on has no fan-in");
     }
 
@@ -490,7 +493,7 @@ mod tests {
         let caller = add_symbol(&conn, file, "caller", "a::caller");
         let target = add_symbol(&conn, file, "target", "a::target");
         add_edge(&conn, file, caller, target, "calls_name", "Exact");
-        install_scope_view(&conn, "c", "").unwrap();
+        install_scope_view(&conn, SCOPE).unwrap();
         let targets = (1..=40_000).collect::<Vec<_>>();
 
         let scores = scoped_weighted_fan_in_many(&conn, &targets, &OracleContext::none()).unwrap();
@@ -506,7 +509,7 @@ mod tests {
         let target = add_symbol(&conn, f, "target", "a::target");
         let caller = add_symbol(&conn, f, "caller", "a::caller");
         let edge = add_edge(&conn, f, caller, target, "calls_name", "NameOnly");
-        install_scope_view(&conn, "c", "").unwrap();
+        install_scope_view(&conn, SCOPE).unwrap();
 
         let heuristic = fan_in(&conn, target).unwrap();
         assert_eq!(heuristic.oracle_tier, None, "no oracle run ⇒ pure heuristic, no tier");
@@ -534,7 +537,7 @@ mod tests {
         let phantom = add_symbol(&conn, f, "phantom", "a::phantom");
         add_edge(&conn, f, real, target, "calls_name", "Exact");
         let dropped = add_edge(&conn, f, phantom, target, "calls_name", "Exact");
-        install_scope_view(&conn, "c", "").unwrap();
+        install_scope_view(&conn, SCOPE).unwrap();
 
         let both = fan_in(&conn, target).unwrap();
         let effects = HashMap::from([(dropped, EdgeOracleEffect::Drop)]);
@@ -557,7 +560,7 @@ mod tests {
         let caller = add_symbol(&conn, f, "caller", "a::caller");
         // One in-edge whose heuristic target is S (`target`).
         let edge = add_edge(&conn, f, caller, target, "calls_name", "Exact");
-        install_scope_view(&conn, "c", "").unwrap();
+        install_scope_view(&conn, SCOPE).unwrap();
 
         // Heuristic baseline: the single in-edge counts (1.0 × 1.0 = 1.0).
         let heuristic = fan_in(&conn, target).unwrap();
@@ -613,7 +616,7 @@ mod tests {
         add_edge(&conn, file_b, cb, thing_b, "calls_name", "Exact");
 
         // Active scope = worktree A: only A's edges are visible.
-        install_scope_view(&conn, "", wt_a).unwrap();
+        install_scope_view(&conn, CheckoutRef { commit_sha: "", worktree_id: wt_a }).unwrap();
         let a = fan_in(&conn, thing_a).unwrap();
         assert_eq!(a.bucket, LoadBearingBucket::Medium, "A sees its 3 in-edges: {a:?}");
         // B's symbol is OUT of scope here — its file isn't in A's `files` view, so its in-edges are
@@ -621,7 +624,7 @@ mod tests {
         assert!(fan_in(&conn, thing_b).is_none(), "B's symbol is invisible under A's scope");
 
         // Switch active scope = worktree B: now only B's single edge is visible.
-        install_scope_view(&conn, "", wt_b).unwrap();
+        install_scope_view(&conn, CheckoutRef { commit_sha: "", worktree_id: wt_b }).unwrap();
         let b = fan_in(&conn, thing_b).unwrap();
         assert_eq!(b.bucket, LoadBearingBucket::Low, "B sees its 1 in-edge: {b:?}");
         assert!(

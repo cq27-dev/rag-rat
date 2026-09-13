@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use rag_rat_base::checkout::{CheckoutKey, CheckoutRef};
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::paths::path_string;
 
@@ -55,9 +56,16 @@ const WORKTREE_OVERLAY_BASIS_META_PREFIX: &str =
 /// build, the recording refresh's timestamp. Internal to the two projection readers so the meta
 /// value is parsed in exactly one place.
 struct RecordedOverlayBasis {
-    base_sha: String,
-    linked_head_sha: String,
+    basis: OverlayBasis,
     refreshed_at_ms: Option<i64>,
+}
+
+/// A worktree's recorded #577 refresh basis: the base and linked HEADs at its last COMPLETE
+/// overlay refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OverlayBasis {
+    pub(crate) base_sha: String,
+    pub(crate) linked_head_sha: String,
 }
 
 /// `repo_meta` key marking that a committed overlay refresh deferred the repo-global

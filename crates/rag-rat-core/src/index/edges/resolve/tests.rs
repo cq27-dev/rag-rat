@@ -1,9 +1,11 @@
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_db::schema;
 use rusqlite::{Connection, params};
 
 use super::*;
 
 const NEW: &str = "newcommitsha";
+const NEW_SCOPE: CheckoutRef<'static> = CheckoutRef { commit_sha: NEW, worktree_id: "" };
 const OLD: &str = "oldcommitsha";
 
 fn seeded_conn() -> Connection {
@@ -139,7 +141,7 @@ fn resolution_is_scoped_to_the_active_checkout() {
     )
     .unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, confidence, resolution) = edge_state(&conn, edge_new);
@@ -180,7 +182,8 @@ fn resolution_prefers_overlay_over_shadowed_committed_rows() {
     add_symbol(&conn, caller, "caller", "crate::a::caller");
     let edge = add_edge(&conn, caller, "b::target", "b::target");
 
-    crate::index::install_scope_view(&conn, NEW, "/wt").unwrap();
+    crate::index::install_scope_view(&conn, CheckoutRef { commit_sha: NEW, worktree_id: "/wt" })
+        .unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, edge);
@@ -402,7 +405,7 @@ fn swift_name_only_edges_do_not_fall_back_to_foreign_symbols() {
     let call_edge = add_named_edge(&conn, source, "parse", EdgeKind::CallsName);
     let import_edge = add_named_edge(&conn, source, "Foundation", EdgeKind::Imports);
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     for (edge, description) in [
@@ -436,7 +439,7 @@ fn swift_suppresses_and_re_resolves_attached_macro_candidates() {
     )
     .unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let suppressed_count: i64 = conn
@@ -528,7 +531,7 @@ fn full_rebuild_uses_language_of_symbol_less_swift_files() {
     graph.push_symbol(target_id, foreign, Language::Rust, &target);
     graph.push_edge(source, &candidate, &[]);
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_and_insert_edges(&conn, graph).unwrap();
 
     let edge: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
@@ -573,7 +576,7 @@ fn swift_qualified_edges_do_not_bind_foreign_scope_paths() {
         conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
     };
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     for edge in [call, type_ref] {
@@ -639,7 +642,7 @@ fn swift_enum_cases_bind_by_bare_name_only_for_the_shorthand_shape() {
     let shorthand: i64 =
         conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (receiver_target, ..) = edge_state(&conn, receiver_call);
@@ -684,7 +687,7 @@ fn swift_value_receiver_calls_resolve_by_bare_name() {
     .unwrap();
     let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, confidence, resolution) = edge_state(&conn, call);
@@ -793,7 +796,7 @@ fn external_receiver_alias_keeps_its_import_origin() {
     add_import_edge(&conn, caller, "Alias", "use dep::Worker as Alias;");
     let call = add_receiver_type_edge(&conn, caller, "run", "w::run", "Alias");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, call);
@@ -829,7 +832,7 @@ fn local_receiver_alias_keeps_its_complete_owner_path() {
     add_import_edge(&conn, caller, "Alias", "use crate::a::Worker as Alias;");
     let call = add_receiver_type_edge(&conn, caller, "run", "w::run", "Alias");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, call);
@@ -884,7 +887,7 @@ fn relative_grouped_and_workspace_aliases_resolve_only_their_complete_owner() {
         })
         .collect::<Vec<_>>();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     for (index, call) in calls.into_iter().enumerate() {
@@ -936,7 +939,7 @@ fn unproven_qualified_receiver_cannot_tail_bind_a_local_type() {
         add_receiver_type_edge(&conn, caller, "execute", "c::execute", "reqwest::Client");
     let local = add_receiver_type_edge(&conn, caller, "execute", "c::execute", "local_mod::Client");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     assert_eq!(edge_state(&conn, external).0, None, "an unknown qualified root fails closed");
@@ -1707,7 +1710,7 @@ fn swift_self_and_super_init_calls_resolve_to_constructors() {
         conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
     });
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     for call in calls {
@@ -1743,7 +1746,7 @@ fn swift_enum_constructions_resolve_to_enum_symbols() {
     );
     let construction = add_named_edge(&conn, source, "Status", EdgeKind::Constructs);
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, confidence, resolution) = edge_state(&conn, construction);
@@ -1791,7 +1794,7 @@ fn references_type_does_not_resolve_to_a_non_type_symbol() {
     let ref_impl = add_type_ref_edge(&conn, user, "Widget");
     let ref_struct = add_type_ref_edge(&conn, user, "Gadget");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, ref_impl);
@@ -1822,7 +1825,7 @@ fn references_type_does_not_bind_generic_params_or_projections() {
     let v_projection = add_type_ref_edge(&conn, user, "V::Value"); // type-param projection
     let real = add_type_ref_edge(&conn, user, "Gadget"); // genuine type reference
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     for (edge, what) in [(generic, "T"), (projection, "Self::Value"), (v_projection, "V::Value")] {
@@ -1855,7 +1858,7 @@ fn references_type_multi_candidate_across_files_does_not_guess() {
     let ambiguous = add_type_ref_edge(&conn, user, "Value");
     let unique = add_type_ref_edge(&conn, user, "Config");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     assert_eq!(
@@ -1879,7 +1882,7 @@ fn references_type_resolves_cfg_split_twin_types() {
     add_symbol_kind(&conn, home, "Thing", "a.rs::Thing", "struct");
     let edge = add_type_ref_edge(&conn, home, "Thing");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, edge);
@@ -1899,7 +1902,7 @@ fn references_type_resolves_same_file_definition_despite_name_collision() {
     add_symbol_kind(&conn, other, "Error", "b.rs::Error", "struct");
     let edge = add_type_ref_edge(&conn, home, "Error");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, edge);
@@ -1959,7 +1962,7 @@ fn scope_exact_does_not_bind_an_ambiguous_scope_path() {
     add_symbol_scope(&conn, f2, "build", "b.rs::build", "core::Builder::build");
     let edge = add_edge(&conn, caller, "build", "core::Builder::build");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, edge);
@@ -1976,7 +1979,7 @@ fn scope_exact_binds_a_unique_scope_path() {
     let target = add_symbol_scope(&conn, defs, "build", "b.rs::build", "core::Builder::build");
     let edge = add_edge(&conn, caller, "build", "core::Builder::build");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, edge);
@@ -2000,7 +2003,7 @@ fn same_file_distinct_scopes_do_not_collapse_to_logical_variant() {
     add_symbol_scope(&conn, defs, "build", "a.rs::build", "B::build");
     let edge = add_edge(&conn, caller, "build", ""); // bare name — nothing disambiguates
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, edge);
@@ -2019,7 +2022,7 @@ fn same_file_same_scope_variants_still_bind_via_logical_variant() {
     add_symbol_scope(&conn, defs, "build", "a.rs::build", "A::build");
     let edge = add_edge(&conn, caller, "build", "");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, edge);
@@ -2060,7 +2063,7 @@ fn external_import_suppresses_bare_but_not_locally_qualified() {
     let bare = add_edge(&conn, user, "Url", "");
     let qualified = add_edge(&conn, user, "Url", "crate::Url");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, bare);
@@ -2084,7 +2087,7 @@ fn use_path_prefix_does_not_suppress_a_local_name() {
     add_import_edge(&conn, user, "Path", "use std::path::{Path, PathBuf};");
     let call = add_edge(&conn, user, "path", "");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, _) = edge_state(&conn, call);
@@ -2113,7 +2116,7 @@ fn qualified_call_through_an_external_receiver_is_suppressed() {
     let local = add_edge(&conn, user, "parse", "Widget::parse");
     let value_recv = add_edge(&conn, user, "build", "config::build");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, resolution) = edge_state(&conn, external);
@@ -2192,7 +2195,7 @@ fn module_aware_suppression_through_db_driver() {
     let in_child = add_edge_at_byte(&conn, user, "Url", "", 100);
     let in_parent = add_edge_at_byte(&conn, user, "Url", "", 40);
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, _) = edge_state(&conn, in_child);
@@ -2255,7 +2258,7 @@ fn per_package_alias_suppression_through_db_driver() {
     let ref_a = add_edge_at_byte(&conn, file_a, "Thing", "", 100);
     let ref_b = add_edge_at_byte(&conn, file_b, "Thing", "", 100);
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _, _) = edge_state(&conn, ref_a);
@@ -2317,7 +2320,8 @@ fn worktree_package_roots_do_not_leak_across_scopes() {
     let call_b = add_receiver_type_edge_at_byte(&conn, file_b, "run", "w::run", "Alias", 100);
 
     // Resolve worktree A's scope: `local` is A's own alias → LOCAL, binds to A's `Thing`.
-    crate::index::install_scope_view(&conn, NEW, wt_a).unwrap();
+    crate::index::install_scope_view(&conn, CheckoutRef { commit_sha: NEW, worktree_id: wt_a })
+        .unwrap();
     resolve_all_edges(&conn).unwrap();
     let (to, _, _) = edge_state(&conn, ref_a);
     assert_eq!(to, Some(local_a), "worktree A declares `local` — its bare ref binds local");
@@ -2329,7 +2333,8 @@ fn worktree_package_roots_do_not_leak_across_scopes() {
 
     // Resolve worktree B's scope: `local` is NOT B's alias → EXTERNAL, the bare ref is
     // suppressed. If B were following A's package map (the #106 leak), this would bind local.
-    crate::index::install_scope_view(&conn, NEW, wt_b).unwrap();
+    crate::index::install_scope_view(&conn, CheckoutRef { commit_sha: NEW, worktree_id: wt_b })
+        .unwrap();
     resolve_all_edges(&conn).unwrap();
     let (to, _, resolution) = edge_state(&conn, ref_b);
     assert_eq!(
@@ -2363,7 +2368,7 @@ fn oracle_unaffected_by_import_scope_columns() {
     )
     .unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     // The oracle's candidate filter is exactly `callee_start_byte IS NOT NULL` (store.rs
     // `edge_join_candidates`). Mirror it here: only the call edge qualifies; the import edge —
     // despite its populated import_scope_* columns — leaves callee_* NULL and is excluded.
@@ -2409,7 +2414,7 @@ fn python_implements_prefers_a_base_class_over_a_non_class() {
     .unwrap();
     let edge: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _confidence, _resolution) = edge_state(&conn, edge);
@@ -2476,7 +2481,7 @@ fn python_implements_ignores_a_foreign_language_class() {
     .unwrap();
     let edge: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _confidence, _resolution) = edge_state(&conn, edge);
@@ -2513,7 +2518,7 @@ fn python_from_import_alias_rebinds_to_the_imported_target() {
     .unwrap();
     let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, confidence, _resolution) = edge_state(&conn, call);
@@ -2554,7 +2559,7 @@ fn python_alias_rebind_respects_the_scope_end_shadow() {
     .unwrap();
     let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _confidence, _resolution) = edge_state(&conn, call);
@@ -2594,7 +2599,7 @@ fn python_alias_rebind_rebinds_a_qualified_receiver() {
     .unwrap();
     let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _confidence, _resolution) = edge_state(&conn, call);
@@ -2641,7 +2646,7 @@ fn python_alias_rebind_picks_the_latest_reimport() {
     .unwrap();
     let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _confidence, _resolution) = edge_state(&conn, call);
@@ -2683,7 +2688,7 @@ fn python_alias_rebind_is_ambiguous_across_exclusive_branches() {
     .unwrap();
     let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, confidence, _resolution) = edge_state(&conn, call);
@@ -2717,7 +2722,7 @@ fn python_alias_rebind_resolves_when_branches_agree() {
     .unwrap();
     let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, _confidence, _resolution) = edge_state(&conn, call);
@@ -2751,7 +2756,7 @@ fn python_alias_rebind_skips_a_qualified_reference() {
     .unwrap();
     let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, confidence, _resolution) = edge_state(&conn, call);
@@ -2785,7 +2790,7 @@ fn python_alias_rebind_skips_a_use_before_the_import() {
     .unwrap();
     let call: i64 = conn.query_row("SELECT MAX(id) FROM edges_data", [], |r| r.get(0)).unwrap();
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
 
     let (to, confidence, _resolution) = edge_state(&conn, call);
@@ -2888,7 +2893,7 @@ fn scoped_resolve_rewrites_only_staged_source_files() {
     let edge_staged = add_edge(&conn, caller_staged, "d::target", "d::target");
     let edge_unstaged = add_edge(&conn, caller_unstaged, "d::target", "d::target");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     // Both edges arrive `unresolved`. Stage ONLY a.rs; b.rs is the poison a full pass would bind.
     stage_edge_rewrite_files(&conn, &[caller_staged]);
     resolve_changed_edges(&conn).unwrap();
@@ -2940,7 +2945,7 @@ fn scoped_resolve_repoints_staged_inedge_onto_moved_target() {
     let new_target = add_symbol(&conn, defs, "target", "crate::d::target");
     assert_ne!(new_target, old_target, "the re-inserted target must carry a fresh id");
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     stage_edge_rewrite_files(&conn, &[caller, defs]);
     resolve_changed_edges(&conn).unwrap();
 
@@ -2975,7 +2980,7 @@ fn test_receiver_type_resolution() {
 
     let edge_id = add_edge_full(&conn, file, "run", None, Some("worker"), Some("Worker"));
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     stage_edge_rewrite_files(&conn, &[file]);
     resolve_changed_edges(&conn).unwrap();
 
@@ -2996,7 +3001,7 @@ fn test_receiver_type_resolution_declines_ambiguous_owners() {
 
     let edge_id = add_edge_full(&conn, source, "run", None, Some("worker"), Some("Worker"));
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     stage_edge_rewrite_files(&conn, &[source]);
     resolve_changed_edges(&conn).unwrap();
 
@@ -3021,7 +3026,7 @@ fn test_scope_degeneric_resolution() {
     let edge_id =
         add_edge_full(&conn, file, "build", Some("SymbolIndex::build"), Some("SymbolIndex"), None);
 
-    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     stage_edge_rewrite_files(&conn, &[file]);
     resolve_changed_edges(&conn).unwrap();
 

@@ -1446,7 +1446,10 @@ fn oracle_surfaces_compiler_tier_on_a_real_git_checkout() {
 
     // Sanity: the active context carries BOTH a real commit_sha and a worktree_id, and the file
     // rows are committed-scoped (commit set, worktree empty) — the shape that broke the AND.
-    let (active_commit, active_worktree) = crate::index::resolve_git_context(&root);
+    let rag_rat_base::checkout::CheckoutKey {
+        commit_sha: active_commit,
+        worktree_id: active_worktree,
+    } = crate::index::resolve_git_context(&root);
     assert!(!active_commit.is_empty(), "real checkout has a HEAD commit");
     assert!(!active_worktree.is_empty(), "worktree id is the root path");
     let (file_commit, file_worktree): (String, String) = db

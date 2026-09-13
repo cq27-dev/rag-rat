@@ -109,8 +109,8 @@ pub fn built_config(subdir: &str) -> (Config, rag_rat_base::test_scratch::Scratc
 /// path (the old `query_cold` under-measure; this is the #80 fix).
 pub fn open_like_production(config: &Config) -> IndexDatabase {
     let mut db = IndexDatabase::open(&config.database).expect("open index");
-    let (commit_sha, worktree_id) = rag_rat_core::index::resolve_git_context(&config.root);
-    db.set_context(&commit_sha, &worktree_id).expect("install active-checkout scope");
+    db.set_context(rag_rat_core::index::resolve_git_context(&config.root).borrowed())
+        .expect("install active-checkout scope");
     db.set_papertrail_context(None);
     db
 }

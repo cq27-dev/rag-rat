@@ -1,6 +1,7 @@
 //! Git context for the active checkout: changed paths, worktree contexts, pathspec/path mapping,
 //! and raw git invocation.
 
+use rag_rat_base::checkout::CheckoutKey;
 use rag_rat_base::paths::path_string;
 use rag_rat_base::repo_discover::discover_repo;
 
@@ -152,12 +153,11 @@ pub(crate) fn path_is_dirty(repo: &gix::Repository, relative: &Path) -> bool {
     changes.next().is_some()
 }
 
-/// The active-checkout `(commit_sha, worktree_id)` keys for `root`, as `open_config` derives them.
+/// The active-checkout key for `root`, as `open_config` derives it.
 /// `pub` so out-of-crate callers that open an index by path (benches mirroring the production
 /// `open_config` path, integration tests) can install the same active-checkout scope `search` uses.
-pub fn resolve_git_context(root: &Path) -> (String, String) {
-    let commit_sha = head_sha(root);
-    (commit_sha, worktree_id_of(root))
+pub fn resolve_git_context(root: &Path) -> CheckoutKey {
+    CheckoutKey { commit_sha: head_sha(root), worktree_id: worktree_id_of(root) }
 }
 
 /// Format a worktree checkout path into the `worktree_id` string scope rows are keyed by — shared
@@ -183,11 +183,11 @@ pub(crate) fn worktree_id_of(path: &Path) -> String {
 /// `worktree` names a valid linked sibling of `root`'s repo, the `worktree_id` selects that
 /// worktree's overlay; otherwise (absent / main / foreign / unreadable) it falls back to `root`'s
 /// own scope — never the wrong repo.
-pub(crate) fn resolve_worktree_scope(root: &Path, worktree: Option<&Path>) -> (String, String) {
-    let (base_sha, base_id) = resolve_git_context(root);
+pub(crate) fn resolve_worktree_scope(root: &Path, worktree: Option<&Path>) -> CheckoutKey {
+    let base = resolve_git_context(root);
     match worktree.and_then(|candidate| validated_sibling_worktree(root, candidate)) {
-        Some(linked) => (base_sha, worktree_id_of(&linked)),
-        None => (base_sha, base_id),
+        Some(linked) => CheckoutKey { worktree_id: worktree_id_of(&linked), ..base },
+        None => base,
     }
 }
 
@@ -516,8 +516,9 @@ mod worktree_scope_tests {
         git(&linked, &["add", "."]);
         git(&linked, &["commit", "-q", "-m", "branch"]);
 
-        let (base_sha, base_id) = resolve_git_context(&main);
-        let (sha, wt) = resolve_worktree_scope(&main, Some(&linked));
+        let CheckoutKey { commit_sha: base_sha, worktree_id: base_id } = resolve_git_context(&main);
+        let CheckoutKey { commit_sha: sha, worktree_id: wt } =
+            resolve_worktree_scope(&main, Some(&linked));
         // Overlay-on-base: the base commit stays the rooted checkout's HEAD; only the worktree_id
         // changes, selecting the linked worktree's overlay.
         assert_eq!(sha, base_sha, "base commit must remain the rooted checkout's HEAD");

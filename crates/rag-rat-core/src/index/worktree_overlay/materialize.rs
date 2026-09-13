@@ -53,7 +53,10 @@ impl IndexDatabase {
         };
         // Scope the connection to the overlay (base commit + linked worktree id) so context-
         // dependent steps (tombstones, FTS, edge resolution) operate in the linked scope.
-        self.set_context(&overlay.base_sha, &overlay.worktree_id)?;
+        self.set_context(CheckoutRef {
+            commit_sha: &overlay.base_sha,
+            worktree_id: &overlay.worktree_id,
+        })?;
 
         let committed = self.resolve_committed_delta_source(&overlay, config)?;
         let mut delta = compute_linked_worktree_delta(config, &overlay, committed)?;
@@ -192,7 +195,7 @@ impl IndexDatabase {
             self.settle_pending_logical_rebuild_inline(logical_rebuild)?;
             return Ok(WorktreeOverlayReport::default());
         };
-        self.set_context(&base_sha, &worktree_id)?;
+        self.set_context(CheckoutRef { commit_sha: &base_sha, worktree_id: &worktree_id })?;
         // Classify each supplied path with the SAME symlink-safe, ignore-aware guards the base
         // `IndexMode::Paths` walker applies (#659), since a supplied path may be arbitrary (a
         // crafted `..`-escape, a symlink-crossing spelling, or an ignored file) — reuse the

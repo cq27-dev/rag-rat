@@ -266,8 +266,12 @@ fn an_upgrade_rekeys_stale_checkout_spellings_instead_of_collecting_them() {
 
     // The per-worktree refresh basis, recorded the way a completed overlay refresh leaves it. Its
     // worktree identity lives in the KEY, so it is the one value a column-only rekey would miss.
-    db.record_worktree_overlay_basis(&first_report.worktree_id, "base-sha", "linked-sha", 42)
-        .unwrap();
+    db.record_worktree_overlay_basis(
+        &first_report.worktree_id,
+        crate::index::OverlayBasisUpdate { base_sha: "base-sha", linked_head_sha: "linked-sha" },
+        42,
+    )
+    .unwrap();
 
     // The store as an older binary left it.
     poison_persisted_spellings(&db);
@@ -509,8 +513,12 @@ fn every_absolute_path_in_the_meta_bag_is_rekeyed_or_reviewed() {
     run_git(&first, &["add", "."]);
     run_git(&first, &["commit", "-q", "-m", "first"]);
     let first_report = db.index_worktree_overlay(&config, &first, &mut |_| {}).unwrap();
-    db.record_worktree_overlay_basis(&first_report.worktree_id, "base-sha", "linked-sha", 42)
-        .unwrap();
+    db.record_worktree_overlay_basis(
+        &first_report.worktree_id,
+        crate::index::OverlayBasisUpdate { base_sha: "base-sha", linked_head_sha: "linked-sha" },
+        42,
+    )
+    .unwrap();
 
     let basis_prefix = rag_rat_db::meta::WORKTREE_OVERLAY_BASIS_META_PREFIX;
     let conn = db.storage.connection();

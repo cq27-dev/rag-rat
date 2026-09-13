@@ -114,7 +114,12 @@ fn scope_view_isolates_repos_sharing_a_commit() {
 
     // Re-scope the SAME connection to repo B (the A7 per-repo drive, done here by hand).
     fx.db.active_repo_id = REPO_B.to_string();
-    fx.db.set_context(&fx.shared_commit, "").unwrap();
+    fx.db
+        .set_context(rag_rat_base::checkout::CheckoutRef {
+            commit_sha: &fx.shared_commit,
+            worktree_id: "",
+        })
+        .unwrap();
     let view_b = paths_in_view(&fx.db);
     assert!(view_b.contains(&"src/b_only.rs".to_string()), "repo B sees its own file: {view_b:?}");
     assert!(
@@ -1144,7 +1149,12 @@ fn clone_precompute_leaves_sibling_repo_generation_untouched() {
     // Re-install the scope view (dropped for the migration) so the precompute reads repo A's scoped
     // symbols, and drive a REAL precompute on repo A (the active scope). It allocates gen 5001
     // (global MAX+1), completes it, and runs `complete_generation`'s scoped DELETE.
-    fx.db.set_context(&fx.shared_commit, "").unwrap();
+    fx.db
+        .set_context(rag_rat_base::checkout::CheckoutRef {
+            commit_sha: &fx.shared_commit,
+            worktree_id: "",
+        })
+        .unwrap();
     fx.db.precompute_clone_graph(None).unwrap();
 
     let conn = fx.db.storage.connection();
@@ -1681,7 +1691,11 @@ fn evidence_pack_never_surfaces_a_sibling_repos_symbols_or_files() {
 
     // Scope to repo A and install its `files` view at the shared commit (the isolation mechanism).
     a5_set_active_repo(&conn, A5_REPO_A);
-    crate::index::lifecycle::install_scope_view(&conn, commit, "").unwrap();
+    crate::index::lifecycle::install_scope_view(&conn, rag_rat_base::checkout::CheckoutRef {
+        commit_sha: commit,
+        worktree_id: "",
+    })
+    .unwrap();
 
     let pack = evidence_pack(&conn, "a_mem").unwrap();
     let resolution = |ident: &str| {

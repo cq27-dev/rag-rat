@@ -25,20 +25,21 @@ impl IndexDatabase {
             // Absent on a pre-#822 two-line value; an unparsable third line degrades the same
             // way (no quiet skip) rather than invalidating the still-meaningful pair.
             let refreshed_at_ms = lines.next().and_then(|at_ms| at_ms.parse().ok());
-            Some(RecordedOverlayBasis { base_sha, linked_head_sha, refreshed_at_ms })
+            Some(RecordedOverlayBasis {
+                basis: OverlayBasis { base_sha, linked_head_sha },
+                refreshed_at_ms,
+            })
         }))
     }
 
-    /// The recorded refresh basis for `worktree_id`: `(base_sha, linked_head_sha)` at the last
+    /// The recorded refresh basis for `worktree_id`: the base and linked HEADs at the last
     /// COMPLETE overlay refresh, or `None` when never refreshed (or written by a pre-#577
     /// build) — the caller then refreshes unconditionally.
     pub(crate) fn worktree_overlay_basis(
         &self,
         worktree_id: &str,
-    ) -> anyhow::Result<Option<(String, String)>> {
-        Ok(self
-            .read_worktree_overlay_basis(worktree_id)?
-            .map(|basis| (basis.base_sha, basis.linked_head_sha)))
+    ) -> anyhow::Result<Option<OverlayBasis>> {
+        Ok(self.read_worktree_overlay_basis(worktree_id)?.map(|recorded| recorded.basis))
     }
 
     /// When `worktree_id`'s last COMPLETE refresh recorded its basis (epoch ms) — the #822
@@ -48,7 +49,9 @@ impl IndexDatabase {
         &self,
         worktree_id: &str,
     ) -> anyhow::Result<Option<i64>> {
-        Ok(self.read_worktree_overlay_basis(worktree_id)?.and_then(|basis| basis.refreshed_at_ms))
+        Ok(self
+            .read_worktree_overlay_basis(worktree_id)?
+            .and_then(|recorded| recorded.refreshed_at_ms))
     }
 
     /// Upsert the refresh basis after a COMPLETE overlay refresh, stamped with `refreshed_at_ms`
@@ -60,13 +63,12 @@ impl IndexDatabase {
     pub(crate) fn record_worktree_overlay_basis(
         &self,
         worktree_id: &str,
-        base_sha: &str,
-        linked_head_sha: &str,
+        basis: OverlayBasisUpdate<'_>,
         refreshed_at_ms: i64,
     ) -> anyhow::Result<()> {
         self.set_repo_meta_if_changed(
             &overlay_basis_meta_key(worktree_id),
-            &format!("{base_sha}\n{linked_head_sha}\n{refreshed_at_ms}"),
+            &format!("{}\n{}\n{refreshed_at_ms}", basis.base_sha, basis.linked_head_sha),
         )?;
         Ok(())
     }
@@ -133,7 +135,7 @@ impl IndexDatabase {
         else {
             return Ok(());
         };
-        self.set_context(&base_sha, &worktree_id)?;
+        self.set_context(CheckoutRef { commit_sha: &base_sha, worktree_id: &worktree_id })?;
         self.storage.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> anyhow::Result<()> {
             self.refresh_packages(&source_root)?;
@@ -300,12 +302,7 @@ impl IndexDatabase {
             // read. Riding the same value as the pair means clear-on-partial (below) and the
             // caller-side clear-on-failure drop the timestamp with it — a cleared basis can
             // never leave a stale quiet-skip behind.
-            self.record_worktree_overlay_basis(
-                worktree_id,
-                basis.base_sha,
-                basis.linked_head_sha,
-                rag_rat_base::time::now_ms(),
-            )
+            self.record_worktree_overlay_basis(worktree_id, basis, rag_rat_base::time::now_ms())
         } else {
             self.clear_worktree_overlay_basis(worktree_id)
         }

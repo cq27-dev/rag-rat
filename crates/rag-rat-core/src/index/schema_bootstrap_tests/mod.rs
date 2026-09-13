@@ -308,8 +308,12 @@ fn path_in_scope(db: &IndexDatabase, path: &str) -> bool {
 }
 
 fn set_base_scope(db: &mut IndexDatabase, root: &Path) {
-    let (sha, _) = resolve_git_context(root);
-    db.set_context(&sha, &worktree_id_of(root)).unwrap();
+    let sha = resolve_git_context(root).commit_sha;
+    db.set_context(rag_rat_base::checkout::CheckoutRef {
+        commit_sha: &sha,
+        worktree_id: &worktree_id_of(root),
+    })
+    .unwrap();
 }
 
 /// The resolved target symbol id of the single `calls_name` edge whose source file is `path` — or
@@ -487,8 +491,7 @@ fn create_dir_memory(db: &IndexDatabase, title: &str, dir: Option<String>) {
 
 /// Shared helper: install the scope view on `conn` for the repo at `root`.
 fn install_scope(conn: &rusqlite::Connection, root: &Path) {
-    let (commit_sha, worktree_id) = resolve_git_context(root);
-    crate::index::install_scope_view(conn, &commit_sha, &worktree_id).unwrap();
+    crate::index::install_scope_view(conn, resolve_git_context(root).borrowed()).unwrap();
 }
 
 fn table_count(db: &IndexDatabase, table: &str) -> i64 {

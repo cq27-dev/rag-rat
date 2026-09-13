@@ -63,12 +63,11 @@ impl IndexDatabase {
         overlay: &ResolvedOverlayScope,
         config: &Config,
     ) -> anyhow::Result<CommittedDeltaSource> {
-        let heads_unchanged = self.worktree_overlay_basis(&overlay.worktree_id)?.is_some_and(
-            |(recorded_base, recorded_linked)| {
-                recorded_base == overlay.base_sha
-                    && recorded_linked == git_context::repo_head_sha(&overlay.linked_repo)
-            },
-        );
+        let heads_unchanged =
+            self.worktree_overlay_basis(&overlay.worktree_id)?.is_some_and(|recorded| {
+                recorded.base_sha == overlay.base_sha
+                    && recorded.linked_head_sha == git_context::repo_head_sha(&overlay.linked_repo)
+            });
         if !heads_unchanged || self.overlay_targets_may_drift(&config.targets)? {
             return Ok(CommittedDeltaSource::TreeDiff);
         }

@@ -428,7 +428,11 @@ mod tests {
             params![target],
         )
         .unwrap();
-        install_scope_view(&conn, COMMIT, "").unwrap();
+        install_scope_view(&conn, rag_rat_base::checkout::CheckoutRef {
+            commit_sha: COMMIT,
+            worktree_id: "",
+        })
+        .unwrap();
 
         let items =
             impact_surface_with_options(&conn, "a.rs::target", 50, GraphResolutionMode::Syntactic)

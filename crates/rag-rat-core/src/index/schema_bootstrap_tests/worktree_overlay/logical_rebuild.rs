@@ -402,7 +402,9 @@ fn overlay_basis_writes_ride_the_refresh_transaction() {
     let report = db.index_worktree_overlay_with_tail(&config, &linked, tail, &mut |_| {}).unwrap();
     assert!(report.status_complete, "an undisturbed delta walk completes");
     assert_eq!(
-        db.worktree_overlay_basis(&report.worktree_id).unwrap(),
+        db.worktree_overlay_basis(&report.worktree_id)
+            .unwrap()
+            .map(|b| (b.base_sha, b.linked_head_sha)),
         Some(("base-head-1".to_string(), "linked-head-1".to_string())),
         "a complete refresh records the maintained basis"
     );
@@ -439,7 +441,9 @@ fn overlay_basis_writes_ride_the_refresh_transaction() {
     .unwrap();
     let standalone = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
     assert_eq!(
-        db.worktree_overlay_basis(&standalone.worktree_id).unwrap(),
+        db.worktree_overlay_basis(&standalone.worktree_id)
+            .unwrap()
+            .map(|b| (b.base_sha, b.linked_head_sha)),
         Some(("base-head-3".to_string(), "linked-head-3".to_string())),
         "a refresh that maintains no basis leaves the recorded pair alone"
     );

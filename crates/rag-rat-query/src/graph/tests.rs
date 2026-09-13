@@ -6,6 +6,7 @@
 //! confess to (#1198), the population a compiler verdict can recover (#1197), and the population
 //! `resolution: "fuzzy"` is supposed to reach by short name (#1199).
 
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_core::index::install_scope_view;
 use rag_rat_db::schema;
 use rusqlite::{Connection, params};
@@ -13,6 +14,7 @@ use rusqlite::{Connection, params};
 use super::*;
 
 const COMMIT: &str = "c0ffee";
+const SCOPE: CheckoutRef<'static> = CheckoutRef { commit_sha: COMMIT, worktree_id: "" };
 const TOOL: &str = "rust-analyzer";
 const TOOL_VERSION: &str = "ra 1.0";
 
@@ -174,7 +176,7 @@ fn summary_counts_unresolved_call_sites_the_seed_could_not_reach() {
     for i in 0..3 {
         add_call(&conn, file, caller, None, "target", "h::target", 100 + i * 10);
     }
-    install_scope_view(&conn, COMMIT, "").unwrap();
+    install_scope_view(&conn, SCOPE).unwrap();
 
     let options = syntactic(target);
     let hops = callers(&conn, "a.rs::target", &options);
@@ -208,7 +210,7 @@ fn an_ambiguous_short_name_does_not_absorb_unrelated_unresolved_calls() {
     for i in 0..3 {
         add_call(&conn, file, caller, None, "target", "other::target", 100 + i * 10);
     }
-    install_scope_view(&conn, COMMIT, "").unwrap();
+    install_scope_view(&conn, SCOPE).unwrap();
 
     let options = syntactic(target);
     let hops = callers(&conn, "a.rs::target", &options);
@@ -243,7 +245,7 @@ fn a_cfg_split_seed_still_counts_the_call_sites_it_could_not_reach() {
     for i in 0..3 {
         add_call(&conn, file, caller, None, "target", "h::target", 100 + i * 10);
     }
-    install_scope_view(&conn, COMMIT, "").unwrap();
+    install_scope_view(&conn, SCOPE).unwrap();
 
     let options = GraphTraversalOptions {
         symbol_id: Some(native),
@@ -281,7 +283,7 @@ fn oracle_verdicts_seed_the_call_sites_the_resolver_left_unbound() {
     for span in &spans {
         add_upgrade_verdict(&conn, "a.rs", "sha-a", *span, target, TOOL_VERSION);
     }
-    install_scope_view(&conn, COMMIT, "").unwrap();
+    install_scope_view(&conn, SCOPE).unwrap();
 
     let options = syntactic(target);
     assert_eq!(callers(&conn, "a.rs::target", &options).len(), 4, "all four call sites come back");
@@ -311,7 +313,7 @@ fn the_symbol_selected_impact_report_carries_an_oracle_seeded_caller() {
     add_call(&conn, file, caller, None, "target", "h::target", 100);
     add_oracle_run(&conn, TOOL_VERSION, "");
     add_upgrade_verdict(&conn, "a.rs", "sha-a", 100, target, TOOL_VERSION);
-    install_scope_view(&conn, COMMIT, "").unwrap();
+    install_scope_view(&conn, SCOPE).unwrap();
 
     let hit = crate::symbol::lookup_by_id(&conn, target).unwrap().unwrap();
     // Graph lanes only: the evidence sections are irrelevant here and several need a populated FTS.
@@ -352,7 +354,7 @@ fn an_oracle_seeded_caller_outranks_a_name_guess_under_a_tight_limit() {
     add_call(&conn, file, caller, None, "target", "a.rs::target", 200);
     add_oracle_run(&conn, TOOL_VERSION, "");
     add_upgrade_verdict(&conn, "a.rs", "sha-a", 100, target, TOOL_VERSION);
-    install_scope_view(&conn, COMMIT, "").unwrap();
+    install_scope_view(&conn, SCOPE).unwrap();
 
     let hops =
         traverse_with_options(&conn, "a.rs::target", Direction::Callers, 1, &syntactic(target))
@@ -380,7 +382,7 @@ fn a_superseded_oracle_run_does_not_seed_callers() {
     add_oracle_run(&conn, "ra 0.9", "");
     add_oracle_run(&conn, TOOL_VERSION, "");
     add_upgrade_verdict(&conn, "a.rs", "sha-a", 100, target, "ra 0.9");
-    install_scope_view(&conn, COMMIT, "").unwrap();
+    install_scope_view(&conn, SCOPE).unwrap();
 
     assert!(callers(&conn, "a.rs::target", &syntactic(target)).is_empty());
 }
@@ -407,7 +409,7 @@ fn a_verdict_resolving_to_a_shadowed_definition_does_not_seed_callers() {
     add_call(&conn, caller_file, caller, None, "target", "h::target", 100);
     add_oracle_run(&conn, TOOL_VERSION, WORKTREE);
     add_upgrade_verdict(&conn, "a.rs", "sha-a", 100, shadowed, TOOL_VERSION);
-    install_scope_view(&conn, COMMIT, WORKTREE).unwrap();
+    install_scope_view(&conn, CheckoutRef { commit_sha: COMMIT, worktree_id: WORKTREE }).unwrap();
 
     assert!(
         callers(&conn, "def.rs::target", &syntactic(live)).is_empty(),
@@ -433,7 +435,7 @@ fn an_oracle_seeded_hop_lands_on_the_symbol_the_verdict_names() {
     // Overloads are attributed by LOGICAL membership, so give each symbol its own logical group.
     let logical =
         [named, sibling].map(|symbol_id| add_logical_symbol(&conn, "a.rs::target", &[symbol_id]));
-    install_scope_view(&conn, COMMIT, "").unwrap();
+    install_scope_view(&conn, SCOPE).unwrap();
 
     let for_logical = |logical_symbol_id: i64, symbol_id: i64| GraphTraversalOptions {
         symbol_id: Some(symbol_id),
@@ -459,7 +461,7 @@ fn fuzzy_reaches_a_short_name_caller_that_syntactic_cannot() {
     add_call(&conn, file, caller, Some(target), "target", "a.rs::target", 10);
     // Unbound, and its written target name belongs to no arm but the short-name one.
     add_call(&conn, file, caller, None, "target", "other::target", 100);
-    install_scope_view(&conn, COMMIT, "").unwrap();
+    install_scope_view(&conn, SCOPE).unwrap();
 
     let options = syntactic(target);
     assert_eq!(callers(&conn, "a.rs::target", &options).len(), 1, "syntactic must not grow");

@@ -385,8 +385,7 @@ impl IndexDatabase {
         // DB (the common case). INDEXING intent: an incremental/discover pass records this
         // checkout's root (#427).
         db.adopt_repo_from_config(config, super::lifecycle::AdoptIntent::Indexing)?;
-        let (commit_sha, worktree_id) = resolve_git_context(&config.root);
-        db.set_context(&commit_sha, &worktree_id)?;
+        db.set_context(resolve_git_context(&config.root).borrowed())?;
         // ADOPTION RESETS ALL CONNECTION-CARRIED REPO-DERIVED STATE BEFORE ANY DEFERRED HEAL (the
         // rule that closes the pre-adoption-pick family). `open_bare` derived per-repo state from
         // the config-less SOLE pick — on a consolidated DB, a first-sorting SIBLING — and each

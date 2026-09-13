@@ -1132,7 +1132,7 @@ fn a_tail_failure_leaves_git_meta_and_history_cursors_on_the_old_state() {
     IndexDatabase::rebuild(&config).unwrap();
     let db_path = config.database.clone();
     let repo_id = resolve_repo_id(&db_path, &root);
-    let (h1, _) = crate::index::resolve_git_context(&root);
+    let h1 = crate::index::resolve_git_context(&root).commit_sha;
 
     let git_commit_meta = |db_path: &Path, repo_id: &str| -> Option<String> {
         let conn = rusqlite::Connection::open(db_path).unwrap();
@@ -1149,7 +1149,7 @@ fn a_tail_failure_leaves_git_meta_and_history_cursors_on_the_old_state() {
     fs::write(root.join("src/b.rs"), "pub fn b() -> u32 { 2 }\n").unwrap();
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-q", "-m", "h2"]);
-    let (h2, _) = crate::index::resolve_git_context(&root);
+    let h2 = crate::index::resolve_git_context(&root).commit_sha;
     assert_ne!(h1, h2);
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1419,7 +1419,7 @@ fn a_head_advancing_rebuild_carries_overlay_package_roots_onto_the_new_base_comm
     IndexDatabase::rebuild(&config).unwrap();
     let db_path = config.database.clone();
     let repo_id = resolve_repo_id(&db_path, &root);
-    let (old_head, _) = crate::index::resolve_git_context(&root);
+    let old_head = crate::index::resolve_git_context(&root).commit_sha;
 
     // A linked worktree that CHANGES a file (so the overlay refresh runs and writes its own
     // `packages` rows from the linked checkout's manifest).
@@ -1453,7 +1453,7 @@ fn a_head_advancing_rebuild_carries_overlay_package_roots_onto_the_new_base_comm
     fs::write(root.join("src/added.rs"), "pub fn added() -> u32 { 9 }\n").unwrap();
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-q", "-m", "advance"]);
-    let (new_head, _) = crate::index::resolve_git_context(&root);
+    let new_head = crate::index::resolve_git_context(&root).commit_sha;
     assert_ne!(old_head, new_head, "HEAD advanced");
     IndexDatabase::rebuild(&config).unwrap();
 
@@ -1549,8 +1549,7 @@ fn standalone_index_targets_publishes_staged_parser_failures_immediately() {
     // The standalone driver: create/adopt/scope, then index_targets — NO rebuild anywhere.
     let mut db = IndexDatabase::create_or_migrate(&config.database).unwrap();
     db.adopt_repo_from_config(&config, crate::index::lifecycle::AdoptIntent::Indexing).unwrap();
-    let (sha, wt) = crate::index::resolve_git_context(&root);
-    db.set_context(&sha, &wt).unwrap();
+    db.set_context(crate::index::resolve_git_context(&root).borrowed()).unwrap();
     db.index_targets(&config).unwrap();
 
     let db_path = config.database.clone();
@@ -1626,7 +1625,7 @@ fn a_rebuild_after_an_overlay_already_refreshed_at_the_new_head_does_not_collide
     fs::write(root.join("src/added.rs"), "pub fn added() -> u32 { 9 }\n").unwrap();
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-q", "-m", "advance"]);
-    let (new_head, _) = crate::index::resolve_git_context(&root);
+    let new_head = crate::index::resolve_git_context(&root).commit_sha;
     fs::write(linked.join("src/caller.rs"), "pub fn overlay_caller() -> u32 { 8 }\n").unwrap();
     let mut db = IndexDatabase::open_config(&config).unwrap();
     db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
@@ -1706,7 +1705,7 @@ fn a_rebuild_dedupes_multi_stale_overlay_package_rows_before_the_re_key() {
     fs::write(root.join("src/added.rs"), "pub fn added() -> u32 { 9 }\n").unwrap();
     run_git(&root, &["add", "."]);
     run_git(&root, &["commit", "-q", "-m", "advance"]);
-    let (new_head, _) = crate::index::resolve_git_context(&root);
+    let new_head = crate::index::resolve_git_context(&root).commit_sha;
     IndexDatabase::rebuild(&config).unwrap();
 
     let conn = rusqlite::Connection::open(&db_path).unwrap();

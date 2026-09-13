@@ -1,3 +1,4 @@
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_db::meta::{read_meta, repo_meta};
 use rag_rat_db::schema;
 use rag_rat_papertrail as papertrail;
@@ -257,8 +258,7 @@ impl IndexDatabase {
         // identity but records NO working-tree root (#427) — a read must not mark this checkout
         // "indexed here".
         db.adopt_repo_from_config(config, AdoptIntent::ReadOnly)?;
-        let (commit_sha, worktree_id) = resolve_git_context(&config.root);
-        db.set_context(&commit_sha, &worktree_id)?;
+        db.set_context(resolve_git_context(&config.root).borrowed())?;
         ai::ensure_model_manifest(db.storage.connection())?;
         db.ensure_graph_index_current()?;
         db.ensure_generated_flags_current()?;
@@ -421,7 +421,7 @@ impl IndexDatabase {
             return Ok(None);
         };
         storage.set_source_root(config.root.clone());
-        let (commit_sha, worktree_id) = resolve_git_context(&config.root);
+        let checkout = resolve_git_context(&config.root);
         let mut db = Self::new_handle(
             storage,
             repo_id,
@@ -435,7 +435,7 @@ impl IndexDatabase {
         // embedding-model seed) see the CONFIG's repo — not the config-blind sole repo, which is a
         // SIBLING in a consolidated DB and would make them falsely report a heal is owed under an
         // empty scope. The graph / generated-flags gates read `repo_id` explicitly.
-        db.set_context(&commit_sha, &worktree_id)?;
+        db.set_context(checkout.borrowed())?;
         let conn = db.storage.connection();
         if db.active_derivation_rows_owed()? {
             return Ok(None);
@@ -663,13 +663,13 @@ impl IndexDatabase {
         Ok(())
     }
 
-    pub fn set_context(&mut self, commit_sha: &str, worktree_id: &str) -> anyhow::Result<()> {
+    pub fn set_context(&mut self, checkout: CheckoutRef<'_>) -> anyhow::Result<()> {
         // A reader / incremental open scopes to the repo's LIVE generation (A6) — the pointer a
         // full rebuild flips once its staged generation is complete. The rebuild connection
         // overrides this with its WRITE generation via `set_context_at_generation`.
         let generation =
             schema::live_files_generation(self.storage.connection(), &self.active_repo_id)?;
-        self.set_context_at_generation(commit_sha, worktree_id, generation)
+        self.set_context_at_generation(checkout, generation)
     }
 
     /// Install the scope VIEW for an arbitrary `(commit, worktree)` at an explicit generation
@@ -682,14 +682,12 @@ impl IndexDatabase {
     /// gates are unaffected by the temporary view swaps.
     pub(super) fn install_view_for_scope(
         &self,
-        commit_sha: &str,
-        worktree_id: &str,
+        checkout: CheckoutRef<'_>,
         generation: i64,
     ) -> rusqlite::Result<()> {
         write_scope_view(self.storage.connection(), &ScopeContext {
-            repo_id: self.active_repo_id.clone(),
-            commit_sha: commit_sha.to_string(),
-            worktree_id: worktree_id.to_string(),
+            repo_id: &self.active_repo_id,
+            checkout,
             generation,
         })
     }
@@ -701,8 +699,7 @@ impl IndexDatabase {
     /// readers stay on the live generation N until the flip.
     pub(crate) fn set_context_at_generation(
         &mut self,
-        commit_sha: &str,
-        worktree_id: &str,
+        checkout: CheckoutRef<'_>,
         generation: i64,
     ) -> anyhow::Result<()> {
         // Install the SQL scope view FIRST, and only commit the in-memory fields once it succeeded.
@@ -714,15 +711,19 @@ impl IndexDatabase {
         // from the connection — a consolidated DB's sole-repo fallback would be ambiguous. This is
         // the one caller that scopes to a SPECIFIC repo without reading it back from the context.
         write_scope_view(self.storage.connection(), &ScopeContext {
-            repo_id: self.active_repo_id.clone(),
-            commit_sha: commit_sha.to_string(),
-            worktree_id: worktree_id.to_string(),
+            repo_id: &self.active_repo_id,
+            checkout,
             generation,
         })?;
-        self.active_commit_sha = commit_sha.to_string();
-        self.active_worktree_id = worktree_id.to_string();
+        self.active_commit_sha = checkout.commit_sha.to_string();
+        self.active_worktree_id = checkout.worktree_id.to_string();
         self.active_generation = generation;
         Ok(())
+    }
+
+    /// The checkout this connection is scoped to: the pair [`Self::set_context`] installed.
+    pub(crate) fn active_checkout(&self) -> CheckoutRef<'_> {
+        CheckoutRef { commit_sha: &self.active_commit_sha, worktree_id: &self.active_worktree_id }
     }
 
     /// Whether this connection is scoped to a LINKED-worktree overlay (a non-empty
@@ -754,8 +755,7 @@ impl IndexDatabase {
         root: &Path,
         worktree: Option<&Path>,
     ) -> anyhow::Result<()> {
-        let (commit_sha, worktree_id) = resolve_worktree_scope(root, worktree);
-        self.set_context(&commit_sha, &worktree_id)
+        self.set_context(resolve_worktree_scope(root, worktree).borrowed())
     }
 }
 
@@ -781,17 +781,12 @@ pub fn install_worktree_scope_view(
     config_root: &Path,
     cwd: &Path,
 ) -> anyhow::Result<()> {
-    let (commit_sha, worktree_id) = resolve_worktree_scope(config_root, Some(cwd));
+    let checkout = resolve_worktree_scope(config_root, Some(cwd));
     // A6: this raw-conn READ installer scopes to the repo's LIVE generation from `repo_meta` (an
     // empty `repo_id` — the sibling-safe "match nothing" case — reads generation 0, still matching
     // nothing, since no row carries the empty repo).
     let generation = schema::live_files_generation(conn, repo_id)?;
-    write_scope_view(conn, &ScopeContext {
-        repo_id: repo_id.to_string(),
-        commit_sha,
-        worktree_id,
-        generation,
-    })?;
+    write_scope_view(conn, &ScopeContext { repo_id, checkout: checkout.borrowed(), generation })?;
     Ok(())
 }
 
@@ -813,10 +808,9 @@ pub fn resolve_scope_repo_id(
 /// existing commit/worktree dimensions. Threaded into [`write_scope_view`], which mirrors it into
 /// `temp.connection_context` so free-conn helpers (`schema::active_repo_id`, `edges::resolve`)
 /// recover the same values.
-pub(crate) struct ScopeContext {
-    pub repo_id: String,
-    pub commit_sha: String,
-    pub worktree_id: String,
+pub(crate) struct ScopeContext<'a> {
+    pub repo_id: &'a str,
+    pub checkout: CheckoutRef<'a>,
     /// The `files.generation` the view filters on (A6): the repo's LIVE generation for a
     /// reader/incremental open, the WRITE generation N+1 for the connection driving a full
     /// rebuild.
@@ -834,17 +828,11 @@ pub(crate) struct ScopeContext {
 /// tests consume it through the dev-dependency, and the gate does not propagate cross-crate.
 pub fn install_scope_view(
     conn: &rusqlite::Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> rusqlite::Result<()> {
     let repo_id = schema::active_repo_id(conn)?;
     let generation = schema::active_generation(conn)?;
-    write_scope_view(conn, &ScopeContext {
-        repo_id,
-        commit_sha: commit_sha.to_string(),
-        worktree_id: worktree_id.to_string(),
-        generation,
-    })
+    write_scope_view(conn, &ScopeContext { repo_id: &repo_id, checkout, generation })
 }
 
 /// Installs the per-connection repo/commit/worktree scoping view; callers query `files` afterward
@@ -860,7 +848,7 @@ pub fn install_scope_view(
 /// treats a failed switch as "still on the previous scope" and keeps using the handle, which would
 /// then read across checkouts. A savepoint makes the failure mean what the caller assumes it does.
 /// Nestable on purpose — callers switch scope inside an open transaction.
-fn write_scope_view(conn: &rusqlite::Connection, ctx: &ScopeContext) -> rusqlite::Result<()> {
+fn write_scope_view(conn: &rusqlite::Connection, ctx: &ScopeContext<'_>) -> rusqlite::Result<()> {
     conn.execute_batch("SAVEPOINT rag_rat_scope_view")?;
     match write_scope_view_inner(conn, ctx) {
         Ok(()) => conn.execute_batch("RELEASE rag_rat_scope_view"),
@@ -872,7 +860,10 @@ fn write_scope_view(conn: &rusqlite::Connection, ctx: &ScopeContext) -> rusqlite
     }
 }
 
-fn write_scope_view_inner(conn: &rusqlite::Connection, ctx: &ScopeContext) -> rusqlite::Result<()> {
+fn write_scope_view_inner(
+    conn: &rusqlite::Connection,
+    ctx: &ScopeContext<'_>,
+) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
             CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);
@@ -882,8 +873,8 @@ fn write_scope_view_inner(conn: &rusqlite::Connection, ctx: &ScopeContext) -> ru
     let mut stmt =
         conn.prepare("INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES (?1, ?2)")?;
     stmt.execute(params![schema::CONNECTION_CONTEXT_REPO_KEY, ctx.repo_id])?;
-    stmt.execute(params!["commit_sha", ctx.commit_sha])?;
-    stmt.execute(params!["worktree_id", ctx.worktree_id])?;
+    stmt.execute(params!["commit_sha", ctx.checkout.commit_sha])?;
+    stmt.execute(params!["worktree_id", ctx.checkout.worktree_id])?;
     // A6: the file generation the view filters on. Stored as TEXT beside the other context keys;
     // the INTEGER `generation` column's numeric affinity coerces it back in the comparisons
     // below.
