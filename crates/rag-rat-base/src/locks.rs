@@ -561,13 +561,7 @@ pub const MAX_SOCKET_PATH_LEN: usize = 100;
 /// comment for why canonicalize-but-not-case-fold).
 fn worktree_hash(worktree_root: &Path) -> String {
     let canonical = crate::paths::canonicalize_or_simplified(worktree_root);
-    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-    let mut hash = String::with_capacity(32);
-    for byte in &digest[..16] {
-        use std::fmt::Write as _;
-        let _ = write!(hash, "{byte:02x}");
-    }
-    hash
+    crate::hash::hex_lower(&Sha256::digest(canonical.to_string_lossy().as_bytes())[..16])
 }
 
 /// Per-worktree election lock path, keyed by a hash of the **canonicalized** worktree root —
