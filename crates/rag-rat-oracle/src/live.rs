@@ -585,8 +585,7 @@ pub fn live_oracle_pass(
             },
         }
     }
-    let mut aborted: Option<String> = None;
-    let mut warming = false;
+    let mut stop: Option<PassStop> = None;
     // Per-pass caches: definition-file disk bytes / indexed sha / symbol spans, keyed by
     // repo-relative path (the LSP returns a bounded set of def paths, so these stay small — the
     // whole-checkout sha map is deliberately NOT loaded).
@@ -624,15 +623,10 @@ pub fn live_oracle_pass(
         // Readiness is dynamic: Cargo metadata or workspace changes can put rust-analyzer back
         // into loading after the pass-entry gate. Never begin another definition batch while it is
         // non-quiescent, or temporary nulls would become permanently completed unresolved work.
-        let readiness_checkpoint = match session.readiness_checkpoint() {
-            Ok(Some(checkpoint)) => checkpoint,
-            Ok(None) => {
-                warming = true;
-                defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
-                break 'files;
-            },
-            Err(err) => {
-                aborted = Some(err.to_string());
+        let readiness_checkpoint = match checkpoint_or_stop(session, None) {
+            Ok(checkpoint) => checkpoint,
+            Err(pass_stop) => {
+                stop = Some(pass_stop);
                 defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
                 break 'files;
             },
@@ -641,19 +635,8 @@ pub fn live_oracle_pass(
         // Callsite drift gate: the server resolves the DIRTY disk bytes, so those bytes must
         // still hash to the indexed `file_sha` the candidates were built from — a mid-pass edit
         // makes the indexed callee ranges point at the wrong content. Skip, never mis-resolve.
-        let Ok(bytes) = std::fs::read(input.scope.root().join(path)) else {
-            report.skipped_drifted += callees.len() as u64;
-            report.unfinished_paths.push(path.clone());
-            continue;
-        };
-        if hex_sha256(&bytes) != callees[0].file_sha {
-            report.skipped_drifted += callees.len() as u64;
-            report.unfinished_paths.push(path.clone());
-            continue;
-        }
-        let Ok(text) = String::from_utf8(bytes) else {
-            report.skipped_drifted += callees.len() as u64;
-            report.unfinished_paths.push(path.clone());
+        let Some(text) = read_undrifted(input.scope.root(), path, &callees[0].file_sha) else {
+            defer_drifted(&mut report, path, callees.len());
             continue;
         };
 
@@ -708,25 +691,17 @@ pub fn live_oracle_pass(
                 // A dead/wedged server: keep what earlier files produced, REQUEUE this file and
                 // every candidate-bearing path after it (the watcher rides them into the next
                 // pass and replaces the session), and never fail the maintenance pass over it.
-                aborted = Some(err.to_string());
+                stop = Some(PassStop::Aborted(err.to_string()));
                 defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
                 break 'files;
             },
         };
         // A reload may begin while the synchronous batch is in flight. Discard the whole batch
         // before interpreting any null definitions, and retry this file once the server is ready.
-        match session.readiness_checkpoint() {
-            Ok(Some(checkpoint)) if checkpoint == readiness_checkpoint => {},
-            Ok(_) => {
-                warming = true;
-                defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
-                break 'files;
-            },
-            Err(err) => {
-                aborted = Some(err.to_string());
-                defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
-                break 'files;
-            },
+        if let Err(pass_stop) = checkpoint_or_stop(session, Some(readiness_checkpoint)) {
+            stop = Some(pass_stop);
+            defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
+            break 'files;
         }
         // The caller may change while synchronous requests are in flight. Re-read AFTER the batch:
         // the server resolved the didOpen snapshot, and writing it against an already-changed disk
@@ -736,8 +711,7 @@ pub fn live_oracle_pass(
             .ok()
             .is_none_or(|current| hex_sha256(&current) != callees[0].file_sha)
         {
-            report.skipped_drifted += to_resolve.len() as u64;
-            report.unfinished_paths.push(path.clone());
+            defer_drifted(&mut report, path, to_resolve.len());
             continue;
         }
         let mut retry_file = deferred_count > 0;
@@ -910,7 +884,7 @@ pub fn live_oracle_pass(
 
     // Every early exit reachable from here is the server's — a dead transport or a readiness
     // error. A layout change returns above, before any file is touched.
-    if aborted.is_some() {
+    if matches!(stop, Some(PassStop::Aborted(_))) {
         report.abort = Some(LivePassAbort::Server);
     }
     // A run row is recorded for a pass that WROTE verdicts OR migrated the tool version: the
@@ -919,9 +893,9 @@ pub fn live_oracle_pass(
     report.version_migrated = version_migrated;
     if report.rows_written > 0 || version_migrated {
         report.run_recorded = true;
-        report.status = match &aborted {
-            Some(err) => format!("Aborted: {err}"),
-            None if warming => "Warming".to_string(),
+        report.status = match &stop {
+            Some(PassStop::Aborted(err)) => format!("Aborted: {err}"),
+            Some(PassStop::Warming) => "Warming".to_string(),
             None if report.rows_written == 0 => "VersionMigrated".to_string(),
             None if report.unfinished_paths.is_empty() => "Completed".to_string(),
             None => "BudgetExhausted".to_string(),
@@ -943,9 +917,9 @@ pub fn live_oracle_pass(
             &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
         )?;
     } else {
-        report.status = match &aborted {
-            Some(err) => format!("Aborted: {err}"),
-            None if warming => "Warming".to_string(),
+        report.status = match &stop {
+            Some(PassStop::Aborted(err)) => format!("Aborted: {err}"),
+            Some(PassStop::Warming) => "Warming".to_string(),
             None if report.unfinished_paths.is_empty() => "NoVerdicts".to_string(),
             None => "BudgetExhausted".to_string(),
         };
@@ -963,6 +937,45 @@ fn defer_candidate_paths_from(
     report.unfinished_paths.extend(
         worklist[position..].iter().filter(|path| by_path.contains_key(path.as_str())).cloned(),
     );
+}
+
+/// Why a pass stopped before the end of its worklist.
+enum PassStop {
+    /// The server went (back) into loading; the rest of the worklist rides the backlog.
+    Warming,
+    /// A dead or wedged server, or a readiness error; the watcher replaces the session.
+    Aborted(String),
+}
+
+/// The server's readiness checkpoint for the next definition batch, or why the pass must stop.
+/// With `expect`, only that exact checkpoint counts as ready: a reload that began while a batch
+/// was in flight moves the checkpoint, and that batch's answers must not be interpreted.
+fn checkpoint_or_stop(
+    session: &mut LiveOracleSession,
+    expect: Option<u64>,
+) -> Result<u64, PassStop> {
+    match session.readiness_checkpoint() {
+        Ok(Some(checkpoint)) if expect.is_none_or(|expected| expected == checkpoint) =>
+            Ok(checkpoint),
+        Ok(_) => Err(PassStop::Warming),
+        Err(err) => Err(PassStop::Aborted(err.to_string())),
+    }
+}
+
+/// The caller file's current disk text, or `None` when it is unreadable, no longer hashes to the
+/// indexed `file_sha` the candidates were built from, or is not UTF-8.
+fn read_undrifted(root: &std::path::Path, path: &str, file_sha: &str) -> Option<String> {
+    let bytes = std::fs::read(root.join(path)).ok()?;
+    if hex_sha256(&bytes) != file_sha {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Count `candidates` drifted callees in `path` as skipped and requeue the file for the next pass.
+fn defer_drifted(report: &mut LivePassReport, path: &str, candidates: usize) {
+    report.skipped_drifted += candidates as u64;
+    report.unfinished_paths.push(path.to_string());
 }
 
 /// The content-stable SCIP-local sentinel a live verdict carries when the resolved symbol has no
