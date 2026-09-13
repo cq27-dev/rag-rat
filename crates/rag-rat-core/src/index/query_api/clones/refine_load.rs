@@ -8,6 +8,7 @@
 //! refinement cache key. Both are all-or-nothing: a single un-hydratable member returns `Ok(None)`
 //! so the caller leaves the whole class un-refined rather than key over a partial multiset.
 
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_clones::NORM_VERSION;
 use rusqlite::Connection;
 
@@ -114,9 +115,9 @@ pub(crate) fn load_refine_rows(
 pub(crate) fn oracle_callee_coverage_exists(
     conn: &Connection,
     member_ids: &[i64],
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<bool> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(
         &rag_rat_db::schema::periphery_repo_scope(conn, "edge_oracle")?,
         "edge_oracle",

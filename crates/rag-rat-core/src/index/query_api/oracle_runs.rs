@@ -4,7 +4,6 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::time::now_ms;
 use rag_rat_oracle::{
     self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls, ToolManifest,
@@ -66,10 +65,7 @@ impl IndexDatabase {
         rag_rat_oracle::run_oracle_at(self.storage.connection(), &rag_rat_oracle::OracleRunInput {
             tool,
             tool_version,
-            checkout: CheckoutRef {
-                commit_sha: &self.active_commit_sha,
-                worktree_id: &self.active_worktree_id,
-            },
+            checkout: self.active_checkout(),
             scip_bytes,
             checkout_root: &root,
             production_sha: shas.production,
@@ -85,10 +81,7 @@ impl IndexDatabase {
     pub fn oracle_pre_spawn_snapshot(
         &self,
     ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        rag_rat_oracle::pre_spawn_snapshot(self.storage.connection(), CheckoutRef {
-            commit_sha: &self.active_commit_sha,
-            worktree_id: &self.active_worktree_id,
-        })
+        rag_rat_oracle::pre_spawn_snapshot(self.storage.connection(), self.active_checkout())
     }
 
     /// Run the live oracle's per-pass resolution (#534) over `worklist` (repo-relative Rust
@@ -162,10 +155,7 @@ impl IndexDatabase {
             self.storage.connection(),
             session,
             &rag_rat_oracle::LivePassInput {
-                checkout: CheckoutRef {
-                    commit_sha: &self.active_commit_sha,
-                    worktree_id: &self.active_worktree_id,
-                },
+                checkout: self.active_checkout(),
                 scope,
                 worklist,
                 max_requests,
@@ -188,10 +178,7 @@ impl IndexDatabase {
             self.storage.connection(),
             tool,
             tool_version,
-            CheckoutRef {
-                commit_sha: &self.active_commit_sha,
-                worktree_id: &self.active_worktree_id,
-            },
+            self.active_checkout(),
             recall_calls,
         )
     }
@@ -214,10 +201,7 @@ impl IndexDatabase {
             profile,
             provenance,
             tool,
-            CheckoutRef {
-                commit_sha: &self.active_commit_sha,
-                worktree_id: &self.active_worktree_id,
-            },
+            self.active_checkout(),
             run,
         )
     }
@@ -251,10 +235,7 @@ impl IndexDatabase {
             profile,
             provenance,
             tool,
-            CheckoutRef {
-                commit_sha: &self.active_commit_sha,
-                worktree_id: &self.active_worktree_id,
-            },
+            self.active_checkout(),
             scip_bytes,
             &root,
             shas.production,
@@ -270,10 +251,12 @@ impl IndexDatabase {
         tool: OracleTool,
         tool_version: &str,
     ) -> anyhow::Result<OracleStatus> {
-        rag_rat_oracle::oracle_status(self.storage.connection(), tool, tool_version, CheckoutRef {
-            commit_sha: &self.active_commit_sha,
-            worktree_id: &self.active_worktree_id,
-        })
+        rag_rat_oracle::oracle_status(
+            self.storage.connection(),
+            tool,
+            tool_version,
+            self.active_checkout(),
+        )
     }
 
     /// `rag-rat oracle run [--tool <id>]` without a pre-built `--scip`: invoke the indexer to
@@ -297,10 +280,7 @@ impl IndexDatabase {
             tool,
             &root,
             scip_output,
-            CheckoutRef {
-                commit_sha: &self.active_commit_sha,
-                worktree_id: &self.active_worktree_id,
-            },
+            self.active_checkout(),
         )
     }
 
@@ -344,19 +324,21 @@ impl IndexDatabase {
     /// The `tool_version` of the most recent oracle run for `tool` in this checkout, or `None` when
     /// no run exists. The version `oracle status` reports verdict counts against.
     pub fn latest_oracle_run_version(&self, tool: OracleTool) -> anyhow::Result<Option<String>> {
-        rag_rat_oracle::latest_run_tool_version(self.storage.connection(), tool, CheckoutRef {
-            commit_sha: &self.active_commit_sha,
-            worktree_id: &self.active_worktree_id,
-        })
+        rag_rat_oracle::latest_run_tool_version(
+            self.storage.connection(),
+            tool,
+            self.active_checkout(),
+        )
     }
 
     /// The `started_at` (Unix-epoch ms) of the most recent oracle run for `tool` in this checkout,
     /// or `None` when none exists — the staleness clock the background auto-fresh oracle (Phase
     /// 5) compares against the index's `indexed_at_ms` to decide whether verdicts are stale.
     pub fn latest_oracle_run_started_at(&self, tool: OracleTool) -> anyhow::Result<Option<i64>> {
-        rag_rat_oracle::latest_run_started_at(self.storage.connection(), tool, CheckoutRef {
-            commit_sha: &self.active_commit_sha,
-            worktree_id: &self.active_worktree_id,
-        })
+        rag_rat_oracle::latest_run_started_at(
+            self.storage.connection(),
+            tool,
+            self.active_checkout(),
+        )
     }
 }

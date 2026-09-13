@@ -31,7 +31,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use rag_rat_base::checkout::CheckoutRef;
 use rusqlite::Connection;
 
 mod build;
@@ -464,12 +463,7 @@ impl IndexDatabase {
         let Some(source_discriminators) = load_source_discriminators(conn, class_ids)? else {
             return Ok(None);
         };
-        let mode = if oracle_callee_coverage_exists(
-            conn,
-            class_ids,
-            &self.active_commit_sha,
-            &self.active_worktree_id,
-        )? {
+        let mode = if oracle_callee_coverage_exists(conn, class_ids, self.active_checkout())? {
             RefineMode::Scip
         } else {
             RefineMode::Baseline
@@ -885,10 +879,7 @@ impl IndexDatabase {
                             conn,
                             &row.path,
                             &disk_sha,
-                            CheckoutRef {
-                                commit_sha: &self.active_commit_sha,
-                                worktree_id: &self.active_worktree_id,
-                            },
+                            self.active_checkout(),
                         )?,
                     );
                 }

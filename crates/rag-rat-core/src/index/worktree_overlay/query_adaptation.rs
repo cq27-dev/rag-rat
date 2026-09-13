@@ -1,3 +1,5 @@
+use rag_rat_base::checkout::CheckoutRef;
+
 use super::*;
 
 impl IndexDatabase {
@@ -104,9 +106,9 @@ impl IndexDatabase {
     /// fork sibling's sha.
     pub(super) fn scope_file_identities(
         &self,
-        commit_sha: &str,
-        worktree_id: &str,
+        checkout: CheckoutRef<'_>,
     ) -> anyhow::Result<HashMap<String, (String, String, String)>> {
+        let CheckoutRef { commit_sha, worktree_id } = checkout;
         let conn = self.storage.connection();
         let mut stmt = conn.prepare(
             "SELECT path, sha256, language, kind FROM main.files

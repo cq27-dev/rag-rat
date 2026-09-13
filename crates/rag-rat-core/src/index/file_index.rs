@@ -1,6 +1,7 @@
 //! The file → rows indexing pipeline: parse/chunk/symbol one file and write its chunk,
 //! symbol, and logical-group rows; heal a stale file in place.
 
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::paths::path_string;
 use rag_rat_base::time::now_ms;
@@ -86,7 +87,10 @@ impl IndexDatabase {
             } else {
                 FileScope::commit(self.active_commit_sha.clone())
             };
-            self.remove_file_in_scope(path, &scope.commit_sha, &scope.worktree_id)?;
+            self.remove_file_in_scope(path, CheckoutRef {
+                commit_sha: &scope.commit_sha,
+                worktree_id: &scope.worktree_id,
+            })?;
 
             self.index_file(
                 path,

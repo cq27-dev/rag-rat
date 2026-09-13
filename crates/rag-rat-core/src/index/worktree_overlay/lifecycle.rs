@@ -1,3 +1,5 @@
+use rag_rat_base::checkout::CheckoutRef;
+
 use super::*;
 
 /// The `repo_meta` key holding `worktree_id`'s overlay refresh basis.
@@ -402,7 +404,10 @@ impl IndexDatabase {
         let mut pruned = Vec::new();
         for path in existing {
             if !shadowing.contains(Path::new(&path)) {
-                self.remove_file_in_scope(Path::new(&path), "", worktree_id)?;
+                self.remove_file_in_scope(Path::new(&path), CheckoutRef {
+                    commit_sha: "",
+                    worktree_id,
+                })?;
                 pruned.push(PathBuf::from(path));
             }
         }

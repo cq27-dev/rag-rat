@@ -1,3 +1,4 @@
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::time::now_ms;
 use rag_rat_db::schema;
@@ -1135,13 +1136,19 @@ impl IndexDatabase {
             // file's committed row.
             if kind == "deleted" {
                 if self.committed_row_exists(&path)? {
-                    self.remove_file_in_scope(Path::new(&path), "", &self.active_worktree_id)?;
+                    self.remove_file_in_scope(Path::new(&path), CheckoutRef {
+                        commit_sha: "",
+                        worktree_id: &self.active_worktree_id,
+                    })?;
                     healed += 1;
                 }
                 continue;
             }
             if self.committed_row_exists(&path)? {
-                self.remove_file_in_scope(Path::new(&path), "", &self.active_worktree_id)?;
+                self.remove_file_in_scope(Path::new(&path), CheckoutRef {
+                    commit_sha: "",
+                    worktree_id: &self.active_worktree_id,
+                })?;
                 healed += 1;
                 continue;
             }
@@ -1284,11 +1291,11 @@ impl IndexDatabase {
             // Both skip gates below read the same exact-scope-key row; fetch it once, and only when
             // a gate applies to this file.
             let scope_row = match &prepared_file.prepared {
-                Ok(_) if guard_concurrent_writes || explicit_paths => self.scope_row_state(
-                    &prepared_file.file.relative_path,
-                    &prepared_file.file.commit_sha,
-                    &prepared_file.file.worktree_id,
-                )?,
+                Ok(_) if guard_concurrent_writes || explicit_paths =>
+                    self.scope_row_state(&prepared_file.file.relative_path, CheckoutRef {
+                        commit_sha: &prepared_file.file.commit_sha,
+                        worktree_id: &prepared_file.file.worktree_id,
+                    })?,
                 _ => None,
             };
             // A lockless heal could have indexed a NEWER on-disk version of THIS exact scope key in
@@ -1331,19 +1338,17 @@ impl IndexDatabase {
             // with the symbols. Skipped once the batch already owes a rebuild — the capture
             // would be dead weight then.
             let replaced_grouping = if logical.is_relinkable() {
-                self.load_grouped_key_claims(
-                    &prepared_file.file.relative_path,
-                    &prepared_file.file.commit_sha,
-                    &prepared_file.file.worktree_id,
-                )?
+                self.load_grouped_key_claims(&prepared_file.file.relative_path, CheckoutRef {
+                    commit_sha: &prepared_file.file.commit_sha,
+                    worktree_id: &prepared_file.file.worktree_id,
+                })?
             } else {
                 None
             };
-            self.remove_file_in_scope(
-                &prepared_file.file.relative_path,
-                &prepared_file.file.commit_sha,
-                &prepared_file.file.worktree_id,
-            )?;
+            self.remove_file_in_scope(&prepared_file.file.relative_path, CheckoutRef {
+                commit_sha: &prepared_file.file.commit_sha,
+                worktree_id: &prepared_file.file.worktree_id,
+            })?;
             // Incremental per-file replace; chunk_fts is kept synced in place by the inline write
             // in insert_chunks (no full rebuild_fts). No accumulator — edges are
             // inserted unresolved here and resolved by resolve_edges in the caller's
@@ -1356,8 +1361,10 @@ impl IndexDatabase {
             let owed_relinks = match &replaced_grouping {
                 Some(replaced) => self.derive_key_stable_relinks(
                     &prepared_file.file.relative_path,
-                    &prepared_file.file.commit_sha,
-                    &prepared_file.file.worktree_id,
+                    CheckoutRef {
+                        commit_sha: &prepared_file.file.commit_sha,
+                        worktree_id: &prepared_file.file.worktree_id,
+                    },
                     replaced,
                 )?,
                 None => None,

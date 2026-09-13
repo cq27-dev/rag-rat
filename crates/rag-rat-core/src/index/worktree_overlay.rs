@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use rag_rat_base::checkout::{CheckoutKey, CheckoutRef};
+use rag_rat_base::checkout::CheckoutKey;
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::paths::path_string;
 

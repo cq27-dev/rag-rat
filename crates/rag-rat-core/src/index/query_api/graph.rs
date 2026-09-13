@@ -1,7 +1,6 @@
 //! Graph-query surface on `IndexDatabase`: caller/callee traversal (find_callers / trace_callees),
 //! impact_surface / ffi_surface, and the graph-vs-text / graph-vs-scip completeness comparisons.
 
-use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_query::graph::{
     self, Callsite, CompareGraphScipQuery, CompareGraphScipReport, CompareGraphScipSummary,
     CompareGraphTextQuery, CompareGraphTextReport, CompareGraphTextSummary, Direction, GraphHop,
@@ -33,14 +32,7 @@ impl IndexDatabase {
         &self,
         opts: &rag_rat_oracle::LibraryUsageOptions,
     ) -> anyhow::Result<rag_rat_oracle::LibraryUsageReport> {
-        rag_rat_oracle::check_library_usage(
-            self.storage.connection(),
-            CheckoutRef {
-                commit_sha: &self.active_commit_sha,
-                worktree_id: &self.active_worktree_id,
-            },
-            opts,
-        )
+        rag_rat_oracle::check_library_usage(self.storage.connection(), self.active_checkout(), opts)
     }
 
     pub fn find_callers_with_options(
@@ -98,10 +90,7 @@ impl IndexDatabase {
         // patch that must not displace it. Batch-first order + first-writer-wins per edge_id
         // gives exactly that, deterministically (never relying on ALL's declaration order).
         let conn = self.storage.connection();
-        let mut runs = rag_rat_oracle::latest_runs_in_scope(conn, CheckoutRef {
-            commit_sha: &self.active_commit_sha,
-            worktree_id: &self.active_worktree_id,
-        })?;
+        let mut runs = rag_rat_oracle::latest_runs_in_scope(conn, self.active_checkout())?;
         if runs.is_empty() {
             // No oracle run for this checkout — nothing to surface, all hops stay heuristic.
             return Ok(false);
@@ -115,10 +104,7 @@ impl IndexDatabase {
                 conn,
                 *tool,
                 tool_version,
-                CheckoutRef {
-                    commit_sha: &self.active_commit_sha,
-                    worktree_id: &self.active_worktree_id,
-                },
+                self.active_checkout(),
                 &edge_ids,
             )? {
                 verdicts.entry(edge_id).or_insert(verdict);
@@ -476,10 +462,7 @@ impl IndexDatabase {
         // verdict sets are disjoint across languages, but a live tool (`ra-lsp`) overlaps its
         // batch counterpart on the same Rust edges — without the dedupe one edge would appear
         // once per tool, and the batch (canonical) verdict is the one to show.
-        let mut runs = rag_rat_oracle::latest_runs_in_scope(conn, CheckoutRef {
-            commit_sha: &self.active_commit_sha,
-            worktree_id: &self.active_worktree_id,
-        })?;
+        let mut runs = rag_rat_oracle::latest_runs_in_scope(conn, self.active_checkout())?;
         // Stable sort by declared AUTHORITY: canonical tools first, preserving their ALL order.
         runs.sort_by_key(|(tool, _)| tool.authority());
         let mut summary = CompareGraphScipSummary::default();
@@ -503,11 +486,12 @@ impl IndexDatabase {
         // authoritative tool doesn't share would be a false "compiler disagrees with the graph".
         let mut canonical_covered = std::collections::HashSet::new();
         for (tool, version) in &runs {
-            let comparisons =
-                rag_rat_oracle::current_oracle_comparisons(conn, *tool, version, CheckoutRef {
-                    commit_sha: &self.active_commit_sha,
-                    worktree_id: &self.active_worktree_id,
-                })?;
+            let comparisons = rag_rat_oracle::current_oracle_comparisons(
+                conn,
+                *tool,
+                version,
+                self.active_checkout(),
+            )?;
             summary.verdicts_examined += u64::try_from(comparisons.len()).unwrap_or(u64::MAX);
             let is_canonical = tool.authority() == rag_rat_oracle::Authority::Canonical;
             for comparison in comparisons {

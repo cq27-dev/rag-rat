@@ -1,6 +1,7 @@
 //! File-row reads and scope mutations: fetch the file row, mark/remove files in the active scope,
 //! and count indexed files.
 
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::paths::path_string;
 use rag_rat_base::time::now_ms;
 
@@ -166,7 +167,7 @@ impl IndexDatabase {
         worktree_id: &str,
     ) -> anyhow::Result<()> {
         let path = path_string(path);
-        self.remove_file_in_scope(Path::new(&path), "", worktree_id)?;
+        self.remove_file_in_scope(Path::new(&path), CheckoutRef { commit_sha: "", worktree_id })?;
         self.storage.connection().execute(
             "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
              indexed_at_ms, indexed_revision, commit_sha, worktree_id, repo_id, generation)
@@ -188,9 +189,9 @@ impl IndexDatabase {
     pub(super) fn remove_file_in_scope(
         &self,
         path: &Path,
-        commit_sha: &str,
-        worktree_id: &str,
+        checkout: CheckoutRef<'_>,
     ) -> anyhow::Result<()> {
+        let CheckoutRef { commit_sha, worktree_id } = checkout;
         // #493: every live-scope file replacement funnels through here, so this is the seam that
         // memoizes the drift-heal snapshot BEFORE the symbol deletes below destroy its
         // member-signature evidence. A no-op unless the key-version stamp is stale, and paid at
@@ -367,9 +368,9 @@ impl IndexDatabase {
     pub(super) fn scope_row_state(
         &self,
         path: &Path,
-        commit_sha: &str,
-        worktree_id: &str,
+        checkout: CheckoutRef<'_>,
     ) -> anyhow::Result<Option<ScopeRowState>> {
+        let CheckoutRef { commit_sha, worktree_id } = checkout;
         self.storage
             .connection()
             .query_row(

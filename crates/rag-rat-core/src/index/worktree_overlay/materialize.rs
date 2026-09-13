@@ -1,3 +1,5 @@
+use rag_rat_base::checkout::CheckoutRef;
+
 use super::*;
 
 impl IndexDatabase {
@@ -291,7 +293,10 @@ impl IndexDatabase {
                 if !is_present_indexable(rel, full)
                     && self.overlay_source_row_exists(rel, &worktree_id)?
                 {
-                    self.remove_file_in_scope(rel, "", &worktree_id)?;
+                    self.remove_file_in_scope(rel, CheckoutRef {
+                        commit_sha: "",
+                        worktree_id: &worktree_id,
+                    })?;
                     pruned_paths.push(rel.clone());
                 }
             }
@@ -405,7 +410,10 @@ impl IndexDatabase {
         // not sha alone: a branch config change that RE-LANGUAGES a byte-identical file
         // must still rewrite the overlay row, mirroring discovery / the base `Paths` flow's
         // staleness (#659).
-        let existing = self.scope_file_identities(&scope.commit_sha, &scope.worktree_id)?;
+        let existing = self.scope_file_identities(CheckoutRef {
+            commit_sha: &scope.commit_sha,
+            worktree_id: &scope.worktree_id,
+        })?;
         let mut files = Vec::new();
         for rel in paths {
             let full_path = source_root.join(rel);

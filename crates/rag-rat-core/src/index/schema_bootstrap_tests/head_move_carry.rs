@@ -4,6 +4,7 @@
 //! chunk/symbol/edge/embedding/memory-binding hanging off it, survives — so a HEAD move costs
 //! roughly its diff, not a full reindex.
 
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::hash::hex_sha256;
 
 use super::*;
@@ -97,7 +98,9 @@ fn scope_row_state_reads_the_scoped_disk_mtime() {
         .unwrap();
     let path = std::path::Path::new("src/lib.rs");
     let mtime_at = |path: &std::path::Path, commit_sha: &str| {
-        db.scope_row_state(path, commit_sha, &worktree_id).unwrap().map(|row| row.modified_at_ms)
+        db.scope_row_state(path, CheckoutRef { commit_sha, worktree_id: &worktree_id })
+            .unwrap()
+            .map(|row| row.modified_at_ms)
     };
 
     // The guard reads this exact scope's mtime — the value it compares against the prepared mtime.

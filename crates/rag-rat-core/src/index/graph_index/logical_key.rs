@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 
+use rag_rat_base::checkout::CheckoutRef;
+
 use crate::index::*;
 
 /// Grouping key that collapses cfg variants / overloads of one symbol into a single logical symbol.
@@ -469,9 +471,9 @@ impl IndexDatabase {
     pub(in crate::index) fn load_grouped_key_claims(
         &self,
         path: &Path,
-        commit_sha: &str,
-        worktree_id: &str,
+        checkout: CheckoutRef<'_>,
     ) -> anyhow::Result<Option<BTreeMap<ReplacedSymbolKey, GroupedKeyClaim>>> {
+        let CheckoutRef { commit_sha, worktree_id } = checkout;
         let conn = self.storage.connection();
         // Same joins as the rebuild's grouping SELECT (raw `main.*`, repo + generation scoped),
         // narrowed to the one scope row being replaced.
@@ -537,10 +539,10 @@ impl IndexDatabase {
     pub(in crate::index) fn derive_key_stable_relinks(
         &self,
         path: &Path,
-        commit_sha: &str,
-        worktree_id: &str,
+        checkout: CheckoutRef<'_>,
         replaced: &BTreeMap<ReplacedSymbolKey, GroupedKeyClaim>,
     ) -> anyhow::Result<Option<Vec<LogicalMemberRelink>>> {
+        let CheckoutRef { commit_sha, worktree_id } = checkout;
         struct ReplacementSymbolSpan {
             symbol_id: i64,
             start_line: i64,
