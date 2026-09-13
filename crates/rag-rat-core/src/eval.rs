@@ -693,32 +693,19 @@ fn evaluate_query(
     }
     let top_hits = top_hits(&hits);
 
-    let path_hits = query
-        .must_include_paths
-        .iter()
-        .filter(|expected| hits.iter().any(|hit| hit.path == **expected))
-        .cloned()
-        .collect::<Vec<_>>();
-    let missing_paths = missing(&query.must_include_paths, &path_hits);
-    let symbol_hits = query
-        .must_include_symbols
-        .iter()
-        .filter(|expected| {
+    let (path_hits, missing_paths) = partition_expected(&query.must_include_paths, |expected| {
+        hits.iter().any(|hit| hit.path == expected)
+    });
+    let (symbol_hits, missing_symbols) =
+        partition_expected(&query.must_include_symbols, |expected| {
             hits.iter()
                 .filter_map(|hit| hit.symbol_path.as_deref())
-                .any(|symbol| symbol == expected.as_str() || symbol.ends_with(expected.as_str()))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let missing_symbols = missing(&query.must_include_symbols, &symbol_hits);
-
-    let graph_target_hits = query
-        .must_include_graph_targets
-        .iter()
-        .filter(|expected| hits.iter().any(|hit| graph_hit_matches(hit, expected)))
-        .cloned()
-        .collect::<Vec<_>>();
-    let missing_graph_targets = missing(&query.must_include_graph_targets, &graph_target_hits);
+                .any(|symbol| symbol == expected || symbol.ends_with(expected))
+        });
+    let (graph_target_hits, missing_graph_targets) =
+        partition_expected(&query.must_include_graph_targets, |expected| {
+            hits.iter().any(|hit| graph_hit_matches(hit, expected))
+        });
 
     let impact = if query.must_include_impact_categories.is_empty()
         && query.must_include_impact_paths.is_empty()
@@ -728,58 +715,35 @@ fn evaluate_query(
     } else {
         db.impact_surface(&query.text, TOP_K as u32).unwrap_or_default()
     };
-    let impact_category_hits = query
-        .must_include_impact_categories
-        .iter()
-        .filter(|expected| impact.iter().any(|item| item.category == **expected))
-        .cloned()
-        .collect::<Vec<_>>();
-    let missing_impact_categories =
-        missing(&query.must_include_impact_categories, &impact_category_hits);
-    let impact_path_hits = query
-        .must_include_impact_paths
-        .iter()
-        .filter(|expected| impact.iter().any(|item| item.path == **expected))
-        .cloned()
-        .collect::<Vec<_>>();
-    let missing_impact_paths = missing(&query.must_include_impact_paths, &impact_path_hits);
-    let impact_symbol_hits = query
-        .must_include_impact_symbols
-        .iter()
-        .filter(|expected| {
+    let (impact_category_hits, missing_impact_categories) =
+        partition_expected(&query.must_include_impact_categories, |expected| {
+            impact.iter().any(|item| item.category == expected)
+        });
+    let (impact_path_hits, missing_impact_paths) =
+        partition_expected(&query.must_include_impact_paths, |expected| {
+            impact.iter().any(|item| item.path == expected)
+        });
+    let (impact_symbol_hits, missing_impact_symbols) =
+        partition_expected(&query.must_include_impact_symbols, |expected| {
             impact
                 .iter()
                 .filter_map(|item| item.symbol.as_deref())
-                .any(|symbol| symbol == expected.as_str() || symbol.ends_with(expected.as_str()))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let missing_impact_symbols = missing(&query.must_include_impact_symbols, &impact_symbol_hits);
+                .any(|symbol| symbol == expected || symbol.ends_with(expected))
+        });
 
     let commit_hits = db.commit_search(&query.text, TOP_K as u32).unwrap_or_default();
-    let git_subject_hits = query
-        .should_include_git_subjects
-        .iter()
-        .filter(|expected| {
+    let (git_subject_hits, missing_git_subjects) =
+        partition_expected(&query.should_include_git_subjects, |expected| {
             let needle = expected.to_ascii_lowercase();
             commit_hits.iter().any(|hit| hit.subject.to_ascii_lowercase().contains(&needle))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let missing_git_subjects = missing(&query.should_include_git_subjects, &git_subject_hits);
+        });
 
     let papertrail = db.rationale_search(&query.text, TOP_K as u32).unwrap_or_default();
-    let papertrail_kind_hits = query
-        .should_include_papertrail_kinds
-        .iter()
-        .filter(|expected| {
+    let (papertrail_kind_hits, missing_papertrail_kinds) =
+        partition_expected(&query.should_include_papertrail_kinds, |expected| {
             let needle = normalize_kind(expected);
             papertrail.iter().any(|item| normalize_kind(&item.classification) == needle)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let missing_papertrail_kinds =
-        missing(&query.should_include_papertrail_kinds, &papertrail_kind_hits);
+        });
     let papertrail_precision_sample = if query.should_include_papertrail_kinds.is_empty() {
         None
     } else if papertrail.is_empty() {
@@ -1057,9 +1021,13 @@ fn graph_hit_matches(hit: &crate::search::lexical::SearchHit, expected: &str) ->
             .any(|ty| ty.name == expected || ty.name.ends_with(expected))
 }
 
-fn missing(expected: &[String], found: &[String]) -> Vec<String> {
-    let found = found.iter().collect::<BTreeSet<_>>();
-    expected.iter().filter(|value| !found.contains(value)).cloned().collect()
+/// Split `expected` into the entries `matches` accepts (hits) and the rest (misses), both in
+/// declaration order.
+fn partition_expected(
+    expected: &[String],
+    matches: impl Fn(&str) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    expected.iter().cloned().partition(|value| matches(value))
 }
 
 fn find_current_source_violations(
