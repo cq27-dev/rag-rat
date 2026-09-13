@@ -139,6 +139,13 @@ fn symbol_is_function_valued(node: Node<'_>) -> bool {
     })
 }
 
+/// Boundary view of one indexed symbol the engine wants fingerprinted (span + kind only).
+pub struct FingerprintCandidate<'a> {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub kind: &'a str,
+}
+
 /// Baseline fingerprints for a file's fingerprintable symbols, walking the SHARED parse tree (no
 /// re-parse, no DB). Returns `(local_symbol_index, fingerprint)` pairs keyed by index into
 /// `symbols`, so the caller maps each to the right DB id when it writes. A symbol is fingerprinted
@@ -147,13 +154,6 @@ fn symbol_is_function_valued(node: Node<'_>) -> bool {
 /// that normalize below `MIN_TOKENS` are skipped. The full-rebuild prepare phase calls this from
 /// the parse it already did for symbols/edges; the incremental path re-parses and calls it from
 /// `store_symbol_fingerprints`.
-/// Boundary view of one indexed symbol the engine wants fingerprinted (span + kind only).
-pub struct FingerprintCandidate<'a> {
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub kind: &'a str,
-}
-
 pub fn fingerprint_symbols(
     root: Node<'_>,
     text: &str,
