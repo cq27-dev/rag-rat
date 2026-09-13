@@ -522,9 +522,6 @@ impl CookbookProvisioner {
     }
 }
 
-/// Build the `CookbookInput` (the env-passed provisioning request) from an ephemeral remote config.
-/// Split out from `provision_and_build` so the config→input mapping — notably that the configured
-/// `backend`, `gpu`, and `num_ctx` are forwarded — is unit-testable without spawning a real recipe.
 /// The Rust-side handshake deadline for [`CookbookProvisioner::provision`]. The floor is
 /// backend-aware (vLLM's huge image needs longer than ollama/infinity; the default covers an
 /// unrecognized backend). A larger `provision_timeout_s` (the distill 30B box, whose weight pull
@@ -539,6 +536,9 @@ fn provision_deadline(input: &CookbookInput) -> Duration {
         .max(backend_floor)
 }
 
+/// Build the `CookbookInput` (the env-passed provisioning request) from an ephemeral remote config.
+/// Split out from `provision_and_build` so the config→input mapping — notably that the configured
+/// `backend`, `gpu`, and `num_ctx` are forwarded — is unit-testable without spawning a real recipe.
 fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
     CookbookInput {
         model: remote.model.trim().to_string(),
@@ -570,16 +570,6 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
     }
 }
 
-/// Provision an ephemeral cookbook box for the selected `spec` over `remote` and build an
-/// [`OpenAiEmbedder`] against it. The single place that wires `cookbook` → `CookbookInput` →
-/// `CookbookProvisioner::provision` → `OpenAiEmbedder::from_provisioned`; shared by the reconcile
-/// ephemeral chunk path AND the install probe (status.rs) so the model→input→handshake→embedder
-/// chain isn't duplicated. The returned [`ProvisionedBox`] MUST be kept alive for as long as the
-/// embedder is used (its `Drop` is the box teardown).
-/// Returns `(embedder, box, persisted_remote, window_concurrency)`. `persisted_remote` keeps the
-/// user's `concurrency` CAP (for the active-config meta); `window_concurrency` is the tuned client
-/// knee (<= cap) — the embedder's real fan-out, which the reconcile path uses to size its selection
-/// window so it doesn't load a cap-wide window the embedder will only drain `knee`-at-a-time.
 /// Context for the in-Rust throughput sweep (see [`crate::index::ai::throughput_tune`]). Present
 /// only on the reconcile path (which has the DB `conn` for the tune cache and the configured chunk
 /// size); the install probe / wizard verify pass `None` (they just ping — no sweep).
@@ -594,6 +584,16 @@ pub struct TuneRequest<'a> {
     pub allow_sweep: bool,
 }
 
+/// Provision an ephemeral cookbook box for the selected `spec` over `remote` and build an
+/// [`OpenAiEmbedder`] against it. The single place that wires `cookbook` → `CookbookInput` →
+/// `CookbookProvisioner::provision` → `OpenAiEmbedder::from_provisioned`; shared by the reconcile
+/// ephemeral chunk path AND the install probe (status.rs) so the model→input→handshake→embedder
+/// chain isn't duplicated. The returned [`ProvisionedBox`] MUST be kept alive for as long as the
+/// embedder is used (its `Drop` is the box teardown).
+/// Returns `(embedder, box, persisted_remote, window_concurrency)`. `persisted_remote` keeps the
+/// user's `concurrency` CAP (for the active-config meta); `window_concurrency` is the tuned client
+/// knee (<= cap) — the embedder's real fan-out, which the reconcile path uses to size its selection
+/// window so it doesn't load a cap-wide window the embedder will only drain `knee`-at-a-time.
 pub fn provision_and_build(
     remote: &RemoteEmbeddingConfig,
     spec: &EmbeddingModelSpec,

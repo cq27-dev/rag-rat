@@ -129,6 +129,16 @@ pub(crate) enum ChunkEmbedder {
     /// diagnostics; the caller reports a generic "model not ready".
     NotReady(anyhow::Error),
 }
+/// Acquire the CHUNK-embed embedder for a reconcile. EPHEMERAL active model: on a provisioning
+/// reconcile, FIRST check for pending candidate chunks — if none, `NoEphemeralWork` (never
+/// provision a paid box for zero work, #330-6); otherwise provision the cookbook box + build an
+/// embedder against it (the bulk path, `provision_and_build`). On a non-provisioning pass (watcher
+/// / maintenance): embed the changed chunks LOCALLY against `query_endpoint` when a probe embed on
+/// it SUCCEEDS (the light/incremental path — no cold-start, single-flight, same vector space as the
+/// box); `SkipEphemeral` when there is no local query server or the probe fails. CONNECT/local: the
+/// usual `active_embedder`. Provisioning happens ONCE here, not per batch. `provision_remote` gates
+/// the cold-start (only an explicit `rag-rat reconcile` sets it); `scan`/`options` size the
+/// provision-path pending-work check.
 pub(crate) fn acquire_chunk_embedder(
     conn: &Connection,
     intra_threads: Option<usize>,

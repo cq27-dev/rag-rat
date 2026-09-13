@@ -1,7 +1,7 @@
-//! Embedding-provider layer: the `Embedder` trait, the backend dispatch (`embedder_for_spec`),
-//! the active-model resolution (`active_embedder`), and one concrete backend per submodule.
-//! This module is the single construction site for every embedder — callers reach it through the
-//! curated re-exports in `index::ai`.
+//! Embedding-provider surface: the `Embedder` trait, the `MockEmbedder`, endpoint log
+//! sanitization, the missing-feature messages, and re-exports of every concrete backend plus the
+//! ephemeral cookbook seams. The backend dispatch (`embedder_for_spec`) and active-model
+//! resolution (`active_embedder`) live in rag-rat-core's `index::ai::embedder_select`.
 
 // Ungated: the ephemeral cookbook lifecycle (#318) spawns a subprocess via std::process — no heavy
 // optional dependency, so it ships unconditionally like the Ollama backend.
@@ -18,23 +18,14 @@ pub use crate::cookbook::{
     install_provision_log_sink, verify_ephemeral_remote, verify_ephemeral_remote_cancellable,
 };
 #[cfg(feature = "fastembed")]
-#[cfg(feature = "fastembed")]
 pub use crate::fastembed::FastEmbedEmbedder;
 pub use crate::hash::HashEmbedder;
 pub use crate::model2vec::MODEL2VEC_HF_REPO;
 #[cfg(feature = "model2vec")]
-#[cfg(feature = "model2vec")]
 pub use crate::model2vec::Model2VecEmbedder;
-// Ungated `pub` re-export (crate-public path `crate::index::ai::providers::OpenAiEmbedder`):
-// wired into `embedder_for_spec` in #317 task 5, so nothing constructs it yet. The `pub`
-// visibility (same pattern as the other backends) exempts it from dead-code/unused-import
-// analysis under `-D warnings` until the dispatch arm lands.
 pub use crate::openai::OpenAiEmbedder;
 // The tuning sweep (index::ai::throughput_tune) builds embedders at varied concurrencies.
 pub(crate) use crate::openai::ProvisionedEmbedderParams;
-// The shared connect-mode auth resolver — reused by the dream verdict client
-// (`dream/model.rs`) so a configured-but-unresolved `auth_env` errors identically for
-// embeddings and the dream model.
 
 pub const MODEL2VEC_MISSING_FEATURE_MESSAGE: &str =
     "Model2Vec backend requested, but this binary was built without Model2Vec support.\nRebuild \
@@ -54,16 +45,6 @@ pub trait Embedder {
 /// pass. The provisioned-box path is unaffected (it keeps the configured timeout).
 pub const LIGHT_REQUEST_TIMEOUT_S: u64 = 30;
 
-/// Acquire the CHUNK-embed embedder for a reconcile. EPHEMERAL active model: on a provisioning
-/// reconcile, FIRST check for pending candidate chunks — if none, `NoEphemeralWork` (never
-/// provision a paid box for zero work, #330-6); otherwise provision the cookbook box + build an
-/// embedder against it (the bulk path, `provision_and_build`). On a non-provisioning pass (watcher
-/// / maintenance): embed the changed chunks LOCALLY against `query_endpoint` when a probe embed on
-/// it SUCCEEDS (the light/incremental path — no cold-start, single-flight, same vector space as the
-/// box); `SkipEphemeral` when there is no local query server or the probe fails. CONNECT/local: the
-/// usual `active_embedder`. Provisioning happens ONCE here, not per batch. `provision_remote` gates
-/// the cold-start (only an explicit `rag-rat reconcile` sets it); `scan`/`options` size the
-/// provision-path pending-work check.
 /// Strip credentials + path from an endpoint URL before logging it: keep `scheme://host[:port]`
 /// only. A debug log is a shared, greppable on-disk artifact, and an endpoint may carry inline
 /// `user:pass@` userinfo (the connect/query endpoints support it — see `endpoint_is_loopback`), so
