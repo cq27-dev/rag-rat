@@ -36,7 +36,7 @@ use minicbor::{Decoder, Encoder};
 use sha2::{Digest, Sha256};
 
 use super::account::AccountId;
-use super::cbor;
+use super::cbor::{self, INFALLIBLE};
 
 /// Domain tag + version for the stream-identity derivation. Bump only when the canonical rule
 /// itself changes — never when a kind/relation token is added.
@@ -47,9 +47,6 @@ const STREAM_DOMAIN: &str = "rag-rat/stream/1";
 /// transitively names its owner — two accounts claiming one stream is cryptographically impossible.
 /// `/1` stays local-only (never on the wire); `/2` is what sync mints.
 const STREAM_V2_DOMAIN: &str = "rag-rat/stream/2";
-
-/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::op`.
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// A stream's immutable identity: `sha256` of the canonical policy tuple. The scoping key for
 /// chains, watermarks, fork detection, and the shadow projection.
@@ -305,7 +302,9 @@ pub fn decode_spec_v2(bytes: &[u8]) -> anyhow::Result<StreamSpecV2> {
         "stream/2 spec must be a 6- or 7-element array"
     );
     anyhow::ensure!(dec.str()? == STREAM_V2_DOMAIN, "unknown stream spec domain");
-    let owner_account_id = AccountId::from_bytes(decode_fixed::<32>(&mut dec, "owner account")?);
+    let owner_account_id = AccountId::from_bytes(
+        dec.bytes()?.try_into().map_err(|_| anyhow::anyhow!("owner account must be 32 bytes"))?,
+    );
     let policy = StreamSpec {
         repo_set: decode_str_array(&mut dec)?,
         kind_allow_list: decode_optional_str_array(&mut dec)?,
@@ -328,21 +327,15 @@ pub fn decode_spec_v2(bytes: &[u8]) -> anyhow::Result<StreamSpecV2> {
     Ok(spec)
 }
 
-fn decode_fixed<const N: usize>(
-    dec: &mut Decoder<'_>,
-    field: &'static str,
-) -> anyhow::Result<[u8; N]> {
-    let value = dec.bytes()?;
-    value.try_into().map_err(|_| anyhow::anyhow!("{field} must be {N} bytes"))
-}
+/// This decoder's wording for a non-canonical array header; the shared `cbor` readers word it
+/// differently, so the length check stays here.
+const INDEFINITE_ARRAY: &str = "indefinite arrays are not canonical";
 
+/// A definite-length array of text strings: the length check keeps this decoder's error wording,
+/// the element reads (and their no-preallocation guard) are the shared `cbor` reader's.
 fn decode_str_array(dec: &mut Decoder<'_>) -> anyhow::Result<Vec<String>> {
-    let len = dec.array()?.ok_or_else(|| anyhow::anyhow!("indefinite arrays are not canonical"))?;
-    let mut values = Vec::with_capacity(len as usize);
-    for _ in 0..len {
-        values.push(dec.str()?.to_string());
-    }
-    Ok(values)
+    anyhow::ensure!(dec.probe().array()?.is_some(), INDEFINITE_ARRAY);
+    Ok(cbor::decode_str_array(dec)?)
 }
 
 fn decode_optional_str_array(dec: &mut Decoder<'_>) -> anyhow::Result<Option<Vec<String>>> {
@@ -355,8 +348,9 @@ fn decode_optional_str_array(dec: &mut Decoder<'_>) -> anyhow::Result<Option<Vec
 }
 
 fn decode_overrides(dec: &mut Decoder<'_>) -> anyhow::Result<Vec<NodeOverride>> {
-    let len = dec.array()?.ok_or_else(|| anyhow::anyhow!("indefinite arrays are not canonical"))?;
-    let mut overrides = Vec::with_capacity(len as usize);
+    let len = dec.array()?.ok_or_else(|| anyhow::anyhow!(INDEFINITE_ARRAY))?;
+    // Attacker-controlled header: grow as decoded rather than preallocating `len`.
+    let mut overrides = Vec::new();
     for _ in 0..len {
         anyhow::ensure!(dec.array()? == Some(2), "stream override must be a 2-element array");
         let node_id = dec.str()?.to_string();
@@ -418,6 +412,23 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn a_short_owner_account_keeps_its_decode_error_wording() {
+        let mut bytes = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut bytes);
+            enc.array(6).expect(INFALLIBLE);
+            enc.str(STREAM_V2_DOMAIN).expect(INFALLIBLE);
+            enc.bytes(&[0]).expect(INFALLIBLE);
+            enc.array(0).expect(INFALLIBLE);
+            enc.null().expect(INFALLIBLE);
+            enc.null().expect(INFALLIBLE);
+            enc.array(0).expect(INFALLIBLE);
+        }
+        let err = decode_spec_v2(&bytes).unwrap_err();
+        assert_eq!(err.to_string(), "owner account must be 32 bytes");
     }
 
     fn filtered_spec() -> StreamSpec {

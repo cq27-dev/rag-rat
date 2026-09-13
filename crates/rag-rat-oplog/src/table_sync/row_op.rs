@@ -18,15 +18,11 @@ use minicbor::Encoder;
 use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
 
-use crate::cbor;
+use crate::cbor::{self, INFALLIBLE, VecEncoder};
 
 /// Domain tag + version, the envelope's first element. Bump the version to evolve the wire format
 /// deliberately (an old binary then rejects the new domain rather than misreading it).
 const DOMAIN: &str = "rag-rat/table-op/1";
-
-/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible), so every encode step
-/// `.expect`s this — mirrors `op`/`content_hash`.
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// One replicated cell: a column name and its typed value. Cells within an op are ordered by column
 /// name and unique — the canonical form the wire pins.
@@ -108,8 +104,6 @@ pub enum DecodedRowOp {
     Known(RowOp),
     Unknown { tag: String, raw: Vec<u8> },
 }
-
-type VecEncoder<'a> = Encoder<&'a mut Vec<u8>>;
 
 /// Encode one row op to canonical CBOR: `[domain, op-kind, payload]`, definite lengths throughout,
 /// deterministic. Cells are emitted sorted by column name so the bytes are stable regardless of the

@@ -19,8 +19,17 @@
 //! demanding `encode(decode(bytes)) == bytes` (e.g. sorted+deduped tags in `op`); this module is
 //! the encoding-level floor beneath that.
 
+use minicbor::Encoder;
 use minicbor::decode::{Decoder, Error as CborError};
 use sha2::{Digest, Sha256};
+
+/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible), so every encode step
+/// `.expect`s this.
+pub(super) const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
+
+/// A `minicbor` encoder writing into an owned `Vec` — the concrete, infallible target every encode
+/// helper shares.
+pub(super) type VecEncoder<'a> = Encoder<&'a mut Vec<u8>>;
 
 /// Validate that `bytes` is EXACTLY one canonical CBOR item (RFC 8949 §4.2 core-deterministic) with
 /// no trailing bytes: MINIMAL-length argument headers, DEFINITE lengths only, sorted + unique map
@@ -175,6 +184,19 @@ pub(super) fn expect_array(d: &mut Decoder<'_>, want: u64) -> Result<(), CborErr
 /// array (canonical CBOR is definite-length only).
 pub(super) fn expect_definite_len(d: &mut Decoder<'_>) -> Result<u64, CborError> {
     d.array()?.ok_or_else(|| CborError::message("expected a definite-length array"))
+}
+
+/// Read a definite-length array of text strings.
+pub(super) fn decode_str_array(d: &mut Decoder<'_>) -> Result<Vec<String>, CborError> {
+    let len = expect_definite_len(d)?;
+    // Do NOT preallocate `len`: it is an attacker-controllable CBOR array header, so a bogus huge
+    // count would OOM before the (short) body is even read. Grow as elements are actually decoded —
+    // a truncated array errors at the first missing element, bounding work by real input size.
+    let mut out = Vec::new();
+    for _ in 0..len {
+        out.push(d.str()?.to_string());
+    }
+    Ok(out)
 }
 
 /// `sha256` into a fixed 32-byte array — the entry-hash / content-address primitive shared by the

@@ -35,7 +35,7 @@ use minicbor::Encoder;
 use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
 
-use super::cbor;
+use super::cbor::{self, INFALLIBLE};
 use super::device::{DevicePublic, DeviceSecret};
 use super::op::{self, DeviceFingerprint, MemoryOp};
 use super::stream::StreamId;
@@ -47,10 +47,6 @@ const ENTRY_DOMAIN: &str = "rag-rat/entry/2";
 
 /// Domain tag + version for the outer transport envelope (body + signature).
 const SIGNED_DOMAIN: &str = "rag-rat/signed-entry/1";
-
-/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible), so every encode step
-/// `.expect`s this — mirrors `super::op`.
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// Upper bound on an entry's lamport, far below `i64::MAX`. A Lamport clock increments by one per
 /// op, so a legitimate value never approaches this; a larger one is malformed or a wedging attack.

@@ -35,15 +35,11 @@ use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
 use rag_rat_query::memory::{self, EdgeRelation};
 
-use super::cbor;
+use super::cbor::{self, INFALLIBLE, VecEncoder};
 
 /// Domain tag + version, the envelope's first element. Bump the version to evolve the wire format
 /// deliberately (an old binary then rejects the new domain rather than misreading it).
 const DOMAIN: &str = "rag-rat/op/1";
-
-/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible), so every encode step
-/// `.expect`s this — mirrors `content_hash`.
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// A globally-unique memory/graph-node id (the `repo_memories.id` / `source_node_id` shape). Owned
 /// and `Ord` so it keys the projected `nodes` map.
@@ -472,10 +468,6 @@ pub enum DecodedOp {
     Unknown { tag: String, raw: Vec<u8> },
 }
 
-/// A `minicbor` encoder writing into an owned `Vec` — the concrete, infallible target every encode
-/// helper shares.
-type VecEncoder<'a> = Encoder<&'a mut Vec<u8>>;
-
 /// Encode one op to canonical CBOR: `[domain, op-kind, payload]`, definite lengths throughout,
 /// deterministic. The op's METADATA (`OpMeta`) is NOT encoded here — it belongs to the signed
 /// envelope (a later increment); these bytes freeze the op wire format the golden vectors pin.
@@ -742,7 +734,7 @@ fn decode_content(d: &mut Decoder<'_>) -> Result<NodeContent, CborError> {
     let body = d.str()?.to_string();
     let confidence = d.str()?.to_string();
     let source = d.str()?.to_string();
-    let tags = decode_str_array(d)?;
+    let tags = cbor::decode_str_array(d)?;
     let payload = decode_opt_str(d)?;
     Ok(NodeContent { kind, title, body, confidence, source, tags, payload })
 }
@@ -799,7 +791,7 @@ fn decode_anchors(d: &mut Decoder<'_>) -> Result<Vec<PortableAnchor>, CborError>
     let len = cbor::expect_definite_len(d)?;
     // Judge the COUNT from the header before decoding a single element. The length is
     // attacker-controlled, so this both bounds the work and stays clear of trusting it enough to
-    // preallocate — the `decode_str_array` rule.
+    // preallocate — the `cbor::decode_str_array` rule.
     if len > MAX_ANCHORS_PER_OP as u64 {
         return Err(CborError::message(format!(
             "node_anchors carries {len} anchors, over the {MAX_ANCHORS_PER_OP} limit"
@@ -889,18 +881,6 @@ fn decode_resolved(d: &mut Decoder<'_>) -> Result<ResolvedAnchor, CborError> {
     let target_node_id = decode_opt_str(d)?;
     let anchor_status = d.str()?.to_string();
     Ok(ResolvedAnchor { target_repo_id, target_node_id, anchor_status })
-}
-
-fn decode_str_array(d: &mut Decoder<'_>) -> Result<Vec<String>, CborError> {
-    let len = cbor::expect_definite_len(d)?;
-    // Do NOT preallocate `len`: it is an attacker-controllable CBOR array header, so a bogus huge
-    // count would OOM before the (short) body is even read. Grow as elements are actually decoded —
-    // a truncated array errors at the first missing element, bounding work by real input size.
-    let mut out = Vec::new();
-    for _ in 0..len {
-        out.push(d.str()?.to_string());
-    }
-    Ok(out)
 }
 
 fn decode_opt_str(d: &mut Decoder<'_>) -> Result<Option<String>, CborError> {

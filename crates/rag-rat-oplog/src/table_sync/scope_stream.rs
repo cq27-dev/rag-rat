@@ -9,14 +9,12 @@
 
 use minicbor::Encoder;
 
-use crate::{AccountId, StreamId, cbor};
+use crate::cbor::{self, INFALLIBLE};
+use crate::{AccountId, StreamId};
 
 /// Domain tag + version for the table-sync stream identity. `/5` is a sibling of the content `/2`
 /// derivation; bump the version only if the canonical rule itself changes.
 const TABLE_STREAM_DOMAIN: &str = "rag-rat/stream/5";
-
-/// Writing CBOR into a `Vec` cannot fail — mirrors `super::row_op` / `super::super::stream`.
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// Derive the immutable `stream_id` for a scope's table-sync log:
 /// `sha256(cbor(["rag-rat/stream/5", account_id (b32), repo_id, incarnation_ref (b32),
