@@ -33,7 +33,7 @@
 use std::io::{BufRead, BufReader};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 #[cfg(unix)]
 use std::sync::atomic::AtomicI32;
 #[cfg(windows)]
@@ -366,151 +366,47 @@ impl CookbookProvisioner {
         ACTIVE_CHILD_PID.store(child.id(), Ordering::SeqCst);
 
         if cancel() {
-            #[cfg(unix)]
-            teardown_group(pgid, &mut child);
-            #[cfg(windows)]
-            {
-                let pid = child.id();
-                taskkill_tree(pid);
-                clear_active_child_pid(pid);
-                let _ = child.wait();
-            }
-            #[cfg(all(not(unix), not(windows)))]
-            {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            abort_cancelled_cookbook(&mut child);
             anyhow::bail!("cookbook `{label}` provisioning cancelled before handshake");
         }
 
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
+        let (stderr_handle, err_rx) =
+            spawn_stderr_drain(child.stderr.take().expect("piped stderr"));
+        let stdout = spawn_stdout_reader(child.stdout.take().expect("piped stdout"));
 
-        // Drain stderr on a thread: forward each (length-capped) line to OUR stderr AND retain only
-        // the last `MAX_CAPTURED_LINES` in a ring buffer, so a failure can report what the cookbook
-        // last said WITHOUT an uncapped accumulator a hostile recipe could OOM us with.
-        let (err_tx, err_rx) = mpsc::channel::<Vec<String>>();
-        let stderr_handle = std::thread::spawn(move || {
-            let mut captured: std::collections::VecDeque<String> =
-                std::collections::VecDeque::new();
-            let mut reader = BufReader::new(stderr);
-            // `read_capped_line` bounds each line's memory at the READ level (a newline-less flood
-            // is drained, not buffered) — `BufRead::lines()` would allocate the whole
-            // line first.
-            while let Ok(Some(line)) = read_capped_line(&mut reader) {
-                emit_provision_log(format!("cookbook: {line}"));
-                captured.push_back(line);
-                if captured.len() > MAX_CAPTURED_LINES {
-                    captured.pop_front();
-                }
-            }
-            let _ = err_tx.send(captured.into_iter().collect());
-        });
-
-        // Read stdout on a thread: parse each line as a typed `CookbookEvent`.
-        //  - `Ready`  → the handshake signal `(endpoint, auth_token)` (sent ONCE).
-        //  - `Status`/`Log`/`Error` → routed through the ONE `handle_event` seam (#329 status bus);
-        //    `Error.message` is retained in `last_error` for the provision-failed context.
-        //  - a line that does NOT parse as an event → forwarded raw to stderr (npx/npm noise).
-        let (hs_tx, hs_rx) = mpsc::channel::<(String, Option<String>)>();
-        let last_error = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
-        let last_error_reader = std::sync::Arc::clone(&last_error);
-        let stdout_handle = std::thread::spawn(move || {
-            let mut sent = false;
-            let mut reader = BufReader::new(stdout);
-            // Bounded read (see `read_capped_line`): a hostile recipe emitting a giant newline-less
-            // line on stdout can't OOM us before the JSON parse. A capped/truncated line simply
-            // fails to parse as an event and is forwarded raw, exactly like other non-event noise.
-            while let Ok(Some(line)) = read_capped_line(&mut reader) {
-                match serde_json::from_str::<CookbookEvent>(line.trim()) {
-                    Ok(CookbookEvent::Ready { endpoint, auth_token }) =>
-                        if !sent {
-                            let _ = hs_tx.send((endpoint, auth_token));
-                            sent = true;
-                        },
-                    Ok(event) => {
-                        if let CookbookEvent::Error { message } = &event {
-                            *last_error_reader.lock().unwrap() = Some(message.clone());
-                        }
-                        handle_event(&event);
-                    },
-                    // Not a typed event (e.g. npx install noise) → forward raw. `line` is already
-                    // length-capped by `read_capped_line`, so no further truncation is needed.
-                    Err(_) => emit_provision_log(format!("cookbook: {line}")),
-                }
-            }
-        });
-
-        // Wait for the handshake, the child exiting first, or the provision timeout — whichever
-        // comes first. Poll so we can notice an early exit without blocking on the
-        // handshake channel.
         // On ANY provisioning-failure exit below, the group is reclaimed (SIGKILL) and THEN
         // `ACTIVE_PGID` cleared — `reap_group` keeps the pgid visible until the kill lands, so a
         // signal mid-reap still reaches the group rather than reading a prematurely-cleared 0.
-        let deadline = Instant::now() + timeout;
-        let (endpoint, auth_token) = loop {
-            match hs_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(handshake) => break handshake,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // The stdout thread ended without a `ready` event → the child closed stdout
-                    // (exited).
-                    #[cfg(unix)]
-                    reap_group(pgid);
-                    #[cfg(windows)]
-                    clear_active_child_pid(child.id());
-                    return Err(provision_failed(
-                        label,
-                        &mut child,
-                        stderr_handle,
-                        err_rx,
-                        &last_error,
-                    ));
-                },
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Ok(Some(_status)) = child.try_wait() {
-                        // Child exited before a `ready` event.
-                        #[cfg(unix)]
-                        reap_group(pgid);
-                        #[cfg(windows)]
-                        clear_active_child_pid(child.id());
-                        return Err(provision_failed(
-                            label,
-                            &mut child,
-                            stderr_handle,
-                            err_rx,
-                            &last_error,
-                        ));
-                    }
-                    if Instant::now() >= deadline {
-                        // Timed out — but the recipe may hold a LIVE box mid-pull/verify, so give
-                        // it its SIGTERM teardown window before SIGKILL
-                        // (R1): `teardown_group` does SIGTERM → grace →
-                        // SIGKILL. (`reap_group` = hard SIGKILL is ONLY for the
-                        // already-exited paths above.)
-                        #[cfg(unix)]
-                        teardown_group(pgid, &mut child);
-                        #[cfg(not(unix))]
-                        {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                        }
-                        #[cfg(windows)]
-                        clear_active_child_pid(child.id());
-                        let _ = stdout_handle.join();
-                        let _ = stderr_handle.join();
-                        anyhow::bail!(
-                            "cookbook `{label}` did not emit a `ready` event within {}s — \
-                             provisioning timed out",
-                            timeout.as_secs()
-                        );
-                    }
-                },
-            }
+        let (endpoint, auth_token) = match await_handshake(&stdout.handshake, &mut child, timeout) {
+            Handshake::Ready { endpoint, auth_token } => (endpoint, auth_token),
+            Handshake::Exited => {
+                #[cfg(unix)]
+                reap_group(pgid);
+                #[cfg(windows)]
+                clear_active_child_pid(child.id());
+                return Err(provision_failed(
+                    label,
+                    &mut child,
+                    stderr_handle,
+                    err_rx,
+                    &stdout.last_error,
+                ));
+            },
+            Handshake::TimedOut => {
+                teardown_timed_out_cookbook(&mut child);
+                let _ = stdout.handle.join();
+                let _ = stderr_handle.join();
+                anyhow::bail!(
+                    "cookbook `{label}` did not emit a `ready` event within {}s — provisioning \
+                     timed out",
+                    timeout.as_secs()
+                );
+            },
         };
 
         // The box is serving. The stdout thread keeps routing `status`/`log` events until teardown;
         // detach it (the child closing stdout on SIGTERM ends it). The stderr thread likewise.
-        drop(stdout_handle);
+        drop(stdout.handle);
         drop(stderr_handle);
         Ok(ProvisionedBox {
             endpoint,
@@ -520,6 +416,149 @@ impl CookbookProvisioner {
             pgid,
         })
     }
+}
+
+/// Drain the cookbook's stderr on a thread: forward each (length-capped) line to OUR stderr AND
+/// retain only the last `MAX_CAPTURED_LINES` in a ring buffer, so a failure can report what the
+/// cookbook last said WITHOUT an uncapped accumulator a hostile recipe could OOM us with. The
+/// retained tail arrives on the returned channel when the stream ends.
+fn spawn_stderr_drain(
+    stderr: ChildStderr,
+) -> (std::thread::JoinHandle<()>, mpsc::Receiver<Vec<String>>) {
+    let (err_tx, err_rx) = mpsc::channel::<Vec<String>>();
+    let handle = std::thread::spawn(move || {
+        let mut captured: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let mut reader = BufReader::new(stderr);
+        // `read_capped_line` bounds each line's memory at the READ level (a newline-less flood is
+        // drained, not buffered) — `BufRead::lines()` would allocate the whole line first.
+        while let Ok(Some(line)) = read_capped_line(&mut reader) {
+            emit_provision_log(format!("cookbook: {line}"));
+            captured.push_back(line);
+            if captured.len() > MAX_CAPTURED_LINES {
+                captured.pop_front();
+            }
+        }
+        let _ = err_tx.send(captured.into_iter().collect());
+    });
+    (handle, err_rx)
+}
+
+/// The cookbook stdout reader: its thread, the one-shot handshake channel, and the last `error`
+/// event message (the provision-failed context).
+struct StdoutReader {
+    handle: std::thread::JoinHandle<()>,
+    handshake: mpsc::Receiver<(String, Option<String>)>,
+    last_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// Read the cookbook's stdout on a thread, parsing each line as a typed `CookbookEvent`:
+///  - `Ready`  → the handshake signal `(endpoint, auth_token)` (sent ONCE).
+///  - `Status`/`Log`/`Error` → routed through the ONE `handle_event` seam (#329 status bus);
+///    `Error.message` is retained in `last_error` for the provision-failed context.
+///  - a line that does NOT parse as an event → forwarded raw to stderr (npx/npm noise).
+fn spawn_stdout_reader(stdout: ChildStdout) -> StdoutReader {
+    let (hs_tx, hs_rx) = mpsc::channel::<(String, Option<String>)>();
+    let last_error = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let last_error_reader = std::sync::Arc::clone(&last_error);
+    let handle = std::thread::spawn(move || {
+        let mut sent = false;
+        let mut reader = BufReader::new(stdout);
+        // Bounded read (see `read_capped_line`): a hostile recipe emitting a giant newline-less
+        // line on stdout can't OOM us before the JSON parse. A capped/truncated line simply fails
+        // to parse as an event and is forwarded raw, exactly like other non-event noise.
+        while let Ok(Some(line)) = read_capped_line(&mut reader) {
+            match serde_json::from_str::<CookbookEvent>(line.trim()) {
+                Ok(CookbookEvent::Ready { endpoint, auth_token }) =>
+                    if !sent {
+                        let _ = hs_tx.send((endpoint, auth_token));
+                        sent = true;
+                    },
+                Ok(event) => {
+                    if let CookbookEvent::Error { message } = &event {
+                        *last_error_reader.lock().unwrap() = Some(message.clone());
+                    }
+                    handle_event(&event);
+                },
+                // Not a typed event (e.g. npx install noise) → forward raw. `line` is already
+                // length-capped by `read_capped_line`, so no further truncation is needed.
+                Err(_) => emit_provision_log(format!("cookbook: {line}")),
+            }
+        }
+    });
+    StdoutReader { handle, handshake: hs_rx, last_error }
+}
+
+/// How the wait for the cookbook's `ready` event ended.
+enum Handshake {
+    Ready {
+        endpoint: String,
+        auth_token: Option<String>,
+    },
+    /// The cookbook exited (or closed stdout) before a `ready` event.
+    Exited,
+    /// No `ready` event before the deadline.
+    TimedOut,
+}
+
+/// Wait for the handshake, the child exiting first, or `timeout` — whichever comes first. Polls so
+/// an early exit is noticed without blocking on the handshake channel.
+fn await_handshake(
+    handshake: &mpsc::Receiver<(String, Option<String>)>,
+    child: &mut Child,
+    timeout: Duration,
+) -> Handshake {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match handshake.recv_timeout(Duration::from_millis(50)) {
+            Ok((endpoint, auth_token)) => return Handshake::Ready { endpoint, auth_token },
+            // The stdout thread ended without a `ready` event → the child closed stdout (exited).
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Handshake::Exited,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(Some(_status)) = child.try_wait() {
+                    return Handshake::Exited;
+                }
+                if Instant::now() >= deadline {
+                    return Handshake::TimedOut;
+                }
+            },
+        }
+    }
+}
+
+/// Stop a cookbook cancelled after spawn but before its handshake: the full SIGTERM → grace →
+/// SIGKILL group teardown on unix (the child is its own group leader, so its pid is the pgid), a
+/// `taskkill /T` tree kill on Windows, a plain kill elsewhere.
+fn abort_cancelled_cookbook(child: &mut Child) {
+    #[cfg(unix)]
+    teardown_group(child.id() as i32, child);
+    #[cfg(windows)]
+    {
+        let pid = child.id();
+        taskkill_tree(pid);
+        clear_active_child_pid(pid);
+        let _ = child.wait();
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Stop a cookbook whose handshake deadline passed. The recipe may hold a LIVE box mid-pull/verify,
+/// so unix gives it its SIGTERM teardown window before SIGKILL (`teardown_group`; the child is its
+/// own group leader, so its pid is the pgid) — `reap_group`'s hard SIGKILL is only for the
+/// already-exited path. Elsewhere the child is killed directly.
+fn teardown_timed_out_cookbook(child: &mut Child) {
+    #[cfg(unix)]
+    teardown_group(child.id() as i32, child);
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    #[cfg(windows)]
+    clear_active_child_pid(child.id());
 }
 
 /// The Rust-side handshake deadline for [`CookbookProvisioner::provision`]. The floor is
