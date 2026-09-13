@@ -490,16 +490,7 @@ impl IndexDatabase {
                  verdicts before comparing"
                     .to_string(),
             );
-            return Ok(CompareGraphScipReport {
-                query: CompareGraphScipQuery {
-                    tool: String::new(),
-                    tool_version: None,
-                    commit_sha: self.active_commit_sha.clone(),
-                    worktree_id: self.active_worktree_id.clone(),
-                },
-                summary,
-                contradictions,
-            });
+            return Ok(self.scip_report(&runs, summary, contradictions));
         }
         // Batch-wins precedence (#534): reserve EVERY edge a batch tool has a verdict on (any
         // kind — Confirm/Upgrade/ResolvedExternal/Contradict) BEFORE emitting any live
@@ -533,35 +524,7 @@ impl IndexDatabase {
                 if !contradicted_edge_ids.insert(comparison.edge_id) {
                     continue;
                 }
-                contradictions.push(GraphScipContradiction {
-                    edge_id: comparison.edge_id,
-                    edge_kind: comparison.edge_kind,
-                    heuristic_confidence: graph::normalize_confidence(
-                        &comparison.heuristic_confidence,
-                    )
-                    .to_string(),
-                    heuristic_target: comparison.heuristic_target,
-                    callee_name: comparison.callee_name,
-                    // Label `resolved-external` ONLY for a contradiction the compiler resolved
-                    // OUTSIDE the corpus (`resolved_symbol_id IS NULL`). A Rust SCIP symbol carries
-                    // a crate/package component even for the LOCAL crate (`scip-rust crate
-                    // held-mini …`), so deriving the label from `scip_symbol`
-                    // alone would mislabel an IN-CORPUS contradiction (the
-                    // compiler resolved to a *different* in-corpus symbol) as
-                    // `resolved-external(<local-crate>)` (#82 finding 1). An in-corpus
-                    // contradiction is a same-corpus disagreement, not an external placement.
-                    resolved_external: comparison
-                        .resolved_symbol_id
-                        .is_none()
-                        .then(|| resolved_external_label(&comparison.scip_symbol))
-                        .flatten(),
-                    scip_symbol: comparison.scip_symbol,
-                    callsite: Some(Callsite {
-                        path: comparison.callsite_path,
-                        line: comparison.callsite_line,
-                        span: [comparison.callsite_line, comparison.callsite_line],
-                    }),
-                });
+                contradictions.push(Self::scip_contradiction_from(comparison));
             }
         }
         // A run exists for this checkout but produced ZERO in-scope verdicts to compare. This is
@@ -578,20 +541,61 @@ impl IndexDatabase {
             );
         }
         summary.contradictions = u64::try_from(contradictions.len()).unwrap_or(u64::MAX);
-        Ok(CompareGraphScipReport {
+        Ok(self.scip_report(&runs, summary, contradictions))
+    }
+
+    /// The report envelope for `compare_graph_to_scip`. The query names the tools (and their
+    /// versions) that contributed verdicts, joined — the report spans every backend with a run,
+    /// not a single hardcoded tool. With no run, the tool is empty and the version absent.
+    fn scip_report(
+        &self,
+        runs: &[(rag_rat_oracle::OracleTool, String)],
+        summary: CompareGraphScipSummary,
+        contradictions: Vec<GraphScipContradiction>,
+    ) -> CompareGraphScipReport {
+        CompareGraphScipReport {
             query: CompareGraphScipQuery {
-                // The tools (and their versions) that contributed verdicts, joined — the report now
-                // spans every backend with a run, not a single hardcoded tool.
                 tool: runs.iter().map(|(tool, _)| tool.as_db_str()).collect::<Vec<_>>().join(","),
-                tool_version: Some(
-                    runs.iter().map(|(_, version)| version.clone()).collect::<Vec<_>>().join(","),
-                ),
+                tool_version: (!runs.is_empty()).then(|| {
+                    runs.iter().map(|(_, version)| version.clone()).collect::<Vec<_>>().join(",")
+                }),
                 commit_sha: self.active_commit_sha.clone(),
                 worktree_id: self.active_worktree_id.clone(),
             },
             summary,
             contradictions,
-        })
+        }
+    }
+
+    fn scip_contradiction_from(
+        comparison: rag_rat_oracle::EdgeOracleComparison,
+    ) -> GraphScipContradiction {
+        GraphScipContradiction {
+            edge_id: comparison.edge_id,
+            edge_kind: comparison.edge_kind,
+            heuristic_confidence: graph::normalize_confidence(&comparison.heuristic_confidence)
+                .to_string(),
+            heuristic_target: comparison.heuristic_target,
+            callee_name: comparison.callee_name,
+            // Label `resolved-external` ONLY for a contradiction the compiler resolved OUTSIDE the
+            // corpus (`resolved_symbol_id IS NULL`). A Rust SCIP symbol carries a crate/package
+            // component even for the LOCAL crate (`scip-rust crate held-mini …`), so deriving the
+            // label from `scip_symbol` alone would mislabel an IN-CORPUS contradiction (the
+            // compiler resolved to a *different* in-corpus symbol) as
+            // `resolved-external(<local-crate>)` (#82 finding 1). An in-corpus contradiction is a
+            // same-corpus disagreement, not an external placement.
+            resolved_external: comparison
+                .resolved_symbol_id
+                .is_none()
+                .then(|| resolved_external_label(&comparison.scip_symbol))
+                .flatten(),
+            scip_symbol: comparison.scip_symbol,
+            callsite: Some(Callsite {
+                path: comparison.callsite_path,
+                line: comparison.callsite_line,
+                span: [comparison.callsite_line, comparison.callsite_line],
+            }),
+        }
     }
 
     fn read_graph_logical_symbol(
