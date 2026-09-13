@@ -8491,6 +8491,18 @@ pub(crate) fn apply_refold_for_held_control_log_freshness(
     )
 }
 
+/// V125 (#1301): re-judge persisted verdicts once a revoking cut vouches for the ops authored
+/// concurrently with it.
+///
+/// Freshness is re-derived only when an account refolds, and content acceptance only when its
+/// stream does. A control op an older binary parked `auth_len_ahead` behind the ops a cut condemned
+/// stays parked in the persisted projection, and so does content that cited it, until unrelated
+/// entries arrive. `apply_and_record_migration` runs the all-account refold hook for this id; the
+/// body queues every content stream for the next settle, as V121 does.
+pub fn apply_refold_for_concurrent_cut_vouch(conn: &Connection) -> rusqlite::Result<()> {
+    apply_refold_for_held_control_log_freshness(conn)
+}
+
 /// V116 (#1179): rebuild `sync_invites` for cross-account WRITER invites.
 ///
 /// A writer invite mints before the grantee account is known — the `StreamGrant` is authored at

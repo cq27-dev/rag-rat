@@ -1839,7 +1839,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 124, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 125, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
@@ -2122,6 +2122,24 @@ fn migration_124_content_projected_superseded_anchors() {
         .query_row(
             "SELECT COUNT(*) FROM schema_version
              WHERE id = '124_content_projected_superseded_anchors'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
+}
+
+/// V125 (#1301) refolds every account and queues every content stream, so a control op parked
+/// `auth_len_ahead` behind the ops a concurrent cut condemned is re-judged with the cut vouching
+/// for it. The ledger row is recorded; a replay is a no-op.
+#[test]
+fn migration_125_refold_for_concurrent_cut_vouch() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    schema::migrations::apply_refold_for_concurrent_cut_vouch(&conn).unwrap();
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '125_refold_for_concurrent_cut_vouch'",
             [],
             |row| row.get(0),
         )

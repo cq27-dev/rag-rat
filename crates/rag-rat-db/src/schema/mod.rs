@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 124;
+pub const LATEST_SCHEMA_VERSION: u32 = 125;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -894,6 +894,12 @@ const MIGRATION_124_DESCRIPTION: &str =
     "Add superseded_anchors_json to content_projected_nodes: the anchor sets a node's register \
      held before the winning one, so the memory drain can tell binding rows that are the image of \
      a publication it has superseded from rows of one still in flight (#1304)";
+const MIGRATION_125_ID: &str = "125_refold_for_concurrent_cut_vouch";
+const MIGRATION_125_CHECKSUM: &str = "sha256:rag-rat-refold-for-concurrent-cut-vouch-v125";
+const MIGRATION_125_DESCRIPTION: &str =
+    "Refold every account and queue every /3 content stream for an acceptance refold, so control \
+     ops authored concurrently with a revoking cut and parked auth_len_ahead behind the ops it \
+     condemned are re-judged with the cut vouching for them (#1301)";
 const MIGRATION_118_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-v118";
 const MIGRATION_118_DESCRIPTION: &str =
     "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
@@ -1164,6 +1170,7 @@ const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[
     MIGRATION_114_ID,
     MIGRATION_115_ID,
     MIGRATION_121_ID,
+    MIGRATION_125_ID,
 ];
 
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
@@ -1190,6 +1197,7 @@ fn apply_and_record_migration(
             | MIGRATION_099_ID
             | MIGRATION_115_ID
             | MIGRATION_121_ID
+            | MIGRATION_125_ID
     ) {
         // The hook runs the CURRENT fold, so it writes whatever columns today's projector writes —
         // not the ones that existed when the migration was written. A refold step therefore depends
@@ -1943,6 +1951,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_124_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_content_projected_superseded_anchors),
     },
+    Migration {
+        id: MIGRATION_125_ID,
+        checksum: MIGRATION_125_CHECKSUM,
+        description: MIGRATION_125_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_refold_for_concurrent_cut_vouch),
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -2179,6 +2193,7 @@ mod ledger_atomicity {
         MIGRATION_114_ID,
         MIGRATION_115_ID,
         MIGRATION_121_ID,
+        MIGRATION_125_ID,
     ];
 
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.
