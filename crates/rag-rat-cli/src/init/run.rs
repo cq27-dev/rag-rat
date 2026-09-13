@@ -66,22 +66,13 @@ fn run_non_interactive(
         }
     }
 
-    if let Some(parent) = options.config_path.parent().filter(|path| !path.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&options.config_path, config_text)?;
-    eprintln!("init: wrote {}", options.config_path.display());
-
-    let config = Config::load(&options.config_path)?;
-    apply_embedding_runtime_env(&config.llm.embedding.runtime);
-    let db = setup_index(&config, &options.config_path)?;
-    setup_model_and_reconcile(&config, &db, options.yes)?;
-    if !options.no_hooks {
-        offer_hooks_install(&config, options.yes)?;
-    }
-    eprintln!("init: complete");
-    print_mcp_connect_hint();
-    Ok(())
+    write_and_apply(options, &config_text, |config, db| {
+        setup_model_and_reconcile(config, db, options.yes)?;
+        if !options.no_hooks {
+            offer_hooks_install(config, options.yes)?;
+        }
+        Ok(())
+    })
 }
 
 /// The interactive flow: run the full-screen ratatui wizard, then write the TOML it returns and
@@ -109,17 +100,29 @@ fn run_interactive(options: &InitOptions) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    write_and_apply(options, &result.toml, |config, db| {
+        setup_model_and_reconcile(config, db, false)?;
+        apply_wizard_hooks(config, &result)
+    })
+}
+
+/// The tail both init flows share: write the rendered config, load it back, and build the index,
+/// then run the flow's own model and hook step before reporting completion.
+fn write_and_apply(
+    options: &InitOptions,
+    toml: &str,
+    model_and_hooks: impl FnOnce(&Config, &IndexDatabase) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     if let Some(parent) = options.config_path.parent().filter(|path| !path.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&options.config_path, &result.toml)?;
+    fs::write(&options.config_path, toml)?;
     eprintln!("init: wrote {}", options.config_path.display());
 
     let config = Config::load(&options.config_path)?;
     apply_embedding_runtime_env(&config.llm.embedding.runtime);
     let db = setup_index(&config, &options.config_path)?;
-    setup_model_and_reconcile(&config, &db, false)?;
-    apply_wizard_hooks(&config, &result)?;
+    model_and_hooks(&config, &db)?;
     eprintln!("init: complete");
     print_mcp_connect_hint();
     Ok(())
