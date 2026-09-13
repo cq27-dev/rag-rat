@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+use super::super::branch::BranchSelection;
 use super::super::ops::{self, AccountOp, DecodedAccountOp};
 use super::super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
 use super::super::{envelope as account_envelope, storage as account_storage};
@@ -1656,7 +1657,7 @@ pub fn settle_pending_content_refold_for_stream_in_tx(
 /// prefix-closed — so keep only the run from seq 0 whose own finished verdict is `Accepted`.
 fn prefix_closed_accepted(
     resolved: &[ResolvedEntry],
-    selection: &candidate::BranchSelection,
+    selection: &BranchSelection,
     raw: &HashMap<EntryHash, ContentAcceptance>,
 ) -> HashSet<EntryHash> {
     let mut chains: HashMap<ChainCoordinate, Vec<(u64, EntryHash)>> = HashMap::new();

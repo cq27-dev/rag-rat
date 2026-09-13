@@ -17,6 +17,7 @@
 //! - [`envelope`]: the 13-part signed account-entry envelope (§6).
 mod authoring;
 mod bootstrap;
+mod branch;
 mod candidate;
 mod content;
 mod cut;

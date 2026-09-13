@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use rusqlite::{OptionalExtension, Transaction, params};
 
+use super::super::branch::BranchSelection;
 use super::super::candidate::{self as account_candidate, Ancestry, HeaderView, UnknownCause};
 use super::super::cut::Cut;
 use super::super::envelope::{self, AccountEntryHeader};
@@ -29,7 +30,7 @@ use super::acceptance::{
     self, AncestryRelation, CitedFreshness, SecretsAcceptance, SecretsAcceptanceInput,
     SecretsParkReason, UnknownAncestry,
 };
-use super::candidate::{self, BranchPin, BranchSelection, SecretsCandidate, SecretsCoordinate};
+use super::candidate::{self, BranchPin, SecretsCandidate, SecretsCoordinate};
 use super::ops::{self, DecodedSecretsOp};
 
 type EntryHash = [u8; 32];

@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
+use super::super::branch::{self, BranchSelection, Candidate, ChainLink, WalkEnd};
 use super::acceptance::{AncestryRelation, UnknownAncestry};
 use super::envelope::ContentEntryHeader;
 use crate::account::AccountId;
@@ -36,7 +37,7 @@ impl HeaderView for HashMap<EntryHash, ContentEntryHeader> {
 /// The chain one `/3` cut bounds: a `/3` seq is dense per `(stream, author_account, device)`, so
 /// that triple — not the account log's `(account, log, device)` — is the content cut coordinate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct ChainCoordinate {
+pub(in crate::account) struct ChainCoordinate {
     pub(super) stream_id: StreamId,
     pub(super) author_account_id: AccountId,
     pub(super) device_fingerprint: DeviceFingerprint,
@@ -53,11 +54,7 @@ impl ChainCoordinate {
 }
 
 /// One `/3` candidate the refold classifies: its hash plus the header the walks read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ContentCandidate {
-    pub(super) entry_hash: EntryHash,
-    pub(super) header: ContentEntryHeader,
-}
+pub(super) type ContentCandidate = Candidate<ContentEntryHeader>;
 
 /// Decide whether `target` lies on the branch `watermark` heads (§11) — the ancestry relation the
 /// acceptance predicate evaluates a revocation cut against.
@@ -73,13 +70,17 @@ pub(super) fn ancestry(
         return AncestryRelation::Unknown(UnknownAncestry::UnknownCutTarget);
     }
     let mut found = false;
-    let end = walk_back(watermark, view, |hash, _| {
-        if hash == target {
-            found = true;
-            return ControlFlow::Break(());
-        }
-        ControlFlow::Continue(())
-    });
+    let end = branch::walk_back(
+        watermark,
+        |hash| view.header(hash),
+        |hash, _| {
+            if hash == target {
+                found = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        },
+    );
     if found {
         return AncestryRelation::OnBranch;
     }
@@ -122,216 +123,44 @@ pub(super) fn validate_cut_target(
     }
 }
 
-/// A register watermark that pins one chain's accepted branch (§16.2). Sourced from the account
-/// log's revocation cuts; a cut naming a currently-`forked` branch PROMOTES it on the next refold,
-/// which is what makes an off-branch condemnation enforceable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct BranchPin {
-    pub(super) coordinate: ChainCoordinate,
-    pub(super) seq: u64,
-    pub(super) watermark: EntryHash,
-}
+/// A register watermark that pins one `/3` chain's accepted branch (§16.2).
+pub(super) type BranchPin = branch::BranchPin<ChainCoordinate>;
 
-/// Eligible entries indexed by the `(chain, prev_hash)` parent slot they extend; a chain root keys
-/// on `None`. Several entries under one key are an equivocation — the slot selection resolves them.
-type BranchChildren = HashMap<(ChainCoordinate, Option<EntryHash>), Vec<(u64, EntryHash)>>;
+impl ChainLink for ContentEntryHeader {
+    type Coordinate = ChainCoordinate;
 
-/// The branch-selection verdict for one refold.
-///
-/// The two sets do NOT partition the eligible candidates, and that is the point. An entry is
-/// `forked` only if it reaches its chain root through held entries and still lost a slot — a real
-/// equivocation loser, terminal unless a later watermark selects it. An entry stranded above a gap
-/// in the dense chain (its predecessor has not arrived) is in NEITHER set: it lost nothing, and the
-/// arrival of the missing predecessor can make it contiguous. Calling that `forked` would discard
-/// valid work for being late; the acceptance predicate parks it as `missing_predecessor` instead.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct BranchSelection {
-    pub(super) accepted: HashSet<EntryHash>,
-    pub(super) forked: HashSet<EntryHash>,
+    fn coordinate(&self) -> ChainCoordinate {
+        ChainCoordinate::of(self)
+    }
+
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    fn prev_hash(&self) -> Option<EntryHash> {
+        self.prev_hash
+    }
 }
 
 /// Select one contiguous accepted chain per `(stream, author_account, device)` from the eligible
-/// candidates (§16.2).
+/// candidates — [`branch::select_accepted_branch`] with `/3` pin admission.
 ///
-/// `eligible` is the caller's authority verdict — the candidates no register has condemned and no
-/// citation has rejected. A condemned entry must not compete for a slot, or an attacker could mine
-/// a small-hash entry beyond a cut and fork an honest sibling out of the accepted branch.
-///
-/// Selection walks the dense seq slots from 0, extending only from the entry that won the previous
-/// slot, so the accepted set is always one hash-linked chain. At a slot with several eligible
-/// children the winner is:
-/// 1. the child on a pinning watermark's branch, if a register pins this chain — a cut names the
-///    branch it bounds, so the register decides, not the hash order; otherwise
-/// 2. the lexicographically smallest `entry_hash` — an unforced fork resolved by a rule both peers
-///    compute identically.
+/// TWO registers can bound one `/3` chain — the author's roster cut and the owner's grant cut —
+/// which is why the shared pin order is total over `(seq, watermark)`.
 pub(super) fn select_accepted_branch(
     candidates: &[ContentCandidate],
     eligible: &HashSet<EntryHash>,
     pins: &[BranchPin],
     view: &dyn HeaderView,
 ) -> BranchSelection {
-    let mut children = BranchChildren::new();
-    let mut chains: HashSet<ChainCoordinate> = HashSet::new();
-    for candidate in candidates.iter().filter(|c| eligible.contains(&c.entry_hash)) {
-        let coordinate = ChainCoordinate::of(&candidate.header);
-        children
-            .entry((coordinate, candidate.header.prev_hash))
-            .or_default()
-            .push((candidate.header.seq, candidate.entry_hash));
-        chains.insert(coordinate);
-    }
-
-    let mut accepted = HashSet::new();
-    let mut rooted = HashSet::new();
-    for chain in chains {
-        let pinned = pinned_branch(chain, pins, view);
-        let mut parent: Option<EntryHash> = None;
-        // A `/3` seq is dense from 0, so the chain ends at the first slot no eligible child fills.
-        // Bounded by the candidate count: every step consumes one distinct entry.
-        for slot in 0..candidates.len() as u64 {
-            let Some(winner) = children.get(&(chain, parent)).and_then(|kids| {
-                let at_slot = kids.iter().filter(|(seq, _)| *seq == slot);
-                at_slot
-                    .clone()
-                    .find(|(_, hash)| pinned.contains(hash))
-                    .or_else(|| at_slot.min_by_key(|(_, hash)| *hash))
-                    .map(|(_, hash)| *hash)
-            }) else {
-                break;
-            };
-            accepted.insert(winner);
-            parent = Some(winner);
-        }
-        collect_rooted(chain, &children, &mut rooted);
-    }
-
-    // Only an entry that reaches its chain root through held entries can have LOST anything: it had
-    // a slot to contest. One stranded above a gap never entered a contest, so it is not a loser —
-    // leave it out of both sets and let the caller park it until its predecessor arrives.
-    let forked = rooted.difference(&accepted).copied().collect();
-    BranchSelection { accepted, forked }
-}
-
-/// Every eligible entry reachable from a chain root by contiguous `prev_hash` links — the entries
-/// that are dense-complete back to seq 0, and so are decidable at all.
-fn collect_rooted(
-    chain: ChainCoordinate,
-    children: &BranchChildren,
-    rooted: &mut HashSet<EntryHash>,
-) {
-    // Breadth-first from the roots (`prev_hash` null at seq 0), stepping exactly one slot per link,
-    // so a gap in the chain simply strands everything above it.
-    let mut frontier: Vec<(Option<EntryHash>, u64)> = vec![(None, 0)];
-    while let Some((parent, slot)) = frontier.pop() {
-        let Some(kids) = children.get(&(chain, parent)) else {
-            continue;
-        };
-        for (seq, hash) in kids.iter().filter(|(seq, _)| *seq == slot) {
-            if !rooted.insert(*hash) {
-                continue;
-            }
-            // A dense chain cannot reach past `u64::MAX`; there is no next slot to walk to.
-            if let Some(next) = seq.checked_add(1) {
-                frontier.push((Some(*hash), next));
-            }
-        }
-    }
-}
-
-/// The entries on the branch a register pins for `chain` — empty when no cut pins it, or when the
-/// pinning watermark is withheld or names a foreign coordinate (neither may steer selection).
-///
-/// The HIGHEST admitted watermark wins: a register only ever extends forward, so the deepest cut is
-/// the most recent statement about which branch is real.
-///
-/// TWO registers can bound one chain — the author's roster cut and the owner's grant cut — so once
-/// a device equivocates they can name different watermarks at the SAME seq. Order the pins by
-/// `(seq, watermark)`, a total order, so the winner never depends on the order the registers were
-/// assembled in: `max_by_key` on `seq` alone hands a tie to whichever pin happens to come last, and
-/// two peers holding identical entries would derive different accepted branches from it.
-fn pinned_branch(
-    chain: ChainCoordinate,
-    pins: &[BranchPin],
-    view: &dyn HeaderView,
-) -> HashSet<EntryHash> {
-    let Some(pin) = pins
-        .iter()
-        .filter(|pin| pin.coordinate == chain)
-        .filter(|pin| validate_cut_target(pin.seq, &pin.watermark, &chain, view) == CutBinding::Ok)
-        .max_by_key(|pin| (pin.seq, pin.watermark))
-    else {
-        return HashSet::new();
-    };
-    let mut branch = HashSet::from([pin.watermark]);
-    walk_back(&pin.watermark, view, |hash, _| {
-        branch.insert(*hash);
-        ControlFlow::Continue(())
-    });
-    branch
-}
-
-/// Why a backward walk stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WalkEnd {
-    /// Reached the chain origin (`prev_hash` is null).
-    Origin,
-    /// A link on the walk is not held — more entries could still decide this.
-    MissingLink,
-    /// A link left the bounded chain or skipped a seq slot: it is forged, not a real predecessor.
-    ForgedLink,
-    /// The visitor broke out early.
-    Stopped,
-}
-
-/// Walk `prev_hash` back from `watermark`, visiting each entry on the ONE bounded chain it heads.
-///
-/// A signed header pins only `prev_hash` NULLITY, never that `prev` is a valid contiguous parent —
-/// so the walk re-derives that: every link must stay on the watermark's `(stream, author, device)`
-/// coordinate and step down exactly one seq slot. A link that jumps coordinate or skips slots is
-/// forged, and the walk refuses to follow it.
-///
-/// Iterative with a visited guard: chain depth is attacker-controlled, and a hash cycle would need
-/// a sha256 collision but a corrupt row must not spin forever either.
-fn walk_back(
-    watermark: &EntryHash,
-    view: &dyn HeaderView,
-    mut visit: impl FnMut(&EntryHash, &ContentEntryHeader) -> ControlFlow<()>,
-) -> WalkEnd {
-    let Some(head) = view.header(watermark) else {
-        return WalkEnd::MissingLink;
-    };
-    let chain = ChainCoordinate::of(head);
-    let mut visited: HashSet<EntryHash> = HashSet::new();
-    let mut current = *watermark;
-    loop {
-        let Some(header) = view.header(&current) else {
-            return WalkEnd::MissingLink;
-        };
-        // Validate the node is on the bounded chain BEFORE the visitor counts it: a forged link
-        // straight to a foreign entry is not a real predecessor, so it is not on this branch.
-        if ChainCoordinate::of(header) != chain {
-            return WalkEnd::ForgedLink;
-        }
-        if visit(&current, header).is_break() {
-            return WalkEnd::Stopped;
-        }
-        if !visited.insert(current) {
-            return WalkEnd::ForgedLink;
-        }
-        let Some(prev) = header.prev_hash else {
-            return WalkEnd::Origin;
-        };
-        // A dense chain is contiguous, so a held predecessor MUST be the exactly-preceding slot; a
-        // link that skips slots (5 → 3) is forged, not a real parent. `checked_add` because `seq`
-        // is a peer-supplied `u64`: a candidate parked at `u64::MAX` is reachable by any peer, and
-        // `+ 1` would panic in a debug build rather than reject the link it is meant to reject.
-        if let Some(prev_header) = view.header(&prev)
-            && prev_header.seq.checked_add(1) != Some(header.seq)
-        {
-            return WalkEnd::ForgedLink;
-        }
-        current = prev;
-    }
+    branch::select_accepted_branch(candidates, eligible, |chain| {
+        branch::pinned_branch(
+            chain,
+            pins,
+            |pin| validate_cut_target(pin.seq, &pin.watermark, &chain, view) == CutBinding::Ok,
+            |hash| view.header(hash),
+        )
+    })
 }
 
 #[cfg(test)]

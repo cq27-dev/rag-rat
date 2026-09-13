@@ -6,17 +6,18 @@
 //! a compromised-then-removed owner device can fork its secrets chain BELOW its `DeviceRemove`
 //! secrets cut, and a pin-less min-hash tiebreak would select the attacker fork (deterministic,
 //! convergent, WRONG), forking the honest cut-preserved wraps off the accepted branch. So this
-//! module ports the CONTENT selection's pin logic (`content::candidate`) onto `AccountEntryHeader`
-//! rows: a register pin promotes the branch its watermark names over the hash order, which is what
-//! makes the off-branch condemnation of the other fork enforceable.
+//! module runs the pin-aware selection the content refold uses ([`super::super::branch`]) over
+//! `AccountEntryHeader` rows: a register pin promotes the branch its watermark names over the hash
+//! order, which is what makes the off-branch condemnation of the other fork enforceable.
 //!
 //! Pins are sourced from BOTH secrets boundaries of a wrap's cited owner incarnation (the device
 //! register AND the owner-incarnation register — two registers can bound one chain), revalidated
 //! here via [`super::super::candidate::validate_cut_target`] at the secrets coordinate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use super::super::AccountId;
+use super::super::branch::{self, BranchSelection, Candidate, ChainLink};
 use super::super::candidate::{self, CutCoordinate, HeaderView};
 use super::super::cut::Cut;
 use super::super::envelope::AccountEntryHeader;
@@ -27,7 +28,7 @@ type EntryHash = [u8; 32];
 
 /// The chain one secrets cut bounds: `(account, device)` on `log: SECRETS_LOG`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct SecretsCoordinate {
+pub(in crate::account) struct SecretsCoordinate {
     pub(super) account_id: AccountId,
     pub(super) device_fingerprint: DeviceFingerprint,
 }
@@ -47,165 +48,61 @@ impl SecretsCoordinate {
 }
 
 /// One log-1 candidate the refold classifies: its hash plus the header the walks read.
-#[derive(Debug, Clone)]
-pub(super) struct SecretsCandidate {
-    pub(super) entry_hash: EntryHash,
-    pub(super) header: AccountEntryHeader,
-}
+pub(super) type SecretsCandidate = Candidate<AccountEntryHeader>;
 
 /// A register watermark that pins one secrets chain's accepted branch (§16.2). Sourced from a
 /// wrap's cited owner-incarnation secrets boundaries; a cut naming a currently-`forked` branch
 /// PROMOTES it, which is what makes an off-branch condemnation of the other fork enforceable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct BranchPin {
-    pub(super) coordinate: SecretsCoordinate,
-    pub(super) seq: u64,
-    pub(super) watermark: EntryHash,
-}
+pub(super) type BranchPin = branch::BranchPin<SecretsCoordinate>;
 
-/// Eligible entries indexed by the `(chain, prev_hash)` parent slot they extend; a chain root keys
-/// on `None`. Several entries under one key are an equivocation — the slot selection resolves them.
-type BranchChildren = HashMap<(SecretsCoordinate, Option<EntryHash>), Vec<(u64, EntryHash)>>;
+/// An account header seen as a link on its SECRETS chain — this module only ever walks log-1
+/// candidates, whose chain is `(account, device)`.
+impl ChainLink for AccountEntryHeader {
+    type Coordinate = SecretsCoordinate;
 
-/// The branch-selection verdict for one refold. The two sets do NOT partition the eligible
-/// candidates: an entry stranded above a gap in the dense chain is in NEITHER (it lost nothing).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct BranchSelection {
-    pub(super) accepted: HashSet<EntryHash>,
-    pub(super) forked: HashSet<EntryHash>,
+    fn coordinate(&self) -> SecretsCoordinate {
+        SecretsCoordinate::of(self)
+    }
+
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    fn prev_hash(&self) -> Option<EntryHash> {
+        self.prev_hash
+    }
 }
 
 /// Select one contiguous accepted chain per `(account, device)` on the secrets log from the
-/// eligible candidates (§16.2). `eligible` is the caller's authority verdict + the slot-eligible
-/// non-evaluable entries; a condemned/rejected entry must not compete for a slot. At a slot with
-/// several eligible children the winner is (1) the child on a pinning watermark's branch, if a
-/// register pins this chain — the register decides, not hash order — else (2) the lexicographically
-/// smallest `entry_hash`.
+/// eligible candidates — [`branch::select_accepted_branch`] with secrets pin admission.
+/// `eligible` is the caller's authority verdict + the slot-eligible non-evaluable entries.
 pub(super) fn select_accepted_branch(
     candidates: &[SecretsCandidate],
     eligible: &HashSet<EntryHash>,
     pins: &[BranchPin],
     view: &dyn HeaderView,
 ) -> BranchSelection {
-    let mut children = BranchChildren::new();
-    let mut chains: HashSet<SecretsCoordinate> = HashSet::new();
-    for candidate in candidates.iter().filter(|c| eligible.contains(&c.entry_hash)) {
-        let coordinate = SecretsCoordinate::of(&candidate.header);
-        children
-            .entry((coordinate, candidate.header.prev_hash))
-            .or_default()
-            .push((candidate.header.seq, candidate.entry_hash));
-        chains.insert(coordinate);
-    }
-
-    let mut accepted = HashSet::new();
-    let mut rooted = HashSet::new();
-    for chain in chains {
-        let pinned = pinned_branch(chain, pins, view);
-        let mut parent: Option<EntryHash> = None;
-        // A secrets seq is dense from 0, so the chain ends at the first slot no eligible child
-        // fills.
-        for slot in 0..candidates.len() as u64 {
-            let Some(winner) = children.get(&(chain, parent)).and_then(|kids| {
-                let at_slot = kids.iter().filter(|(seq, _)| *seq == slot);
-                at_slot
-                    .clone()
-                    .find(|(_, hash)| pinned.contains(hash))
-                    .or_else(|| at_slot.min_by_key(|(_, hash)| *hash))
-                    .map(|(_, hash)| *hash)
-            }) else {
-                break;
-            };
-            accepted.insert(winner);
-            parent = Some(winner);
-        }
-        collect_rooted(chain, &children, &mut rooted);
-    }
-
-    // Only an entry that reaches its chain root through held entries can have LOST anything. One
-    // stranded above a gap never entered a contest, so it is not a loser — leave it out of both
-    // sets and let the caller park it until its predecessor arrives.
-    let forked = rooted.difference(&accepted).copied().collect();
-    BranchSelection { accepted, forked }
-}
-
-/// Every eligible entry reachable from a chain root by contiguous `prev_hash` links.
-fn collect_rooted(
-    chain: SecretsCoordinate,
-    children: &BranchChildren,
-    rooted: &mut HashSet<EntryHash>,
-) {
-    let mut frontier: Vec<(Option<EntryHash>, u64)> = vec![(None, 0)];
-    while let Some((parent, slot)) = frontier.pop() {
-        let Some(kids) = children.get(&(chain, parent)) else {
-            continue;
-        };
-        for (seq, hash) in kids.iter().filter(|(seq, _)| *seq == slot) {
-            if !rooted.insert(*hash) {
-                continue;
-            }
-            if let Some(next) = seq.checked_add(1) {
-                frontier.push((Some(*hash), next));
-            }
-        }
-    }
-}
-
-/// The entries on the branch a register pins for `chain` — empty when no cut pins it, or when the
-/// pinning watermark is withheld or names a foreign coordinate (neither may steer selection). The
-/// HIGHEST admitted watermark wins, ordered by `(seq, watermark)` (a total order) so the winner
-/// never depends on the order the pins were assembled in — two registers can name the SAME seq once
-/// a device equivocates.
-fn pinned_branch(
-    chain: SecretsCoordinate,
-    pins: &[BranchPin],
-    view: &dyn HeaderView,
-) -> HashSet<EntryHash> {
-    let coordinate = chain.cut_coordinate();
-    let Some(pin) = pins
-        .iter()
-        .filter(|pin| pin.coordinate == chain)
-        .filter(|pin| {
-            candidate::validate_cut_target(
-                &Cut::At { seq: pin.seq, hash: pin.watermark },
-                &coordinate,
-                view,
-            ) == candidate::CutBinding::Ok
-        })
-        .max_by_key(|pin| (pin.seq, pin.watermark))
-    else {
-        return HashSet::new();
-    };
-    // Walk `prev_hash` back from the watermark, collecting the branch it heads. A withheld/forged
-    // link simply ends the walk — validate_cut_target already confirmed the watermark is held and
-    // names this coordinate.
-    let mut branch = HashSet::from([pin.watermark]);
-    let mut visited: HashSet<EntryHash> = HashSet::new();
-    let mut current = pin.watermark;
-    while let Some(header) = view.header(&current) {
-        if SecretsCoordinate::of(header) != chain {
-            break; // a forged cross-coordinate link is not a real predecessor
-        }
-        branch.insert(current);
-        if !visited.insert(current) {
-            break;
-        }
-        let Some(prev) = header.prev_hash else {
-            break; // reached the chain origin
-        };
-        // A dense chain is contiguous — a held predecessor must be the exactly-preceding slot.
-        if let Some(prev_header) = view.header(&prev)
-            && prev_header.seq.checked_add(1) != Some(header.seq)
-        {
-            break;
-        }
-        current = prev;
-    }
-    branch
+    branch::select_accepted_branch(candidates, eligible, |chain| {
+        let coordinate = chain.cut_coordinate();
+        branch::pinned_branch(
+            chain,
+            pins,
+            |pin| {
+                candidate::validate_cut_target(
+                    &Cut::At { seq: pin.seq, hash: pin.watermark },
+                    &coordinate,
+                    view,
+                ) == candidate::CutBinding::Ok
+            },
+            |hash| view.header(hash),
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     const ACCOUNT: [u8; 32] = [0xaa; 32];
