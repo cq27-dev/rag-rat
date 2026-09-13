@@ -77,25 +77,7 @@ impl IndexDatabase {
             delta.tombstones.extend(drift_tombstones);
         }
         let scope = FileScope::worktree(worktree_id.clone());
-        // ONE transaction around the whole overlay update — incremental file replacement, tombstone
-        // writes, the prune, AND the global logical-symbol/package/edge/FTS refresh — mirroring the
-        // incremental pass (`index_incremental_with_progress`). Without it a concurrent reader can
-        // observe partially replaced overlay rows or the globally cleared `logical_symbols` table
-        // mid-rebuild, and an error midway leaves the overlay half-applied. BEGIN IMMEDIATE
-        // acquires the write lock up front so a racing writer waits out busy_timeout
-        // instead of failing the deferred read→write upgrade with SQLITE_BUSY; ROLLBACK on
-        // any error (#219 review).
-        self.storage.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> anyhow::Result<OverlayMutations> {
-            // #826: arm scoped logical re-derive capture — the overlay's file removals / inserts
-            // below stage the worktree's changed PATHS so `finalize_overlay_refresh`'s Inline case
-            // can re-derive only those paths' logical groups instead of the whole repo. Armed (and
-            // cleared) here — INSIDE the guarded closure so a temp-table create/clear failure rolls
-            // the transaction back rather than stranding it open on this reusable `&mut self` (the
-            // next refresh would then fail "cannot start a transaction within a transaction"). A
-            // batch's next worktree starts fresh; the Deferred (batch) case ignores the staged
-            // paths and settles via one whole-repo rebuild at the batch tail.
-            self.begin_scoped_logical_rederive()?;
+        let mutations = self.in_overlay_refresh_txn(tail.logical_rebuild, || {
             let applied = self.index_explicit_paths_from_root(
                 config,
                 &source_root,
@@ -144,38 +126,10 @@ impl IndexDatabase {
             // commit each). Un-gated on the counts: a COMPLETE no-change refresh must still
             // record its basis (that skip proof is the whole point of #577).
             self.apply_overlay_basis_tail(&worktree_id, delta.status_complete, tail.basis)?;
-            // Written ∪ tombstoned ∪ pruned — all three change what a query serves for this
-            // checkout (un-shadowing by prune as much as a write), and all three are the sets the
-            // transaction COMMITTED, not the candidates it started from.
-            let changed_paths = applied
-                .planned
-                .into_iter()
-                .chain(tombstoned_paths)
-                .chain(pruned_paths)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
+            let changed_paths =
+                committed_changed_paths(applied.planned, tombstoned_paths, pruned_paths);
             Ok(OverlayMutations { indexed, tombstoned, pruned, changed_paths })
-        })();
-        // #826: disarm scoped logical re-derive capture on BOTH Ok and Err paths — this pass's
-        // `&mut self` outlives an error return, so the flag must not leak into the caller's next
-        // use.
-        self.finish_scoped_logical_rederive();
-        let mutations = match result {
-            Ok(mutations) => {
-                self.storage.execute_batch("COMMIT")?;
-                mutations
-            },
-            Err(err) => {
-                let _ = self.storage.execute_batch("ROLLBACK");
-                return Err(err);
-            },
-        };
-        // AFTER the commit (its own transaction): an Inline refresh whose delta was EMPTY
-        // skipped the finalize above, so this is the exit that consumes a stale pending
-        // obligation instead of returning past it (#819 review). A failed refresh skips it —
-        // the obligation survives for the next pass, like the batch callers' error arms.
-        self.settle_pending_logical_rebuild_inline(tail.logical_rebuild)?;
+        })?;
 
         let OverlayMutations { indexed, tombstoned, pruned, changed_paths } = mutations;
         Ok(WorktreeOverlayReport {
@@ -294,20 +248,9 @@ impl IndexDatabase {
             }
         }
         let scope = FileScope::worktree(worktree_id.clone());
-        // ONE transaction (see `index_worktree_overlay` for the rationale): index the readable set,
-        // write tombstones, then the gated logical-symbol/edge/FTS refresh. BEGIN IMMEDIATE up
-        // front; ROLLBACK on any error.
-        self.storage.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> anyhow::Result<OverlayMutations> {
-            // #826: arm scoped logical re-derive capture — the overlay's file removals / inserts
-            // below stage the worktree's changed PATHS so `finalize_overlay_refresh`'s Inline case
-            // can re-derive only those paths' logical groups instead of the whole repo. Armed (and
-            // cleared) here — INSIDE the guarded closure so a temp-table create/clear failure rolls
-            // the transaction back rather than stranding it open on this reusable `&mut self` (the
-            // next refresh would then fail "cannot start a transaction within a transaction"). A
-            // batch's next worktree starts fresh; the Deferred (batch) case ignores the staged
-            // paths and settles via one whole-repo rebuild at the batch tail.
-            self.begin_scoped_logical_rederive()?;
+        // Index the readable set, write tombstones, then the gated logical-symbol/edge/FTS refresh,
+        // all in the one overlay-refresh transaction.
+        let mutations = self.in_overlay_refresh_txn(logical_rebuild, || {
             let applied = self.index_explicit_paths_from_root(
                 config,
                 &source_root,
@@ -360,34 +303,10 @@ impl IndexDatabase {
                 logical_rebuild,
                 grouping: applied.outcome.logical,
             })?;
-            let changed_paths = applied
-                .planned
-                .into_iter()
-                .chain(tombstoned_paths)
-                .chain(pruned_paths)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
+            let changed_paths =
+                committed_changed_paths(applied.planned, tombstoned_paths, pruned_paths);
             Ok(OverlayMutations { indexed, tombstoned, pruned, changed_paths })
-        })();
-        // #826: disarm scoped logical re-derive capture on BOTH Ok and Err paths — this pass's
-        // `&mut self` outlives an error return, so the flag must not leak into the caller's next
-        // use.
-        self.finish_scoped_logical_rederive();
-        let mutations = match result {
-            Ok(mutations) => {
-                self.storage.execute_batch("COMMIT")?;
-                mutations
-            },
-            Err(err) => {
-                let _ = self.storage.execute_batch("ROLLBACK");
-                return Err(err);
-            },
-        };
-        // The Inline entry-point exit settle (#819 review), AFTER the commit: an unchanged
-        // supplied path identity-skips (the finalize above never ran), and a stale pending
-        // obligation must not survive this exit.
-        self.settle_pending_logical_rebuild_inline(logical_rebuild)?;
+        })?;
         let OverlayMutations { indexed, tombstoned, pruned, changed_paths } = mutations;
         Ok(WorktreeOverlayReport {
             worktree_id,
@@ -408,6 +327,54 @@ impl IndexDatabase {
             // (#679).
             status_complete: false,
         })
+    }
+
+    /// The ONE transaction around an overlay refresh — shared by the whole-delta and path-scoped
+    /// routes. `apply` does the route's incremental file replacement, tombstone writes, prune /
+    /// removals AND the global logical-symbol/package/edge/FTS refresh, mirroring the incremental
+    /// pass (`index_incremental_with_progress`): without one transaction a concurrent reader can
+    /// observe partially replaced overlay rows or the globally cleared `logical_symbols` table
+    /// mid-rebuild, and an error midway leaves the overlay half-applied. BEGIN IMMEDIATE acquires
+    /// the write lock up front so a racing writer waits out busy_timeout instead of failing the
+    /// deferred read→write upgrade with SQLITE_BUSY; ROLLBACK on any error (#219 review).
+    fn in_overlay_refresh_txn(
+        &self,
+        logical_rebuild: OverlayLogicalRebuild,
+        apply: impl FnOnce() -> anyhow::Result<OverlayMutations>,
+    ) -> anyhow::Result<OverlayMutations> {
+        self.storage.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> anyhow::Result<OverlayMutations> {
+            // #826: arm scoped logical re-derive capture — the overlay's file removals / inserts
+            // stage the worktree's changed PATHS so `finalize_overlay_refresh`'s Inline case can
+            // re-derive only those paths' logical groups instead of the whole repo. Armed (and
+            // cleared) here — INSIDE the guarded closure so a temp-table create/clear failure rolls
+            // the transaction back rather than stranding it open on this reusable connection (the
+            // next refresh would then fail "cannot start a transaction within a transaction"). A
+            // batch's next worktree starts fresh; the Deferred (batch) case ignores the staged
+            // paths and settles via one whole-repo rebuild at the batch tail.
+            self.begin_scoped_logical_rederive()?;
+            apply()
+        })();
+        // #826: disarm scoped logical re-derive capture on BOTH Ok and Err paths — the connection
+        // outlives an error return, so the flag must not leak into the caller's next use.
+        self.finish_scoped_logical_rederive();
+        let mutations = match result {
+            Ok(mutations) => {
+                self.storage.execute_batch("COMMIT")?;
+                mutations
+            },
+            Err(err) => {
+                let _ = self.storage.execute_batch("ROLLBACK");
+                return Err(err);
+            },
+        };
+        // The Inline entry-point exit settle (#819 review), AFTER the commit (its own
+        // transaction): a refresh whose delta was EMPTY, or whose supplied paths all
+        // identity-skipped, never ran the finalize, so this is the exit that consumes a stale
+        // pending obligation instead of returning past it. A failed refresh skips it — the
+        // obligation survives for the next pass, like the batch callers' error arms.
+        self.settle_pending_logical_rebuild_inline(logical_rebuild)?;
+        Ok(mutations)
     }
 
     /// Index an EXPLICIT set of repo-relative `paths`, reading bytes from `source_root` (which may
@@ -492,4 +459,21 @@ pub(super) struct OverlayMutations {
     /// the transaction DID, not from the candidates it considered, so a refresh that changed
     /// nothing reports nothing.
     pub(super) changed_paths: Vec<PathBuf>,
+}
+
+/// Written ∪ tombstoned ∪ pruned, deduped — all three change what a query serves for the checkout
+/// (un-shadowing by prune as much as a write), and all three are the sets the transaction
+/// COMMITTED, not the candidates it started from.
+fn committed_changed_paths(
+    written: Vec<PathBuf>,
+    tombstoned: Vec<PathBuf>,
+    pruned: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    written
+        .into_iter()
+        .chain(tombstoned)
+        .chain(pruned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
