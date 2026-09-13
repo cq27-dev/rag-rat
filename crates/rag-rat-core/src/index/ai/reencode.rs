@@ -142,7 +142,7 @@ fn load_cursor(conn: &Connection) -> anyhow::Result<(i64, String)> {
 
 /// Persist the keyset cursor as `"<chunk_id>\n<model_id>"` (model ids never contain a newline).
 fn save_cursor(conn: &Connection, cursor: &(i64, String)) -> anyhow::Result<()> {
-    set_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META, &format!("{}\n{}", cursor.0, cursor.1))
+    Ok(set_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META, &format!("{}\n{}", cursor.0, cursor.1))?)
 }
 
 /// Read up to `limit` legacy f32 rows past `cursor`, in `(chunk_id, model_id)` order (the UNIQUE

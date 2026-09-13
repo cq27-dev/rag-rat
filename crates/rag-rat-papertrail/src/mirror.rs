@@ -1016,7 +1016,7 @@ pub(crate) fn set_attested_error(
     let key = attested_meta_key(binding, conn, "error")?;
     let sanitized: String =
         detail.chars().map(|ch| if ch.is_control() { ' ' } else { ch }).take(512).collect();
-    rag_rat_db::meta::set_meta(conn, &key, sanitized.trim())
+    Ok(rag_rat_db::meta::set_meta(conn, &key, sanitized.trim())?)
 }
 
 /// Clear a binding's persisted attested-walk failure — a clean completed attested walk.
@@ -1025,7 +1025,7 @@ pub(crate) fn clear_attested_error(
     binding: &ResolvedTracker,
 ) -> anyhow::Result<()> {
     let key = attested_meta_key(binding, conn, "error")?;
-    rag_rat_db::meta::delete_meta(conn, &key)
+    Ok(rag_rat_db::meta::delete_meta(conn, &key)?)
 }
 
 /// Read a binding's persisted attested-walk failure, for the status snapshot.
@@ -1034,7 +1034,7 @@ pub(crate) fn read_attested_error(
     binding: &ResolvedTracker,
 ) -> anyhow::Result<Option<String>> {
     let key = attested_meta_key(binding, conn, "error")?;
-    rag_rat_db::meta::read_meta(conn, &key)
+    Ok(rag_rat_db::meta::read_meta(conn, &key)?)
 }
 
 /// Clear a binding's attested-closers `since` watermark. The INVARIANT: EVERY seam that forces a
@@ -1047,7 +1047,7 @@ pub(crate) fn read_attested_error(
 /// inlining the delete, so a third reset seam can't forget it.
 fn clear_attested_watermark(conn: &Connection, binding: &ResolvedTracker) -> anyhow::Result<()> {
     let key = attested_since_key(binding, conn)?;
-    rag_rat_db::meta::delete_meta(conn, &key)
+    Ok(rag_rat_db::meta::delete_meta(conn, &key)?)
 }
 
 /// The provider-attested closers walk (#702 stage 2): pages `attested_closers_page` until the

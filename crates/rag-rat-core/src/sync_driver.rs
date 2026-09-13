@@ -661,7 +661,7 @@ fn read_advertisement(conn: &Connection) -> anyhow::Result<Option<PersistedAdver
 }
 
 fn write_advertisement(conn: &Connection, record: &PersistedAdvertisement) -> anyhow::Result<()> {
-    rag_rat_db::meta::set_meta(conn, DISCOVERY_ADVERTISEMENT, &serde_json::to_string(record)?)
+    Ok(rag_rat_db::meta::set_meta(conn, DISCOVERY_ADVERTISEMENT, &serde_json::to_string(record)?)?)
 }
 
 /// Per-peer concurrent-session fairness for the resident accept loop: bounds how many in-flight
@@ -1379,11 +1379,11 @@ fn sync_due(conn: &Connection, interval_secs: u64) -> anyhow::Result<bool> {
 }
 
 fn record_sync(conn: &Connection) -> anyhow::Result<()> {
-    rag_rat_db::meta::set_meta(conn, LAST_SYNC, &time::now_ms().to_string())
+    Ok(rag_rat_db::meta::set_meta(conn, LAST_SYNC, &time::now_ms().to_string())?)
 }
 
 fn heartbeat(conn: &Connection) -> anyhow::Result<()> {
-    rag_rat_db::meta::set_meta(conn, RESIDENT_HEARTBEAT, &time::now_ms().to_string())
+    Ok(rag_rat_db::meta::set_meta(conn, RESIDENT_HEARTBEAT, &time::now_ms().to_string())?)
 }
 
 fn roster_capability(

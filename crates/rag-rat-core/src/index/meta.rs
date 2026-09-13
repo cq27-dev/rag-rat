@@ -165,7 +165,7 @@ impl IndexDatabase {
     }
 
     pub(super) fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
-        read_meta(self.storage.connection(), key)
+        Ok(read_meta(self.storage.connection(), key)?)
     }
 
     /// The content digest over EVERY indexed file row — an O(1) read of the incrementally

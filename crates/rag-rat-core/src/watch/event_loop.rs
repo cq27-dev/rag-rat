@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use notify::recommended_watcher;
 use rag_rat_base::config::Config;
 use rag_rat_base::locks::{self, FileLock};
+use rag_rat_db::meta::watch_placement::{self, FlushOutcome};
 use rag_rat_papertrail::AutosyncRequest;
 
 use super::live_oracle::LiveOracleTail;
@@ -291,7 +292,7 @@ fn watcher_main(
 /// `lock_timeout` (`Duration::ZERO` for a non-blocking try on the event loop — it must not stall
 /// event classification; [`SKIP_TIMEOUT`] at shutdown). The persist goes through the LIGHTWEIGHT,
 /// NON-CREATING, NON-BLOCKING config-scoped path
-/// ([`rag_rat_db::meta::record_watch_placement_failures_scoped`]).
+/// ([`watch_placement::record_watch_placement_failures_scoped`]).
 ///
 /// Returns whether the flush SETTLED: `true` = persisted, or nothing to persist (no failures, no
 /// index yet, repo not registered) — the caller may advance its low-water mark; `false` = a
@@ -312,8 +313,9 @@ pub(crate) fn flush_watch_placement_failures(
         // The flock is held (a pass mid-write, another process) — transient; retry next tick.
         return false;
     };
-    match rag_rat_db::meta::record_watch_placement_failures_scoped(config, failures) {
-        Ok(settled) => settled,
+    match watch_placement::record_watch_placement_failures_scoped(config, failures) {
+        Ok(FlushOutcome::Settled) => true,
+        Ok(FlushOutcome::BusySkip) => false,
         Err(error) => {
             // A non-busy error (schema corruption, a vanished file) can't be fixed by retrying —
             // treat as settled so the drain doesn't spin/log every tick; the next full pass

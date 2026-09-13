@@ -244,7 +244,7 @@ pub fn is_repo_removed(conn: &Connection, repo_id: &str) -> rusqlite::Result<boo
 
 /// Lift the removed-via-`rm` tombstone for `repo_id` — `rag-rat init`'s deliberate re-add, the ONE
 /// path allowed to bring a removed repo back. Idempotent (clearing an absent tombstone is a no-op).
-pub fn clear_repo_removed(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
+pub fn clear_repo_removed(conn: &Connection, repo_id: &str) -> rusqlite::Result<()> {
     crate::meta::delete_meta(conn, &removed_repo_key(repo_id))
 }
 
