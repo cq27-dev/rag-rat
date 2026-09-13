@@ -76,6 +76,42 @@ impl FindingKind {
     }
 }
 
+/// The `dream_findings.status` lifecycle tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum FindingStatus {
+    Open,
+    Accepted,
+    Dismissed,
+    Resolved,
+    Superseded,
+    Archived,
+}
+
+impl FindingStatus {
+    /// The exact persisted token.
+    pub(crate) fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token; `None` outside the closed set.
+    pub(crate) fn from_db_str(value: &str) -> Option<Self> {
+        value.parse().ok()
+    }
+
+    /// Still on the worklist: open, or carrying a human verdict a refresh must preserve. The rest
+    /// are terminal — supersede, resolve, and review all act only on current rows.
+    pub(crate) fn is_current(self) -> bool {
+        matches!(self, Self::Open | Self::Accepted | Self::Dismissed)
+    }
+}
+
+/// The SQL list of current statuses, for `status IN {current_statuses_sql()}` — the set
+/// [`FindingStatus::is_current`] names, pinned to it by `current_statuses_sql_matches_is_current`.
+pub(crate) fn current_statuses_sql() -> &'static str {
+    "('open', 'accepted', 'dismissed')"
+}
+
 fn claim_hash(kind: &str, subject: &str, evidence: &str) -> String {
     let mut h = Sha256::new();
     h.update(kind.as_bytes());
@@ -459,6 +495,7 @@ fn sync_in_tx(
     // read predicate `{repo_clause}` and the INSERT's `{repo_col}`/`{repo_val}` stamp prefix.
     let scope = dream_repo_scope(conn)?;
     let repo_clause = dream_repo_scope_clause(&scope);
+    let current = current_statuses_sql();
     let (repo_col, repo_val) = match &scope {
         Some(repo_id) => ("repo_id, ".to_string(), format!("'{}', ", repo_id.replace('\'', "''"))),
         None => (String::new(), String::new()),
@@ -487,16 +524,17 @@ fn sync_in_tx(
         let supersede_others = |id: &str| {
             conn.execute(
                 &format!(
-                    "UPDATE dream_findings SET status = 'superseded', superseded_by = ?1 WHERE \
-                     kind = ?2 AND subject = ?3 AND id != ?1 AND status IN \
-                     ('open','accepted','dismissed'){repo_clause}"
+                    "UPDATE dream_findings SET status = ?4, superseded_by = ?1 WHERE kind = ?2 \
+                     AND subject = ?3 AND id != ?1 AND status IN {current}{repo_clause}"
                 ),
-                rusqlite::params![id, kind, f.subject],
+                rusqlite::params![id, kind, f.subject, FindingStatus::Superseded.as_db_str()],
             )
         };
         match existing {
             // same claim still current: refresh, preserving any human verdict (accepted/dismissed)
-            Some((id, status)) if matches!(status.as_str(), "open" | "accepted" | "dismissed") => {
+            Some((id, status))
+                if FindingStatus::from_db_str(&status).is_some_and(FindingStatus::is_current) =>
+            {
                 conn.execute(
                     "UPDATE dream_findings SET last_seen_at_ms = ?1, base_rank = ?2 WHERE id = ?3",
                     rusqlite::params![now_ms, f.rank, id],
@@ -508,9 +546,9 @@ fn sync_in_tx(
             // rows.
             Some((id, _terminal)) => {
                 conn.execute(
-                    "UPDATE dream_findings SET status = 'open', superseded_by = NULL, \
-                     last_seen_at_ms = ?1, base_rank = ?2 WHERE id = ?3",
-                    rusqlite::params![now_ms, f.rank, id],
+                    "UPDATE dream_findings SET status = ?4, superseded_by = NULL, last_seen_at_ms \
+                     = ?1, base_rank = ?2 WHERE id = ?3",
+                    rusqlite::params![now_ms, f.rank, id, FindingStatus::Open.as_db_str()],
                 )?;
                 opened += 1;
                 superseded += supersede_others(&id)?;
@@ -522,9 +560,18 @@ fn sync_in_tx(
                     &format!(
                         "INSERT INTO dream_findings({repo_col}id, kind, subject, claim_hash, \
                          evidence, base_rank, status, first_seen_at_ms, last_seen_at_ms) \
-                         VALUES({repo_val}?1,?2,?3,?4,?5,?6,'open',?7,?7)"
+                         VALUES({repo_val}?1,?2,?3,?4,?5,?6,?8,?7,?7)"
                     ),
-                    rusqlite::params![id, kind, f.subject, ch, f.evidence, f.rank, now_ms],
+                    rusqlite::params![
+                        id,
+                        kind,
+                        f.subject,
+                        ch,
+                        f.evidence,
+                        f.rank,
+                        now_ms,
+                        FindingStatus::Open.as_db_str()
+                    ],
                 )?;
                 opened += 1;
                 superseded += supersede_others(&id)?;
@@ -536,8 +583,7 @@ fn sync_in_tx(
     // findings.
     let current: Vec<(String, String, String)> = conn
         .prepare(&format!(
-            "SELECT id, kind, subject FROM dream_findings WHERE status IN \
-             ('open','accepted','dismissed'){repo_clause}"
+            "SELECT id, kind, subject FROM dream_findings WHERE status IN {current}{repo_clause}"
         ))?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -546,7 +592,10 @@ fn sync_in_tx(
         // open findings (a plain `dream` must not resolve a prior `--verify` run's findings).
         let computed = FindingKind::from_db_str(&kind).is_some_and(|k| resolve_kinds.contains(&k));
         if computed && !seen.contains(&(kind, subject)) {
-            conn.execute("UPDATE dream_findings SET status = 'resolved' WHERE id = ?1", [&id])?;
+            conn.execute(
+                "UPDATE dream_findings SET status = ?2 WHERE id = ?1",
+                rusqlite::params![id, FindingStatus::Resolved.as_db_str()],
+            )?;
             resolved += 1;
         }
     }
@@ -593,6 +642,7 @@ pub fn review_dream_finding(
     }
     let scope = dream_repo_scope(conn)?;
     let repo_clause = dream_repo_scope_clause(&scope);
+    let current = current_statuses_sql();
     // Match the prefix against ALL of this repo's findings — reviewable AND terminal
     // (resolved/superseded/archived). A prefix that also hits a terminal row is NOT unambiguous
     // even if only one match is reviewable, so a stale short prefix can never silently act on a
@@ -608,7 +658,7 @@ pub fn review_dream_finding(
         all.iter().filter(|(id, ..)| id.starts_with(prefix)).collect();
     let (id, kind, subject) = match matches.as_slice() {
         [(id, kind, subject, status)] => {
-            if !matches!(status.as_str(), "open" | "accepted" | "dismissed") {
+            if !FindingStatus::from_db_str(status).is_some_and(FindingStatus::is_current) {
                 anyhow::bail!(
                     "finding `{prefix}` is {status} — not reviewable (the code moved on; there's \
                      nothing to act on)"
@@ -623,10 +673,11 @@ pub fn review_dream_finding(
         },
     };
     let new_status = match verdict {
-        ReviewVerdict::Accept => "accepted",
-        ReviewVerdict::Dismiss => "dismissed",
-        ReviewVerdict::Reset => "open",
-    };
+        ReviewVerdict::Accept => FindingStatus::Accepted,
+        ReviewVerdict::Dismiss => FindingStatus::Dismissed,
+        ReviewVerdict::Reset => FindingStatus::Open,
+    }
+    .as_db_str();
     // Reset clears the human verdict; accept/dismiss stamp when it was reviewed.
     let reviewed_at = match verdict {
         ReviewVerdict::Reset => None,
@@ -642,7 +693,7 @@ pub fn review_dream_finding(
     let changed = conn.execute(
         &format!(
             "UPDATE dream_findings SET status = ?2, reviewed_at_ms = ?3 WHERE id = ?1 AND status \
-             IN ('open', 'accepted', 'dismissed'){repo_clause}"
+             IN {current}{repo_clause}"
         ),
         rusqlite::params![id, new_status, reviewed_at],
     )?;
@@ -673,6 +724,18 @@ mod tests {
             assert_eq!(serde_json::to_value(kind).unwrap(), token, "serialized as the same token");
         }
         assert_eq!(FindingKind::computed_by(true).len(), kinds.len(), "a verify run computes all");
+    }
+
+    #[test]
+    fn current_statuses_sql_matches_is_current() {
+        use FindingStatus::*;
+        let all = [Open, Accepted, Dismissed, Resolved, Superseded, Archived];
+        for status in all {
+            assert_eq!(FindingStatus::from_db_str(status.as_db_str()), Some(status));
+        }
+        let listed: Vec<&str> =
+            all.into_iter().filter(|s| s.is_current()).map(FindingStatus::as_db_str).collect();
+        assert_eq!(current_statuses_sql(), format!("('{}')", listed.join("', '")));
     }
 
     // A single coverage_gap finding, synced into the active repo; returns its id.

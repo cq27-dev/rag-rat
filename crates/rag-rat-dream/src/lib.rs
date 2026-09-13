@@ -158,9 +158,9 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> anyhow::Result<DreamR
     // Default worklist = the 'open' (needs-attention) set. `--all` (include_reviewed) also surfaces
     // the human-reviewed 'accepted'/'dismissed' rows so a reviewer can see + `--reset` them.
     let status_filter = if opts.include_reviewed {
-        "status IN ('open','accepted','dismissed')"
+        format!("status IN {}", findings::current_statuses_sql())
     } else {
-        "status = 'open'"
+        format!("status = '{}'", findings::FindingStatus::Open.as_db_str())
     };
     let mut open: Vec<WorklistFinding> = conn
         .prepare(&format!(
