@@ -169,11 +169,13 @@ pub(crate) fn parse_tracker_refs_with_source(
         let local = source
             .provider
             .is_code_host()
-            .then(|| tracker_token_ref_shaped(token, source, true, true, true))
+            .then(|| tracker_token_ref(token, source, GrammarScope::SourceLocal))
             .flatten();
         // Pass 1: qualified/URL grammars only, config order (every bare arm disabled).
         let parsed = local.or_else(|| {
-            trackers.iter().find_map(|tracker| tracker_token_ref(token, tracker, false, false))
+            trackers
+                .iter()
+                .find_map(|tracker| tracker_token_ref(token, tracker, GrammarScope::QualifiedOnly))
         });
         if let Some(mut parsed) = parsed {
             parsed.ref_kind = ref_kind_for(parsed.provider, previous);
@@ -197,8 +199,8 @@ pub(crate) fn parse_tracker_refs_with_bindings(
     for token in ref_tokens(text) {
         if let Some((binding_index, mut parsed)) =
             trackers.iter().enumerate().find_map(|(index, tracker)| {
-                tracker_token_ref(token, tracker, code_host == Some(index), true)
-                    .map(|parsed| (index, parsed))
+                let scope = GrammarScope::Configured { is_code_host: code_host == Some(index) };
+                tracker_token_ref(token, tracker, scope).map(|parsed| (index, parsed))
             })
         {
             parsed.ref_kind = ref_kind_for(parsed.provider, previous);
@@ -208,26 +210,46 @@ pub(crate) fn parse_tracker_refs_with_bindings(
     }
     refs
 }
+/// Which of a binding's ref shapes a routing pass may match.
+#[derive(Clone, Copy)]
+enum GrammarScope {
+    /// Only the LOCAL SHORTHAND shapes (`#N`, `!N`, `GH-N`), owned by the source binding. The
+    /// source-probe pass of the two-pass router uses it so a source-local shorthand can win before
+    /// any cross-tracker grammar (a Jira project literally named `GH` must not claim a GitHub
+    /// source's `GH-5`), while qualified/URL shapes stay config-order-claimed.
+    SourceLocal,
+    /// Qualified and URL shapes only — every bare arm disabled.
+    QualifiedOnly,
+    /// The single-pass configured grammar: qualified/URL shapes plus the bare shorthands, where a
+    /// bare `#N` belongs only to the designated code-host binding (`is_code_host`).
+    Configured { is_code_host: bool },
+}
+
+impl GrammarScope {
+    fn is_code_host(self) -> bool {
+        match self {
+            Self::SourceLocal => true,
+            Self::QualifiedOnly => false,
+            Self::Configured { is_code_host } => is_code_host,
+        }
+    }
+
+    fn allows_bare(self) -> bool {
+        !matches!(self, Self::QualifiedOnly)
+    }
+
+    fn bare_only(self) -> bool {
+        matches!(self, Self::SourceLocal)
+    }
+}
+
 fn tracker_token_ref(
     token: &str,
     tracker: &ResolvedTracker,
-    is_code_host: bool,
-    allow_bare: bool,
+    scope: GrammarScope,
 ) -> Option<TrackerParsedRef> {
-    tracker_token_ref_shaped(token, tracker, is_code_host, allow_bare, false)
-}
-
-/// `bare_only` restricts matching to the LOCAL SHORTHAND shapes (`#N`, `!N`, `GH-N`) — the
-/// source-probe pass of the two-pass router uses it so a source-local shorthand can win before
-/// any cross-tracker grammar (a Jira project literally named `GH` must not claim a GitHub
-/// source's `GH-5`), while qualified/URL shapes stay config-order-claimed.
-fn tracker_token_ref_shaped(
-    token: &str,
-    tracker: &ResolvedTracker,
-    is_code_host: bool,
-    allow_bare: bool,
-    bare_only: bool,
-) -> Option<TrackerParsedRef> {
+    let (is_code_host, allow_bare, bare_only) =
+        (scope.is_code_host(), scope.allows_bare(), scope.bare_only());
     match tracker.provider {
         Tracker::Github => {
             let base = url_base(tracker, "https://github.com");
