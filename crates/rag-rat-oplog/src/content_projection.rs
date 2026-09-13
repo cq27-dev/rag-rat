@@ -58,7 +58,11 @@ use super::stream::StreamId;
 // v7 (#1276): the node fold gains the anchor-scopes register, paired with the winning set like the
 // hash, so `anchors_json` rows carry each symbol anchor's `scope_hash`. The bump re-folds every
 // stream, `node_anchor_scopes` ops an older binary kept opaque included.
-pub(crate) const CONTENT_PROJECTOR_VERSION: i64 = 7;
+// v8 (#1304): the node fold keeps the anchor sets the register superseded, with each one's author
+// (`superseded_anchors_json`), so the drain can tell binding rows that are the image of a
+// publication another account made and this fold has superseded from rows of one still in flight.
+// The bump re-folds every stream so existing nodes carry their history.
+pub(crate) const CONTENT_PROJECTOR_VERSION: i64 = 8;
 
 /// The `oplog_meta` key holding the `/3` projector version the content projection was last folded
 /// by. DISTINCT from the `/1` `projector_version` (they evolve independently and share one meta
@@ -381,10 +385,31 @@ fn write_projection(
             .anchors_meta
             .and_then(|meta| authors.get(&(meta.lamport, meta.device)).copied().flatten())
             .map(AccountId::to_bytes);
+        // The sets the register held before the winner (see `ProjectedNode::superseded_anchors`),
+        // each with its author; NULL when there are none. Anchors only — a superseded set's scopes
+        // are never read.
+        let superseded_anchors_json = (!node.superseded_anchors.is_empty())
+            .then(|| {
+                let sets: Vec<SupersededAnchorSetRow> = node
+                    .superseded_anchors
+                    .iter()
+                    .map(|(set, meta)| SupersededAnchorSetRow {
+                        author: authors
+                            .get(&(meta.lamport, meta.device))
+                            .copied()
+                            .flatten()
+                            .map(|account| rag_rat_base::hash::hex_lower(&account.to_bytes())),
+                        anchors: set.iter().map(PortableAnchorRow::from).collect(),
+                    })
+                    .collect();
+                serde_json::to_string(&sets)
+            })
+            .transpose()
+            .context("serialize projected /3 node superseded anchors")?;
         tx.execute(
             "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status, \
-             anchors_json, source_text_hash, anchors_author)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             anchors_json, source_text_hash, anchors_author, superseded_anchors_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 stream_bytes.as_slice(),
                 node_id.as_str(),
@@ -392,7 +417,8 @@ fn write_projection(
                 node.status.as_db_str(),
                 anchors_json,
                 node.source_text_hash,
-                anchors_author.as_ref().map(|bytes| bytes.as_slice())
+                anchors_author.as_ref().map(|bytes| bytes.as_slice()),
+                superseded_anchors_json,
             ],
         )?;
     }
@@ -576,6 +602,27 @@ pub struct ProjectedContentNode {
     /// leaves a set the local account authored to `anchors/1`, which already carries it, and
     /// converges only sets another account authored.
     pub anchors_author: Option<AccountId>,
+    /// The anchor sets this node's register held before the winning one, each with its author,
+    /// oldest first and capped (see `ProjectedNode::superseded_anchors`). The drain converges
+    /// binding rows it holds with no applied set only when they are the image of one of these that
+    /// another account published.
+    pub superseded_anchors: Vec<SupersededAnchorSet>,
+}
+
+/// One anchor set a node's register superseded, and the account that published it (`None` when the
+/// fold could not attribute the entry).
+pub struct SupersededAnchorSet {
+    pub anchors: Vec<PortableAnchor>,
+    pub author: Option<AccountId>,
+}
+
+/// The stored shape of one [`SupersededAnchorSet`] inside `superseded_anchors_json`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SupersededAnchorSetRow {
+    /// The publishing account as lowercase hex, or absent when unattributed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<String>,
+    anchors: Vec<PortableAnchorRow>,
 }
 
 /// One projected `/3` edge, decoded for a projection consumer: the stable key, the folded spec (the
@@ -596,7 +643,8 @@ pub fn list_projected_content_nodes(
     stream_id: StreamId,
 ) -> anyhow::Result<Vec<ProjectedContentNode>> {
     let mut stmt = conn.prepare(
-        "SELECT node_id, content_json, status, anchors_json, source_text_hash, anchors_author
+        "SELECT node_id, content_json, status, anchors_json, source_text_hash, anchors_author,
+                superseded_anchors_json
          FROM content_projected_nodes
          WHERE stream_id = ?1 ORDER BY node_id",
     )?;
@@ -608,11 +656,20 @@ pub fn list_projected_content_nodes(
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<Vec<u8>>>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ))
     })?;
     let mut nodes = Vec::new();
     for row in rows {
-        let (node_id, content_json, status, anchors_json, source_text_hash, anchors_author) = row?;
+        let (
+            node_id,
+            content_json,
+            status,
+            anchors_json,
+            source_text_hash,
+            anchors_author,
+            superseded_anchors_json,
+        ) = row?;
         let content: NodeContentRow = serde_json::from_str(&content_json)
             .with_context(|| format!("decode projected /3 node content for `{node_id}`"))?;
         let status = NodeStatus::from_db_str(&status).with_context(|| {
@@ -631,6 +688,24 @@ pub fn list_projected_content_nodes(
             })
             .collect();
         let anchors = rows.map(|rows| rows.into_iter().map(PortableAnchor::from).collect());
+        let superseded_anchors = superseded_anchors_json
+            .map(|json| serde_json::from_str::<Vec<SupersededAnchorSetRow>>(&json))
+            .transpose()
+            .with_context(|| {
+                format!("decode projected /3 node superseded anchors for `{node_id}`")
+            })?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| {
+                Ok(SupersededAnchorSet {
+                    author: row.author.as_deref().map(AccountId::from_hex).transpose()?,
+                    anchors: row.anchors.into_iter().map(PortableAnchor::from).collect(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+            .with_context(|| {
+                format!("decode projected /3 node superseded anchors for `{node_id}`")
+            })?;
         let anchors_author = anchors_author
             .map(|bytes| {
                 <[u8; 32]>::try_from(bytes.as_slice()).map(AccountId::from_bytes).map_err(|_| {
@@ -648,6 +723,7 @@ pub fn list_projected_content_nodes(
             source_text_hash,
             anchor_scopes,
             anchors_author,
+            superseded_anchors,
         });
     }
     Ok(nodes)

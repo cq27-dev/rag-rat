@@ -8708,7 +8708,15 @@ pub(crate) fn ensure_content_projection_shape(conn: &Connection) -> rusqlite::Re
     }
     add_column_if_missing(conn, "content_projected_nodes", "anchors_json", "TEXT")?;
     add_column_if_missing(conn, "content_projected_nodes", "source_text_hash", "TEXT")?;
-    add_column_if_missing(conn, "content_projected_nodes", "anchors_author", "BLOB")
+    add_column_if_missing(conn, "content_projected_nodes", "anchors_author", "BLOB")?;
+    add_column_if_missing(conn, "content_projected_nodes", "superseded_anchors_json", "TEXT")
+}
+
+/// V124 (#1304): the anchor sets a node's register held before the winning one, as the content
+/// projector writes them. Nullable — NULL until a second publication folds — and populated by the
+/// projector's rebuild on the version bump that ships beside this column, not by a backfill here.
+pub fn apply_content_projected_superseded_anchors(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "content_projected_nodes", "superseded_anchors_json", "TEXT")
 }
 
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {

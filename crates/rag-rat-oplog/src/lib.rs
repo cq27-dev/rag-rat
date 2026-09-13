@@ -150,7 +150,7 @@ pub use content_projection::rebuild_all_content_projections_if_stale;
 // reconcile. Read-only over the projection tables, keeping the private row DTOs inside this
 // crate.
 pub use content_projection::{
-    ProjectedContentEdge, ProjectedContentNode, list_projected_content_edges,
+    ProjectedContentEdge, ProjectedContentNode, SupersededAnchorSet, list_projected_content_edges,
     list_projected_content_nodes,
 };
 // The drain-gate seam (#902): a per-stream projection epoch + last-drained watermark (both in

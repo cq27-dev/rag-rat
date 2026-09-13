@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 123;
+pub const LATEST_SCHEMA_VERSION: u32 = 124;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -888,6 +888,12 @@ const MIGRATION_123_DESCRIPTION: &str =
      resolved_symbol_kind, resolved_signature_hash, resolved_moniker_tool_version on \
      repo_memory_bindings), so relocation writes local columns and no longer republishes the row \
      on anchors/1 (#1297)";
+const MIGRATION_124_ID: &str = "124_content_projected_superseded_anchors";
+const MIGRATION_124_CHECKSUM: &str = "sha256:rag-rat-content-projected-superseded-anchors-v124";
+const MIGRATION_124_DESCRIPTION: &str =
+    "Add superseded_anchors_json to content_projected_nodes: the anchor sets a node's register \
+     held before the winning one, so the memory drain can tell binding rows that are the image of \
+     a publication it has superseded from rows of one still in flight (#1304)";
 const MIGRATION_118_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-v118";
 const MIGRATION_118_DESCRIPTION: &str =
     "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
@@ -1930,6 +1936,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_123_CHECKSUM,
         description: MIGRATION_123_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_memory_binding_resolution),
+    },
+    Migration {
+        id: MIGRATION_124_ID,
+        checksum: MIGRATION_124_CHECKSUM,
+        description: MIGRATION_124_DESCRIPTION,
+        apply: MigrationFn::Plain(migrations::apply_content_projected_superseded_anchors),
     },
 ];
 

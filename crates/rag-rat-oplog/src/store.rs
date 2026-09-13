@@ -681,6 +681,7 @@ pub fn load_projection(conn: &Connection, stream: StreamId) -> anyhow::Result<Pr
                 source_text_hash: None,
                 anchor_scopes: Default::default(),
                 anchors_meta: None,
+                superseded_anchors: Vec::new(),
             });
         }
     }

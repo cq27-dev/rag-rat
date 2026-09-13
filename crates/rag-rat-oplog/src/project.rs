@@ -84,7 +84,20 @@ pub struct ProjectedNode {
     /// account, which is how the drain tells a set its own account's `anchors/1` already
     /// carries from one only the snapshot can deliver.
     pub anchors_meta: Option<OpMeta>,
+    /// The anchor sets this node's register held before the winning one, each with the
+    /// `(lamport, device)` of the entry that published it, oldest first, at most
+    /// [`SUPERSEDED_ANCHOR_SETS_KEPT`]. A device that receives a memory's binding rows from a
+    /// sibling before it holds the memory reads them against these: rows that are the image of a
+    /// superseded publication another account made are known to be stale and are converged on the
+    /// winner; rows matching no such publication may be one still in flight, and are left alone.
+    /// The meta names the publication's author, which the content projection resolves.
+    pub superseded_anchors: Vec<(Vec<PortableAnchor>, OpMeta)>,
 }
+
+/// How many superseded anchor sets a node keeps (see [`ProjectedNode::superseded_anchors`]): enough
+/// to recognise the image any live sibling can still hold, bounded so a memory rebound daily for
+/// years does not grow its projection row without limit.
+pub const SUPERSEDED_ANCHOR_SETS_KEPT: usize = 32;
 
 /// A projected edge: its winning spec (from the last add) and its last resolved anchor, if any.
 /// Presence in `ProjectedState::edges` IS its presence.
@@ -101,6 +114,9 @@ struct NodeAccum {
     content: Option<NodeContent>,
     status: Option<NodeStatus>,
     anchors: Option<(Vec<PortableAnchor>, OpMeta)>,
+    /// The sets the register held before the current one, with their publishing entry's meta,
+    /// oldest first, capped.
+    superseded_anchors: Vec<(Vec<PortableAnchor>, OpMeta)>,
     /// Each device's latest `NodeSourceHash`, to pair with that device's anchor set.
     source_text_hash_by_device: BTreeMap<op::DeviceFingerprint, String>,
     /// Each device's `NodeAnchorScopes` by Lamport, so a set pairs with the latest scopes its
@@ -202,6 +218,12 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                 // per-binding merge, so a later op saying "these two" retires a binding the
                 // earlier one named.
                 let node = nodes.entry(node_id.clone()).or_default();
+                if let Some(superseded) = node.anchors.take() {
+                    node.superseded_anchors.push(superseded);
+                    if node.superseded_anchors.len() > SUPERSEDED_ANCHOR_SETS_KEPT {
+                        node.superseded_anchors.remove(0);
+                    }
+                }
                 node.anchors = Some((canonical_anchors(anchors), entry.meta));
                 node.anchor_set_lamports_by_device
                     .entry(entry.meta.device)
@@ -284,6 +306,7 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
                     source_text_hash,
                     anchor_scopes,
                     anchors_meta,
+                    superseded_anchors: acc.superseded_anchors,
                 }))
             })
             .collect(),
@@ -519,6 +542,34 @@ mod tests {
             node_id: NodeId::from(id),
             anchors: binding_ids.iter().map(|binding_id| anchor(binding_id)).collect(),
         }
+    }
+
+    /// The sets a node's register held before the winner are kept, oldest first and capped, so a
+    /// consumer can recognise a publication it has already superseded. A republish of identical
+    /// bytes is a publication too. The first set supersedes nothing.
+    #[test]
+    fn superseded_anchor_sets_are_kept_oldest_first_and_capped() {
+        let mut entries = vec![at(1, 1, create("mem_1", "t"))];
+        for i in 0..(SUPERSEDED_ANCHOR_SETS_KEPT as u64 + 3) {
+            entries.push(at(2 + i, 1, anchors_op("mem_1", &[&format!("b{i}")])));
+        }
+        let state = project(&entries);
+        let node = &state.nodes[&NodeId::from("mem_1")];
+        assert_eq!(node.anchors.as_ref().unwrap()[0].binding_id, "b34");
+        let kept: Vec<&str> =
+            node.superseded_anchors.iter().map(|(set, _)| set[0].binding_id.as_str()).collect();
+        assert_eq!(
+            node.superseded_anchors.last().map(|(_, meta)| meta.lamport),
+            Some(2 + SUPERSEDED_ANCHOR_SETS_KEPT as u64 + 1),
+            "each set keeps the meta of the entry that published it",
+        );
+        assert_eq!(kept.len(), SUPERSEDED_ANCHOR_SETS_KEPT, "capped");
+        assert_eq!(kept.first(), Some(&"b2"), "the oldest kept set follows the ones dropped");
+        assert_eq!(kept.last(), Some(&"b33"), "the newest kept set is the one the winner replaced");
+
+        let first =
+            project(&[at(1, 1, create("mem_2", "t")), at(2, 1, anchors_op("mem_2", &["a"]))]);
+        assert!(first.nodes[&NodeId::from("mem_2")].superseded_anchors.is_empty());
     }
 
     /// The anchor register is LWW and a FULL-SET replacement, exactly like content: the later op
