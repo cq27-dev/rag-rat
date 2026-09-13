@@ -5,15 +5,20 @@
 # in Cargo.toml). `version_group` below makes release-plz assign the SAME next version to every
 # member (the highest bump required across the group), so they never drift. A new crate MUST be
 # added here with `version_group = "rag-rat"`, or release-plz treats it as its own group and tries
-# to publish it at the current (already-taken) workspace version.
+# to publish it at the current (already-taken) workspace version — and to the `rag-rat` package's
+# `changelog_include` list, or its commits never reach the changelog.
 
 [workspace]
 # One git tag + one GitHub release per bump, not one per crate. The libraries stay tag/release-
 # silent; the `rag-rat` binary below re-enables both and anchors the single workspace tag.
 git_tag_enable = false
 git_release_enable = false
-# Conventional-commit changelog. `changelog_path` can only be set per-package (below), so all three
-# members point at the same root CHANGELOG.md to produce one combined history.
+# Conventional-commit changelog: ONE combined CHANGELOG.md at the root, written by the `rag-rat`
+# package alone (below). release-plz attributes a commit to a package by the files it touches, and
+# a package skips a changelog that already carries the version header — so when every member
+# pointed `changelog_path` at the same file, the first member processed (rag-rat-base) wrote its
+# own view and the rest wrote nothing: any commit that touched no file of that one crate was left
+# out of the release notes. `changelog_include` on `rag-rat` folds every member's commits in.
 changelog_update = true
 
 # `rag-rat` is the user-facing binary and the natural anchor for the workspace tag. Because every
@@ -32,61 +37,76 @@ git_tag_enable = true
 git_release_enable = false
 git_tag_name = "v{{ version }}"
 changelog_path = "./CHANGELOG.md"
+# Every workspace member: a crate missing here has its commits dropped from the release notes.
+changelog_include = [
+    "rag-rat-core",
+    "rag-rat-mcp",
+    "rag-rat-base",
+    "rag-rat-db",
+    "rag-rat-papertrail",
+    "rag-rat-llm",
+    "rag-rat-oracle",
+    "rag-rat-query",
+    "rag-rat-dream",
+    "rag-rat-clones",
+    "rag-rat-oplog",
+    "rag-rat-sync",
+]
 
 [[package]]
 name = "rag-rat-core"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false
 
 [[package]]
 name = "rag-rat-mcp"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false
 
 [[package]]
 name = "rag-rat-base"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false
 
 [[package]]
 name = "rag-rat-db"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false
 
 [[package]]
 name = "rag-rat-papertrail"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false
 
 [[package]]
 name = "rag-rat-llm"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false
 
 [[package]]
 name = "rag-rat-oracle"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false
 
 [[package]]
 name = "rag-rat-query"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false
 
 [[package]]
 name = "rag-rat-dream"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false
 
 [[package]]
 name = "rag-rat-clones"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false
 
 [[package]]
 name = "rag-rat-oplog"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false
 
 # rag-rat-sync joined the workspace in #406 and was bootstrapped onto crates.io by hand for its
 # first two releases (0.21.0, 0.21.1): release-plz's registry token can publish new versions of a
@@ -96,4 +116,4 @@ changelog_path = "./CHANGELOG.md"
 [[package]]
 name = "rag-rat-sync"
 version_group = "rag-rat"
-changelog_path = "./CHANGELOG.md"
+changelog_update = false

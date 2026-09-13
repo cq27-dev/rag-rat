@@ -70,6 +70,10 @@ env:
 jobs:
   eval:
     name: eval (search-quality)
+    # The release PR (`release-plz-*`) changes versions, the changelog and the plugin manifests —
+    # nothing this workflow measures — and its branch is rewritten on every push to main, so
+    # running here would only restart a long job that a merge cancels again.
+    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
