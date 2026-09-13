@@ -7,7 +7,8 @@
 # pinned tool, and the Bencher testbed should be re-baselined when the image changes.
 #
 # NOT used by the lightweight iai-callgrind push/PR bench — that one is deterministic by design and
-# runs on the GitHub-hosted runner. valgrind + the iai runner are included anyway so this image can
+# runs directly on the runner (the self-hosted `bigmem` box for the repository's own work, a hosted
+# runner for a fork's pull request). valgrind + the iai runner are included anyway so this image can
 # reproduce that bench too if ever needed.
 #
 # Base must be trixie, not bookworm: the pinned scip-clang prebuilt links against GLIBC_2.38, which

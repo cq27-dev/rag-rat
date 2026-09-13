@@ -74,13 +74,14 @@ jobs:
     # nothing this workflow measures — and its branch is rewritten on every push to main, so
     # running here would only restart a long job that a merge cancels again.
     if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(runner.name, 'hetzner-') }}
       - uses: taiki-e/install-action@nextest
       # rust-cache can restore a PARTIAL ort-sys download — a cache marker present but the native
       # onnxruntime lib missing — so `cargo clean` alone re-emits link metadata pointing at a lib

@@ -20,7 +20,8 @@ permissions:
 
 env:
   BENCHER_PROJECT: rag-rat
-  BENCHER_TESTBED: ubuntu-latest
+  # Where bench-pr-run measures: the self-hosted benchmark runner (see bench-pr-run.yml).
+  BENCHER_TESTBED: hetzner-bigmem
   # The secret holds a Bencher *project key* (`bencher_run_…`) — use the --key auth path
   # (BENCHER_API_KEY), not the account-JWT path (BENCHER_API_TOKEN). See docs/bencher.md.
   BENCHER_API_KEY: ${{ secrets.BENCHER_API_TOKEN }}
@@ -29,7 +30,7 @@ jobs:
   track:
     # Only proceed if step 1's benchmarks actually succeeded.
     if: github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Download benchmark results (from step 1)
         uses: dawidd6/action-download-artifact@v6

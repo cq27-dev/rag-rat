@@ -24,7 +24,9 @@ concurrency:
 
 env:
   BENCHER_PROJECT: rag-rat
-  BENCHER_TESTBED: ubuntu-latest
+  # The `bench` job's testbed (the self-hosted benchmark runner); `eval_recall` stays hosted and
+  # overrides it below.
+  BENCHER_TESTBED: hetzner-bigmem
   # The secret holds a Bencher *project key* (`bencher_run_…`), so it goes in BENCHER_API_KEY
   # (the --key auth path), NOT BENCHER_API_TOKEN (which expects an account JWT and rejects a key).
   BENCHER_API_KEY: ${{ secrets.BENCHER_API_TOKEN }}
@@ -33,7 +35,8 @@ env:
 
 jobs:
   bench:
-    runs-on: ubuntu-latest
+    # The self-hosted benchmark runner: one slot, so this never runs beside another benchmark.
+    runs-on: bigmem
     # The publish steps below hardcode `--branch main --thresholds-reset`, so this job must only run
     # against main — a manual dispatch from a feature ref would otherwise reset main's baseline with
     # non-main results. The push trigger is already main-only; this guards the workflow_dispatch ref.
@@ -41,21 +44,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install valgrind (iai-callgrind)
-        run: sudo apt-get update && sudo apt-get install -y valgrind
-      - name: Cache iai-callgrind-runner
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/bin/iai-callgrind-runner
-          key: iai-runner-${{ env.IAI_RUNNER_VERSION }}
+      # The runner is persistent: the iai runner stays installed in its cargo home, and the bench
+      # corpus in the directory its `RAG_RAT_BENCH_CORPUS` names, so neither needs a cache step.
       - name: Install iai-callgrind-runner
         run: command -v iai-callgrind-runner || cargo install --locked iai-callgrind-runner@${{ env.IAI_RUNNER_VERSION }}
-      - name: Cache bench corpus (cargo 0.97.1)
-        uses: actions/cache@v5
-        with:
-          path: target/bench-corpus
-          key: bench-corpus-cargo-0.97.1
       - uses: bencherdev/bencher@main
 
       # Instruction counts — TRACKING ONLY, no `--err`. iai is *mostly* deterministic, but the
@@ -96,9 +88,10 @@ jobs:
   # recall@3; a noisy dip doesn't hard-fail the run. Same stance as the iai/criterion series above.
   eval_recall:
     name: search recall (commit-replay)
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-4
     if: github.ref == 'refs/heads/main'
     env:
+      BENCHER_TESTBED: ubicloud-standard-4
       # Stable, cacheable location for the MiniLM ONNX download (fastembed honours this env var;
       # mirrors eval.yml). The model is immutable, so the cache key is static.
       RAG_RAT_MODEL_CACHE: ${{ github.workspace }}/.rag-rat-models

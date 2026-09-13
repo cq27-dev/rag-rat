@@ -100,6 +100,10 @@ env:
   # compiler) is locked, so a transitive npm release can't shift a PR's numbers while the indexer's
   # own `--version` is unchanged (#185 item 2).
   SCIP_CLANG_VERSION: v0.4.0
+  # CMake 4 dropped compatibility with a `cmake_minimum_required` below 3.5, which yaml-cpp 0.8.0
+  # (the cpp-yaml corpus) declares. CMake reads this floor from the environment, so the corpus
+  # profile — whose hash keys report comparability — stays as committed; an older CMake ignores it.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   matrix:
@@ -109,7 +113,7 @@ jobs:
     # nothing this workflow measures — and its branch is rewritten on every push to main, so
     # running here would only restart a long job that a merge cancels again.
     if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     outputs:
       tier: ${{ steps.select.outputs.tier }}
       corpora: ${{ steps.select.outputs.corpora }}
@@ -137,7 +141,9 @@ jobs:
     needs: matrix
     if: needs.matrix.outputs.tier == 'small'
     # 24.04: the pinned scip-clang prebuilt links against a recent GLIBC (see bench.Containerfile).
-    runs-on: ubuntu-24.04
+    # Six legs fan out onto six ephemeral VMs at once. Each is a cold build, but the corpora are
+    # small and the alternative — the box's warm slots — queues them behind the CI jobs.
+    runs-on: ubicloud-standard-4
     strategy:
       fail-fast: false
       matrix:
@@ -154,6 +160,7 @@ jobs:
         with:
           components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(runner.name, 'hetzner-') }}
 
       - name: Build rag-rat (release, hash embedder — no model download)
         run: cargo build --release --no-default-features --bin rag-rat
@@ -162,6 +169,9 @@ jobs:
         run: |
           set -euo pipefail
           tool="$(python3 tools/oracle-corpus.py --corpus '${{ matrix.corpus }}' --field tool)"
+          # A per-job bin dir: writable on every runner, and on PATH for the oracle's probe.
+          mkdir -p "$RUNNER_TEMP/bin" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
           echo "installing $tool for ${{ matrix.corpus }}"
           case "$tool" in
             rust-analyzer)
@@ -172,13 +182,15 @@ jobs:
               # the single line to change when un-pinning. Copy the proxy to an absolute path on PATH
               # so the oracle's `rust-analyzer scip` probe finds it.
               ra="$(rustup which rust-analyzer)"
-              install -m 0755 "$ra" /usr/local/bin/rust-analyzer
+              # A symlink, not a copy: the binary finds librustc_driver through an rpath relative
+              # to its real location, so a copy elsewhere fails to load.
+              ln -sf "$ra" "$RUNNER_TEMP/bin/rust-analyzer"
               rust-analyzer --version ;;
             scip-clang)
               curl --proto '=https' --tlsv1.2 -sSfL \
                 "https://github.com/sourcegraph/scip-clang/releases/download/${SCIP_CLANG_VERSION}/scip-clang-x86_64-linux" \
-                -o /usr/local/bin/scip-clang
-              chmod +x /usr/local/bin/scip-clang
+                -o "$RUNNER_TEMP/bin/scip-clang"
+              chmod +x "$RUNNER_TEMP/bin/scip-clang"
               scip-clang --version ;;
             scip-python|scip-typescript)
               # Install the pinned npm toolchain from its committed lockfile (full transitive tree,
@@ -201,11 +213,14 @@ jobs:
       - name: Run the oracle for ${{ matrix.corpus }}
         env:
           CORPUS: ${{ matrix.corpus }}
-          RAG_RAT_BIN: target/release/rag-rat
           ORACLE_WORK: ${{ runner.temp }}/oracle-${{ matrix.corpus }}
           REPORT_OUT: ${{ runner.temp }}/${{ matrix.corpus }}-report.json
           RAG_RAT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: bash tools/oracle-run.sh
+        # The binary sits under the cargo target dir in use — a self-hosted runner keeps one outside
+        # the checkout — not necessarily under ./target.
+        run: |
+          export RAG_RAT_BIN="${CARGO_TARGET_DIR:-$PWD/target}/release/rag-rat"
+          bash tools/oracle-run.sh
 
       - name: Upload resolution report
         if: always()
@@ -224,7 +239,7 @@ jobs:
     # Run whenever the matrix ran, even if a corpus leg failed its health gate — a failing report is
     # exactly what we want surfaced in the summary/comment.
     if: always() && needs.matrix.outputs.tier == 'small' && needs.small.result != 'skipped'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v5
 
