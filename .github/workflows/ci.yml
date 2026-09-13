@@ -137,8 +137,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: ${{ !startsWith(runner.name, 'hetzner-') }}
       - uses: taiki-e/install-action@cargo-llvm-cov
+      # The instrumented build is ~18 GB and identical on every persistent runner; one shared dir
+      # instead of one per runner keeps it warm for all of them and stores it once. Cargo's own lock
+      # covers only the build, not llvm-cov's clean/test/report cycle, so the whole command runs
+      # under a host-wide lock: two coverage jobs on the box run one after the other.
+      - name: Share the instrumented build between the persistent runners
+        if: ${{ startsWith(runner.name, 'hetzner-') }}
+        run: |
+          echo "CARGO_TARGET_DIR=$HOME/cargo-target-coverage" >> "$GITHUB_ENV"
+          echo "COVERAGE_LOCK=$HOME/cargo-target-coverage.lock" >> "$GITHUB_ENV"
       - name: Generate coverage (lcov)
-        run: cargo llvm-cov --workspace --no-default-features --locked --lcov --output-path lcov.info
+        run: |
+          if [ -n "${COVERAGE_LOCK:-}" ]; then
+            exec flock "$COVERAGE_LOCK" cargo llvm-cov --workspace --no-default-features --locked --lcov --output-path lcov.info
+          fi
+          cargo llvm-cov --workspace --no-default-features --locked --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:
