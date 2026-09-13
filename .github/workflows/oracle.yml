@@ -100,6 +100,10 @@ env:
   # compiler) is locked, so a transitive npm release can't shift a PR's numbers while the indexer's
   # own `--version` is unchanged (#185 item 2).
   SCIP_CLANG_VERSION: v0.4.0
+  # CMake 4 dropped compatibility with a `cmake_minimum_required` below 3.5, which yaml-cpp 0.8.0
+  # (the cpp-yaml corpus) declares. CMake reads this floor from the environment, so the corpus
+  # profile — whose hash keys report comparability — stays as committed; an older CMake ignores it.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   matrix:
