@@ -64,6 +64,27 @@ impl StreamId {
     }
 }
 
+/// An op-log entry's content address: `sha256(body_bytes)` — what a signature covers, what the next
+/// entry's `prev_hash` links to, and what the store keys rows by. A newtype so an entry hash cannot
+/// be transposed with a stream id, a device fingerprint, or a repository incarnation — every one of
+/// them also a bare 32-byte array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntryHash([u8; 32]);
+
+impl EntryHash {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// Whether a per-node override pulls a node INTO the view or drops it OUT — the per-node
 /// refinement on top of the per-kind allow-list defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

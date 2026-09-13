@@ -51,7 +51,7 @@
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use crate::op::DeviceFingerprint;
-use crate::stream::StreamId;
+use crate::stream::{EntryHash, StreamId};
 
 /// What one prefix compaction did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +93,7 @@ pub(crate) fn record_adopted_floor(
     stream: StreamId,
     device: DeviceFingerprint,
     lamport: u64,
-    entry_hash: [u8; 32],
+    entry_hash: EntryHash,
     now_ms: i64,
 ) -> anyhow::Result<()> {
     tx.execute(
@@ -573,7 +573,7 @@ mod tests {
         let forged = crate::entry::sign_entry_from_op_bytes(
             device.secret(),
             stream(),
-            Some(<[u8; 32]>::try_from(tail_hash.as_slice()).unwrap()),
+            Some(EntryHash::from_bytes(<[u8; 32]>::try_from(tail_hash.as_slice()).unwrap())),
             2,
             super::super::row_op::encode(&upsert("rx", "forged")),
         );
@@ -708,7 +708,9 @@ mod tests {
             &floor_bytes,
             Some(store::AdvertisedFloor {
                 lamport: 2,
-                entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+                entry_hash: EntryHash::from_bytes(
+                    <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+                ),
             }),
         )
         .unwrap();
@@ -772,7 +774,9 @@ mod tests {
             &floor_bytes,
             Some(store::AdvertisedFloor {
                 lamport: 1,
-                entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+                entry_hash: EntryHash::from_bytes(
+                    <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+                ),
             }),
         )
         .unwrap();
@@ -874,7 +878,9 @@ mod tests {
             &bytes(4).1,
             Some(store::AdvertisedFloor {
                 lamport: 4,
-                entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+                entry_hash: EntryHash::from_bytes(
+                    <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+                ),
             }),
         )
         .unwrap();
@@ -991,7 +997,9 @@ mod tests {
             &floor_bytes,
             Some(store::AdvertisedFloor {
                 lamport: 4,
-                entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+                entry_hash: EntryHash::from_bytes(
+                    <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
+                ),
             }),
         )
         .unwrap();

@@ -30,7 +30,7 @@ use super::op::{
     NodeStatus, OpMeta, PortableAnchor, ResolvedAnchor,
 };
 use super::project::{self, ProjectedEdge, ProjectedNode, ProjectedState};
-use super::stream::StreamId;
+use super::stream::{EntryHash, StreamId};
 
 /// Bump when the fold's projectable set or LWW semantics change (a new op kind becomes `Known`, a
 /// register is added). A shadow projection stamped with an older version is re-folded on demand
@@ -48,26 +48,26 @@ const PROJECTOR_VERSION_KEY: &str = "projector_version";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendOutcome {
     /// Verified, chain-continuous, newly inserted; the projection was re-folded in the same txn.
-    Appended { entry_hash: [u8; 32] },
+    Appended { entry_hash: EntryHash },
     /// `entry_hash` already stored — an idempotent redelivery; nothing changed.
-    AlreadyPresent { entry_hash: [u8; 32] },
+    AlreadyPresent { entry_hash: EntryHash },
     /// `lamport` advances past the tail but `prev_hash` does not point at it (a gap): the
     /// predecessor has not arrived. Routine under out-of-order delivery — the caller retries
     /// after backfill.
-    MissingPredecessor { entry_hash: [u8; 32] },
+    MissingPredecessor { entry_hash: EntryHash },
     /// The entry conflicts with the stored chain (a second genesis, or a `lamport` at/behind the
     /// tail) — an equivocation. `conflicting` is the stored entry it collides with. The rejected
     /// entry is durably quarantined in `oplog_fork_evidence` (BOTH heads must survive a process
     /// exit — a cloned/restored device is exactly the case where forensics happen later); the
     /// log and projection stay untouched.
-    Fork { entry_hash: [u8; 32], conflicting: Vec<u8> },
+    Fork { entry_hash: EntryHash, conflicting: Vec<u8> },
 }
 
 /// The head of one `(stream, device)` chain — its highest-`lamport` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainTail {
     pub lamport: u64,
-    pub entry_hash: [u8; 32],
+    pub entry_hash: EntryHash,
 }
 
 /// Verify and durably append one signed entry under `pubkey` onto `expected_stream`, keeping the
@@ -185,7 +185,7 @@ pub fn author_in_tx(
     device: &LocalDevice,
     op: &MemoryOp,
     now_ms: i64,
-) -> anyhow::Result<[u8; 32]> {
+) -> anyhow::Result<EntryHash> {
     assert_projector_not_newer(tx)?;
     let entry_hash = author_one(tx, stream, device, op, now_ms)?;
     reproject_after_write(tx, stream)?;
@@ -201,7 +201,7 @@ pub fn author_op(
     device: &LocalDevice,
     op: &MemoryOp,
     now_ms: i64,
-) -> anyhow::Result<[u8; 32]> {
+) -> anyhow::Result<EntryHash> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let entry_hash = author_in_tx(&tx, stream, device, op, now_ms)?;
     tx.commit()?;
@@ -280,7 +280,7 @@ fn author_one(
     device: &LocalDevice,
     op: &MemoryOp,
     now_ms: i64,
-) -> anyhow::Result<[u8; 32]> {
+) -> anyhow::Result<EntryHash> {
     let (lamport, prev_hash) = match chain_tail(tx, stream, device.fingerprint())? {
         Some(tail) => (tail.lamport + 1, Some(tail.entry_hash)),
         None => (0, None),
@@ -349,7 +349,7 @@ fn predecessor_present(
     conn: &Connection,
     stream: StreamId,
     device: DeviceFingerprint,
-    prev_hash: &[u8; 32],
+    prev_hash: &EntryHash,
 ) -> rusqlite::Result<bool> {
     let stream_bytes = stream.to_bytes();
     let device_bytes = device.to_bytes();
@@ -373,7 +373,7 @@ fn insert_entry(
 ) -> rusqlite::Result<()> {
     let stream_bytes = verified.stream_id.to_bytes();
     let device_bytes = verified.device_fingerprint.to_bytes();
-    let prev_hash: Option<Vec<u8>> = verified.prev_hash.map(|h| h.to_vec());
+    let prev_hash: Option<Vec<u8>> = verified.prev_hash.map(|h| h.as_slice().to_vec());
     tx.execute(
         "INSERT INTO oplog_entries(
              entry_hash, stream_id, device_fingerprint, lamport, prev_hash, signed_bytes,
@@ -411,13 +411,13 @@ pub fn chain_tail(
     row.map(|(lamport, hash)| {
         Ok(ChainTail {
             lamport: u64::try_from(lamport).context("stored lamport is negative")?,
-            entry_hash: hash_from_vec(hash)?,
+            entry_hash: EntryHash::from_bytes(hash_from_vec(hash)?),
         })
     })
     .transpose()
 }
 
-fn entry_exists(conn: &Connection, entry_hash: &[u8; 32]) -> rusqlite::Result<bool> {
+fn entry_exists(conn: &Connection, entry_hash: &EntryHash) -> rusqlite::Result<bool> {
     Ok(conn
         .query_row(
             "SELECT 1 FROM oplog_entries WHERE entry_hash = ?1",
@@ -432,7 +432,7 @@ fn entry_exists(conn: &Connection, entry_hash: &[u8; 32]) -> rusqlite::Result<bo
 /// quarantine row points at it).
 struct ConflictingEntry {
     signed_bytes: Vec<u8>,
-    entry_hash: [u8; 32],
+    entry_hash: EntryHash,
 }
 
 /// The stored entry an incoming one collides with: prefer the entry in the same `(stream, device,
@@ -465,7 +465,10 @@ fn conflicting_entry(
             .optional()?,
     };
     row.map(|(signed_bytes, entry_hash)| {
-        Ok(ConflictingEntry { signed_bytes, entry_hash: hash_from_vec(entry_hash)? })
+        Ok(ConflictingEntry {
+            signed_bytes,
+            entry_hash: EntryHash::from_bytes(hash_from_vec(entry_hash)?),
+        })
     })
     .transpose()
 }
@@ -477,12 +480,12 @@ fn record_fork_evidence(
     verified: &VerifiedEntry,
     lamport: i64,
     signed_bytes: &[u8],
-    conflicting_entry_hash: Option<[u8; 32]>,
+    conflicting_entry_hash: Option<EntryHash>,
     now_ms: i64,
 ) -> rusqlite::Result<()> {
     let stream_bytes = verified.stream_id.to_bytes();
     let device_bytes = verified.device_fingerprint.to_bytes();
-    let conflicting: Option<Vec<u8>> = conflicting_entry_hash.map(|h| h.to_vec());
+    let conflicting: Option<Vec<u8>> = conflicting_entry_hash.map(|h| h.as_slice().to_vec());
     tx.execute(
         "INSERT INTO oplog_fork_evidence(
              stream_id, entry_hash, device_fingerprint, lamport, signed_bytes,
@@ -1158,8 +1161,13 @@ mod tests {
         let conn = db();
         let s = secret(3);
         // A follow-on that references a predecessor we don't hold (no genesis appended yet).
-        let orphan =
-            entry::sign_entry(&s, stream_a(), Some([7u8; 32]), 2, &create("mem_a", "orphan"));
+        let orphan = entry::sign_entry(
+            &s,
+            stream_a(),
+            Some(EntryHash::from_bytes([7u8; 32])),
+            2,
+            &create("mem_a", "orphan"),
+        );
         assert!(matches!(
             append(&conn, stream_a(), &orphan.signed_bytes, &s.public(), 1_000).unwrap(),
             AppendOutcome::MissingPredecessor { .. }
@@ -1170,7 +1178,13 @@ mod tests {
         // gap).
         let g = entry::sign_entry(&s, stream_a(), None, 1, &create("mem_a", "first"));
         append(&conn, stream_a(), &g.signed_bytes, &s.public(), 1_001).unwrap();
-        let gap = entry::sign_entry(&s, stream_a(), Some([9u8; 32]), 5, &create("mem_b", "gap"));
+        let gap = entry::sign_entry(
+            &s,
+            stream_a(),
+            Some(EntryHash::from_bytes([9u8; 32])),
+            5,
+            &create("mem_b", "gap"),
+        );
         assert!(matches!(
             append(&conn, stream_a(), &gap.signed_bytes, &s.public(), 1_002).unwrap(),
             AppendOutcome::MissingPredecessor { .. }
@@ -1212,8 +1226,13 @@ mod tests {
 
         // A stale entry (lamport at/below the tail) whose predecessor we don't even hold can never
         // become a valid extension either — it is a permanent equivocation, NOT a retryable gap.
-        let stale_absent =
-            entry::sign_entry(&s, stream_a(), Some([3u8; 32]), 4, &create("mem_d", "stale-absent"));
+        let stale_absent = entry::sign_entry(
+            &s,
+            stream_a(),
+            Some(EntryHash::from_bytes([3u8; 32])),
+            4,
+            &create("mem_d", "stale-absent"),
+        );
         assert!(matches!(
             append(&conn, stream_a(), &stale_absent.signed_bytes, &s.public(), 1_003).unwrap(),
             AppendOutcome::Fork { .. }
@@ -1227,7 +1246,7 @@ mod tests {
         assert_eq!(quarantined.len(), 3, "each fork left one evidence row");
         assert!(
             quarantined.iter().any(|(hash, signed, conflicting)| {
-                hash.as_slice() == second_genesis.entry.entry_hash
+                hash.as_slice() == second_genesis.entry.entry_hash.as_slice()
                     && signed == &second_genesis.signed_bytes
                     && conflicting.as_deref() == Some(g.entry.entry_hash.as_slice())
             }),

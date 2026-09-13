@@ -20,6 +20,7 @@ use super::store::{self, AcceptOutcome};
 use super::{produce, refold};
 use crate::device::DevicePublic;
 use crate::op::OpMeta;
+use crate::stream::EntryHash;
 use crate::{AccountId, LocalDevice};
 
 /// The stable dependencies of a sync pass: the project being synced, the owning account (which the
@@ -318,7 +319,7 @@ fn author_repair(
     stream: crate::stream::StreamId,
     op: &RowOp,
     what: &str,
-) -> anyhow::Result<Option<[u8; 32]>> {
+) -> anyhow::Result<Option<EntryHash>> {
     let Some(signed) =
         store::author_row_entry_if_it_fits(tx, stream, ctx.device.secret(), op, ctx.now_ms)?
     else {
@@ -487,8 +488,8 @@ struct IngestScope<'a> {
 /// The entry an acceptance put at the chain tail — what a promotion probe keys on.
 #[derive(Debug, Clone, Copy)]
 struct AcceptedEntry {
-    entry_hash: [u8; 32],
-    prev_hash: Option<[u8; 32]>,
+    entry_hash: EntryHash,
+    prev_hash: Option<EntryHash>,
 }
 
 /// Re-ingest every held child of `parent_hash`, returning the one that took the successor slot.
@@ -507,7 +508,7 @@ fn drain_children(
     scope: &IngestScope<'_>,
     stream: crate::stream::StreamId,
     device: crate::op::DeviceFingerprint,
-    parent_hash: &[u8; 32],
+    parent_hash: &EntryHash,
     promoted: &mut Vec<IngestOutcome>,
 ) -> anyhow::Result<Option<AcceptedEntry>> {
     let mut took_the_slot = None;
@@ -1760,7 +1761,7 @@ mod tests {
         let sibling = entry::sign_entry_from_op_bytes(
             a.local.secret(),
             stream,
-            Some(genesis_hash),
+            Some(EntryHash::from_bytes(genesis_hash)),
             9,
             row_op::encode(&row_op::RowOp::Remove {
                 table: "t_demo".into(),
@@ -1906,7 +1907,7 @@ mod tests {
         let loser = entry::sign_entry_from_op_bytes(
             a.local.secret(),
             stream,
-            Some(genesis_hash),
+            Some(EntryHash::from_bytes(genesis_hash)),
             50,
             remove("r_loser"),
         );
@@ -1977,7 +1978,7 @@ mod tests {
         let invalid = entry::sign_entry_from_op_bytes(
             a.local.secret(),
             stream,
-            Some(genesis_hash),
+            Some(EntryHash::from_bytes(genesis_hash)),
             0,
             row_op::encode(&row_op::RowOp::Remove {
                 table: "t_demo".into(),
@@ -2043,7 +2044,7 @@ mod tests {
         let cross = entry::sign_entry_from_op_bytes(
             c.local.secret(),
             stream,
-            Some(a_genesis_hash),
+            Some(EntryHash::from_bytes(a_genesis_hash)),
             5,
             row_op::encode(&row_op::RowOp::Remove {
                 table: "t_demo".into(),
@@ -2119,7 +2120,7 @@ mod tests {
         let loser = entry::sign_entry_from_op_bytes(
             a.local.secret(),
             stream,
-            Some(genesis_hash),
+            Some(EntryHash::from_bytes(genesis_hash)),
             50,
             remove("r_loser"),
         );

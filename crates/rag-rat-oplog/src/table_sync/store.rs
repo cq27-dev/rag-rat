@@ -35,7 +35,7 @@ use crate::device::{DevicePublic, DeviceSecret};
 // the bound is the auth/roster milestone's job — device removal.)
 use crate::entry::{self, MAX_ENTRY_LAMPORT, MAX_LAMPORT_ADVANCE, SignedEntry, VerifiedEntry};
 use crate::op::{DeviceFingerprint, OpMeta};
-use crate::stream::StreamId;
+use crate::stream::{EntryHash, StreamId};
 
 /// Why a retained entry is NOT projected into its table — persisted per entry so a later binary
 /// that understands the payload replays exactly the outstanding set (#1001). Without a durable
@@ -185,18 +185,18 @@ pub(crate) enum AcceptOutcome {
     Stored {
         op: RowOp,
         meta: OpMeta,
-        entry_hash: [u8; 32],
+        entry_hash: EntryHash,
         /// Where this entry sits on its chain — what a gapped successor cites. `None` for a
         /// genesis.
-        prev_hash: Option<[u8; 32]>,
+        prev_hash: Option<EntryHash>,
     },
     /// Stored and retained, but NOT applied — an undecodable payload, a future op-kind, or a table
     /// not in this scope. The chain still advanced, and the entry is marked pending so a later
     /// binary replays it.
     StoredInert {
         reason: PendingReason,
-        entry_hash: [u8; 32],
-        prev_hash: Option<[u8; 32]>,
+        entry_hash: EntryHash,
+        prev_hash: Option<EntryHash>,
     },
     AlreadyPresent,
     /// The lamport advances past the tail but the entry does not link to it (a gap): the
@@ -522,7 +522,7 @@ enum ChainFit {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AdvertisedFloor {
     pub lamport: u64,
-    pub entry_hash: [u8; 32],
+    pub entry_hash: EntryHash,
 }
 
 fn classify(
@@ -618,7 +618,7 @@ fn chain_tail(
     tx: &Transaction<'_>,
     stream: StreamId,
     device: DeviceFingerprint,
-) -> anyhow::Result<Option<(u64, [u8; 32])>> {
+) -> anyhow::Result<Option<(u64, EntryHash)>> {
     let stream_bytes = stream.to_bytes();
     let device_bytes = device.to_bytes();
     let row = tx
@@ -629,14 +629,15 @@ fn chain_tail(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    row.map(|(lamport, hash)| Ok((u64::try_from(lamport)?, fixed32(hash)?))).transpose()
+    row.map(|(lamport, hash)| Ok((u64::try_from(lamport)?, EntryHash::from_bytes(fixed32(hash)?))))
+        .transpose()
 }
 
 fn chain_witness(
     tx: &Transaction<'_>,
     stream: StreamId,
     device: DeviceFingerprint,
-) -> anyhow::Result<Option<(u64, [u8; 32])>> {
+) -> anyhow::Result<Option<(u64, EntryHash)>> {
     let row = tx
         .query_row(
             "SELECT lamport, entry_hash FROM table_sync_chain_tips
@@ -645,10 +646,11 @@ fn chain_witness(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    row.map(|(lamport, hash)| Ok((u64::try_from(lamport)?, fixed32(hash)?))).transpose()
+    row.map(|(lamport, hash)| Ok((u64::try_from(lamport)?, EntryHash::from_bytes(fixed32(hash)?))))
+        .transpose()
 }
 
-fn entry_exists(tx: &Transaction<'_>, entry_hash: &[u8; 32]) -> anyhow::Result<bool> {
+fn entry_exists(tx: &Transaction<'_>, entry_hash: &EntryHash) -> anyhow::Result<bool> {
     Ok(tx
         .query_row(
             "SELECT 1 FROM table_sync_entries WHERE entry_hash = ?1",
@@ -661,8 +663,8 @@ fn entry_exists(tx: &Transaction<'_>, entry_hash: &[u8; 32]) -> anyhow::Result<b
 
 /// A verified entry held in `table_sync_gapped_entries`, awaiting its chain predecessor.
 pub(crate) struct GappedEntry {
-    pub entry_hash: [u8; 32],
-    pub prev_hash: [u8; 32],
+    pub entry_hash: EntryHash,
+    pub prev_hash: EntryHash,
     pub signed_bytes: Vec<u8>,
 }
 
@@ -681,7 +683,7 @@ const MAX_GAPPED_PER_CHAIN: usize = 4096;
 /// dropped here is simply re-retained when it actually arrives.
 pub(crate) const GAPPED_ENTRY_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
-fn gapped_entry_exists(tx: &Transaction<'_>, entry_hash: &[u8; 32]) -> anyhow::Result<bool> {
+fn gapped_entry_exists(tx: &Transaction<'_>, entry_hash: &EntryHash) -> anyhow::Result<bool> {
     Ok(tx
         .query_row(
             "SELECT 1 FROM table_sync_gapped_entries WHERE entry_hash = ?1",
@@ -788,7 +790,7 @@ fn retain_gapped_entry(
 pub(crate) fn discard_gapped_descendants(
     tx: &Transaction<'_>,
     stream: StreamId,
-    root: &[u8; 32],
+    root: &EntryHash,
 ) -> anyhow::Result<usize> {
     let stream_bytes = stream.to_bytes();
     let mut discarded = 0;
@@ -805,7 +807,7 @@ pub(crate) fn discard_gapped_descendants(
             tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
                 child
             ])?;
-            worklist.push(fixed32(child)?);
+            worklist.push(EntryHash::from_bytes(fixed32(child)?));
             discarded += 1;
         }
     }
@@ -841,7 +843,7 @@ pub(crate) fn discard_foreign_chain_citations(
     tx: &Transaction<'_>,
     stream: StreamId,
     own_device: DeviceFingerprint,
-    hash: &[u8; 32],
+    hash: &EntryHash,
 ) -> anyhow::Result<usize> {
     let stream_bytes = stream.to_bytes();
     let own_bytes = own_device.to_bytes();
@@ -862,7 +864,8 @@ pub(crate) fn discard_foreign_chain_citations(
         ])?;
         discarded += 1;
         // Everything queued behind it is orphaned by the same argument.
-        discarded += discard_gapped_descendants(tx, stream, &fixed32(entry_hash)?)?;
+        discarded +=
+            discard_gapped_descendants(tx, stream, &EntryHash::from_bytes(fixed32(entry_hash)?))?;
     }
     Ok(discarded)
 }
@@ -883,7 +886,7 @@ pub(crate) fn take_gapped_child(
     tx: &Transaction<'_>,
     stream: StreamId,
     device: DeviceFingerprint,
-    prev_hash: &[u8; 32],
+    prev_hash: &EntryHash,
 ) -> anyhow::Result<Option<GappedEntry>> {
     let stream_bytes = stream.to_bytes();
     let device_bytes = device.to_bytes();
@@ -909,8 +912,8 @@ pub(crate) fn take_gapped_child(
         entry_hash.as_slice()
     ])?;
     Ok(Some(GappedEntry {
-        entry_hash: fixed32(entry_hash)?,
-        prev_hash: fixed32(prev)?,
+        entry_hash: EntryHash::from_bytes(fixed32(entry_hash)?),
+        prev_hash: EntryHash::from_bytes(fixed32(prev)?),
         signed_bytes,
     }))
 }
@@ -926,7 +929,7 @@ fn insert_entry(
 ) -> anyhow::Result<()> {
     let stream_bytes = verified.stream_id.to_bytes();
     let device_bytes = verified.device_fingerprint.to_bytes();
-    let prev_hash: Option<Vec<u8>> = verified.prev_hash.map(|h| h.to_vec());
+    let prev_hash: Option<Vec<u8>> = verified.prev_hash.map(|h| h.as_slice().to_vec());
     tx.execute(
         "INSERT INTO table_sync_entries(
              entry_hash, stream_id, device_fingerprint, lamport, prev_hash, signed_bytes,
@@ -968,7 +971,7 @@ fn insert_entry(
 /// applier can detect (the entry is already stored by then).
 pub(crate) fn mark_entry_pending(
     tx: &Transaction<'_>,
-    entry_hash: &[u8; 32],
+    entry_hash: &EntryHash,
     reason: PendingReason,
     projector_version: i64,
 ) -> anyhow::Result<()> {
@@ -991,7 +994,7 @@ pub(crate) fn mark_entry_pending(
 /// bump forever. The entry itself stays stored — it still relays, and it is the evidence.
 pub(crate) fn record_entry_quarantine(
     tx: &Transaction<'_>,
-    entry_hash: &[u8; 32],
+    entry_hash: &EntryHash,
     reason: &str,
 ) -> anyhow::Result<()> {
     tx.execute(
@@ -1006,7 +1009,7 @@ pub(crate) fn record_entry_quarantine(
 /// Clear an entry's pending mark — it now projects completely.
 pub(crate) fn clear_entry_pending(
     tx: &Transaction<'_>,
-    entry_hash: &[u8; 32],
+    entry_hash: &EntryHash,
 ) -> anyhow::Result<()> {
     tx.execute(
         "UPDATE table_sync_entries
@@ -1059,7 +1062,7 @@ pub(crate) fn winning_entry_op(
 /// One retained-but-unprojected entry, with everything replay needs except its apply context (which
 /// comes from [`stream_context`], since the stream id hashes that away).
 pub(crate) struct PendingEntry {
-    pub(crate) entry_hash: [u8; 32],
+    pub(crate) entry_hash: EntryHash,
     pub(crate) stream_id: StreamId,
     pub(crate) signed_bytes: Vec<u8>,
     /// The mark this entry currently carries. `None` when the stored token is not in this binary's
@@ -1110,7 +1113,7 @@ pub(crate) fn pending_entries(
     rows.into_iter()
         .map(|(hash, stream, signed_bytes, reason, projector_version)| {
             Ok(PendingEntry {
-                entry_hash: fixed32(hash)?,
+                entry_hash: EntryHash::from_bytes(fixed32(hash)?),
                 stream_id: StreamId::from_bytes(fixed32(stream)?),
                 signed_bytes,
                 reason: reason.as_deref().and_then(PendingReason::from_db_str),
@@ -1159,7 +1162,7 @@ pub(crate) struct ReadoptionCandidate {
     pub(crate) original_lamport: u64,
     /// The winning entry's hash, when that entry is still retained. `None` after accepted-entry
     /// compaction reclaimed it (#1127): `(stream, device, lamport)` still names the slot.
-    pub(crate) entry_hash: Option<[u8; 32]>,
+    pub(crate) entry_hash: Option<EntryHash>,
 }
 
 /// The provenance one re-adopted row carries into the audit log.
@@ -1175,8 +1178,8 @@ pub(crate) struct ReadoptionAudit {
     pub(crate) original_lamport: u64,
     /// The winning entry's hash, or `None` when compaction reclaimed it before re-adoption ran —
     /// `(stream, removed, original_lamport)` still names the slot.
-    pub(crate) original_entry_hash: Option<[u8; 32]>,
-    pub(crate) adopted_entry_hash: [u8; 32],
+    pub(crate) original_entry_hash: Option<EntryHash>,
+    pub(crate) adopted_entry_hash: EntryHash,
     pub(crate) adopted_at_ms: i64,
 }
 
@@ -1371,7 +1374,7 @@ pub(crate) fn readoption_candidates(
             table_name,
             row_pk,
             original_lamport: u64::try_from(lamport)?,
-            entry_hash: entry_hash.map(fixed32).transpose()?,
+            entry_hash: entry_hash.map(fixed32).transpose()?.map(EntryHash::from_bytes),
         });
     }
     Ok(candidates)
@@ -1398,7 +1401,7 @@ pub(crate) fn record_readoption_audit(
             audit.table_name,
             audit.row_pk,
             i64::try_from(audit.original_lamport)?,
-            audit.original_entry_hash.as_ref().map(<[u8; 32]>::as_slice),
+            audit.original_entry_hash.as_ref().map(EntryHash::as_slice),
             audit.adopted_entry_hash.as_slice(),
             audit.adopted_at_ms,
         ],
@@ -1688,8 +1691,8 @@ mod tests {
             table_name: "t".to_string(),
             row_pk: "aa".to_string(),
             original_lamport: 7,
-            original_entry_hash: Some([1; 32]),
-            adopted_entry_hash: [2; 32],
+            original_entry_hash: Some(EntryHash::from_bytes([1; 32])),
+            adopted_entry_hash: EntryHash::from_bytes([2; 32]),
             adopted_at_ms: 42,
         })
         .unwrap();
@@ -2318,7 +2321,7 @@ mod tests {
         let newcomer = entry::sign_entry_from_op_bytes(
             &secret,
             stream(),
-            Some([7u8; 32]),
+            Some(EntryHash::from_bytes([7u8; 32])),
             5,
             row_op::encode(&op("r_new")),
         );
@@ -2366,7 +2369,7 @@ mod tests {
         let far = entry::sign_entry_from_op_bytes(
             &secret,
             stream(),
-            Some([7u8; 32]),
+            Some(EntryHash::from_bytes([7u8; 32])),
             9_000_000,
             row_op::encode(&op("r_far")),
         );
@@ -2452,7 +2455,7 @@ mod tests {
             let tie = entry::sign_entry_from_op_bytes(
                 &secret,
                 stream(),
-                Some([7u8; 32]),
+                Some(EntryHash::from_bytes([7u8; 32])),
                 u64::try_from(BOUNDARY).unwrap(),
                 row_op::encode(&op(&format!("tie{nonce}"))),
             );

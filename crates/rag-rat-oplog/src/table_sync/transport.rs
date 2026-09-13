@@ -15,7 +15,7 @@ use super::{retention, store};
 use crate::AccountId;
 use crate::account::{self, RepoIncarnationState};
 use crate::device::DevicePublic;
-use crate::stream::StreamId;
+use crate::stream::{EntryHash, StreamId};
 
 /// One locally-supported repo-scoped table stream.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -116,7 +116,7 @@ pub(crate) fn table_sync_sweep_expired_gapped(
     };
     let mut swept = 0;
     for (stream_id, hash) in expired {
-        let hash = fixed32(hash)?;
+        let hash = EntryHash::from_bytes(fixed32(hash)?);
         // The descendant sweep below may have already reclaimed this row behind an earlier root;
         // only a real deletion counts (and only a real root needs its subtree walked).
         if tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
@@ -489,7 +489,7 @@ pub fn table_sync_ingest(
     ingest_against(
         conn,
         &IngestRoute { account_id, stream, registry: SYNCABLE_TABLES },
-        expected_device,
+        crate::op::DeviceFingerprint::from_bytes(expected_device),
         signed_bytes,
         now_ms,
         advertised_floor,
@@ -801,7 +801,7 @@ struct IngestRoute<'a> {
 fn ingest_against(
     conn: &Connection,
     route: &IngestRoute<'_>,
-    expected_device: [u8; 32],
+    expected_device: crate::op::DeviceFingerprint,
     signed_bytes: &[u8],
     now_ms: i64,
     advertised_floor: Option<(u64, [u8; 32])>,
@@ -817,7 +817,7 @@ fn ingest_against(
         return Ok(TableSyncIngestOutcome::NoChange);
     }
     let signer = signed.entry.device_fingerprint;
-    if signer.to_bytes() != expected_device {
+    if signer != expected_device {
         return Ok(TableSyncIngestOutcome::NoChange);
     }
     let Some(pubkey_bytes) =
@@ -849,8 +849,10 @@ fn ingest_against(
         &stream.scope_id,
         signed_bytes,
         &pubkey,
-        advertised_floor
-            .map(|(lamport, entry_hash)| store::AdvertisedFloor { lamport, entry_hash }),
+        advertised_floor.map(|(lamport, entry_hash)| store::AdvertisedFloor {
+            lamport,
+            entry_hash: EntryHash::from_bytes(entry_hash),
+        }),
     )?;
     // An applied row on this stream changed derived state, so advance the Lens lanes that scope
     // feeds (the explicit replacement for the row triggers the synced scopes dropped). All entries
@@ -962,7 +964,7 @@ mod tests {
                 ingest_against(
                     &conn,
                     &IngestRoute { account_id: account(), stream: route, registry: &[REPO_SPEC] },
-                    [0; 32],
+                    crate::op::DeviceFingerprint::from_bytes([0; 32]),
                     &[0],
                     0,
                     None
@@ -1707,7 +1709,7 @@ mod tests {
             ingest_against(
                 &destination,
                 &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
-                [0; 32],
+                crate::op::DeviceFingerprint::from_bytes([0; 32]),
                 &authored[0],
                 1,
                 None
@@ -1719,7 +1721,7 @@ mod tests {
             ingest_against(
                 &destination,
                 &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
-                author,
+                crate::op::DeviceFingerprint::from_bytes(author),
                 &authored[0],
                 1,
                 None
@@ -1731,7 +1733,7 @@ mod tests {
             ingest_against(
                 &destination,
                 &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
-                author,
+                crate::op::DeviceFingerprint::from_bytes(author),
                 &authored[0],
                 2,
                 None
@@ -1753,7 +1755,7 @@ mod tests {
             ingest_against(
                 &removed,
                 &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
-                author,
+                crate::op::DeviceFingerprint::from_bytes(author),
                 &authored[0],
                 1,
                 None
@@ -1911,7 +1913,7 @@ mod tests {
                 ingest_against(
                     peer,
                     &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
-                    head.device_fingerprint,
+                    crate::op::DeviceFingerprint::from_bytes(head.device_fingerprint),
                     &entry.signed_bytes,
                     1,
                     floor,
@@ -2009,7 +2011,7 @@ mod tests {
                 StreamId::from_bytes(route.stream_id),
                 writer,
                 4,
-                fixed32(floor_hash).unwrap(),
+                EntryHash::from_bytes(fixed32(floor_hash).unwrap()),
                 0,
             )
             .unwrap();
@@ -2220,7 +2222,7 @@ mod tests {
                 StreamId::from_bytes(route.stream_id),
                 local,
                 8,
-                fixed32(floor_hash).unwrap(),
+                EntryHash::from_bytes(fixed32(floor_hash).unwrap()),
                 0,
             )
             .unwrap();

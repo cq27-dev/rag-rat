@@ -182,7 +182,7 @@ pub use project::AnchorScopes;
 // per J1).
 pub use project::ProjectedState;
 pub use store::{author_batch, author_op, load_projection};
-pub use stream::{AccessMode, StreamId};
+pub use stream::{AccessMode, EntryHash, StreamId};
 // The table-sync forward-compat seam (#1001): replay entries retained but not projected when
 // they arrived. Belongs at store open, before producing — see the module docs.
 pub use table_sync::{
