@@ -15,7 +15,7 @@ use super::prompts::{
     self, AnchorContext, FixCommit, PartnerThread, PromptBudget, PromptInput, PromptUnit,
     SymbolContext,
 };
-use super::thread::ThreadKey;
+use super::thread::{self, ThreadKey};
 use super::{run_stats, validate};
 
 const MAX_STORED_ERROR_CHARS: usize = 2_000;
@@ -765,7 +765,7 @@ fn persist_success(
     if updated != 1 {
         return Ok(false);
     }
-    clear_model_junctions(conn, repo_id, &job.key)?;
+    thread::clear_model_junctions(conn, repo_id, &job.key)?;
     // The per-thread `ordinal` is the whole-row-LWW key discriminator (evidence has no natural
     // unique key); assign it in citation order — the order `collect_evidence` produced these
     // rows.
@@ -909,19 +909,6 @@ fn insert_evidence(
             repo_id,
         ],
     )?;
-    Ok(())
-}
-
-fn clear_model_junctions(conn: &Connection, repo_id: &str, key: &ThreadKey) -> anyhow::Result<()> {
-    for table in ["papertrail_distill_evidence", "papertrail_distill_alternatives"] {
-        conn.execute(
-            &format!(
-                "DELETE FROM {table} WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3
-                 AND item_kind = ?4 AND item_key = ?5"
-            ),
-            params![repo_id, key.tracker, key.project, key.item_kind, key.item_key],
-        )?;
-    }
     Ok(())
 }
 

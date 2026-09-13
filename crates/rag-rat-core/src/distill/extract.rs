@@ -573,8 +573,11 @@ fn write_record(
     // model columns on regeneration), rewrite junctions, queue.
     let rebuild_anchor_candidates = state != RecordState::Unchanged;
     clear_mechanical_junctions(conn, repo_id, &thread_key, rebuild_anchor_candidates)?;
+    // Extraction or prompt identity changed: an identical rerun keeps the model's work, but a
+    // requeued record must expose no stale evidence, alternatives, or anchor selections.
     if invalidate_model {
-        clear_model_junctions(conn, repo_id, &thread_key)?;
+        thread::clear_model_junctions(conn, repo_id, &thread_key)?;
+        thread::deselect_anchors(conn, repo_id, &thread_key)?;
     }
     upsert_skeleton(conn, repo_id, now, opts, plan, invalidate_model, &SkeletonFacets {
         input_hash: &input_hash,
@@ -1631,30 +1634,6 @@ fn clear_mechanical_junctions(
         "DELETE FROM papertrail_distill_edges
          WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND src_item_kind = ?4
            AND src_item_key = ?5 AND edge_kind = 'coalesced'",
-        thread_key.params(repo_id),
-    )?;
-    Ok(())
-}
-
-/// Clear model-owned junction state when extraction or prompt identity changes. An identical rerun
-/// keeps the model's work; a requeued record exposes no stale evidence, alternatives, or
-/// selections.
-fn clear_model_junctions(
-    conn: &Connection,
-    repo_id: &str,
-    thread_key: &ThreadKey,
-) -> anyhow::Result<()> {
-    for table in ["papertrail_distill_evidence", "papertrail_distill_alternatives"] {
-        conn.execute(
-            &format!("DELETE FROM {table} WHERE {}", thread::THREAD_KEY_WHERE),
-            thread_key.params(repo_id),
-        )?;
-    }
-    conn.execute(
-        &format!(
-            "UPDATE papertrail_distill_anchors SET selected = 0 WHERE {}",
-            thread::THREAD_KEY_WHERE
-        ),
         thread_key.params(repo_id),
     )?;
     Ok(())
