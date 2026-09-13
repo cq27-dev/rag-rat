@@ -861,8 +861,30 @@ pub(crate) const PROJECTOR_GENERATIONS: &[&[TableGeneration]] = &[
 pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> Result<(), String> {
     let columns = schema_facts::physical_column_info(conn, spec.name)
         .map_err(|err| format!("cannot read columns of `{}`: {err}", spec.name))?;
-    let physical: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    // Order is part of the contract: the first failing rule is the one reported. The later rules
+    // read their own schema facts, so a failed read surfaces only after every earlier rule passed.
+    rule_every_column_classified_once(spec, &columns)?;
+    rule_repo_scope_is_a_text_pk(spec)?;
+    rule_declares_a_synced_column(spec)?;
+    rule_declared_pk_is_the_table_pk(spec, &columns)?;
+    rule_pk_columns_are_not_null(spec, &columns)?;
+    rule_pk_uses_binary_collation(conn, spec)?;
+    rule_no_outbound_foreign_key(conn, spec)?;
+    rule_no_inbound_foreign_key(conn, spec)?;
+    rule_no_trigger(conn, spec)?;
+    rule_no_non_pk_unique_index(conn, spec)?;
+    rule_identity_columns_are_never_added(spec)?;
+    rule_added_column_defaults_converge(conn, spec, &columns)?;
+    rule_local_columns_are_materializable(spec, &columns)?;
+    rule_no_generated_column(conn, spec)?;
+    rule_table_is_strict(conn, spec)?;
+    rule_value_types_match_physical(spec, &columns)
+}
 
+fn rule_every_column_classified_once(
+    spec: &TableSpec,
+    columns: &[PhysicalColumn],
+) -> Result<(), String> {
     let mut classified: BTreeSet<&str> = BTreeSet::new();
     let mut duplicated: Vec<&str> = Vec::new();
     let declared = spec
@@ -883,7 +905,7 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
         ));
     }
 
-    let physical_set: BTreeSet<&str> = physical.iter().copied().collect();
+    let physical_set: BTreeSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     let unclassified: Vec<&str> = physical_set.difference(&classified).copied().collect();
     let absent: Vec<&str> = classified.difference(&physical_set).copied().collect();
     if !unclassified.is_empty() || !absent.is_empty() {
@@ -893,38 +915,40 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             spec.name
         ));
     }
+    Ok(())
+}
 
-    // A repo scope must be a primary-key column: only then does the applier's repo-identity gate
-    // fire on every incoming op. A non-pk repo column would filter the producer but leave ingest
-    // unguarded, so a peer could write another repo's row into the shared table.
-    if let Some(repo_column) = spec.repo_column {
-        match spec.repo_pk_index() {
-            None => {
-                return Err(format!(
-                    "`{}`: repo_column `{repo_column}` must be a primary-key column so the ingest \
-                     repo gate applies",
-                    spec.name
-                ));
-            },
-            // The applier's repo gate compares the repo pk value to `TypedValue::Text(repo_id)`, so
-            // a non-Text scope key never matches — every locally-produced row self-quarantines and
-            // the whole table can never sync.
-            Some(idx) if spec.pk[idx].value_type != ValueType::Text => {
-                return Err(format!(
-                    "`{}`: repo_column `{repo_column}` must be ValueType::Text (the repo gate \
-                     compares it to the text repo_id)",
-                    spec.name
-                ));
-            },
-            Some(_) => {},
-        }
+/// A repo scope must be a primary-key column: only then does the applier's repo-identity gate fire
+/// on every incoming op. A non-pk repo column would filter the producer but leave ingest unguarded,
+/// so a peer could write another repo's row into the shared table.
+fn rule_repo_scope_is_a_text_pk(spec: &TableSpec) -> Result<(), String> {
+    let Some(repo_column) = spec.repo_column else {
+        return Ok(());
+    };
+    match spec.repo_pk_index() {
+        None => Err(format!(
+            "`{}`: repo_column `{repo_column}` must be a primary-key column so the ingest repo \
+             gate applies",
+            spec.name
+        )),
+        // The applier's repo gate compares the repo pk value to `TypedValue::Text(repo_id)`, so a
+        // non-Text scope key never matches — every locally-produced row self-quarantines and the
+        // whole table can never sync.
+        Some(idx) if spec.pk[idx].value_type != ValueType::Text => Err(format!(
+            "`{}`: repo_column `{repo_column}` must be ValueType::Text (the repo gate compares it \
+             to the text repo_id)",
+            spec.name
+        )),
+        Some(_) => Ok(()),
     }
+}
 
-    // The whole-row apply/produce SQL builds a `SELECT`/`SET` over the synced columns; a spec with
-    // no synced non-key column would emit empty-column SQL (`SELECT  FROM …`) at apply time. A
-    // key-only (pure set-membership) table would need a deliberately designed empty-row path
-    // (existence-only hash, no-op update) that whole-row LWW does not have — reject it here rather
-    // than emit invalid SQL when its first row is applied.
+/// The whole-row apply/produce SQL builds a `SELECT`/`SET` over the synced columns; a spec with no
+/// synced non-key column would emit empty-column SQL (`SELECT  FROM …`) at apply time. A key-only
+/// (pure set-membership) table would need a deliberately designed empty-row path (existence-only
+/// hash, no-op update) that whole-row LWW does not have — reject it here rather than emit invalid
+/// SQL when its first row is applied.
+fn rule_declares_a_synced_column(spec: &TableSpec) -> Result<(), String> {
     if spec.columns.is_empty() {
         return Err(format!(
             "`{}`: a syncable table must declare at least one synced non-key column; a key-only \
@@ -932,16 +956,27 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             spec.name
         ));
     }
+    Ok(())
+}
 
-    // The declared `pk` must be EXACTLY the table's real primary key, in order. The classification
-    // check above only matched column NAMES, so a spec could name a non-key column as `pk` (or bury
-    // a real key column in `columns`/`local_columns`): row identity would then be non-unique — one
-    // op could update or delete several physical rows through `pk_where`, and the per-row clock /
-    // tombstone key would not identify a single row. Compare against `PRAGMA table_info`'s pk
-    // order.
+/// The table's primary-key columns in `PRAGMA table_info` pk order.
+fn physical_pk_columns(columns: &[PhysicalColumn]) -> Vec<&PhysicalColumn> {
     let mut pk_cols: Vec<&PhysicalColumn> = columns.iter().filter(|c| c.pk_position > 0).collect();
     pk_cols.sort_by_key(|c| c.pk_position);
-    let actual_pk: Vec<&str> = pk_cols.iter().map(|c| c.name.as_str()).collect();
+    pk_cols
+}
+
+/// The declared `pk` must be EXACTLY the table's real primary key, in order. The classification
+/// check only matched column NAMES, so a spec could name a non-key column as `pk` (or bury a real
+/// key column in `columns`/`local_columns`): row identity would then be non-unique — one op could
+/// update or delete several physical rows through `pk_where`, and the per-row clock / tombstone key
+/// would not identify a single row. Compare against `PRAGMA table_info`'s pk order.
+fn rule_declared_pk_is_the_table_pk(
+    spec: &TableSpec,
+    columns: &[PhysicalColumn],
+) -> Result<(), String> {
+    let actual_pk: Vec<&str> =
+        physical_pk_columns(columns).iter().map(|c| c.name.as_str()).collect();
     let declared_pk: Vec<&str> = spec.pk.iter().map(|c| c.name).collect();
     if actual_pk != declared_pk {
         return Err(format!(
@@ -950,13 +985,18 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             spec.name
         ));
     }
+    Ok(())
+}
 
-    // Every pk column must be NOT NULL. A rowid table's bare `id TEXT PRIMARY KEY` is NULLABLE
-    // (SQLite's historic quirk) — a NULL pk is unaddressable, so `read_all_rows` emits a Null pk
-    // that self-apply quarantines, and `produce_and_author` then re-signs that ghost row on
-    // every pass. A STRICT table makes its pk NOT NULL (table_info reports it), which is the
-    // intended shape.
-    for col in &pk_cols {
+/// Every pk column must be NOT NULL. A rowid table's bare `id TEXT PRIMARY KEY` is NULLABLE
+/// (SQLite's historic quirk) — a NULL pk is unaddressable, so `read_all_rows` emits a Null pk that
+/// self-apply quarantines, and `produce_and_author` then re-signs that ghost row on every pass. A
+/// STRICT table makes its pk NOT NULL (table_info reports it), which is the intended shape.
+fn rule_pk_columns_are_not_null(
+    spec: &TableSpec,
+    columns: &[PhysicalColumn],
+) -> Result<(), String> {
+    for col in physical_pk_columns(columns) {
         if !col.not_null {
             return Err(format!(
                 "`{}`: primary-key column `{}` is nullable — declare it NOT NULL (a STRICT table \
@@ -965,12 +1005,14 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             ));
         }
     }
+    Ok(())
+}
 
-    // Every pk column must use BINARY equality. A non-binary collation (e.g. `COLLATE NOCASE`)
-    // makes SQLite treat values differing only by collation as ONE row in the `WHERE`
-    // predicates, but `row_op::row_pk_string` encodes them as DIFFERENT bookkeeping identities
-    // — so one physical row would carry two write clocks / published hashes and diverge (or
-    // suppress the wrong update).
+/// Every pk column must use BINARY equality. A non-binary collation (e.g. `COLLATE NOCASE`) makes
+/// SQLite treat values differing only by collation as ONE row in the `WHERE` predicates, but
+/// `row_op::row_pk_string` encodes them as DIFFERENT bookkeeping identities — so one physical row
+/// would carry two write clocks / published hashes and diverge (or suppress the wrong update).
+fn rule_pk_uses_binary_collation(conn: &Connection, spec: &TableSpec) -> Result<(), String> {
     if let Some(col) = schema_facts::pk_column_with_non_binary_collation(conn, spec.name)
         .map_err(|err| format!("cannot read the pk collation of `{}`: {err}", spec.name))?
     {
@@ -981,13 +1023,16 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             spec.name
         ));
     }
+    Ok(())
+}
 
-    // Whole-row LWW converges per row INDEPENDENTLY — each row's fate is decided solely by its own
-    // write clock. A CROSS-ROW constraint breaks that: the same op set can fold to different states
-    // under different arrival orders (two rows racing for one UNIQUE value: whichever loses is
-    // quarantined, and WHICH loses depends on order), so peers diverge with no dirty-local edit. A
-    // foreign key is the same class (a delete/insert can fail against another row). Reject both
-    // until a deterministic cross-row conflict rule exists.
+/// Whole-row LWW converges per row INDEPENDENTLY — each row's fate is decided solely by its own
+/// write clock. A CROSS-ROW constraint breaks that: the same op set can fold to different states
+/// under different arrival orders (two rows racing for one UNIQUE value: whichever loses is
+/// quarantined, and WHICH loses depends on order), so peers diverge with no dirty-local edit. A
+/// foreign key is the same class (a delete/insert can fail against another row). Reject both until
+/// a deterministic cross-row conflict rule exists.
+fn rule_no_outbound_foreign_key(conn: &Connection, spec: &TableSpec) -> Result<(), String> {
     if schema_facts::table_has_foreign_key(conn, spec.name)
         .map_err(|err| format!("cannot read foreign keys of `{}`: {err}", spec.name))?
     {
@@ -997,9 +1042,13 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             spec.name
         ));
     }
-    // The inbound direction is the same hazard: a table REFERENCED by another's FK can have a
-    // `Remove` blocked (FK RESTRICT) on a peer that holds a child row but not on one that doesn't →
-    // the delete quarantines on one side, applies on the other, and the replicas diverge.
+    Ok(())
+}
+
+/// The inbound direction is the same hazard: a table REFERENCED by another's FK can have a `Remove`
+/// blocked (FK RESTRICT) on a peer that holds a child row but not on one that doesn't → the delete
+/// quarantines on one side, applies on the other, and the replicas diverge.
+fn rule_no_inbound_foreign_key(conn: &Connection, spec: &TableSpec) -> Result<(), String> {
     if schema_facts::table_is_referenced_by_foreign_key(conn, spec.name)
         .map_err(|err| format!("cannot scan foreign keys referencing `{}`: {err}", spec.name))?
     {
@@ -1009,10 +1058,14 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             spec.name
         ));
     }
-    // A trigger breaks the whole-row fold's assumption that a row write is independent and
-    // deterministic: an INSERT/UPDATE/DELETE trigger can adjust the row (or others) from local
-    // derived state, so the SAME received op folds to different physical results on two devices,
-    // and apply_upsert then publishes each divergent result — the replicas stay divergent.
+    Ok(())
+}
+
+/// A trigger breaks the whole-row fold's assumption that a row write is independent and
+/// deterministic: an INSERT/UPDATE/DELETE trigger can adjust the row (or others) from local derived
+/// state, so the SAME received op folds to different physical results on two devices, and
+/// apply_upsert then publishes each divergent result — the replicas stay divergent.
+fn rule_no_trigger(conn: &Connection, spec: &TableSpec) -> Result<(), String> {
     if let Some(trigger) = schema_facts::table_trigger(conn, spec.name)
         .map_err(|err| format!("cannot read triggers of `{}`: {err}", spec.name))?
     {
@@ -1022,6 +1075,12 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             spec.name
         ));
     }
+    Ok(())
+}
+
+/// A non-pk UNIQUE index is the cross-row constraint class [`rule_no_outbound_foreign_key`]
+/// describes: two rows racing for one value diverge by arrival order.
+fn rule_no_non_pk_unique_index(conn: &Connection, spec: &TableSpec) -> Result<(), String> {
     if let Some(index) = schema_facts::non_pk_unique_index(conn, spec.name)
         .map_err(|err| format!("cannot read indexes of `{}`: {err}", spec.name))?
     {
@@ -1032,35 +1091,15 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             spec.name
         ));
     }
+    Ok(())
+}
 
-    // A synced column's DECLARED default must equal its physical SQL default, exactly (#1002).
-    //
-    // This is a CONVERGENCE check for the upgrade path, not hygiene. `ALTER TABLE ADD COLUMN`
-    // backfills existing rows with the SQL default, while the applier fills a column an older op
-    // omits with the DECLARED one. If the two disagree, a device that applied an op BEFORE
-    // upgrading and one that applied the same op AFTER hold different rows AT THE SAME CLOCK —
-    // silent divergence with no local edit to signal it, and nothing to repair it while the
-    // authoring entry is unavailable.
-    //
-    // KNOW ITS LIMIT. The real invariant is "the migration that introduces the column backfills
-    // existing rows with the DECLARED default", and this reads `PRAGMA table_info.dflt_value` — the
-    // DEFAULT CLAUSE. Those coincide only for `ALTER TABLE ADD COLUMN … DEFAULT x`. They do NOT
-    // coincide for a table REBUILD (`CREATE new; INSERT INTO new SELECT …, <expr> FROM old; DROP;
-    // RENAME`), which is a routine migration idiom in this repo: the `SELECT` expression is
-    // invisible here, so a rebuild that backfills anything other than the declared default passes
-    // this check while violating the invariant. INTRODUCE A SYNCED COLUMN WITH `ADD COLUMN …
-    // DEFAULT x`, which satisfies it structurally. A rebuild that computes per-row values is not
-    // wrong, but it is new content peers have not seen, and it re-authors the whole table once on
-    // every device — budget for that deliberately rather than discovering it.
-    //
-    // A declared default must also match its column's `ValueType`: the fill goes straight into the
-    // row, so a mistyped default would write a value the applier would have quarantined on the
-    // wire.
-    // An IDENTITY column can never be `added`. The declared default is unreachable for it: an op
-    // authored before the key grew carries fewer pk values, and `apply_row_op`'s arity check
-    // quarantines it TERMINALLY before projection ever runs — so the evolution the `added` shape
-    // promises simply does not exist here, and declaring it would advertise a redemption path that
-    // silently drops every older op instead. A changed primary key is a new table identity.
+/// An IDENTITY column can never be `added`. The declared default is unreachable for it: an op
+/// authored before the key grew carries fewer pk values, and `apply_row_op`'s arity check
+/// quarantines it TERMINALLY before projection ever runs — so the evolution the `added` shape
+/// promises simply does not exist here, and declaring it would advertise a redemption path that
+/// silently drops every older op instead. A changed primary key is a new table identity.
+fn rule_identity_columns_are_never_added(spec: &TableSpec) -> Result<(), String> {
     for key in spec.pk {
         if key.added.is_some() {
             return Err(format!(
@@ -1071,7 +1110,36 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             ));
         }
     }
+    Ok(())
+}
 
+/// A synced column's DECLARED default must equal its physical SQL default, exactly (#1002).
+///
+/// This is a CONVERGENCE check for the upgrade path, not hygiene. `ALTER TABLE ADD COLUMN`
+/// backfills existing rows with the SQL default, while the applier fills a column an older op
+/// omits with the DECLARED one. If the two disagree, a device that applied an op BEFORE upgrading
+/// and one that applied the same op AFTER hold different rows AT THE SAME CLOCK — silent
+/// divergence with no local edit to signal it, and nothing to repair it while the authoring entry
+/// is unavailable.
+///
+/// KNOW ITS LIMIT. The real invariant is "the migration that introduces the column backfills
+/// existing rows with the DECLARED default", and this reads `PRAGMA table_info.dflt_value` — the
+/// DEFAULT CLAUSE. Those coincide only for `ALTER TABLE ADD COLUMN … DEFAULT x`. They do NOT
+/// coincide for a table REBUILD (`CREATE new; INSERT INTO new SELECT …, <expr> FROM old; DROP;
+/// RENAME`), which is a routine migration idiom in this repo: the `SELECT` expression is invisible
+/// here, so a rebuild that backfills anything other than the declared default passes this check
+/// while violating the invariant. INTRODUCE A SYNCED COLUMN WITH `ADD COLUMN … DEFAULT x`, which
+/// satisfies it structurally. A rebuild that computes per-row values is not wrong, but it is new
+/// content peers have not seen, and it re-authors the whole table once on every device — budget
+/// for that deliberately rather than discovering it.
+///
+/// A declared default must also match its column's `ValueType`: the fill goes straight into the
+/// row, so a mistyped default would write a value the applier would have quarantined on the wire.
+fn rule_added_column_defaults_converge(
+    conn: &Connection,
+    spec: &TableSpec,
+    columns: &[PhysicalColumn],
+) -> Result<(), String> {
     // Read and lex the table's DDL ONCE: its declarations and constraints are a fact about the
     // table, not about each column.
     let ddl = schema_facts::read_table_ddl(conn, spec.name)
@@ -1153,11 +1221,17 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             ));
         }
     }
+    Ok(())
+}
 
-    // Every local (never-replicated) column must be nullable or carry a DB default: a remote upsert
-    // INSERTs only the pk + synced columns (a local column is re-derived here, not sent), so a NOT
-    // NULL local column with no default makes that insert fail and the applier quarantine the op —
-    // the row would then be absent on every new peer that never authored it locally.
+/// Every local (never-replicated) column must be nullable or carry a DB default: a remote upsert
+/// INSERTs only the pk + synced columns (a local column is re-derived here, not sent), so a NOT
+/// NULL local column with no default makes that insert fail and the applier quarantine the op — the
+/// row would then be absent on every new peer that never authored it locally.
+fn rule_local_columns_are_materializable(
+    spec: &TableSpec,
+    columns: &[PhysicalColumn],
+) -> Result<(), String> {
     for local in spec.local_columns {
         if let Some(col) = columns.iter().find(|c| c.name == *local)
             && col.not_null
@@ -1170,19 +1244,16 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             ));
         }
     }
+    Ok(())
+}
 
-    // The table MUST be STRICT. STRICT enforces the declared column type at write time, so a value
-    // the producer read (by its `ValueType`) can never be affinity-coerced to a different stored
-    // type. It pins the storage CLASS only, not the value's domain within it — a `Bool` can still
-    // hold 2 and a `Text` can still hold invalid UTF-8 — which is why `read_typed` carries those as
-    // unreadable rather than relying on the schema. It also makes pk columns NOT NULL, and is the
-    // schema convention for every new table regardless.
-    // A GENERATED column is invisible to the rest of this lint and to the applier alike:
-    // `PRAGMA table_info` omits it, so the exhaustiveness diff never classifies it, and the
-    // applier never supplies it. It is not inert, though — its expression can read a synced column,
-    // and its own NOT NULL and CHECK constraints then apply to a value derived from whatever the
-    // applier filled in. That makes a constraint reachable through it depend on this column
-    // transitively, which the probe models by name and therefore cannot see.
+/// A GENERATED column is invisible to the rest of this lint and to the applier alike: `PRAGMA
+/// table_info` omits it, so the exhaustiveness diff never classifies it, and the applier never
+/// supplies it. It is not inert, though — its expression can read a synced column, and its own NOT
+/// NULL and CHECK constraints then apply to a value derived from whatever the applier filled in.
+/// That makes a constraint reachable through it depend on this column transitively, which the probe
+/// models by name and therefore cannot see.
+fn rule_no_generated_column(conn: &Connection, spec: &TableSpec) -> Result<(), String> {
     if let Some(generated) = schema_facts::generated_column(conn, spec.name)
         .map_err(|err| format!("cannot read the columns of `{}`: {err}", spec.name))?
     {
@@ -1193,7 +1264,16 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             spec.name
         ));
     }
+    Ok(())
+}
 
+/// The table MUST be STRICT. STRICT enforces the declared column type at write time, so a value the
+/// producer read (by its `ValueType`) can never be affinity-coerced to a different stored type. It
+/// pins the storage CLASS only, not the value's domain within it — a `Bool` can still hold 2 and a
+/// `Text` can still hold invalid UTF-8 — which is why `read_typed` carries those as unreadable
+/// rather than relying on the schema. It also makes pk columns NOT NULL, and is the schema
+/// convention for every new table regardless.
+fn rule_table_is_strict(conn: &Connection, spec: &TableSpec) -> Result<(), String> {
     if !schema_facts::table_is_strict(conn, spec.name)
         .map_err(|err| format!("cannot read the schema of `{}`: {err}", spec.name))?
     {
@@ -1203,10 +1283,16 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
             spec.name
         ));
     }
+    Ok(())
+}
 
-    // Each replicated column's declared `ValueType` must match its physical STRICT type, so the
-    // value the producer reads round-trips through SQLite unchanged and a peer's op passes the
-    // applier's type check. (Local columns are re-derived, never sent, so they are exempt.)
+/// Each replicated column's declared `ValueType` must match its physical STRICT type, so the value
+/// the producer reads round-trips through SQLite unchanged and a peer's op passes the applier's
+/// type check. (Local columns are re-derived, never sent, so they are exempt.)
+fn rule_value_types_match_physical(
+    spec: &TableSpec,
+    columns: &[PhysicalColumn],
+) -> Result<(), String> {
     for spec_col in spec.pk.iter().chain(spec.columns.iter()) {
         let Some(phys) = columns.iter().find(|c| c.name == spec_col.name) else {
             continue; // classified/absent already checked above
