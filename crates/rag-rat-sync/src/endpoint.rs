@@ -41,8 +41,8 @@ use crate::enrollment::{
     RESPONSE_ACK, RESPONSE_ACK_TIMEOUT, run_enrollment_acceptor, run_enrollment_dialer,
 };
 use crate::session::{
-    DEFAULT_IDLE_TIMEOUT, ServeScope, SessionError, SessionReport, SyncStore, run_session,
-    run_session_limited,
+    DEFAULT_IDLE_TIMEOUT, ServeScope, SessionError, SessionLimits, SessionReport, SyncStore,
+    run_session, run_session_limited,
 };
 use crate::store::{OplogContentSyncStore, OplogSyncStore};
 use crate::table_session::{
@@ -1077,9 +1077,7 @@ where
             recv,
             AuthRole::Acceptor,
             capabilities,
-            DEFAULT_IDLE_TIMEOUT,
-            egress,
-            now_ms,
+            SessionLimits { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress, now_ms },
         )
         .await
         .map_err(SyncFailure::Session)?
@@ -1090,9 +1088,7 @@ where
             recv,
             AuthRole::Acceptor,
             capabilities,
-            DEFAULT_IDLE_TIMEOUT,
-            egress,
-            now_ms,
+            SessionLimits { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress, now_ms },
         )
         .await
         .map_err(SyncFailure::Session)?
@@ -1246,9 +1242,7 @@ pub async fn dispatch_connection_multi(
             recv,
             AuthRole::Acceptor,
             capabilities,
-            DEFAULT_IDLE_TIMEOUT,
-            egress,
-            now_ms,
+            SessionLimits { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress, now_ms },
         )
         .await
         .map_err(SyncFailure::Session)?
@@ -1259,9 +1253,7 @@ pub async fn dispatch_connection_multi(
             recv,
             AuthRole::Acceptor,
             capabilities,
-            DEFAULT_IDLE_TIMEOUT,
-            egress,
-            now_ms,
+            SessionLimits { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress, now_ms },
         )
         .await
         .map_err(SyncFailure::Session)?

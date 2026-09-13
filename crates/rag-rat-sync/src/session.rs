@@ -163,43 +163,39 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    run_session_with_idle_timeout(store, send, recv, role, capabilities, DEFAULT_IDLE_TIMEOUT).await
+    run_session_limited(store, send, recv, role, capabilities, SessionLimits::default()).await
 }
 
-/// [`run_session`] with an explicit idle timeout — the receiver aborts if the peer sends no frame
-/// within `idle_timeout`. Exposed so tests can exercise the timeout without waiting the default.
-pub async fn run_session_with_idle_timeout<S, R, W>(
-    store: &mut S,
-    send: W,
-    recv: R,
-    role: AuthRole,
-    capabilities: SessionCapabilities,
-    idle_timeout: Duration,
-) -> Result<SessionReport, SessionError>
-where
-    S: SyncStore,
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    run_session_limited(store, send, recv, role, capabilities, idle_timeout, None, || 0).await
+/// The per-session serving policy of [`run_session_limited`]. The default is the unmetered
+/// session [`run_session`] runs: the default idle timeout and no egress cap.
+pub struct SessionLimits<F = fn() -> i64> {
+    /// The receiver aborts if the peer sends no frame within this window. Tests shorten it to
+    /// exercise the timeout without waiting the default.
+    pub idle_timeout: Duration,
+    /// The shared GLOBAL egress cap. `None` leaves the session unmetered (the dialer paths and
+    /// tests).
+    pub egress: Option<std::sync::Arc<std::sync::Mutex<crate::GlobalEgressLimiter>>>,
+    /// The clock the egress budget refills against; read only when `egress` is `Some`.
+    pub now_ms: F,
 }
 
-/// [`run_session_with_idle_timeout`] plus a GLOBAL egress cap. When `egress` is `Some`, each
-/// outgoing entries page is charged against the shared [`crate::GlobalEgressLimiter`], and the
-/// sender STOPS after the last page the budget allowed (sending `Done` early) — the withheld tail
-/// is re-offered by the next session's inventory diff, so a throttled reader converges across
-/// retries. `None` leaves the session unmetered (the dialer paths and tests). `now_ms` is read only
-/// when `egress` is `Some`.
-#[allow(clippy::too_many_arguments)]
+impl Default for SessionLimits {
+    fn default() -> Self {
+        Self { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress: None, now_ms: || 0 }
+    }
+}
+
+/// [`run_session`] under explicit [`SessionLimits`]. When `limits.egress` is `Some`, each outgoing
+/// entries page is charged against the shared [`crate::GlobalEgressLimiter`], and the sender STOPS
+/// after the last page the budget allowed (sending `Done` early) — the withheld tail is re-offered
+/// by the next session's inventory diff, so a throttled reader converges across retries.
 pub async fn run_session_limited<S, R, W, F>(
     store: &mut S,
     mut send: W,
     mut recv: R,
     role: AuthRole,
     capabilities: SessionCapabilities,
-    idle_timeout: Duration,
-    egress: Option<std::sync::Arc<std::sync::Mutex<crate::GlobalEgressLimiter>>>,
-    now_ms: F,
+    limits: SessionLimits<F>,
 ) -> Result<SessionReport, SessionError>
 where
     S: SyncStore,
@@ -207,6 +203,7 @@ where
     W: AsyncWrite + Unpin,
     F: Fn() -> i64,
 {
+    let SessionLimits { idle_timeout, egress, now_ms } = limits;
     let account_id = store.account_id();
     let snapshot = store.snapshot().map_err(SessionError::Store)?;
     let have = bounded_inventory(snapshot.iter().map(|(h, _)| *h));
@@ -600,9 +597,11 @@ mod tests {
                     server_recv,
                     AuthRole::Acceptor,
                     SessionCapabilities::new(PeerCapability::ReadWrite, PeerCapability::ReadOnly),
-                    DEFAULT_IDLE_TIMEOUT,
-                    Some(egress.clone()),
-                    move || now,
+                    SessionLimits {
+                        idle_timeout: DEFAULT_IDLE_TIMEOUT,
+                        egress: Some(egress.clone()),
+                        now_ms: move || now,
+                    },
                 ),
                 run_session(
                     &mut reader,
@@ -632,9 +631,11 @@ mod tests {
                     server_recv,
                     AuthRole::Acceptor,
                     SessionCapabilities::new(PeerCapability::ReadWrite, PeerCapability::ReadOnly),
-                    DEFAULT_IDLE_TIMEOUT,
-                    Some(egress.clone()),
-                    move || later,
+                    SessionLimits {
+                        idle_timeout: DEFAULT_IDLE_TIMEOUT,
+                        egress: Some(egress.clone()),
+                        now_ms: move || later,
+                    },
                 ),
                 run_session(
                     &mut reader,
@@ -677,9 +678,11 @@ mod tests {
                 server_recv,
                 AuthRole::Acceptor,
                 SessionCapabilities::new(PeerCapability::ReadWrite, PeerCapability::ReadOnly),
-                DEFAULT_IDLE_TIMEOUT,
-                Some(egress),
-                || 1_700_000_000_000,
+                SessionLimits {
+                    idle_timeout: DEFAULT_IDLE_TIMEOUT,
+                    egress: Some(egress),
+                    now_ms: || 1_700_000_000_000,
+                },
             ),
             run_session(
                 &mut reader,
@@ -766,13 +769,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            run_session_with_idle_timeout(
+            run_session_limited(
                 &mut server,
                 send,
                 recv,
                 AuthRole::Acceptor,
                 SessionCapabilities::bidirectional(),
-                Duration::from_millis(50),
+                SessionLimits {
+                    idle_timeout: Duration::from_millis(50),
+                    ..SessionLimits::default()
+                },
             ),
         )
         .await
@@ -964,13 +970,16 @@ mod tests {
         write_frame(&mut peer_send, &Frame::Hello { account_id: [11; 32], have: vec![] })
             .await
             .unwrap();
-        let result = run_session_with_idle_timeout(
+        let result = run_session_limited(
             &mut receiver,
             send,
             recv,
             AuthRole::Dialer,
             SessionCapabilities::bidirectional(),
-            std::time::Duration::from_millis(50),
+            SessionLimits {
+                idle_timeout: std::time::Duration::from_millis(50),
+                ..SessionLimits::default()
+            },
         )
         .await;
         drop(peer_send); // keep the stream alive until after the timeout fired

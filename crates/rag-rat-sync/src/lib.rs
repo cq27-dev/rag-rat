@@ -53,8 +53,8 @@ pub use enrollment::{
 /// way is what makes this crate the single place the transport is chosen.
 pub use iroh::EndpointAddr;
 pub use session::{
-    DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES, ServeScope, SessionError, SessionReport,
-    SyncStore, run_session, run_session_limited, run_session_with_idle_timeout,
+    DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES, ServeScope, SessionError, SessionLimits,
+    SessionReport, SyncStore, run_session, run_session_limited,
 };
 pub use store::{OplogContentSyncStore, OplogSyncStore, OplogTableSyncStore};
 pub use table_session::{
