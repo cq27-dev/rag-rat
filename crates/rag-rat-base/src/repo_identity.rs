@@ -360,18 +360,12 @@ fn empty_repo_error(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::test_scratch::ScratchDir;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_root() -> PathBuf {
-        let mut root = std::env::temp_dir();
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        root.push(format!("rag-rat-repo-identity-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        root
+    fn temp_root() -> ScratchDir {
+        ScratchDir::new("repo-identity")
     }
 
     fn git(root: &Path, args: &[&str]) {
@@ -412,7 +406,6 @@ mod tests {
         assert_eq!(identity.repo_id, expected[0]);
         assert_eq!(identity.class, RepoIdentityClass::Portable, "a full history is portable");
         assert_eq!(identity.display_name, root.file_name().unwrap().to_string_lossy());
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -432,7 +425,6 @@ mod tests {
         let identity = resolve_repo_identity(&root, None).unwrap();
         assert_eq!(identity.repo_id, roots[0], "smallest root hash by byte order wins");
         assert_eq!(identity.class, RepoIdentityClass::Portable);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -455,7 +447,6 @@ mod tests {
         let blank = resolve_repo_identity(&root, Some("   ")).unwrap();
         assert_eq!(blank.repo_id, derived);
         assert_eq!(blank.class, RepoIdentityClass::Portable);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The pre-adoption placeholder marker ([`LEGACY_REPO_ID`]) is a RESERVED repo_id: pinning it
@@ -480,7 +471,6 @@ mod tests {
         let err_padded = resolve_repo_identity(&root, Some(&padded))
             .expect_err("the trimmed reserved id is still refused");
         assert!(err_padded.to_string().contains("reserved"), "{err_padded}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The `local:` prefix is reserved for machine-derived shallow-clone ids: `register_repo` keys
@@ -502,7 +492,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("local:"), "error names the reserved prefix: {msg}");
         assert!(msg.contains("reserved"), "error explains it is reserved: {msg}");
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Build an origin repo with `commits` empty commits under `base/origin`, then a `--depth`
@@ -555,7 +544,6 @@ mod tests {
         let pinned = resolve_repo_identity(&shallow, Some("pinned-shallow")).unwrap();
         assert_eq!(pinned.repo_id, "pinned-shallow");
         assert_eq!(pinned.class, RepoIdentityClass::Portable, "a pin overrides to Portable");
-        std::fs::remove_dir_all(&base).ok();
     }
 
     /// A clone flagged shallow whose `--depth` COVERS the whole history is NOT depth-dependent: the
@@ -577,7 +565,6 @@ mod tests {
             .expect("full history present → the real root is reachable");
         assert_eq!(identity.repo_id, origin_root, "id is the real root, depth-independent");
         assert_eq!(identity.class, RepoIdentityClass::Portable, "a covered clone is portable");
-        std::fs::remove_dir_all(&base).ok();
     }
 
     /// An empty repo (`git init`, unborn HEAD, zero commits) cannot derive an id; the error names
@@ -598,7 +585,6 @@ mod tests {
         let pinned = resolve_repo_identity(&root, Some("pinned-empty")).unwrap();
         assert_eq!(pinned.repo_id, "pinned-empty");
         assert_eq!(pinned.class, RepoIdentityClass::Portable);
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -612,6 +598,5 @@ mod tests {
         let identity = resolve_repo_identity(&root, Some("pinned")).unwrap();
         assert_eq!(identity.repo_id, "pinned");
         assert_eq!(identity.class, RepoIdentityClass::Portable);
-        std::fs::remove_dir_all(&root).ok();
     }
 }
