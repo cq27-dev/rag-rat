@@ -843,37 +843,31 @@ pub fn redeem_writer_invite(
     now_ms: &dyn Fn() -> i64,
 ) -> Result<WriterGrantReceipt, InviteError> {
     // Reject random unauthenticated nonces without the database-wide writer reservation; a valid
-    // candidate is re-read after BEGIN IMMEDIATE below (mirrors [`redeem_invite`]).
-    let Some(invite) = stored_invite(conn, request.nonce)? else {
-        return Err(InviteError::Unknown);
-    };
-    // The replay window is bounded exactly as enrollment's: past the retention period a consumed
-    // nonce answers Used and the row is pruned, never a receipt.
+    // candidate is re-screened after BEGIN IMMEDIATE below (mirrors [`redeem_invite`]).
+    let invite = load_invite(conn, request.nonce)?;
     let arrival_ms = now_ms();
-    if receipt_replay_expired(&invite, arrival_ms) {
-        prune_expired_invites(conn, arrival_ms)?;
-        return Err(InviteError::Used);
+    match screen_writer_invite(conn, request, invite, arrival_ms)? {
+        Screened::Replay(receipt) => return Ok(receipt),
+        Screened::ReplayExpired => {
+            prune_expired_invites(conn, arrival_ms)?;
+            return Err(InviteError::Used);
+        },
+        Screened::Proceed(_) => {},
     }
-    if let Some(receipt) = writer_replay_receipt(conn, &invite, request)? {
-        return Ok(receipt);
-    }
-    writer_redeem_preflight(&invite, request, arrival_ms)?;
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| InviteError::Storage(error.into()))?;
     let commit_ms = now_ms();
-    let Some(invite) = stored_invite(&tx, request.nonce)? else {
-        return Err(InviteError::Unknown);
+    let invite = load_invite(&tx, request.nonce)?;
+    let invite = match screen_writer_invite(&tx, request, invite, commit_ms)? {
+        Screened::Replay(receipt) => return Ok(receipt),
+        Screened::ReplayExpired => {
+            prune_expired_invites_in_tx(&tx, commit_ms)?;
+            tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
+            return Err(InviteError::Used);
+        },
+        Screened::Proceed(invite) => *invite,
     };
-    if receipt_replay_expired(&invite, commit_ms) {
-        prune_expired_invites_in_tx(&tx, commit_ms)?;
-        tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
-        return Err(InviteError::Used);
-    }
-    if let Some(receipt) = writer_replay_receipt(&tx, &invite, request)? {
-        return Ok(receipt);
-    }
-    writer_redeem_preflight(&invite, request, commit_ms)?;
     prune_expired_invites_in_tx(&tx, commit_ms)?;
     let account_id = stored_invite_account(&invite)?;
     if read_local_account(&tx)
@@ -1022,24 +1016,20 @@ pub fn redeem_invite(
         return Err(InviteError::WrongNode);
     }
     // Reject random unauthenticated nonces without taking SQLite's database-wide writer
-    // reservation. A valid candidate is re-read after BEGIN IMMEDIATE below.
-    let Some(invite) = stored_invite(conn, request.nonce)? else {
-        return Err(InviteError::Unknown);
-    };
-    let account_id = stored_invite_account(&invite)?;
-    if request.expected_account != account_id {
-        return Err(InviteError::AccountMismatch);
-    }
+    // reservation. A valid candidate is re-screened after BEGIN IMMEDIATE below. The arrival clock
+    // is read AFTER the row lookup and the account check, so a lookup that crosses the replay
+    // deadline is judged at its end (a stale earlier sample could replay a receipt the deadline
+    // has already retired), and a wrong-account request never reads the clock.
+    let invite = load_invite(conn, request.nonce)?;
+    ensure_expected_account(&request, &invite)?;
     let arrival_ms = now_ms();
-    if receipt_replay_expired(&invite, arrival_ms) {
-        prune_expired_invites(conn, arrival_ms)?;
-        return Err(InviteError::Used);
-    }
-    if let Some(receipt) = replay_receipt(conn, &invite, &request)? {
-        return Ok((receipt, empty_catch_up(&request)));
-    }
-    if arrival_ms >= invite.expires_at_ms {
-        return Err(InviteError::Expired);
+    match screen_invite(conn, &request, invite, arrival_ms)? {
+        Screened::Replay(receipt) => return Ok((receipt, empty_catch_up(&request))),
+        Screened::ReplayExpired => {
+            prune_expired_invites(conn, arrival_ms)?;
+            return Err(InviteError::Used);
+        },
+        Screened::Proceed(_) => {},
     }
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
@@ -1048,24 +1038,18 @@ pub fn redeem_invite(
     // NOW that the writer lock is held, or an invite that expired during the wait would be
     // consumed against the stale pre-wait timestamp.
     let commit_ms = now_ms();
-    let Some(invite) = stored_invite(&tx, request.nonce)? else {
-        return Err(InviteError::Unknown);
+    let invite = load_invite(&tx, request.nonce)?;
+    ensure_expected_account(&request, &invite)?;
+    let invite = match screen_invite(&tx, &request, invite, commit_ms)? {
+        Screened::Replay(receipt) => return Ok((receipt, empty_catch_up(&request))),
+        Screened::ReplayExpired => {
+            prune_expired_invites_in_tx(&tx, commit_ms)?;
+            tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
+            return Err(InviteError::Used);
+        },
+        Screened::Proceed(invite) => *invite,
     };
     let account_id = stored_invite_account(&invite)?;
-    if request.expected_account != account_id {
-        return Err(InviteError::AccountMismatch);
-    }
-    if receipt_replay_expired(&invite, commit_ms) {
-        prune_expired_invites_in_tx(&tx, commit_ms)?;
-        tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
-        return Err(InviteError::Used);
-    }
-    if let Some(receipt) = replay_receipt(&tx, &invite, &request)? {
-        return Ok((receipt, empty_catch_up(&request)));
-    }
-    if commit_ms >= invite.expires_at_ms {
-        return Err(InviteError::Expired);
-    }
     prune_expired_invites_in_tx(&tx, commit_ms)?;
     if read_local_account(&tx)
         .map_err(InviteError::from)?
@@ -1194,6 +1178,75 @@ pub fn redeem_invite(
         tracing::warn!(%error, "post-enrollment pre-verify retry failed");
     }
     Ok((receipt, catch_up))
+}
+
+/// How a redemption screen resolved an invite. Each redemption screens twice, identically: once
+/// before the writer lock, so a random nonce is refused without the database-wide reservation, and
+/// again after BEGIN IMMEDIATE against the re-read clock.
+enum Screened<R> {
+    /// A same-redemption replay inside the retention window: answer with the original receipt.
+    Replay(R),
+    /// A consumed nonce past its replay retention: prune it and answer `Used`, never a receipt.
+    ReplayExpired,
+    /// A live invite past every deterministic refusal: redeem it.
+    Proceed(Box<StoredInvite>),
+}
+
+/// A redemption's invite row, `Unknown` for a nonce this store never minted. Before the writer
+/// lock the row is loaded before the arrival clock is read; under the lock the commit clock is
+/// read first and the row is re-loaded after it.
+fn load_invite(conn: &Connection, nonce: [u8; 32]) -> Result<StoredInvite, InviteError> {
+    stored_invite(conn, nonce)?.ok_or(InviteError::Unknown)
+}
+
+/// Refuse an enrollment whose expected account is not the invite's. Runs straight after each
+/// [`load_invite`], ahead of the arrival clock, so a wrong-account request never reads the clock.
+fn ensure_expected_account(
+    request: &EnrollmentRequest,
+    invite: &StoredInvite,
+) -> Result<(), InviteError> {
+    if request.expected_account != stored_invite_account(invite)? {
+        return Err(InviteError::AccountMismatch);
+    }
+    Ok(())
+}
+
+/// The enrollment screen over a loaded, account-checked invite: the bounded replay window, an
+/// exact-request replay, then expiry.
+fn screen_invite(
+    conn: &Connection,
+    request: &EnrollmentRequest,
+    invite: StoredInvite,
+    at_ms: i64,
+) -> Result<Screened<EnrollmentReceipt>, InviteError> {
+    if receipt_replay_expired(&invite, at_ms) {
+        return Ok(Screened::ReplayExpired);
+    }
+    if let Some(receipt) = replay_receipt(conn, &invite, request)? {
+        return Ok(Screened::Replay(receipt));
+    }
+    if at_ms >= invite.expires_at_ms {
+        return Err(InviteError::Expired);
+    }
+    Ok(Screened::Proceed(Box::new(invite)))
+}
+
+/// The writer-invite screen over a loaded invite: the replay window bounded exactly as
+/// enrollment's, a same-redemption replay, then the writer preflight refusals.
+fn screen_writer_invite(
+    conn: &Connection,
+    request: &WriterGrantRequest,
+    invite: StoredInvite,
+    at_ms: i64,
+) -> Result<Screened<WriterGrantReceipt>, InviteError> {
+    if receipt_replay_expired(&invite, at_ms) {
+        return Ok(Screened::ReplayExpired);
+    }
+    if let Some(receipt) = writer_replay_receipt(conn, &invite, request)? {
+        return Ok(Screened::Replay(receipt));
+    }
+    writer_redeem_preflight(&invite, request, at_ms)?;
+    Ok(Screened::Proceed(Box::new(invite)))
 }
 
 fn stored_invite(conn: &Connection, nonce: [u8; 32]) -> Result<Option<StoredInvite>, InviteError> {
@@ -2110,6 +2163,33 @@ mod tests {
         let invites: i64 =
             conn.query_row("SELECT COUNT(*) FROM sync_invites", [], |row| row.get(0)).unwrap();
         assert_eq!(invites, 0, "an unusable invite must never cross the mint boundary");
+    }
+
+    #[test]
+    fn a_wrong_account_enrollment_is_refused_before_the_arrival_clock_is_read() {
+        let conn = db();
+        let account = rag_rat_oplog::local_account(&conn, NOW).unwrap();
+        let ticket = ticket(&conn, account, DeviceRole::Member);
+        let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
+        let request = EnrollmentRequest {
+            nonce: ticket.nonce,
+            expected_account: AccountId::from_bytes([0x55; 32]),
+            ed25519_pubkey,
+            x25519_pubkey,
+            transport_node_id: [9; 32],
+            budget: generous_budget(),
+            held_entry_hashes: Vec::new(),
+        };
+        let clock_reads = std::cell::Cell::new(0);
+        let clock = || {
+            clock_reads.set(clock_reads.get() + 1);
+            NOW + 1
+        };
+        assert!(matches!(
+            redeem_invite(&conn, request, [9; 32], &clock),
+            Err(InviteError::AccountMismatch)
+        ));
+        assert_eq!(clock_reads.get(), 0, "the account check runs before the arrival clock is read");
     }
 
     #[test]
