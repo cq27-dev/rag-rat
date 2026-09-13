@@ -1488,13 +1488,22 @@ mod freshness_version_tests {
         // model, its version, AND its provenance — so no site can activate without any of
         // them (the recovery bug for the version; the #394 masquerade bug for provenance).
         let conn = schema_conn();
-        activate_model_with_version(&conn, HASH_MODEL_ID, "hash-v1", false).unwrap();
+        activate_model_with_version(
+            &conn,
+            HASH_MODEL_ID,
+            "hash-v1",
+            ActiveModelProvenance::Confirmed,
+        )
+        .unwrap();
         assert_eq!(
             repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().as_deref(),
             Some(HASH_MODEL_ID)
         );
         assert_eq!(active_version(&conn), "hash-v1");
-        assert!(!active_embedding_model_is_provisional(&conn).unwrap(), "false ⇒ non-provisional");
+        assert!(
+            !active_embedding_model_is_provisional(&conn).unwrap(),
+            "Confirmed ⇒ non-provisional"
+        );
     }
 
     // Needs a real fastembed install (the no-default-features CI build bails without the feature);

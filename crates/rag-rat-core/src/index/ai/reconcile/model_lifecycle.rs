@@ -70,7 +70,12 @@ pub(crate) fn recover_cached_fastembed_model_at(
             .ok_or_else(|| anyhow::anyhow!("unknown model `{FASTEMBED_MODEL_ID}`"))?;
         // PROVISIONAL: a cache recovery is automatic, not a user choice — a differing config seed
         // must still win over it on a fresh index (#394 review).
-        activate_model_with_version(conn, FASTEMBED_MODEL_ID, spec.version, true)?;
+        activate_model_with_version(
+            conn,
+            FASTEMBED_MODEL_ID,
+            spec.version,
+            ActiveModelProvenance::Provisional,
+        )?;
     }
     Ok(())
 }
@@ -107,40 +112,77 @@ pub(crate) fn fastembed_cache_ready(cache_dir: &Path) -> bool {
     !revision.is_empty() && repo.join("snapshots").join(revision).is_dir()
 }
 
+/// Who chose the active embedding model, persisted as [`ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META`]
+/// (`"1"` / `"0"`). An absent or unrecognised value reads as `None`, which the seed treats as
+/// non-provisional (a pre-#394 index keeps its model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActiveModelProvenance {
+    /// Set automatically (config seed, fastembed-cache recovery); yields to a differing config.
+    Provisional,
+    /// Chosen explicitly (`install_model`) or confirmed by a reconcile that committed embeddings.
+    Confirmed,
+}
+
+impl ActiveModelProvenance {
+    pub(crate) fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Provisional => "1",
+            Self::Confirmed => "0",
+        }
+    }
+
+    pub(crate) fn from_db_str(token: &str) -> Option<Self> {
+        match token {
+            "1" => Some(Self::Provisional),
+            "0" => Some(Self::Confirmed),
+            _ => None,
+        }
+    }
+}
+
 /// Activate `model_id` as the active embedding model, stamp its freshness `version`, and record its
 /// PROVENANCE — all in ONE call, the SINGLE place that writes these metas, so no activation site
 /// can set the active model without its version (the bug R3b fixed in recovery) or its provenance.
-/// `provisional = true` for an AUTOMATIC activation (config seed, fastembed-cache recovery),
-/// `false` for an EXPLICIT one (`install_model`). See [`ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META`].
+/// `Provisional` for an AUTOMATIC activation (config seed, fastembed-cache recovery), `Confirmed`
+/// for an EXPLICIT one (`install_model`). See [`ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META`].
 pub(crate) fn activate_model_with_version(
     conn: &Connection,
     model_id: &str,
     version: &str,
-    provisional: bool,
+    provenance: ActiveModelProvenance,
 ) -> anyhow::Result<()> {
     // The whole active-model provenance family is per-repo now: model id + freshness version moved
     // to `repo_meta` in V039, and V040 reunited the provisional flag (+ remote config) there — one
     // writer, one table.
     set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
     set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, version)?;
-    set_repo_meta(
-        conn,
-        ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META,
-        if provisional { "1" } else { "0" },
-    )?;
+    set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META, provenance.as_db_str())?;
     Ok(())
 }
 
 /// Whether the active embedding model is PROVISIONAL — set automatically (seed / cache recovery)
 /// and not yet confirmed by an explicit install or a committed reconcile. Absent ⇒ non-provisional.
 pub(crate) fn active_embedding_model_is_provisional(conn: &Connection) -> anyhow::Result<bool> {
-    Ok(repo_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META)?.as_deref() == Some("1"))
+    Ok(active_embedding_model_provenance(conn)? == Some(ActiveModelProvenance::Provisional))
+}
+
+/// The recorded [`ActiveModelProvenance`], or `None` when no (or an unrecognised) flag is stored.
+pub(crate) fn active_embedding_model_provenance(
+    conn: &Connection,
+) -> anyhow::Result<Option<ActiveModelProvenance>> {
+    Ok(repo_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META)?
+        .as_deref()
+        .and_then(ActiveModelProvenance::from_db_str))
 }
 
 /// Clear the provisional flag — the active model is now the CONFIRMED choice (an explicit install,
 /// or a reconcile that committed embeddings under it). Idempotent.
 pub(crate) fn clear_active_embedding_model_provisional(conn: &Connection) -> anyhow::Result<()> {
-    set_repo_meta(conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META, "0")
+    set_repo_meta(
+        conn,
+        ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META,
+        ActiveModelProvenance::Confirmed.as_db_str(),
+    )
 }
 
 /// Clear the active embedding model entirely — the inverse of [`activate_model_with_version`].
@@ -202,7 +244,12 @@ pub(crate) fn seed_active_embedding_model(
     // version through the single writer (never the active meta alone, per the R3b footgun). The
     // static `spec.version` is correct pre-install; `install_model` re-stamps the runtime-accurate
     // version and clears the provisional flag.
-    activate_model_with_version(conn, spec.model_id, spec.version, true)
+    activate_model_with_version(
+        conn,
+        spec.model_id,
+        spec.version,
+        ActiveModelProvenance::Provisional,
+    )
 }
 
 /// Read-only test of whether [`seed_active_embedding_model`] would WRITE. The read-only open
@@ -302,7 +349,7 @@ pub(crate) fn install_model(
     };
     // EXPLICIT: `models install` is a user choice — not provisional, so the config seed never
     // overrides it (#394 review).
-    activate_model_with_version(conn, model_id, &freshness, false)?;
+    activate_model_with_version(conn, model_id, &freshness, ActiveModelProvenance::Confirmed)?;
     model(conn, model_id)
 }
 
@@ -365,6 +412,19 @@ mod seed_active_embedding_model_tests {
     }
 
     #[test]
+    fn provenance_tokens_round_trip_and_unknown_reads_as_none() {
+        for provenance in [ActiveModelProvenance::Provisional, ActiveModelProvenance::Confirmed] {
+            assert_eq!(
+                ActiveModelProvenance::from_db_str(provenance.as_db_str()),
+                Some(provenance)
+            );
+        }
+        assert_eq!(ActiveModelProvenance::Provisional.as_db_str(), "1");
+        assert_eq!(ActiveModelProvenance::Confirmed.as_db_str(), "0");
+        assert_eq!(ActiveModelProvenance::from_db_str("true"), None);
+    }
+
+    #[test]
     fn seeds_the_configured_model_when_active_is_unset() {
         let conn = fresh_conn();
         assert!(
@@ -414,7 +474,13 @@ mod seed_active_embedding_model_tests {
         // Simulate a fastembed-cache recovery: activated, but PROVISIONAL (automatic, not a user
         // choice). A `models install` would be non-provisional; this must NOT masquerade as one.
         let minilm = spec(MINILM).expect("registry has all-MiniLM");
-        activate_model_with_version(&conn, minilm.model_id, minilm.version, true).unwrap();
+        activate_model_with_version(
+            &conn,
+            minilm.model_id,
+            minilm.version,
+            ActiveModelProvenance::Provisional,
+        )
+        .unwrap();
         assert!(active_embedding_model_is_provisional(&conn).unwrap());
 
         assert!(active_embedding_model_seed_owed(&conn, Some(JINA)).unwrap());
