@@ -1119,10 +1119,12 @@ async fn sync_attested_closers<C: PapertrailClient>(
         // that the PR's `closingIssuesReferences` never lists. The PR phase only CREATES keyword
         // edges (idempotent upserts); it never reaps.
         for issue_key in &page.replaced_issue_closers {
-            report.attested_writes += tx.execute(
-                "DELETE FROM papertrail_closing_edges WHERE repo_id = ?1 AND tracker = ?2 AND \
-                 project = ?3 AND source = 'provider' AND issue_key = ?4",
-                params![repo_id, binding.provider.as_db_str(), binding.project, issue_key],
+            report.attested_writes += reap_provider_closers_for_issue(
+                &tx,
+                &repo_id,
+                binding.provider,
+                &binding.project,
+                issue_key,
             )?;
         }
         for edge in &page.edges {
@@ -1134,14 +1136,13 @@ async fn sync_attested_closers<C: PapertrailClient>(
             // reopened). An un-mirrored or reopened target is skipped; a later closed+in-scope
             // walk records it. (`edge.project` is the issue's project — same-project after the
             // cross-repo skips, i.e. `binding.project`.)
-            let target_closed = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM papertrail_items WHERE repo_id = ?1 AND tracker = ?2 \
-                 AND project = ?3 AND item_kind = 'issue' AND item_key = ?4 AND state_normalized \
-                 != 'open')",
-                params![repo_id, binding.provider.as_db_str(), edge.project, edge.issue_key],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if !target_closed {
+            if !cached_issue_is_closed(
+                &tx,
+                &repo_id,
+                binding.provider,
+                &edge.project,
+                &edge.issue_key,
+            )? {
                 continue;
             }
             // Defer to the issue's ONE authoritative closer: never store an edge that CONFLICTS
@@ -1151,59 +1152,27 @@ async fn sync_attested_closers<C: PapertrailClient>(
             // edited after the watermark would resurrect `#5←#9` once #5's ClosedEvent had already
             // moved its closer elsewhere (and #5 sits below the watermark, never re-read). The
             // same-closer case is not a conflict, so an idempotent re-store still passes.
-            let conflicting_closer = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM papertrail_closing_edges WHERE repo_id = ?1 AND \
-                 tracker = ?2 AND project = ?3 AND issue_kind = ?4 AND issue_key = ?5 AND source \
-                 = 'provider' AND NOT (closer_kind = ?6 AND closer_key = ?7))",
-                params![
-                    repo_id,
-                    binding.provider.as_db_str(),
-                    edge.project,
-                    edge.issue_kind.as_db_str(),
-                    edge.issue_key,
-                    edge.closer_kind.as_db_str(),
-                    edge.closer_key,
-                ],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if conflicting_closer {
+            if has_conflicting_provider_closer(&tx, &repo_id, binding.provider, edge)? {
                 continue;
             }
             store_closing_edge(&tx, binding.provider, edge)?;
             report.attested_edges += 1;
         }
         for update in &page.item_updates {
-            if let Some(resolution) = update.resolution {
-                report.attested_writes += tx.execute(
-                    "UPDATE papertrail_items SET resolution = ?6 WHERE repo_id = ?1 AND tracker = \
-                     ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
-                    params![
-                        repo_id,
-                        binding.provider.as_db_str(),
-                        binding.project,
-                        update.item_kind.as_db_str(),
-                        update.item_key,
-                        resolution.as_db_str(),
-                    ],
-                )?;
-            }
-            if let Some(sha) = &update.merge_commit_sha {
-                // The merged-only invariant, enforced in SQL: an attested sha lands only on rows
-                // the store already normalized as merged.
-                report.attested_writes += tx.execute(
-                    "UPDATE papertrail_items SET merge_commit_sha = ?6 WHERE repo_id = ?1 AND \
-                     tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5 AND \
-                     state_normalized = 'merged'",
-                    params![
-                        repo_id,
-                        binding.provider.as_db_str(),
-                        binding.project,
-                        update.item_kind.as_db_str(),
-                        update.item_key,
-                        sha,
-                    ],
-                )?;
-            }
+            report.attested_writes += stamp_attested_resolution(
+                &tx,
+                &repo_id,
+                binding.provider,
+                &binding.project,
+                update,
+            )?;
+            report.attested_writes += stamp_attested_merge_commit(
+                &tx,
+                &repo_id,
+                binding.provider,
+                &binding.project,
+                update,
+            )?;
         }
         tx.commit()?;
         match page.next {

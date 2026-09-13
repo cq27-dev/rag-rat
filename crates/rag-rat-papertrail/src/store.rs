@@ -323,6 +323,129 @@ pub fn closing_edges_for_item(
     Ok(edges)
 }
 
+/// Whether `issue_key` is a CACHED issue that is not open — the only target a closing edge may be
+/// stored for. Cached ⇒ the item passed its binding's tag filter; not open ⇒ a reopened issue has
+/// no closure evidence.
+pub(crate) fn cached_issue_is_closed(
+    conn: &Connection,
+    repo_id: &str,
+    tracker: Tracker,
+    project: &str,
+    issue_key: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM papertrail_items WHERE repo_id = ?1 AND tracker = ?2 AND \
+         project = ?3 AND item_kind = ?4 AND item_key = ?5 AND state_normalized != ?6)",
+        params![
+            repo_id,
+            tracker.as_db_str(),
+            project,
+            ItemKind::Issue.as_db_str(),
+            issue_key,
+            NormalizedState::Open.as_db_str(),
+        ],
+        |row| row.get(0),
+    )
+}
+
+/// Whether `edge`'s issue already has a PROVIDER closer other than `edge`'s own — the issue's one
+/// authoritative closer, which an attested edge must never contradict.
+pub(crate) fn has_conflicting_provider_closer(
+    conn: &Connection,
+    repo_id: &str,
+    tracker: Tracker,
+    edge: &ClosingEdge,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM papertrail_closing_edges WHERE repo_id = ?1 AND tracker = ?2 \
+         AND project = ?3 AND issue_kind = ?4 AND issue_key = ?5 AND source = ?6 AND NOT \
+         (closer_kind = ?7 AND closer_key = ?8))",
+        params![
+            repo_id,
+            tracker.as_db_str(),
+            edge.project,
+            edge.issue_kind.as_db_str(),
+            edge.issue_key,
+            ClosingEdgeSource::Provider.as_db_str(),
+            edge.closer_kind.as_db_str(),
+            edge.closer_key,
+        ],
+        |row| row.get(0),
+    )
+}
+
+/// Delete every PROVIDER closer edge targeting one issue, whatever the closer kind — the attested
+/// walk's issue-keyed replace-set. Returns the rows removed.
+pub(crate) fn reap_provider_closers_for_issue(
+    conn: &Connection,
+    repo_id: &str,
+    tracker: Tracker,
+    project: &str,
+    issue_key: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM papertrail_closing_edges WHERE repo_id = ?1 AND tracker = ?2 AND project = \
+         ?3 AND source = ?4 AND issue_key = ?5",
+        params![
+            repo_id,
+            tracker.as_db_str(),
+            project,
+            ClosingEdgeSource::Provider.as_db_str(),
+            issue_key,
+        ],
+    )
+}
+
+/// Stamp an attested resolution onto the cached item, when the update carries one. Returns the
+/// rows updated.
+pub(crate) fn stamp_attested_resolution(
+    conn: &Connection,
+    repo_id: &str,
+    tracker: Tracker,
+    project: &str,
+    update: &AttestedItemUpdate,
+) -> rusqlite::Result<usize> {
+    let Some(resolution) = update.resolution else { return Ok(0) };
+    conn.execute(
+        "UPDATE papertrail_items SET resolution = ?6 WHERE repo_id = ?1 AND tracker = ?2 AND \
+         project = ?3 AND item_kind = ?4 AND item_key = ?5",
+        params![
+            repo_id,
+            tracker.as_db_str(),
+            project,
+            update.item_kind.as_db_str(),
+            update.item_key,
+            resolution.as_db_str(),
+        ],
+    )
+}
+
+/// Stamp an attested merge sha onto the cached item, when the update carries one — only onto a row
+/// the store already normalized as merged (the merged-only invariant, enforced in SQL). Returns
+/// the rows updated.
+pub(crate) fn stamp_attested_merge_commit(
+    conn: &Connection,
+    repo_id: &str,
+    tracker: Tracker,
+    project: &str,
+    update: &AttestedItemUpdate,
+) -> rusqlite::Result<usize> {
+    let Some(sha) = &update.merge_commit_sha else { return Ok(0) };
+    conn.execute(
+        "UPDATE papertrail_items SET merge_commit_sha = ?6 WHERE repo_id = ?1 AND tracker = ?2 \
+         AND project = ?3 AND item_kind = ?4 AND item_key = ?5 AND state_normalized = ?7",
+        params![
+            repo_id,
+            tracker.as_db_str(),
+            project,
+            update.item_kind.as_db_str(),
+            update.item_key,
+            sha,
+            NormalizedState::Merged.as_db_str(),
+        ],
+    )
+}
+
 /// WHOLE-TABLE rebuild of the `papertrail_fts` mirror from the base tables — the full re-walk /
 /// recovery path ONLY (and the V060 migration backfill). Routine syncs maintain the mirror
 /// incrementally in [`store_item`] / [`store_comment`]; calling this per sync would re-pay the

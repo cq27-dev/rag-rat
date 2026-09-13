@@ -716,9 +716,9 @@ pub(crate) fn store_text_closing_edges_from_commit_refs(
 ) -> anyhow::Result<()> {
     let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     conn.execute(
-        "DELETE FROM papertrail_closing_edges WHERE repo_id = ?1 AND source = 'text' AND \
-         closer_kind = 'commit'",
-        params![repo_id],
+        "DELETE FROM papertrail_closing_edges WHERE repo_id = ?1 AND source = ?2 AND closer_kind \
+         = ?3",
+        params![repo_id, ClosingEdgeSource::Text.as_db_str(), CloserKind::Commit.as_db_str()],
     )?;
     for reference in refs {
         // Per-project default-branch gate: HEAD must be THIS project's remote default branch.
@@ -748,21 +748,13 @@ pub(crate) fn store_text_closing_edges_from_commit_refs(
         // but this rederive runs at sync END, so without it a reopened issue whose closing
         // commit is still in history would have its text-tier closer re-minted every sync.
         // (Un-mirrored targets stay annotations; the provider lane attests them.)
-        let cached_kind: Option<String> = conn
-            .query_row(
-                "SELECT item_kind FROM papertrail_items WHERE repo_id = ?1 AND tracker = ?2 AND \
-                 project = ?3 AND item_key = ?4 AND item_kind = 'issue' AND state_normalized != \
-                 'open'",
-                params![
-                    repo_id,
-                    reference.tracker.as_db_str(),
-                    reference.project,
-                    reference.item_key
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if cached_kind.as_deref() != Some(ItemKind::Issue.as_db_str()) {
+        if !cached_issue_is_closed(
+            conn,
+            &repo_id,
+            reference.tracker,
+            &reference.project,
+            &reference.item_key,
+        )? {
             continue;
         }
         // Defer to the provider tier. The text tier is the FALLBACK for issues the provider lane
@@ -774,9 +766,15 @@ pub(crate) fn store_text_closing_edges_from_commit_refs(
         // as a provider row (same sha), so skipping the text copy is harmless.
         let has_provider_closer: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM papertrail_closing_edges WHERE repo_id = ?1 AND tracker \
-             = ?2 AND project = ?3 AND issue_kind = 'issue' AND issue_key = ?4 AND source = \
-             'provider')",
-            params![repo_id, reference.tracker.as_db_str(), reference.project, reference.item_key],
+             = ?2 AND project = ?3 AND issue_kind = ?5 AND issue_key = ?4 AND source = ?6)",
+            params![
+                repo_id,
+                reference.tracker.as_db_str(),
+                reference.project,
+                reference.item_key,
+                ItemKind::Issue.as_db_str(),
+                ClosingEdgeSource::Provider.as_db_str(),
+            ],
             |row| row.get(0),
         )?;
         if has_provider_closer {
