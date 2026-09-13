@@ -14,7 +14,7 @@ fn run_with_empty_scip_completes_with_no_verdicts() {
 
     let empty = Index::default().write_to_bytes().unwrap();
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &empty, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &empty, h.root(), None, None).unwrap();
 
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.no_occurrence, 1, "no document → no occurrence bucket");
@@ -47,7 +47,7 @@ fn candidate_outside_any_occurrence_counts_no_occurrence() {
     ]);
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.no_occurrence, 1);
     assert_eq!(report.rows_written, 0);
@@ -90,7 +90,7 @@ fn run_aggregates_counts_and_recall_gap() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.upgraded, 1);
     assert_eq!(report.rows_written, 1);
@@ -131,7 +131,7 @@ fn rerun_clears_stale_verdict_for_dropped_edge() {
         ..Default::default()
     });
     let bytes = index.write_to_bytes().unwrap();
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(
         h.verdict(edge).map(|(k, _, _)| k).as_deref(),
         Some("upgrade"),
@@ -150,7 +150,7 @@ fn rerun_clears_stale_verdict_for_dropped_edge() {
                 SymbolRole::UnspecifiedSymbolRole as i32,
             ),
         ]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &empty_doc, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &empty_doc, h.root(), None, None).unwrap();
 
     assert!(h.verdict(edge).is_none(), "the dropped edge's stale verdict was cleared on rerun");
     let total: i64 =
@@ -199,7 +199,7 @@ fn recall_gap_counts_only_call_like_occurrences() {
     };
     let bytes = index.write_to_bytes().unwrap();
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     // Only the one uncovered callable reference is the recall gap; the import + type ref are not.
     assert_eq!(report.oracle_only_calls, 1, "only the call-like uncovered reference counts");
@@ -226,7 +226,7 @@ fn eval_metrics_derive_rates_from_persisted_verdicts() {
 
     // Recall sides come from the run, occurrence-counted over the call population: 3 covered call
     // occurrences + 1 oracle-only gap. (Recall no longer derives from the per-kind verdict sum.)
-    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, RecallCalls {
+    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, CHECKOUT, RecallCalls {
         covered: 3,
         oracle_only: 1,
     })
@@ -265,15 +265,8 @@ fn oracle_upgradeable_fraction_is_bounded_by_one() {
     h.write_verdict(e_low, &sha, None, "s", OracleResolutionKind::Upgrade);
     h.write_verdict(e_exact, &sha, None, "s", OracleResolutionKind::ResolvedExternal);
 
-    let m = super::oracle_eval_metrics(
-        &h.conn,
-        TOOL,
-        VERSION,
-        COMMIT,
-        WORKTREE,
-        RecallCalls::default(),
-    )
-    .unwrap();
+    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, CHECKOUT, RecallCalls::default())
+        .unwrap();
     // Old numerator (upgraded 1 + resolved_external 1 = 2) over denominator 1 would be 2.0.
     // Scoped numerator counts only the low-conf upgrade → 1/1 = 1.0.
     assert!(
@@ -292,15 +285,8 @@ fn oracle_upgradeable_fraction_is_bounded_by_one() {
 #[test]
 fn eval_metrics_are_vacuously_perfect_with_no_verdicts() {
     let h = Harness::new();
-    let m = super::oracle_eval_metrics(
-        &h.conn,
-        TOOL,
-        VERSION,
-        COMMIT,
-        WORKTREE,
-        RecallCalls::default(),
-    )
-    .unwrap();
+    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, CHECKOUT, RecallCalls::default())
+        .unwrap();
     assert_eq!(m.precision, 1.0);
     assert_eq!(m.recall, 1.0);
     assert_eq!(m.name_only_recovery_rate, 1.0);

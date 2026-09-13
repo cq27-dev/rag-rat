@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use rag_rat_base::checkout::CheckoutRef;
 use rusqlite::Connection;
 
 mod build;
@@ -884,8 +885,10 @@ impl IndexDatabase {
                             conn,
                             &row.path,
                             &disk_sha,
-                            &self.active_commit_sha,
-                            &self.active_worktree_id,
+                            CheckoutRef {
+                                commit_sha: &self.active_commit_sha,
+                                worktree_id: &self.active_worktree_id,
+                            },
                         )?,
                     );
                 }

@@ -100,8 +100,7 @@ fn resolution_report_assembles_before_after_from_index() {
     };
 
     let report =
-        super::resolution_report(&h.conn, &profile, &provenance, TOOL, COMMIT, WORKTREE, &run)
-            .unwrap();
+        super::resolution_report(&h.conn, &profile, &provenance, TOOL, CHECKOUT, &run).unwrap();
 
     // Before/after resolution.
     assert_eq!(report.resolution.total_edges, 7);

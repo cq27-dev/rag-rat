@@ -10,15 +10,15 @@ use super::*;
 fn oracle_status_reports_counts_and_last_run() {
     let h = Harness::new();
     // No verdicts, no runs yet → zeros and `None` last run.
-    let empty = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let empty = super::oracle_status(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(empty.total_verdicts, 0);
     assert_eq!(empty.last_run_status, None);
     assert_eq!(empty.last_run_commit_sha, None);
 
     // Two runs in THIS checkout; the later one wins for "last run". Both recorded under the active
     // `(COMMIT, WORKTREE)` so the worktree-scoped `last_run_meta` can see them (finding 3).
-    store::record_oracle_run(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, "Completed", "{}").unwrap();
-    store::record_oracle_run(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, "Blocked", "{}").unwrap();
+    store::record_oracle_run(&h.conn, TOOL, VERSION, CHECKOUT, "Completed", "{}").unwrap();
+    store::record_oracle_run(&h.conn, TOOL, VERSION, CHECKOUT, "Blocked", "{}").unwrap();
 
     let f = h.add_file("a.rs", "x\n");
     let sha = h.file_sha("a.rs");
@@ -27,7 +27,7 @@ fn oracle_status_reports_counts_and_last_run() {
     h.write_verdict(e1, &sha, None, "s", OracleResolutionKind::Upgrade);
     h.write_verdict(e2, &sha, None, "s", OracleResolutionKind::Contradict);
 
-    let status = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let status = super::oracle_status(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(status.tool, "rust-analyzer");
     assert_eq!(status.tool_version, VERSION);
     assert_eq!(status.total_verdicts, 2);

@@ -2,6 +2,7 @@
 //! seed resolution for personalization) and the load-bearing-callee enrichment of search/symbol/
 //! neighbor hits.
 
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_query::graph::GraphHop;
 use rag_rat_query::pagerank::{
     self, EdgeOracleEffect, ImportanceOptions, ImportantSymbolsResult, RankedImportance,
@@ -405,11 +406,10 @@ impl IndexDatabase {
         use rag_rat_oracle::OracleResolutionKind as Kind;
         // CPU gate: one scoped existence query, so the dominant "no oracle ever" path skips the
         // per-tool version lookups and the whole-graph verdict scan entirely.
-        if !rag_rat_oracle::any_run_in_scope(
-            self.storage.connection(),
-            &self.active_commit_sha,
-            &self.active_worktree_id,
-        )? {
+        if !rag_rat_oracle::any_run_in_scope(self.storage.connection(), CheckoutRef {
+            commit_sha: &self.active_commit_sha,
+            worktree_id: &self.active_worktree_id,
+        })? {
             return Ok(None);
         }
         let mut effects: Option<std::collections::HashMap<i64, EdgeOracleEffect>> = None;
@@ -427,8 +427,10 @@ impl IndexDatabase {
                 self.storage.connection(),
                 tool,
                 &version,
-                &self.active_commit_sha,
-                &self.active_worktree_id,
+                CheckoutRef {
+                    commit_sha: &self.active_commit_sha,
+                    worktree_id: &self.active_worktree_id,
+                },
             )?;
             let map = effects.get_or_insert_with(std::collections::HashMap::new);
             for (edge_id, (kind, resolved_symbol_id)) in verdicts {

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use ::protobuf::{EnumOrUnknown, Message};
 use ::scip::types::{Document, Index, Occurrence, PositionEncoding};
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::test_scratch::ScratchDir;
 use rag_rat_db::schema;
 use rusqlite::{Connection, params};
@@ -23,6 +24,9 @@ pub const VERSION: &str = "test";
 // masked the #82 P0 (the AND-of-both-non-empty predicate matched zero rows on every real repo).
 pub const COMMIT: &str = "deadbeefcafef00d";
 pub const WORKTREE: &str = "";
+/// [`COMMIT`] and [`WORKTREE`] as one key: the checkout every harness row is seeded into.
+pub const CHECKOUT: CheckoutRef<'static> =
+    CheckoutRef { commit_sha: COMMIT, worktree_id: WORKTREE };
 
 /// The content-key fields of a live edge, owned so an [`EdgeOracleRow`] borrowing them outlives the
 /// borrow (#248: verdicts are content-keyed, not rowid-keyed).
@@ -400,7 +404,7 @@ impl Harness {
     /// Persisted `edge_oracle` verdict count in the harness's active scope (all kinds) — wraps
     /// the internal scoped counter so dependent-crate tests don't need `store::` visibility.
     pub fn verdict_count(&self) -> u64 {
-        store::count_edge_oracle_scoped(&self.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap()
+        store::count_edge_oracle_scoped(&self.conn, TOOL, VERSION, CHECKOUT, None).unwrap()
     }
 }
 

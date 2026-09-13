@@ -115,7 +115,7 @@ fn deleting_an_edge_leaves_a_dangling_verdict_that_does_not_resolve() {
     h.write_verdict(edge, &file_sha, None, "s", OracleResolutionKind::Upgrade);
     assert!(h.verdict(edge).is_some(), "verdict resolves before delete");
     assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(),
         1,
         "the live verdict is counted before delete"
     );
@@ -124,7 +124,7 @@ fn deleting_an_edge_leaves_a_dangling_verdict_that_does_not_resolve() {
 
     assert!(h.verdict(edge).is_none(), "no live edge → the verdict no longer resolves");
     assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(),
         0,
         "the dangling verdict is excluded from the scoped count (live-edge join)"
     );

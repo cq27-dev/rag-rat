@@ -1,3 +1,5 @@
+use rag_rat_base::checkout::CheckoutRef;
+
 use super::*;
 
 /// Seed one edge with a written verdict and return `(harness, edge_id, file_sha)`. The verdict's
@@ -43,7 +45,7 @@ fn seed_verdict_full(
 fn current_verdict_is_surfaced_for_edge() {
     let (h, edge, _sha) = seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", true);
     let verdicts =
-        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, CHECKOUT, &[edge])
             .unwrap();
     let verdict = verdicts.get(&edge).expect("current verdict surfaced");
     assert_eq!(verdict.kind, OracleResolutionKind::Upgrade);
@@ -59,7 +61,7 @@ fn drifted_file_verdict_is_not_surfaced() {
     // `edge_oracle.file_sha`, so the current-content predicate filters the verdict out.
     h.conn.execute("UPDATE files SET sha256 = 'drifted-sha' WHERE path = 'a.rs'", []).unwrap();
     let verdicts =
-        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, CHECKOUT, &[edge])
             .unwrap();
     assert!(verdicts.is_empty(), "a drifted file's verdict must not surface as Compiler");
 }
@@ -71,7 +73,7 @@ fn drifted_file_verdict_is_not_surfaced() {
 fn current_oracle_verdicts_all_returns_scoped_current() {
     let (h, edge, _sha, resolved) =
         seed_verdict_full(OracleResolutionKind::Upgrade, "scip x `target`().", true);
-    let all = store::current_oracle_verdicts_all(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let all = store::current_oracle_verdicts_all(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(
         all.get(&edge),
         Some(&(OracleResolutionKind::Upgrade, resolved)),
@@ -81,8 +83,7 @@ fn current_oracle_verdicts_all_returns_scoped_current() {
     // Drift the callsite file: the currency gate must drop the verdict from the whole-graph scan
     // too, exactly as it does for the per-edge read.
     h.conn.execute("UPDATE files SET sha256 = 'drifted-sha' WHERE path = 'a.rs'", []).unwrap();
-    let after =
-        store::current_oracle_verdicts_all(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let after = store::current_oracle_verdicts_all(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert!(after.is_empty(), "a drifted file's verdict must not surface in the whole-graph scan");
 }
 
@@ -97,15 +98,14 @@ fn resolved_def_drift_verdict_is_not_surfaced() {
     let resolved = resolved.expect("in-corpus verdict has a resolved symbol id");
     // Sanity: while the resolved def symbol exists, the verdict surfaces.
     let before =
-        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, CHECKOUT, &[edge])
             .unwrap();
     assert!(before.contains_key(&edge), "current in-corpus verdict surfaces before def drift");
     // The def file was reindexed: AUTOINCREMENT mints new ids, so the old resolved symbol id is
     // gone. Model that by deleting the resolved symbol row.
     h.conn.execute("DELETE FROM symbols WHERE id = ?1", params![resolved]).unwrap();
-    let after =
-        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
-            .unwrap();
+    let after = store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, CHECKOUT, &[edge])
+        .unwrap();
     assert!(after.is_empty(), "a verdict whose resolved definition drifted must not surface");
 }
 
@@ -141,11 +141,14 @@ fn overlay_shadowed_def_verdict_is_not_surfaced() {
     );
 
     // Sanity: with no overlay, the committed def is in scope → the verdict surfaces.
-    let before =
-        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, active_wt, &[
-            edge,
-        ])
-        .unwrap();
+    let before = store::current_oracle_verdicts_for_edges(
+        &h.conn,
+        TOOL,
+        VERSION,
+        CheckoutRef { commit_sha: COMMIT, worktree_id: active_wt },
+        &[edge],
+    )
+    .unwrap();
     assert!(before.contains_key(&edge), "verdict surfaces before the def file goes dirty");
 
     // The def file goes dirty: a worktree-scoped overlay row for `defs.rs` is inserted; the
@@ -153,11 +156,14 @@ fn overlay_shadowed_def_verdict_is_not_surfaced() {
     // worktree id matches the overlay, so the committed def is now shadowed out of scope.
     h.add_file_in_scope("defs.rs", "", active_wt);
 
-    let after =
-        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, active_wt, &[
-            edge,
-        ])
-        .unwrap();
+    let after = store::current_oracle_verdicts_for_edges(
+        &h.conn,
+        TOOL,
+        VERSION,
+        CheckoutRef { commit_sha: COMMIT, worktree_id: active_wt },
+        &[edge],
+    )
+    .unwrap();
     assert!(
         after.is_empty(),
         "a verdict whose resolved def is shadowed by a dirty overlay must not keep surfacing"
@@ -178,8 +184,7 @@ fn out_of_scope_verdict_is_not_surfaced() {
         &h.conn,
         TOOL,
         VERSION,
-        "a-different-commit-sha",
-        WORKTREE,
+        CheckoutRef { commit_sha: "a-different-commit-sha", worktree_id: WORKTREE },
         &[edge],
     )
     .unwrap();
@@ -209,7 +214,7 @@ fn resolved_external_label_surfaces_package() {
         false,
     );
     let verdicts =
-        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, CHECKOUT, &[edge])
             .unwrap();
     let verdict = verdicts.get(&edge).expect("verdict surfaced");
     assert_eq!(verdict.resolved_external_label().as_deref(), Some("resolved-external(tokio)"));
@@ -238,8 +243,7 @@ fn comparisons_return_current_contradictions_only() {
         OracleResolutionKind::Contradict,
     );
 
-    let comparisons =
-        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let comparisons = store::current_oracle_comparisons(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(comparisons.len(), 1);
     let c = &comparisons[0];
     assert_eq!(c.kind, OracleResolutionKind::Contradict);
@@ -249,8 +253,7 @@ fn comparisons_return_current_contradictions_only() {
 
     // Drift the file → the comparison drops out (no stale contradiction surfaced).
     h.conn.execute("UPDATE files SET sha256 = 'drift' WHERE id = ?1", params![f]).unwrap();
-    let after =
-        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let after = store::current_oracle_comparisons(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert!(after.is_empty(), "a drifted file's contradiction must not surface");
 }
 
@@ -259,17 +262,25 @@ fn comparisons_return_current_contradictions_only() {
 #[test]
 fn latest_run_tool_version_tracks_active_checkout() {
     let h = Harness::new();
-    assert_eq!(store::latest_run_tool_version(&h.conn, TOOL, COMMIT, WORKTREE).unwrap(), None);
-    store::record_oracle_run(&h.conn, TOOL, "v1", COMMIT, WORKTREE, "Completed", "{}").unwrap();
-    store::record_oracle_run(&h.conn, TOOL, "v2", COMMIT, WORKTREE, "Completed", "{}").unwrap();
+    assert_eq!(store::latest_run_tool_version(&h.conn, TOOL, CHECKOUT).unwrap(), None);
+    store::record_oracle_run(&h.conn, TOOL, "v1", CHECKOUT, "Completed", "{}").unwrap();
+    store::record_oracle_run(&h.conn, TOOL, "v2", CHECKOUT, "Completed", "{}").unwrap();
     assert_eq!(
-        store::latest_run_tool_version(&h.conn, TOOL, COMMIT, WORKTREE).unwrap().as_deref(),
+        store::latest_run_tool_version(&h.conn, TOOL, CHECKOUT).unwrap().as_deref(),
         Some("v2")
     );
     // A sibling worktree's run does not leak in.
-    store::record_oracle_run(&h.conn, TOOL, "v3", COMMIT, "other", "Completed", "{}").unwrap();
+    store::record_oracle_run(
+        &h.conn,
+        TOOL,
+        "v3",
+        CheckoutRef { commit_sha: COMMIT, worktree_id: "other" },
+        "Completed",
+        "{}",
+    )
+    .unwrap();
     assert_eq!(
-        store::latest_run_tool_version(&h.conn, TOOL, COMMIT, WORKTREE).unwrap().as_deref(),
+        store::latest_run_tool_version(&h.conn, TOOL, CHECKOUT).unwrap().as_deref(),
         Some("v2")
     );
 }
@@ -280,13 +291,34 @@ fn latest_run_tool_version_tracks_active_checkout() {
 #[test]
 fn prune_oracle_runs_drops_dead_contexts_only() {
     let h = Harness::new();
-    store::record_oracle_run(&h.conn, TOOL, "v1", "live-commit", "live-wt", "Completed", "{}")
-        .unwrap();
-    store::record_oracle_run(&h.conn, TOOL, "v1", "dead-commit", "dead-wt", "Completed", "{}")
-        .unwrap();
+    store::record_oracle_run(
+        &h.conn,
+        TOOL,
+        "v1",
+        CheckoutRef { commit_sha: "live-commit", worktree_id: "live-wt" },
+        "Completed",
+        "{}",
+    )
+    .unwrap();
+    store::record_oracle_run(
+        &h.conn,
+        TOOL,
+        "v1",
+        CheckoutRef { commit_sha: "dead-commit", worktree_id: "dead-wt" },
+        "Completed",
+        "{}",
+    )
+    .unwrap();
     // A run whose commit is dead but whose worktree overlay is live survives (OR rule).
-    store::record_oracle_run(&h.conn, TOOL, "v1", "dead-commit", "live-wt", "Completed", "{}")
-        .unwrap();
+    store::record_oracle_run(
+        &h.conn,
+        TOOL,
+        "v1",
+        CheckoutRef { commit_sha: "dead-commit", worktree_id: "live-wt" },
+        "Completed",
+        "{}",
+    )
+    .unwrap();
 
     let live_commits = vec!["live-commit".to_string()];
     let live_worktrees = vec!["live-wt".to_string()];

@@ -1,3 +1,5 @@
+use rag_rat_base::checkout::CheckoutRef;
+
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -41,19 +43,16 @@ fn clear_edge_oracle_for_tool_scopes_by_checkout_content() {
     };
     assert_eq!(total_rows(), 2);
     // The scoped count sees ONLY the active checkout's verdict.
-    assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
-        1
-    );
+    assert_eq!(store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(), 1);
 
     // Clear the ACTIVE checkout's scope only.
-    store::clear_edge_oracle_for_tool(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    store::clear_edge_oracle_for_tool(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
 
     assert!(h.verdict(active_edge).is_none(), "active checkout's verdict cleared");
     assert!(h.verdict(other_edge).is_some(), "the other worktree's verdict is untouched");
     assert_eq!(total_rows(), 1, "only the other worktree's verdict remains in the table");
     assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(),
         0,
         "active checkout's scoped count is now zero"
     );
@@ -71,10 +70,7 @@ fn edge_oracle_reads_and_clears_are_scoped_to_the_active_repo() {
     let active_sha = h.file_sha("a.rs");
     let active_edge = h.add_edge(active_file, "target", 14, 20, "NameOnly", None);
     h.write_verdict(active_edge, &active_sha, None, "s", OracleResolutionKind::Upgrade);
-    assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
-        1
-    );
+    assert_eq!(store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(), 1);
 
     // Copy the active verdict under a SIBLING repo_id: SAME content key, so it joins the SAME live
     // edge — an UNSCOPED read would double-count it and an unscoped clear would delete it.
@@ -95,13 +91,13 @@ fn edge_oracle_reads_and_clears_are_scoped_to_the_active_repo() {
 
     // The scoped count still sees ONLY the active repo's verdict.
     assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(),
         1,
         "a sibling repo's content-colliding verdict must not inflate the active repo's count",
     );
 
     // The scoped clear removes ONLY the active repo's verdict; the sibling survives.
-    store::clear_edge_oracle_for_tool(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    store::clear_edge_oracle_for_tool(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     let remaining: i64 =
         h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
     assert_eq!(remaining, 1, "the sibling repo's verdict survives the active repo's clear");
@@ -127,7 +123,7 @@ fn oracle_status_header_and_counts_describe_the_active_repo_not_a_sibling() {
     let sha = h.file_sha("a.rs");
     let edge = h.add_edge(f, "target", 14, 20, "NameOnly", None);
     h.write_verdict(edge, &sha, None, "s", OracleResolutionKind::Upgrade);
-    store::record_oracle_run(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, "complete", "{}").unwrap();
+    store::record_oracle_run(&h.conn, TOOL, VERSION, CHECKOUT, "complete", "{}").unwrap();
 
     // A sibling repo's NEWER run (higher id — wins an unscoped ORDER BY id DESC) at the SAME
     // (tool, version, commit, worktree), plus a content-colliding sibling verdict.
@@ -152,7 +148,7 @@ fn oracle_status_header_and_counts_describe_the_active_repo_not_a_sibling() {
         )
         .unwrap();
 
-    let status = super::status::status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let status = super::status::status(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(
         status.last_run_status.as_deref(),
         Some("complete"),
@@ -189,12 +185,12 @@ fn edge_oracle_survives_reindex_for_unchanged_file() {
 
     // Sanity before reindex: counted + surfaced in compare.
     assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(),
         1,
         "verdict counted before reindex"
     );
     assert_eq!(
-        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap().len(),
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, CHECKOUT).unwrap().len(),
         1
     );
     let physical_before: i64 =
@@ -215,12 +211,11 @@ fn edge_oracle_survives_reindex_for_unchanged_file() {
     // And it RE-ANCHORS to the new edge by content key: still counted, still in compare, now keyed
     // on the NEW edge id.
     assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(),
         1,
         "verdict still counted after reindex (re-anchored by content)"
     );
-    let comparisons =
-        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let comparisons = store::current_oracle_comparisons(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(comparisons.len(), 1, "verdict re-surfaces in compare after reindex");
     assert_eq!(
         comparisons[0].edge_id, edge_v2,
@@ -244,7 +239,7 @@ fn edge_oracle_stale_after_file_change_not_counted() {
     let edge = h.add_edge(f, "target", 14, 20, "Exact", None);
     h.write_verdict(edge, &sha, None, "scip x `target`().", OracleResolutionKind::Confirm);
     assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(),
         1,
         "current verdict counted"
     );
@@ -253,14 +248,12 @@ fn edge_oracle_stale_after_file_change_not_counted() {
     h.conn.execute("UPDATE files SET sha256 = 'changed-sha' WHERE id = ?1", params![f]).unwrap();
 
     assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(),
         0,
         "a changed file's verdict is stale → not counted (file_sha mismatch)"
     );
     assert!(
-        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE)
-            .unwrap()
-            .is_empty(),
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, CHECKOUT).unwrap().is_empty(),
         "a stale verdict does not surface in compare either"
     );
 }
@@ -310,12 +303,11 @@ fn oracle_run_then_reindex_then_compare_graph_to_scip_nonempty() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(report.rows_written, 1, "the run wrote one verdict");
 
     // Compare surface is non-empty before reindex (sanity).
-    let before =
-        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let before = store::current_oracle_comparisons(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(before.len(), 1, "the contradiction surfaces in compare before reindex");
     assert_eq!(before[0].edge_id, edge_v1);
     assert_eq!(before[0].kind, OracleResolutionKind::Contradict);
@@ -328,8 +320,7 @@ fn oracle_run_then_reindex_then_compare_graph_to_scip_nonempty() {
     assert_ne!(edge_v2, edge_v1, "reindex minted a new edge rowid");
 
     // THE REGRESSION ASSERTION: compare surface is STILL non-empty, re-anchored to the new edge id.
-    let after =
-        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let after = store::current_oracle_comparisons(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(after.len(), 1, "compare surface survives reindex (re-anchored by content key)");
     assert_eq!(
         after[0].edge_id, edge_v2,
@@ -452,7 +443,7 @@ fn status_eval_counts_unaffected_by_dangling() {
         OracleResolutionKind::Confirm,
     );
 
-    let status0 = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let status0 = super::oracle_status(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(status0.total_verdicts, 2, "both verdicts counted before any change");
     assert_eq!(status0.confirmed, 2);
 
@@ -465,7 +456,7 @@ fn status_eval_counts_unaffected_by_dangling() {
         .execute("UPDATE files SET sha256 = 'churn-changed' WHERE id = ?1", params![churn])
         .unwrap();
 
-    let status1 = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let status1 = super::oracle_status(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(
         status1.total_verdicts, 1,
         "only the live + current (unchanged-file) verdict counts; the changed file's is stale",
@@ -473,7 +464,7 @@ fn status_eval_counts_unaffected_by_dangling() {
     assert_eq!(status1.confirmed, 1);
 
     // Eval metrics use the SAME scoped counts — the stale verdict does not inflate them either.
-    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, RecallCalls {
+    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, CHECKOUT, RecallCalls {
         covered: 1,
         oracle_only: 0,
     })
@@ -498,15 +489,8 @@ fn upgradeable_fraction_denominator_is_scoped_to_active_checkout() {
     let other = h.add_file_in_scope("a.rs", OTHER_COMMIT, OTHER_WORKTREE);
     let _ = h.add_edge(other, "v", 0, 1, "NameOnly", None);
 
-    let m = super::oracle_eval_metrics(
-        &h.conn,
-        TOOL,
-        VERSION,
-        COMMIT,
-        WORKTREE,
-        RecallCalls::default(),
-    )
-    .unwrap();
+    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, CHECKOUT, RecallCalls::default())
+        .unwrap();
     assert!(
         (m.oracle_upgradeable_fraction - 1.0).abs() < 1e-9,
         "scoped fraction is 1/1, not diluted to 1/2 by the other worktree; got {}",
@@ -560,7 +544,7 @@ fn recall_gap_excludes_definitions_in_unindexed_files() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None)
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None)
             .unwrap()
             .oracle_only_calls
     };
@@ -619,7 +603,7 @@ fn recall_gap_excludes_occurrences_in_unindexed_source_files() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None)
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None)
             .unwrap()
             .oracle_only_calls
     };
@@ -663,7 +647,7 @@ fn verdict_counts_and_metrics_ignore_sibling_checkout_rows() {
     // A's metrics: precision = 1 confirm / (1 confirm + 1 contradict) = 0.5; recall over A's
     // covered call set (2 covered call occurrences) and 0 oracle-only = 2/2 = 1.0. The recall
     // counts come from the run; B's three verdict rows never enter A's precision either.
-    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, RecallCalls {
+    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, CHECKOUT, RecallCalls {
         covered: 2,
         oracle_only: 0,
     })
@@ -679,15 +663,18 @@ fn verdict_counts_and_metrics_ignore_sibling_checkout_rows() {
     assert!((m.recall - 1.0).abs() < 1e-9, "recall is A's covered set only; got {}", m.recall);
 
     // The status read shares the same scoped `verdict_counts`, so it is scoped identically.
-    let status = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let status = super::oracle_status(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(status.total_verdicts, 2, "status counts only A's two verdicts");
     assert_eq!(status.confirmed, 1);
     assert_eq!(status.contradicted, 1);
     assert_eq!(status.upgraded, 0);
 
     // Sanity: checkout B's own scoped status sees its three rows, proving the rows really exist.
-    let status_b =
-        super::oracle_status(&h.conn, TOOL, VERSION, OTHER_COMMIT, OTHER_WORKTREE).unwrap();
+    let status_b = super::oracle_status(&h.conn, TOOL, VERSION, CheckoutRef {
+        commit_sha: OTHER_COMMIT,
+        worktree_id: OTHER_WORKTREE,
+    })
+    .unwrap();
     assert_eq!(status_b.total_verdicts, 3);
     assert_eq!(status_b.confirmed, 2);
     assert_eq!(status_b.upgraded, 1);
@@ -714,7 +701,7 @@ fn exact_in_corpus_edge_contradicted_by_external_scip_resolution() {
     ]);
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     let (kind, resolved, scip) = h.verdict(edge).expect("verdict written");
     assert_eq!(
@@ -730,15 +717,8 @@ fn exact_in_corpus_edge_contradicted_by_external_scip_resolution() {
     assert_eq!(h.heuristic_resolution(edge), ("exact".to_string(), Some(in_corpus)));
 
     // Precision counts it honestly: 0 confirmed / (0 + 1 contradicted) = 0.0.
-    let m = super::oracle_eval_metrics(
-        &h.conn,
-        TOOL,
-        VERSION,
-        COMMIT,
-        WORKTREE,
-        RecallCalls::default(),
-    )
-    .unwrap();
+    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, CHECKOUT, RecallCalls::default())
+        .unwrap();
     assert!(
         (m.precision - 0.0).abs() < 1e-9,
         "contradiction lowers precision; got {}",
@@ -763,7 +743,7 @@ fn name_only_edge_with_external_scip_stays_resolved_external() {
     ]);
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     let (kind, _, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
@@ -812,7 +792,7 @@ fn scip_definition_outside_indexed_corpus_resolves_external() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
     assert_eq!(resolved, None, "def maps to no indexed symbol → external");
@@ -836,7 +816,7 @@ fn reference_without_definition_or_package_yields_no_verdict() {
     ]);
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert!(h.verdict(edge).is_none(), "no definition + no package → no verdict");
     assert_eq!(report.rows_written, 0);
     assert_eq!(report.no_occurrence, 1, "dropped into the no-actionable bucket");
@@ -879,7 +859,7 @@ fn recall_gap_excludes_field_const_term_reads() {
             ..Default::default()
         };
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None)
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None)
             .unwrap()
             .oracle_only_calls
     };
@@ -934,7 +914,7 @@ fn covered_side_ignores_references_type_confirmation() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     // BOTH edges got verdicts (both carry callee ranges and join)…
     assert!(h.verdict(call_edge).is_some(), "call edge verdicted");
     assert!(h.verdict(type_edge).is_some(), "type-ref edge verdicted");
@@ -945,7 +925,7 @@ fn covered_side_ignores_references_type_confirmation() {
     );
     assert_eq!(report.oracle_only_calls, 0, "both call-like occurrences were covered");
 
-    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, RecallCalls {
+    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, CHECKOUT, RecallCalls {
         covered: report.covered_calls,
         oracle_only: report.oracle_only_calls,
     })
@@ -1005,7 +985,7 @@ fn covered_side_requires_a_callable_scip_symbol() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     // Both edges still get verdicts (both join + resolve in-corpus)…
     assert!(h.verdict(call_edge).is_some(), "call edge verdicted");
     assert!(h.verdict(ctor_edge).is_some(), "constructor edge verdicted");
@@ -1066,8 +1046,7 @@ fn drifted_file_sha_is_skipped_not_verdicted() {
         let _ = target_sym;
         let bytes = index.write_to_bytes().unwrap();
         let report =
-            run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None)
-                .unwrap();
+            run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
         (h.verdict(edge), report.skipped_drifted, report.rows_written)
     };
 
@@ -1165,18 +1144,9 @@ fn stale_production_snapshot_is_skipped_not_verdicted() {
             },
         }
 
-        let report = run_oracle(
-            &h.conn,
-            TOOL,
-            VERSION,
-            COMMIT,
-            WORKTREE,
-            &bytes,
-            h.root(),
-            Some(&production),
-            None,
-        )
-        .unwrap();
+        let report =
+            run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), Some(&production), None)
+                .unwrap();
         (h.verdict(edge), report.skipped_drifted, report.rows_written)
     };
 
@@ -1220,17 +1190,24 @@ fn last_run_meta_is_scoped_to_active_worktree() {
     // THIS checkout's last. `oracle_runs.worktree_id` scoping is orthogonal to the file-predicate
     // fix, so this uses a non-empty sibling worktree id directly rather than the file-level
     // `OTHER_*` constants.
-    store::record_oracle_run(&h.conn, TOOL, VERSION, COMMIT, "sibling-wt", "Completed", "{}")
-        .unwrap();
+    store::record_oracle_run(
+        &h.conn,
+        TOOL,
+        VERSION,
+        CheckoutRef { commit_sha: COMMIT, worktree_id: "sibling-wt" },
+        "Completed",
+        "{}",
+    )
+    .unwrap();
 
     // This checkout has no run yet → no last run, despite the sibling's row existing.
-    let status = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    let status = super::oracle_status(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(status.last_run_status, None, "the sibling worktree's run is not ours");
     assert_eq!(status.last_run_commit_sha, None);
 
     // Record a run in THIS checkout → now it's the last run.
-    store::record_oracle_run(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, "Blocked", "{}").unwrap();
-    let status = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    store::record_oracle_run(&h.conn, TOOL, VERSION, CHECKOUT, "Blocked", "{}").unwrap();
+    let status = super::oracle_status(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
     assert_eq!(status.last_run_status.as_deref(), Some("Blocked"));
 }
 
@@ -1281,7 +1258,7 @@ fn deleted_file_occurrences_do_not_inflate_gap() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None)
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None)
             .unwrap()
             .oracle_only_calls
     };
@@ -1339,15 +1316,8 @@ fn name_only_recovery_rate_excludes_exact_upgrades() {
     h.write_verdict(e_low, &sha, None, "s", OracleResolutionKind::Upgrade);
     h.write_verdict(e_exact, &sha, None, "s", OracleResolutionKind::Upgrade);
 
-    let m = super::oracle_eval_metrics(
-        &h.conn,
-        TOOL,
-        VERSION,
-        COMMIT,
-        WORKTREE,
-        RecallCalls::default(),
-    )
-    .unwrap();
+    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, CHECKOUT, RecallCalls::default())
+        .unwrap();
     // Raw count still reports both upgrade rows for transparency…
     assert_eq!(m.upgraded, 2);
     // …but the rate is scoped to the low-confidence population: 1 low-conf upgrade / 1 low-conf
@@ -1424,7 +1394,7 @@ fn a_batch_clear_cannot_erase_a_sibling_whose_currency_is_another_version() {
     assert_eq!(versions(), vec!["old-version".to_string(), VERSION.to_string()]);
 
     // The active checkout clears authoritatively for the version it is establishing.
-    store::clear_edge_oracle_for_tool(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    store::clear_edge_oracle_for_tool(&h.conn, TOOL, VERSION, CHECKOUT).unwrap();
 
     assert_eq!(
         versions(),

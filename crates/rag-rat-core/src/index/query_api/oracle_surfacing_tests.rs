@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use ::protobuf::{EnumOrUnknown, Message};
 use ::scip::types::{Document, Index, Occurrence, PositionEncoding, SymbolRole};
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::config::ResolvedTarget;
 use rag_rat_oracle::OracleTool;
 
@@ -873,8 +874,7 @@ fn gc_prunes_oracle_runs_for_dead_contexts() {
         db.storage.connection(),
         OracleTool::RustAnalyzer,
         "v-test",
-        &db.active_commit_sha,
-        &db.active_worktree_id,
+        CheckoutRef { commit_sha: &db.active_commit_sha, worktree_id: &db.active_worktree_id },
         &Index::default().write_to_bytes().unwrap(),
         &root,
         None,

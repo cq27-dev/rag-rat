@@ -6,7 +6,7 @@
 
 use rag_rat_oracle::run_oracle;
 use rag_rat_oracle::test_support::{
-    COMMIT, Harness, TARGET_MONIKER, TOOL, VERSION, WORKTREE, move_target_with_edit, occurrence,
+    CHECKOUT, Harness, TARGET_MONIKER, TOOL, VERSION, move_target_with_edit, occurrence,
     scip_bytes_docs,
 };
 use rag_rat_query::memory::{
@@ -334,7 +334,7 @@ fn moniker_binding_validation_statuses() {
         TARGET_MONIKER,
         SymbolRole::Definition as i32,
     )])]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     let memory_id = create_target_memory(&h, sym);
 
     let moniker_status = |h: &Harness| -> String {
@@ -412,7 +412,7 @@ fn moniker_for_symbol_with_member_defs_is_the_symbols_own() {
         occurrence(0, 7, 13, struct_moniker, SymbolRole::Definition as i32),
     ])]);
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     assert_eq!(report.monikers_written, 1, "one row per logical symbol, not per def");
     let (moniker, ..) = h.moniker(3003).expect("moniker row written");
@@ -439,7 +439,7 @@ fn synthetic_file_definition_does_not_overwrite_a_symbols_moniker() {
         occurrence(0, 9, 14, greet_moniker, SymbolRole::Definition as i32),
     ])]);
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     assert_eq!(report.monikers_written, 1, "the namespace symbol must not add a second row");
     let (moniker, ..) = h.moniker(4004).expect("moniker row written");
@@ -465,7 +465,7 @@ fn moniker_string_drift_rebinds_via_live_logical_symbol_then_survives_move() {
         TARGET_MONIKER,
         SymbolRole::Definition as i32,
     )])]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     let memory_id = create_target_memory(&h, sym);
 
     // Crate version bump: same symbol, same location, NEW moniker string + tool version.
@@ -477,7 +477,7 @@ fn moniker_string_drift_rebinds_via_live_logical_symbol_then_survives_move() {
         bumped_moniker,
         SymbolRole::Definition as i32,
     )])]);
-    run_oracle(&h.conn, TOOL, "v-bumped", COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, "v-bumped", CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     validate_memories(&h.conn, None).unwrap();
     let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
@@ -501,7 +501,7 @@ fn moniker_string_drift_rebinds_via_live_logical_symbol_then_survives_move() {
         bumped_moniker,
         SymbolRole::Definition as i32,
     )])]);
-    run_oracle(&h.conn, TOOL, "v-bumped", COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, "v-bumped", CHECKOUT, &bytes, h.root(), None, None).unwrap();
     validate_memories(&h.conn, None).unwrap();
     let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
     let symbol_binding =
@@ -529,7 +529,7 @@ fn string_resolution_preserves_bind_time_tool_version() {
         TARGET_MONIKER,
         SymbolRole::Definition as i32,
     )])]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     let memory_id = create_target_memory(&h, sym);
 
     // Move with the SAME moniker string but a NEWER tool version: the stored logical id is dead,
@@ -542,7 +542,7 @@ fn string_resolution_preserves_bind_time_tool_version() {
         TARGET_MONIKER,
         SymbolRole::Definition as i32,
     )])]);
-    run_oracle(&h.conn, TOOL, "v-newer", COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, "v-newer", CHECKOUT, &bytes, h.root(), None, None).unwrap();
     validate_memories(&h.conn, None).unwrap();
 
     let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
@@ -653,7 +653,7 @@ fn oracle_outputs_survive_full_and_incremental_reindex() {
         ("defs.rs", vec![occurrence(0, 3, 9, TARGET_MONIKER, SymbolRole::Definition as i32)]),
     ]);
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(report.rows_written, 1, "the run wrote a verdict");
     assert_eq!(report.monikers_written, 1, "the run wrote a moniker");
 
@@ -748,7 +748,7 @@ fn memory_survives_file_move_via_moniker_relocation() {
         TARGET_MONIKER,
         SymbolRole::Definition as i32,
     )])]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     let memory_id = create_target_memory(&h, sym);
 
@@ -761,7 +761,7 @@ fn memory_survives_file_move_via_moniker_relocation() {
         TARGET_MONIKER,
         SymbolRole::Definition as i32,
     )])]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     let report = validate_memories(&h.conn, None).unwrap();
     assert!(report.relocated >= 1, "expected a relocation, got {report:?}");
@@ -795,7 +795,7 @@ fn a_moniker_relocation_answers_a_retarget_mark() {
         TARGET_MONIKER,
         SymbolRole::Definition as i32,
     )])]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     let memory_id = create_target_memory(&h, sym);
     move_target_with_edit(&h, defs, "function");
     let bytes = scip_bytes_docs(vec![("moved.rs", vec![occurrence(
@@ -805,7 +805,7 @@ fn a_moniker_relocation_answers_a_retarget_mark() {
         TARGET_MONIKER,
         SymbolRole::Definition as i32,
     )])]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     h.conn
         .execute(
             "UPDATE repo_memory_bindings SET relocation_reason = ?2
@@ -840,7 +840,7 @@ fn cross_version_moniker_match_requires_kind_corroboration() {
             TARGET_MONIKER,
             SymbolRole::Definition as i32,
         )])]);
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
         let memory_id = create_target_memory(&h, sym);
 
         move_target_with_edit(&h, defs, new_kind);
@@ -852,8 +852,7 @@ fn cross_version_moniker_match_requires_kind_corroboration() {
             TARGET_MONIKER,
             SymbolRole::Definition as i32,
         )])]);
-        run_oracle(&h.conn, TOOL, "v-newer", COMMIT, WORKTREE, &bytes, h.root(), None, None)
-            .unwrap();
+        run_oracle(&h.conn, TOOL, "v-newer", CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
         validate_memories(&h.conn, None).unwrap();
         if expect_status == "gone" {

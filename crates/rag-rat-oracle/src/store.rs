@@ -8,6 +8,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::time::now_ms;
 use rusqlite::{Connection, params};
 
@@ -45,9 +46,9 @@ pub(crate) fn active_checkout_file_predicate(sha_param: &str, wt_param: &str) ->
 ///   upgrade/recovery denominator).
 pub(crate) fn resolution_before_counts(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<(u64, u64, u64)> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let scope = active_checkout_file_predicate("?1", "?2");
     let (total, resolved, unresolved): (i64, i64, i64) = conn.query_row(
         &format!(
@@ -278,7 +279,7 @@ pub fn callee_moniker_current_clause(
 /// EXACT bytes the caller's byte offsets were derived from: `edge_oracle` spans were computed
 /// against the content hashed into each row's `file_sha`, so filtering on it is what makes the
 /// span join sound (a drifted file simply matches nothing — the conservative no-collapse
-/// fallback). `commit_sha`/`worktree_id` scope the currency gate
+/// fallback). `checkout` scopes the currency gate
 /// ([`callee_moniker_current_clause`]): only call-HEAD rows the LATEST run of each tool in the
 /// active checkout stands behind, whose resolved definition still exists, are returned. Uses
 /// `idx_edge_oracle_anchor` (source_path prefix).
@@ -292,9 +293,9 @@ pub fn current_callee_monikers(
     conn: &Connection,
     source_path: &str,
     file_sha: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<HashMap<(usize, usize), String>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
     let current_clause = callee_moniker_current_clause(conn, "?3", "?4")?;
     let mut stmt = conn.prepare(&format!(
@@ -348,9 +349,9 @@ pub(crate) struct SymbolSpan {
 /// commit/worktree via the `files` row the edge points at.
 pub(crate) fn edge_join_candidates(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Vec<EdgeJoinCandidate>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let mut stmt = conn.prepare(&format!(
         "
         SELECT edges.id,
@@ -401,9 +402,9 @@ pub(crate) fn edge_join_candidates(
 pub(crate) fn indexed_file_sha_for_path(
     conn: &Connection,
     path: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Option<String>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     use rusqlite::OptionalExtension as _;
     conn.query_row(
         &format!(
@@ -442,15 +443,13 @@ pub(crate) fn live_covered_edges_for_path(
     tool_version: &str,
     source_path: &str,
     file_sha: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<std::collections::HashSet<LiveEdgeKey>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     // Shared content-key rows are NOT usable continuation coverage until this checkout has a run
     // establishing the same tool version as current. Without this gate, a sibling's rows can make
     // a fresh checkout skip every request while surfacing rejects them for missing currency.
-    if latest_run_tool_version(conn, tool, commit_sha, worktree_id)?.as_deref()
-        != Some(tool_version)
-    {
+    if latest_run_tool_version(conn, tool, checkout)?.as_deref() != Some(tool_version) {
         return Ok(std::collections::HashSet::new());
     }
     let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
@@ -511,9 +510,9 @@ pub(crate) fn migrate_live_verdicts_to_version(
     tool: OracleTool,
     from_version: &str,
     to_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<LiveVersionMigration> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let repo_clause = oracle_repo_scope_clause(conn, "old")?;
     let dest_repo_clause = oracle_repo_scope_clause(conn, "dest")?;
     let scope = active_checkout_file_predicate("?4", "?5");
@@ -646,14 +645,13 @@ pub(crate) fn migrate_live_verdicts_to_version(
 /// the prepare and wedge the backlog forever.
 pub(crate) fn edge_join_candidates_for_paths(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     paths: &[String],
 ) -> anyhow::Result<Vec<EdgeJoinCandidate>> {
     const PATH_CHUNK: usize = 500;
     let mut out = Vec::new();
     for chunk in paths.chunks(PATH_CHUNK) {
-        out.extend(edge_join_candidates_in_paths(conn, commit_sha, worktree_id, chunk)?);
+        out.extend(edge_join_candidates_in_paths(conn, checkout, chunk)?);
     }
     // Chunks concatenate in worklist order; the per-chunk ORDER BY keeps candidates grouped by
     // path, which is all the live pass's per-file grouping requires.
@@ -662,10 +660,10 @@ pub(crate) fn edge_join_candidates_for_paths(
 
 fn edge_join_candidates_in_paths(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     paths: &[String],
 ) -> anyhow::Result<Vec<EdgeJoinCandidate>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     if paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -844,9 +842,9 @@ pub(crate) fn verdict_content_is_current_anywhere(
 pub(crate) fn symbol_spans_for_path(
     conn: &Connection,
     path: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Vec<SymbolSpan>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let mut stmt = conn.prepare(&format!(
         "
         SELECT symbols.id, symbols.start_byte, symbols.end_byte
@@ -882,9 +880,9 @@ pub(crate) fn symbol_spans_for_path(
 /// must hold for a recall gap.
 pub(crate) fn indexed_paths_in_scope(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<std::collections::HashSet<String>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     // EXCLUDE tombstones: `mark_file_deleted` leaves a `kind='deleted'` row in `files` for a path
     // removed from the checkout (so incremental sync can detect the deletion). Its source is no
     // longer indexed, so an occurrence whose call site is that path can never be covered by an edge
@@ -909,9 +907,9 @@ pub(crate) fn indexed_paths_in_scope(
 /// are excluded for the same reason as [`indexed_paths_in_scope`].
 pub(crate) fn indexed_file_shas_in_scope(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let mut stmt = conn.prepare(&format!(
         "SELECT path, sha256 FROM files WHERE {scope} AND kind != 'deleted'",
         scope = active_checkout_file_predicate("?1", "?2"),
@@ -1019,9 +1017,9 @@ pub(crate) fn write_logical_symbol_moniker(
 pub(crate) fn clear_external_symbols_for_tool(
     conn: &Connection,
     tool: OracleTool,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<()> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let repo_clause = oracle_repo_scope_clause(conn, "external_symbols")?;
     conn.execute(
         &format!(
@@ -1054,10 +1052,10 @@ pub(crate) fn write_external_symbol(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     row: &ExternalSymbolRow<'_>,
 ) -> anyhow::Result<()> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let repo_id = oracle_repo_scope(conn)?
         .ok_or_else(|| anyhow::anyhow!("external_symbols requires post-A5 repo scoping"))?;
     conn.execute(
@@ -1112,9 +1110,9 @@ pub(crate) fn clear_edge_oracle_for_tool(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<()> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     // CONTENT-JOIN scope (#248): with no `edge_id` FK there is no rowid to match — restrict the
     // DELETE to verdicts whose CONTENT key has a live edge in the active checkout, the same key the
     // read join uses. `edges_data` is queried directly (not the 7-LEFT-JOIN `edges` view) with ONE
@@ -1245,38 +1243,28 @@ pub(crate) fn record_oracle_run(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     status: &str,
     stats_json: &str,
 ) -> anyhow::Result<i64> {
-    record_oracle_run_at(
-        conn,
-        tool,
-        tool_version,
-        commit_sha,
-        worktree_id,
-        now_ms(),
-        status,
-        stats_json,
-    )
+    record_oracle_run_at(conn, tool, tool_version, checkout, now_ms(), status, stats_json)
 }
 
 /// Record an oracle run, returning its row id. `stats_json` is an opaque `OracleReport` snapshot.
-/// `worktree_id` scopes the run to the active checkout so the status read's `last_run_meta` can
-/// distinguish this checkout's run from a sibling worktree's run under the same
+/// `checkout.worktree_id` scopes the run to the active checkout so the status read's
+/// `last_run_meta` can distinguish this checkout's run from a sibling worktree's run under the same
 /// `(tool, tool_version, commit_sha)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_oracle_run_at(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     started_at_ms: i64,
     status: &str,
     stats_json: &str,
 ) -> anyhow::Result<i64> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     // `started_at_ms` is the moment the run actually BEGAN (the pre-spawn snapshot), passed in by
     // the caller — NOT `now_ms()` at completion. The auto-run staleness gate compares this
     // against the index's last-change clock; stamping completion time made a run that
@@ -1324,9 +1312,9 @@ pub(crate) fn record_oracle_run_at(
 pub(crate) fn latest_run_tool_version(
     conn: &Connection,
     tool: OracleTool,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Option<String>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let repo_clause = oracle_repo_scope_clause(conn, "oracle_runs")?;
     let version = conn
         .query_row(
@@ -1355,9 +1343,9 @@ pub(crate) fn latest_run_tool_version(
 pub(crate) fn latest_run_started_at(
     conn: &Connection,
     tool: OracleTool,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Option<i64>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let repo_clause = oracle_repo_scope_clause(conn, "oracle_runs")?;
     let started_at = conn
         .query_row(
@@ -1381,9 +1369,9 @@ pub(crate) fn latest_run_started_at(
 /// table is empty, so this returns instantly). Scoped to `(commit_sha, worktree_id)`.
 pub(crate) fn any_run_in_scope(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<bool> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let repo_clause = oracle_repo_scope_clause(conn, "oracle_runs")?;
     let exists = conn
         .query_row(
@@ -1469,10 +1457,10 @@ pub(crate) fn count_edge_oracle_scoped(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     kind: Option<OracleResolutionKind>,
 ) -> anyhow::Result<u64> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let scope_join = edge_oracle_scope_join(conn)?;
     // COUNT(DISTINCT edge_oracle.rowid), not COUNT(*): the scope join joins each `edge_oracle` row
     // to its LIVE edge by the content key. That key is measured 1:1 with a live edge (0
@@ -1643,10 +1631,10 @@ pub(crate) fn current_oracle_verdicts_for_edges(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     edge_ids: &[i64],
 ) -> anyhow::Result<std::collections::HashMap<i64, EdgeOracleVerdict>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let mut out = std::collections::HashMap::new();
     if edge_ids.is_empty() {
         return Ok(out);
@@ -1723,9 +1711,9 @@ pub(crate) fn current_oracle_verdicts_all(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<std::collections::HashMap<i64, (OracleResolutionKind, Option<i64>)>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     // Re-project the LIVE edge id (#248): keyed by `edges.id` (the reindexed rowid the content join
     // resolves to), which is the id the importance ranker's heuristic traversal carries.
     let sql = format!(
@@ -1787,9 +1775,9 @@ pub(crate) fn current_oracle_comparisons(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Vec<EdgeOracleComparison>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     // The heuristic target's qualified name is fetched via a correlated subquery rather than a
     // trailing LEFT JOIN, so the shared `edge_oracle_scope_join` string (which already ends in a
     // WHERE) stays the single source of the scope predicate — a JOIN can't legally follow a WHERE.

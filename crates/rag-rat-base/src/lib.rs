@@ -4,6 +4,7 @@
 //! SQLite, no domain logic — so every other crate can depend on it without cycles.
 
 pub mod canonical;
+pub mod checkout;
 pub mod config;
 pub mod data_dir;
 pub mod embedding_models;

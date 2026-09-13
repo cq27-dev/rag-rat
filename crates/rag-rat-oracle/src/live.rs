@@ -48,6 +48,7 @@ use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::time::Instant;
 
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::paths;
 use rusqlite::Connection;
@@ -377,8 +378,7 @@ impl LiveOracleSession {
 /// Inputs for one live oracle pass.
 pub struct LivePassInput<'a> {
     /// The active checkout the just-reindexed files (and their edge candidates) are scoped to.
-    pub commit_sha: &'a str,
-    pub worktree_id: &'a str,
+    pub checkout: CheckoutRef<'a>,
     /// What this pass may look at: the configured root each document path is joined onto, the
     /// enclosing checkout, and the corpus. Carried as one value rather than a bare root so a
     /// caller cannot hand the pass a root the scope was not resolved for.
@@ -529,12 +529,7 @@ pub fn live_oracle_pass(
         anyhow::bail!("live_oracle_pass requires a live (non-batch) tool");
     };
 
-    let candidates = store::edge_join_candidates_for_paths(
-        conn,
-        input.commit_sha,
-        input.worktree_id,
-        input.worklist,
-    )?;
+    let candidates = store::edge_join_candidates_for_paths(conn, input.checkout, input.worklist)?;
     let mut by_path: HashMap<&str, Vec<&store::EdgeJoinCandidate>> = HashMap::new();
     for candidate in &candidates {
         by_path.entry(candidate.source_path.as_str()).or_default().push(candidate);
@@ -597,8 +592,7 @@ pub fn live_oracle_pass(
             conn,
             tool,
             session.tool_version(),
-            input.commit_sha,
-            input.worktree_id,
+            input.checkout,
             input.started_at_ms,
             &report.status,
             &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
@@ -636,9 +630,7 @@ fn migrate_version_if_moved(
     input: &LivePassInput<'_>,
     tool: crate::OracleTool,
 ) -> anyhow::Result<VersionTransition> {
-    let Some(old_version) =
-        store::latest_run_tool_version(conn, tool, input.commit_sha, input.worktree_id)?
-    else {
+    let Some(old_version) = store::latest_run_tool_version(conn, tool, input.checkout)? else {
         return Ok(VersionTransition::Unchanged);
     };
     if old_version == session.tool_version() {
@@ -650,8 +642,7 @@ fn migrate_version_if_moved(
             tool,
             &old_version,
             session.tool_version(),
-            input.commit_sha,
-            input.worktree_id,
+            input.checkout,
         )? {
             store::LiveVersionMigration::Copied(moved) =>
                 VersionTransition::Migrated { moved_rows: moved > 0 },
@@ -763,8 +754,7 @@ fn resolve_one_file(
         session.tool_version(),
         path,
         &callees[0].file_sha,
-        input.commit_sha,
-        input.worktree_id,
+        input.checkout,
     )?;
     let is_covered = |c: &store::EdgeJoinCandidate| {
         covered.contains(&(
@@ -850,12 +840,7 @@ fn resolve_one_file(
         let indexed_sha = match def_indexed_sha.entry(def_path.clone()) {
             Entry::Occupied(entry) => entry.get().clone(),
             Entry::Vacant(entry) => entry
-                .insert(store::indexed_file_sha_for_path(
-                    conn,
-                    &def_path,
-                    input.commit_sha,
-                    input.worktree_id,
-                )?)
+                .insert(store::indexed_file_sha_for_path(conn, &def_path, input.checkout)?)
                 .clone(),
         };
         match indexed_sha {
@@ -881,12 +866,8 @@ fn resolve_one_file(
         };
         let spans = match def_spans.entry(def_path.clone()) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(store::symbol_spans_for_path(
-                conn,
-                &def_path,
-                input.commit_sha,
-                input.worktree_id,
-            )?),
+            Entry::Vacant(entry) =>
+                entry.insert(store::symbol_spans_for_path(conn, &def_path, input.checkout)?),
         };
         let Some(symbol_id) = join::map_definition_to_symbol(spans, def_start, def_end) else {
             // The def is in an indexed file but under no indexed symbol (macro-generated

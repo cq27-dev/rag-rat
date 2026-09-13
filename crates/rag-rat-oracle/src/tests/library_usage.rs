@@ -1,6 +1,8 @@
 //! `check_library_usage` (#114): the end-to-end read — run the oracle over a `.scip` that carries a
 //! `resolved-external` call site AND its `external_symbols` contract, then assert the join surfaces
 //! the current signature/docs and the deprecation verdict.
+use rag_rat_base::checkout::CheckoutRef;
+
 use super::*;
 use crate::{LibraryUsageOptions, LibraryUsageStatus, OracleResolutionKind, check_library_usage};
 
@@ -74,15 +76,14 @@ fn check_library_usage_surfaces_signature_and_asserts_deprecation() {
         "get(url: string): ResponsePromise",
     )]);
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(report.resolved_external, 1, "the call resolved external");
     assert_eq!(report.external_symbols_written, 1, "the contract persisted");
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
     assert_eq!(resolved, None);
 
-    let out =
-        check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions::default()).unwrap();
+    let out = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions::default()).unwrap();
     assert_eq!(out.status, LibraryUsageStatus::Ok);
     assert_eq!(out.total_external_call_sites, 1);
     assert_eq!(out.deprecated_call_sites, 1);
@@ -116,16 +117,16 @@ fn check_library_usage_filters_by_deprecation_and_package() {
         vec!["@deprecated".to_string()],
         "get(url: string): ResponsePromise",
     )]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
-    let deprecated_only = check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions {
+    let deprecated_only = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions {
         deprecated_only: true,
         ..Default::default()
     })
     .unwrap();
     assert_eq!(deprecated_only.entries.len(), 1, "deprecated contract kept");
 
-    let other_pkg = check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions {
+    let other_pkg = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions {
         package: Some("tokio".to_string()),
         ..Default::default()
     })
@@ -147,7 +148,7 @@ fn check_library_usage_is_isolated_across_checkouts() {
 
     let moniker = "scip-typescript npm ky 1.7.2 index.ts/get().";
     let bytes = scip_external_call(moniker, vec![external(moniker, "get", vec![], "get(): X")]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     // Checkout B (a DIFFERENT commit) runs the SAME tool with a DIFFERENT contract, and its
     // authoritative per-checkout clear runs against B's scope only.
@@ -157,8 +158,7 @@ fn check_library_usage_is_isolated_across_checkouts() {
         &h.conn,
         TOOL,
         VERSION,
-        OTHER_COMMIT,
-        OTHER_WORKTREE,
+        CheckoutRef { commit_sha: OTHER_COMMIT, worktree_id: OTHER_WORKTREE },
         &bytes_b,
         h.root(),
         None,
@@ -167,8 +167,7 @@ fn check_library_usage_is_isolated_across_checkouts() {
     .unwrap();
 
     // A's contract survived B's run (per-checkout scope), and A never sees B's contract.
-    let a =
-        check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions::default()).unwrap();
+    let a = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions::default()).unwrap();
     assert_eq!(a.entries.len(), 1, "A keeps exactly its own contract");
     assert_eq!(a.entries[0].moniker, moniker);
     let total: i64 =
@@ -194,12 +193,11 @@ fn check_library_usage_includes_external_contradictions() {
     let moniker = "scip-typescript npm ky 1.7.2 index.ts/get().";
     let bytes = scip_external_call(moniker, vec![external(moniker, "get", vec![], "get(): X")]);
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(report.contradicted, 1, "the mis-bound dependency call is a contradiction");
     assert_eq!(report.resolved_external, 0, "not recorded as resolved-external");
 
-    let out =
-        check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions::default()).unwrap();
+    let out = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions::default()).unwrap();
     assert_eq!(out.total_external_call_sites, 1, "the external contradiction is counted");
     assert_eq!(out.entries.len(), 1);
     assert_eq!(out.entries[0].moniker, moniker);
@@ -214,8 +212,7 @@ fn check_library_usage_reports_missing_oracle_and_missing_external_symbols() {
     h.add_file("caller.rs", "fn caller() {}\n");
 
     // No oracle run yet.
-    let no_run =
-        check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions::default()).unwrap();
+    let no_run = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions::default()).unwrap();
     assert_eq!(no_run.status, LibraryUsageStatus::NoOracleRun);
 
     // A run whose `.scip` carries NO external_symbols.
@@ -235,9 +232,8 @@ fn check_library_usage_reports_missing_oracle_and_missing_external_symbols() {
         .write_to_bytes()
         .unwrap()
     };
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
-    let no_ext =
-        check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions::default()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+    let no_ext = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions::default()).unwrap();
     assert_eq!(no_ext.status, LibraryUsageStatus::NoExternalSymbols);
 }
 
@@ -254,12 +250,11 @@ fn check_library_usage_no_contracts_still_reports_coverage_counts() {
     // contract.
     let bytes = scip_external_call(moniker, vec![]);
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(report.resolved_external, 1);
     assert_eq!(report.external_symbols_written, 0);
 
-    let out =
-        check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions::default()).unwrap();
+    let out = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions::default()).unwrap();
     assert_eq!(out.status, LibraryUsageStatus::NoExternalSymbols);
     assert_eq!(out.total_external_call_sites, 1, "the external call is still counted");
     assert_eq!(out.call_sites_without_signature_info, 1, "and reported as an uncovered gap");
@@ -284,9 +279,9 @@ fn check_library_usage_limit_is_a_hard_cap() {
     h.add_edge(caller, "fetch", 14, 19, "NameOnly", None);
     let moniker = "scip-typescript npm ky 1.7.2 index.ts/get().";
     let bytes = scip_external_call(moniker, vec![external(moniker, "get", vec![], "get(): X")]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
-    let zero = check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions {
+    let zero = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions {
         limit: 0,
         ..Default::default()
     })
@@ -315,8 +310,7 @@ fn prune_external_symbols_drops_dead_checkouts_only() {
         &h.conn,
         TOOL,
         "v1",
-        "live-commit",
-        "live-wt",
+        CheckoutRef { commit_sha: "live-commit", worktree_id: "live-wt" },
         &row("pkg a 1 m/l()."),
     )
     .unwrap();
@@ -324,8 +318,7 @@ fn prune_external_symbols_drops_dead_checkouts_only() {
         &h.conn,
         TOOL,
         "v1",
-        "dead-commit",
-        "dead-wt",
+        CheckoutRef { commit_sha: "dead-commit", worktree_id: "dead-wt" },
         &row("pkg a 1 m/d()."),
     )
     .unwrap();
@@ -334,8 +327,7 @@ fn prune_external_symbols_drops_dead_checkouts_only() {
         &h.conn,
         TOOL,
         "v1",
-        "dead-commit",
-        "live-wt",
+        CheckoutRef { commit_sha: "dead-commit", worktree_id: "live-wt" },
         &row("pkg a 1 m/o()."),
     )
     .unwrap();
@@ -365,11 +357,10 @@ fn check_library_usage_ignores_non_call_external_edges() {
     let moniker = "scip-typescript npm ky 1.7.2 index.ts/get().";
     let bytes = scip_external_call(moniker, vec![external(moniker, "get", vec![], "get(): X")]);
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(report.resolved_external, 1, "the oracle still resolves the type ref external");
 
-    let out =
-        check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions::default()).unwrap();
+    let out = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions::default()).unwrap();
     assert_eq!(out.total_external_call_sites, 0, "but a references_type edge is not a call site");
     assert!(out.entries.is_empty());
 }
@@ -385,10 +376,9 @@ fn check_library_usage_counts_constructor_calls() {
     h.add_edge_with_kind(caller, "fetch", 14, 19, "constructs", "NameOnly", None);
     let moniker = "scip-typescript npm ky 1.7.2 index.ts/Ky#constructor().";
     let bytes = scip_external_call(moniker, vec![external(moniker, "Ky", vec![], "constructor()")]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
-    let out =
-        check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions::default()).unwrap();
+    let out = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions::default()).unwrap();
     assert_eq!(out.total_external_call_sites, 1, "a constructor call counts as library usage");
     assert_eq!(out.entries.len(), 1);
     assert_eq!(out.entries[0].moniker, moniker);
@@ -407,11 +397,10 @@ fn check_library_usage_deduplicates_multi_kind_edges_at_one_call_site() {
     let moniker = "scip-typescript npm ky 1.7.2 index.ts/get().";
     let bytes = scip_external_call(moniker, vec![external(moniker, "get", vec![], "get()")]);
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(report.resolved_external, 2, "both edge kinds get a verdict");
 
-    let out =
-        check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions::default()).unwrap();
+    let out = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions::default()).unwrap();
     assert_eq!(
         out.total_external_call_sites, 1,
         "the two edge kinds at one span count as ONE call"
@@ -452,17 +441,17 @@ fn check_library_usage_path_filter_tolerates_trailing_slash() {
     }
     .write_to_bytes()
     .unwrap();
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     for filter in ["src", "src/"] {
-        let out = check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions {
+        let out = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions {
             path: Some(filter.to_string()),
             ..Default::default()
         })
         .unwrap();
         assert_eq!(out.total_external_call_sites, 1, "path {filter:?} matches src/caller.rs");
     }
-    let none = check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions {
+    let none = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions {
         path: Some("other".to_string()),
         ..Default::default()
     })
@@ -509,11 +498,10 @@ fn check_library_usage_caps_call_sites_per_entry() {
     .write_to_bytes()
     .unwrap();
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(report.resolved_external, n as u64, "all N calls resolved external");
 
-    let out =
-        check_library_usage(&h.conn, COMMIT, WORKTREE, &LibraryUsageOptions::default()).unwrap();
+    let out = check_library_usage(&h.conn, CHECKOUT, &LibraryUsageOptions::default()).unwrap();
     assert_eq!(out.entries.len(), 1);
     assert_eq!(out.entries[0].call_count, n, "call_count is the TRUE total");
     assert_eq!(

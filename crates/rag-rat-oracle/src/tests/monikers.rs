@@ -26,7 +26,7 @@ fn oracle_run_writes_monikers_for_in_corpus_defs() {
         )]),
     ]);
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     assert_eq!(report.monikers_written, 1, "only the in-corpus def writes a moniker");
     let (moniker, tool, tool_version) = h.moniker(1001).expect("moniker row written");
@@ -86,7 +86,7 @@ fn oracle_run_persists_external_symbols_and_reclears_them() {
         external(current, vec!["The supported entry point.".to_string()], "fn new_api()"),
     ]);
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert_eq!(report.external_symbols_written, 2, "both external contracts persisted");
 
     // The deprecated contract landed with the raw moniker, kind, signature, and the derived flag.
@@ -113,8 +113,7 @@ fn oracle_run_persists_external_symbols_and_reclears_them() {
     // Authoritative re-run: a `.scip` that drops `old_api` clears its stale contract.
     let bytes2 = scip_with(vec![external(current, vec![], "fn new_api()")]);
     let report2 =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes2, h.root(), None, None)
-            .unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes2, h.root(), None, None).unwrap();
     assert_eq!(report2.external_symbols_written, 1);
     let remaining: i64 =
         h.conn.query_row("SELECT COUNT(*) FROM external_symbols", [], |r| r.get(0)).unwrap();
@@ -147,11 +146,11 @@ fn oracle_rerun_clears_prior_monikers_for_tool() {
         TARGET_MONIKER,
         SymbolRole::Definition as i32,
     )])]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
     assert!(h.moniker(1001).is_some());
 
     // Second run: a `.scip` with no definitions at all.
     let empty = scip_bytes_docs(vec![("defs.rs", vec![])]);
-    run_oracle(&h.conn, TOOL, "v2", COMMIT, WORKTREE, &empty, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, "v2", CHECKOUT, &empty, h.root(), None, None).unwrap();
     assert!(h.moniker(1001).is_none(), "authoritative clear removed the stale moniker");
 }

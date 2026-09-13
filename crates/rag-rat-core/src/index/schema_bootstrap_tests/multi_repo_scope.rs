@@ -8,6 +8,8 @@
 //! and rows are seeded directly, and the connection is re-scoped by setting `active_repo_id` (a
 //! `pub` field) + `set_context` — the exact machinery A7 will drive per-repo.
 
+use rag_rat_base::checkout::CheckoutRef;
+
 use super::*;
 
 /// A shared DB holding repo A (really indexed) plus repo B (seeded rows at repo A's SAME commit).
@@ -2127,8 +2129,11 @@ fn current_callee_monikers_ignores_a_sibling_repos_rows() {
 
     a5_set_active_repo(&conn, A5_REPO_A);
     let monikers =
-        rag_rat_oracle::current_callee_monikers(&conn, "src/x.rs", "sha-x", "commit-x", "")
-            .unwrap();
+        rag_rat_oracle::current_callee_monikers(&conn, "src/x.rs", "sha-x", CheckoutRef {
+            commit_sha: "commit-x",
+            worktree_id: "",
+        })
+        .unwrap();
     assert_eq!(
         monikers,
         std::collections::HashMap::from([((5, 8), "rust cr 1.0 a().".to_string())]),

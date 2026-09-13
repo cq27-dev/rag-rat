@@ -57,12 +57,12 @@ pub use live::{
 // corpus fixtures; the rest of `lsp` stays private.
 pub use lsp::position::{LineIndex, LspEncoding, LspPosition};
 pub use manifest::{ToolAvailability, ToolManifest};
+use rag_rat_base::checkout::CheckoutRef;
 pub use report::{
     CorpusHealth, CorpusProfile, OracleResolutionReport, REPORT_SCHEMA_VERSION, ResolutionBefore,
     ResolutionDelta, RunProvenance,
 };
-use run::OracleRunInput;
-pub use run::{OracleEvalMetrics, RecallCalls};
+pub use run::{OracleEvalMetrics, OracleRunInput, RecallCalls};
 use rusqlite::Connection;
 use serde::Serialize;
 pub use status::OracleStatus;
@@ -78,69 +78,46 @@ pub use store::{
 ///
 /// `production_sha` is the per-document disk-hash snapshot captured when a TOOL produced this
 /// `.scip` (`None` for a pre-built `--scip`). When present it arms the scip-vs-disk content gate
-/// (#82 TOCTOU); see [`run::OracleRunInput::production_sha`].
+/// (#82 TOCTOU); see [`OracleRunInput::production_sha`].
 ///
 /// `pre_spawn_sha` is the indexed `(path -> files.sha256)` snapshot taken BEFORE the tool
 /// subprocess was spawned (`None` for a pre-built `--scip`). It arms the pre-spawn gate (#83),
 /// which covers the subprocess INTERIOR the post-exit `production_sha` cannot; see
-/// [`run::OracleRunInput::pre_spawn_sha`].
-// The args mirror `OracleRunInput`'s fields one-to-one (this is the public thin adapter to it), so
-// a params struct would only re-wrap what callers already pass positionally.
+/// [`OracleRunInput::pre_spawn_sha`].
 /// Run + record stamped at `now_ms()` — for callers without a controlled spawn moment (a pre-built
 /// `--scip`, tests). The tool-driven path uses [`run_oracle_at`] with the real start time (#145).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "positional convenience over OracleRunInput that stamps now_ms(); the struct form is \
+              run_oracle_at"
+)]
 pub fn run_oracle(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     scip_bytes: &[u8],
     checkout_root: &Path,
     production_sha: Option<&HashMap<String, String>>,
     pre_spawn_sha: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<OracleReport> {
-    run_oracle_at(
-        conn,
+    run_oracle_at(conn, &OracleRunInput {
         tool,
         tool_version,
-        commit_sha,
-        worktree_id,
+        checkout,
         scip_bytes,
         checkout_root,
         production_sha,
         pre_spawn_sha,
-        rag_rat_base::time::now_ms(),
-    )
+        started_at_ms: rag_rat_base::time::now_ms(),
+    })
 }
 
-/// As [`run_oracle`], but records `oracle_runs.started_at = started_at_ms` (the moment the run
-/// began, captured before the tool subprocess) instead of completion time, so the auto-run
+/// As [`run_oracle`], but records `oracle_runs.started_at = input.started_at_ms` (the moment the
+/// run began, captured before the tool subprocess) instead of completion time, so the auto-run
 /// staleness gate isn't wedged by a run that overlapped a watcher reindex (#145).
-#[allow(clippy::too_many_arguments)]
-pub fn run_oracle_at(
-    conn: &Connection,
-    tool: OracleTool,
-    tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
-    scip_bytes: &[u8],
-    checkout_root: &Path,
-    production_sha: Option<&HashMap<String, String>>,
-    pre_spawn_sha: Option<&HashMap<String, String>>,
-    started_at_ms: i64,
-) -> anyhow::Result<OracleReport> {
-    run::run(conn, &OracleRunInput {
-        tool,
-        tool_version,
-        commit_sha,
-        worktree_id,
-        scip_bytes,
-        checkout_root,
-        production_sha,
-        pre_spawn_sha,
-        started_at_ms,
-    })
+pub fn run_oracle_at(conn: &Connection, input: &OracleRunInput) -> anyhow::Result<OracleReport> {
+    run::run(conn, input)
 }
 
 /// Run the oracle for a corpus report PROVISIONALLY: execute the pass, assemble the typed report,
@@ -161,8 +138,7 @@ pub fn run_oracle_report(
     profile: &report::CorpusProfile,
     provenance: &report::RunProvenance,
     tool: OracleTool,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     scip_bytes: &[u8],
     checkout_root: &Path,
     production_sha: Option<&HashMap<String, String>>,
@@ -173,15 +149,14 @@ pub fn run_oracle_report(
     let run = run::run_in_tx(conn, &OracleRunInput {
         tool,
         tool_version: &provenance.tool_version,
-        commit_sha,
-        worktree_id,
+        checkout,
         scip_bytes,
         checkout_root,
         production_sha,
         pre_spawn_sha,
         started_at_ms,
     })?;
-    let report = resolution_report(conn, profile, provenance, tool, commit_sha, worktree_id, &run)?;
+    let report = resolution_report(conn, profile, provenance, tool, checkout, &run)?;
     let violations = check_corpus_health(profile, &report);
     if violations.is_empty() {
         tx.commit()?;
@@ -195,10 +170,9 @@ pub fn run_oracle_report(
 /// nothing), and read-only, so the CLI takes it before acquiring the index write lock.
 pub fn pre_spawn_snapshot(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<HashMap<String, String>> {
-    store::indexed_file_shas_in_scope(conn, commit_sha, worktree_id)
+    store::indexed_file_shas_in_scope(conn, checkout)
 }
 
 /// Heuristic-vs-oracle eval metrics for a tool/version, diffing `edge_oracle` against `edges`,
@@ -210,11 +184,10 @@ pub fn oracle_eval_metrics(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     recall_calls: RecallCalls,
 ) -> anyhow::Result<OracleEvalMetrics> {
-    run::eval_metrics(conn, tool, tool_version, commit_sha, worktree_id, recall_calls)
+    run::eval_metrics(conn, tool, tool_version, checkout, recall_calls)
 }
 
 /// Assemble the typed before/after [`OracleResolutionReport`] (C2) for a just-completed run: read
@@ -229,18 +202,16 @@ pub fn resolution_report(
     profile: &report::CorpusProfile,
     provenance: &report::RunProvenance,
     tool: OracleTool,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     run: &OracleReport,
 ) -> anyhow::Result<report::OracleResolutionReport> {
     let (total_edges, resolved_in_corpus, unresolved) =
-        store::resolution_before_counts(conn, commit_sha, worktree_id)?;
+        store::resolution_before_counts(conn, checkout)?;
     let before = report::ResolutionBefore { total_edges, resolved_in_corpus, unresolved };
     let symbols_with_moniker =
         store::count_symbols_with_moniker(conn, tool, &provenance.tool_version)?;
     let recall = RecallCalls { covered: run.covered_calls, oracle_only: run.oracle_only_calls };
-    let metrics =
-        run::eval_metrics(conn, tool, &provenance.tool_version, commit_sha, worktree_id, recall)?;
+    let metrics = run::eval_metrics(conn, tool, &provenance.tool_version, checkout, recall)?;
     Ok(report::OracleResolutionReport::assemble(
         profile,
         provenance,
@@ -257,10 +228,9 @@ pub fn oracle_status(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<OracleStatus> {
-    status::status(conn, tool, tool_version, commit_sha, worktree_id)
+    status::status(conn, tool, tool_version, checkout)
 }
 
 /// The outcome of `oracle run`: either a completed pass with its report, or a `Blocked` probe
@@ -503,12 +473,11 @@ pub fn run_oracle_with_tool(
     tool: OracleTool,
     checkout_root: &Path,
     scip_output: &Path,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<OracleRunOutcome> {
     // Snapshot the indexed shas BEFORE spawning the tool — the pre-spawn gate (#83) needs the state
     // from before the subprocess could observe any source.
-    let pre_spawn_sha = pre_spawn_snapshot(conn, commit_sha, worktree_id)?;
+    let pre_spawn_sha = pre_spawn_snapshot(conn, checkout)?;
     // Stamp the run's start right after that snapshot (the indexed state it covers) and before the
     // subprocess: later than the indexed_at it's based on, yet before any mid-run reindex, so the
     // auto-run staleness gate is neither falsely rerun nor wrongly skipped. (#145 + #146 review)
@@ -517,18 +486,16 @@ pub fn run_oracle_with_tool(
         ScipProduction::Blocked { tool, program, hint } =>
             Ok(OracleRunOutcome::Blocked { tool, program, hint }),
         ScipProduction::Produced { version, bytes, production_sha } => {
-            let report = run_oracle_at(
-                conn,
+            let report = run_oracle_at(conn, &OracleRunInput {
                 tool,
-                &version,
-                commit_sha,
-                worktree_id,
-                &bytes,
+                tool_version: &version,
+                checkout,
+                scip_bytes: &bytes,
                 checkout_root,
-                Some(&production_sha),
-                Some(&pre_spawn_sha),
+                production_sha: Some(&production_sha),
+                pre_spawn_sha: Some(&pre_spawn_sha),
                 started_at_ms,
-            )?;
+            })?;
             Ok(OracleRunOutcome::Completed {
                 tool: tool.as_db_str().to_string(),
                 tool_version: version,
@@ -569,18 +536,10 @@ pub fn current_oracle_verdicts_for_edges(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     edge_ids: &[i64],
 ) -> anyhow::Result<std::collections::HashMap<i64, EdgeOracleVerdict>> {
-    store::current_oracle_verdicts_for_edges(
-        conn,
-        tool,
-        tool_version,
-        commit_sha,
-        worktree_id,
-        edge_ids,
-    )
+    store::current_oracle_verdicts_for_edges(conn, tool, tool_version, checkout, edge_ids)
 }
 
 /// Fetch ALL current, in-scope oracle verdicts for `(tool, tool_version)` in this checkout, keyed
@@ -591,20 +550,15 @@ pub fn current_oracle_verdicts_all(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<std::collections::HashMap<i64, (OracleResolutionKind, Option<i64>)>> {
-    store::current_oracle_verdicts_all(conn, tool, tool_version, commit_sha, worktree_id)
+    store::current_oracle_verdicts_all(conn, tool, tool_version, checkout)
 }
 
 /// Whether ANY oracle run exists in the active checkout (across all tools) — the cheap existence
 /// probe that short-circuits the per-tool [`latest_run_tool_version`] calls when nothing ever ran.
-pub fn any_run_in_scope(
-    conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
-) -> anyhow::Result<bool> {
-    store::any_run_in_scope(conn, commit_sha, worktree_id)
+pub fn any_run_in_scope(conn: &Connection, checkout: CheckoutRef<'_>) -> anyhow::Result<bool> {
+    store::any_run_in_scope(conn, checkout)
 }
 
 /// Prune `oracle_runs` rows for dead `(commit_sha, worktree_id)` contexts — a gc companion that
@@ -645,10 +599,9 @@ pub fn prune_edge_oracle_without_live_edge(conn: &Connection) -> anyhow::Result<
 pub fn latest_run_tool_version(
     conn: &Connection,
     tool: OracleTool,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Option<String>> {
-    store::latest_run_tool_version(conn, tool, commit_sha, worktree_id)
+    store::latest_run_tool_version(conn, tool, checkout)
 }
 
 /// Every oracle tool that has at least one run in this checkout, paired with its latest
@@ -659,13 +612,11 @@ pub fn latest_run_tool_version(
 /// per-tool verdict sets are disjoint and merge cleanly. Tools with no run in scope are skipped.
 pub fn latest_runs_in_scope(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Vec<(OracleTool, String)>> {
     let mut runs = Vec::new();
     for &tool in OracleTool::ALL {
-        if let Some(version) = store::latest_run_tool_version(conn, tool, commit_sha, worktree_id)?
-        {
+        if let Some(version) = store::latest_run_tool_version(conn, tool, checkout)? {
             runs.push((tool, version));
         }
     }
@@ -678,10 +629,9 @@ pub fn latest_runs_in_scope(
 pub fn latest_run_started_at(
     conn: &Connection,
     tool: OracleTool,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Option<i64>> {
-    store::latest_run_started_at(conn, tool, commit_sha, worktree_id)
+    store::latest_run_started_at(conn, tool, checkout)
 }
 
 /// Load the CURRENT, in-scope `edge_oracle` verdicts joined to their heuristic edge resolution —
@@ -691,10 +641,9 @@ pub fn current_oracle_comparisons(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Vec<EdgeOracleComparison>> {
-    store::current_oracle_comparisons(conn, tool, tool_version, commit_sha, worktree_id)
+    store::current_oracle_comparisons(conn, tool, tool_version, checkout)
 }
 
 /// The oracle tool that produced a SCIP index. Phase 1 ships only the Rust backend (consumed from a

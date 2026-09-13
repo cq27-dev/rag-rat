@@ -28,7 +28,7 @@ fn def_inside_corpus_upgrades_unresolved_edge() {
     });
     let bytes = full.write_to_bytes().unwrap();
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     let (kind, resolved, _scip) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::Upgrade.as_db_str());
@@ -50,7 +50,7 @@ fn def_outside_corpus_resolves_external() {
         occurrence(0, 14, 19, external, SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     let (kind, resolved, scip) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
@@ -124,7 +124,7 @@ fn non_ascii_identifier_resolves_under_both_encodings() {
         });
         let bytes = index.write_to_bytes().unwrap();
 
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
         let (kind, resolved, _) =
             h.verdict(edge).unwrap_or_else(|| panic!("verdict written for encoding {encoding:?}"));
@@ -149,7 +149,7 @@ fn local_symbols_are_skipped() {
         occurrence(0, 14, 20, "local 0", SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     assert!(h.verdict(edge).is_none(), "local symbol must not produce a verdict");
 }
@@ -194,7 +194,7 @@ fn exact_edge_contradiction_recorded_not_applied() {
     });
     let bytes = index.write_to_bytes().unwrap();
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::Contradict.as_db_str());
@@ -239,7 +239,7 @@ fn exact_edge_agreement_recorded_as_confirm() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::Confirm.as_db_str());
@@ -303,7 +303,7 @@ fn decl_and_def_of_same_logical_symbol_is_confirm_not_contradiction() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
 
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(
@@ -381,7 +381,7 @@ fn a_namespace_occurrence_answers_only_when_it_bounds_the_token() {
         });
         let bytes = full.write_to_bytes().unwrap();
 
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
         (h.verdict(edge), ns_sym)
     }
 

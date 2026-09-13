@@ -1,6 +1,7 @@
 //! Oracle status — the serializable summary surfaced like `llm_status` (phase 2 wires it into
 //! the MCP `llm_status`-style view; phase 1 just exposes the type + builder).
 
+use rag_rat_base::checkout::CheckoutRef;
 use rusqlite::Connection;
 use serde::Serialize;
 
@@ -31,12 +32,11 @@ pub(crate) fn status(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<OracleStatus> {
     let VerdictCounts { total, upgraded, resolved_external, confirmed, contradicted } =
-        run::verdict_counts(conn, tool, tool_version, commit_sha, worktree_id)?;
-    let last_run = last_run_meta(conn, tool, tool_version, commit_sha, worktree_id)?;
+        run::verdict_counts(conn, tool, tool_version, checkout)?;
+    let last_run = last_run_meta(conn, tool, tool_version, checkout)?;
     Ok(OracleStatus {
         tool: tool.as_db_str().to_string(),
         tool_version: tool_version.to_string(),
@@ -62,9 +62,9 @@ fn last_run_meta(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Option<(String, String)>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let repo_clause = super::store::oracle_repo_scope_clause(conn, "oracle_runs")?;
     let row = conn
         .query_row(

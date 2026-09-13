@@ -11,6 +11,7 @@
 //! Surfacing-not-asserting for non-deterministic drift is the deliberate design, mirroring the
 //! issue's guidance.
 
+use rag_rat_base::checkout::CheckoutRef;
 use rusqlite::Connection;
 use serde::Serialize;
 
@@ -201,11 +202,10 @@ fn with_read_snapshot<T>(
 /// read itself.
 pub fn check_library_usage(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     opts: &LibraryUsageOptions,
 ) -> anyhow::Result<LibraryUsageReport> {
-    with_read_snapshot(conn, || check_library_usage_inner(conn, commit_sha, worktree_id, opts))
+    with_read_snapshot(conn, || check_library_usage_inner(conn, checkout, opts))
 }
 
 /// Join external call sites to `external_symbols` contracts for the active checkout, across every
@@ -219,11 +219,10 @@ pub fn check_library_usage(
 /// `limit` bounds the doc/signature payload (not the whole dependency surface).
 fn check_library_usage_inner(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     opts: &LibraryUsageOptions,
 ) -> anyhow::Result<LibraryUsageReport> {
-    let runs = latest_runs_in_scope(conn, commit_sha, worktree_id)?;
+    let runs = latest_runs_in_scope(conn, checkout)?;
     if runs.is_empty() {
         return Ok(LibraryUsageReport::empty(LibraryUsageStatus::NoOracleRun));
     }
@@ -240,7 +239,7 @@ fn check_library_usage_inner(
     // counts reflect the real gap.
     let mut flags: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     for (tool, _) in &runs {
-        for (moniker, deprecated) in load_contract_flags(conn, *tool, commit_sha, worktree_id)? {
+        for (moniker, deprecated) in load_contract_flags(conn, *tool, checkout)? {
             flags.insert(moniker, deprecated);
         }
     }
@@ -252,7 +251,7 @@ fn check_library_usage_inner(
     let mut without_info = 0usize;
     let mut deprecated_sites = 0usize;
     for (tool, tool_version) in &runs {
-        for site in external_call_sites(conn, *tool, tool_version, commit_sha, worktree_id, opts)? {
+        for site in external_call_sites(conn, *tool, tool_version, checkout, opts)? {
             // The package filter is applied here (not in SQL) because the package component is
             // extracted by `scip::symbol::parse_symbol`, not a stored column.
             if let Some(pkg) = package_filter
@@ -312,9 +311,7 @@ fn check_library_usage_inner(
         std::collections::HashMap::new();
     if !survivors.is_empty() {
         for (tool, _) in &runs {
-            for (moniker, contract) in
-                load_contracts_for(conn, *tool, commit_sha, worktree_id, &survivors)?
-            {
+            for (moniker, contract) in load_contracts_for(conn, *tool, checkout, &survivors)? {
                 contracts.insert(moniker, contract);
             }
         }
@@ -364,9 +361,9 @@ fn check_library_usage_inner(
 fn load_contract_flags(
     conn: &Connection,
     tool: OracleTool,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Vec<(String, bool)>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let repo_clause = store::oracle_repo_scope_clause(conn, "external_symbols")?;
     let sql = format!(
         "SELECT moniker, deprecated FROM external_symbols
@@ -388,10 +385,10 @@ fn load_contract_flags(
 fn load_contracts_for(
     conn: &Connection,
     tool: OracleTool,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     monikers: &[&str],
 ) -> anyhow::Result<Vec<(String, Contract)>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     if monikers.is_empty() {
         return Ok(Vec::new());
     }
@@ -446,10 +443,10 @@ fn external_call_sites(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     opts: &LibraryUsageOptions,
 ) -> anyhow::Result<Vec<CallSiteRow>> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let scope_join = store::edge_oracle_scope_join(conn)?;
 
     // Path filter: exact file OR anything under `<path>/`. `instr(x, y) = 1` (y is a prefix of x)

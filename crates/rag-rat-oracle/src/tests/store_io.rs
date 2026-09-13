@@ -1,3 +1,5 @@
+use rag_rat_base::checkout::CheckoutRef;
+
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -23,7 +25,7 @@ fn edge_join_candidates_filters_null_range_and_scopes_by_worktree() {
         )
         .unwrap();
 
-    let candidates = store::edge_join_candidates(&h.conn, COMMIT, WORKTREE).unwrap();
+    let candidates = store::edge_join_candidates(&h.conn, CHECKOUT).unwrap();
     let ids: Vec<i64> = candidates.iter().map(|c| c.edge_id).collect();
     // Only the two call edges, ordered by callee_start_byte (a at 14 before b at 19).
     assert_eq!(ids, vec![edge_a, edge_b]);
@@ -36,7 +38,14 @@ fn edge_join_candidates_filters_null_range_and_scopes_by_worktree() {
     // A candidate scoped to a DIFFERENT commit is out of scope. (Under clean-checkout semantics a
     // commit-scoped file is visible from any worktree-overlay query as long as the commit matches,
     // so the isolation that actually matters is the commit, not the overlay id.)
-    assert!(store::edge_join_candidates(&h.conn, "other-commit-sha", WORKTREE).unwrap().is_empty());
+    assert!(
+        store::edge_join_candidates(&h.conn, CheckoutRef {
+            commit_sha: "other-commit-sha",
+            worktree_id: WORKTREE
+        })
+        .unwrap()
+        .is_empty()
+    );
 }
 
 /// `symbol_spans_for_path` returns the file's symbols ordered by start byte, scoped to the path +
@@ -48,14 +57,12 @@ fn symbol_spans_for_path_returns_scoped_ordered_spans() {
     let a = h.add_symbol(defs, "a", 3, 4);
     let b = h.add_symbol(defs, "b", 13, 14);
 
-    let spans = store::symbol_spans_for_path(&h.conn, "defs.rs", COMMIT, WORKTREE).unwrap();
+    let spans = store::symbol_spans_for_path(&h.conn, "defs.rs", CHECKOUT).unwrap();
     assert_eq!(spans.iter().map(|s| s.symbol_id).collect::<Vec<_>>(), vec![a, b]);
     assert_eq!(spans[0].start_byte, 3);
     assert_eq!(spans[1].end_byte, 14);
 
-    assert!(
-        store::symbol_spans_for_path(&h.conn, "missing.rs", COMMIT, WORKTREE).unwrap().is_empty()
-    );
+    assert!(store::symbol_spans_for_path(&h.conn, "missing.rs", CHECKOUT).unwrap().is_empty());
 }
 
 /// #248: writing an `edge_oracle` row keyed by the edge's CONTENT key round-trips every field;
@@ -87,10 +94,7 @@ fn write_edge_oracle_round_trips_and_upserts_without_touching_edges() {
     assert_eq!(kind, OracleResolutionKind::Upgrade.as_db_str());
     assert_eq!(resolved, Some(target_sym));
     assert_eq!(scip, "scip `target`().");
-    assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
-        1
-    );
+    assert_eq!(store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(), 1);
 
     // Re-write the SAME content key (same edge) with a new sha + verdict → upsert, still one row.
     // Use the same `caller_sha` so the count path keeps it (a different sha would read as stale).
@@ -102,7 +106,7 @@ fn write_edge_oracle_round_trips_and_upserts_without_touching_edges() {
         OracleResolutionKind::ResolvedExternal,
     );
     assert_eq!(
-        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, CHECKOUT, None).unwrap(),
         1,
         "upsert overwrote the row by content key — no duplicate"
     );
@@ -173,19 +177,10 @@ fn record_oracle_run_at_persists_the_passed_start_time() {
     let h = Harness::new();
     // Deliberately far in the past: if the impl stamped `now_ms()` instead, this would not match.
     let started_at_ms = 1_000_000_i64;
-    store::record_oracle_run_at(
-        &h.conn,
-        TOOL,
-        VERSION,
-        COMMIT,
-        WORKTREE,
-        started_at_ms,
-        "Completed",
-        "{}",
-    )
-    .unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, started_at_ms, "Completed", "{}")
+        .unwrap();
     assert_eq!(
-        store::latest_run_started_at(&h.conn, TOOL, COMMIT, WORKTREE).unwrap(),
+        store::latest_run_started_at(&h.conn, TOOL, CHECKOUT).unwrap(),
         Some(started_at_ms),
         "started_at must be the value the caller passed, not completion time"
     );
@@ -196,10 +191,24 @@ fn record_oracle_run_at_persists_the_passed_start_time() {
 #[test]
 fn record_oracle_run_and_count_by_kind() {
     let h = Harness::new();
-    let id1 = store::record_oracle_run(&h.conn, TOOL, VERSION, "abc", WORKTREE, "Completed", "{}")
-        .unwrap();
-    let id2 = store::record_oracle_run(&h.conn, TOOL, VERSION, "abc", WORKTREE, "Completed", "{}")
-        .unwrap();
+    let id1 = store::record_oracle_run(
+        &h.conn,
+        TOOL,
+        VERSION,
+        CheckoutRef { commit_sha: "abc", worktree_id: WORKTREE },
+        "Completed",
+        "{}",
+    )
+    .unwrap();
+    let id2 = store::record_oracle_run(
+        &h.conn,
+        TOOL,
+        VERSION,
+        CheckoutRef { commit_sha: "abc", worktree_id: WORKTREE },
+        "Completed",
+        "{}",
+    )
+    .unwrap();
     assert!(id2 > id1, "row id increments");
 
     let f = h.add_file("a.rs", "x\n");
@@ -214,8 +223,7 @@ fn record_oracle_run_and_count_by_kind() {
             &h.conn,
             TOOL,
             VERSION,
-            COMMIT,
-            WORKTREE,
+            CHECKOUT,
             Some(OracleResolutionKind::Upgrade)
         )
         .unwrap(),
@@ -226,8 +234,7 @@ fn record_oracle_run_and_count_by_kind() {
             &h.conn,
             TOOL,
             VERSION,
-            COMMIT,
-            WORKTREE,
+            CHECKOUT,
             Some(OracleResolutionKind::Contradict)
         )
         .unwrap(),
@@ -252,14 +259,12 @@ fn current_callee_monikers_filters_sha_locals_and_conflicts() {
     // The currency gate only trusts rows the LATEST run of their tool stands behind — record a
     // completed run for BOTH tools so every row below is in play (the conflict drop must fire
     // on trusted rows, not on rows the run gate already filtered).
-    store::record_oracle_run_at(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, 0, "Completed", "{}")
-        .unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, 0, "Completed", "{}").unwrap();
     store::record_oracle_run_at(
         &h.conn,
         OracleTool::ScipClang,
         VERSION,
-        COMMIT,
-        WORKTREE,
+        CHECKOUT,
         0,
         "Completed",
         "{}",
@@ -308,7 +313,7 @@ fn current_callee_monikers_filters_sha_locals_and_conflicts() {
     let loc_edge = h.add_edge(file, "loc", loc_lo, loc_hi, "NameOnly", None);
     h.write_verdict(loc_edge, &sha, None, "local 5", OracleResolutionKind::Upgrade);
 
-    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, COMMIT, WORKTREE).unwrap();
+    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, CHECKOUT).unwrap();
     assert_eq!(
         monikers,
         std::collections::HashMap::from([((keep_lo, keep_hi), "rust cr 1.0 keep().".to_string())]),
@@ -334,19 +339,9 @@ fn current_callee_monikers_drops_superseded_runs_and_dead_defs() {
     };
     // The latest completed run for TOOL carries VERSION — rows under any other version of TOOL,
     // or under a tool with NO run in this checkout, are not backed by it.
-    store::record_oracle_run_at(
-        &h.conn,
-        TOOL,
-        "superseded",
-        COMMIT,
-        WORKTREE,
-        0,
-        "Completed",
-        "{}",
-    )
-    .unwrap();
-    store::record_oracle_run_at(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, 1, "Completed", "{}")
+    store::record_oracle_run_at(&h.conn, TOOL, "superseded", CHECKOUT, 0, "Completed", "{}")
         .unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, 1, "Completed", "{}").unwrap();
 
     // (a) A row written under TOOL's SUPERSEDED version: the latest run no longer stands behind
     // it, even though its file_sha is current.
@@ -412,7 +407,7 @@ fn current_callee_monikers_drops_superseded_runs_and_dead_defs() {
         OracleResolutionKind::Upgrade,
     );
 
-    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, COMMIT, WORKTREE).unwrap();
+    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, CHECKOUT).unwrap();
     assert_eq!(
         monikers,
         std::collections::HashMap::from([((live_lo, live_hi), "rust cr 1.0 live().".to_string())]),
@@ -434,8 +429,7 @@ fn current_callee_monikers_includes_macro_heads_and_excludes_non_call_kinds() {
         let start = src.find(name).unwrap();
         (start, start + name.len())
     };
-    store::record_oracle_run_at(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, 0, "Completed", "{}")
-        .unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, 0, "Completed", "{}").unwrap();
 
     let (mac_lo, mac_hi) = span("emit");
     let mac_edge =
@@ -447,7 +441,7 @@ fn current_callee_monikers_includes_macro_heads_and_excludes_non_call_kinds() {
         h.add_edge_with_kind(file, "Widget", ty_lo, ty_hi, "references_type", "NameOnly", None);
     h.write_verdict(ty_edge, &sha, None, "rust cr 1.0 Widget#", OracleResolutionKind::Upgrade);
 
-    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, COMMIT, WORKTREE).unwrap();
+    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, CHECKOUT).unwrap();
     assert_eq!(
         monikers,
         std::collections::HashMap::from([((mac_lo, mac_hi), "rust cr 1.0 emit!.".to_string())]),
@@ -470,8 +464,7 @@ fn current_callee_monikers_drops_verdicts_without_a_live_edge() {
         let start = src.find(name).unwrap();
         (start, start + name.len())
     };
-    store::record_oracle_run_at(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, 0, "Completed", "{}")
-        .unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, 0, "Completed", "{}").unwrap();
 
     // A live edge + its verdict, keyed off the real edge — returned.
     let (live_lo, live_hi) = span("live");
@@ -495,7 +488,7 @@ fn current_callee_monikers_drops_verdicts_without_a_live_edge() {
     })
     .unwrap();
 
-    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, COMMIT, WORKTREE).unwrap();
+    let monikers = store::current_callee_monikers(&h.conn, "m.rs", &sha, CHECKOUT).unwrap();
     assert_eq!(
         monikers,
         std::collections::HashMap::from([((live_lo, live_hi), "rust cr 1.0 live().".to_string())]),
@@ -519,7 +512,7 @@ fn edge_join_candidates_for_paths_scopes_and_chunks() {
     h.add_edge(c, "t", 9, 10, "NameOnly", None);
 
     // Scoped: only the named paths come back.
-    let candidates = store::edge_join_candidates_for_paths(&h.conn, COMMIT, WORKTREE, &[
+    let candidates = store::edge_join_candidates_for_paths(&h.conn, CHECKOUT, &[
         "a.rs".to_string(),
         "b.rs".to_string(),
     ])
@@ -532,15 +525,12 @@ fn edge_join_candidates_for_paths_scopes_and_chunks() {
     // resolves — the query is issued in bounded `IN` lists.
     let mut big: Vec<String> = (0..600).map(|i| format!("src/filler-{i}.rs")).collect();
     big.push("a.rs".to_string());
-    let candidates =
-        store::edge_join_candidates_for_paths(&h.conn, COMMIT, WORKTREE, &big).unwrap();
+    let candidates = store::edge_join_candidates_for_paths(&h.conn, CHECKOUT, &big).unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].edge_id, edge_a);
 
     // Empty worklist → no query, no candidates.
-    assert!(
-        store::edge_join_candidates_for_paths(&h.conn, COMMIT, WORKTREE, &[]).unwrap().is_empty()
-    );
+    assert!(store::edge_join_candidates_for_paths(&h.conn, CHECKOUT, &[]).unwrap().is_empty());
 }
 
 /// `live_covered_edges_for_path` (the budget-continuation coverage read, #534) must NOT count a
@@ -576,8 +566,7 @@ fn live_covered_edges_excludes_a_stale_definition_verdict() {
         "v",
         "src.rs",
         &sha,
-        COMMIT,
-        WORKTREE,
+        CHECKOUT,
     )
     .unwrap();
     assert!(covered.is_empty(), "a verdict with a vanished definition is not coverage");
@@ -599,16 +588,14 @@ fn live_covered_edges_excludes_a_stale_definition_verdict() {
         kind: OracleResolutionKind::Upgrade,
     })
     .unwrap();
-    store::record_oracle_run(&h.conn, OracleTool::RaLsp, "v", COMMIT, WORKTREE, "Completed", "{}")
-        .unwrap();
+    store::record_oracle_run(&h.conn, OracleTool::RaLsp, "v", CHECKOUT, "Completed", "{}").unwrap();
     let covered = store::live_covered_edges_for_path(
         &h.conn,
         OracleTool::RaLsp,
         "v",
         "src.rs",
         &sha,
-        COMMIT,
-        WORKTREE,
+        CHECKOUT,
     )
     .unwrap();
     assert_eq!(covered.len(), 1, "the live-definition verdict is coverage; the stale one is not");
@@ -640,8 +627,7 @@ fn live_covered_edges_requires_this_checkouts_current_run() {
         &h.conn,
         OracleTool::RaLsp,
         "v",
-        OTHER_COMMIT,
-        OTHER_WORKTREE,
+        CheckoutRef { commit_sha: OTHER_COMMIT, worktree_id: OTHER_WORKTREE },
         "Completed",
         "{}",
     )
@@ -654,14 +640,12 @@ fn live_covered_edges_requires_this_checkouts_current_run() {
             "v",
             "src.rs",
             &sha,
-            COMMIT,
-            WORKTREE,
+            CHECKOUT,
         )
         .unwrap()
     };
     assert!(covered().is_empty(), "a sibling's run does not establish this checkout's currency");
 
-    store::record_oracle_run(&h.conn, OracleTool::RaLsp, "v", COMMIT, WORKTREE, "Completed", "{}")
-        .unwrap();
+    store::record_oracle_run(&h.conn, OracleTool::RaLsp, "v", CHECKOUT, "Completed", "{}").unwrap();
     assert_eq!(covered().len(), 1, "this checkout's matching run activates shared coverage");
 }

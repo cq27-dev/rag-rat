@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::hash::hex_sha256;
 use rusqlite::Connection;
 
@@ -19,17 +20,16 @@ use super::store::{self, CALL_EDGE_KIND, EdgeOracleRow};
 use super::{OracleReport, OracleResolutionKind, OracleTool};
 
 /// Inputs for one oracle pass.
-pub(crate) struct OracleRunInput<'a> {
-    pub(crate) tool: OracleTool,
-    pub(crate) tool_version: &'a str,
-    /// The commit/worktree the edges are scoped to (and which the `.scip` was built against).
-    pub(crate) commit_sha: &'a str,
-    pub(crate) worktree_id: &'a str,
+pub struct OracleRunInput<'a> {
+    pub tool: OracleTool,
+    pub tool_version: &'a str,
+    /// The checkout the edges are scoped to (and which the `.scip` was built against).
+    pub checkout: CheckoutRef<'a>,
     /// Serialized `.scip` bytes.
-    pub(crate) scip_bytes: &'a [u8],
+    pub scip_bytes: &'a [u8],
     /// Checkout root: document paths in the `.scip` are joined against this to read current bytes
     /// for position-encoding conversion.
-    pub(crate) checkout_root: &'a Path,
+    pub checkout_root: &'a Path,
     /// `relative_path -> hex sha256` of the disk bytes captured the instant the tool finished
     /// producing the `.scip`, for a tool-driven run; `None` for a pre-built `--scip` (no
     /// production moment we control). When present it adds the scip-vs-disk leg of the content
@@ -40,7 +40,7 @@ pub(crate) struct OracleRunInput<'a> {
     /// the watcher reindexing EITHER in the lock-free window corrupts the join while `disk_sha
     /// == file_sha` (both the new content) still passes the index-vs-disk gate. See
     /// [`super::ScipProduction::Produced`].
-    pub(crate) production_sha: Option<&'a HashMap<String, String>>,
+    pub production_sha: Option<&'a HashMap<String, String>>,
     /// The indexed `(path -> files.sha256)` snapshot taken **before the tool subprocess was
     /// spawned** (#83); `None` for a pre-built `--scip` (no spawn). The post-exit
     /// `production_sha` gate cannot see INSIDE the subprocess: the tool reads each source near
@@ -52,11 +52,11 @@ pub(crate) struct OracleRunInput<'a> {
     /// ENTIRE window (spawn → join), for both the call-site and definition documents. Residual
     /// ABA (an edit reverted to byte-identical content) is acceptable — the verdict is then
     /// correct anyway.
-    pub(crate) pre_spawn_sha: Option<&'a HashMap<String, String>>,
+    pub pre_spawn_sha: Option<&'a HashMap<String, String>>,
     /// Unix-epoch ms when the run actually BEGAN (the pre-spawn snapshot moment), recorded as
     /// `oracle_runs.started_at`. Must be the start, not completion: the auto-run staleness gate
     /// keys on it (#145).
-    pub(crate) started_at_ms: i64,
+    pub started_at_ms: i64,
 }
 
 /// Run the oracle join over all current edge candidates and persist verdicts + a run row.
@@ -90,21 +90,15 @@ pub(crate) fn run_in_tx(
 ) -> anyhow::Result<OracleReport> {
     let mut report = OracleReport::default();
 
-    let candidates = store::edge_join_candidates(conn, input.commit_sha, input.worktree_id)?;
+    let candidates = store::edge_join_candidates(conn, input.checkout)?;
 
-    store::clear_edge_oracle_for_tool(
-        conn,
-        input.tool,
-        input.tool_version,
-        input.commit_sha,
-        input.worktree_id,
-    )?;
+    store::clear_edge_oracle_for_tool(conn, input.tool, input.tool_version, input.checkout)?;
     // Monikers are authoritative per tool the same way verdicts are per (tool, tool_version):
     // clear, then write the current `.scip`'s definitions, all in this transaction (#70).
     store::clear_logical_symbol_monikers_for_tool(conn, input.tool)?;
     // External dependency contracts are authoritative per tool too (#114): clear, then write the
     // current `.scip`'s `external_symbols` after the moniker pass, all in this transaction.
-    store::clear_external_symbols_for_tool(conn, input.tool, input.commit_sha, input.worktree_id)?;
+    store::clear_external_symbols_for_tool(conn, input.tool, input.checkout)?;
 
     // Parse the `.scip`, reading each document's current checkout bytes for encoding conversion.
     // The bytes we read here are the SAME bytes whose hash we compare against each candidate's
@@ -137,8 +131,7 @@ pub(crate) fn run_in_tx(
     // The join-time indexed `(path -> files.sha256)` map for the active checkout. Used by the
     // pre-spawn gate's DEFINITION-side check (#83) and the moniker pass below (the call-site side
     // compares against `candidate.file_sha`, which already IS the join-time indexed sha).
-    let indexed_shas =
-        store::indexed_file_shas_in_scope(conn, input.commit_sha, input.worktree_id)?;
+    let indexed_shas = store::indexed_file_shas_in_scope(conn, input.checkout)?;
     let gates = DriftGates {
         disk_sha: &disk_sha,
         indexed_shas: &indexed_shas,
@@ -171,12 +164,10 @@ pub(crate) fn run_in_tx(
     // per-edge join below and by the recall-gap pass, so a `.scip` def in a file rag-rat didn't
     // index (or in another checkout) maps to `None` and is excluded from both — they must agree on
     // what "in the indexed corpus" means.
-    let commit_sha = input.commit_sha;
-    let worktree_id = input.worktree_id;
     let resolve_symbol = |def_path: &str, def_start: usize, def_end: usize| -> Option<i64> {
         if !symbol_span_cache.borrow().contains_key(def_path) {
-            let loaded = store::symbol_spans_for_path(conn, def_path, commit_sha, worktree_id)
-                .unwrap_or_default();
+            let loaded =
+                store::symbol_spans_for_path(conn, def_path, input.checkout).unwrap_or_default();
             symbol_span_cache.borrow_mut().insert(def_path.to_string(), loaded);
         }
         let cache = symbol_span_cache.borrow();
@@ -304,8 +295,7 @@ pub(crate) fn run_in_tx(
         conn,
         input.tool,
         input.tool_version,
-        input.commit_sha,
-        input.worktree_id,
+        input.checkout,
         input.started_at_ms,
         &report.status,
         &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
@@ -528,8 +518,7 @@ fn write_external_symbols(
             conn,
             input.tool,
             input.tool_version,
-            input.commit_sha,
-            input.worktree_id,
+            input.checkout,
             &store::ExternalSymbolRow {
                 moniker,
                 kind: &info.kind,
@@ -560,7 +549,7 @@ fn count_recall_gap(
     drifted_paths: &HashSet<String>,
     resolve_symbol: &dyn Fn(&str, usize, usize) -> Option<i64>,
 ) -> anyhow::Result<u64> {
-    let indexed_paths = store::indexed_paths_in_scope(conn, input.commit_sha, input.worktree_id)?;
+    let indexed_paths = store::indexed_paths_in_scope(conn, input.checkout)?;
     Ok(count_uncovered_calls(
         index,
         matched_occurrences,
@@ -653,12 +642,9 @@ pub(crate) fn verdict_counts(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<VerdictCounts> {
-    let count = |kind| {
-        store::count_edge_oracle_scoped(conn, tool, tool_version, commit_sha, worktree_id, kind)
-    };
+    let count = |kind| store::count_edge_oracle_scoped(conn, tool, tool_version, checkout, kind);
     Ok(VerdictCounts {
         total: count(None)?,
         upgraded: count(Some(OracleResolutionKind::Upgrade))?,
@@ -734,11 +720,10 @@ pub(crate) fn eval_metrics(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
     recall_calls: RecallCalls,
 ) -> anyhow::Result<OracleEvalMetrics> {
-    let counts = verdict_counts(conn, tool, tool_version, commit_sha, worktree_id)?;
+    let counts = verdict_counts(conn, tool, tool_version, checkout)?;
 
     // Precision: of Exact/Syntactic edges the oracle judged, how many it confirmed.
     let judged = counts.confirmed + counts.contradicted;
@@ -754,10 +739,8 @@ pub(crate) fn eval_metrics(
     // the numerator to the low-confidence join (exactly as `count_upgradeable_low_confidence` does)
     // keeps it ⊆ the denominator structurally, mirroring the over-1.0 hardening on the upgradeable
     // fraction (#81 finding 6b).
-    let low_conf_seen =
-        count_low_confidence_with_oracle(conn, tool, tool_version, commit_sha, worktree_id)?;
-    let low_conf_upgraded =
-        count_low_confidence_upgrades(conn, tool, tool_version, commit_sha, worktree_id)?;
+    let low_conf_seen = count_low_confidence_with_oracle(conn, tool, tool_version, checkout)?;
+    let low_conf_upgraded = count_low_confidence_upgrades(conn, tool, tool_version, checkout)?;
     let name_only_recovery_rate = ratio(low_conf_upgraded, low_conf_seen);
 
     // Oracle-upgradeable fraction of unresolved: upgrade-OR-external verdicts on low-confidence
@@ -768,9 +751,9 @@ pub(crate) fn eval_metrics(
     // the denominator — counting them let the fraction exceed 1.0. Scoping the numerator to the
     // low-confidence join keeps it ⊆ the denominator, so the fraction is bounded by 1.0 (at most
     // one verdict per edge).
-    let unresolved_total = count_unresolved_candidates(conn, commit_sha, worktree_id)?;
+    let unresolved_total = count_unresolved_candidates(conn, checkout)?;
     let upgradeable_low_conf =
-        count_upgradeable_low_confidence(conn, tool, tool_version, commit_sha, worktree_id)?;
+        count_upgradeable_low_confidence(conn, tool, tool_version, checkout)?;
     let oracle_upgradeable_fraction = ratio(upgradeable_low_conf, unresolved_total);
 
     // CALL recall: covered call occurrences vs. all in-corpus call occurrences the oracle saw
@@ -809,9 +792,9 @@ fn count_low_confidence_with_oracle(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<u64> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let count: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(*){} AND edges.confidence IN {}",
@@ -834,9 +817,9 @@ fn count_low_confidence_upgrades(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<u64> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let count: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(*){} AND edge_oracle.kind = 'upgrade' AND edges.confidence IN {}",
@@ -860,9 +843,9 @@ fn count_upgradeable_low_confidence(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<u64> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let count: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(*){} AND edge_oracle.kind IN ('upgrade', 'resolved-external') AND \
@@ -885,9 +868,9 @@ fn count_upgradeable_low_confidence(
 /// numerator (`count_upgradeable_low_confidence`) is already scoped, so the two must match.
 fn count_unresolved_candidates(
     conn: &Connection,
-    commit_sha: &str,
-    worktree_id: &str,
+    checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<u64> {
+    let CheckoutRef { commit_sha, worktree_id } = checkout;
     let count: i64 = conn.query_row(
         &format!(
             "

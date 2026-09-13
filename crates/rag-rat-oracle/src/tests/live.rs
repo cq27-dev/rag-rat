@@ -65,8 +65,7 @@ fn seed_corpus(h: &Harness) -> (i64, i64, i64) {
 
 fn pass_input<'a>(h: &'a Harness, worklist: &'a [String], max_requests: u64) -> LivePassInput<'a> {
     LivePassInput {
-        commit_sha: COMMIT,
-        worktree_id: WORKTREE,
+        checkout: CHECKOUT,
         scope: h.scope(),
         worklist,
         max_requests,
@@ -681,8 +680,7 @@ fn live_version_migration_leaves_a_sibling_checkouts_rows_alone() {
         OracleTool::RaLsp,
         "old-v",
         "new-v",
-        COMMIT,
-        WORKTREE,
+        CHECKOUT,
     )
     .unwrap();
 
@@ -742,8 +740,7 @@ fn live_version_migration_preserves_a_shared_old_version_row() {
         OracleTool::RaLsp,
         "old-v",
         "new-v",
-        COMMIT,
-        WORKTREE,
+        CHECKOUT,
     )
     .unwrap();
     assert_eq!(copied, crate::store::LiveVersionMigration::Copied(1));
@@ -791,8 +788,7 @@ fn live_version_migration_blocks_a_different_content_destination_collision() {
         &h.conn,
         OracleTool::RaLsp,
         LIVE_VERSION,
-        COMMIT,
-        WORKTREE,
+        CHECKOUT,
         "Completed",
         "{}",
     )
@@ -838,7 +834,7 @@ fn live_version_migration_blocks_a_different_content_destination_collision() {
     assert_eq!(report.status, "VersionMigrationBlocked");
     assert!(!report.version_migrated);
     assert_eq!(
-        crate::store::latest_run_tool_version(&h.conn, OracleTool::RaLsp, COMMIT, WORKTREE)
+        crate::store::latest_run_tool_version(&h.conn, OracleTool::RaLsp, CHECKOUT)
             .unwrap()
             .as_deref(),
         Some(LIVE_VERSION),
@@ -897,8 +893,7 @@ fn live_version_migration_replaces_a_stale_destination_collision() {
         OracleTool::RaLsp,
         "old-v",
         "new-v",
-        COMMIT,
-        WORKTREE,
+        CHECKOUT,
     )
     .unwrap();
     assert_eq!(copied, crate::store::LiveVersionMigration::Copied(1));
