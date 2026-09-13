@@ -30,8 +30,18 @@ on:
 permissions:
   contents: read
 
+# A push supersedes the run in flight: bench-pr-track reads only a `success` run, so a cancelled one
+# tracks nothing and the runner minutes go to the commit that will actually be reviewed.
+concurrency:
+  group: bench-pr-run-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   benchmark:
+    # The release PR (`release-plz-*`) changes versions, the changelog and the plugin manifests —
+    # nothing this workflow measures — and its branch is rewritten on every push to main, so
+    # running here would only restart a long job that a merge cancels again.
+    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
