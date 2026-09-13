@@ -290,7 +290,7 @@ fn recover_param_type(
             // bucket has a real coarse Rust type.)
             let bucket_unmapped =
                 vp.type_hint.as_deref().is_some_and(|b| literal_bucket_to_type(b).is_none());
-            if (vp.type_hint.is_none() || bucket_unmapped) && anchor_leaf_is_literal(anchor, lo) {
+            if (vp.type_hint.is_none() || bucket_unmapped) && anchor.leaf_is_literal(lo) {
                 let n = *type_param_counter;
                 *type_param_counter += 1;
                 return RecoveredType {
@@ -332,12 +332,6 @@ fn recover_param_type(
             RecoveredType { type_text: None, type_source: "none", unresolved: false }
         },
     }
-}
-
-/// `true` when the anchor's spine leaf at column `lo` is a literal-bucket token (`LIT_*`) — i.e.
-/// the value_param hole is a literal, not a local identifier (`ID<n>`).
-fn anchor_leaf_is_literal(anchor: &RefineMember, lo: usize) -> bool {
-    anchor.seq.get(lo).is_some_and(|tok| tok.starts_with("LIT_"))
 }
 
 /// Map a `LIT_*` bucket to a coarse Rust type string, or `None` for a bucket with no stable Rust
@@ -816,7 +810,7 @@ mod tests {
         use crate::normalize::NodeSpan;
 
         // Synthetic anchor: `fn ...` header reduced to a single literal leaf at column 0 (all that
-        // `anchor_leaf_is_literal` / `recover_param_type` inspect). seq[0] = a LIT_* token.
+        // `RefineMember::leaf_is_literal` / `recover_param_type` inspect). seq[0] = a LIT_* token.
         let anchor = RefineMember {
             callee_monikers: Default::default(),
             symbol_id: 1,

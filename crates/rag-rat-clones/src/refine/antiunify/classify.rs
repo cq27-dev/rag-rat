@@ -87,7 +87,7 @@ pub(super) fn matched_column_reopen(
     members: &[RefineMember],
     alignment: &ClassAlignment,
 ) -> Option<ReopenRole> {
-    let role = if anchor_leaf_is_literal(anchor, col) {
+    let role = if anchor.leaf_is_literal(col) {
         ReopenRole::ValueLiteral
     } else if anchor_leaf_is_type_identifier(anchor, col) {
         ReopenRole::TypeParam
@@ -157,14 +157,6 @@ fn matched_callee_monikers_agree(
 fn anchor_leaf_is_callee_identifier(anchor: &RefineMember, col: usize) -> bool {
     anchor.node_spans.get(col).is_some_and(|sp| sp.is_leaf && is_callee_leaf_kind(sp.kind))
         && run_in_callee_position(anchor, col, col)
-}
-
-/// `true` when the anchor's spine leaf at column `col` is a value-erased literal bucket (`LIT_*`).
-/// The normalizer buckets every literal to its KIND, dropping the value — so a `LIT_*` token at a
-/// matched column may hide a real source-value difference across members (Fix 2).
-fn anchor_leaf_is_literal(anchor: &RefineMember, col: usize) -> bool {
-    anchor.node_spans.get(col).is_some_and(|sp| sp.is_leaf)
-        && anchor.seq.get(col).is_some_and(|tok| tok.starts_with("LIT_"))
 }
 
 /// `true` when the anchor's spine leaf at column `col` is a TYPE-POSITION identifier — a leaf whose

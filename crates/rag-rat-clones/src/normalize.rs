@@ -37,15 +37,10 @@ fn is_identifier_kind(kind: &str) -> bool {
 /// it must bucket rather than pass through as punctuation.
 fn is_literal_kind(kind: &str, lang: Language) -> bool {
     kind.ends_with("literal")
+        || is_string_body_leaf_kind(kind)
         || matches!(
             kind,
-            "string_content"
-                | "string_fragment"
-                | "line_str_text"
-                | "multi_line_str_text"
-                | "raw_str_part"
-                | "raw_str_end_part"
-                | "str_escaped_char"
+            "str_escaped_char"
                 | "interpreted_string_literal_content"
                 | "raw_string_literal_content"
                 | "integer"
@@ -54,6 +49,28 @@ fn is_literal_kind(kind: &str, lang: Language) -> bool {
                 | "char"
         )
         || (matches!(lang, Language::C | Language::Cpp) && kind == "character")
+}
+
+/// The string-BODY leaf kinds whose value the baseline normalizer erases: Rust/Python
+/// `string_content` and TS/JS `string_fragment` (#232 #2a), plus Swift's `line_str_text` /
+/// `multi_line_str_text` (the `"…"` and `"""…"""` bodies) and `raw_str_part` / `raw_str_end_part`
+/// (the `#"…"#` body — an UNINTERPOLATED raw string arrives as a single `raw_str_end_part` leaf
+/// carrying its own delimiters).
+///
+/// SINGLE source of truth for [`is_literal_kind`], which buckets them, and the anti-unify string
+/// widening, which widens a hole over one of them to its enclosing quote-bearing node so the hole
+/// covers the WHOLE `"hello"`: a hole over the bare text leaf, with the quotes left as fixed
+/// template text, does not describe the `&str` value that actually varies.
+pub(crate) fn is_string_body_leaf_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string_content"
+            | "string_fragment"
+            | "line_str_text"
+            | "multi_line_str_text"
+            | "raw_str_part"
+            | "raw_str_end_part"
+    )
 }
 
 /// A leaf kind that is a boolean literal in the grammars that expose booleans as their own leaf

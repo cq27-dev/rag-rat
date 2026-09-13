@@ -1,28 +1,7 @@
 use super::super::RefineMember;
 use super::classify::is_type_position;
 use super::spans::subtree_token_count;
-
-/// The string-BODY leaf kinds whose value the baseline normalizer erases (buckets to
-/// `LIT_STRING_CONTENT` / `LIT_STRING_FRAGMENT`): Rust/Python `string_content` and TS/JS
-/// `string_fragment` (#232 #2a). Both are the inner text leaf that needs widening to its enclosing
-/// quote-bearing node so the hole covers the WHOLE `"hello"`.
-///
-/// Swift's are `line_str_text` / `multi_line_str_text` (the `"…"` and `"""…"""` bodies) and
-/// `raw_str_part` / `raw_str_end_part` (the `#"…"#` body — an UNINTERPOLATED raw string arrives as
-/// a single `raw_str_end_part` leaf carrying its own delimiters). They must widen for the same
-/// reason every other language's do: a hole over the bare text leaf, with the quotes left as fixed
-/// template text, does not describe the `&str` value that actually varies.
-fn is_string_body_leaf_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "string_content"
-            | "string_fragment"
-            | "line_str_text"
-            | "multi_line_str_text"
-            | "raw_str_part"
-            | "raw_str_end_part"
-    )
-}
+use crate::normalize;
 
 /// The quote-bearing string-NODE kinds that wrap a string-body leaf: Rust/Python `string_literal`,
 /// TS/JS `string` (#232 #2a), and TS/JS `template_string` — the `` `…` `` template literal (#254).
@@ -66,7 +45,7 @@ pub(super) fn is_string_node_kind(kind: &str) -> bool {
 /// start; its `"""` multi-line delimiter and `str_escaped_char` escape leaf ARE string-internal and
 /// widen like every other grammar's.
 fn is_string_delimiter_or_body_leaf_kind(kind: &str) -> bool {
-    is_string_body_leaf_kind(kind)
+    normalize::is_string_body_leaf_kind(kind)
         || matches!(kind, "\"" | "`" | "'" | "\"\"\"" | "escape_sequence" | "str_escaped_char")
 }
 

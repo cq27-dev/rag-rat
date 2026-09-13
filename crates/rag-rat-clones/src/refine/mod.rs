@@ -55,3 +55,14 @@ pub struct RefineMember {
     /// `node_spans`.
     pub callee_monikers: std::collections::HashMap<(usize, usize), String>,
 }
+
+impl RefineMember {
+    /// `true` when this member's spine leaf at column `col` is a value-erased literal bucket
+    /// (`LIT_*`) — so a hole there is a literal, not a local identifier (`ID<n>`). The normalizer
+    /// buckets every literal to its KIND, dropping the value, so a `LIT_*` token at a matched
+    /// column may hide a real source-value difference across members.
+    pub(crate) fn leaf_is_literal(&self, col: usize) -> bool {
+        self.node_spans.get(col).is_some_and(|span| span.is_leaf)
+            && self.seq.get(col).is_some_and(|tok| tok.starts_with("LIT_"))
+    }
+}
