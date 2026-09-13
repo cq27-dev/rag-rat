@@ -192,17 +192,57 @@ impl GitHubClient {
     }
 }
 
-/// The two-phase attested-closers walk, encoded in the page cursor: `prs[:<after>]` then
-/// `issues[:<after>]`.
-fn attested_phase(cursor: Option<&str>) -> (&'static str, Option<String>) {
-    match cursor {
-        None | Some("prs") => ("prs", None),
-        Some("issues") => ("issues", None),
-        Some(other) => match other.split_once(':') {
-            Some(("prs", after)) => ("prs", Some(after.to_string())),
-            Some(("issues", after)) => ("issues", Some(after.to_string())),
-            _ => ("prs", None),
-        },
+/// The two phases of the attested-closers walk: merged/closed PRs, then closed issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttestedPhase {
+    Prs,
+    Issues,
+}
+
+impl AttestedPhase {
+    /// The phase's token in the page cursor.
+    fn as_token(self) -> &'static str {
+        match self {
+            Self::Prs => "prs",
+            Self::Issues => "issues",
+        }
+    }
+
+    fn parse_token(token: &str) -> Option<Self> {
+        match token {
+            "prs" => Some(Self::Prs),
+            "issues" => Some(Self::Issues),
+            _ => None,
+        }
+    }
+
+    fn query(self) -> &'static str {
+        match self {
+            Self::Prs => ATTESTED_PRS_QUERY,
+            Self::Issues => ATTESTED_ISSUES_QUERY,
+        }
+    }
+
+    /// The GraphQL connection under `repository` the phase's query pages.
+    fn connection_field(self) -> &'static str {
+        match self {
+            Self::Prs => "pullRequests",
+            Self::Issues => "issues",
+        }
+    }
+}
+
+/// Decode the walk's page cursor — `prs[:<after>]` then `issues[:<after>]` — into its phase and
+/// GraphQL `after` token. An absent or unrecognised cursor restarts at the PR phase.
+fn attested_phase(cursor: Option<&str>) -> (AttestedPhase, Option<String>) {
+    let Some(cursor) = cursor else { return (AttestedPhase::Prs, None) };
+    let (token, after) = match cursor.split_once(':') {
+        Some((token, after)) => (token, Some(after.to_string())),
+        None => (cursor, None),
+    };
+    match AttestedPhase::parse_token(token) {
+        Some(phase) => (phase, after),
+        None => (AttestedPhase::Prs, None),
     }
 }
 
@@ -582,13 +622,11 @@ impl PapertrailClient for GitHubClient {
             .split_once('/')
             .ok_or_else(|| anyhow::anyhow!("GitHub project is owner/repo"))?;
         let (phase, after) = attested_phase(cursor);
-        let query = if phase == "prs" { ATTESTED_PRS_QUERY } else { ATTESTED_ISSUES_QUERY };
         let variables = serde_json::json!({ "owner": owner, "name": name, "after": after });
-        let Some(data) = self.graphql_query(query, variables).await? else {
+        let Some(data) = self.graphql_query(phase.query(), variables).await? else {
             return Ok(None);
         };
-        let connection =
-            &data["repository"][if phase == "prs" { "pullRequests" } else { "issues" }];
+        let connection = &data["repository"][phase.connection_field()];
         parse_attested_page(connection, phase, project, after.as_deref(), since).map(Some)
     }
 }
@@ -598,7 +636,7 @@ impl PapertrailClient for GitHubClient {
 /// `PapertrailClient` stubs bypass this function entirely, so its bugs are invisible to them).
 fn parse_attested_page(
     connection: &Value,
-    phase: &str,
+    phase: AttestedPhase,
     project: &str,
     after: Option<&str>,
     since: Option<&str>,
@@ -620,136 +658,9 @@ fn parse_attested_page(
             // conservative MINIMUM across phases, so neither stream can skip updates.
             page.frontier = Some(updated_at.to_string());
         }
-        if phase == "prs" {
-            // MERGED-only: a closed-UNMERGED PR closes nothing, yet GitHub still lists its
-            // `closingIssuesReferences` — minting an edge for it would assert a false closer
-            // (the same trap the text tier and the item store guard against). An unmerged PR is
-            // a pure no-op here: it never had a provider edge of ours to replace, either.
-            let Some(merged_at) = node["mergedAt"].as_str() else {
-                continue;
-            };
-            let _ = merged_at;
-            let merge_commit =
-                node.pointer("/mergeCommit/oid").and_then(Value::as_str).map(str::to_string);
-            // The PR phase CREATES keyword edges but does NOT reap: reaping is issue-keyed (see
-            // `replaced_issue_closers`), because a closer-keyed replace-set would clobber the
-            // issue-phase UI-linked rows this PR's `closingIssuesReferences` never lists.
-            // No silent caps: a PR closing >100 issues is pathological, but its tail must surface
-            // as an explicit gap, not vanish past an unpaginated nested connection.
-            if node.pointer("/closingIssuesReferences/pageInfo/hasNextPage")
-                == Some(&Value::Bool(true))
-            {
-                anyhow::bail!(
-                    "PR #{number} carries more than 100 closing references; the nested connection \
-                     is not paginated"
-                );
-            }
-            for closed in node
-                .pointer("/closingIssuesReferences/nodes")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let issue_key = closed["number"].as_u64().unwrap_or_default().to_string();
-                let issue_project = closed
-                    .pointer("/repository/nameWithOwner")
-                    .and_then(Value::as_str)
-                    .unwrap_or(project);
-                // Cross-repository closures are SKIPPED: `closer_key` is same-project by the
-                // schema contract, so a bare PR number under the ISSUE's project would name an
-                // unrelated item. (A both-projects edge shape can lift this later.) GitHub repo
-                // names are CASE-INSENSITIVE: the binding may carry `owner/repo` while GraphQL
-                // returns the canonical `Owner/Repo`, so an exact compare would wrongly treat the
-                // repo's OWN issues as cross-repo and drop every edge — fold ASCII case.
-                if !issue_project.eq_ignore_ascii_case(project) {
-                    continue;
-                }
-                page.edges.push(ClosingEdge {
-                    project: project.to_string(),
-                    issue_kind: ItemKind::Issue,
-                    issue_key,
-                    closer_kind: CloserKind::ChangeRequest,
-                    closer_key: number.clone(),
-                    closer_commit: merge_commit.clone(),
-                    source: ClosingEdgeSource::Provider,
-                });
-            }
-            if let Some(sha) = merge_commit {
-                page.item_updates.push(AttestedItemUpdate {
-                    item_kind: ItemKind::ChangeRequest,
-                    item_key: number.clone(),
-                    resolution: None,
-                    merge_commit_sha: Some(sha),
-                });
-            }
-        } else {
-            if let Some(resolution) = parse::resolution_from_state_reason(
-                node["stateReason"]
-                    .as_str()
-                    .map(|reason| {
-                        // GraphQL enum tokens are UPPER_SNAKE; the REST mapper speaks lowercase.
-                        reason.to_ascii_lowercase()
-                    })
-                    .as_deref(),
-            ) {
-                page.item_updates.push(AttestedItemUpdate {
-                    item_kind: ItemKind::Issue,
-                    item_key: number.clone(),
-                    resolution: Some(resolution),
-                    merge_commit_sha: None,
-                });
-            }
-            page.replaced_issue_closers.push(number.clone());
-            let closer = node
-                .pointer("/timelineItems/nodes")
-                .and_then(Value::as_array)
-                .and_then(|nodes| nodes.last())
-                .map(|event| event["closer"].clone())
-                .unwrap_or(Value::Null);
-            match closer["__typename"].as_str() {
-                Some("Commit") =>
-                    if let Some(oid) = closer["oid"].as_str() {
-                        page.edges.push(ClosingEdge {
-                            project: project.to_string(),
-                            issue_kind: ItemKind::Issue,
-                            issue_key: number.clone(),
-                            closer_kind: CloserKind::Commit,
-                            closer_key: oid.to_string(),
-                            closer_commit: Some(oid.to_string()),
-                            source: ClosingEdgeSource::Provider,
-                        });
-                    },
-                Some("PullRequest") => {
-                    // Cross-repository PR closers are SKIPPED, symmetric to the PR phase:
-                    // `closer_key` is same-project, so a bare PR number under the ISSUE's project
-                    // would name an unrelated item. Case-insensitive like the PR phase — GitHub's
-                    // canonical `nameWithOwner` casing may differ from the binding's project.
-                    let closer_repo = closer
-                        .pointer("/repository/nameWithOwner")
-                        .and_then(Value::as_str)
-                        .unwrap_or(project);
-                    if let Some(pr) = closer["number"].as_u64()
-                        && closer_repo.eq_ignore_ascii_case(project)
-                    {
-                        page.edges.push(ClosingEdge {
-                            project: project.to_string(),
-                            issue_kind: ItemKind::Issue,
-                            issue_key: number.clone(),
-                            closer_kind: CloserKind::ChangeRequest,
-                            closer_key: pr.to_string(),
-                            // Preserve the attested merge commit for a UI-linked PR closure that
-                            // surfaces ONLY through ClosedEvent (no keyword-derived edge from the
-                            // PR phase) — GitHub exposes the closer PR's mergeCommit here.
-                            closer_commit: closer
-                                .pointer("/mergeCommit/oid")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                            source: ClosingEdgeSource::Provider,
-                        });
-                    }
-                },
-                _ => {},
-            }
+        match phase {
+            AttestedPhase::Prs => parse_pr_node(node, &number, project, &mut page)?,
+            AttestedPhase::Issues => parse_issue_node(node, &number, project, &mut page),
         }
     }
     let has_next = connection.pointer("/pageInfo/hasNextPage").and_then(Value::as_bool)
@@ -758,13 +669,151 @@ fn parse_attested_page(
     let end_cursor =
         connection.pointer("/pageInfo/endCursor").and_then(Value::as_str).unwrap_or_default();
     page.next = if has_next {
-        Some(format!("{phase}:{end_cursor}"))
-    } else if phase == "prs" {
-        Some("issues".to_string())
+        Some(format!("{}:{end_cursor}", phase.as_token()))
+    } else if phase == AttestedPhase::Prs {
+        Some(AttestedPhase::Issues.as_token().to_string())
     } else {
         None
     };
     Ok(page)
+}
+
+/// One merged/closed PR node: its `closingIssuesReferences` become provider closer edges and its
+/// attested merge commit an item update.
+fn parse_pr_node(
+    node: &Value,
+    number: &str,
+    project: &str,
+    page: &mut AttestedClosersPage,
+) -> anyhow::Result<()> {
+    // MERGED-only: a closed-UNMERGED PR closes nothing, yet GitHub still lists its
+    // `closingIssuesReferences` — minting an edge for it would assert a false closer (the same
+    // trap the text tier and the item store guard against). An unmerged PR is a pure no-op here:
+    // it never had a provider edge of ours to replace, either.
+    if node["mergedAt"].as_str().is_none() {
+        return Ok(());
+    }
+    let merge_commit = node.pointer("/mergeCommit/oid").and_then(Value::as_str).map(str::to_string);
+    // The PR phase CREATES keyword edges but does NOT reap: reaping is issue-keyed (see
+    // `replaced_issue_closers`), because a closer-keyed replace-set would clobber the issue-phase
+    // UI-linked rows this PR's `closingIssuesReferences` never lists. No silent caps: a PR closing
+    // >100 issues is pathological, but its tail must surface as an explicit gap, not vanish past
+    // an unpaginated nested connection.
+    if node.pointer("/closingIssuesReferences/pageInfo/hasNextPage") == Some(&Value::Bool(true)) {
+        anyhow::bail!(
+            "PR #{number} carries more than 100 closing references; the nested connection is not \
+             paginated"
+        );
+    }
+    for closed in node
+        .pointer("/closingIssuesReferences/nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let issue_key = closed["number"].as_u64().unwrap_or_default().to_string();
+        let issue_project =
+            closed.pointer("/repository/nameWithOwner").and_then(Value::as_str).unwrap_or(project);
+        // Cross-repository closures are SKIPPED: `closer_key` is same-project by the schema
+        // contract, so a bare PR number under the ISSUE's project would name an unrelated item. (A
+        // both-projects edge shape can lift this later.) GitHub repo names are CASE-INSENSITIVE:
+        // the binding may carry `owner/repo` while GraphQL returns the canonical `Owner/Repo`, so
+        // an exact compare would wrongly treat the repo's OWN issues as cross-repo and drop every
+        // edge — fold ASCII case.
+        if !issue_project.eq_ignore_ascii_case(project) {
+            continue;
+        }
+        page.edges.push(ClosingEdge {
+            project: project.to_string(),
+            issue_kind: ItemKind::Issue,
+            issue_key,
+            closer_kind: CloserKind::ChangeRequest,
+            closer_key: number.to_string(),
+            closer_commit: merge_commit.clone(),
+            source: ClosingEdgeSource::Provider,
+        });
+    }
+    if let Some(sha) = merge_commit {
+        page.item_updates.push(AttestedItemUpdate {
+            item_kind: ItemKind::ChangeRequest,
+            item_key: number.to_string(),
+            resolution: None,
+            merge_commit_sha: Some(sha),
+        });
+    }
+    Ok(())
+}
+
+/// One closed issue node: its attested resolution, the issue-keyed closer replace-set, and the
+/// closer of its last `ClosedEvent` (a commit, or a same-project PR).
+fn parse_issue_node(node: &Value, number: &str, project: &str, page: &mut AttestedClosersPage) {
+    if let Some(resolution) = parse::resolution_from_state_reason(
+        node["stateReason"]
+            .as_str()
+            .map(|reason| {
+                // GraphQL enum tokens are UPPER_SNAKE; the REST mapper speaks lowercase.
+                reason.to_ascii_lowercase()
+            })
+            .as_deref(),
+    ) {
+        page.item_updates.push(AttestedItemUpdate {
+            item_kind: ItemKind::Issue,
+            item_key: number.to_string(),
+            resolution: Some(resolution),
+            merge_commit_sha: None,
+        });
+    }
+    page.replaced_issue_closers.push(number.to_string());
+    let closer = node
+        .pointer("/timelineItems/nodes")
+        .and_then(Value::as_array)
+        .and_then(|nodes| nodes.last())
+        .map(|event| event["closer"].clone())
+        .unwrap_or(Value::Null);
+    match closer["__typename"].as_str() {
+        Some("Commit") =>
+            if let Some(oid) = closer["oid"].as_str() {
+                page.edges.push(ClosingEdge {
+                    project: project.to_string(),
+                    issue_kind: ItemKind::Issue,
+                    issue_key: number.to_string(),
+                    closer_kind: CloserKind::Commit,
+                    closer_key: oid.to_string(),
+                    closer_commit: Some(oid.to_string()),
+                    source: ClosingEdgeSource::Provider,
+                });
+            },
+        Some("PullRequest") => {
+            // Cross-repository PR closers are SKIPPED, symmetric to the PR phase: `closer_key` is
+            // same-project, so a bare PR number under the ISSUE's project would name an unrelated
+            // item. Case-insensitive like the PR phase — GitHub's canonical `nameWithOwner` casing
+            // may differ from the binding's project.
+            let closer_repo = closer
+                .pointer("/repository/nameWithOwner")
+                .and_then(Value::as_str)
+                .unwrap_or(project);
+            if let Some(pr) = closer["number"].as_u64()
+                && closer_repo.eq_ignore_ascii_case(project)
+            {
+                page.edges.push(ClosingEdge {
+                    project: project.to_string(),
+                    issue_kind: ItemKind::Issue,
+                    issue_key: number.to_string(),
+                    closer_kind: CloserKind::ChangeRequest,
+                    closer_key: pr.to_string(),
+                    // Preserve the attested merge commit for a UI-linked PR closure that surfaces
+                    // ONLY through ClosedEvent (no keyword-derived edge from the PR phase) —
+                    // GitHub exposes the closer PR's mergeCommit here.
+                    closer_commit: closer
+                        .pointer("/mergeCommit/oid")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    source: ClosingEdgeSource::Provider,
+                });
+            }
+        },
+        _ => {},
+    }
 }
 
 fn github_headers() -> Vec<(&'static str, &'static str)> {
@@ -1491,7 +1540,7 @@ mod tests {
             "closingIssuesReferences": { "pageInfo": { "hasNextPage": false },
                 "nodes": [{ "number": 5, "repository": { "nameWithOwner": "o/r" } }] }
         }]));
-        let page = parse_attested_page(&conn, "prs", "o/r", None, None).unwrap();
+        let page = parse_attested_page(&conn, AttestedPhase::Prs, "o/r", None, None).unwrap();
         assert_eq!(page.edges.len(), 1);
         assert_eq!(page.edges[0].issue_key, "5");
         assert_eq!(page.edges[0].closer_key, "9");
@@ -1509,7 +1558,7 @@ mod tests {
             "closingIssuesReferences": { "pageInfo": { "hasNextPage": false },
                 "nodes": [{ "number": 5, "repository": { "nameWithOwner": "o/r" } }] }
         }]));
-        let page = parse_attested_page(&conn, "prs", "o/r", None, None).unwrap();
+        let page = parse_attested_page(&conn, AttestedPhase::Prs, "o/r", None, None).unwrap();
         assert!(page.edges.is_empty(), "a closed-unmerged PR closes nothing");
         assert!(page.item_updates.is_empty());
     }
@@ -1524,7 +1573,7 @@ mod tests {
                 { "number": 7, "repository": { "nameWithOwner": "o/r" } }
             ] }
         }]));
-        let page = parse_attested_page(&conn, "prs", "o/r", None, None).unwrap();
+        let page = parse_attested_page(&conn, AttestedPhase::Prs, "o/r", None, None).unwrap();
         assert_eq!(page.edges.len(), 1, "the cross-repo o/other#5 is skipped");
         assert_eq!(page.edges[0].issue_key, "7");
         assert_eq!(page.edges[0].project, "o/r");
@@ -1537,7 +1586,7 @@ mod tests {
             "mergeCommit": { "oid": "abc" },
             "closingIssuesReferences": { "pageInfo": { "hasNextPage": true }, "nodes": [] }
         }]));
-        let err = parse_attested_page(&conn, "prs", "o/r", None, None).unwrap_err();
+        let err = parse_attested_page(&conn, AttestedPhase::Prs, "o/r", None, None).unwrap_err();
         assert!(err.to_string().contains("closing references"), "silent truncation must bail");
     }
 
@@ -1550,7 +1599,7 @@ mod tests {
                 { "number": 6, "updatedAt": "2026-01-04T00:00:00Z", "stateReason": "NOT_PLANNED",
                   "timelineItems": { "nodes": [{ "closer": { "__typename": "PullRequest", "number": 11 } }] } }
             ] });
-        let page = parse_attested_page(&conn, "issues", "o/r", None, None).unwrap();
+        let page = parse_attested_page(&conn, AttestedPhase::Issues, "o/r", None, None).unwrap();
         assert_eq!(page.replaced_issue_closers, vec!["5".to_string(), "6".to_string()]);
         let commit_edge = page.edges.iter().find(|e| e.issue_key == "5").unwrap();
         assert_eq!(commit_edge.closer_kind, CloserKind::Commit);
@@ -1570,8 +1619,14 @@ mod tests {
               "mergeCommit": { "oid": "b" }, "closingIssuesReferences": { "pageInfo": { "hasNextPage": false }, "nodes": [] } }
         ]));
         // Watermark cuts at the second (older) node; the phase still advances to issues.
-        let page =
-            parse_attested_page(&conn, "prs", "o/r", None, Some("2026-01-03T00:00:00Z")).unwrap();
+        let page = parse_attested_page(
+            &conn,
+            AttestedPhase::Prs,
+            "o/r",
+            None,
+            Some("2026-01-03T00:00:00Z"),
+        )
+        .unwrap();
         // Only the fresh PR #9 is processed (its merge sha becomes an item update); #8 is cut
         // before it is reached.
         assert_eq!(page.item_updates.len(), 1, "only the fresh PR is processed past the watermark");
@@ -1584,7 +1639,7 @@ mod tests {
             "nodes": [{ "number": 5, "updatedAt": "2026-01-05T00:00:00Z", "stateReason": "COMPLETED",
                 "timelineItems": { "nodes": [{ "closer": { "__typename": "PullRequest", "number": 9,
                     "repository": { "nameWithOwner": "other/repo" } } }] } }] });
-        let page = parse_attested_page(&conn, "issues", "o/r", None, None).unwrap();
+        let page = parse_attested_page(&conn, AttestedPhase::Issues, "o/r", None, None).unwrap();
         assert!(
             page.edges.is_empty(),
             "a PR closer in another repo names a bare number under the wrong project — skip it",
@@ -1604,7 +1659,7 @@ mod tests {
             "closingIssuesReferences": { "pageInfo": { "hasNextPage": false },
                 "nodes": [{ "number": 5, "repository": { "nameWithOwner": "O/R" } }] }
         }]));
-        let pr_page = parse_attested_page(&prs, "prs", "o/r", None, None).unwrap();
+        let pr_page = parse_attested_page(&prs, AttestedPhase::Prs, "o/r", None, None).unwrap();
         assert_eq!(pr_page.edges.len(), 1, "canonical-cased same repo is not cross-repo");
         assert_eq!(pr_page.edges[0].issue_key, "5");
 
@@ -1612,7 +1667,8 @@ mod tests {
             "nodes": [{ "number": 5, "updatedAt": "2026-01-05T00:00:00Z", "stateReason": "COMPLETED",
                 "timelineItems": { "nodes": [{ "closer": { "__typename": "PullRequest", "number": 9,
                     "repository": { "nameWithOwner": "O/R" } } }] } }] });
-        let issue_page = parse_attested_page(&issues, "issues", "o/r", None, None).unwrap();
+        let issue_page =
+            parse_attested_page(&issues, AttestedPhase::Issues, "o/r", None, None).unwrap();
         assert_eq!(issue_page.edges.len(), 1, "the issue-phase PR closer is same-repo too");
         assert_eq!(issue_page.edges[0].closer_key, "9");
     }
@@ -1639,7 +1695,7 @@ mod tests {
                 "timelineItems": { "nodes": [{ "closer": { "__typename": "PullRequest", "number": 9,
                     "mergeCommit": { "oid": "sha9" },
                     "repository": { "nameWithOwner": "o/r" } } }] } }] });
-        let page = parse_attested_page(&conn, "issues", "o/r", None, None).unwrap();
+        let page = parse_attested_page(&conn, AttestedPhase::Issues, "o/r", None, None).unwrap();
         let edge = page.edges.iter().find(|e| e.issue_key == "5").unwrap();
         assert_eq!(edge.closer_kind, CloserKind::ChangeRequest);
         assert_eq!(edge.closer_key, "9");
