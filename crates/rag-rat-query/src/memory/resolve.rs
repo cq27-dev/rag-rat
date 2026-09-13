@@ -152,12 +152,6 @@ pub(crate) fn dir_has_files(conn: &Connection, dir: &str) -> anyhow::Result<bool
     Ok(n != 0)
 }
 
-/// Escape a string for use as a SQLite `LIKE` pattern under `ESCAPE '\'`: the three special
-/// characters `\`, `%`, `_` are backslash-escaped so a path containing one matches literally.
-fn like_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
-}
-
 pub(crate) fn resolve_logical_symbol_binding(
     conn: &Connection,
     logical_symbol_id: i64,

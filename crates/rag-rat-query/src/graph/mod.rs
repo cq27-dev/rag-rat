@@ -17,19 +17,15 @@ const CALL_EDGE_KINDS: &[&str] = &["calls_name", "constructs", "dispatches", "us
 const MACRO_EDGE_KINDS: &[&str] = &["uses_macro"];
 const REFERENCE_EDGE_KINDS: &[&str] =
     &["references_type", "uses_precedence_group", "imports", "exports", "contains", "implements"];
-const OPTIONAL_EDGE_KINDS: &[&str] = &[
-    "calls_name",
-    "constructs",
-    "dispatches",
-    "uses_operator",
-    "uses_macro",
-    "references_type",
-    "uses_precedence_group",
-    "imports",
-    "exports",
-    "contains",
-    "implements",
-];
+
+/// Whether a caller may name `edge_kind` in `GraphTraversalOptions::edge_kinds` — the union of the
+/// three default sets, so a kind added to one of them is accepted by the validator without a
+/// second list to keep in step.
+fn is_optional_edge_kind(edge_kind: &str) -> bool {
+    [CALL_EDGE_KINDS, MACRO_EDGE_KINDS, REFERENCE_EDGE_KINDS]
+        .iter()
+        .any(|set| set.contains(&edge_kind))
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct GraphTraversalOptions {
@@ -174,7 +170,9 @@ impl GraphResolutionMode {
 }
 
 impl GraphTraversalOptions {
-    pub fn callee_edge_kinds(&self) -> anyhow::Result<Vec<String>> {
+    /// The edge kinds a traversal admits. Direction-independent: callers and callees read the same
+    /// set.
+    pub fn traversal_edge_kinds(&self) -> anyhow::Result<Vec<String>> {
         if let Some(edge_kinds) = &self.edge_kinds {
             validate_edge_kinds(edge_kinds)?;
             return Ok(edge_kinds.clone());
@@ -188,10 +186,6 @@ impl GraphTraversalOptions {
             edge_kinds.extend(REFERENCE_EDGE_KINDS.iter().map(|value| (*value).to_string()));
         }
         Ok(edge_kinds)
-    }
-
-    pub fn caller_edge_kinds(&self) -> anyhow::Result<Vec<String>> {
-        self.callee_edge_kinds()
     }
 }
 

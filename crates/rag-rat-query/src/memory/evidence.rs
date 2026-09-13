@@ -1068,7 +1068,7 @@ fn looks_like_path(s: &str, file_paths: &[String]) -> bool {
 /// (indeterminate — never a false absence). A corrupt blob is skipped best-effort.
 fn text_probe(conn: &Connection, ident: &str) -> rusqlite::Result<TextProbe> {
     let target = text_search_target(ident);
-    let Some(query) = fts_phrase_query(target) else {
+    let Some(query) = fts_token_query(target) else {
         return Ok(TextProbe::Exhausted);
     };
     let dicts = chunk_text_dict_bytes(conn)?;
@@ -1163,7 +1163,7 @@ fn text_search_target(ident: &str) -> &str {
 /// of `target`, in order, inside ONE quoted phrase (`"clone edges"`). Every token is kept, even a
 /// 1-char one — dropping an interior token would break the adjacency the phrase relies on. `None`
 /// when the target yields no token (so it can't be in the FTS index — the probe is skipped).
-fn fts_phrase_query(target: &str) -> Option<String> {
+fn fts_token_query(target: &str) -> Option<String> {
     let tokens: Vec<&str> =
         target.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| !t.is_empty()).collect();
     (!tokens.is_empty()).then(|| format!("\"{}\"", tokens.join(" ")))
@@ -1231,12 +1231,6 @@ fn resolve_file_segment(ident: &str, file_paths: &[String]) -> Vec<String> {
     }
     let suffix = format!("/{ident}");
     file_paths.iter().filter(|p| p.ends_with(&suffix)).cloned().collect()
-}
-
-/// Escape a string for use as a SQLite `LIKE` pattern under `ESCAPE '\'` — the three special chars
-/// `\`, `%`, `_` are backslash-escaped so a bound path with a literal `_`/`%` matches literally.
-fn like_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 /// Every indexed file path for the active repo (through the `files` view), sorted for deterministic
@@ -1309,7 +1303,7 @@ fn resolve_bound_files(
             // unrelated sibling's files into this memory's hash/excerpts. Escape the path and use
             // an explicit ESCAPE char; the exact-file arm (`path = ?1`) needs no
             // escaping.
-            let dir_pattern = format!("{}/%", like_escape(&path));
+            let dir_pattern = format!("{}/%", super::like_escape(&path));
             let mut stmt = conn.prepare_cached(
                 "SELECT id, path, sha256 FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
             )?;

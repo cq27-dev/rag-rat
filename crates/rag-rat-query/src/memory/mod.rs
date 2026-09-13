@@ -38,6 +38,12 @@ pub(crate) fn memory_repo_scope_clause(scope: &Option<String>) -> String {
     rag_rat_db::schema::periphery_repo_scope_clause(scope, "repo_memories")
 }
 
+/// Escape a string for use as a SQLite `LIKE` pattern under `ESCAPE '\'`: the three special
+/// characters `\`, `%`, `_` are backslash-escaped so a bound path containing one matches literally.
+pub(crate) fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 /// Serialize `synced_anchor_drifted` only when it is set, so the common case adds no field and a
 /// drifted memory carries a visible one. A reader that never demotes still sees the divergence.
 fn is_not_drifted(drifted: &bool) -> bool {

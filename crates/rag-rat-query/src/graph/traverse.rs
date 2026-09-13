@@ -15,8 +15,7 @@ pub fn traverse_with_options(
     limit: u32,
     options: &GraphTraversalOptions,
 ) -> anyhow::Result<Vec<GraphHop>> {
-    let edge_kinds =
-        if reverse { options.caller_edge_kinds()? } else { options.callee_edge_kinds()? };
+    let edge_kinds = options.traversal_edge_kinds()?;
     let quoted = quoted_placeholders(edge_kinds.len());
     let unique_short_name = unique_symbol_name(conn, short_name(symbol))?;
     let mode = options.resolution_mode;
@@ -185,8 +184,7 @@ pub fn traversal_summary(
     options: &GraphTraversalOptions,
     returned_count: usize,
 ) -> anyhow::Result<GraphTraversalSummary> {
-    let edge_kinds =
-        if reverse { options.caller_edge_kinds()? } else { options.callee_edge_kinds()? };
+    let edge_kinds = options.traversal_edge_kinds()?;
     let quoted = quoted_placeholders(edge_kinds.len());
     let unique_short_name = unique_symbol_name(conn, short_name(symbol))?;
     let mode = options.resolution_mode;

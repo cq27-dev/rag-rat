@@ -29,7 +29,7 @@ pub(crate) const RESOLVED_OPERATOR_ONLY: &str =
 
 pub(crate) fn validate_edge_kinds(edge_kinds: &[String]) -> anyhow::Result<()> {
     for edge_kind in edge_kinds {
-        if !OPTIONAL_EDGE_KINDS.contains(&edge_kind.as_str()) {
+        if !is_optional_edge_kind(edge_kind) {
             anyhow::bail!("unknown graph edge kind `{edge_kind}`");
         }
     }
