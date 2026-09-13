@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
 use super::*;
 
@@ -973,52 +974,97 @@ pub(crate) fn resolve_and_insert_edges(
     Ok(())
 }
 
+/// Resolve one reference to the symbol it names, or `None` when no stage can bind it without
+/// guessing. The stages run in a fixed precedence — receiver type, then the written qualified path,
+/// then the bare name — and a stage may DECLINE (stop with `None`) as well as bind, which is what
+/// keeps a weaker later stage from overriding a stronger stage's negative evidence.
 pub(crate) fn resolve_symbol<'a>(
     request: ResolveSymbolRequest<'_>,
     index: &SymbolIndex<'a>,
 ) -> Option<Resolved<'a>> {
-    let kind_matches = |symbol: &IndexedSymbol| {
-        (request.edge_kind != EdgeKind::UsesMacro || symbol.kind == "macro")
+    let resolution = Resolution::new(&request, index);
+    if resolution.declines_upfront() {
+        return None;
+    }
+    if let Some(resolved) = resolution.try_receiver_type() {
+        return Some(resolved);
+    }
+    if let ControlFlow::Break(resolved) = resolution.try_qualified() {
+        return resolved;
+    }
+    resolution.try_bare_name()
+}
+
+/// One reference's resolution, split into the stages [`resolve_symbol`] runs in order.
+struct Resolution<'r, 'a> {
+    request: &'r ResolveSymbolRequest<'r>,
+    index: &'r SymbolIndex<'a>,
+    policy: Option<&'static crate::index::languages::ResolutionPolicy>,
+    /// The receiver-type identity is classified ONCE at request build (see
+    /// [`ReceiverTypeIdentity`]): only Local identities resolve here — External and Ambiguous
+    /// never bind to local symbols. This is a Local identity's owner path, `None` otherwise.
+    receiver_owner: Option<&'r str>,
+}
+
+impl<'r, 'a> Resolution<'r, 'a> {
+    fn new(request: &'r ResolveSymbolRequest<'r>, index: &'r SymbolIndex<'a>) -> Self {
+        Self {
+            request,
+            index,
+            policy: crate::index::languages::resolver_policy_for_name(request.source_language),
+            receiver_owner: request.receiver_type.and_then(ReceiverTypeIdentity::local_owner),
+        }
+    }
+
+    fn has_local_receiver_type(&self) -> bool {
+        self.receiver_owner.is_some()
+    }
+
+    fn kind_matches(&self, symbol: &IndexedSymbol) -> bool {
+        (self.request.edge_kind != EdgeKind::UsesMacro || symbol.kind == "macro")
             && crate::index::languages::target_matches_policy(
-                request.source_language,
-                request.edge_kind,
+                self.request.source_language,
+                self.request.edge_kind,
                 &symbol.language,
                 &symbol.kind,
             )
-    };
-    // Crate-aware import suppression (#61 Project B): the name is `use`d from an external
-    // dependency crate, so it denotes that dependency's item — never a local same-named symbol.
-    // Leave it unresolved (the SCIP oracle bins it `resolved-external`). This kills the
-    // external-dep collisions (`Url` → local instead of the `url` crate) WITHOUT touching
-    // correct cross-crate binds into local workspace crates (those roots are in the local-crate
-    // set, so not external).
-    //
-    let policy = crate::index::languages::resolver_policy_for_name(request.source_language);
-    // A language-owned local qualifier overrides an external bare-leaf import.
-    if request.imported_external
-        && !request.target_qualified_name.and_then(|path| path.split_once("::")).is_some_and(
-            |(root, _)| {
-                policy.is_some_and(|policy| {
-                    (policy.qualified_root)(root) == crate::index::languages::QualifiedRoot::Local
-                })
-            },
-        )
-    {
-        return None;
     }
-    if policy.is_some_and(|policy| {
-        (policy.reference_disposition)(request.edge_kind, request.name)
-            == crate::index::languages::ReferenceDisposition::Unresolvable
-    }) {
-        return None;
+
+    /// References no stage may bind, whatever the index holds.
+    fn declines_upfront(&self) -> bool {
+        let request = self.request;
+        // Crate-aware import suppression (#61 Project B): the name is `use`d from an external
+        // dependency crate, so it denotes that dependency's item — never a local same-named symbol.
+        // Leave it unresolved (the SCIP oracle bins it `resolved-external`). This kills the
+        // external-dep collisions (`Url` → local instead of the `url` crate) WITHOUT touching
+        // correct cross-crate binds into local workspace crates (those roots are in the local-crate
+        // set, so not external).
+        //
+        // A language-owned local qualifier overrides an external bare-leaf import.
+        let external_import = request.imported_external
+            && !request.target_qualified_name.and_then(|path| path.split_once("::")).is_some_and(
+                |(root, _)| {
+                    self.policy.is_some_and(|policy| {
+                        (policy.qualified_root)(root)
+                            == crate::index::languages::QualifiedRoot::Local
+                    })
+                },
+            );
+        external_import
+            || self.policy.is_some_and(|policy| {
+                (policy.reference_disposition)(request.edge_kind, request.name)
+                    == crate::index::languages::ReferenceDisposition::Unresolvable
+            })
     }
-    // The receiver-type identity is classified ONCE at request build (see
-    // [`ReceiverTypeIdentity`]): only Local identities resolve here — External and Ambiguous
-    // never bind to local symbols. A qualified local hint additionally earns the conservative
-    // tail fallback below; a bare one IS its own tail.
-    let receiver_owner = request.receiver_type.and_then(ReceiverTypeIdentity::local_owner);
-    let has_local_receiver_type = receiver_owner.is_some();
-    if let (Some(identity), Some(type_hint)) = (request.receiver_type, receiver_owner) {
+
+    /// A Local receiver type binds through its owner's scope. A qualified local hint additionally
+    /// earns the conservative tail fallback below; a bare one IS its own tail.
+    fn try_receiver_type(&self) -> Option<Resolved<'a>> {
+        let request = self.request;
+        let index = self.index;
+        let (Some(identity), Some(type_hint)) = (request.receiver_type, self.receiver_owner) else {
+            return None;
+        };
         let target = format!("{type_hint}::{}", request.name);
         let target_normalized = receiver_scope_path(&target, request.source_language);
         // A bare, non-import-bound receiver names this package's own type, and `Worker::run` is
@@ -1049,7 +1095,7 @@ pub(crate) fn resolve_symbol<'a>(
                 .flatten()
                 .copied()
                 .filter(|symbol| {
-                    kind_matches(symbol)
+                    self.kind_matches(symbol)
                         && in_receiver_package(symbol)
                         && (!require_alias_file
                             || alias_owner_matches_symbol_file(type_hint, symbol))
@@ -1078,7 +1124,7 @@ pub(crate) fn resolve_symbol<'a>(
                 )
                 .copied()
                 .filter(|symbol| {
-                    kind_matches(symbol)
+                    self.kind_matches(symbol)
                         && in_receiver_package(symbol)
                         && scope_grammar::generic_arguments_compatible(target, &symbol.scope_path)
                         && (!require_alias_file
@@ -1118,7 +1164,7 @@ pub(crate) fn resolve_symbol<'a>(
                 .flatten()
                 .copied()
                 .filter(|symbol| {
-                    kind_matches(symbol)
+                    self.kind_matches(symbol)
                         && in_receiver_package(symbol)
                         && (symbol.scope_path.ends_with(&scope_suffix)
                             || receiver_scope_path(&symbol.scope_path, Some(&symbol.language))
@@ -1135,8 +1181,19 @@ pub(crate) fn resolve_symbol<'a>(
                 return Some((symbol, EdgeConfidence::Syntactic, reason));
             }
         }
+        None
     }
-    if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
+
+    /// The written qualified path, strongest surface first. `Break(None)` declines the reference
+    /// outright: an ambiguous path, an unresolvable projection, or a qualifier the language does
+    /// not let fall back to the bare name.
+    fn try_qualified(&self) -> ControlFlow<Option<Resolved<'a>>> {
+        let request = self.request;
+        let index = self.index;
+        let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty())
+        else {
+            return ControlFlow::Continue(());
+        };
         // Semantic SCOPE-PATH match first (#61). An edge's `target_qualified_name` is a source-code
         // path (`Workspace::new`), which aligns with a symbol's `scope_path`
         // (`core::Workspace::new`) — NOT with the file-path `qualified_name` below, which a
@@ -1156,10 +1213,12 @@ pub(crate) fn resolve_symbol<'a>(
             .into_iter()
             .flatten()
             .copied()
-            .filter(|symbol| kind_matches(symbol))
+            .filter(|symbol| self.kind_matches(symbol))
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&scope_exact) {
-            return Some(hit.resolved(EdgeConfidence::Exact, ResolutionReason::ScopeExact));
+            return ControlFlow::Break(Some(
+                hit.resolved(EdgeConfidence::Exact, ResolutionReason::ScopeExact),
+            ));
         }
         // Reaching here means the exact stage found NOTHING or found an AMBIGUITY. Either way the
         // raw candidates at the normalized key belong in this set: when normalization was a no-op
@@ -1186,14 +1245,14 @@ pub(crate) fn resolve_symbol<'a>(
                     .flatten(),
             )
             .copied()
-            .filter(|symbol| kind_matches(symbol))
+            .filter(|symbol| self.kind_matches(symbol))
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&scope_normalized) {
-            return Some((
+            return ControlFlow::Break(Some((
                 hit.symbol(),
                 EdgeConfidence::Syntactic,
                 ResolutionReason::ScopeDegeneric,
-            ));
+            )));
         }
         let scope_suffix = format!("::{qualified}");
         let scope_matches = index
@@ -1202,10 +1261,14 @@ pub(crate) fn resolve_symbol<'a>(
             .into_iter()
             .flatten()
             .copied()
-            .filter(|symbol| kind_matches(symbol) && symbol.scope_path.ends_with(&scope_suffix))
+            .filter(|symbol| {
+                self.kind_matches(symbol) && symbol.scope_path.ends_with(&scope_suffix)
+            })
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&scope_matches) {
-            return Some(hit.resolved(EdgeConfidence::Syntactic, ResolutionReason::ScopeSuffix));
+            return ControlFlow::Break(Some(
+                hit.resolved(EdgeConfidence::Syntactic, ResolutionReason::ScopeSuffix),
+            ));
         }
         // Exact qualified-name match (bucket entries already share `qualified_name == qualified`).
         if let Some(symbol) = index
@@ -1214,9 +1277,13 @@ pub(crate) fn resolve_symbol<'a>(
             .into_iter()
             .flatten()
             .copied()
-            .find(|symbol| kind_matches(symbol))
+            .find(|symbol| self.kind_matches(symbol))
         {
-            return Some((symbol, EdgeConfidence::Exact, ResolutionReason::Exact));
+            return ControlFlow::Break(Some((
+                symbol,
+                EdgeConfidence::Exact,
+                ResolutionReason::Exact,
+            )));
         }
         let suffix = format!("::{qualified}");
         let matches = index
@@ -1225,17 +1292,17 @@ pub(crate) fn resolve_symbol<'a>(
             .into_iter()
             .flatten()
             .copied()
-            .filter(|symbol| kind_matches(symbol) && symbol.qualified_name.ends_with(&suffix))
+            .filter(|symbol| self.kind_matches(symbol) && symbol.qualified_name.ends_with(&suffix))
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&matches) {
-            return Some(
+            return ControlFlow::Break(Some(
                 hit.resolved(EdgeConfidence::Syntactic, ResolutionReason::QualifiedSuffix),
-            );
+            ));
         }
         // Distinct qualified-name matches: the written path is ambiguous, and a bare-name guess
         // would be weaker evidence than that ambiguity.
         if !matches.is_empty() {
-            return None;
+            return ControlFlow::Break(None);
         }
         let projected_self = request.source_language == Some(Language::Rust.as_str())
             && request.receiver_hint == Some("Self")
@@ -1247,9 +1314,9 @@ pub(crate) fn resolve_symbol<'a>(
             // `Self::Assoc::run()` dispatches through the associated type, not the enclosing impl
             // owner. Until projection resolution can establish that type, a bare `run` match is
             // less evidence than the written path and must not claim an unrelated method.
-            return None;
+            return ControlFlow::Break(None);
         }
-        if !has_local_receiver_type
+        if !self.has_local_receiver_type()
             && !allow_unqualified_fallback(
                 request.edge_kind,
                 qualified,
@@ -1259,102 +1326,115 @@ pub(crate) fn resolve_symbol<'a>(
                 request.source_language,
             )
         {
+            return ControlFlow::Break(None);
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// The last resort: every symbol sharing the reference's bare name, narrowed by kind
+    /// preference and then by the reference's own file.
+    fn try_bare_name(&self) -> Option<Resolved<'a>> {
+        let request = self.request;
+        let has_local_receiver_type = self.has_local_receiver_type();
+        // A typed receiver that did not match its owner is negative evidence for repository-wide
+        // bare-name resolution. A qualified target still gets its stronger scope-path pass above,
+        // which preserves `self.default_method()` calls in traits without letting `Worker::run`
+        // drift onto an unrelated same-tail owner.
+        //
+        // A Rust receiver-bearing call may reach this bare-name stage only with a proven local
+        // owner. The candidate must either belong to that owner or be a trait default backed by an
+        // indexed `impl Trait for Owner`; receiver spelling alone is not evidence. In particular,
+        // derives mint no impl symbol, so `self.clone()` cannot claim an unrelated workspace
+        // `clone`.
+        let rust_receiver_fallback = request.source_language == Some(Language::Rust.as_str())
+            && (has_local_receiver_type || matches!(request.receiver_hint, Some("self" | "Self")));
+        // ANY receiver-type identity closes this door, not only a local one. An `ExternalQualified`
+        // receiver proves the owner is a dependency's, so no local symbol can be the answer — that
+        // is the whole point of classifying it — and `Ambiguous` is unusable evidence, which is
+        // still not the same as no evidence. Gating on `has_local_receiver_type` let both fall
+        // through to repo-wide bare-name matching, where `use dep::Worker; fn f(w: Worker) {
+        // w.run(); }` bound whatever unique local `run` existed.
+        if request.receiver_type.is_some() && !has_local_receiver_type {
             return None;
         }
-    }
-    // A typed receiver that did not match its owner is negative evidence for repository-wide
-    // bare-name resolution. A qualified target still gets its stronger scope-path pass above,
-    // which preserves `self.default_method()` calls in traits without letting `Worker::run`
-    // drift onto an unrelated same-tail owner.
-    //
-    // A Rust receiver-bearing call may reach this bare-name stage only with a proven local owner.
-    // The candidate must either belong to that owner or be a trait default backed by an indexed
-    // `impl Trait for Owner`; receiver spelling alone is not evidence. In particular, derives mint
-    // no impl symbol, so `self.clone()` cannot claim an unrelated workspace `clone`.
-    let rust_receiver_fallback = request.source_language == Some(Language::Rust.as_str())
-        && (has_local_receiver_type || matches!(request.receiver_hint, Some("self" | "Self")));
-    // ANY receiver-type identity closes this door, not only a local one. An `ExternalQualified`
-    // receiver proves the owner is a dependency's, so no local symbol can be the answer — that is
-    // the whole point of classifying it — and `Ambiguous` is unusable evidence, which is still not
-    // the same as no evidence. Gating on `has_local_receiver_type` let both fall through to
-    // repo-wide bare-name matching, where `use dep::Worker; fn f(w: Worker) { w.run(); }` bound
-    // whatever unique local `run` existed.
-    if request.receiver_type.is_some() && !has_local_receiver_type {
-        return None;
-    }
-    if rust_receiver_fallback && !has_local_receiver_type {
-        return None;
-    }
-    let short = short_name(request.name);
-    // A reference that carried a qualifier or a receiver has already had its qualified shape tried
-    // above; reaching the bare-name fallback means that shape found nothing. Some target kinds are
-    // only ever evidenced by the BARE shape (a Swift enum case, reachable by bare name only through
-    // shorthand `.idle`), so binding one to a qualified/receiver-bearing reference here would
-    // manufacture a dependency the source never expressed — `client.idle()` becoming a "caller" of
-    // `enum Status { case idle }`. Let the language policy exclude those kinds from this fallback.
-    // ANY receiver-type identity — including Ambiguous — suppresses the bare fallback: unusable
-    // evidence is not the same as no evidence.
-    let reference_is_bare = request.target_qualified_name.is_none_or(str::is_empty)
-        && request.receiver_hint.is_none_or(str::is_empty)
-        && request.receiver_type.is_none();
-    let bare_shape_ok = |symbol: &IndexedSymbol| {
-        reference_is_bare
-            || !policy.is_some_and(|policy| {
-                (policy.target_shape)(request.edge_kind, &symbol.kind)
-                    == crate::index::languages::ReferenceShape::UnqualifiedOnly
+        if rust_receiver_fallback && !has_local_receiver_type {
+            return None;
+        }
+        let short = short_name(request.name);
+        // A reference that carried a qualifier or a receiver has already had its qualified shape
+        // tried above; reaching the bare-name fallback means that shape found nothing. Some target
+        // kinds are only ever evidenced by the BARE shape (a Swift enum case, reachable by bare
+        // name only through shorthand `.idle`), so binding one to a qualified/receiver-bearing
+        // reference here would manufacture a dependency the source never expressed —
+        // `client.idle()` becoming a "caller" of `enum Status { case idle }`. Let the language
+        // policy exclude those kinds from this fallback. ANY receiver-type identity — including
+        // Ambiguous — suppresses the bare fallback: unusable evidence is not the same as no
+        // evidence.
+        let reference_is_bare = request.target_qualified_name.is_none_or(str::is_empty)
+            && request.receiver_hint.is_none_or(str::is_empty)
+            && request.receiver_type.is_none();
+        let bare_shape_ok = |symbol: &IndexedSymbol| {
+            reference_is_bare
+                || !self.policy.is_some_and(|policy| {
+                    (policy.target_shape)(request.edge_kind, &symbol.kind)
+                        == crate::index::languages::ReferenceShape::UnqualifiedOnly
+                })
+        };
+        let matches = self
+            .index
+            .by_name
+            .get(short)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|symbol| {
+                self.kind_matches(symbol)
+                    && bare_shape_ok(symbol)
+                    && if rust_receiver_fallback {
+                        receiver_type_admits_owner(
+                            self.receiver_owner,
+                            request.receiver_package,
+                            request.file_package,
+                            symbol,
+                            self.index,
+                        )
+                    } else {
+                        true
+                    }
             })
-    };
-    let matches = index
-        .by_name
-        .get(short)
-        .into_iter()
-        .flatten()
-        .copied()
-        .filter(|symbol| {
-            kind_matches(symbol)
-                && bare_shape_ok(symbol)
-                && if rust_receiver_fallback {
-                    receiver_type_admits_owner(
-                        receiver_owner,
-                        request.receiver_package,
-                        request.file_package,
-                        symbol,
-                        index,
-                    )
-                } else {
-                    true
-                }
-        })
-        .collect::<Vec<_>>();
-    let preferred = preferred_matches(request.edge_kind, request.source_language, &matches);
-    // Language policy decides whether a type-position reference may bind a value declaration.
-    if preferred.is_empty()
-        && request.edge_kind == EdgeKind::ReferencesType
-        && policy.is_some_and(|policy| {
-            policy.type_binding == crate::index::languages::TypeBinding::DefinitionsOnly
-        })
-    {
-        return None;
+            .collect::<Vec<_>>();
+        let preferred = preferred_matches(request.edge_kind, request.source_language, &matches);
+        // Language policy decides whether a type-position reference may bind a value declaration.
+        if preferred.is_empty()
+            && request.edge_kind == EdgeKind::ReferencesType
+            && self.policy.is_some_and(|policy| {
+                policy.type_binding == crate::index::languages::TypeBinding::DefinitionsOnly
+            })
+        {
+            return None;
+        }
+        if preferred.is_empty()
+            && crate::index::languages::requires_same_language_target(
+                request.source_language,
+                request.edge_kind,
+            )
+        {
+            return None;
+        }
+        let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
+        if let Some(hit) = unique_or_logical(matches) {
+            return Some(
+                hit.resolved(EdgeConfidence::Syntactic, ResolutionReason::TargetNameFallback),
+            );
+        }
+        let same_file = matches
+            .iter()
+            .copied()
+            .filter(|symbol| symbol.file_id == request.source_file_id)
+            .collect::<Vec<_>>();
+        unique_or_logical(&same_file)
+            .map(|hit| hit.resolved(EdgeConfidence::Syntactic, ResolutionReason::SameFileName))
     }
-    if preferred.is_empty()
-        && crate::index::languages::requires_same_language_target(
-            request.source_language,
-            request.edge_kind,
-        )
-    {
-        return None;
-    }
-    let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
-    if let Some(hit) = unique_or_logical(matches) {
-        return Some(hit.resolved(EdgeConfidence::Syntactic, ResolutionReason::TargetNameFallback));
-    }
-    let same_file = matches
-        .iter()
-        .copied()
-        .filter(|symbol| symbol.file_id == request.source_file_id)
-        .collect::<Vec<_>>();
-    unique_or_logical(&same_file)
-        .map(|hit| hit.resolved(EdgeConfidence::Syntactic, ResolutionReason::SameFileName))
 }
 
 /// A resolved binding: the target, the confidence stamped on the edge, and the persisted reason.
