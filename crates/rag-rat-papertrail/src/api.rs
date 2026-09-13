@@ -168,107 +168,60 @@ impl ProviderClient {
     }
 }
 
-impl PapertrailClient for ProviderClient {
+/// Implement [`PapertrailClient`] for [`ProviderClient`] by delegating each listed method to the
+/// wrapped provider client. The list must name EVERY trait method, defaulted ones included: a
+/// method left off compiles against the trait default instead of the provider's override — the
+/// wrapper would swallow, say, a provider's `attested_closers_page` behind the `Ok(None)` default
+/// and the attested lane would silently degrade to the text tier.
+macro_rules! delegate_provider_client {
+    (
+        $(async fn $name:ident(&self $(, $arg:ident: $ty:ty)*) -> $ret:ty;)*
+        $(fn $sync_name:ident(&self $(, $sync_arg:ident: $sync_ty:ty)*) -> $sync_ret:ty;)*
+    ) => {
+        impl PapertrailClient for ProviderClient {
+            $(
+                async fn $name(&self $(, $arg: $ty)*) -> $ret {
+                    match self {
+                        Self::Github(client) => client.$name($($arg),*).await,
+                        Self::Gitlab(client) => client.$name($($arg),*).await,
+                    }
+                }
+            )*
+            $(
+                fn $sync_name(&self $(, $sync_arg: $sync_ty)*) -> $sync_ret {
+                    match self {
+                        Self::Github(client) => client.$sync_name($($sync_arg),*),
+                        Self::Gitlab(client) => client.$sync_name($($sync_arg),*),
+                    }
+                }
+            )*
+        }
+    };
+}
+
+delegate_provider_client! {
     async fn item(
-        &self,
-        project: &str,
-        kind: ItemKind,
-        key: &str,
-    ) -> anyhow::Result<PapertrailItem> {
-        match self {
-            Self::Github(client) => client.item(project, kind, key).await,
-            Self::Gitlab(client) => client.item(project, kind, key).await,
-        }
-    }
-
+        &self, project: &str, kind: ItemKind, key: &str
+    ) -> anyhow::Result<PapertrailItem>;
     async fn item_comments(
-        &self,
-        project: &str,
-        kind: ItemKind,
-        key: &str,
-    ) -> anyhow::Result<Vec<PapertrailComment>> {
-        match self {
-            Self::Github(client) => client.item_comments(project, kind, key).await,
-            Self::Gitlab(client) => client.item_comments(project, kind, key).await,
-        }
-    }
-
-    fn item_comment_streams(&self, kind: ItemKind) -> &'static [&'static str] {
-        match self {
-            Self::Github(client) => client.item_comment_streams(kind),
-            Self::Gitlab(client) => client.item_comment_streams(kind),
-        }
-    }
-
+        &self, project: &str, kind: ItemKind, key: &str
+    ) -> anyhow::Result<Vec<PapertrailComment>>;
     async fn item_comments_page(
-        &self,
-        project: &str,
-        kind: ItemKind,
-        key: &str,
-        cursor: &PageCursor,
-    ) -> anyhow::Result<CommentsPage> {
-        match self {
-            Self::Github(client) => client.item_comments_page(project, kind, key, cursor).await,
-            Self::Gitlab(client) => client.item_comments_page(project, kind, key, cursor).await,
-        }
-    }
-
-    async fn enrich_item(&self, item: &mut PapertrailItem) -> anyhow::Result<()> {
-        match self {
-            Self::Github(client) => client.enrich_item(item).await,
-            Self::Gitlab(client) => client.enrich_item(item).await,
-        }
-    }
-
-    async fn items_page(&self, project: &str, cursor: &PageCursor) -> anyhow::Result<ItemsPage> {
-        match self {
-            Self::Github(client) => client.items_page(project, cursor).await,
-            Self::Gitlab(client) => client.items_page(project, cursor).await,
-        }
-    }
-
-    fn comment_streams(&self) -> &'static [&'static str] {
-        match self {
-            Self::Github(client) => client.comment_streams(),
-            Self::Gitlab(client) => client.comment_streams(),
-        }
-    }
-
+        &self, project: &str, kind: ItemKind, key: &str, cursor: &PageCursor
+    ) -> anyhow::Result<CommentsPage>;
+    async fn enrich_item(&self, item: &mut PapertrailItem) -> anyhow::Result<()>;
+    async fn items_page(&self, project: &str, cursor: &PageCursor) -> anyhow::Result<ItemsPage>;
     async fn comments_page(
-        &self,
-        project: &str,
-        cursor: &PageCursor,
-    ) -> anyhow::Result<CommentsPage> {
-        match self {
-            Self::Github(client) => client.comments_page(project, cursor).await,
-            Self::Gitlab(client) => client.comments_page(project, cursor).await,
-        }
-    }
-
+        &self, project: &str, cursor: &PageCursor
+    ) -> anyhow::Result<CommentsPage>;
     async fn freshness_probe(
-        &self,
-        project: &str,
-        probe: &FreshnessProbe,
-    ) -> anyhow::Result<FreshnessResult> {
-        match self {
-            Self::Github(client) => client.freshness_probe(project, probe).await,
-            Self::Gitlab(client) => client.freshness_probe(project, probe).await,
-        }
-    }
+        &self, project: &str, probe: &FreshnessProbe
+    ) -> anyhow::Result<FreshnessResult>;
     async fn attested_closers_page(
-        &self,
-        project: &str,
-        cursor: Option<&str>,
-        since: Option<&str>,
-    ) -> anyhow::Result<Option<AttestedClosersPage>> {
-        // Delegation is MANDATORY here: the enum wrapper otherwise swallows a provider's
-        // override behind the trait's `Ok(None)` default and the attested lane silently
-        // degrades to the text tier.
-        match self {
-            Self::Github(client) => client.attested_closers_page(project, cursor, since).await,
-            Self::Gitlab(client) => client.attested_closers_page(project, cursor, since).await,
-        }
-    }
+        &self, project: &str, cursor: Option<&str>, since: Option<&str>
+    ) -> anyhow::Result<Option<AttestedClosersPage>>;
+    fn item_comment_streams(&self, kind: ItemKind) -> &'static [&'static str];
+    fn comment_streams(&self) -> &'static [&'static str];
 }
 
 /// What one dispatched binding produced: a resumable report, or the error entry to surface.
