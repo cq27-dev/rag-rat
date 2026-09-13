@@ -154,30 +154,16 @@ pub(crate) fn reconcile_with_options_progress(
                 _ => ("Current", None),
             };
             let report = ReconcileReport {
-                processed_chunks: 0,
-                embeddings_written: 0,
-                skipped_chunks: 0,
-                failed_chunks: 0,
-                blocked_chunks: 0,
-                model_id: active_model_id.clone(),
-                model_version: model_version.clone(),
-                embedding_dim,
-                batch_size,
-                max_embedding_chars,
-                forced: options.force,
-                changed_first: options.changed_first,
-                until_clean: options.until_clean,
-                max_seconds: options.max_seconds,
-                work_reasons: BTreeMap::new(),
-                skipped_by_policy: BTreeMap::new(),
-                input_chars: 0,
-                truncated_inputs: 0,
-                elapsed_ms: 0,
-                chunks_per_sec: 0.0,
-                chars_per_sec: 0.0,
-                avg_chars_per_chunk: 0.0,
                 status: status.to_string(),
                 message,
+                ..batch_write::empty_current_reconcile_report(
+                    active_model_id.clone(),
+                    model_version.clone(),
+                    embedding_dim,
+                    batch_size,
+                    max_embedding_chars,
+                    &options,
+                )
             };
             finish_reconcile_attempt(conn, attempt_id, &report)?;
             progress(ReconcileProgress::Started {
@@ -208,30 +194,16 @@ pub(crate) fn reconcile_with_options_progress(
     let skipped_by_policy = policy_scan::embedding_policy_skip_summary(conn, max_embedding_chars)?;
     let skipped_chunks = skipped_by_policy.values().sum();
     let mut report = ReconcileReport {
-        processed_chunks: 0,
-        embeddings_written: 0,
         skipped_chunks,
-        failed_chunks: 0,
-        blocked_chunks: 0,
-        model_id: active_model_id.clone(),
-        model_version: model_version.clone(),
-        embedding_dim,
-        batch_size,
-        max_embedding_chars,
-        forced: options.force,
-        changed_first: options.changed_first,
-        until_clean: options.until_clean,
-        max_seconds: options.max_seconds,
-        work_reasons: BTreeMap::new(),
         skipped_by_policy,
-        input_chars: 0,
-        truncated_inputs: 0,
-        elapsed_ms: 0,
-        chunks_per_sec: 0.0,
-        chars_per_sec: 0.0,
-        avg_chars_per_chunk: 0.0,
-        status: "Current".to_string(),
-        message: None,
+        ..batch_write::empty_current_reconcile_report(
+            active_model_id.clone(),
+            model_version.clone(),
+            embedding_dim,
+            batch_size,
+            max_embedding_chars,
+            &options,
+        )
     };
 
     // `_provisioned` MUST outlive the embed loop: its `Drop` is the box teardown. Bound at function
