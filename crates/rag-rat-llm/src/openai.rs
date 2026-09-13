@@ -32,7 +32,7 @@ struct EmbedRequest<'a> {
 
 /// One item of the `/v1/embeddings` response `data` array. `index` is the position of this
 /// embedding's input WITHIN the request (0-based); a server may return items out of order, so we
-/// reorder by it and require the indices to cover exactly `0..len` (see `embed_one_request_with`).
+/// reorder by it and require the indices to cover exactly `0..len` (see `validate_embeddings`).
 #[derive(Deserialize)]
 struct EmbedData {
     embedding: Vec<f32>,
@@ -247,63 +247,9 @@ impl OpenAiEmbedder {
         auth_header: Option<&str>,
         texts: &[String],
     ) -> anyhow::Result<Vec<Vec<f32>>> {
-        let payload = EmbedRequest { model: server_model, input: texts, encoding_format: "float" };
-        let raw = crate::http::post_json(&agent, embed_url, auth_header, &payload, "embed")?;
-        let parsed: EmbedResponse = serde_json::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("malformed embed response: {e}"))?;
-
-        // Count contract: one embedding per input, retryable on violation (a transient server fault
-        // can drop rows).
-        let n = texts.len();
-        if parsed.data.len() != n {
-            anyhow::bail!(
-                "embed count mismatch: requested {n} texts but server returned {} embeddings",
-                parsed.data.len()
-            );
-        }
-
-        // The OpenAI `data[]` carries a per-request `index`; a server MAY return items out of
-        // order. Place each embedding at its `index` and require the indices to cover
-        // EXACTLY `0..n` with no duplicate or out-of-range — sorting alone would silently
-        // accept a dup/gap and misalign vectors with their chunks.
-        let mut ordered: Vec<Option<Vec<f32>>> = std::iter::repeat_with(|| None).take(n).collect();
-        for item in parsed.data {
-            let idx = item.index;
-            if idx >= n {
-                anyhow::bail!("embed response index {idx} out of range for {n} inputs");
-            }
-            if ordered[idx].is_some() {
-                anyhow::bail!("embed response has a duplicate index {idx}");
-            }
-            ordered[idx] = Some(item.embedding);
-        }
-        let embeddings = ordered
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| v.ok_or_else(|| anyhow::anyhow!("embed response is missing index {i}")))
-            .collect::<anyhow::Result<Vec<Vec<f32>>>>()?;
-
-        // Dim contract (LOUD): the int8 encoding, per-family centroids, and the linked-entries rail
-        // all assume a fixed dim. A server returning a different-width vector means the configured
-        // model and the server model disagree — naming both dims makes the misconfiguration
-        // obvious. EVERY vector is checked, not just the first: a late wrong-width vector that
-        // slipped through would make `store_embedding` bail and ABORT the whole reconcile instead
-        // of failing just that chunk, so we name the offending index and reject here.
-        for (i, vector) in embeddings.iter().enumerate() {
-            if vector.len() != dim {
-                anyhow::bail!(
-                    "embed dim mismatch: server returned a {}-dim vector at index {} but this \
-                     model is configured for {} dims (server model `{}`). The selected registry \
-                     model and the server model must match.",
-                    vector.len(),
-                    i,
-                    dim,
-                    server_model
-                );
-            }
-        }
-
-        Ok(embeddings)
+        let parsed =
+            request_embeddings(&agent, embed_url, server_model, auth_header, texts, "embed")?;
+        validate_embeddings(parsed, texts.len(), Some(dim), server_model)
     }
 
     /// Send ONE `/v1/embeddings` request for `texts` (already sized to `<= self.batch_size` by the
@@ -324,43 +270,101 @@ impl OpenAiEmbedder {
     /// EVAL-ONLY (#346): embed a single probe text and return the server's response vector LENGTH,
     /// WITHOUT enforcing the dim-parity contract. The `benchmark-embedding` CLI uses this to learn
     /// the dimension of an OFF-REGISTRY HF model (no registry `spec.dim` to check against) before
-    /// the throughput sweep. It calls the shared request path with `dim = observed` — i.e. it
-    /// reads the first vector's length and validates against ITSELF, so no mismatch is
-    /// possible; the point is to LEARN the dim, not enforce a known one.
+    /// the throughput sweep. It runs the shared request + count/index validation with no expected
+    /// dim — the point is to LEARN the dim, not enforce a known one.
     #[cfg(feature = "eval")]
     pub(crate) fn probe_dim(&self) -> anyhow::Result<usize> {
         let probe = ["rag-rat benchmark dim probe".to_string()];
-        // Two-phase: send the request with the dim guard DISABLED (a sentinel `0` never equals a
-        // real vector width, so `embed_one_request_with` would reject it — instead we read
-        // the raw length directly here via a guard-free variant).
-        let vectors = Self::embed_first_vector_unchecked(
-            self.agent.clone(),
+        let parsed = request_embeddings(
+            &self.agent,
             &self.embed_url,
             &self.server_model,
             self.auth_header.as_deref(),
             &probe,
+            "dim probe",
         )?;
+        let vectors = validate_embeddings(parsed, probe.len(), None, &self.server_model)?;
         vectors.first().map(Vec::len).ok_or_else(|| anyhow::anyhow!("dim probe returned no vector"))
     }
+}
 
-    /// EVAL-ONLY (#346): the request + parse of [`Self::embed_one_request_with`] WITHOUT the
-    /// per-vector dim-parity check — the guard-free path [`Self::probe_dim`] uses to LEARN an
-    /// off-registry model's dim. Enforces the count contract still (one embedding per input), just
-    /// not the dim (there is no known dim to enforce yet).
-    #[cfg(feature = "eval")]
-    fn embed_first_vector_unchecked(
-        agent: ureq::Agent,
-        embed_url: &str,
-        server_model: &str,
-        auth_header: Option<&str>,
-        texts: &[String],
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
-        let payload = EmbedRequest { model: server_model, input: texts, encoding_format: "float" };
-        let raw = crate::http::post_json(&agent, embed_url, auth_header, &payload, "dim probe")?;
-        let parsed: EmbedResponse = serde_json::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("malformed dim probe response: {e}"))?;
-        Ok(parsed.data.into_iter().map(|item| item.embedding).collect())
+/// Send ONE `/v1/embeddings` request for `texts` and parse the success body. `op` labels the call
+/// in errors (`embed` for the embed path, `dim probe` for the eval probe).
+fn request_embeddings(
+    agent: &ureq::Agent,
+    embed_url: &str,
+    server_model: &str,
+    auth_header: Option<&str>,
+    texts: &[String],
+    op: &str,
+) -> anyhow::Result<EmbedResponse> {
+    let payload = EmbedRequest { model: server_model, input: texts, encoding_format: "float" };
+    let raw = crate::http::post_json(agent, embed_url, auth_header, &payload, op)?;
+    serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("malformed {op} response: {e}"))
+}
+
+/// Enforce the response contracts for a request of `n` inputs: one embedding per input, indices
+/// covering exactly `0..n`, and — when `dim` is known — every vector exactly `dim` wide. Returns
+/// the vectors in input order.
+fn validate_embeddings(
+    parsed: EmbedResponse,
+    n: usize,
+    dim: Option<usize>,
+    server_model: &str,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    // Count contract: one embedding per input, retryable on violation (a transient server fault
+    // can drop rows).
+    if parsed.data.len() != n {
+        anyhow::bail!(
+            "embed count mismatch: requested {n} texts but server returned {} embeddings",
+            parsed.data.len()
+        );
     }
+
+    // The OpenAI `data[]` carries a per-request `index`; a server MAY return items out of order.
+    // Place each embedding at its `index` and require the indices to cover EXACTLY `0..n` with no
+    // duplicate or out-of-range — sorting alone would silently accept a dup/gap and misalign
+    // vectors with their chunks.
+    let mut ordered: Vec<Option<Vec<f32>>> = std::iter::repeat_with(|| None).take(n).collect();
+    for item in parsed.data {
+        let idx = item.index;
+        if idx >= n {
+            anyhow::bail!("embed response index {idx} out of range for {n} inputs");
+        }
+        if ordered[idx].is_some() {
+            anyhow::bail!("embed response has a duplicate index {idx}");
+        }
+        ordered[idx] = Some(item.embedding);
+    }
+    let embeddings = ordered
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| v.ok_or_else(|| anyhow::anyhow!("embed response is missing index {i}")))
+        .collect::<anyhow::Result<Vec<Vec<f32>>>>()?;
+
+    // Dim contract (LOUD): the int8 encoding, per-family centroids, and the linked-entries rail all
+    // assume a fixed dim. A server returning a different-width vector means the configured model
+    // and the server model disagree — naming both dims makes the misconfiguration obvious. EVERY
+    // vector is checked, not just the first: a late wrong-width vector that slipped through would
+    // make `store_embedding` bail and ABORT the whole reconcile instead of failing just that chunk,
+    // so we name the offending index and reject here.
+    if let Some(dim) = dim {
+        for (i, vector) in embeddings.iter().enumerate() {
+            if vector.len() != dim {
+                anyhow::bail!(
+                    "embed dim mismatch: server returned a {}-dim vector at index {} but this \
+                     model is configured for {} dims (server model `{}`). The selected registry \
+                     model and the server model must match.",
+                    vector.len(),
+                    i,
+                    dim,
+                    server_model
+                );
+            }
+        }
+    }
+
+    Ok(embeddings)
 }
 
 /// Resolve the `Authorization` header from the configured `auth_env` name, looking the value up
