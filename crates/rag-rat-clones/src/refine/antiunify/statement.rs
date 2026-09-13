@@ -1,6 +1,6 @@
 use super::super::RefineMember;
+use super::super::budget::CellBudget;
 use super::alignment::{align_to_anchor_with_budget, resolve_anchor_idx};
-use super::budget::CellBudget;
 use super::build::anti_unify_with_budget;
 use super::spans::direct_children;
 use super::types::{ClassAlignment, EmittedSpan};

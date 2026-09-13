@@ -32,24 +32,41 @@ pub(crate) const ALIGN_AGGREGATE_CELLS_BUDGET: u64 = 100_000_000;
 /// statement takes the skip-and-sample path instead of running exact DP. The cutover is consumed in
 /// the existing deterministic member/statement order, so the truncation point — and therefore the
 /// whole degraded output — is byte-identical for a given class.
-pub(super) struct CellBudget {
+///
+/// The fidelity lane ([`align::class_fidelity`]) draws from its own instance the same way, so both
+/// LCS lanes share one check-after-charge discipline.
+pub(crate) struct CellBudget {
     /// Cumulative `Σ |a|·|b|` charged over the exact `lcs_align` calls run so far.
-    pub(super) spent: u64,
+    pub(crate) spent: u64,
     /// The cap; `spent > budget` latches `exhausted`.
-    pub(super) budget: u64,
+    pub(crate) budget: u64,
     /// `true` once `spent` has exceeded `budget`. Latches — never resets within a class.
-    pub(super) exhausted: bool,
+    pub(crate) exhausted: bool,
 }
 
 impl CellBudget {
-    pub(super) fn new(budget: u64) -> Self {
+    pub(crate) fn new(budget: u64) -> Self {
         CellBudget { spent: 0, budget, exhausted: false }
+    }
+
+    /// A per-class budget drawn from a SHARED CROSS-CLASS allowance: the lane's per-class `cap`,
+    /// or less once the `remaining` allowance has drained below it. Hand the spend back with
+    /// [`Self::settle`].
+    pub(crate) fn draw_from_global(cap: u64, remaining: u64) -> Self {
+        Self::new(cap.min(remaining))
+    }
+
+    /// Decrement the shared allowance by everything this class charged. `spent` can exceed the
+    /// per-class cap by at most "one pair" (charge-then-check), but never the global remaining
+    /// beyond saturation, so subsequent classes correctly see a smaller (or zero) allowance.
+    pub(crate) fn settle(self, remaining: &mut u64) {
+        *remaining = remaining.saturating_sub(self.spent);
     }
 
     /// Charge `cells` against the budget BEFORE running the exact DP, then return whether the
     /// budget is now exhausted. A pair already charged still runs exactly (the bound is "budget
-    /// + one pair"), mirroring [`align::class_fidelity`]'s check-after-charge discipline.
-    pub(super) fn charge(&mut self, cells: u64) -> bool {
+    /// + one pair").
+    pub(crate) fn charge(&mut self, cells: u64) -> bool {
         self.spent = self.spent.saturating_add(cells);
         if self.spent > self.budget {
             self.exhausted = true;

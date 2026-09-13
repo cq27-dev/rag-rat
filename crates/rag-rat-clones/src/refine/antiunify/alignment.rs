@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use super::super::RefineMember;
 use super::super::align::{self, AlignOp, lcs_align};
-use super::budget::{ALIGN_AGGREGATE_CELLS_BUDGET, CellBudget};
+use super::super::budget::{ALIGN_AGGREGATE_CELLS_BUDGET, CellBudget};
 use super::types::ClassAlignment;
 
 /// Resolve the anchor's position within the canonical-sorted `members` slice.

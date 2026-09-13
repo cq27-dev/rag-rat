@@ -45,7 +45,6 @@
 //!   are byte-identical across all members. Conservative — a near-miss stays two metavars.
 
 mod alignment;
-mod budget;
 mod build;
 mod classify;
 mod render;
@@ -61,8 +60,6 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use alignment::align_to_anchor_with_budget;
 pub(crate) use alignment::{align_to_anchor, resolve_anchor_idx};
-#[cfg(test)]
-use budget::{ALIGN_AGGREGATE_CELLS_BUDGET, CellBudget};
 pub(crate) use build::{anti_unify, anti_unify_global};
 #[cfg(test)]
 use build::{anti_unify_with_budget, collapse_recurring};
@@ -88,6 +85,8 @@ use widen::{annotation_type_context, widen_string_content_run};
 use super::RefineMember;
 #[cfg(test)]
 use super::align;
+#[cfg(test)]
+use super::budget::{ALIGN_AGGREGATE_CELLS_BUDGET, CellBudget};
 #[cfg(test)]
 use super::score::Confidence;
 #[cfg(test)]

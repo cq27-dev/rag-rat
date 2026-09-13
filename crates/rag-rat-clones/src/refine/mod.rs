@@ -9,6 +9,8 @@ pub mod align;
 
 pub(crate) mod antiunify;
 
+pub(crate) mod budget;
+
 pub(crate) mod signature;
 
 pub mod cache;

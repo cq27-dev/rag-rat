@@ -18,6 +18,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use super::align;
 use super::antiunify::{align_to_anchor, anti_unify, anti_unify_global, resolve_anchor_idx};
+use super::budget::CellBudget;
 use super::score::{Confidence, confidence_v2, metavar_profile, refactorability_v2};
 use super::signature::propose_signature;
 use crate::refine::RefineMember;
@@ -297,7 +298,8 @@ pub fn refine_compute_and_store_budgeted(
     let seqs: Vec<Vec<String>> = members.iter().map(|m| m.seq.clone()).collect();
     let fidelity = match global_remaining.as_deref_mut() {
         Some(remaining) => align::class_fidelity_global(&seqs, remaining),
-        None => align::class_fidelity(&seqs, align::LCS_AGGREGATE_CELLS_BUDGET),
+        None =>
+            align::class_fidelity(&seqs, &mut CellBudget::new(align::LCS_AGGREGATE_CELLS_BUDGET)),
     };
     let (lcs_ratio, lcs_sampled) = (fidelity.min_ratio, fidelity.sampled);
 

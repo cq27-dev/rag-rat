@@ -15,6 +15,8 @@
 //! the **minimum** over all unordered pairs: a single loose member drags the class ratio down,
 //! mirroring Plan-2's min-not-average discipline.
 
+use super::budget::CellBudget;
+
 /// One step in an LCS alignment of two token sequences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AlignOp {
@@ -197,10 +199,6 @@ pub(crate) struct ClassFidelity {
     /// count the aggregate-budget tests assert is BOUNDED.
     #[allow(dead_code)] // read only by the aggregate-budget tests
     pub(crate) exact_dp_pairs: u64,
-    /// The exact-DP cells charged (`Σ |a|·|b|` over the exact pairs). [`class_fidelity_global`]
-    /// decrements its shared allowance by this so the WHOLE refine pass — not just each class — is
-    /// cell-bounded.
-    pub(crate) exact_dp_cells: u64,
 }
 
 /// Like [`class_fidelity`] but draws its exact-DP allowance from a SHARED CROSS-CLASS budget
@@ -221,9 +219,9 @@ pub(crate) fn class_fidelity_global(
     seqs: &[Vec<String>],
     remaining_cells: &mut u64,
 ) -> ClassFidelity {
-    let per_class = LCS_AGGREGATE_CELLS_BUDGET.min(*remaining_cells);
-    let fidelity = class_fidelity(seqs, per_class);
-    *remaining_cells = remaining_cells.saturating_sub(fidelity.exact_dp_cells);
+    let mut cells = CellBudget::draw_from_global(LCS_AGGREGATE_CELLS_BUDGET, *remaining_cells);
+    let fidelity = class_fidelity(seqs, &mut cells);
+    cells.settle(remaining_cells);
     fidelity
 }
 
@@ -233,14 +231,9 @@ pub(crate) fn class_fidelity_global(
 /// TINY budget on SMALL sequences in milliseconds, instead of running ~26 real 1900² DPs to exhaust
 /// the 100M production budget (~11 s). The cutover logic is byte-identical regardless of the budget
 /// value, so the fast test exercises the same code path as production.
-pub(crate) fn class_fidelity(seqs: &[Vec<String>], budget: u64) -> ClassFidelity {
+pub(crate) fn class_fidelity(seqs: &[Vec<String>], cells: &mut CellBudget) -> ClassFidelity {
     if seqs.len() < 2 {
-        return ClassFidelity {
-            min_ratio: 1.0,
-            sampled: false,
-            exact_dp_pairs: 0,
-            exact_dp_cells: 0,
-        };
+        return ClassFidelity { min_ratio: 1.0, sampled: false, exact_dp_pairs: 0 };
     }
 
     // Member-count cap: use at most LCS_MEMBER_SAMPLE members. The slice is already in canonical
@@ -253,13 +246,11 @@ pub(crate) fn class_fidelity(seqs: &[Vec<String>], budget: u64) -> ClassFidelity
 
     let mut min_ratio = f64::INFINITY;
     let mut sampled_seq = false;
-    // AGGREGATE exact-DP budget: track the cumulative `Σ |a|·|b|` over the pairs that actually ran
-    // the exact O(n·m) DP. Once it exceeds LCS_AGGREGATE_CELLS_BUDGET, every REMAINING pair falls
-    // back to the order-blind Dice proxy — so no class runs unbounded exact DP regardless of member
+    // AGGREGATE exact-DP budget: `cells` tracks the cumulative `Σ |a|·|b|` over the pairs that
+    // actually ran the exact O(n·m) DP. Once it is exhausted, every REMAINING pair falls back to
+    // the order-blind Dice proxy — so no class runs unbounded exact DP regardless of member
     // count or per-member length-under-cap (the ADVERSARY-B perf cliff).
-    let mut exact_dp_cells: u64 = 0;
     let mut exact_dp_pairs: u64 = 0;
-    let mut budget_exhausted = false;
 
     for i in 0..effective.len() {
         for j in (i + 1)..effective.len() {
@@ -268,7 +259,7 @@ pub(crate) fn class_fidelity(seqs: &[Vec<String>], budget: u64) -> ClassFidelity
             let denom = (a.len() + b.len()) as f64;
             let ratio = if denom == 0.0 {
                 1.0
-            } else if budget_exhausted || a.len().max(b.len()) > LCS_MAX_SEQ_TOKENS {
+            } else if cells.exhausted || a.len().max(b.len()) > LCS_MAX_SEQ_TOKENS {
                 // Per-pair length cap OR aggregate budget exhausted: use the Dice proxy instead of
                 // the O(n·m) DP. Dice ignores token order so it is an UPPER BOUND on the true LCS
                 // ratio — clamp to [`DICE_PROXY_CEILING`] (< the High-confidence threshold) so an
@@ -280,11 +271,8 @@ pub(crate) fn class_fidelity(seqs: &[Vec<String>], budget: u64) -> ClassFidelity
                 // exact DP. Once the running sum exceeds the budget, the NEXT pairs
                 // take the proxy branch above — but this pair, already accounted,
                 // still computes exactly.
-                exact_dp_cells = exact_dp_cells.saturating_add((a.len() as u64) * (b.len() as u64));
+                cells.charge((a.len() as u64) * (b.len() as u64));
                 exact_dp_pairs += 1;
-                if exact_dp_cells > budget {
-                    budget_exhausted = true;
-                }
                 let lcs = lcs_align(a, b).lcs_len;
                 2.0 * lcs as f64 / denom
             };
@@ -298,12 +286,7 @@ pub(crate) fn class_fidelity(seqs: &[Vec<String>], budget: u64) -> ClassFidelity
     // loop body (i=0, j=1) executes at least once and `min_ratio` is updated from `f64::INFINITY`.
     // The `f64::INFINITY` fallback is therefore unreachable — assert it in debug, return min_ratio.
     debug_assert!(min_ratio.is_finite(), "min_ratio must be set: effective.len() >= 2");
-    ClassFidelity {
-        min_ratio,
-        sampled: sampled_members || sampled_seq,
-        exact_dp_pairs,
-        exact_dp_cells,
-    }
+    ClassFidelity { min_ratio, sampled: sampled_members || sampled_seq, exact_dp_pairs }
 }
 
 #[cfg(test)]
@@ -316,7 +299,7 @@ mod tests {
 
     /// Fidelity at the production aggregate budget.
     fn fidelity(seqs: &[Vec<String>]) -> ClassFidelity {
-        class_fidelity(seqs, LCS_AGGREGATE_CELLS_BUDGET)
+        class_fidelity(seqs, &mut CellBudget::new(LCS_AGGREGATE_CELLS_BUDGET))
     }
 
     /// Two identical sequences → all Match ops, lcs_len == len, class_fidelity == 1.0.
@@ -605,7 +588,8 @@ mod tests {
         );
         let total_pairs = (member_count * (member_count - 1) / 2) as u64; // 190
 
-        let ClassFidelity { sampled, exact_dp_pairs, .. } = class_fidelity(&seqs, tiny_budget);
+        let ClassFidelity { sampled, exact_dp_pairs, .. } =
+            class_fidelity(&seqs, &mut CellBudget::new(tiny_budget));
 
         // The budget tripped → sampled flag set (a budget-truncated class is never reported exact).
         assert!(sampled, "aggregate-budget truncation must set lcs_sampled=true");

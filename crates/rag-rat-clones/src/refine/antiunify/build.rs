@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use super::super::RefineMember;
+use super::super::budget::{ALIGN_AGGREGATE_CELLS_BUDGET, CellBudget};
 use super::super::score::Confidence;
 use super::alignment::align_to_anchor_with_budget;
-use super::budget::{ALIGN_AGGREGATE_CELLS_BUDGET, CellBudget};
 use super::classify::{RunClass, classify_run, matched_column_reopen};
 use super::render::{coverage_from_mask, render_template};
 use super::spans::{
@@ -56,17 +56,13 @@ pub(crate) fn anti_unify_global(
     anchor_idx: usize,
     remaining_cells: &mut u64,
 ) -> (ClassAlignment, Template) {
-    let per_class = ALIGN_AGGREGATE_CELLS_BUDGET.min(*remaining_cells);
-    let mut budget = CellBudget::new(per_class);
+    let mut budget = CellBudget::draw_from_global(ALIGN_AGGREGATE_CELLS_BUDGET, *remaining_cells);
     let alignment = align_to_anchor_with_budget(members, anchor_idx, &mut budget);
     // The same budget rides into the anti-unify: `spent` already carries the star-align charge, so
     // the re-descent continues from where the parent left off (one per-class budget across both
     // sub-lanes), exactly as `anti_unify` seeds itself from `alignment.spent_cells`.
     let template = anti_unify_with_budget(members, &alignment, &mut budget);
-    // Decrement the shared allowance by everything this class charged. `spent` can exceed
-    // `per_class` by at most "one pair" (charge-then-check), but never the global remaining beyond
-    // saturation, so subsequent classes correctly see a smaller (or zero) allowance.
-    *remaining_cells = remaining_cells.saturating_sub(budget.spent);
+    budget.settle(remaining_cells);
     (alignment, template)
 }
 
