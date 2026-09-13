@@ -21,3 +21,8 @@ pub(crate) fn set_output_format(format: OutputFormat) {
 pub(crate) fn output_format() -> OutputFormat {
     OUTPUT_FORMAT.get().copied().unwrap_or_default()
 }
+
+/// The output format a `--json` flag selects: JSON when set, TOON otherwise.
+pub(crate) fn output_format_from_json_flag(json: bool) -> OutputFormat {
+    if json { OutputFormat::Json } else { OutputFormat::Toon }
+}

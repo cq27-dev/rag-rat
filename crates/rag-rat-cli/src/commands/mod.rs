@@ -29,7 +29,7 @@ pub(crate) use consolidate::consolidate;
 pub(crate) use distill::distill;
 #[cfg(feature = "eval")]
 pub(crate) use dump_verify_packs::{dump_memory_input_hashes, dump_verify_packs};
-pub(crate) use format::{output_format, set_output_format};
+pub(crate) use format::{output_format, output_format_from_json_flag, set_output_format};
 pub(crate) use hooks::{hooks, papertrail};
 pub(crate) use index_ops::{doctor, doctor_global_store, index, maintenance, reconcile};
 pub(crate) use memory::{dream, memory};

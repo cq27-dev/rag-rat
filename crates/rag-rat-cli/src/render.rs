@@ -199,6 +199,18 @@ pub(crate) fn print_output(value: &impl serde::Serialize) -> anyhow::Result<()> 
     println!("{}", rag_rat_core::render(value, output_format()));
     Ok(())
 }
+/// The `--json` fork for a command with a human-readable view: under the global `--json` print
+/// `value` as structured output, otherwise run `human` instead.
+pub(crate) fn print_output_or(
+    value: &impl serde::Serialize,
+    human: impl FnOnce(),
+) -> anyhow::Result<()> {
+    if output_format() == rag_rat_core::OutputFormat::Json {
+        return print_output(value);
+    }
+    human();
+    Ok(())
+}
 pub(crate) fn render_index_progress(progress: IndexProgress) {
     match progress {
         IndexProgress::Started { database, mode } => {

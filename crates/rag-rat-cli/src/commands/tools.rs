@@ -13,7 +13,9 @@ use clap::error::ErrorKind;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Map, Value, json};
 
-use crate::commands::{apply_embedding_runtime_env, set_output_format};
+use crate::commands::{
+    apply_embedding_runtime_env, output_format_from_json_flag, set_output_format,
+};
 use crate::load_config_or_hint;
 use crate::render::print_output;
 
@@ -44,11 +46,7 @@ pub(crate) fn run_tools(
     };
 
     let json_output = outer_json || matches.get_flag(JSON_OUTPUT);
-    set_output_format(if json_output {
-        rag_rat_core::OutputFormat::Json
-    } else {
-        rag_rat_core::OutputFormat::Toon
-    });
+    set_output_format(output_format_from_json_flag(json_output));
 
     let Some((cli_tool_name, tool_matches)) = matches.subcommand() else {
         debug_assert!(matches.get_flag(SCHEMA));

@@ -6,12 +6,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use rag_rat_base::config::Config;
-use rag_rat_core::{IndexDatabase, OutputFormat};
+use rag_rat_core::IndexDatabase;
 
 use crate::cli::{DoctorArgs, IndexArgs, MaintenanceArgs, ReconcileArgs};
-use crate::commands::output_format;
 use crate::render::{
-    print_output, print_reconcile_plan, render_index_progress, render_reconcile_progress,
+    print_output, print_output_or, print_reconcile_plan, render_index_progress,
+    render_reconcile_progress,
 };
 use crate::{
     DEFAULT_MAINTENANCE_SECONDS, acquire_cli_write_lock, open_index, report_pending_schema_upgrade,
@@ -174,12 +174,7 @@ pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result
         )?;
         // `--plan` prints a human summary by default; the global `--json` switches to the
         // structured plan.
-        if output_format() == OutputFormat::Json {
-            print_output(&plan)?;
-        } else {
-            print_reconcile_plan(&plan);
-        }
-        return Ok(());
+        return print_output_or(&plan, || print_reconcile_plan(&plan));
     }
     // Force the legacy-f32 → int8 vector re-encode (#312) when asked, ignoring the run-once gate —
     // for users who want it now on a huge index. Format-only, idempotent. This SHORT-CIRCUITS: it
@@ -190,12 +185,9 @@ pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result
         let deadline = args.max_seconds.map(|s| Instant::now() + std::time::Duration::from_secs(s));
         let converted = db.reencode_legacy_vectors_now(deadline)?;
         let report = serde_json::json!({ "reencoded_vectors": converted });
-        if output_format() == OutputFormat::Json {
-            print_output(&report)?;
-        } else {
+        return print_output_or(&report, || {
             eprintln!("rag-rat: re-encoded {converted} legacy f32 vector blobs to int8");
-        }
-        return Ok(());
+        });
     }
     let options = rag_rat_core::index::ai::ReconcileOptions {
         limit: args.limit,

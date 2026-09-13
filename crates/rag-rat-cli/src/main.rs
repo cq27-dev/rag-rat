@@ -78,11 +78,7 @@ fn main() -> anyhow::Result<()> {
     // `tools` (including its inherited `--json`) are intentionally resolved there before the
     // OnceLock is set.
     if !matches!(&cli.command, Cmd::Tools(_)) {
-        set_output_format(if cli.json {
-            rag_rat_core::OutputFormat::Json
-        } else {
-            rag_rat_core::OutputFormat::Toon
-        });
+        set_output_format(commands::output_format_from_json_flag(cli.json));
     }
 
     // These commands must tolerate the ABSENCE of a config: `init` creates one; `agent-hook`
@@ -431,8 +427,7 @@ fn run_mcp(explicit: Option<&str>, json: bool) -> anyhow::Result<()> {
     // unhandled SIGUSR1 would kill the server outright instead of upgrading it.
     #[cfg(unix)]
     rag_rat_mcp::upgrade::suppress_sigusr1_until_armed();
-    let output_format =
-        if json { rag_rat_core::OutputFormat::Json } else { rag_rat_core::OutputFormat::Toon };
+    let output_format = commands::output_format_from_json_flag(json);
     let config = discover_config_optional(explicit)?;
     // Repo-specific setup only when a config actually resolved. `_log` holds the tracing guard for
     // the server's lifetime; a dormant server writes no log (there is no repo to anchor it to).

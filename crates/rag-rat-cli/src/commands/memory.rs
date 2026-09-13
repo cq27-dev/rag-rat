@@ -2,12 +2,10 @@
 //! / show) with its `*_bind_target` selector helpers, and `dream` (the deterministic
 //! memory-maintenance worklist pass).
 use rag_rat_base::config::Config;
-use rag_rat_core::OutputFormat;
 
 use crate::cli::{DreamArgs, MemoryArgs, MemoryCommand};
-use crate::commands::output_format;
 use crate::open_index;
-use crate::render::print_output;
+use crate::render::{print_output, print_output_or};
 
 /// Dream-mode worklist (#122): run the deterministic memory-maintenance pass (coverage gaps +
 /// stale references), sync it into `dream_findings`, and render the open worklist. Writes ONLY to
@@ -158,57 +156,48 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
             let db = open_index(config)?;
             let entries = db.memory_doctor()?;
             // Human-readable rebind suggestions by default; the global `--json` emits the
-            // structured doctor entries instead.
-            if output_format() == OutputFormat::Json {
-                print_output(&entries)?;
-                let any_gone = entries.iter().any(|e| e.anchor_status == "gone");
-                if any_gone {
-                    anyhow::bail!("one or more memories have gone anchors");
+            // structured doctor entries instead. Either way a gone anchor fails the command.
+            print_output_or(&entries, || {
+                if entries.is_empty() {
+                    eprintln!("All active memory anchors are current.");
+                    return;
                 }
-                return Ok(());
-            }
-            if entries.is_empty() {
-                eprintln!("All active memory anchors are current.");
-                return Ok(());
-            }
-            let mut any_gone = false;
-            for entry in &entries {
-                eprintln!("[{}] {} ({})", entry.anchor_status, entry.title, entry.memory_id);
-                eprintln!("  binding: {} {}", entry.binding_kind, entry.binding_id);
-                // `pending` (#492): the target is alive in another indexed scope (an in-flight
-                // worktree branch) — informational only. Never suggest rebind/mark-obsolete
-                // (that advice clobbered a valid forward anchor on the dogfood repo), and never
-                // fail the command over it.
-                if entry.anchor_status == "pending" {
-                    eprintln!(
-                        "  -> in flight on another checkout (worktree overlay); no action needed \
-                         — it re-anchors when that branch lands"
-                    );
-                    continue;
-                }
-                if entry.candidates.is_empty() {
-                    if entry.anchor_status == "gone" {
+                for entry in &entries {
+                    eprintln!("[{}] {} ({})", entry.anchor_status, entry.title, entry.memory_id);
+                    eprintln!("  binding: {} {}", entry.binding_kind, entry.binding_id);
+                    // `pending` (#492): the target is alive in another indexed scope (an in-flight
+                    // worktree branch) — informational only. Never suggest rebind/mark-obsolete
+                    // (that advice clobbered a valid forward anchor on the dogfood repo), and never
+                    // fail the command over it.
+                    if entry.anchor_status == "pending" {
                         eprintln!(
-                            "  -> code appears deleted; rag-rat memory mark-obsolete {}",
-                            entry.memory_id
+                            "  -> in flight on another checkout (worktree overlay); no action \
+                             needed — it re-anchors when that branch lands"
                         );
+                        continue;
                     }
-                } else {
-                    for candidate in &entry.candidates {
-                        // Suggest --symbol-path (exact qualified-name match) rather than --symbol
-                        // (substring): a fully-qualified candidate fed to --symbol would also hit
-                        // longer siblings. Exact match plus cfg-group collapse makes this runnable.
-                        eprintln!(
-                            "  rag-rat memory rebind {} --symbol-path {}",
-                            entry.memory_id, candidate
-                        );
+                    if entry.candidates.is_empty() {
+                        if entry.anchor_status == "gone" {
+                            eprintln!(
+                                "  -> code appears deleted; rag-rat memory mark-obsolete {}",
+                                entry.memory_id
+                            );
+                        }
+                    } else {
+                        for candidate in &entry.candidates {
+                            // Suggest --symbol-path (exact qualified-name match) rather than
+                            // --symbol (substring): a fully-qualified candidate fed to --symbol
+                            // would also hit longer siblings. Exact match plus cfg-group collapse
+                            // makes this runnable.
+                            eprintln!(
+                                "  rag-rat memory rebind {} --symbol-path {}",
+                                entry.memory_id, candidate
+                            );
+                        }
                     }
                 }
-                if entry.anchor_status == "gone" {
-                    any_gone = true;
-                }
-            }
-            if any_gone {
+            })?;
+            if entries.iter().any(|entry| entry.anchor_status == "gone") {
                 anyhow::bail!("one or more memories have gone anchors");
             }
             Ok(())
@@ -265,20 +254,18 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
             let summaries = db.memory_list(kind.as_deref())?;
             // The global `--json` emits the structured list (a caller parsing stdout gets JSON, not
             // the human lines below).
-            if output_format() == OutputFormat::Json {
-                return print_output(&summaries);
-            }
-            if summaries.is_empty() {
-                eprintln!("No memories found.");
-                return Ok(());
-            }
-            for s in &summaries {
-                println!(
-                    "{}  [{}/{}]  {}  ({}:{})",
-                    s.memory_id, s.kind, s.status, s.title, s.binding_kind, s.binding_id
-                );
-            }
-            Ok(())
+            print_output_or(&summaries, || {
+                if summaries.is_empty() {
+                    eprintln!("No memories found.");
+                    return;
+                }
+                for s in &summaries {
+                    println!(
+                        "{}  [{}/{}]  {}  ({}:{})",
+                        s.memory_id, s.kind, s.status, s.title, s.binding_kind, s.binding_id
+                    );
+                }
+            })
         },
         MemoryCommand::Show { memory_id } => {
             let db = open_index(config)?;
@@ -286,30 +273,30 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
                 anyhow::bail!("memory `{memory_id}` not found");
             };
             // The global `--json` emits the structured memory instead of the human view below.
-            if output_format() == OutputFormat::Json {
-                return print_output(&memory);
-            }
-            println!("Title:      {}", memory.title);
-            println!("Kind:       {} / {} / {}", memory.kind, memory.status, memory.confidence);
-            println!();
-            println!("{}", memory.body);
-            if !memory.bindings.is_empty() {
+            print_output_or(&memory, || {
+                println!("Title:      {}", memory.title);
+                println!("Kind:       {} / {} / {}", memory.kind, memory.status, memory.confidence);
                 println!();
-                println!("Bindings:");
-                for b in &memory.bindings {
-                    // The authored anchor, and where this store resolved it when that differs —
-                    // the same identity `doctor` lists the binding under.
-                    match &b.resolved_binding_id {
-                        Some(resolved) => println!(
-                            "  {} {} -> {} [{}]",
-                            b.binding_kind, b.binding_id, resolved, b.anchor_status
-                        ),
-                        None =>
-                            println!("  {} {} [{}]", b.binding_kind, b.binding_id, b.anchor_status),
+                println!("{}", memory.body);
+                if !memory.bindings.is_empty() {
+                    println!();
+                    println!("Bindings:");
+                    for b in &memory.bindings {
+                        // The authored anchor, and where this store resolved it when that differs —
+                        // the same identity `doctor` lists the binding under.
+                        match &b.resolved_binding_id {
+                            Some(resolved) => println!(
+                                "  {} {} -> {} [{}]",
+                                b.binding_kind, b.binding_id, resolved, b.anchor_status
+                            ),
+                            None => println!(
+                                "  {} {} [{}]",
+                                b.binding_kind, b.binding_id, b.anchor_status
+                            ),
+                        }
                     }
                 }
-            }
-            Ok(())
+            })
         },
     }
 }
