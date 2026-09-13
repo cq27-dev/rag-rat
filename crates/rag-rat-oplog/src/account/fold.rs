@@ -63,6 +63,36 @@ pub(super) enum Outcome {
     RetainedUnfolded,
 }
 
+/// The §16.3 stored status of an account-log entry — `account_entry_status.status`, beside its
+/// optional `detail` reason. These are persisted tokens: a rename needs a migration exactly like a
+/// column rename. The strings are pinned by `every_fold_outcome_has_a_stable_storage_taxonomy`
+/// and the secrets `status_pairs_cover_every_frozen_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum EntryStatus {
+    /// The accepted-slot winner (the storage layer resolves `effective` into accepted vs forked).
+    Accepted,
+    /// An effective entry that lost its accepted slot to an equivocating sibling.
+    Forked,
+    Effective,
+    RetainedUnfolded,
+    Condemned,
+    Parked,
+    Rejected,
+}
+
+impl EntryStatus {
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value
+            .parse()
+            .map_err(|_| anyhow::anyhow!("unknown persisted account entry status `{value}`"))
+    }
+}
+
 impl Outcome {
     pub(super) fn is_effective(&self) -> bool {
         matches!(self, Outcome::Effective { .. })
@@ -73,12 +103,12 @@ impl Outcome {
     /// and a fold-semantic `Rejected` maps to `("rejected", reason)`; structural ingest rejects
     /// are never folded (they are not stored). Kept beside the enum so the projection can't
     /// drift.
-    pub(super) fn taxonomy(&self) -> (&'static str, Option<&'static str>) {
+    pub(super) fn taxonomy(&self) -> (EntryStatus, Option<&'static str>) {
         match self {
-            Outcome::Effective { .. } => ("effective", None),
-            Outcome::RetainedUnfolded => ("retained_unfolded", None),
+            Outcome::Effective { .. } => (EntryStatus::Effective, None),
+            Outcome::RetainedUnfolded => (EntryStatus::RetainedUnfolded, None),
             Outcome::Condemned(reason) => (
-                "condemned",
+                EntryStatus::Condemned,
                 Some(match reason {
                     CondemnedReason::BeyondCut => "beyond_cut",
                     CondemnedReason::OffBranch => "off_branch",
@@ -86,7 +116,7 @@ impl Outcome {
                 }),
             ),
             Outcome::Parked(reason) => (
-                "parked",
+                EntryStatus::Parked,
                 Some(match reason {
                     ParkReason::UnknownOwnerRef => "unknown_owner_ref",
                     ParkReason::UnknownCutTarget => "unknown_cut_target",
@@ -97,7 +127,7 @@ impl Outcome {
                 }),
             ),
             Outcome::Rejected(reason) => (
-                "rejected",
+                EntryStatus::Rejected,
                 Some(match reason {
                     RejectReason::StaleAuthority => "stale_authority",
                     RejectReason::GenesisSelfHash => "genesis_self_hash",
@@ -5936,7 +5966,9 @@ mod tests {
             (Outcome::Rejected(RejectReason::Ineffective), ("rejected", Some("ineffective"))),
         ];
         for (outcome, expected) in cases {
-            assert_eq!(outcome.taxonomy(), expected, "taxonomy drift for {outcome:?}");
+            let (status, detail) = outcome.taxonomy();
+            assert_eq!((status.as_db_str(), detail), expected, "taxonomy drift for {outcome:?}");
+            assert_eq!(EntryStatus::from_db_str(status.as_db_str()).unwrap(), status);
         }
     }
 

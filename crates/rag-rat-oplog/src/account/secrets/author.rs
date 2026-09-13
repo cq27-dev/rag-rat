@@ -44,7 +44,7 @@ use super::super::bootstrap::{self, LocalAccountRef};
 use super::super::envelope::{
     AccountEntryHeader, VerifiedAccountEntry, sign_account_entry, signed_entry_len,
 };
-use super::super::fold::{SECRETS_LOG, SUPPORTED_OP_VERSION};
+use super::super::fold::{EntryStatus, SECRETS_LOG, SUPPORTED_OP_VERSION};
 use super::super::keywrap::{self, ContentKey, SealedKeyWrap, WrapContext};
 use super::super::storage::{self, CandidateInsert};
 use super::super::{AccountId, authoring, limits};
@@ -171,7 +171,7 @@ pub fn advance_repo_incarnation_in_tx(
     }
     let statuses = storage::refold_in_tx(tx, account_id, now_ms)?;
     anyhow::ensure!(
-        statuses.get(&verified.entry_hash).map(String::as_str) == Some("accepted"),
+        statuses.get(&verified.entry_hash).copied() == Some(EntryStatus::Accepted),
         "authored repository incarnation did not fold accepted",
     );
     anyhow::ensure!(
@@ -652,11 +652,14 @@ fn author_stream_key_wrap_batch_in_tx(
     // roll back.
     let statuses = storage::refold_in_tx(tx, account_id, now_ms)?;
     for entry_hash in &authored {
-        match statuses.get(entry_hash).map(String::as_str) {
-            Some("accepted") => {},
-            other => anyhow::bail!(
-                "authored StreamKeyWrap did not fold accepted (status {other:?}); rolling back",
-            ),
+        match statuses.get(entry_hash).copied() {
+            Some(EntryStatus::Accepted) => {},
+            other => {
+                let other = other.map(EntryStatus::as_db_str);
+                anyhow::bail!(
+                    "authored StreamKeyWrap did not fold accepted (status {other:?}); rolling back",
+                )
+            },
         }
     }
     Ok(authored)
@@ -908,7 +911,7 @@ mod tests {
         };
         storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
         let statuses = storage::refold_in_tx(&tx, account, NOW).unwrap();
-        assert_eq!(statuses.get(&verified.entry_hash).map(String::as_str), Some("accepted"));
+        assert_eq!(statuses.get(&verified.entry_hash).copied(), Some(EntryStatus::Accepted));
         tx.commit().unwrap();
         verified.entry_hash
     }

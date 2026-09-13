@@ -14,10 +14,11 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry};
+use super::fold::{self, EntryStatus};
 use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
-use super::{AccountId, content, fold, secrets, snapshot};
+use super::{AccountId, content, secrets, snapshot};
 use crate::cbor;
 use crate::device::{DevicePublic, DeviceX25519Public};
 use crate::op::DeviceFingerprint;
@@ -49,7 +50,7 @@ struct AccountProjection {
 }
 
 struct AccountStateFold {
-    statuses: HashMap<EntryHash, String>,
+    statuses: HashMap<EntryHash, EntryStatus>,
     affected_streams: Vec<StreamId>,
     rejected_content_promotions: content::ContentPromotionOutcome,
 }
@@ -100,7 +101,10 @@ pub enum IngestOutcome {
     PreVerifyWithEviction { scopes: Vec<CapacityScope> },
     /// Structurally valid input could not be retained within an operational admission budget.
     CapacityReached { scope: CapacityScope },
-    /// Stored as a candidate; `status` is its post-refold §16.3 taxonomy label.
+    /// Stored as a candidate; `status` is its post-refold §16.3 taxonomy label — an
+    /// [`EntryStatus`] token when this refold classified it, the stored token verbatim on a
+    /// redelivery (the column is unconstrained TEXT, so a token this build does not know still
+    /// reports).
     Ingested { status: String },
     /// This entry was stored, but valid parked entries hit terminal grow-only candidate capacity.
     /// They were removed from the unauthenticated queue; request these hashes again if capacity is
@@ -303,8 +307,10 @@ fn account_ingest_decoded_in_tx(
     let promotion =
         if introduces_device { PreVerifyPromotion::Retry } else { PreVerifyPromotion::Skip };
     let state = refold_untrusted_ingest_in_tx(tx, account_id, now_ms, promotion)?;
-    let status =
-        state.statuses.get(&verified.entry_hash).cloned().unwrap_or_else(|| "unknown".into());
+    let status = state
+        .statuses
+        .get(&verified.entry_hash)
+        .map_or_else(|| "unknown".to_string(), |status| status.as_db_str().to_string());
     Ok(match (rejected_promotions.scope, state.rejected_content_promotions.scope) {
         (Some(account_scope), Some(content_scope)) =>
             IngestOutcome::IngestedWithRejectedAccountAndContentPromotions {
@@ -1552,7 +1558,7 @@ pub(super) fn refold_in_tx(
     tx: &Transaction<'_>,
     account_id: AccountId,
     now_ms: i64,
-) -> anyhow::Result<HashMap<[u8; 32], String>> {
+) -> anyhow::Result<HashMap<[u8; 32], EntryStatus>> {
     let state = fold_account_state_in_tx(tx, account_id, now_ms, PreVerifyPromotion::Skip)?;
     super::content::finalize_affected_streams(tx, &state.affected_streams, now_ms)?;
     // `state.rejected_content_promotions` is deliberately DISCARDED here: this trusted/local path
@@ -1625,21 +1631,18 @@ fn fold_account_state_in_tx(
         account_id.to_bytes().as_slice()
     ])?;
 
-    let mut statuses: HashMap<[u8; 32], String> = HashMap::new();
+    let mut statuses: HashMap<[u8; 32], EntryStatus> = HashMap::new();
     for row in rows {
         let accepted = projection.accepted.contains(&row.entry_hash);
-        let (status, detail): (String, Option<String>) = if accepted {
-            ("accepted".to_string(), None)
+        let (status, detail) = if accepted {
+            (EntryStatus::Accepted, None)
         } else if projection.forked.contains(&row.entry_hash) {
-            ("forked".to_string(), None)
+            (EntryStatus::Forked, None)
         } else {
             match projection.history.outcome(&row.entry_hash) {
-                Some(outcome) => {
-                    let (s, d) = outcome.taxonomy();
-                    (s.to_string(), d.map(str::to_string))
-                },
+                Some(outcome) => outcome.taxonomy(),
                 // Every non-forked candidate participates in the final fold.
-                None => ("retained_unfolded".to_string(), None),
+                None => (EntryStatus::RetainedUnfolded, None),
             }
         };
         if accepted {
@@ -1651,7 +1654,7 @@ fn fold_account_state_in_tx(
             "INSERT INTO account_entry_status(entry_hash, status, detail) VALUES (?1, ?2, ?3)
              ON CONFLICT(entry_hash) DO UPDATE SET status = excluded.status, detail = \
              excluded.detail",
-            params![row.entry_hash.as_slice(), status, detail],
+            params![row.entry_hash.as_slice(), status.as_db_str(), detail],
         )?;
         statuses.insert(row.entry_hash, status);
     }
@@ -7087,6 +7090,24 @@ mod tests {
             IngestOutcome::Ingested { status: "accepted".into() },
         );
         assert_eq!(status(&conn, &genesis_hash), Some("accepted".into()));
+    }
+
+    #[test]
+    fn exact_redelivery_reports_an_unrecognized_stored_status_verbatim() {
+        // `account_entry_status.status` is unconstrained TEXT: a redelivery reports whatever token
+        // is stored, including one this build does not know, instead of failing the ingest.
+        let conn = db();
+        let (_account_id, genesis_bytes, genesis_hash) = genesis(&Dev::new(1));
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        conn.execute(
+            "UPDATE account_entry_status SET status = 'future_status' WHERE entry_hash = ?1",
+            params![genesis_hash.as_slice()],
+        )
+        .unwrap();
+        assert_eq!(
+            account_ingest(&conn, &genesis_bytes, NOW + 1).unwrap(),
+            IngestOutcome::Ingested { status: "future_status".into() },
+        );
     }
 
     #[test]

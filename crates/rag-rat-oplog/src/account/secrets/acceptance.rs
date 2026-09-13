@@ -15,7 +15,7 @@
 
 use super::super::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
-    OwnerChainAuthority,
+    EntryStatus, OwnerChainAuthority,
 };
 
 type EntryHash = [u8; 32];
@@ -92,29 +92,32 @@ pub(in crate::account) enum SecretsAcceptance {
 impl SecretsAcceptance {
     /// The persisted `(status, detail)` PAIR (§16.3) — account rows store status + detail columns,
     /// NOT the content predicate's combined `status{detail}` strings (S-b).
-    pub(in crate::account) fn as_db_pair(self) -> (&'static str, Option<&'static str>) {
+    pub(in crate::account) fn as_db_pair(self) -> (EntryStatus, Option<&'static str>) {
         match self {
-            Self::Accepted => ("accepted", None),
-            Self::Forked => ("forked", None),
-            Self::Parked(SecretsParkReason::MissingPredecessor) =>
-                ("parked", Some("missing_predecessor")),
-            Self::Parked(SecretsParkReason::UnknownOwnerRef) =>
-                ("parked", Some("unknown_owner_ref")),
-            Self::Parked(SecretsParkReason::UnknownStreamOwner) =>
-                ("parked", Some("unknown_account")),
-            Self::Parked(SecretsParkReason::AuthLenAhead) => ("parked", Some("auth_len_ahead")),
-            Self::Parked(SecretsParkReason::IncompleteCutAncestry) =>
-                ("parked", Some("incomplete_cut_ancestry")),
-            Self::Parked(SecretsParkReason::UnknownCutTarget) =>
-                ("parked", Some("unknown_cut_target")),
-            Self::Parked(SecretsParkReason::ContestedSubject) =>
-                ("parked", Some("contested_subject")),
-            Self::Condemned(SecretsCondemnReason::BeyondCut) => ("condemned", Some("beyond_cut")),
-            Self::Condemned(SecretsCondemnReason::OffBranch) => ("condemned", Some("off_branch")),
-            Self::Condemned(SecretsCondemnReason::ClosedIncarnation) =>
-                ("condemned", Some("closed_incarnation")),
+            Self::Accepted => (EntryStatus::Accepted, None),
+            Self::Forked => (EntryStatus::Forked, None),
+            Self::Parked(reason) => (
+                EntryStatus::Parked,
+                Some(match reason {
+                    SecretsParkReason::MissingPredecessor => "missing_predecessor",
+                    SecretsParkReason::UnknownOwnerRef => "unknown_owner_ref",
+                    SecretsParkReason::UnknownStreamOwner => "unknown_account",
+                    SecretsParkReason::AuthLenAhead => "auth_len_ahead",
+                    SecretsParkReason::IncompleteCutAncestry => "incomplete_cut_ancestry",
+                    SecretsParkReason::UnknownCutTarget => "unknown_cut_target",
+                    SecretsParkReason::ContestedSubject => "contested_subject",
+                }),
+            ),
+            Self::Condemned(reason) => (
+                EntryStatus::Condemned,
+                Some(match reason {
+                    SecretsCondemnReason::BeyondCut => "beyond_cut",
+                    SecretsCondemnReason::OffBranch => "off_branch",
+                    SecretsCondemnReason::ClosedIncarnation => "closed_incarnation",
+                }),
+            ),
             Self::Rejected(SecretsRejectReason::OwnerReferenceInvalid) =>
-                ("rejected", Some("invalid_owner")),
+                (EntryStatus::Rejected, Some("invalid_owner")),
         }
     }
 }
@@ -608,7 +611,8 @@ mod tests {
                 ("rejected", Some("invalid_owner")),
             ),
         ] {
-            assert_eq!(verdict.as_db_pair(), pair);
+            let (status, detail) = verdict.as_db_pair();
+            assert_eq!((status.as_db_str(), detail), pair);
         }
     }
 }

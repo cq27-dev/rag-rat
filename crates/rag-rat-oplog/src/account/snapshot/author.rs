@@ -35,7 +35,7 @@ use anyhow::Context;
 use rusqlite::Transaction;
 
 use super::super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry, sign_account_entry};
-use super::super::fold::{self, AccountClassification};
+use super::super::fold::{self, AccountClassification, EntryStatus};
 use super::super::storage::{self, CandidateInsert};
 use super::super::{AccountId, authoring, limits};
 use super::ops::{SnapshotOp, SnapshotTarget};
@@ -213,12 +213,15 @@ pub fn author_snapshot_in_tx(
     // Anything else — `accepted` above all — would mean an annex entry reached the control fold,
     // which is exactly the failure ANNEX_LOG exists to prevent (#809). Roll the caller back.
     let statuses = storage::refold_in_tx(tx, account_id, now_ms)?;
-    match statuses.get(&verified.entry_hash).map(String::as_str) {
-        Some("retained_unfolded") => {},
-        other => anyhow::bail!(
-            "authored snapshot folded to {other:?} instead of staying inert on the annex log; \
-             rolling back",
-        ),
+    match statuses.get(&verified.entry_hash).copied() {
+        Some(EntryStatus::RetainedUnfolded) => {},
+        other => {
+            let other = other.map(EntryStatus::as_db_str);
+            anyhow::bail!(
+                "authored snapshot folded to {other:?} instead of staying inert on the annex log; \
+                 rolling back",
+            )
+        },
     }
     Ok(SnapshotAuthorOutcome::Authored(verified.entry_hash))
 }

@@ -452,12 +452,15 @@ fn mint_local_account_in_tx(tx: &Transaction<'_>, now_ms: i64) -> anyhow::Result
     let statuses = storage::refold_in_tx(tx, account_id, now_ms)?;
     // Verify the genesis folded EFFECTIVE (accepted), not merely inserted — never return a wedged
     // account.
-    match statuses.get(&verified.entry_hash).map(String::as_str) {
-        Some("accepted") => Ok(()),
-        other => anyhow::bail!(
-            "the local account genesis did not fold effective (status {other:?}); refusing to \
-             mint a wedged account",
-        ),
+    match statuses.get(&verified.entry_hash).copied() {
+        Some(super::EntryStatus::Accepted) => Ok(()),
+        other => {
+            let other = other.map(super::EntryStatus::as_db_str);
+            anyhow::bail!(
+                "the local account genesis did not fold effective (status {other:?}); refusing to \
+                 mint a wedged account",
+            )
+        },
     }
 }
 

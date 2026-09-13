@@ -22,7 +22,7 @@ use super::super::branch::BranchSelection;
 use super::super::candidate::{self as account_candidate, Ancestry, HeaderView, UnknownCause};
 use super::super::cut::Cut;
 use super::super::envelope::{self, AccountEntryHeader};
-use super::super::fold::{SECRETS_LOG, SUPPORTED_OP_VERSION};
+use super::super::fold::{EntryStatus, SECRETS_LOG, SUPPORTED_OP_VERSION};
 use super::super::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityQuery, OwnerChainAuthority, storage,
 };
@@ -114,7 +114,7 @@ enum Phase {
 pub(in crate::account) fn refold_secrets_log(
     tx: &Transaction<'_>,
     account_id: AccountId,
-    statuses: &mut HashMap<EntryHash, String>,
+    statuses: &mut HashMap<EntryHash, EntryStatus>,
 ) -> anyhow::Result<()> {
     let headers = load_secrets_headers(tx, account_id)?;
     if headers.is_empty() {
@@ -545,20 +545,20 @@ fn write_secrets_verdict(
     tx: &Transaction<'_>,
     entry_hash: &EntryHash,
     verdict: SecretsAcceptance,
-    statuses: &mut HashMap<EntryHash, String>,
+    statuses: &mut HashMap<EntryHash, EntryStatus>,
 ) -> rusqlite::Result<()> {
     let (status, detail) = verdict.as_db_pair();
     tx.execute(
         "INSERT INTO account_entry_status(entry_hash, status, detail) VALUES (?1, ?2, ?3)
          ON CONFLICT(entry_hash) DO UPDATE SET status = excluded.status, detail = excluded.detail",
-        params![entry_hash.as_slice(), status, detail],
+        params![entry_hash.as_slice(), status.as_db_str(), detail],
     )?;
     if verdict == SecretsAcceptance::Accepted {
         tx.execute("UPDATE account_entries SET accepted = 1 WHERE entry_hash = ?1", [
             entry_hash.as_slice()
         ])?;
     }
-    statuses.insert(*entry_hash, status.to_string());
+    statuses.insert(*entry_hash, status);
     Ok(())
 }
 
@@ -838,7 +838,7 @@ mod tests {
         // S4: the ingest-returned status is the secrets pass's verdict, not the `retained_unfolded`
         // baseline the main loop wrote.
         let outcome = ingest(&conn, &bytes);
-        assert_eq!(outcome, IngestOutcome::Ingested { status: "accepted".to_string() });
+        assert_eq!(outcome, IngestOutcome::Ingested { status: "accepted".into() });
         assert_eq!(status(&conn, &hash), ("accepted".to_string(), None));
         assert_eq!(accepted_flag(&conn, &hash), 1);
     }
@@ -869,9 +869,7 @@ mod tests {
         // the owner-only gate rejects it (WrongSubject → invalid_owner).
         let wrap = wrap_op(account, stream_id, &member, 0x20);
         let (bytes, hash) = wrap_entry(account, &member, 0, None, Some(genesis_hash), &wrap);
-        assert_eq!(ingest(&conn, &bytes), IngestOutcome::Ingested {
-            status: "rejected".to_string()
-        });
+        assert_eq!(ingest(&conn, &bytes), IngestOutcome::Ingested { status: "rejected".into() });
         assert_eq!(
             status(&conn, &hash),
             ("rejected".to_string(), Some("invalid_owner".to_string()))

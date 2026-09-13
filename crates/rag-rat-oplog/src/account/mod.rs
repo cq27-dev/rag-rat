@@ -100,8 +100,8 @@ pub(crate) use content::{content_projected_tables_exist, open_sealed_payload};
 #[allow(unused_imports, reason = "envelope tests consume these crate-internal signing seams")]
 pub(in crate::account) use content::{seal_and_sign_content_entry, sign_sealed_content_entry};
 pub use fold::{
-    AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, GrantAuthority,
-    GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,
+    AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, EntryStatus,
+    GrantAuthority, GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,
     RosterContentAuthority,
 };
 pub use id::AccountId;
