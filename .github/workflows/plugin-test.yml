@@ -35,7 +35,7 @@ jobs:
   # ── plugin/skills/<name> is a hand-maintained copy of .agents/skills/<name>; diff every pair ─────
   # ── No build, so no `if:` guard — it costs seconds and is worth running in the dispatch mode too. ─
   skill-parity:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
       - run: bash plugin/test/verify-skill-parity.sh
@@ -43,7 +43,7 @@ jobs:
   # ── Build a rag-rat once so the launcher matrix can drive a real MCP handshake ──────────────────
   build-binary:
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
-    runs-on: ubuntu-latest # glibc 2.39 — this IS the binary's runtime floor
+    runs-on: ubicloud-standard-4-ubuntu-2404 # glibc 2.39 — this IS the binary's runtime floor
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -59,7 +59,7 @@ jobs:
   launcher:
     needs: build-binary
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     strategy:
       fail-fast: false
       matrix:
@@ -86,7 +86,7 @@ jobs:
   # ── Claude Code: non-interactive plugin install + component assertions (no API key needed) ──────
   claude-install:
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -98,7 +98,7 @@ jobs:
   # ── Codex: non-interactive `plugin add` + `plugin list` install + component staging (no API key) ─
   codex-install:
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -110,7 +110,7 @@ jobs:
   # ── Download path (dispatch with a published release version): fetch real assets per distro ──────
   download-path:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '' }}
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     strategy:
       fail-fast: false
       matrix:

@@ -113,7 +113,7 @@ jobs:
     # nothing this workflow measures — and its branch is rewritten on every push to main, so
     # running here would only restart a long job that a merge cancels again.
     if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     outputs:
       tier: ${{ steps.select.outputs.tier }}
       corpora: ${{ steps.select.outputs.corpora }}
@@ -141,7 +141,7 @@ jobs:
     needs: matrix
     if: needs.matrix.outputs.tier == 'small'
     # 24.04: the pinned scip-clang prebuilt links against a recent GLIBC (see bench.Containerfile).
-    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubuntu-24.04' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
     strategy:
       fail-fast: false
       matrix:
@@ -158,7 +158,7 @@ jobs:
         with:
           components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
-        if: runner.environment == 'github-hosted'
+        if: ${{ !startsWith(runner.name, 'hetzner-') }}
 
       - name: Build rag-rat (release, hash embedder — no model download)
         run: cargo build --release --no-default-features --bin rag-rat
@@ -237,7 +237,7 @@ jobs:
     # Run whenever the matrix ran, even if a corpus leg failed its health gate — a failing report is
     # exactly what we want surfaced in the summary/comment.
     if: always() && needs.matrix.outputs.tier == 'small' && needs.small.result != 'skipped'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v5
 

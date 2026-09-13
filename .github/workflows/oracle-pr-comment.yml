@@ -19,7 +19,7 @@ jobs:
     # Only for PR-triggered oracle runs (skip push / release / dispatch). The artifact is uploaded
     # only by the small tier's `report` job, so non-PR runs simply have nothing to post.
     if: github.event.workflow_run.event == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Download the rendered report (from the oracle run)
         uses: dawidd6/action-download-artifact@v6

@@ -55,7 +55,7 @@ env:
 jobs:
   cargo-deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v5
       - uses: taiki-e/install-action@cargo-deny
@@ -64,7 +64,7 @@ jobs:
 
   cargo-audit:
     name: cargo-audit
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v5
       - uses: taiki-e/install-action@cargo-audit

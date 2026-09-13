@@ -88,10 +88,10 @@ jobs:
   # recall@3; a noisy dip doesn't hard-fail the run. Same stance as the iai/criterion series above.
   eval_recall:
     name: search recall (commit-replay)
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-4
     if: github.ref == 'refs/heads/main'
     env:
-      BENCHER_TESTBED: ubuntu-latest
+      BENCHER_TESTBED: ubicloud-standard-4
       # Stable, cacheable location for the MiniLM ONNX download (fastembed honours this env var;
       # mirrors eval.yml). The model is immutable, so the cache key is static.
       RAG_RAT_MODEL_CACHE: ${{ github.workspace }}/.rag-rat-models
