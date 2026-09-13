@@ -484,7 +484,11 @@ fn moniker_string_drift_rebinds_via_live_logical_symbol_then_survives_move() {
     let moniker_binding =
         memory.bindings.iter().find(|b| b.binding_kind == "scip_moniker").expect("moniker binding");
     assert_eq!(moniker_binding.anchor_status, "relocated");
-    assert_eq!(moniker_binding.binding_id, bumped_moniker, "rebound to the current string");
+    assert_eq!(
+        moniker_binding.current_binding_id(),
+        bumped_moniker,
+        "rebound to the current string"
+    );
     assert_eq!(moniker_binding.moniker_tool_version.as_deref(), Some("v-bumped"));
     assert_eq!(moniker_binding.relocation_reason.as_deref(), Some("moniker-refresh"));
 
@@ -766,7 +770,7 @@ fn memory_survives_file_move_via_moniker_relocation() {
     let symbol_binding =
         memory.bindings.iter().find(|b| b.binding_kind == "symbol").expect("symbol binding");
     assert_eq!(symbol_binding.anchor_status, "relocated");
-    assert_eq!(symbol_binding.binding_id, "moved.rs::target");
+    assert_eq!(symbol_binding.current_binding_id(), "moved.rs::target");
     assert_eq!(symbol_binding.path.as_deref(), Some("moved.rs"));
     assert_eq!(symbol_binding.relocation_reason.as_deref(), Some("moniker-match"));
     let moniker_binding =
@@ -815,7 +819,7 @@ fn a_moniker_relocation_answers_a_retarget_mark() {
     let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
     let symbol_binding =
         memory.bindings.iter().find(|b| b.binding_kind == "symbol").expect("symbol binding");
-    assert_eq!(symbol_binding.binding_id, "moved.rs::target");
+    assert_eq!(symbol_binding.current_binding_id(), "moved.rs::target");
     assert_eq!(symbol_binding.relocation_reason.as_deref(), Some("moniker-match"));
 }
 

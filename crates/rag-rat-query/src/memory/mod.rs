@@ -101,11 +101,26 @@ pub struct RepoMemory {
     pub tags: Vec<String>,
 }
 
+/// One anchor of a memory, as this store sees it.
+///
+/// Two things live in a binding row (#1297). The AUTHORED anchor — `binding_id`, and the path,
+/// span, kind, signature and moniker version the author bound — replicates on `anchors/1` and in
+/// the `/3` anchor set, and changes only when the author rebinds. This store's RESOLUTION of it
+/// is local: where validation last found the target here and what it landed on. The struct is the
+/// store's view: `binding_id` is the authored identity; `resolved_binding_id` the name the target
+/// carries here when it differs; `path`, the span, `symbol_kind`, `signature_hash` and
+/// `moniker_tool_version` are the resolution where the store has one (`resolved` set — then they
+/// are its view, NULL included), else the authored value. Readers that need the authored value
+/// itself — publication, the drain's identity match — read the columns.
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoMemoryBinding {
     pub memory_id: String,
     pub binding_kind: String,
     pub binding_id: String,
+    /// The qualified name, fingerprint or hash the target carries on this store when relocation
+    /// moved it off the authored one; `None` while it is the authored one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_binding_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,6 +166,35 @@ pub struct RepoMemoryBinding {
     pub relocation_reason: Option<String>,
     pub anchor_status: String,
     pub created_at_ms: i64,
+}
+
+/// The SET fragment a writer that moves ONE component of a binding's resolution (its name, a
+/// call-path hash) pairs with its own assignment: it marks the row resolved on this store and
+/// carries every other shadow forward — what the row had already resolved, else the authored
+/// value. Once `resolved` is set the seven shadows are this store's view, NULL included, so a
+/// partial writer must never leave one unset. The caller's own column must not appear here.
+pub const BINDING_RESOLUTION_CARRY_SQL: &str = "resolved = 1,
+     resolved_path = IIF(resolved, resolved_path, path),
+     resolved_start_line = IIF(resolved, resolved_start_line, start_line),
+     resolved_end_line = IIF(resolved, resolved_end_line, end_line),
+     resolved_symbol_kind = IIF(resolved, resolved_symbol_kind, symbol_kind),
+     resolved_signature_hash = IIF(resolved, resolved_signature_hash, signature_hash),
+     resolved_moniker_tool_version = IIF(resolved, resolved_moniker_tool_version, \
+                                                moniker_tool_version)";
+
+impl RepoMemoryBinding {
+    /// The name, fingerprint or hash the target carries on this store: the resolution where
+    /// relocation moved it, the authored identity otherwise. What lookups against the index and
+    /// the local call-path tables key on; never what identifies the row or crosses the wire.
+    pub fn current_binding_id(&self) -> &str {
+        self.resolved_binding_id.as_deref().unwrap_or(&self.binding_id)
+    }
+
+    /// Record where relocation landed. Landing back on the authored identity clears the
+    /// resolution rather than restating it, so "resolved" always means "moved".
+    pub(crate) fn set_resolved_binding_id(&mut self, id: String) {
+        self.resolved_binding_id = (id != self.binding_id).then_some(id);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -652,6 +696,7 @@ mod tests {
             memory_id: "mem_x".to_string(),
             binding_kind: kind.to_string(),
             binding_id: format!("{kind}-id"),
+            resolved_binding_id: None,
             path: path.map(str::to_string),
             start_line: path.map(|_| 10),
             end_line: path.map(|_| 20),

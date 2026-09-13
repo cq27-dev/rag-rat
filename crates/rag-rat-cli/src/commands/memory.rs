@@ -298,7 +298,16 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
                 println!();
                 println!("Bindings:");
                 for b in &memory.bindings {
-                    println!("  {} {} [{}]", b.binding_kind, b.binding_id, b.anchor_status);
+                    // The authored anchor, and where this store resolved it when that differs —
+                    // the same identity `doctor` lists the binding under.
+                    match &b.resolved_binding_id {
+                        Some(resolved) => println!(
+                            "  {} {} -> {} [{}]",
+                            b.binding_kind, b.binding_id, resolved, b.anchor_status
+                        ),
+                        None =>
+                            println!("  {} {} [{}]", b.binding_kind, b.binding_id, b.anchor_status),
+                    }
                 }
             }
             Ok(())

@@ -183,7 +183,8 @@ fn memory_relocation_is_durable_across_a_second_reindex() {
         .storage
         .connection()
         .query_row(
-            "SELECT binding_id FROM repo_memory_bindings WHERE binding_kind = 'symbol' LIMIT 1",
+            "SELECT IIF(resolved, resolved_binding_id, binding_id) FROM repo_memory_bindings
+             WHERE binding_kind = 'symbol' LIMIT 1",
             [],
             |row| row.get::<_, String>(0),
         )
@@ -506,16 +507,18 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
     // Restore a.rs and rebuild so both exist, then corrupt the stored symbol_id row.
     fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
     let db = IndexDatabase::rebuild(&config).unwrap();
-    // Null out the symbol_id so the exact-id check misses, and corrupt binding_id to an
-    // impossible qualified_name so the qualified_name lookup also misses — leaving only
-    // the bare-name+hash path, which must return None (>=2 candidates). Scoped to the test's
-    // own SYMBOL binding: the poison sibling seeds two PATH bindings under one memory, and an
-    // unscoped rewrite would collapse their binding_ids into a PK collision.
+    // Null out the symbol_id so the exact-id check misses, drop the resolution the first pass
+    // recorded onto b.rs, and point the authored name at an impossible qualified_name so the name
+    // lookups also miss, leaving only the bare-name+hash path, which must return None
+    // (>=2 candidates). Scoped to the test's own SYMBOL binding: the poison sibling seeds two PATH
+    // bindings under one memory, and an unscoped rewrite would collapse their binding_ids into a
+    // PK collision.
     db.storage
         .connection()
         .execute(
-            "UPDATE repo_memory_bindings SET symbol_id = NULL, binding_id = 'src/gone.rs::target' \
-             WHERE binding_kind = 'symbol'",
+            "UPDATE repo_memory_bindings
+                SET symbol_id = NULL, binding_id = 'src/gone.rs::target', resolved = NULL
+              WHERE binding_kind = 'symbol'",
             [],
         )
         .unwrap();
@@ -529,6 +532,98 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
         report.relocated, 0,
         "must not relocate when two identical bodies exist: {report:?}"
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The authored name is tried LAST: after a symbol moved a.rs -> b.rs -> c.rs, a stranger
+/// reusing the authored name in a.rs must not capture the memory while the content hash still
+/// identifies the unchanged target in c.rs (#1297). The resolved name is dead (b.rs is gone), so
+/// the ladder falls through the hash arm before it ever considers the authored name.
+#[test]
+fn a_stranger_reusing_the_authored_name_does_not_beat_the_content_hash() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    let body = "pub fn target() -> u32 {\n    77\n}\n";
+    fs::write(root.join("src/a.rs"), body).unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let symbol = db
+        .select_symbol(&rag_rat_query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("target".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("target in a.rs");
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: "target follows its text".to_string(),
+        body: "The content hash outranks a reused authored name.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        payload_json: None,
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(symbol.symbol_id),
+            logical_symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            path: None,
+            start_line: None,
+            end_line: None,
+            commit_hash: None,
+            tracker: None,
+            project: None,
+            item_key: None,
+            start_logical_symbol_id: None,
+            end_logical_symbol_id: None,
+            edge_sequence_hash: None,
+            path_summary: None,
+            edge_path: None,
+            dir: None,
+        },
+    })
+    .unwrap();
+    drop(db);
+    let current = |db: &IndexDatabase| -> (String, String, Option<String>) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT IIF(resolved, resolved_binding_id, binding_id),
+                        IIF(resolved, resolved_path, path), path
+                 FROM repo_memory_bindings WHERE binding_kind = 'symbol'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    };
+
+    // a.rs -> b.rs: the raw handle dies with the file; the hash arm lands on b.rs.
+    fs::remove_file(root.join("src/a.rs")).unwrap();
+    fs::write(root.join("src/b.rs"), body).unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.memory_validate().unwrap();
+    assert_eq!(current(&db).0, "src/b.rs::target");
+    drop(db);
+
+    // b.rs -> c.rs, while a stranger reuses the authored name in a.rs with different text.
+    fs::remove_file(root.join("src/b.rs")).unwrap();
+    fs::write(root.join("src/c.rs"), body).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    99\n}\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let report = db.memory_validate().unwrap();
+    assert_eq!(report.gone, 0, "{report:?}");
+    let (name, path, authored_path) = current(&db);
+    assert_eq!((name.as_str(), path.as_str()), ("src/c.rs::target", "src/c.rs"));
+    assert_eq!(authored_path.as_deref(), Some("src/a.rs"), "the authored anchor is untouched");
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -655,7 +750,8 @@ fn memory_logical_binding_relocates_across_files() {
         .storage
         .connection()
         .query_row(
-            "SELECT path FROM repo_memory_bindings WHERE binding_kind = 'logical_symbol' LIMIT 1",
+            "SELECT IIF(resolved, resolved_path, path) FROM repo_memory_bindings
+             WHERE binding_kind = 'logical_symbol' LIMIT 1",
             [],
             |row| row.get::<_, Option<String>>(0),
         )
@@ -665,6 +761,21 @@ fn memory_logical_binding_relocates_across_files() {
         path.contains("b.rs"),
         "logical binding path should be b.rs after relocation, got: {path}"
     );
+    // The relocation is this store's resolution; the authored anchor — what replicates on
+    // `anchors/1` and in the memory's published set — still names a.rs (#1297).
+    let (authored_path, authored_id, resolved_id): (Option<String>, String, Option<String>) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT path, binding_id, resolved_binding_id FROM repo_memory_bindings
+             WHERE binding_kind = 'logical_symbol' LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(authored_path.as_deref().is_some_and(|p| p.contains("a.rs")), "{authored_path:?}");
+    assert_eq!(authored_id, "src/gone.rs::logical_target", "the authored name is left as written");
+    assert!(resolved_id.as_deref().is_some_and(|id| id.contains("b.rs")), "{resolved_id:?}");
 
     let _ = fs::remove_dir_all(&root);
 }

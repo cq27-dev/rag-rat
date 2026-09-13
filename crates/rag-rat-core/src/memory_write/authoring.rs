@@ -2263,24 +2263,27 @@ pub(crate) fn anchor_publication_ops(
 
 /// The scope path a symbol binding `b` resolves to through its own handle, as a SQL expression: the
 /// raw symbol row first, else the logical group's first member. Either is trusted only if it still
-/// answers to the binding's qualified name — a raw symbol id is a rowid reassigned on reindex and
-/// carries no foreign key, so a stale one can name an unrelated live symbol, whose scope would then
-/// be published as this target's. NULL, or empty, when the handle is dead or predates the column.
+/// answers to the name this store resolved the binding to — the authored name until relocation
+/// moves it here (#1297) — because a raw symbol id is a rowid reassigned on reindex and carries no
+/// foreign key, so a stale one can name an unrelated live symbol, whose scope would then be
+/// published as this target's. NULL, or empty, when the handle is dead or predates the column.
 const BOUND_SCOPE_PATH_SQL: &str = "COALESCE(
     (SELECT s.scope_path FROM symbols s
       WHERE s.id = b.symbol_id
-        AND s.qualified_name_id = (SELECT id FROM name_strings WHERE value = b.binding_id)),
+        AND s.qualified_name_id = (SELECT id FROM name_strings WHERE value = IIF(b.resolved, \
+                                    b.resolved_binding_id, b.binding_id))),
     (SELECT s.scope_path FROM logical_symbol_members m
        JOIN symbols s ON s.id = m.symbol_id
        JOIN logical_symbols ls ON ls.id = m.logical_symbol_id
       WHERE m.logical_symbol_id = b.logical_symbol_id
-        AND ls.qualified_name_id = (SELECT id FROM name_strings WHERE value = b.binding_id)
+        AND ls.qualified_name_id = (SELECT id FROM name_strings WHERE value = IIF(b.resolved, \
+                                    b.resolved_binding_id, b.binding_id))
       ORDER BY m.start_line LIMIT 1))";
 
 /// Whether a projected anchor `a` (a `json_each` row over `anchors_json`) and a binding row `b`
 /// name the same row, the same target AND the same publication, as a SQL predicate. The target is
-/// compared as the drain's `same_target` compares it — on what identifies it, not where it sits,
-/// since the validate loop rewrites `path` and the line span for the same target. The publication
+/// compared as the drain's `same_target` compares it — on what identifies it, not where it sits;
+/// the location is where the author found it, and says nothing about which target. The publication
 /// is `created_at_ms`: each rebind restamps it and `anchors/1` carries it verbatim, so it tells a
 /// row a sibling device's newer rebind has yet to reach from the set that device published —
 /// which the target columns cannot, when the rebind was between twins agreeing on all of them.
@@ -2816,6 +2819,69 @@ mod tests {
         assert_eq!(
             scopes.map(|scopes| scopes.into_iter().map(|s| s.scope_hash).collect::<Vec<_>>()),
             Some(vec![rag_rat_base::hash::hex_sha256(b"Twin as Beta")]),
+        );
+    }
+
+    /// A binding this store relocated — its handle now names a symbol under a different qualified
+    /// name, recorded as the resolution — still publishes its scope under the authored anchor:
+    /// the handle guard compares against the name the store resolved the binding to, not the
+    /// authored one, or every relocated anchor would lose the scope that tells twins apart. A
+    /// handle whose row answers to neither name is stale, and publishes none.
+    #[test]
+    fn a_relocated_binding_still_publishes_the_scope_its_handle_resolves_to() {
+        let (conn, _stream) = conn_with_stream();
+        conn.execute(
+            "INSERT INTO files(repo_id, path, language, kind, sha256, modified_at_ms, \
+             indexed_at_ms)
+             VALUES (?1, 'src/lib.rs', 'rust', 'code', 'sha', 1, 1)",
+            [REPO],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES ('src/lib.rs::Twin')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, kind,
+                    start_byte, end_byte, start_line, end_line)
+             VALUES (?1, 'rust', 'Twin', (SELECT id FROM name_strings WHERE value = \
+             'src/lib.rs::Twin'),
+                     'Twin as Beta', 'impl', 0, 1, 1, 1)",
+            [file_id],
+        )
+        .unwrap();
+        let symbol_id = conn.last_insert_rowid();
+        let seed = |id: &str, resolved_to: Option<&str>| {
+            insert_memory(&conn, id, "active", 1);
+            conn.execute(
+                "INSERT INTO repo_memory_bindings(
+                     repo_id, memory_id, binding_kind, binding_id, symbol_id, symbol_kind,
+                     anchor_status, created_at_ms, resolved, resolved_binding_id)
+                 VALUES (?1, ?2, 'symbol', 'src/lib.rs::OldTwin', ?3, 'impl', 'current', 1,
+                         ?4, ?5)",
+                params![REPO, id, symbol_id, resolved_to.map(|_| 1), resolved_to],
+            )
+            .unwrap();
+        };
+        seed("mem_relocated", Some("src/lib.rs::Twin"));
+        seed("mem_stale_handle", None);
+        let scopes = |id: &str| match anchor_scopes_op(&conn, id).unwrap() {
+            MemoryOp::NodeAnchorScopes { scopes, .. } => scopes
+                .into_iter()
+                .map(|scope| (scope.binding_id, scope.scope_hash))
+                .collect::<Vec<_>>(),
+            other => panic!("unexpected op {other:?}"),
+        };
+        assert_eq!(
+            scopes("mem_relocated"),
+            vec![(
+                "src/lib.rs::OldTwin".to_string(),
+                rag_rat_base::hash::hex_sha256(b"Twin as Beta")
+            )],
+            "the scope is published under the AUTHORED anchor, found through the resolution",
+        );
+        assert!(
+            scopes("mem_stale_handle").is_empty(),
+            "a handle answering to neither name is stale"
         );
     }
 

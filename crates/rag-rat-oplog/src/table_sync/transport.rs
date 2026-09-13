@@ -1537,7 +1537,9 @@ mod tests {
             .execute(
                 "UPDATE repo_memory_bindings
                  SET logical_symbol_id = 71, symbol_id = 72, chunk_id = 73, edge_id = 74,
-                     anchor_status = 'relocated'
+                     anchor_status = 'relocated', resolved = 1, resolved_path = 'src/here.rs',
+                     resolved_start_line = 40, resolved_end_line = 41,
+                     resolved_binding_id = 'src/here.rs'
                  WHERE repo_id = 'repo-a' AND memory_id = 'memory-a'",
                 [],
             )
@@ -1545,7 +1547,8 @@ mod tests {
         assert_eq!(
             table_sync_author_pending(&destination, account, 3).unwrap(),
             0,
-            "checkout-local resolution does not become a replicated edit",
+            "checkout-local resolution — the rowids, the status, where relocation landed — does \
+             not become a replicated edit",
         );
         source
             .execute(
@@ -1560,9 +1563,13 @@ mod tests {
         let after_update = lens_revisions(&destination);
         assert_ne!(after_update.0, before_update.0);
         assert_ne!(after_update.1, before_update.1);
-        let row: (String, i64, i64, i64, i64, String) = destination
+        // A winning upsert that CHANGES the authored row resets the checkout-local resolution
+        // that described the old one — where relocation had landed (`registry::reset_on_upsert`);
+        // the handles and the status stay.
+        let row: (String, i64, Option<i64>, Option<i64>, i64, String, Option<String>) = destination
             .query_row(
-                "SELECT path, logical_symbol_id, symbol_id, chunk_id, edge_id, anchor_status
+                "SELECT path, logical_symbol_id, symbol_id, chunk_id, edge_id, anchor_status,
+                        COALESCE(resolved_path, resolved_binding_id)
                  FROM repo_memory_bindings
                  WHERE repo_id = 'repo-a' AND memory_id = 'memory-a'",
                 [],
@@ -1574,11 +1581,15 @@ mod tests {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
             .unwrap();
-        assert_eq!(row, ("src/renamed.rs".into(), 71, 72, 73, 74, "relocated".into()));
+        assert_eq!(
+            row,
+            ("src/renamed.rs".into(), 71, Some(72), Some(73), 74, "relocated".into(), None)
+        );
 
         source
             .execute_batch(

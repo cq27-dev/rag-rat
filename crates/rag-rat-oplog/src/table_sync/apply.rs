@@ -16,7 +16,7 @@
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{OptionalExtension, Transaction, params_from_iter};
 
-use super::registry::{DefaultValue, TableSpec, ValueType};
+use super::registry::{self, DefaultValue, TableSpec, ValueType};
 use super::row_op::{self, Cell, RowOp, TypedValue};
 use super::store::PendingReason;
 use crate::op::OpMeta;
@@ -356,7 +356,19 @@ fn apply_upsert(
     // (malformed producer / schema skew); it is quarantined, NOT propagated as an error, so the
     // already-stored entry is retained and the chain advances instead of wedging.
     let write = if row_exists(tx, spec, pk_vals)? {
-        update_row(tx, spec, &known, pk_vals)
+        // A winner that CHANGES the row's synced columns is a new authored statement, and this
+        // store's local resolution of the old one goes with it (`registry::reset_on_upsert`); a
+        // winner restating the row already held — a redelivery, a sibling's identical write —
+        // leaves it alone.
+        let reset = registry::reset_on_upsert(spec);
+        let restated = !reset.is_empty()
+            && matches!(
+                read_synced_cells(tx, spec, pk_vals)?,
+                SyncedRow::Cells(ref held)
+                    if held.iter().map(|cell| (cell.column.as_str(), &cell.value))
+                        .eq(known.iter().map(|(name, value)| (*name, value)))
+            );
+        update_row(tx, spec, &known, pk_vals, if restated { &[] } else { reset })
     } else {
         insert_row(tx, spec, pk_vals, &known)
     };
@@ -683,16 +695,27 @@ fn insert_row(
 }
 
 /// Replace an existing row's synced columns in ONE statement (whole-row), so a constraint failure
-/// is atomic — never a half-written row.
+/// is atomic — never a half-written row. `reset` names local columns nulled in the same statement
+/// (see `registry::reset_on_upsert`), except on rows the spec's `reset_on_upsert_keeps` predicate
+/// selects.
 fn update_row(
     tx: &Transaction<'_>,
     spec: &TableSpec,
     cells: &[(&'static str, TypedValue)],
     pk_vals: &[TypedValue],
+    reset: &[&str],
 ) -> anyhow::Result<()> {
+    let keep = registry::reset_on_upsert_keeps(spec);
     let assignments = cells
         .iter()
         .map(|(name, _)| format!("{} = ?", quote_ident(name)))
+        .chain(reset.iter().map(|name| {
+            let name = quote_ident(name);
+            match keep {
+                Some(keep) => format!("{name} = IIF({keep}, {name}, NULL)"),
+                None => format!("{name} = NULL"),
+            }
+        }))
         .collect::<Vec<_>>()
         .join(", ");
     let sql =
@@ -1238,6 +1261,138 @@ mod tests {
         assert_eq!(current_row_clock(&tx, "repo", "t_demo", &row_pk).unwrap().unwrap().0, 5);
         tx.commit().unwrap();
         assert_eq!(title(&c).as_deref(), Some("hi"));
+    }
+
+    /// A `repo_memory_bindings` upsert over the production spec, every synced cell supplied.
+    fn binding_upsert(path: &str) -> RowOp {
+        binding_upsert_of("symbol", path)
+    }
+
+    fn binding_upsert_of(kind: &str, path: &str) -> RowOp {
+        let text = |value: &str| TypedValue::Text(value.to_string());
+        RowOp::Upsert {
+            spec_version: 1,
+            table: "repo_memory_bindings".to_string(),
+            pk: vec![text("repo-a"), text("memory-a"), text(kind), text("src/lib.rs::Run")],
+            cells: [
+                ("path", text(path)),
+                ("start_line", TypedValue::I64(4)),
+                ("end_line", TypedValue::I64(9)),
+                ("commit_hash", text("")),
+                ("tracker", text("")),
+                ("project", text("")),
+                ("item_key", text("")),
+                ("created_at_ms", TypedValue::I64(1)),
+                ("symbol_kind", text("struct")),
+                ("signature_hash", text("sig")),
+                ("moniker_tool", text("")),
+                ("moniker_tool_version", text("")),
+            ]
+            .into_iter()
+            .map(|(column, value)| Cell { column: column.to_string(), value })
+            .collect(),
+        }
+    }
+
+    /// The local columns of the one production binding row: what this store resolved beside
+    /// the authored anchor.
+    fn binding_resolution(
+        conn: &rusqlite::Connection,
+    ) -> (Option<i64>, Option<i64>, Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT logical_symbol_id, symbol_id, resolved_binding_id, resolved_symbol_kind
+             FROM repo_memory_bindings WHERE memory_id = 'memory-a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    /// A winning upsert that CHANGES a binding's authored columns resets this store's resolution
+    /// of the old anchor — where relocation landed — while keeping every handle validation
+    /// re-derives the target from; one that RESTATES the row already held leaves the resolution
+    /// alone. Without the reset the location and discriminators recorded for the old anchor
+    /// would outlive the author's change as this store's view (#1297).
+    #[test]
+    fn a_changed_binding_upsert_resets_the_local_resolution_and_a_restated_one_keeps_it() {
+        let spec = super::super::registry::SYNCABLE_TABLES
+            .iter()
+            .find(|spec| spec.name == "repo_memory_bindings")
+            .expect("the anchors spec");
+        let mut c = conn();
+        let tx = c.transaction().unwrap();
+        let meta = |lamport: u64| OpMeta { lamport, device: device(2) };
+        assert_eq!(
+            apply_row_op(&tx, spec, "repo-a", &binding_upsert("src/lib.rs"), meta(5)).unwrap(),
+            ApplyOutcome::Applied
+        );
+        tx.execute(
+            "UPDATE repo_memory_bindings
+                SET logical_symbol_id = 71, symbol_id = 72, resolved_binding_id = \
+             'src/lib.rs::Ran',
+                    resolved_symbol_kind = 'impl'
+              WHERE memory_id = 'memory-a'",
+            [],
+        )
+        .unwrap();
+        // Restated at a higher clock — a sibling writing the same row: nothing to invalidate.
+        assert_eq!(
+            apply_row_op(&tx, spec, "repo-a", &binding_upsert("src/lib.rs"), meta(6)).unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            binding_resolution(&tx),
+            (Some(71), Some(72), Some("src/lib.rs::Ran".to_string()), Some("impl".to_string())),
+            "a restated row keeps this store's resolution",
+        );
+        // Changed: a new authored statement; the old resolution goes, the handle stays.
+        assert_eq!(
+            apply_row_op(&tx, spec, "repo-a", &binding_upsert("src/moved.rs"), meta(7)).unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            binding_resolution(&tx),
+            (Some(71), Some(72), None, None),
+            "a changed row resets the resolution and keeps every handle",
+        );
+    }
+
+    /// A call-path binding's resolution is the KEY of its local call-path rows, not evidence:
+    /// an authored restatement leaves it in place (`registry::reset_on_upsert_keeps`), or the
+    /// rows under the resolved hash would be unreachable and the anchor `gone`.
+    #[test]
+    fn a_changed_call_path_upsert_keeps_the_resolution_the_local_rows_are_keyed_by() {
+        let spec = super::super::registry::SYNCABLE_TABLES
+            .iter()
+            .find(|spec| spec.name == "repo_memory_bindings")
+            .expect("the anchors spec");
+        let mut c = conn();
+        let tx = c.transaction().unwrap();
+        let meta = |lamport: u64| OpMeta { lamport, device: device(2) };
+        let op = |path: &str| binding_upsert_of("call_path", path);
+        assert_eq!(
+            apply_row_op(&tx, spec, "repo-a", &op("a"), meta(5)).unwrap(),
+            ApplyOutcome::Applied
+        );
+        tx.execute(
+            "UPDATE repo_memory_bindings SET resolved = 1, resolved_binding_id = 'converged-hash'
+              WHERE memory_id = 'memory-a'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            apply_row_op(&tx, spec, "repo-a", &op("b"), meta(6)).unwrap(),
+            ApplyOutcome::Applied
+        );
+        let (flag, hash): (Option<i64>, Option<String>) = tx
+            .query_row(
+                "SELECT resolved, resolved_binding_id FROM repo_memory_bindings
+                 WHERE memory_id = 'memory-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((flag, hash.as_deref()), (Some(1), Some("converged-hash")));
     }
 
     #[test]

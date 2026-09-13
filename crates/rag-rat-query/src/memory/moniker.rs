@@ -246,7 +246,8 @@ pub(crate) fn moniker_binding_for_memory(
 ) -> anyhow::Result<Option<MonikerRow>> {
     conn.query_row(
         "
-        SELECT binding_id, moniker_tool, moniker_tool_version
+        SELECT IIF(resolved, resolved_binding_id, binding_id), moniker_tool,
+               IIF(resolved, resolved_moniker_tool_version, moniker_tool_version)
         FROM repo_memory_bindings
         WHERE memory_id = ?1 AND binding_kind = ?2
           AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
@@ -394,10 +395,10 @@ pub(crate) fn validate_moniker_binding(
         let Some(matched) = relocate_match_for_logical_symbol(conn, stored_id)? else {
             return Ok("stale".to_string());
         };
-        let drifted = binding.binding_id != row.moniker;
+        let drifted = binding.current_binding_id() != row.moniker;
         apply_relocate_match(binding, &matched);
         if drifted {
-            binding.binding_id = row.moniker;
+            binding.set_resolved_binding_id(row.moniker);
             binding.moniker_tool_version = Some(row.tool_version);
             binding.relocation_reason = Some(MONIKER_REFRESH_REASON.to_string());
             return Ok("relocated".to_string());
@@ -405,7 +406,7 @@ pub(crate) fn validate_moniker_binding(
         return Ok("current".to_string());
     }
     // (2) The stored id is dead (file move) or has no current row: resolve the recorded string.
-    match resolve_moniker(conn, &binding.binding_id, &tool)? {
+    match resolve_moniker(conn, binding.current_binding_id(), &tool)? {
         MonikerResolution::NoData => Ok("unverified".to_string()),
         MonikerResolution::Gone => Ok("gone".to_string()),
         MonikerResolution::Dangling | MonikerResolution::Ambiguous => Ok("stale".to_string()),

@@ -929,7 +929,6 @@ struct PersistedCallPathParent {
 
 struct PersistedCallPathBinding {
     logical_symbol_id: Option<i64>,
-    created_at_ms: i64,
 }
 
 struct AffectedCallPath {
@@ -939,7 +938,9 @@ struct AffectedCallPath {
     new_hash: String,
     replacements: std::collections::BTreeMap<i64, EdgeReplacement>,
     parent: Option<PersistedCallPathParent>,
-    binding: Option<PersistedCallPathBinding>,
+    /// Every binding resolving to `old_hash` — several authored anchors can converge on one
+    /// path here (#1297), each carrying its own endpoint handle.
+    bindings: Vec<PersistedCallPathBinding>,
 }
 
 /// Remap persisted call-path callee ids and every identity derived from them.
@@ -1039,7 +1040,7 @@ pub fn remap_call_path_callee_logical_symbol_ids(
         let working_hash =
             unused_working_hash(conn, &memory_id, &old_hash, &mut reserved_working_keys)?;
         let parent = load_call_path_parent(conn, &memory_id, &old_hash)?;
-        let binding = load_call_path_binding(conn, &memory_id, &old_hash)?;
+        let bindings = load_call_path_bindings(conn, &memory_id, &old_hash)?;
         planned.push(AffectedCallPath {
             memory_id,
             old_hash,
@@ -1047,7 +1048,7 @@ pub fn remap_call_path_callee_logical_symbol_ids(
             new_hash,
             replacements,
             parent,
-            binding,
+            bindings,
         });
     }
 
@@ -1124,7 +1125,8 @@ fn call_path_key_exists(conn: &Connection, memory_id: &str, hash: &str) -> rusql
               WHERE memory_id = ?1 AND edge_sequence_hash = ?2
              UNION ALL
               SELECT 1 FROM repo_memory_bindings
-               WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
+               WHERE memory_id = ?1 AND binding_kind = 'call_path'
+                 AND IIF(resolved, resolved_binding_id, binding_id) = ?2
                  AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
          )",
         params![memory_id, hash],
@@ -1132,6 +1134,11 @@ fn call_path_key_exists(conn: &Connection, memory_id: &str, hash: &str) -> rusql
     )
 }
 
+/// Move a call path's LOCAL identity — the key of its `repo_memory_call_paths`/`_edges` rows and
+/// the binding's resolution — from one hash to another. The binding's authored `binding_id` is
+/// the hash the author bound, replicates on `anchors/1`, and is not touched: a remap is this
+/// store's re-derivation, not a rebind (#1297). Landing back on the authored hash clears the
+/// resolution.
 fn move_call_path_key(
     conn: &Connection,
     memory_id: &str,
@@ -1149,9 +1156,13 @@ fn move_call_path_key(
         params![to, memory_id, from],
     )?;
     conn.execute(
-        "UPDATE repo_memory_bindings SET binding_id = ?1
-          WHERE memory_id = ?2 AND binding_kind = 'call_path' AND binding_id = ?3
-            AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)",
+        &format!(
+            "UPDATE repo_memory_bindings
+                SET resolved_binding_id = ?1, {BINDING_RESOLUTION_CARRY_SQL}
+              WHERE memory_id = ?2 AND binding_kind = 'call_path'
+                AND IIF(resolved, resolved_binding_id, binding_id) = ?3
+                AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)"
+        ),
         params![to, memory_id, from],
     )?;
     Ok(())
@@ -1178,24 +1189,22 @@ fn load_call_path_parent(
     .optional()
 }
 
-fn load_call_path_binding(
+fn load_call_path_bindings(
     conn: &Connection,
     memory_id: &str,
     hash: &str,
-) -> rusqlite::Result<Option<PersistedCallPathBinding>> {
-    conn.query_row(
-        "SELECT logical_symbol_id, created_at_ms FROM repo_memory_bindings
-          WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
-            AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)",
-        params![memory_id, hash],
-        |row| {
-            Ok(PersistedCallPathBinding {
-                logical_symbol_id: row.get(0)?,
-                created_at_ms: row.get(1)?,
-            })
-        },
-    )
-    .optional()
+) -> rusqlite::Result<Vec<PersistedCallPathBinding>> {
+    let mut stmt = conn.prepare(
+        "SELECT logical_symbol_id FROM repo_memory_bindings
+          WHERE memory_id = ?1 AND binding_kind = 'call_path'
+            AND IIF(resolved, resolved_binding_id, binding_id) = ?2
+            AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
+          ORDER BY binding_id",
+    )?;
+    let rows = stmt.query_map(params![memory_id, hash], |row| {
+        Ok(PersistedCallPathBinding { logical_symbol_id: row.get(0)? })
+    })?;
+    rows.collect()
 }
 
 fn unanimous_non_null(values: impl IntoIterator<Item = Option<i64>>) -> Option<i64> {
@@ -1293,68 +1302,51 @@ fn finalize_call_path_parent(
     Ok(())
 }
 
+/// Every authored call path that converged on `new_hash` keeps its binding row and RESOLVES to the
+/// converged hash; the local `call_paths`/`_edges` rows under the working keys merge into one set
+/// in the parent and edge finalizers. Nothing is deleted and no authored column moves — a remap
+/// is this store's re-derivation, and `created_at_ms` is the author's (#1297). The rowid is the
+/// unanimous one across the rows that now describe one path, else cleared for validation to
+/// re-derive.
 fn finalize_call_path_binding(
     conn: &Connection,
     memory_id: &str,
     new_hash: &str,
     paths: &[&AffectedCallPath],
 ) -> rusqlite::Result<()> {
-    let existing = load_call_path_binding(conn, memory_id, new_hash)?;
-    let bindings = paths.iter().filter_map(|path| path.binding.as_ref()).collect::<Vec<_>>();
-    if existing.is_none() && bindings.is_empty() {
+    let existing = load_call_path_bindings(conn, memory_id, new_hash)?;
+    let bindings = paths.iter().flat_map(|path| path.bindings.iter()).collect::<Vec<_>>();
+    if existing.is_empty() && bindings.is_empty() {
         return Ok(());
     }
     let logical_symbol_id = unanimous_non_null(
         existing
-            .as_ref()
+            .iter()
             .map(|binding| binding.logical_symbol_id)
-            .into_iter()
             .chain(bindings.iter().map(|binding| binding.logical_symbol_id)),
     );
-    let created_at_ms = existing
-        .as_ref()
-        .map(|binding| binding.created_at_ms)
-        .into_iter()
-        .chain(bindings.iter().map(|binding| binding.created_at_ms))
-        .min()
-        .expect("a binding exists");
-
-    if existing.is_some() {
-        for path in paths {
-            conn.execute(
-                "DELETE FROM repo_memory_bindings
-                  WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
-                    AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)",
-                params![memory_id, path.working_hash],
-            )?;
-        }
-        conn.execute(
-            "UPDATE repo_memory_bindings SET logical_symbol_id = ?1, created_at_ms = ?2
-              WHERE memory_id = ?3 AND binding_kind = 'call_path' AND binding_id = ?4
-                AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?3)",
-            params![logical_symbol_id, created_at_ms, memory_id, new_hash],
-        )?;
-        return Ok(());
-    }
-
-    let winner = paths.iter().find(|path| path.binding.is_some()).expect("a binding exists");
     for path in paths {
-        if path.working_hash != winner.working_hash {
-            conn.execute(
-                "DELETE FROM repo_memory_bindings
-                  WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
-                    AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)",
-                params![memory_id, path.working_hash],
-            )?;
-        }
+        conn.execute(
+            &format!(
+                "UPDATE repo_memory_bindings
+                    SET resolved_binding_id = ?1, logical_symbol_id = ?2,
+                        {BINDING_RESOLUTION_CARRY_SQL}
+                  WHERE memory_id = ?3 AND binding_kind = 'call_path'
+                    AND IIF(resolved, resolved_binding_id, binding_id) = ?4
+                    AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?3)"
+            ),
+            params![new_hash, logical_symbol_id, memory_id, path.working_hash],
+        )?;
     }
-    conn.execute(
-        "UPDATE repo_memory_bindings
-            SET binding_id = ?1, logical_symbol_id = ?2, created_at_ms = ?3
-          WHERE memory_id = ?4 AND binding_kind = 'call_path' AND binding_id = ?5
-            AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?4)",
-        params![new_hash, logical_symbol_id, created_at_ms, memory_id, winner.working_hash],
-    )?;
+    if !existing.is_empty() {
+        conn.execute(
+            "UPDATE repo_memory_bindings SET logical_symbol_id = ?1
+              WHERE memory_id = ?2 AND binding_kind = 'call_path'
+                AND IIF(resolved, resolved_binding_id, binding_id) = ?3
+                AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)",
+            params![logical_symbol_id, memory_id, new_hash],
+        )?;
+    }
     Ok(())
 }
 

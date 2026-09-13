@@ -1683,68 +1683,26 @@ impl IndexDatabase {
         };
         let signature_hash =
             signature.map(|sig| rag_rat_base::hash::hex_sha256(sig.trim().as_bytes()));
-        // Snapshot the current binding_ids before mutating, so the rename loop is not walking a
-        // live cursor it is also writing to. A binding whose memory is not materialized here — the
-        // drain keeps a removed synced memory's bindings for `anchors/1` to carry (#1298) — is
-        // refreshed like any other: this heal runs once per key derivation, nothing repeats it
-        // when the memory returns, and the values it writes are derivation facts every device
-        // computes identically, so the rows it publishes are the ones a live device publishes too.
-        // The walk is ordered so that when two bindings of one memory collapse to one name, every
-        // device keeps the same row and deletes the same one.
-        let stale_binding_ids: Vec<(String, String, String)> = {
-            let mut stmt = conn.prepare(
-                "SELECT repo_id, memory_id, binding_id FROM repo_memory_bindings
-                  WHERE binding_kind = 'logical_symbol' AND logical_symbol_id = ?1
-                  ORDER BY repo_id, memory_id, binding_id",
-            )?;
-            stmt.query_map(params![logical_symbol_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut changed = false;
-        for (repo_id, memory_id, old_binding_id) in stale_binding_ids {
-            let updated = conn.execute(
-                "UPDATE OR IGNORE repo_memory_bindings
-                    SET binding_id = ?3, symbol_kind = ?4, signature_hash = ?5
-                  WHERE repo_id = ?6 AND memory_id = ?1
-                    AND binding_kind = 'logical_symbol' AND binding_id = ?2",
-                params![memory_id, old_binding_id, qualified_name, kind, signature_hash, repo_id],
-            )?;
-            changed |= updated > 0;
-            // The rename was ignored because a sibling binding of this memory already holds the
-            // target qualified name: drop the stale row instead of leaving it mis-labelled. Only
-            // for a memory materialized here: which rows collapse depends on what the validate
-            // loop did to them since, and it leaves a removed memory's rows alone, so this
-            // device's collision is not necessarily a live device's — and the delete publishes a
-            // `Remove` on `anchors/1`. The duplicate is invisible meanwhile (every reader joins
-            // `repo_memories`), but it must not keep a live handle: validation trusts one and
-            // never repairs the name behind it. Its checkout-local resolution is cleared instead
-            // (nothing on `anchors/1` moves), so when the memory returns the row re-enters the
-            // relocation ladder; when that relocates it, the rename collides and validation takes
-            // the duplicate. A row the ladder cannot place — the anchored text changed meanwhile
-            // and no moniker resolves it — stays behind as a `gone` binding at the stale name.
-            if updated == 0 && old_binding_id != qualified_name {
-                let deleted = conn.execute(
-                    "DELETE FROM repo_memory_bindings
-                      WHERE repo_id = ?3 AND memory_id = ?1
-                        AND binding_kind = 'logical_symbol' AND binding_id = ?2
-                        AND EXISTS (SELECT 1 FROM repo_memories m
-                                     WHERE m.id = ?1 AND m.repo_id = ?3)",
-                    params![memory_id, old_binding_id, repo_id],
-                )?;
-                if deleted == 0 {
-                    conn.execute(
-                        "UPDATE repo_memory_bindings
-                            SET logical_symbol_id = NULL, anchor_status = 'unverified'
-                          WHERE repo_id = ?3 AND memory_id = ?1
-                            AND binding_kind = 'logical_symbol' AND binding_id = ?2",
-                        params![memory_id, old_binding_id, repo_id],
-                    )?;
-                }
-                changed = true;
-            }
-        }
+        // Every binding at this id takes the live discriminators as its RESOLUTION — where this
+        // store finds the target and what it landed on. The authored columns are the author's and
+        // never change here (#1297): nothing is renamed, so two bindings of one memory collapsing
+        // onto one name collide with nothing, and nothing reaches `anchors/1`. A binding whose
+        // memory is not materialized here (the drain keeps a removed synced memory's bindings) is
+        // refreshed like any other: the heal runs once per key derivation and nothing repeats it
+        // when the memory returns. What the row had not resolved yet is carried from the authored
+        // value, since a resolved row's shadows are its whole view.
+        let changed = conn.execute(
+            "UPDATE repo_memory_bindings
+                SET resolved = 1, resolved_binding_id = ?2, resolved_symbol_kind = ?3,
+                    resolved_signature_hash = ?4,
+                    resolved_path = IIF(resolved, resolved_path, path),
+                    resolved_start_line = IIF(resolved, resolved_start_line, start_line),
+                    resolved_end_line = IIF(resolved, resolved_end_line, end_line),
+                    resolved_moniker_tool_version =
+                        IIF(resolved, resolved_moniker_tool_version, moniker_tool_version)
+              WHERE binding_kind = 'logical_symbol' AND logical_symbol_id = ?1",
+            params![logical_symbol_id, qualified_name, kind, signature_hash],
+        )? > 0;
         if changed {
             rag_rat_db::meta::bump_lens_revisions(conn, &self.active_repo_id, &[
                 rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,

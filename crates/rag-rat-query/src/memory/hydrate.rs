@@ -32,7 +32,8 @@ pub fn duplicate_memory_id(
           AND lower(repo_memories.title) = lower(?1)
           AND lower(repo_memories.body) = lower(?2)
           AND repo_memory_bindings.binding_kind = ?3
-          AND repo_memory_bindings.binding_id = ?4
+          AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_binding_id, \
+                 repo_memory_bindings.binding_id) = ?4
           AND repo_memories.payload_json IS ?5
           AND repo_memories.status != 'obsolete'{repo_clause}
         LIMIT 1
@@ -178,14 +179,43 @@ pub(crate) fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemory
         tags: Vec::new(),
     })
 }
+/// The SELECT list every reader that hydrates through [`binding_row`] must carry: the authored
+/// columns and this store's `resolved_*` shadows (#1297).
+pub(crate) const BINDING_ROW_COLUMNS: &str =
+    "memory_id, binding_kind, binding_id, path, start_line, end_line, logical_symbol_id, \
+     symbol_id, chunk_id, edge_id, commit_hash, tracker, project, item_key, symbol_kind, \
+     signature_hash, moniker_tool, moniker_tool_version, relocation_reason, anchor_status, \
+     created_at_ms, resolved, resolved_binding_id, resolved_path, resolved_start_line, \
+     resolved_end_line, resolved_symbol_kind, resolved_signature_hash, \
+     resolved_moniker_tool_version";
+
 pub(crate) fn binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemoryBinding> {
+    // The location and discriminator fields are this store's resolution where it has one —
+    // `resolved` set, and then the shadows are its view, NULL included — else the authored value;
+    // `binding_id` stays the authored identity (#1297).
+    let resolved = row.get::<_, Option<i64>>("resolved")?.is_some_and(|flag| flag != 0);
+    fn pick<T: rusqlite::types::FromSql>(
+        row: &rusqlite::Row<'_>,
+        resolved: bool,
+        shadow: &str,
+        authored: &str,
+    ) -> rusqlite::Result<Option<T>> {
+        row.get(if resolved { shadow } else { authored })
+    }
+    let binding_id: String = row.get("binding_id")?;
+    let resolved_binding_id = if resolved {
+        row.get::<_, Option<String>>("resolved_binding_id")?.filter(|id| *id != binding_id)
+    } else {
+        None
+    };
     Ok(RepoMemoryBinding {
         memory_id: row.get("memory_id")?,
         binding_kind: row.get("binding_kind")?,
-        binding_id: row.get("binding_id")?,
-        path: row.get("path")?,
-        start_line: row.get("start_line")?,
-        end_line: row.get("end_line")?,
+        binding_id,
+        resolved_binding_id,
+        path: pick(row, resolved, "resolved_path", "path")?,
+        start_line: pick(row, resolved, "resolved_start_line", "start_line")?,
+        end_line: pick(row, resolved, "resolved_end_line", "end_line")?,
         logical_symbol_id: row.get("logical_symbol_id")?,
         symbol_id: row.get("symbol_id")?,
         chunk_id: row.get("chunk_id")?,
@@ -194,10 +224,15 @@ pub(crate) fn binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemor
         tracker: row.get("tracker")?,
         project: row.get("project")?,
         item_key: row.get("item_key")?,
-        symbol_kind: row.get("symbol_kind")?,
-        signature_hash: row.get("signature_hash")?,
+        symbol_kind: pick(row, resolved, "resolved_symbol_kind", "symbol_kind")?,
+        signature_hash: pick(row, resolved, "resolved_signature_hash", "signature_hash")?,
         moniker_tool: row.get("moniker_tool")?,
-        moniker_tool_version: row.get("moniker_tool_version")?,
+        moniker_tool_version: pick(
+            row,
+            resolved,
+            "resolved_moniker_tool_version",
+            "moniker_tool_version",
+        )?,
         relocation_reason: row.get("relocation_reason")?,
         anchor_status: row.get("anchor_status")?,
         created_at_ms: row.get("created_at_ms")?,
@@ -207,18 +242,15 @@ pub(crate) fn attach_memory_children(
     conn: &Connection,
     memory: &mut RepoMemory,
 ) -> anyhow::Result<()> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "
-        SELECT memory_id, binding_kind, binding_id, path, start_line, end_line, logical_symbol_id,
-               symbol_id, chunk_id, edge_id, commit_hash, tracker, project,
-               item_key, symbol_kind, signature_hash, moniker_tool, moniker_tool_version,
-               relocation_reason, anchor_status, created_at_ms
+        SELECT {BINDING_ROW_COLUMNS}
         FROM repo_memory_bindings
         WHERE memory_id = ?1
           AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
         ORDER BY binding_kind, binding_id
         ",
-    )?;
+    ))?;
     memory.bindings =
         stmt.query_map([&memory.memory_id], binding_row)?.collect::<Result<Vec<_>, _>>()?;
     let mut stmt = conn.prepare(
@@ -324,13 +356,15 @@ pub(crate) fn mark_drifted_synced_anchor(
             UNION ALL
             SELECT files.sha256 AS current_hash
             FROM repo_memory_bindings
-            JOIN files ON files.path = repo_memory_bindings.path
+            JOIN files ON files.path = IIF(repo_memory_bindings.resolved, \
+         repo_memory_bindings.resolved_path, repo_memory_bindings.path)
             WHERE repo_memory_bindings.memory_id = ?1
               AND repo_memory_bindings.binding_kind = 'path'
             UNION ALL
             SELECT files.sha256 AS current_hash
             FROM repo_memory_bindings
-            JOIN files ON files.path = repo_memory_bindings.path
+            JOIN files ON files.path = IIF(repo_memory_bindings.resolved, \
+         repo_memory_bindings.resolved_path, repo_memory_bindings.path)
             WHERE repo_memory_bindings.memory_id = ?1
               AND repo_memory_bindings.binding_kind = 'edge'
               AND NOT EXISTS (
@@ -341,10 +375,13 @@ pub(crate) fn mark_drifted_synced_anchor(
             UNION ALL
             SELECT chunks.text_hash AS current_hash
             FROM repo_memory_bindings
-            JOIN files ON files.path = repo_memory_bindings.path
+            JOIN files ON files.path = IIF(repo_memory_bindings.resolved, \
+         repo_memory_bindings.resolved_path, repo_memory_bindings.path)
             JOIN chunks ON chunks.file_id = files.id
-                       AND chunks.start_line <= repo_memory_bindings.start_line
-                       AND chunks.end_line >= repo_memory_bindings.end_line
+                       AND chunks.start_line <= IIF(repo_memory_bindings.resolved, \
+         repo_memory_bindings.resolved_start_line, repo_memory_bindings.start_line)
+                       AND chunks.end_line >= IIF(repo_memory_bindings.resolved, \
+         repo_memory_bindings.resolved_end_line, repo_memory_bindings.end_line)
             WHERE repo_memory_bindings.memory_id = ?1
               AND repo_memory_bindings.binding_kind IN ('symbol', 'logical_symbol')
               AND NOT EXISTS (
@@ -352,8 +389,10 @@ pub(crate) fn mark_drifted_synced_anchor(
                   JOIN files AS served ON served.id = resolved.file_id
                   WHERE resolved.id = repo_memory_bindings.chunk_id
               )
-              AND repo_memory_bindings.start_line IS NOT NULL
-              AND repo_memory_bindings.end_line IS NOT NULL
+              AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_start_line, \
+         repo_memory_bindings.start_line) IS NOT NULL
+              AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_end_line, \
+         repo_memory_bindings.end_line) IS NOT NULL
         )
         ",
         params![&memory.memory_id, stamp],

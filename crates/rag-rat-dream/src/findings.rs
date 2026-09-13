@@ -162,9 +162,9 @@ pub(super) fn coverage_gap(conn: &Connection, limit: usize) -> anyhow::Result<Ve
 
     let covered_paths: HashSet<String> = conn
         .prepare(&format!(
-            "SELECT b.path FROM repo_memory_bindings b
+            "SELECT IIF(b.resolved, b.resolved_path, b.path) FROM repo_memory_bindings b
              JOIN repo_memories m ON m.id = b.memory_id AND m.repo_id = b.repo_id
-             WHERE b.path IS NOT NULL{b_clause}"
+             WHERE IIF(b.resolved, b.resolved_path, b.path) IS NOT NULL{b_clause}"
         ))?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()?;

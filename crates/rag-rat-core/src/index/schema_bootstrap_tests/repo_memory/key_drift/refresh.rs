@@ -215,7 +215,9 @@ fn a_drift_heal_refreshes_the_discriminators_of_a_binding_without_its_memory() {
         .storage
         .connection()
         .query_row(
-            "SELECT logical_symbol_id, binding_id, symbol_kind, signature_hash
+            "SELECT logical_symbol_id, IIF(resolved, resolved_binding_id, binding_id),
+                    IIF(resolved, resolved_symbol_kind, symbol_kind),
+                    IIF(resolved, resolved_signature_hash, signature_hash)
                FROM repo_memory_bindings WHERE memory_id = ?1",
             params![memory_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -336,7 +338,9 @@ fn a_drift_heal_refreshes_the_binding_discriminators() {
         .storage
         .connection()
         .query_row(
-            "SELECT logical_symbol_id, binding_id, symbol_kind, signature_hash
+            "SELECT logical_symbol_id, IIF(resolved, resolved_binding_id, binding_id),
+                    IIF(resolved, resolved_symbol_kind, symbol_kind),
+                    IIF(resolved, resolved_signature_hash, signature_hash)
                FROM repo_memory_bindings WHERE memory_id = ?1",
             params![memory_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -357,7 +361,7 @@ fn a_drift_heal_refreshes_the_binding_discriminators() {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
-    assert_eq!(binding_id, live_qual, "binding_id must be refreshed to the live qualified name");
+    assert_eq!(binding_id, live_qual, "the resolution must carry the live qualified name");
     assert_eq!(symbol_kind, live_kind, "symbol_kind must be refreshed to the live kind");
     assert_eq!(
         signature_hash,
@@ -1513,7 +1517,7 @@ fn a_symbol_binding_refreshes_its_name_when_the_row_is_renamed_in_place() {
         .storage
         .connection()
         .query_row(
-            "SELECT binding_id FROM repo_memory_bindings
+            "SELECT IIF(resolved, resolved_binding_id, binding_id) FROM repo_memory_bindings
               WHERE memory_id = ?1 AND binding_kind = 'symbol'",
             params![memory_id],
             |r| r.get(0),
@@ -2057,7 +2061,8 @@ fn a_published_rebind_between_same_named_impls_follows_the_signature() {
             tx.commit().unwrap();
             db.memory_validate().unwrap();
             conn.query_row(
-                "SELECT start_line, relocation_reason FROM repo_memory_bindings
+                "SELECT IIF(resolved, resolved_start_line, start_line), relocation_reason FROM \
+                 repo_memory_bindings
                   WHERE memory_id = ?1",
                 params![memory_id],
                 |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
@@ -2174,7 +2179,8 @@ fn an_edited_symbols_memory_is_not_taken_by_a_sibling_with_its_old_signature() {
         let conn = db.storage.connection();
         let start_line = || -> Option<i64> {
             conn.query_row(
-                "SELECT start_line FROM repo_memory_bindings WHERE memory_id = ?1",
+                "SELECT IIF(resolved, resolved_start_line, start_line) FROM repo_memory_bindings
+                 WHERE memory_id = ?1",
                 params![memory_id],
                 |r| r.get(0),
             )
@@ -2354,7 +2360,9 @@ fn a_linked_checkout_without_the_authors_target_leaves_the_retarget_to_the_base(
         db.storage
             .connection()
             .query_row(
-                "SELECT start_line, signature_hash, relocation_reason FROM repo_memory_bindings
+                "SELECT IIF(resolved, resolved_start_line, start_line),
+                        IIF(resolved, resolved_signature_hash, signature_hash), relocation_reason
+                   FROM repo_memory_bindings
                   WHERE memory_id = ?1",
                 params![memory_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -2438,7 +2446,9 @@ fn a_local_kind_change_is_not_taken_by_a_sibling_with_the_old_kind() {
         db.storage
             .connection()
             .query_row(
-                "SELECT start_line, symbol_kind FROM repo_memory_bindings WHERE memory_id = ?1",
+                "SELECT IIF(resolved, resolved_start_line, start_line),
+                        IIF(resolved, resolved_symbol_kind, symbol_kind)
+                   FROM repo_memory_bindings WHERE memory_id = ?1",
                 params![memory_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -2594,7 +2604,9 @@ fn landed_binding(db: &IndexDatabase, memory_id: &str) -> (Option<i64>, Option<S
     db.storage
         .connection()
         .query_row(
-            "SELECT start_line, relocation_reason, anchor_status FROM repo_memory_bindings
+            "SELECT IIF(resolved, resolved_start_line, start_line), relocation_reason, \
+             anchor_status
+               FROM repo_memory_bindings
               WHERE memory_id = ?1",
             params![memory_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),

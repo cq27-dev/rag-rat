@@ -101,7 +101,10 @@ pub fn memories_for_chunk(
         WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
           AND (
               repo_memory_bindings.chunk_id = ?1
-              OR (files.path IS NOT NULL AND repo_memory_bindings.path = files.path)
+              OR (files.path IS NOT NULL
+                  AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
+         repo_memory_bindings.path)
+                      = files.path)
           )
         GROUP BY repo_memories.id
         ORDER BY binds_this_chunk DESC, updated_at_ms DESC
@@ -129,7 +132,8 @@ pub fn memories_for_path(
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
          AND repo_memory_bindings.repo_id = repo_memories.repo_id
         WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
-          AND repo_memory_bindings.path = ?1
+          AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
+         repo_memory_bindings.path) = ?1
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?2
         "
@@ -158,10 +162,12 @@ pub fn memories_for_symbol(
           AND (
               repo_memory_bindings.logical_symbol_id = ?1
               OR repo_memory_bindings.symbol_id = ?2
-              OR repo_memory_bindings.binding_id = ?3
+              OR IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_binding_id, \
+         repo_memory_bindings.binding_id) = ?3
               OR (
                   repo_memory_bindings.binding_kind = 'path'
-                  AND repo_memory_bindings.path = ?4
+                  AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
+         repo_memory_bindings.path) = ?4
               )
           )
         ORDER BY repo_memories.updated_at_ms DESC
@@ -665,15 +671,19 @@ pub(crate) fn memory_ids_with_broken_anchors(conn: &Connection) -> rusqlite::Res
 }
 
 pub fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>> {
-    // Query bindings whose anchor_status is non-current, restricted to active memories.
-    // Mirrors the column list used by validate_memories / binding_row.
+    // Query bindings whose anchor_status is non-current, restricted to active memories. The
+    // location and discriminators are this store's resolution where it has one (as `binding_row`
+    // hydrates them); the identity stays the authored `binding_id` the entry is listed under.
     let scope = memory_repo_scope(conn)?;
     let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
     let mut stmt = conn.prepare(&format!(
         "
-        SELECT b.memory_id, b.binding_kind, b.binding_id, b.path,
-               b.symbol_kind, b.signature_hash, b.anchor_status,
-               m.title
+        SELECT b.memory_id, b.binding_kind, b.binding_id,
+               IIF(b.resolved, b.resolved_path, b.path),
+               IIF(b.resolved, b.resolved_symbol_kind, b.symbol_kind),
+               IIF(b.resolved, b.resolved_signature_hash, b.signature_hash),
+               b.anchor_status, m.title,
+               IIF(b.resolved, b.resolved_binding_id, b.binding_id)
         FROM repo_memory_bindings AS b
         JOIN repo_memories AS m ON m.id = b.memory_id AND m.repo_id = b.repo_id
         WHERE m.status = 'active'
@@ -698,6 +708,10 @@ pub fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>
         signature_hash: Option<String>,
         anchor_status: String,
         title: String,
+        /// The name the target carries on this store — where the row resolved to, else the
+        /// authored name. Repair candidates are searched from here; `binding_id` stays the
+        /// authored identity the entry is listed under (#1297).
+        current_id: String,
     }
 
     let rows = stmt.query_map([], |row| {
@@ -710,6 +724,7 @@ pub fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>
             signature_hash: row.get(5)?,
             anchor_status: row.get(6)?,
             title: row.get(7)?,
+            current_id: row.get(8)?,
         })
     })?;
 
@@ -718,7 +733,7 @@ pub fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>
         let r = row?;
         let candidates = live_symbol_candidates(
             conn,
-            &r.binding_id,
+            &r.current_id,
             r.path.as_deref(),
             r.symbol_kind.as_deref(),
             r.signature_hash.as_deref(),
@@ -894,16 +909,12 @@ pub fn validate_memories(
     // in any window.
     let staged_window = staged_generation_exists(conn, &scope)?;
     // Only bindings whose memory is materialized here. The drain keeps a removed synced memory's
-    // bindings for `anchors/1` to carry (#1298); this pass rewrites portable columns, so an orphan
-    // would be counted in the report and relocated — publishing an Upsert, or on a key collision
-    // a Remove, for a memory this device cannot show. It re-enters the sweep when the memory does.
+    // bindings for `anchors/1` to carry (#1298); an orphan has nothing to show here, so resolving
+    // it would only put rows the doctor and the health counts never see into this report. It
+    // re-enters the sweep when the memory does.
     let mut stmt = conn.prepare(&format!(
         "
-        SELECT memory_id, binding_kind, binding_id, path, start_line, end_line,
-               logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, tracker,
-               project, item_key, symbol_kind, signature_hash, moniker_tool,
-               moniker_tool_version, relocation_reason, anchor_status, created_at_ms,
-               downgrade_pending_at_ms
+        SELECT {BINDING_ROW_COLUMNS}, downgrade_pending_at_ms
         FROM repo_memory_bindings
         WHERE 1=1{repo_clause}
           AND EXISTS (SELECT 1 FROM repo_memories m
@@ -932,7 +943,10 @@ pub fn validate_memories(
     };
     for row in rows {
         let (mut binding, downgrade_pending_at_ms) = row?;
-        let original_binding_id = binding.binding_id.clone();
+        // The fingerprint the row resolved to before this pass — what a hidden linked-worktree
+        // edge is looked up by. The authored `binding_id` keys every write below and the ladder
+        // never moves it (#1297).
+        let stored_binding_id = binding.current_binding_id().to_string();
         let stored_status = binding.anchor_status.clone();
         let stored_edge_id = binding.edge_id;
         report.checked += 1;
@@ -952,7 +966,7 @@ pub fn validate_memories(
                     conn,
                     edge_id,
                     repo_id,
-                    &original_binding_id,
+                    &stored_binding_id,
                 )?,
                 _ => false,
             }
@@ -974,7 +988,7 @@ pub fn validate_memories(
                 params![
                     binding.memory_id,
                     binding.binding_kind,
-                    original_binding_id,
+                    binding.binding_id,
                     scope.as_deref()
                 ],
             )?;
@@ -1001,28 +1015,16 @@ pub fn validate_memories(
                     params![
                         binding.memory_id,
                         binding.binding_kind,
-                        original_binding_id,
+                        binding.binding_id,
                         now_ms(),
                         scope.as_deref()
                     ],
                 )?;
             } else {
-                stamp_validated_binding(
-                    conn,
-                    scope.as_deref(),
-                    &binding,
-                    &original_binding_id,
-                    &status,
-                )?;
+                stamp_validated_binding(conn, scope.as_deref(), &binding, &status)?;
             }
         } else {
-            stamp_validated_binding(
-                conn,
-                scope.as_deref(),
-                &binding,
-                &original_binding_id,
-                &status,
-            )?;
+            stamp_validated_binding(conn, scope.as_deref(), &binding, &status)?;
         }
         match status.as_str() {
             "current" => report.current += 1,
@@ -1050,26 +1052,30 @@ pub fn validate_memories(
     Ok(report)
 }
 
-/// Persist one validated binding: the full field rewrite `validate_memories` stamps for every
-/// non-deferred observation. Clears `downgrade_pending_at_ms` — a persisted stamp is either an
-/// upgrade (the anchor is seen again; the pending downgrade is disarmed) or the confirmed
-/// downgrade itself (the marker's job is done).
+/// Persist one validated binding: this store's RESOLUTION of the authored anchor — status, rowids,
+/// and where relocation landed (`resolved_*`) — for every non-deferred observation. The authored
+/// columns are never written here: they are what the author bound, they replicate on `anchors/1`,
+/// and they change only by authoring (#1297). So nothing is renamed and nothing collides; two
+/// authored anchors of one memory that resolve to one target are two rows resolving alike. The
+/// stamp sets `resolved`, after which the seven shadows are this store's view, NULL included —
+/// a target with no signature clears the evidence rather than leaving the author's in force. Clears
+/// `downgrade_pending_at_ms` — a persisted stamp is either an upgrade (the anchor is seen again;
+/// the pending downgrade is disarmed) or the confirmed downgrade itself (the marker's job is done).
 fn stamp_validated_binding(
     conn: &Connection,
     repo_id: Option<&str>,
     binding: &RepoMemoryBinding,
-    original_binding_id: &str,
     status: &str,
 ) -> anyhow::Result<()> {
-    let updated = conn.execute(
+    conn.execute(
         "
-        UPDATE OR IGNORE repo_memory_bindings
+        UPDATE repo_memory_bindings
         SET anchor_status = ?3, logical_symbol_id = ?4, symbol_id = ?5, chunk_id = ?6,
-            edge_id = ?7, path = ?8, start_line = ?9, end_line = ?10,
-            binding_id = ?11, symbol_kind = ?12, signature_hash = ?13,
-            moniker_tool_version = ?15, relocation_reason = ?16,
-            downgrade_pending_at_ms = NULL
-         WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?14
+            edge_id = ?7, resolved = 1, resolved_path = ?8, resolved_start_line = ?9,
+            resolved_end_line = ?10, resolved_binding_id = ?11, resolved_symbol_kind = ?12,
+            resolved_signature_hash = ?13, resolved_moniker_tool_version = ?14,
+            relocation_reason = ?15, downgrade_pending_at_ms = NULL
+         WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?16
            AND (?17 IS NULL OR repo_id = ?17)
         ",
         params![
@@ -1083,26 +1089,15 @@ fn stamp_validated_binding(
             binding.path,
             binding.start_line,
             binding.end_line,
-            binding.binding_id,
+            binding.current_binding_id(),
             binding.symbol_kind,
             binding.signature_hash,
-            original_binding_id,
             binding.moniker_tool_version,
             binding.relocation_reason,
+            binding.binding_id,
             repo_id
         ],
     )?;
-    // UPDATE OR IGNORE: if a sibling binding already holds the new (memory_id, kind,
-    // binding_id) PK, the rewrite is a no-op rather than a crash. Drop the
-    // now-duplicate stale row.
-    if updated == 0 && binding.binding_id != original_binding_id {
-        conn.execute(
-            "DELETE FROM repo_memory_bindings
-             WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3
-               AND (?4 IS NULL OR repo_id = ?4)",
-            params![binding.memory_id, binding.binding_kind, original_binding_id, repo_id],
-        )?;
-    }
     Ok(())
 }
 

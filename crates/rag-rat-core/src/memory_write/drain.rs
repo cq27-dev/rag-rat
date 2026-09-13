@@ -851,9 +851,9 @@ fn same_row(held: &rag_rat_oplog::PortableAnchor, anchor: &rag_rat_oplog::Portab
 /// Whether a held binding and a published anchor name the same row AND the same target, compared on
 /// what identifies the target rather than where it currently sits. The row alone is not enough: a
 /// struct and its impl share a qualified name, told apart by `symbol_kind` and `signature_hash`.
-/// The location is left out because the validate loop rewrites it in place for the SAME target —
-/// `path` and the line span when a symbol only moves, `moniker_tool_version` on a moniker refresh —
-/// and `created_at_ms` because each rebind restamps it.
+/// The location is left out because it says where the author found the target, not which target:
+/// two captures of one symbol can differ on `path`, the line span and `moniker_tool_version`
+/// without the target having changed — and `created_at_ms` because each rebind restamps it.
 ///
 /// A kind the drain never installs (`chunk`, `call_path`) never matches: its id is a checkout-local
 /// rowid, so equal ids on two stores say nothing about the target, and such a row held beside a
@@ -1033,9 +1033,10 @@ fn converge_bindings(
 /// The validator, running scoped to a checkout of the memory's repo (which this drain, running for
 /// every repo, is not), then weighs the author's evidence above the handle.
 ///
-/// The baseline is the author's last statement, not the row: relocation refreshes the row's kind
-/// and signature to this checkout's view, so after a local edit an unchanged republish would read
-/// as a retarget, and the validator would follow the old signature to a same-named sibling.
+/// The baseline is the author's last statement, not the row: the row's authored kind and signature
+/// are the author's too, but a row seeded from an older set, or converged on a foreign one, can
+/// carry values the current author never published, and an unchanged republish would then read as
+/// a retarget and the validator follow the old signature to a same-named sibling.
 ///
 /// The target's published scope (`published_scope`, see `rag_rat_oplog::AnchorScope`) is judged the
 /// same way, against the scope the baseline recorded — and only where BOTH are known. Two impls of
@@ -1082,6 +1083,10 @@ pub(crate) fn refresh_binding(
              project = ?10, item_key = ?11, symbol_kind = ?12, signature_hash = ?13,
              moniker_tool = ?14, moniker_tool_version = ?15, created_at_ms = ?16,
              symbol_id = NULL, chunk_id = NULL,
+             resolved = NULL, resolved_binding_id = NULL, resolved_path = NULL,
+             resolved_start_line = NULL,
+             resolved_end_line = NULL, resolved_symbol_kind = NULL,
+             resolved_signature_hash = NULL, resolved_moniker_tool_version = NULL,
              anchor_status = 'unverified',
              relocation_reason = ?17,
              downgrade_pending_at_ms = NULL
@@ -3898,9 +3903,9 @@ mod tests {
         assert!(parked_digest(&conn, "mem_peer").is_none());
     }
 
-    /// A binding relocated here — the validate loop rewrote its qualified name — no longer matches
-    /// the published set by target, so the stamp is refused on its return; the hash it carried
-    /// comes back with the parked baseline instead of being lost.
+    /// A binding relocated here — validation recorded a resolution off the authored name — still
+    /// IS the authored anchor: the row's identity matches the published set by target, so on its
+    /// return the author's hash is stamped beside it, and the resolution is left as this store's.
     #[test]
     fn a_relocated_binding_keeps_its_source_hash_across_removal() {
         let conn = scoped_conn();
@@ -3920,8 +3925,12 @@ mod tests {
         drain_worker(&conn, stream, 1_000);
         assert_eq!(source_hash_of(&conn, "mem_peer").as_deref(), Some(HASH_A));
         conn.execute(
-            "UPDATE repo_memory_bindings SET binding_id = 'src/lib.rs::Moved'
-             WHERE memory_id = 'mem_peer'",
+            "UPDATE repo_memory_bindings
+                SET resolved = 1, resolved_binding_id = 'src/lib.rs::Moved',
+                    resolved_path = path, resolved_start_line = start_line,
+                    resolved_end_line = end_line, resolved_symbol_kind = symbol_kind,
+                    resolved_signature_hash = signature_hash
+              WHERE memory_id = 'mem_peer'",
             [],
         )
         .unwrap();
@@ -3932,18 +3941,22 @@ mod tests {
 
         publish();
         drain_worker(&conn, stream, 3_000);
-        let binding_id: String = conn
+        let resolved: Option<String> = conn
             .query_row(
-                "SELECT binding_id FROM repo_memory_bindings WHERE memory_id = 'mem_peer'",
+                "SELECT resolved_binding_id FROM repo_memory_bindings WHERE memory_id = 'mem_peer'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(binding_id, "src/lib.rs::Moved", "an unchanged set leaves the relocation");
+        assert_eq!(
+            resolved.as_deref(),
+            Some("src/lib.rs::Moved"),
+            "an unchanged set leaves the resolution",
+        );
         assert_eq!(
             source_hash_of(&conn, "mem_peer").as_deref(),
             Some(HASH_A),
-            "the hash the row carried survives the removal",
+            "the authored row matches the published anchor, so the hash is stamped again",
         );
     }
 
