@@ -89,7 +89,6 @@ pub fn traverse_with_options(
               AND ({predicate})
               AND ({target_filter})
               AND ({visibility_filter})
-              AND ?4 IN ('true', 'false')
             ORDER BY
                 {CONFIDENCE_ORDER_SQL},
                 edges.edge_kind,
@@ -240,7 +239,6 @@ pub fn traversal_summary(
               AND ({predicate})
               AND ({target_filter})
               AND ({visibility_filter})
-              AND ?4 IN ('true', 'false')
             "
         )
     };
@@ -440,7 +438,6 @@ pub(crate) fn hidden_unresolved_candidate_count(
               AND ({source_predicate})
               AND edges.to_symbol_id IS NULL
               AND coalesce(({target_filter}) AND ({visibility_filter}), 0) = 0
-              AND ?4 IN ('true', 'false')
             "
         )
     };

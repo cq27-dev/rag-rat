@@ -44,13 +44,22 @@ pub(crate) fn validate_edge_kinds(edge_kinds: &[String]) -> anyhow::Result<()> {
     }
     Ok(())
 }
+/// The positional binds every traversal statement shares, in slot order: `?1` the qualified seed,
+/// `?2` its `%::` suffix pattern, `?3` the short name, `?4` the name-fallback gate, `?5` the row
+/// limit, `?6` the seed symbol id, `?7` the unique-short-name gate, `?8` the seed logical id, then
+/// one slot per edge kind from `?9`. The predicate fragments reference these slots by number and a
+/// statement may leave any of them unreferenced: SQLite sizes the parameter list by the highest
+/// slot, which the edge-kind list always sets. The two gates stay text because the predicates
+/// compare them with `'true'`; the ids and the limit bind as integers.
 pub(crate) fn traversal_params(
     symbol: &str,
     limit: u32,
     edge_kinds: &[String],
     options: &GraphTraversalOptions,
     unique_short_name: bool,
-) -> Vec<String> {
+) -> Vec<rusqlite::types::Value> {
+    use rusqlite::types::Value;
+
     let qualified = symbol.to_string();
     let short = short_name(symbol).to_string();
     let fuzzy_qualified = format!("%::{qualified}");
@@ -65,16 +74,16 @@ pub(crate) fn traversal_params(
         || !is_qualified_symbol(symbol))
     .to_string();
     let mut params = vec![
-        qualified,
-        fuzzy_qualified,
-        short,
-        allow_name_fallback,
-        limit.to_string(),
-        options.symbol_id.unwrap_or(-1).to_string(),
-        unique_short_name.to_string(),
-        options.logical_symbol_id.unwrap_or(-1).to_string(),
+        Value::Text(qualified),
+        Value::Text(fuzzy_qualified),
+        Value::Text(short),
+        Value::Text(allow_name_fallback),
+        Value::Integer(i64::from(limit)),
+        Value::Integer(options.symbol_id.unwrap_or(-1)),
+        Value::Text(unique_short_name.to_string()),
+        Value::Integer(options.logical_symbol_id.unwrap_or(-1)),
     ];
-    params.extend(edge_kinds.iter().cloned());
+    params.extend(edge_kinds.iter().cloned().map(Value::Text));
     params
 }
 pub(crate) fn quoted_placeholders(count: usize) -> String {
