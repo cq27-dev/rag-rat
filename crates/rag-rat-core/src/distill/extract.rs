@@ -136,158 +136,15 @@ pub(crate) fn extract(
         let items = load_items(conn, &repo_id)?;
         let edges = load_closing_edges(conn, &repo_id)?;
 
-        // Index items by their FULL thread identity (tracker, project, kind_token, key): within one
-        // repo, issue/PR numbers are only unique per (tracker, project) — a repo can mirror several
-        // tracker bindings — so keying by kind/key alone would collide same-numbered items across
-        // projects. `merged_prs` drops the kind (always change_request).
-        let mut by_key: BTreeMap<ThreadKey, &ItemRow> = BTreeMap::new();
-        let mut merged_prs: BTreeMap<(String, String, String), &ItemRow> = BTreeMap::new();
-        let mut closed_issues: Vec<&ItemRow> = Vec::new();
-        for item in &items {
-            by_key.insert(ThreadKey::from(item), item);
-            match item.kind {
-                ItemKind::Issue if item.state_normalized == "closed" => closed_issues.push(item),
-                ItemKind::ChangeRequest if item.state_normalized == "merged" => {
-                    merged_prs.insert(
-                        (item.tracker.clone(), item.project.clone(), item.key.clone()),
-                        item,
-                    );
-                },
-                _ => {},
-            }
-        }
-
-        // Closing edges grouped by the (tracker, project, issue) they close.
-        let mut edges_by_issue: BTreeMap<(String, String, String), Vec<&ClosingEdgeRow>> =
-            BTreeMap::new();
-        for edge in &edges {
-            edges_by_issue
-                .entry((edge.tracker.clone(), edge.project.clone(), edge.issue_key.clone()))
-                .or_default()
-                .push(edge);
-        }
-
-        // Plan the records: closed issues (coalescing their merged-PR closers within the same
-        // project), then merged PRs that no issue coalesced away.
-        let mut coalesced_away: BTreeSet<(String, String, String)> = BTreeSet::new();
-        let mut plans: Vec<RecordPlan> = Vec::new();
-        for issue in &closed_issues {
-            let issue_edges = edges_by_issue
-                .get(&(issue.tracker.clone(), issue.project.clone(), issue.key.clone()))
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let mut fix_shas: BTreeSet<String> = BTreeSet::new();
-            let mut partners: BTreeSet<String> = BTreeSet::new();
-            let mut source = FixEdgeSource::None;
-            // The closing-keyword floor is derived from the canonical parser's output, NOT a
-            // re-scan: a TEXT-tier closing edge on this ISSUE means the closer-minting tier matched
-            // a closing keyword (provider-aware — GitLab gerunds included — project-scoped, and
-            // issue-vs-PR kind-correct, none of which a hand-rolled text scan gets right).
-            let mut text_closing = false;
-            for edge in issue_edges {
-                match edge.closer_kind {
-                    Some(CloserKind::Commit) => {
-                        // A commit closer is an accepted fix edge; upgrade provenance and take the
-                        // sha.
-                        fix_shas.insert(edge.closer_key.clone());
-                        source = stronger_source(source, edge.source);
-                        text_closing |= edge.source == Some(ClosingEdgeSource::Text);
-                    },
-                    Some(CloserKind::ChangeRequest) => {
-                        // Only a MERGED PR in the SAME project is a real coalesce partner +
-                        // fix-commit source; a closed-unmerged PR's
-                        // merge_commit_sha is a trap (GitHub's ephemeral
-                        // test merge), so it never contributes a commit — and its edge must NOT
-                        // upgrade provenance, or the no-fix-edge floor
-                        // would wrongly not fire.
-                        let partner_id =
-                            (issue.tracker.clone(), issue.project.clone(), edge.closer_key.clone());
-                        if let Some(pr) = merged_prs.get(&partner_id) {
-                            partners.insert(edge.closer_key.clone());
-                            coalesced_away.insert(partner_id);
-                            source = stronger_source(source, edge.source);
-                            text_closing |= edge.source == Some(ClosingEdgeSource::Text);
-                            if let Some(commit) =
-                                edge.closer_commit.clone().or_else(|| pr.merge_commit_sha.clone())
-                            {
-                                fix_shas.insert(commit);
-                            }
-                        }
-                    },
-                    None => {},
-                }
-            }
-            plans.push(RecordPlan {
-                tracker: issue.tracker.clone(),
-                project: issue.project.clone(),
-                kind: ItemKind::Issue,
-                key: issue.key.clone(),
-                partners: partners.into_iter().collect(),
-                fix_shas: fix_shas.into_iter().collect(),
-                fix_edge_source: source,
-                text_closing,
-            });
-        }
-        for pr in merged_prs.values() {
-            if coalesced_away.contains(&(pr.tracker.clone(), pr.project.clone(), pr.key.clone())) {
-                continue;
-            }
-            // A standalone merged PR is its own provider-attested closure; its merge commit is the
-            // fix.
-            let fix_shas = pr.merge_commit_sha.clone().into_iter().collect();
-            plans.push(RecordPlan {
-                tracker: pr.tracker.clone(),
-                project: pr.project.clone(),
-                kind: ItemKind::ChangeRequest,
-                key: pr.key.clone(),
-                partners: Vec::new(),
-                fix_shas,
-                fix_edge_source: FixEdgeSource::Provider,
-                // The closing-keyword floor is an issue concept; a standalone merged PR's
-                // landed-ness is carried by fix_edge_source, not a closing keyword.
-                text_closing: false,
-            });
-        }
-
-        // The full set of records that SHOULD exist after this pass.
-        let planned: BTreeSet<ThreadKey> = plans.iter().map(ThreadKey::from).collect();
-
-        // The threads this device actually mirrors. A record whose thread is ABSENT here is "no
-        // opinion, never delete" — not "delete": once `distill/1` replicates these records (#1135),
-        // `delete_record` authors a producer `Remove`, so a thin/empty-mirror device (fresh
-        // enrollment, or a roster peer without tracker credentials — exactly whom the roster-only
-        // scope serves) would otherwise reconcile its empty plan into Removes that wipe the fleet's
-        // distilled records. Only a thread STILL mirrored but no longer eligible is stale here.
-        let mirrored: BTreeSet<ThreadKey> = items.iter().map(ThreadKey::from).collect();
+        // Index items by their FULL thread identity: within one repo, issue/PR numbers are only
+        // unique per (tracker, project) — a repo can mirror several tracker bindings — so keying by
+        // kind/key alone would collide same-numbered items across projects.
+        let by_key: BTreeMap<ThreadKey, &ItemRow> =
+            items.iter().map(|item| (ThreadKey::from(item), item)).collect();
+        let plans = plan_records(&items, &edges);
+        let records_deleted = clear_stale_threads(conn, &repo_id, &items, &plans)?;
 
         let mut report = ExtractReport { eligible: plans.len(), ..Default::default() };
-        // Reconcile against the planned set: a persisted record whose thread is still mirrored but
-        // no longer planned — a reopened issue, an un-merged PR, or a PR now coalesced into
-        // an issue — loses its stale record/junctions/queue so consumers never see an
-        // ineligible or duplicate record. A record whose thread the mirror no longer
-        // carries is left untouched (see above).
-        let mut records_deleted = 0usize;
-        for existing in load_record_keys(conn, &repo_id)? {
-            if mirrored.contains(&existing) && !planned.contains(&existing) {
-                delete_record(conn, &repo_id, &existing)?;
-                records_deleted += 1;
-            }
-        }
-        // The cheap sync enqueue queues eligible PRs BEFORE extraction runs, so a thread queued but
-        // never recorded (a PR extraction now coalesces, or a thread that became ineligible first)
-        // leaves a queue row `delete_record` never touched. Drop any queue key not in the plan so a
-        // later drain never processes a duplicate coalesced PR or an ineligible thread.
-        for queued in load_queue_keys(conn, &repo_id)? {
-            if !planned.contains(&queued) {
-                conn.execute(
-                    &format!(
-                        "DELETE FROM papertrail_distill_queue WHERE {}",
-                        thread::THREAD_KEY_WHERE
-                    ),
-                    queued.params(&repo_id),
-                )?;
-            }
-        }
         for plan in &plans {
             let written = write_record(conn, &repo_id, now, opts, plan, &by_key, repo.as_ref())?;
             report.records_written += 1;
@@ -312,6 +169,161 @@ pub(crate) fn extract(
         }
         Ok(report)
     })
+}
+
+/// Plan the records this pass should hold: closed issues (coalescing their merged-PR closers within
+/// the same project), then merged PRs that no issue coalesced away.
+fn plan_records(items: &[ItemRow], edges: &[ClosingEdgeRow]) -> Vec<RecordPlan> {
+    // Merged PRs are keyed without the kind (always change_request).
+    let mut merged_prs: BTreeMap<(String, String, String), &ItemRow> = BTreeMap::new();
+    let mut closed_issues: Vec<&ItemRow> = Vec::new();
+    for item in items {
+        match item.kind {
+            ItemKind::Issue if item.state_normalized == "closed" => closed_issues.push(item),
+            ItemKind::ChangeRequest if item.state_normalized == "merged" => {
+                merged_prs
+                    .insert((item.tracker.clone(), item.project.clone(), item.key.clone()), item);
+            },
+            _ => {},
+        }
+    }
+
+    // Closing edges grouped by the (tracker, project, issue) they close.
+    let mut edges_by_issue: BTreeMap<(String, String, String), Vec<&ClosingEdgeRow>> =
+        BTreeMap::new();
+    for edge in edges {
+        edges_by_issue
+            .entry((edge.tracker.clone(), edge.project.clone(), edge.issue_key.clone()))
+            .or_default()
+            .push(edge);
+    }
+
+    let mut coalesced_away: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut plans: Vec<RecordPlan> = Vec::new();
+    for issue in &closed_issues {
+        let issue_edges = edges_by_issue
+            .get(&(issue.tracker.clone(), issue.project.clone(), issue.key.clone()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut fix_shas: BTreeSet<String> = BTreeSet::new();
+        let mut partners: BTreeSet<String> = BTreeSet::new();
+        let mut source = FixEdgeSource::None;
+        // The closing-keyword floor is derived from the canonical parser's output, NOT a
+        // re-scan: a TEXT-tier closing edge on this ISSUE means the closer-minting tier matched
+        // a closing keyword (provider-aware — GitLab gerunds included — project-scoped, and
+        // issue-vs-PR kind-correct, none of which a hand-rolled text scan gets right).
+        let mut text_closing = false;
+        for edge in issue_edges {
+            match edge.closer_kind {
+                Some(CloserKind::Commit) => {
+                    // A commit closer is an accepted fix edge; upgrade provenance and take the
+                    // sha.
+                    fix_shas.insert(edge.closer_key.clone());
+                    source = stronger_source(source, edge.source);
+                    text_closing |= edge.source == Some(ClosingEdgeSource::Text);
+                },
+                Some(CloserKind::ChangeRequest) => {
+                    // Only a MERGED PR in the SAME project is a real coalesce partner +
+                    // fix-commit source; a closed-unmerged PR's
+                    // merge_commit_sha is a trap (GitHub's ephemeral
+                    // test merge), so it never contributes a commit — and its edge must NOT
+                    // upgrade provenance, or the no-fix-edge floor
+                    // would wrongly not fire.
+                    let partner_id =
+                        (issue.tracker.clone(), issue.project.clone(), edge.closer_key.clone());
+                    if let Some(pr) = merged_prs.get(&partner_id) {
+                        partners.insert(edge.closer_key.clone());
+                        coalesced_away.insert(partner_id);
+                        source = stronger_source(source, edge.source);
+                        text_closing |= edge.source == Some(ClosingEdgeSource::Text);
+                        if let Some(commit) =
+                            edge.closer_commit.clone().or_else(|| pr.merge_commit_sha.clone())
+                        {
+                            fix_shas.insert(commit);
+                        }
+                    }
+                },
+                None => {},
+            }
+        }
+        plans.push(RecordPlan {
+            tracker: issue.tracker.clone(),
+            project: issue.project.clone(),
+            kind: ItemKind::Issue,
+            key: issue.key.clone(),
+            partners: partners.into_iter().collect(),
+            fix_shas: fix_shas.into_iter().collect(),
+            fix_edge_source: source,
+            text_closing,
+        });
+    }
+    for pr in merged_prs.values() {
+        if coalesced_away.contains(&(pr.tracker.clone(), pr.project.clone(), pr.key.clone())) {
+            continue;
+        }
+        // A standalone merged PR is its own provider-attested closure; its merge commit is the
+        // fix.
+        let fix_shas = pr.merge_commit_sha.clone().into_iter().collect();
+        plans.push(RecordPlan {
+            tracker: pr.tracker.clone(),
+            project: pr.project.clone(),
+            kind: ItemKind::ChangeRequest,
+            key: pr.key.clone(),
+            partners: Vec::new(),
+            fix_shas,
+            fix_edge_source: FixEdgeSource::Provider,
+            // The closing-keyword floor is an issue concept; a standalone merged PR's
+            // landed-ness is carried by fix_edge_source, not a closing keyword.
+            text_closing: false,
+        });
+    }
+    plans
+}
+
+/// Reconcile persisted records and queue rows against this pass's `plans`, deleting what is stale.
+/// Returns how many records were deleted.
+fn clear_stale_threads(
+    conn: &Connection,
+    repo_id: &str,
+    items: &[ItemRow],
+    plans: &[RecordPlan],
+) -> anyhow::Result<usize> {
+    // The full set of records that SHOULD exist after this pass.
+    let planned: BTreeSet<ThreadKey> = plans.iter().map(ThreadKey::from).collect();
+
+    // The threads this device actually mirrors. A record whose thread is ABSENT here is "no
+    // opinion, never delete" — not "delete": once `distill/1` replicates these records (#1135),
+    // `delete_record` authors a producer `Remove`, so a thin/empty-mirror device (fresh
+    // enrollment, or a roster peer without tracker credentials — exactly whom the roster-only
+    // scope serves) would otherwise reconcile its empty plan into Removes that wipe the fleet's
+    // distilled records. Only a thread STILL mirrored but no longer eligible is stale here.
+    let mirrored: BTreeSet<ThreadKey> = items.iter().map(ThreadKey::from).collect();
+
+    // Reconcile against the planned set: a persisted record whose thread is still mirrored but
+    // no longer planned — a reopened issue, an un-merged PR, or a PR now coalesced into
+    // an issue — loses its stale record/junctions/queue so consumers never see an
+    // ineligible or duplicate record. A record whose thread the mirror no longer
+    // carries is left untouched (see above).
+    let mut records_deleted = 0usize;
+    for existing in load_record_keys(conn, repo_id)? {
+        if mirrored.contains(&existing) && !planned.contains(&existing) {
+            delete_record(conn, repo_id, &existing)?;
+            records_deleted += 1;
+        }
+    }
+    // The cheap sync enqueue queues eligible PRs BEFORE extraction runs, so a thread queued but
+    // never recorded (a PR extraction now coalesces, or a thread that became ineligible first)
+    // leaves a queue row `delete_record` never touched. Drop any queue key not in the plan so a
+    // later drain never processes a duplicate coalesced PR or an ineligible thread.
+    for queued in load_queue_keys(conn, repo_id)? {
+        if !planned.contains(&queued) {
+            conn.execute(
+                &format!("DELETE FROM papertrail_distill_queue WHERE {}", thread::THREAD_KEY_WHERE),
+                queued.params(repo_id),
+            )?;
+        }
+    }
+    Ok(records_deleted)
 }
 
 /// The stronger of the current fix-edge source and a newly seen closing-edge source: provider
@@ -478,36 +490,7 @@ fn write_record(
     // (plan.text_closing), not a re-scan of commit text — a marker string, since the specific
     // keyword isn't load-bearing.
     let closing_keyword: Option<&str> = plan.text_closing.then_some("closing");
-    // Revert detection is causal, not timestamp-ordered, and NEVER keys on the fix commit itself
-    // being a `Revert` (that is intentional revert work that LANDED — not this record being
-    // reverted). The floor fires ONLY when a downstream landed commit reverts one of THIS record's
-    // CURRENT fixing commits: git's revert body names the reverted commit ("This reverts commit
-    // <sha>"), so a reopen→revert→re-fix leaves the stale revert pointing at the OLD (replaced) fix
-    // sha — not in `fix_shas` — and correctly does not flip. A revert can name the record's OWN
-    // thread OR a coalesced partner PR (GitHub's revert says "Reverts …#<pr>"), so gather from
-    // both.
-    let mut revert_shas =
-        revert_commit_shas(conn, repo_id, &plan.tracker, &plan.project, plan.kind, &plan.key)?;
-    for partner in &plan.partners {
-        revert_shas.extend(revert_commit_shas(
-            conn,
-            repo_id,
-            &plan.tracker,
-            &plan.project,
-            ItemKind::ChangeRequest,
-            partner,
-        )?);
-    }
-    let mut revert_override = false;
-    for revert_sha in &revert_shas {
-        if let Some(commit) = commit_message(conn, repo_id, revert_sha)? {
-            let text = format!("{}\n{}", commit.subject, commit.body);
-            if plan.fix_shas.iter().any(|fix| text.contains(fix.as_str())) {
-                revert_override = true;
-                break;
-            }
-        }
-    }
+    let revert_override = detect_revert_override(conn, repo_id, plan)?;
 
     // --- Anchor candidates from the changed source files. "Qualified" counts resolved SYMBOL
     // anchors (bound to a `sym_<hex>` logical id) — the precise, high-value bindings — separately
@@ -558,7 +541,6 @@ fn write_record(
     // unchanged record keeps its result unless the prompt contract changed. Input or prompt changes
     // clear every model-owned field before requeueing so stale findings never remain visible.
     let state = record_state(conn, repo_id, &thread_key, &input_hash, opts.pipeline_version)?;
-    let regenerated = state == RecordState::Regenerated;
     let prompt_changed = state == RecordState::Unchanged
         && match stored_prompt_version(conn, repo_id, &thread_key)? {
             Some(version) => version != prompts::PROMPT_VERSION,
@@ -567,29 +549,114 @@ fn write_record(
             // prompt. A NULL-stamped row with no queue entry needs recovery/reprocessing.
             None => !queue_entry_exists(conn, repo_id, &thread_key)?,
         };
-    let invalidate_model = regenerated || prompt_changed;
 
-    // --- Persist: rebuild this thread's mechanical junctions, upsert the skeleton row (clearing
-    // model columns on regeneration), rewrite junctions, queue.
+    let queued = persist_record(conn, repo_id, now, opts, repo, RecordWrite {
+        plan,
+        thread_key: &thread_key,
+        item,
+        state,
+        prompt_changed,
+        facets: SkeletonFacets {
+            input_hash: &input_hash,
+            fix_edge_source: plan.fix_edge_source,
+            anchors_qualified,
+            thread_shape: thread_shape.as_db_str(),
+            revert_override,
+            closing_keyword,
+        },
+        snapshot: &snapshot,
+        xrefs: &xrefs,
+        anchors: &anchors,
+    })?;
+    Ok(WriteOutcome { queued, mechanical_status })
+}
+
+/// Whether a landed commit reverts one of `plan`'s CURRENT fixing commits.
+///
+/// Revert detection is causal, not timestamp-ordered, and NEVER keys on the fix commit itself
+/// being a `Revert` (that is intentional revert work that LANDED — not this record being
+/// reverted). The floor fires ONLY when a downstream landed commit reverts one of THIS record's
+/// CURRENT fixing commits: git's revert body names the reverted commit ("This reverts commit
+/// <sha>"), so a reopen→revert→re-fix leaves the stale revert pointing at the OLD (replaced) fix
+/// sha — not in `fix_shas` — and correctly does not flip. A revert can name the record's OWN
+/// thread OR a coalesced partner PR (GitHub's revert says "Reverts …#<pr>"), so gather from
+/// both.
+fn detect_revert_override(
+    conn: &Connection,
+    repo_id: &str,
+    plan: &RecordPlan,
+) -> anyhow::Result<bool> {
+    let mut revert_shas =
+        revert_commit_shas(conn, repo_id, &plan.tracker, &plan.project, plan.kind, &plan.key)?;
+    for partner in &plan.partners {
+        revert_shas.extend(revert_commit_shas(
+            conn,
+            repo_id,
+            &plan.tracker,
+            &plan.project,
+            ItemKind::ChangeRequest,
+            partner,
+        )?);
+    }
+    for revert_sha in &revert_shas {
+        if let Some(commit) = commit_message(conn, repo_id, revert_sha)? {
+            let text = format!("{}\n{}", commit.subject, commit.body);
+            if plan.fix_shas.iter().any(|fix| text.contains(fix.as_str())) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Everything [`persist_record`] writes for one thread, derived by [`write_record`].
+struct RecordWrite<'a> {
+    plan: &'a RecordPlan,
+    thread_key: &'a ThreadKey,
+    item: &'a ItemRow,
+    state: RecordState,
+    prompt_changed: bool,
+    facets: SkeletonFacets<'a>,
+    snapshot: &'a ThreadSnapshot,
+    xrefs: &'a [XrefSnapshot],
+    anchors: &'a [candidates::AnchorCandidate],
+}
+
+/// Persist one record: rebuild this thread's mechanical junctions, upsert the skeleton row
+/// (clearing model columns on regeneration), rewrite junctions, queue. Returns the queue rows
+/// written.
+fn persist_record(
+    conn: &Connection,
+    repo_id: &str,
+    now: i64,
+    opts: &ExtractOptions,
+    repo: Option<&gix::Repository>,
+    write: RecordWrite<'_>,
+) -> anyhow::Result<usize> {
+    let RecordWrite {
+        plan,
+        thread_key,
+        item,
+        state,
+        prompt_changed,
+        facets,
+        snapshot,
+        xrefs,
+        anchors,
+    } = write;
+    let invalidate_model = state == RecordState::Regenerated || prompt_changed;
     let rebuild_anchor_candidates = state != RecordState::Unchanged;
-    clear_mechanical_junctions(conn, repo_id, &thread_key, rebuild_anchor_candidates)?;
+    clear_mechanical_junctions(conn, repo_id, thread_key, rebuild_anchor_candidates)?;
     // Extraction or prompt identity changed: an identical rerun keeps the model's work, but a
     // requeued record must expose no stale evidence, alternatives, or anchor selections.
     if invalidate_model {
-        thread::clear_model_junctions(conn, repo_id, &thread_key)?;
-        thread::deselect_anchors(conn, repo_id, &thread_key)?;
+        thread::clear_model_junctions(conn, repo_id, thread_key)?;
+        thread::deselect_anchors(conn, repo_id, thread_key)?;
     }
-    upsert_skeleton(conn, repo_id, now, opts, plan, invalidate_model, &SkeletonFacets {
-        input_hash: &input_hash,
-        fix_edge_source: plan.fix_edge_source,
-        anchors_qualified,
-        thread_shape: thread_shape.as_db_str(),
-        revert_override,
-        closing_keyword,
-    })?;
+    upsert_skeleton(conn, repo_id, now, opts, plan, invalidate_model, &facets)?;
     if state != RecordState::Unchanged {
-        replace_snapshot(conn, repo_id, &thread_key, &snapshot)?;
-        replace_xrefs(conn, repo_id, &thread_key, &xrefs)?;
+        replace_snapshot(conn, repo_id, thread_key, snapshot)?;
+        replace_xrefs(conn, repo_id, thread_key, xrefs)?;
     }
     // The fix-diff snapshot is rebuilt when the identity changed, and SELF-HEALED when an earlier
     // pass ran without a usable repo handle (bare/copied index, shallow clone): the rows are a
@@ -601,22 +668,21 @@ fn write_record(
         && anchors
             .iter()
             .any(|a| matches!(a.kind, candidates::AnchorKind::Symbol) && a.file_path.is_some())
-        && !fix_diff_rows_exist(conn, repo_id, &thread_key)?;
+        && !fix_diff_rows_exist(conn, repo_id, thread_key)?;
     if state != RecordState::Unchanged || diff_heal {
-        let fix_diffs = fix_diff_snapshots(repo, &plan.fix_shas, &anchors);
-        replace_fix_diffs(conn, repo_id, &thread_key, &fix_diffs)?;
+        let fix_diffs = fix_diff_snapshots(repo, &plan.fix_shas, anchors);
+        replace_fix_diffs(conn, repo_id, thread_key, &fix_diffs)?;
     }
     write_commits(conn, repo_id, now, plan, &plan.fix_shas)?;
     write_coalesced_edges(conn, repo_id, now, plan)?;
     if rebuild_anchor_candidates {
-        write_anchors(conn, repo_id, plan, &anchors)?;
+        write_anchors(conn, repo_id, plan, anchors)?;
     }
-    let queued = if matches!(state, RecordState::New | RecordState::Regenerated) || prompt_changed {
-        enqueue_one(conn, repo_id, now, item, invalidate_model)?
+    if matches!(state, RecordState::New | RecordState::Regenerated) || prompt_changed {
+        enqueue_one(conn, repo_id, now, item, invalidate_model)
     } else {
-        0
-    };
-    Ok(WriteOutcome { queued, mechanical_status })
+        Ok(0)
+    }
 }
 
 fn stored_prompt_version(
