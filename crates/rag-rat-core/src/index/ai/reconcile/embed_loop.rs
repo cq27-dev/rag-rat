@@ -3,6 +3,7 @@ use super::{batch_write, policy_scan};
 
 const RECONCILE_SELECT_ID_BATCH_LIMIT: usize = 900;
 
+#[cfg(test)]
 pub(crate) fn reconcile(
     conn: &Connection,
     limit: Option<u32>,
@@ -15,6 +16,7 @@ pub(crate) fn reconcile(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_with_progress(
     conn: &Connection,
     limit: Option<u32>,

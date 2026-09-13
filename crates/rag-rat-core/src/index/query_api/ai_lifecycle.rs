@@ -25,7 +25,10 @@ impl IndexDatabase {
         ai::install_model(self.storage.connection(), model_id, remote)
     }
 
-    pub fn reconcile(
+    /// Test shorthand for [`Self::reconcile_with_options_progress`] with only `limit` and
+    /// `batch_size` set. Unlike that entry point it skips the op-log ghost heal.
+    #[cfg(test)]
+    pub(crate) fn reconcile(
         &self,
         limit: Option<u32>,
         batch_size: Option<u32>,
@@ -50,7 +53,9 @@ impl IndexDatabase {
         ai::reconcile_plan(self.storage.connection(), max_embedding_chars)
     }
 
-    pub fn reconcile_with_progress(
+    /// Test shorthand like [`Self::reconcile`], adding `force` and a progress callback.
+    #[cfg(test)]
+    pub(crate) fn reconcile_with_progress(
         &self,
         limit: Option<u32>,
         batch_size: Option<u32>,

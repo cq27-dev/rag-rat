@@ -1334,7 +1334,11 @@ mod tests {
             if let Some(model_id) = config.llm.embedding.backend.model_id() {
                 db.install_model(model_id, config.llm.embedding.remote.as_ref())
                     .expect("install embedding model");
-                db.reconcile(None, None).expect("reconcile embeddings");
+                db.reconcile_with_options_progress(
+                    crate::index::ai::ReconcileOptions::default(),
+                    |_| {},
+                )
+                .expect("reconcile embeddings");
             }
         }
 
