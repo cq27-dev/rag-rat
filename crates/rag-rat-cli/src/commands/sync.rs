@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use rag_rat_base::config::Config;
 use rag_rat_base::{hash, locks, time};
+use rag_rat_core::IndexDatabase;
 use rag_rat_sync::{
     AuthPolicy, NodeAuth, OplogContentSyncStore, OplogSyncStore, PeerAuthorization, PeerCapability,
 };
@@ -27,254 +28,265 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
     // `serve`, `init`, and `join` bind an endpoint and run their own network loop; they must run
     // OUTSIDE the command-wide repo write lock (which would block indexing, the watcher, and GC for
     // the server's whole life) and manage the database-scoped SESSION lock themselves instead.
+    // Every local configure/report command runs under the repo write lock via `with_repo_db`.
     match &args.command {
-        SyncCommand::Serve { once } => return serve(config, *once),
-        SyncCommand::Init { role, label, ttl_secs } =>
-            return init(config, InviteMint {
-                role: role.to_device_role(),
-                label: label.clone(),
-                ttl: Duration::from_secs(*ttl_secs),
-            }),
-        SyncCommand::Join { ticket } => return join(config, ticket),
+        SyncCommand::Serve { once } => serve(config, *once),
+        SyncCommand::Init { role, label, ttl_secs } => init(config, InviteMint {
+            role: role.to_device_role(),
+            label: label.clone(),
+            ttl: Duration::from_secs(*ttl_secs),
+        }),
+        SyncCommand::Join { ticket } => join(config, ticket),
         SyncCommand::InviteWriter { ttl_secs } =>
-            return invite_writer(config, Duration::from_secs(*ttl_secs)),
+            invite_writer(config, Duration::from_secs(*ttl_secs)),
         // A pasted TICKET routes contribution through the network redemption; the bare owner-id
         // form stays the local configure-only path below.
         SyncCommand::Contribute { account }
             if rag_rat_sync::InviteTicket::from_ticket_string(account).is_ok() =>
-            return contribute_with_ticket(config, account),
-        SyncCommand::Pull { account, peer } => return pull(config, account, peer.as_deref()),
-        SyncCommand::Enable
-        | SyncCommand::Publish { .. }
-        | SyncCommand::CatchUp { .. }
-        | SyncCommand::Whoami
-        | SyncCommand::Grant { .. }
-        | SyncCommand::Revoke { .. }
-        | SyncCommand::Grants
-        | SyncCommand::Contribute { .. }
-        | SyncCommand::Subscribe { .. }
-        | SyncCommand::Unsubscribe
-        | SyncCommand::Uncontribute => {},
+            contribute_with_ticket(config, account),
+        SyncCommand::Pull { account, peer } => pull(config, account, peer.as_deref()),
+        SyncCommand::Enable => with_repo_db(config, enable),
+        SyncCommand::Publish { seed } => with_repo_db(config, |db| publish(db, seed.as_deref())),
+        SyncCommand::CatchUp { target } => with_repo_db(config, |db| catch_up(db, *target)),
+        SyncCommand::Whoami => with_repo_db(config, whoami),
+        SyncCommand::Grant { account } => with_repo_db(config, |db| grant(db, account)),
+        SyncCommand::Revoke { account, reason, keep_until } =>
+            with_repo_db(config, |db| revoke(db, account, reason, keep_until.as_deref())),
+        SyncCommand::Grants => with_repo_db(config, grants),
+        SyncCommand::Contribute { account } => with_repo_db(config, |db| contribute(db, account)),
+        SyncCommand::Subscribe { account } =>
+            with_repo_db(config, |db| subscribe(config, db, account.as_deref())),
+        SyncCommand::Unsubscribe => with_repo_db(config, unsubscribe),
+        SyncCommand::Uncontribute => with_repo_db(config, uncontribute),
     }
+}
+
+/// Run a local sync command under the per-repo write lock against the opened index.
+fn with_repo_db(
+    config: &Config,
+    run: impl FnOnce(&IndexDatabase) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let _lock = crate::repo_write_lock(config)?;
     let db = open_index(config)?;
-    match &args.command {
-        SyncCommand::Enable => {
-            let enabled = db.sync_enable()?;
-            print_output(&serde_json::json!({
-                "status": if enabled { "enabled" } else { "already_enabled" },
-                "repo_id": db.active_repo_id,
-                "sealed_local_authoring": true,
-                "transport_configured": false,
-                "note": "subsequent local memory changes are sealed; transport is not configured",
-            }))
+    run(&db)
+}
+
+fn enable(db: &IndexDatabase) -> anyhow::Result<()> {
+    let enabled = db.sync_enable()?;
+    print_output(&serde_json::json!({
+        "status": if enabled { "enabled" } else { "already_enabled" },
+        "repo_id": db.active_repo_id,
+        "sealed_local_authoring": true,
+        "transport_configured": false,
+        "note": "subsequent local memory changes are sealed; transport is not configured",
+    }))
+}
+
+fn publish(db: &IndexDatabase, seed: Option<&Path>) -> anyhow::Result<()> {
+    let (published, seeded_memories) = match seed {
+        Some(path) => {
+            let report = db.sync_publish_seed(path)?;
+            (report.published, Some(report.imported_memories))
         },
-        SyncCommand::Publish { seed } => {
-            let (published, seeded_memories) = match seed.as_deref() {
-                Some(path) => {
-                    let report = db.sync_publish_seed(path)?;
-                    (report.published, Some(report.imported_memories))
-                },
-                None => (db.sync_publish()?, None),
-            };
-            print_output(&serde_json::json!({
-                "status": if published { "published" } else { "already_published" },
-                "repo_id": db.active_repo_id,
-                "public_read": true,
-                "seeded_memories": seeded_memories,
-                "transport_configured": false,
-                "note": "this account is now a public knowledge base; subsequent memory changes are public and the account is servable to anonymous readers once `sync serve` runs",
-            }))
+        None => (db.sync_publish()?, None),
+    };
+    print_output(&serde_json::json!({
+        "status": if published { "published" } else { "already_published" },
+        "repo_id": db.active_repo_id,
+        "public_read": true,
+        "seeded_memories": seeded_memories,
+        "transport_configured": false,
+        "note": "this account is now a public knowledge base; subsequent memory changes are public and the account is servable to anonymous readers once `sync serve` runs",
+    }))
+}
+
+fn catch_up(db: &IndexDatabase, target: rag_rat_oplog::DeviceFingerprint) -> anyhow::Result<()> {
+    let report = db.sync_catch_up(target)?;
+    print_output(&serde_json::json!({
+        "status": "caught_up",
+        "repo_id": db.active_repo_id,
+        "target": report.target.to_string(),
+        "required": report.required,
+        "already_covered": report.already_covered,
+        "authored": report.authored,
+        "keys_rotated": false,
+        "pairing_performed": false,
+        "transport_configured": false,
+        "note": "existing live keys were re-wrapped without rotation; no enrollment, pairing, or transport occurred",
+    }))
+}
+
+fn whoami(db: &IndexDatabase) -> anyhow::Result<()> {
+    let account_id = db.sync_whoami()?;
+    let owner = db.sync_owner_config()?;
+    print_output(&serde_json::json!({
+        "account_id": account_id,
+        "repo_id": db.active_repo_id,
+        "contribution_owner_account_id": owner.contribution_owner_account_id,
+        "subscription_owner_account_id": owner.subscription_owner_account_id,
+        "note": "share this account id with an owner so they can `sync grant` it write access to their repo's memories",
+    }))
+}
+
+fn grant(db: &IndexDatabase, account: &str) -> anyhow::Result<()> {
+    let grant_id = db.sync_grant(account)?;
+    print_output(&serde_json::json!({
+        "status": "granted",
+        "repo_id": db.active_repo_id,
+        "grantee_account_id": account,
+        "grant_id": grant_id,
+        "role": "writer",
+        "note": "the grantee may now author memories into this repo once it holds this account's log — its automatic sync pulls it when this host is in its [sync] server_peers; `sync revoke` closes it",
+    }))
+}
+
+fn revoke(
+    db: &IndexDatabase,
+    account: &str,
+    reason: &str,
+    keep_until: Option<&str>,
+) -> anyhow::Result<()> {
+    let keep_until = keep_until
+        .map(|value| -> anyhow::Result<(&str, u64)> {
+            let (seq, device) = value.split_once('@').context(
+                "--keep-until takes <seq>@<device-hex> — the seq, an @, then the 64-hex device \
+                 fingerprint",
+            )?;
+            Ok((device, seq.trim().parse::<u64>().context("--keep-until's seq is a number")?))
+        })
+        .transpose()?;
+    let (report, nodes_removed) = db.sync_revoke(account, reason, keep_until)?;
+    print_output(&serde_json::json!({
+        "status": "revoked",
+        "repo_id": db.active_repo_id,
+        "grantee_account_id": report.grantee_account_id,
+        "grant_ids": report.grant_ids,
+        "revoke_ids": report.revoke_ids,
+        "reason": report.reason,
+        "kept": report.cuts.iter().map(|(device, seq)| serde_json::json!({
+            "device": device,
+            "through_seq": seq,
+        })).collect::<Vec<_>>(),
+        "nodes_removed": nodes_removed,
+        "note": "the grantee can no longer author onto this repo; its entries beyond the kept prefixes are condemned, and peers learn the revocation as they sync this account's log",
+    }))
+}
+
+fn grants(db: &IndexDatabase) -> anyhow::Result<()> {
+    let grants = db.sync_grants()?;
+    print_output(&serde_json::json!({
+        "repo_id": db.active_repo_id,
+        "grants": grants.iter().map(|grant| serde_json::json!({
+            "grantee_account_id": grant.grantee_account_id,
+            "role": grant.role,
+            "status": if grant.open { "open" } else { "revoked" },
+            "grant_id": grant.grant_id,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+// Every command that RE-POINTS the repo's authoritative stream (contribute, subscribe,
+// unsubscribe, uncontribute) drains before reporting, the way `contribute_with_ticket` already
+// does: the re-point is only a configuration write, the memories move in the drain, and no read
+// path runs one. Reporting the new configuration while `memory search` still shows the old
+// contents reads as a failed command.
+
+fn contribute(db: &IndexDatabase, account: &str) -> anyhow::Result<()> {
+    db.sync_contribute(account)?;
+    let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+    db.fold_wal();
+    print_output(&serde_json::json!({
+        "status": "contributing",
+        "repo_id": db.active_repo_id,
+        "owner_account_id": account,
+        "memories_added": effects.nodes_written,
+        "memories_removed": effects.nodes_removed,
+        "note": "memory changes for this repo now target the owner's stream; the owner must `sync grant` this account, and this store needs the owner's log — automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
+    }))
+}
+
+fn subscribe(config: &Config, db: &IndexDatabase, account: Option<&str>) -> anyhow::Result<()> {
+    // Two trust paths, not one command with a default. An operator naming the id has obtained it
+    // out of band and may move this repo's pin; the checked-in locator is untrusted input and may
+    // only establish one.
+    let (owner, source, locator) = match account {
+        Some(account) => (account.to_string(), "argument", None),
+        None => {
+            let checkout = locator_checkout(&config.root, std::env::current_dir().ok());
+            let locator = rag_rat_base::stream_locator::load(&checkout)?.with_context(|| {
+                format!(
+                    "no owner given and this repo checks in no `{}`. Pass the owner's 64-hex \
+                     account id (from their `rag-rat sync whoami`), or add the locator file.",
+                    rag_rat_base::stream_locator::STREAM_LOCATOR_FILE,
+                )
+            })?;
+            (locator.owner.clone(), "locator", Some(locator))
         },
-        SyncCommand::CatchUp { target } => {
-            let report = db.sync_catch_up(*target)?;
-            print_output(&serde_json::json!({
-                "status": "caught_up",
-                "repo_id": db.active_repo_id,
-                "target": report.target.to_string(),
-                "required": report.required,
-                "already_covered": report.already_covered,
-                "authored": report.authored,
-                "keys_rotated": false,
-                "pairing_performed": false,
-                "transport_configured": false,
-                "note": "existing live keys were re-wrapped without rotation; no enrollment, pairing, or transport occurred",
-            }))
-        },
-        SyncCommand::Whoami => {
-            let account_id = db.sync_whoami()?;
-            let owner = db.sync_owner_config()?;
-            print_output(&serde_json::json!({
-                "account_id": account_id,
-                "repo_id": db.active_repo_id,
-                "contribution_owner_account_id": owner.contribution_owner_account_id,
-                "subscription_owner_account_id": owner.subscription_owner_account_id,
-                "note": "share this account id with an owner so they can `sync grant` it write access to their repo's memories",
-            }))
-        },
-        SyncCommand::Grant { account } => {
-            let grant_id = db.sync_grant(account)?;
-            print_output(&serde_json::json!({
-                "status": "granted",
-                "repo_id": db.active_repo_id,
-                "grantee_account_id": account,
-                "grant_id": grant_id,
-                "role": "writer",
-                "note": "the grantee may now author memories into this repo once it holds this account's log — its automatic sync pulls it when this host is in its [sync] server_peers; `sync revoke` closes it",
-            }))
-        },
-        SyncCommand::Revoke { account, reason, keep_until } => {
-            let keep_until = keep_until
-                .as_deref()
-                .map(|value| -> anyhow::Result<(&str, u64)> {
-                    let (seq, device) = value.split_once('@').context(
-                        "--keep-until takes <seq>@<device-hex> — the seq, an @, then the 64-hex \
-                         device fingerprint",
-                    )?;
-                    Ok((
-                        device,
-                        seq.trim().parse::<u64>().context("--keep-until's seq is a number")?,
-                    ))
-                })
-                .transpose()?;
-            let (report, nodes_removed) = db.sync_revoke(account, reason, keep_until)?;
-            print_output(&serde_json::json!({
-                "status": "revoked",
-                "repo_id": db.active_repo_id,
-                "grantee_account_id": report.grantee_account_id,
-                "grant_ids": report.grant_ids,
-                "revoke_ids": report.revoke_ids,
-                "reason": report.reason,
-                "kept": report.cuts.iter().map(|(device, seq)| serde_json::json!({
-                    "device": device,
-                    "through_seq": seq,
-                })).collect::<Vec<_>>(),
-                "nodes_removed": nodes_removed,
-                "note": "the grantee can no longer author onto this repo; its entries beyond the kept prefixes are condemned, and peers learn the revocation as they sync this account's log",
-            }))
-        },
-        SyncCommand::Grants => {
-            let grants = db.sync_grants()?;
-            print_output(&serde_json::json!({
-                "repo_id": db.active_repo_id,
-                "grants": grants.iter().map(|grant| serde_json::json!({
-                    "grantee_account_id": grant.grantee_account_id,
-                    "role": grant.role,
-                    "status": if grant.open { "open" } else { "revoked" },
-                    "grant_id": grant.grant_id,
-                })).collect::<Vec<_>>(),
-            }))
-        },
-        // Every arm that RE-POINTS the repo's authoritative stream drains before reporting, the way
-        // `contribute_with_ticket` already does: the re-point is only a configuration write, the
-        // memories move in the drain, and no read path runs one. Reporting the new configuration
-        // while `memory search` still shows the old contents reads as a failed command.
-        SyncCommand::Contribute { account } => {
-            db.sync_contribute(account)?;
-            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
-            db.fold_wal();
-            print_output(&serde_json::json!({
-                "status": "contributing",
-                "repo_id": db.active_repo_id,
-                "owner_account_id": account,
-                "memories_added": effects.nodes_written,
-                "memories_removed": effects.nodes_removed,
-                "note": "memory changes for this repo now target the owner's stream; the owner must `sync grant` this account, and this store needs the owner's log — automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
-            }))
-        },
-        SyncCommand::Subscribe { account } => {
-            // Two trust paths, not one command with a default. An operator naming the id has
-            // obtained it out of band and may move this repo's pin; the checked-in locator is
-            // untrusted input and may only establish one.
-            let (owner, source, locator) = match account {
-                Some(account) => (account.clone(), "argument", None),
-                None => {
-                    let checkout = locator_checkout(&config.root, std::env::current_dir().ok());
-                    let locator =
-                        rag_rat_base::stream_locator::load(&checkout)?.with_context(|| {
-                            format!(
-                                "no owner given and this repo checks in no `{}`. Pass the owner's \
-                                 64-hex account id (from their `rag-rat sync whoami`), or add the \
-                                 locator file.",
-                                rag_rat_base::stream_locator::STREAM_LOCATOR_FILE,
-                            )
-                        })?;
-                    (locator.owner.clone(), "locator", Some(locator))
-                },
-            };
-            // The routing is persisted, not merely echoed: a clone that subscribed from a locator
-            // has no `[sync] server_peers` — carrying that routing is the locator's whole purpose —
-            // and a foreign account cannot be discovered. It commits in the same transaction as the
-            // owner and pin, and an operator-named subscribe clears any previous routing there too.
-            match locator.as_ref() {
-                None => db.sync_subscribe(&owner)?,
-                Some(locator) => db.sync_subscribe_from_locator(
-                    &owner,
-                    &locator.peers,
-                    locator.relay.as_deref(),
-                )?,
-            }
-            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
-            db.fold_wal();
-            print_output(&serde_json::json!({
-                "status": "subscribed",
-                "repo_id": db.active_repo_id,
-                "owner_account_id": owner,
-                "owner_source": source,
-                // The routing the locator supplied, echoed so an operator can see what this store
-                // will dial without opening the file. Neither carries authority.
-                "peers": locator.as_ref().map(|l| l.peers.clone()),
-                "relay": locator.as_ref().and_then(|l| l.relay.clone()),
-                "read_only": true,
-                "memories_added": effects.nodes_written,
-                "memories_removed": effects.nodes_removed,
-                "note": if locator.as_ref().is_some_and(|l| !l.peers.is_empty()) {
-                    format!(
-                        "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). The locator's peers are recorded, so automatic sync pulls the \
-                         owner's log without any [sync] server_peers; run `{}` to fetch it now",
-                        subscribe_pull_hint(&owner, false),
-                    )
-                } else {
-                    format!(
-                        "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log and no routing was supplied: \
-                         automatic sync pulls it once the owner's host is in [sync] server_peers, \
-                         or run `{}` now",
-                        subscribe_pull_hint(&owner, true),
-                    )
-                },
-            }))
-        },
-        SyncCommand::Unsubscribe => {
-            let cleared = db.sync_unsubscribe()?;
-            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
-            db.fold_wal();
-            print_output(&serde_json::json!({
-                "status": if cleared { "unsubscribed" } else { "not_subscribed" },
-                "repo_id": db.active_repo_id,
-                "memories_restored": effects.nodes_written,
-                "memories_removed": effects.nodes_removed,
-                "note": "this repo's memories materialize from its own account's stream again: what its other devices had synced here is restored and the owner's goes in turn. Local binding work is not restored — a `memory rebind` made on a memory the subscription removed, and any local edge onto it, went with the row",
-            }))
-        },
-        SyncCommand::Uncontribute => {
-            let cleared = db.sync_uncontribute()?;
-            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
-            db.fold_wal();
-            print_output(&serde_json::json!({
-                "status": if cleared { "uncontributed" } else { "not_contributing" },
-                "repo_id": db.active_repo_id,
-                "memories_restored": effects.nodes_written,
-                "memories_removed": effects.nodes_removed,
-                "note": "memory changes for this repo target this store's own stream again, and its own stream materializes it in the owner's place. Contributions already authored onto the owner's stream stay there, and the owner's grant stays open until it runs `sync revoke` — so until then this index still may not hold a private memory stream in any repo, or those contributions become unfetchable. What that blocks is memory AUTHORING (`memory create`/`update`/`rebind`, and `sync enable`) in any repo of this index that is not published: those refuse, naming the conflict, and write nothing. Indexing, search and reconcile are unaffected. Publish the repo with `sync publish`, re-run `sync contribute`, or index it in a separate database",
-            }))
-        },
-        SyncCommand::Serve { .. }
-        | SyncCommand::Init { .. }
-        | SyncCommand::Join { .. }
-        | SyncCommand::InviteWriter { .. }
-        | SyncCommand::Pull { .. } =>
-            unreachable!("the network commands are dispatched before the write lock"),
+    };
+    // The routing is persisted, not merely echoed: a clone that subscribed from a locator has no
+    // `[sync] server_peers` — carrying that routing is the locator's whole purpose — and a foreign
+    // account cannot be discovered. It commits in the same transaction as the owner and pin, and
+    // an operator-named subscribe clears any previous routing there too.
+    match locator.as_ref() {
+        None => db.sync_subscribe(&owner)?,
+        Some(locator) =>
+            db.sync_subscribe_from_locator(&owner, &locator.peers, locator.relay.as_deref())?,
     }
+    let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+    db.fold_wal();
+    print_output(&serde_json::json!({
+        "status": "subscribed",
+        "repo_id": db.active_repo_id,
+        "owner_account_id": owner,
+        "owner_source": source,
+        // The routing the locator supplied, echoed so an operator can see what this store will
+        // dial without opening the file. Neither carries authority.
+        "peers": locator.as_ref().map(|l| l.peers.clone()),
+        "relay": locator.as_ref().and_then(|l| l.relay.clone()),
+        "read_only": true,
+        "memories_added": effects.nodes_written,
+        "memories_removed": effects.nodes_removed,
+        "note": if locator.as_ref().is_some_and(|l| !l.peers.is_empty()) {
+            format!(
+                "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). The locator's peers are recorded, so automatic sync pulls the \
+                 owner's log without any [sync] server_peers; run `{}` to fetch it now",
+                subscribe_pull_hint(&owner, false),
+            )
+        } else {
+            format!(
+                "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log and no routing was supplied: \
+                 automatic sync pulls it once the owner's host is in [sync] server_peers, \
+                 or run `{}` now",
+                subscribe_pull_hint(&owner, true),
+            )
+        },
+    }))
+}
+
+fn unsubscribe(db: &IndexDatabase) -> anyhow::Result<()> {
+    let cleared = db.sync_unsubscribe()?;
+    let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+    db.fold_wal();
+    print_output(&serde_json::json!({
+        "status": if cleared { "unsubscribed" } else { "not_subscribed" },
+        "repo_id": db.active_repo_id,
+        "memories_restored": effects.nodes_written,
+        "memories_removed": effects.nodes_removed,
+        "note": "this repo's memories materialize from its own account's stream again: what its other devices had synced here is restored and the owner's goes in turn. Local binding work is not restored — a `memory rebind` made on a memory the subscription removed, and any local edge onto it, went with the row",
+    }))
+}
+
+fn uncontribute(db: &IndexDatabase) -> anyhow::Result<()> {
+    let cleared = db.sync_uncontribute()?;
+    let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+    db.fold_wal();
+    print_output(&serde_json::json!({
+        "status": if cleared { "uncontributed" } else { "not_contributing" },
+        "repo_id": db.active_repo_id,
+        "memories_restored": effects.nodes_written,
+        "memories_removed": effects.nodes_removed,
+        "note": "memory changes for this repo target this store's own stream again, and its own stream materializes it in the owner's place. Contributions already authored onto the owner's stream stay there, and the owner's grant stays open until it runs `sync revoke` — so until then this index still may not hold a private memory stream in any repo, or those contributions become unfetchable. What that blocks is memory AUTHORING (`memory create`/`update`/`rebind`, and `sync enable`) in any repo of this index that is not published: those refuse, naming the conflict, and write nothing. Indexing, search and reconcile are unaffected. Publish the repo with `sync publish`, re-run `sync contribute`, or index it in a separate database",
+    }))
 }
 
 /// The relay this invocation binds: `RAG_RAT_SYNC_RELAY` (ops/tests) overrides the configured
