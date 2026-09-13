@@ -35,23 +35,39 @@ pub(crate) fn import_export_items(
     Ok(items)
 }
 
-pub(crate) fn test_items(
-    conn: &Connection,
-    symbol: &SymbolHit,
-    names: &[String],
-    limit: u32,
-) -> anyhow::Result<Vec<ImpactItem>> {
-    let mut items = Vec::new();
-    for name in names_for_like(symbol, names) {
-        items.extend(section_like_items(
-            conn,
-            &name,
-            "Tests touching this symbol/path",
-            "test_mentions_symbol_or_path",
+/// The file-mention sections of the impact report. Each names the files that mention the symbol
+/// (by path, symbol name or chunk text), narrowed by its own file filter.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FileSection {
+    Tests,
+    Docs,
+    TextFallback,
+}
+
+impl FileSection {
+    fn category(self) -> &'static str {
+        match self {
+            Self::Tests => "Tests touching this symbol/path",
+            Self::Docs => "Docs mentioning symbol/path",
+            Self::TextFallback => "Text fallback hits",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Tests => "test_mentions_symbol_or_path",
+            Self::Docs => "docs_mentions_symbol_or_path",
+            Self::TextFallback => "text_fallback",
+        }
+    }
+
+    fn sql_filter(self) -> &'static str {
+        match self {
             // Test detection reads the precomputed `files.has_test_code` flag (#77) instead of
             // scanning `chunks.text` for the markers — same marker set (see
             // `index::text_has_test_marker`), now an indexed column, no raw-text scan.
-            "
+            Self::Tests =>
+                "
             files.kind = 'source'
             AND (
                 files.path LIKE '%test%'
@@ -59,50 +75,29 @@ pub(crate) fn test_items(
                 OR files.has_test_code = 1
             )
             ",
-            limit,
-        )?);
+            Self::Docs => "files.kind = 'docs'",
+            Self::TextFallback => "1 = 1",
+        }
     }
-    let mut items = collapse_by_path(items);
-    items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    Ok(items)
 }
 
-pub(crate) fn docs_items(
+/// One file-mention section: every name the symbol goes by, matched under the section's filter,
+/// collapsed to one row per file and capped at `limit`.
+pub(crate) fn file_section_items(
     conn: &Connection,
     symbol: &SymbolHit,
     names: &[String],
     limit: u32,
+    section: FileSection,
 ) -> anyhow::Result<Vec<ImpactItem>> {
     let mut items = Vec::new();
     for name in names_for_like(symbol, names) {
         items.extend(section_like_items(
             conn,
             &name,
-            "Docs mentioning symbol/path",
-            "docs_mentions_symbol_or_path",
-            "files.kind = 'docs'",
-            limit,
-        )?);
-    }
-    let mut items = collapse_by_path(items);
-    items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    Ok(items)
-}
-
-pub(crate) fn text_fallback_items(
-    conn: &Connection,
-    symbol: &SymbolHit,
-    names: &[String],
-    limit: u32,
-) -> anyhow::Result<Vec<ImpactItem>> {
-    let mut items = Vec::new();
-    for name in names_for_like(symbol, names) {
-        items.extend(section_like_items(
-            conn,
-            &name,
-            "Text fallback hits",
-            "text_fallback",
-            "1 = 1",
+            section.category(),
+            section.reason(),
+            section.sql_filter(),
             limit,
         )?);
     }

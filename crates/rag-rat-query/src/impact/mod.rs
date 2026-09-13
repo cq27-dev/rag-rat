@@ -242,12 +242,18 @@ pub fn impact_surface_report_for_symbol(
     let names = vec![symbol.name.clone(), symbol.qualified_name.clone()];
     let import_export_dependents =
         import_export_items(conn, symbol.symbol_id, &symbol.qualified_name, &names, limit)?;
-    let tests_touching_symbol_path =
-        if options.include_tests { test_items(conn, symbol, &names, limit)? } else { Vec::new() };
-    let docs_mentioning_symbol_path =
-        if options.include_docs { docs_items(conn, symbol, &names, limit)? } else { Vec::new() };
+    let tests_touching_symbol_path = if options.include_tests {
+        file_section_items(conn, symbol, &names, limit, FileSection::Tests)?
+    } else {
+        Vec::new()
+    };
+    let docs_mentioning_symbol_path = if options.include_docs {
+        file_section_items(conn, symbol, &names, limit, FileSection::Docs)?
+    } else {
+        Vec::new()
+    };
     let text_fallback_hits = if options.include_text_fallback {
-        text_fallback_items(conn, symbol, &names, limit)?
+        file_section_items(conn, symbol, &names, limit, FileSection::TextFallback)?
     } else {
         Vec::new()
     };

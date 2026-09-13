@@ -36,10 +36,11 @@ pub(crate) fn scoped_chunk_row_count(
 /// Whether `text` contains a test marker — the file-level `files.has_test_code` signal that lets
 /// `impact_surface`'s "tests touching this symbol" query filter on an indexed flag instead of a
 /// `chunks.text LIKE` scan (#77). INVARIANT: this marker set MUST match the V024 backfill SQL in
-/// `schema::migrations::apply_files_has_test_code` and `test_items`'s filter, or an incrementally
-/// reindexed file and a forward-migrated one would disagree. (The `it(` / `test(` substrings are
-/// intentionally broad — they reproduce the original `LIKE '%it(%'` / `'%test(%'` behavior exactly,
-/// noise included, so the precomputed flag is a faithful drop-in for the scan it replaces.)
+/// `schema::migrations::apply_files_has_test_code` and `FileSection::Tests`'s filter, or an
+/// incrementally reindexed file and a forward-migrated one would disagree. (The `it(` / `test(`
+/// substrings are intentionally broad — they reproduce the original `LIKE '%it(%'` / `'%test(%'`
+/// behavior exactly, noise included, so the precomputed flag is a faithful drop-in for the scan it
+/// replaces.)
 pub(crate) fn text_has_test_marker(text: &str) -> bool {
     text.contains("#[cfg(test)]")
         || text.contains("describe(")

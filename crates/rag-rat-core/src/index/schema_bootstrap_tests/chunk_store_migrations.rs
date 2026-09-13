@@ -691,7 +691,7 @@ fn name_strings_max_id_stays_in_the_three_byte_range() {
 fn files_has_test_code_flag_is_computed_at_index_time() {
     // #77 V024: the precomputed files.has_test_code flag replaces impact_surface's chunks.text
     // marker scan. Assert it's set at index time from the file's text (the same marker set the
-    // V024 backfill + test_items use), independent of the path.
+    // V024 backfill + the `FileSection::Tests` filter use), independent of the path.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
