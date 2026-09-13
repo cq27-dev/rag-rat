@@ -54,7 +54,7 @@ mod listener {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use rag_rat_base::config::Config;
+    use rag_rat_base::config::{Config, MemorySurface};
     use rag_rat_base::locks::{self, FileLock};
     use rag_rat_core::query::grep_augment::{self, DedupeFilter};
     use rag_rat_db::storage::IndexConnection;
@@ -251,119 +251,167 @@ mod listener {
                 io?;
             }, // propagate real I/O errors as before
         }
-        let reply = match serde_json::from_str::<HookRequest>(&line) {
-            Ok(req)
-                if req.v == PROTOCOL_VERSION
-                    && matches!(req.kind.as_str(), "grep_augment" | "read_augment") =>
-            {
-                // One logical timestamp for this request: it decides what's still within the
-                // resurface window AND stamps whatever gets shown, so the window measures time
-                // between full surfaces (#759).
-                let now = Instant::now();
-                let filter = {
-                    let state = sessions.entry(req.session_id.clone()).or_default();
-                    state.last_used = Some(now);
-                    // The suppress set is a snapshot (owned), so the borrow ends before the await.
-                    DedupeFilter {
-                        memory_ids: recently_seen(&mut state.seen_memories, now),
-                        symbol_keys: recently_seen(&mut state.seen_symbols, now),
-                    }
-                };
-                let database = config.database.clone();
-                let config_root = config.root.clone();
-                let repo_id_override = config.repo_id_override.clone();
-                let memory_surface = config.memory.surface;
-                // Scope to the session's worktree overlay (#219). Absent cwd (older client) → the
-                // config root, which resolves to the base scope. This also fixes the listener's
-                // prior lack of ANY scope install: compose queries the `files` view, so without
-                // this it read raw, unscoped rows.
-                let cwd = req.cwd.clone().map(PathBuf::from).unwrap_or_else(|| config_root.clone());
-                let kind = req.kind.clone();
-                // Echoed on the reply so a newer client can distinguish "handled, nothing new" from
-                // an older listener's unknown-kind null (#756 review).
-                let handled_kind = req.kind.clone();
-                let pattern = req.pattern.clone();
-                let search_path = req.search_path.clone();
-                let read_path = req.path.clone();
-                // rusqlite is sync; one short read off the runtime threads.
-                let composed = tokio::task::spawn_blocking(move || {
-                    let conn = IndexConnection::open_read_only(&database)?;
-                    // Resolve the repo dimension from this config (identity + override) so the
-                    // scope binds the config's repo, not the config-blind sole
-                    // repo (a sibling in a consolidated DB); an unprovable repo
-                    // → empty scope, never a sibling's rows.
-                    let repo_id = rag_rat_core::index::resolve_scope_repo_id(
-                        conn.connection(),
-                        &config_root,
-                        repo_id_override.as_deref(),
-                    )?
-                    .unwrap_or_default();
-                    rag_rat_core::index::install_worktree_scope_view(
-                        conn.connection(),
-                        &repo_id,
-                        &config_root,
-                        &cwd,
-                    )?;
-                    match kind.as_str() {
-                        // read_augment with no path resolves to nothing to inject.
-                        "read_augment" => match read_path.as_deref() {
-                            Some(path) => rag_rat_core::query::read_augment::compose(
-                                conn.connection(),
-                                path,
-                                &filter,
-                                memory_surface,
-                            ),
-                            None => Ok(None),
-                        },
-                        _ => grep_augment::compose(
-                            conn.connection(),
-                            &pattern,
-                            search_path.as_deref(),
-                            &filter,
-                            memory_surface,
-                        ),
-                    }
-                })
-                .await?;
-                let composed = super::degrade_when_fts_corrupt(composed, || {
-                    super::spawn_background_fts_heal(config.clone())
-                })?;
-                match composed {
-                    Some(out) => {
-                        // compose's returned IDs are exactly the items RENDERED, so stamp each with
-                        // `now`: only a full surface (re)starts its resurface window. A key that
-                        // was suppressed this call isn't in these lists, so
-                        // its earlier timestamp — and thus its window — is
-                        // left untouched (#759).
-                        let state = sessions.entry(req.session_id).or_default();
-                        for id in &out.memory_ids {
-                            state.seen_memories.insert(id.clone(), now);
-                        }
-                        for key in &out.symbol_keys {
-                            state.seen_symbols.insert(key.clone(), now);
-                        }
-                        HookResponse {
-                            v: PROTOCOL_VERSION,
-                            context: Some(out.context),
-                            kind: Some(handled_kind),
-                        }
-                    },
-                    None => HookResponse {
-                        v: PROTOCOL_VERSION,
-                        context: None,
-                        kind: Some(handled_kind),
-                    },
-                }
-            },
+        let reply = match handled_request(&line) {
+            Some((req, kind)) => answer(req, kind, config, sessions).await?,
             // Unknown v/kind or malformed JSON: answer null-context with NO handled `kind`, never
             // error back. The absent `kind` tells a newer client this listener didn't handle the
             // request so it should fall back (#756 review).
-            _ => HookResponse { v: PROTOCOL_VERSION, context: None, kind: None },
+            None => HookResponse { v: PROTOCOL_VERSION, context: None, kind: None },
         };
         let mut payload = serde_json::to_string(&reply)?;
         payload.push('\n');
         write.write_all(payload.as_bytes()).await?;
         Ok(())
+    }
+
+    /// The request kinds this listener composes an answer for.
+    #[derive(Debug, Clone, Copy)]
+    enum HookKind {
+        GrepAugment,
+        ReadAugment,
+    }
+
+    impl HookKind {
+        fn parse(kind: &str) -> Option<Self> {
+            match kind {
+                "grep_augment" => Some(Self::GrepAugment),
+                "read_augment" => Some(Self::ReadAugment),
+                _ => None,
+            }
+        }
+
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::GrepAugment => "grep_augment",
+                Self::ReadAugment => "read_augment",
+            }
+        }
+    }
+
+    /// The request, when it is one this listener handles: the current protocol version and a known
+    /// kind. The kind is validated once, here, and carried typed from then on.
+    fn handled_request(line: &str) -> Option<(HookRequest, HookKind)> {
+        let req = serde_json::from_str::<HookRequest>(line).ok()?;
+        if req.v != PROTOCOL_VERSION {
+            return None;
+        }
+        let kind = HookKind::parse(&req.kind)?;
+        Some((req, kind))
+    }
+
+    /// Compose the answer to one handled request and record what it surfaced for the session.
+    async fn answer(
+        req: HookRequest,
+        kind: HookKind,
+        config: &Config,
+        sessions: &mut HashMap<String, SessionState>,
+    ) -> anyhow::Result<HookResponse> {
+        // One logical timestamp for this request: it decides what's still within the resurface
+        // window AND stamps whatever gets shown, so the window measures time between full surfaces
+        // (#759).
+        let now = Instant::now();
+        let filter = {
+            let state = sessions.entry(req.session_id.clone()).or_default();
+            state.last_used = Some(now);
+            // The suppress set is a snapshot (owned), so the borrow ends before the await.
+            DedupeFilter {
+                memory_ids: recently_seen(&mut state.seen_memories, now),
+                symbol_keys: recently_seen(&mut state.seen_symbols, now),
+            }
+        };
+        let inputs = ComposeInputs {
+            database: config.database.clone(),
+            config_root: config.root.clone(),
+            repo_id_override: config.repo_id_override.clone(),
+            // Scope to the session's worktree overlay (#219). Absent cwd (older client) → the
+            // config root, which resolves to the base scope. This also fixes the listener's prior
+            // lack of ANY scope install: compose queries the `files` view, so without this it read
+            // raw, unscoped rows.
+            cwd: req.cwd.clone().map(PathBuf::from).unwrap_or_else(|| config.root.clone()),
+            pattern: req.pattern.clone(),
+            search_path: req.search_path.clone(),
+            read_path: req.path.clone(),
+            filter,
+            memory_surface: config.memory.surface,
+        };
+        // rusqlite is sync; one short read off the runtime threads.
+        let composed = tokio::task::spawn_blocking(move || compose_for(kind, inputs)).await?;
+        let composed = super::degrade_when_fts_corrupt(composed, || {
+            super::spawn_background_fts_heal(config.clone())
+        })?;
+        // Echoed on the reply so a newer client can distinguish "handled, nothing new" from an
+        // older listener's unknown-kind null (#756 review).
+        let handled_kind = Some(kind.as_str().to_string());
+        let Some(out) = composed else {
+            return Ok(HookResponse { v: PROTOCOL_VERSION, context: None, kind: handled_kind });
+        };
+        // compose's returned IDs are exactly the items RENDERED, so stamp each with `now`: only a
+        // full surface (re)starts its resurface window. A key that was suppressed this call isn't
+        // in these lists, so its earlier timestamp — and thus its window — is left untouched
+        // (#759).
+        let state = sessions.entry(req.session_id).or_default();
+        for id in &out.memory_ids {
+            state.seen_memories.insert(id.clone(), now);
+        }
+        for key in &out.symbol_keys {
+            state.seen_symbols.insert(key.clone(), now);
+        }
+        Ok(HookResponse { v: PROTOCOL_VERSION, context: Some(out.context), kind: handled_kind })
+    }
+
+    /// Everything one composition needs, moved onto the blocking thread.
+    struct ComposeInputs {
+        database: PathBuf,
+        config_root: PathBuf,
+        repo_id_override: Option<String>,
+        cwd: PathBuf,
+        pattern: String,
+        search_path: Option<String>,
+        read_path: Option<String>,
+        filter: DedupeFilter,
+        memory_surface: MemorySurface,
+    }
+
+    /// Open the read-only index, install the session's worktree scope, and compose `kind`'s answer.
+    fn compose_for(
+        kind: HookKind,
+        inputs: ComposeInputs,
+    ) -> anyhow::Result<Option<grep_augment::GrepAugment>> {
+        let conn = IndexConnection::open_read_only(&inputs.database)?;
+        // Resolve the repo dimension from this config (identity + override) so the scope binds the
+        // config's repo, not the config-blind sole repo (a sibling in a consolidated DB); an
+        // unprovable repo → empty scope, never a sibling's rows.
+        let repo_id = rag_rat_core::index::resolve_scope_repo_id(
+            conn.connection(),
+            &inputs.config_root,
+            inputs.repo_id_override.as_deref(),
+        )?
+        .unwrap_or_default();
+        rag_rat_core::index::install_worktree_scope_view(
+            conn.connection(),
+            &repo_id,
+            &inputs.config_root,
+            &inputs.cwd,
+        )?;
+        match kind {
+            // read_augment with no path resolves to nothing to inject.
+            HookKind::ReadAugment => match inputs.read_path.as_deref() {
+                Some(path) => rag_rat_core::query::read_augment::compose(
+                    conn.connection(),
+                    path,
+                    &inputs.filter,
+                    inputs.memory_surface,
+                ),
+                None => Ok(None),
+            },
+            HookKind::GrepAugment => grep_augment::compose(
+                conn.connection(),
+                &inputs.pattern,
+                inputs.search_path.as_deref(),
+                &inputs.filter,
+                inputs.memory_surface,
+            ),
+        }
     }
 
     #[cfg(test)]
