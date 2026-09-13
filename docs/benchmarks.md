@@ -15,7 +15,9 @@ feeds; comparisons across versions belong there, not here.
 The kernel index runs on a self-hosted big-memory box (the `bench-release` workflow's
 `[self-hosted, bigmem]` runner), inside the pinned bench container so the toolchain and SCIP indexers
 are reproducible. It runs here rather than on a hosted runner for a stable wall-clock — not because
-it no longer fits a hosted box (see the peak below).
+it no longer fits a hosted box (see the peak below). The same runner takes the lightweight push/PR
+benchmarks (`bench`, `bench-pr-run`), so the repository's benchmarks run one at a time: one runner,
+one slot.
 
 | | |
 |---|---|

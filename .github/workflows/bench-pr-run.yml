@@ -27,6 +27,12 @@ on:
       - '.github/workflows/bench-pr-run.yml'
 
 # Fork-safe by construction: no secrets are used here, and the token is read-only.
+#
+# Benchmarks run on the self-hosted `bigmem` runner: ONE runner, one slot, so every benchmark of the
+# repository (this, `bench` on main, `bench-release`, the heavy oracle tier) runs one at a time by
+# construction, never beside another. A fork's pull request is untrusted code that may not run
+# there, and no hosted baseline is kept for it to compare against, so it skips the benchmark; its
+# tracker run (`bench-pr-track`, gated on this one succeeding) skips with it.
 permissions:
   contents: read
 
@@ -41,14 +47,11 @@ jobs:
     # The release PR (`release-plz-*`) changes versions, the changelog and the plugin manifests —
     # nothing this workflow measures — and its branch is rewritten on every push to main, so
     # running here would only restart a long job that a merge cancels again.
-    if: ${{ !startsWith(github.head_ref, 'release-plz-') }}
-    runs-on: ubuntu-latest
+    if: ${{ !startsWith(github.head_ref, 'release-plz-') && !github.event.pull_request.head.repo.fork }}
+    runs-on: bigmem
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install valgrind (iai-callgrind)
-        run: sudo apt-get update && sudo apt-get install -y valgrind
       - name: Cache iai-callgrind-runner
         uses: actions/cache@v5
         with:

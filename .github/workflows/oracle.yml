@@ -137,7 +137,7 @@ jobs:
     needs: matrix
     if: needs.matrix.outputs.tier == 'small'
     # 24.04: the pinned scip-clang prebuilt links against a recent GLIBC (see bench.Containerfile).
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:
@@ -154,6 +154,7 @@ jobs:
         with:
           components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
 
       - name: Build rag-rat (release, hash embedder — no model download)
         run: cargo build --release --no-default-features --bin rag-rat
@@ -162,6 +163,9 @@ jobs:
         run: |
           set -euo pipefail
           tool="$(python3 tools/oracle-corpus.py --corpus '${{ matrix.corpus }}' --field tool)"
+          # A per-job bin dir: writable on every runner, and on PATH for the oracle's probe.
+          mkdir -p "$RUNNER_TEMP/bin" && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
           echo "installing $tool for ${{ matrix.corpus }}"
           case "$tool" in
             rust-analyzer)
@@ -172,13 +176,13 @@ jobs:
               # the single line to change when un-pinning. Copy the proxy to an absolute path on PATH
               # so the oracle's `rust-analyzer scip` probe finds it.
               ra="$(rustup which rust-analyzer)"
-              install -m 0755 "$ra" /usr/local/bin/rust-analyzer
+              install -m 0755 "$ra" "$RUNNER_TEMP/bin/rust-analyzer"
               rust-analyzer --version ;;
             scip-clang)
               curl --proto '=https' --tlsv1.2 -sSfL \
                 "https://github.com/sourcegraph/scip-clang/releases/download/${SCIP_CLANG_VERSION}/scip-clang-x86_64-linux" \
-                -o /usr/local/bin/scip-clang
-              chmod +x /usr/local/bin/scip-clang
+                -o "$RUNNER_TEMP/bin/scip-clang"
+              chmod +x "$RUNNER_TEMP/bin/scip-clang"
               scip-clang --version ;;
             scip-python|scip-typescript)
               # Install the pinned npm toolchain from its committed lockfile (full transitive tree,

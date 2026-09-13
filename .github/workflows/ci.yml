@@ -17,6 +17,12 @@ on:
 permissions:
   contents: read
 
+# Same-repository work runs on the self-hosted `ci` runners. A pull request from a fork is untrusted
+# code and stays on a hosted runner — the only place it may execute. Each self-hosted runner's own
+# `.env` sets `CARGO_TARGET_DIR` outside the checkout (which `actions/checkout` cleans), so its
+# target dir stays warm from job to job; `runner.environment` gates the steps that exist for hosted
+# runners only — the GitHub cache round-trip, since a hosted runner starts empty every time.
+#
 # Newer pushes to the same branch/PR cancel older in-flight runs.
 concurrency:
   group: ci-${{ github.ref }}
@@ -32,7 +38,7 @@ env:
 jobs:
   fmt:
     name: rustfmt
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v5
       # rustfmt.toml uses nightly-only options (struct_lit_style, imports_granularity, …),
@@ -44,13 +50,14 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
       # --no-default-features = hash-only build: no ONNX/model downloads, fast and network-free.
       # This lints the cfg(not(feature = ...)) branches; the feature-gated code is linted by the
       # clippy-all-features job below.
@@ -58,13 +65,14 @@ jobs:
 
   clippy-all-features:
     name: clippy (all features)
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
       # The all-features graph compiles ort/fastembed, which downloads the ONNX runtime; force
       # ort-sys to re-emit its link metadata for the current cache location (matches build-full).
       - run: cargo clean -p ort-sys
@@ -74,12 +82,13 @@ jobs:
 
   test:
     name: test
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
       - uses: taiki-e/install-action@nextest
       # Hash embedder only (no model downloads). Tests run in parallel; the `ci` profile emits a
       # JUnit report at target/nextest/ci/junit.xml.
@@ -96,11 +105,12 @@ jobs:
 
   build-full:
     name: build (fastembed + model2vec)
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
       # rust-cache can restore a PARTIAL ort-sys download — a cache marker present but the native
       # onnxruntime lib missing — so `cargo clean` alone re-emits link metadata pointing at a lib
       # that isn't there ("could not find native static library `onnxruntime`"). Nuke the downloaded
@@ -114,7 +124,7 @@ jobs:
 
   coverage:
     name: coverage
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
@@ -122,6 +132,7 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+        if: runner.environment == 'github-hosted'
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage (lcov)
         run: cargo llvm-cov --workspace --no-default-features --locked --lcov --output-path lcov.info
@@ -135,7 +146,7 @@ jobs:
 
   lens-extension:
     name: vscode lens extension
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
