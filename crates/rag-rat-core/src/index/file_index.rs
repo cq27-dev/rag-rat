@@ -9,6 +9,18 @@ use rag_rat_clones as clones;
 use super::*;
 use crate::index::graph_index::{LogicalSymbolKey, LogicalSymbolMemberRow};
 
+/// Which pass [`IndexDatabase::insert_prepared_file`] writes for — the mode that routes parser
+/// failures, the clone-df bump and edge insertion.
+pub(super) enum FileWrite<'a> {
+    /// A full-rebuild wave: parser failures are STAGED (published with the flip), symbols and
+    /// remapped edges accumulate into the graph for one in-memory resolve, and `clone_token_df` is
+    /// recomputed at finalize rather than bumped per file.
+    StagedRebuild(&'a mut edges::FullRebuildGraph),
+    /// An incremental write into the live generation: direct parser-failure upsert/clear, a
+    /// per-file df bump, and unresolved per-file edge inserts.
+    Live,
+}
+
 /// Identity of the file whose chunks are being inserted — passed from the caller (which just
 /// inserted the file row) so `insert_chunks` doesn't re-`SELECT` it per file (#57).
 struct ChunkInsertFile<'a> {
@@ -122,11 +134,11 @@ impl IndexDatabase {
     ) -> anyhow::Result<()> {
         // Heal path: prepare from the bytes already in hand through the SAME single-parse core the
         // full-rebuild / changed-file passes use, then route through `insert_prepared_file` in
-        // incremental mode (`graph = None`). ONE tree-sitter parse instead of 5, and no duplicated
-        // generated-file gate / parser-failure / chunk-source / has_test_code logic (#518).
-        // `heal_file`'s `remove_file_in_scope` already cleared the prior file row and its parser
-        // failure, so the incremental insert writes the live generation in place; `full_path` is
-        // unused by the insert (the bytes are already parsed).
+        // incremental mode (`FileWrite::Live`). ONE tree-sitter parse instead of 5, and no
+        // duplicated generated-file gate / parser-failure / chunk-source / has_test_code
+        // logic (#518). `heal_file`'s `remove_file_in_scope` already cleared the prior file
+        // row and its parser failure, so the incremental insert writes the live generation
+        // in place; `full_path` is unused by the insert (the bytes are already parsed).
         let content = prepare_index_content_from_text(path, language, kind, text, modified_at_ms);
         let prepared_file = PreparedIndexFile {
             file: IndexFile {
@@ -139,28 +151,28 @@ impl IndexDatabase {
             },
             prepared: Ok(content),
         };
-        self.insert_prepared_file(&prepared_file, None)
+        self.insert_prepared_file(&prepared_file, FileWrite::Live)
     }
 
-    /// `graph`: on a full rebuild, `Some` accumulator — symbols (with their new DB ids) and
-    /// remapped edge candidates are collected for one in-memory resolve-and-insert pass after
-    /// the loop, and NO edges are inserted here. `None` (incremental) inserts edges unresolved
-    /// per file as before, to be resolved by the DB-based `resolve_edges`.
+    /// `write` selects the pass mode: a full-rebuild wave accumulates symbols (with their new DB
+    /// ids) and remapped edge candidates into the graph for one in-memory resolve-and-insert pass
+    /// after the loop, inserting NO edges here; a live (incremental) write inserts edges
+    /// unresolved per file, to be resolved by the DB-based `resolve_edges`.
     pub(super) fn insert_prepared_file(
         &self,
         prepared_file: &PreparedIndexFile,
-        graph: Option<&mut edges::FullRebuildGraph>,
+        write: FileWrite<'_>,
     ) -> anyhow::Result<()> {
         let file = &prepared_file.file;
-        // Parser-failure routing (A6, P2 review): the FULL REBUILD (`graph.is_some()` — the same
+        // Parser-failure routing (A6, P2 review): the FULL REBUILD (`StagedRebuild` — the same
         // mode split the edge accumulator uses) STAGES its upserts/clears into the connection's
         // temp table, published atomically with the flip by `apply_staged_parser_failures`. The
         // per-wave commits land BEFORE the flip, so a direct write here would expose (and, on a
         // tail failure, strand) an UNPUBLISHED generation's failure state to readers still scoped
-        // to the old generation. Incremental passes (`None`) write the LIVE generation in place,
+        // to the old generation. Incremental passes (`Live`) write the LIVE generation in place,
         // so they keep the direct upsert/clear (their `remove_file_in_scope` already cleared; the
         // clear branch is the full-rebuild's clean-reparse path, a no-op for them).
-        let staged_rebuild = graph.is_some();
+        let staged_rebuild = matches!(write, FileWrite::StagedRebuild(_));
         let prepared = match &prepared_file.prepared {
             Ok(prepared) => prepared,
             Err(err) => {
@@ -244,23 +256,23 @@ impl IndexDatabase {
         )?;
         // Clone fingerprints were computed in the parallel prepare phase from the same parse used
         // for symbols/edges (#230) — no second read, no second parse here, just the DB write.
-        // bump_df = graph.is_none(): the full-rebuild path (graph: Some) recomputes clone_token_df
-        // authoritatively from the token-bag BLOBs in refresh_clone_token_df at finalize
-        // (rebuild.rs), so per-token upserts here would be recomputed-and-discarded — pure waste
-        // plus hot-row contention on common tokens. The incremental path (graph: None) runs no
+        // bump_df only on a live write: the full-rebuild path (`StagedRebuild`) recomputes
+        // clone_token_df authoritatively from the token-bag BLOBs in refresh_clone_token_df at
+        // finalize (rebuild.rs), so per-token upserts here would be recomputed-and-discarded — pure
+        // waste plus hot-row contention on common tokens. The incremental path (`Live`) runs no
         // such finalize, so the bump is how the LIVE df stays current (#479 — the persisted
         // postings' order is safe regardless: it is pinned per generation in `clone_df_epoch`).
         self.write_symbol_fingerprints(
             &symbol_db_ids,
             &prepared.symbol_fingerprints,
-            BumpDf(graph.is_none()),
+            BumpDf(!staged_rebuild),
         )?;
         // Edge candidates were computed in the parallel prepare phase with LOCAL symbol indices;
         // remap them to the real DB ids just assigned.
-        match graph {
+        match write {
             // Full rebuild: accumulate symbols (with ids) + remapped edges for one in-memory
             // resolve-and-insert pass after the loop. No edge insert here.
-            Some(graph) => {
+            FileWrite::StagedRebuild(graph) => {
                 for (symbol, &id) in prepared.symbols.iter().zip(&symbol_db_ids) {
                     graph.push_symbol(id, file_id, file.language, symbol);
                 }
@@ -269,7 +281,7 @@ impl IndexDatabase {
                 }
             },
             // Incremental: insert unresolved edges per file; resolve_edges resolves them afterward.
-            None => {
+            FileWrite::Live => {
                 // #827: register this (re)written file as set (a) of the scoped re-resolve write
                 // set (no-op unless a scoped incremental pass armed capture).
                 // Staged unconditionally — even an edge-less changed file may host

@@ -3,6 +3,7 @@ use rag_rat_base::time::now_ms;
 use rag_rat_db::schema;
 
 use super::*;
+use crate::index::file_index::FileWrite;
 
 /// What an incremental file pass did, split by what each count gates downstream: `indexed`
 /// (derived or deleted rows — real content change), `manifest_in_change_set` (a `Cargo.toml`
@@ -24,6 +25,17 @@ struct IncrementalFilesOutcome {
 pub(super) struct IncrementalWriteOutcome {
     pub(super) written: usize,
     pub(super) logical: graph_index::LogicalGroupingUpkeep,
+}
+
+/// Where the plan [`IndexDatabase::write_prepared_incremental_files`] writes was prepared — which
+/// decides whether the concurrent-write guards apply.
+pub(super) enum WriteOrigin {
+    /// The #560 hoisted pass in this mode: the plan was prepared OFF the write lock, so a
+    /// concurrent commit could have landed in between.
+    Hoisted(IndexMode),
+    /// Prepared inside the caller's own transaction (zero-hit heal, worktree-overlay pass): no
+    /// concurrent commit can interleave.
+    InTransaction,
 }
 
 /// Everything the incremental/discover WRITE phase needs, computed entirely OUTSIDE the write
@@ -786,7 +798,7 @@ impl IndexDatabase {
                     // re-read, and the in-memory text is available regardless of whether the
                     // chunks.text column still exists. `finalize_full_rebuild_fts` then only
                     // rebuilds commit_fts.
-                    self.insert_prepared_file(prepared_file, Some(&mut graph))?;
+                    self.insert_prepared_file(prepared_file, FileWrite::StagedRebuild(&mut graph))?;
                 }
                 Ok(())
             })();
@@ -951,7 +963,7 @@ impl IndexDatabase {
         let written = self.write_prepared_incremental_files(
             &prepared.prepared_files,
             &prepared.deleted,
-            Some(mode),
+            WriteOrigin::Hoisted(mode),
             progress,
         )?;
         Ok(IncrementalFilesOutcome {
@@ -1150,7 +1162,12 @@ impl IndexDatabase {
         let prepared = prepare_files_with_progress(&files, progress, 0, files.len())?;
         // In-txn caller (zero-hit heal / worktree-overlay pass): the parse+write share one
         // transaction, so no concurrent commit can interleave — no guards needed (#561).
-        self.write_prepared_incremental_files(&prepared, &deleted, None, progress)
+        self.write_prepared_incremental_files(
+            &prepared,
+            &deleted,
+            WriteOrigin::InTransaction,
+            progress,
+        )
     }
 
     /// Write ALREADY-PREPARED files into the live generation: tombstone the deletions, then
@@ -1162,7 +1179,7 @@ impl IndexDatabase {
         &self,
         prepared: &[PreparedIndexFile],
         deleted: &BTreeSet<PathBuf>,
-        mode_guard: Option<IndexMode>,
+        origin: WriteOrigin,
         progress: &mut F,
     ) -> anyhow::Result<IncrementalWriteOutcome>
     where
@@ -1175,12 +1192,11 @@ impl IndexDatabase {
         } else {
             self.begin_logical_grouping_upkeep()?
         };
-        // `mode_guard` is `Some` only for the #560 hoisted path, whose plan was prepared OFF the
-        // write lock; the in-txn callers (zero-hit heal, worktree-overlay pass) prepare inside
-        // their own transaction — no concurrent commit is possible — so they pass `None`
-        // and skip both guards below. The mtime guard (changed-file overwrites) applies in
-        // either hoisted mode.
-        let guard_concurrent_writes = mode_guard.is_some();
+        // Only the #560 hoisted path (`Hoisted`) prepared its plan OFF the write lock; the in-txn
+        // callers (zero-hit heal, worktree-overlay pass) prepare inside their own transaction — no
+        // concurrent commit is possible — so they pass `InTransaction` and skip both guards
+        // below. The mtime guard (changed-file overwrites) applies in every hoisted mode.
+        let guard_concurrent_writes = matches!(origin, WriteOrigin::Hoisted(_));
         // The fs-deletion restore recheck applies only to the fs-deletion modes (Changed and
         // Paths). There, `deleted` is purely file-deletions and the target/ignore set is
         // stable within the pass, so "exists on disk" means "restored AND still in scope".
@@ -1188,7 +1204,9 @@ impl IndexDatabase {
         // set or became gitignored but still exists on disk) which MUST be tombstoned
         // regardless of disk existence — and a genuine fs-restore in Discover self-heals on
         // the next discover pass anyway.
-        let revalidate_fs_deletions = mode_guard.is_some_and(IndexMode::revalidates_fs_deletions);
+        let revalidate_fs_deletions =
+            matches!(origin, WriteOrigin::Hoisted(mode) if mode.revalidates_fs_deletions());
+        let explicit_paths = matches!(origin, WriteOrigin::Hoisted(IndexMode::Paths));
         let mut deleted_count = 0usize;
         for path in deleted {
             // A git-deleted path may have been RESTORED on disk during the off-lock window (#561).
@@ -1235,12 +1253,11 @@ impl IndexDatabase {
             // Both skip gates below read the same exact-scope-key row; fetch it once, and only when
             // a gate applies to this file.
             let scope_row = match &prepared_file.prepared {
-                Ok(_) if guard_concurrent_writes || mode_guard == Some(IndexMode::Paths) => self
-                    .scope_row_state(
-                        &prepared_file.file.relative_path,
-                        &prepared_file.file.commit_sha,
-                        &prepared_file.file.worktree_id,
-                    )?,
+                Ok(_) if guard_concurrent_writes || explicit_paths => self.scope_row_state(
+                    &prepared_file.file.relative_path,
+                    &prepared_file.file.commit_sha,
+                    &prepared_file.file.worktree_id,
+                )?,
                 _ => None,
             };
             // A lockless heal could have indexed a NEWER on-disk version of THIS exact scope key in
@@ -1266,11 +1283,11 @@ impl IndexDatabase {
             // TARGET-identity drift with unchanged bytes (an extension-precedence change
             // re-languages the path) must still reindex, exactly as discovery's
             // staleness does — a sha-only skip would strand the old parse. Gated to
-            // `Paths`: the heal / worktree-overlay callers (`mode_guard = None`)
+            // `Paths`: the heal / worktree-overlay callers (`InTransaction`)
             // deliberately re-index UNCHANGED content to upgrade a stale anchor/schema
             // format the sha doesn't capture, and Changed/Discover never prepare an
             // unchanged file — so neither wants this skip.
-            if mode_guard == Some(IndexMode::Paths)
+            if explicit_paths
                 && let Ok(content) = &prepared_file.prepared
                 && let Some(row) = &scope_row
                 && row.sha256 == content.sha256
@@ -1300,7 +1317,7 @@ impl IndexDatabase {
             // in insert_chunks (no full rebuild_fts). No accumulator — edges are
             // inserted unresolved here and resolved by resolve_edges in the caller's
             // terminal tail.
-            self.insert_prepared_file(prepared_file, None)?;
+            self.insert_prepared_file(prepared_file, FileWrite::Live)?;
             written += 1;
             // Compare the replacement's key multiset against the captured claims: identical →
             // the file's owed member rows accumulate; anything else (including a first-time
