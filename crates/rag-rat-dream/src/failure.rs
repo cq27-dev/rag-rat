@@ -83,6 +83,9 @@ impl DreamModelFailure {
     }
 }
 
+/// Every field is a borrow or a `Copy` token, so a runner builds one stamp per entry and hands the
+/// same value to the blocking gate, the failure record, and the clear.
+#[derive(Clone, Copy)]
 pub(crate) struct FailureStamp<'a> {
     pub(crate) memory_id: &'a str,
     pub(crate) repo_id: &'a str,

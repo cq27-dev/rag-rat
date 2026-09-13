@@ -247,15 +247,6 @@ pub(super) fn run_verdict_pass(
                 model_id: pass.model.model_id(),
                 now_ms,
             })?;
-            let failure_stamp = FailureStamp {
-                memory_id: &entry.memory_id,
-                repo_id,
-                pass: DreamModelPass::Verify,
-                content_hash: &content_hash,
-                checked_inputs_hash: Some(&inputs_hash),
-                prompt_version: PROMPT_VERSION,
-                model_id: pass.model.model_id(),
-            };
             failure::clear_failure(tx, &failure_stamp)?;
             Ok(())
         })?;
