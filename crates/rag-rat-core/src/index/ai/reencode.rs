@@ -1,4 +1,4 @@
-use rag_rat_db::meta::{meta, set_meta};
+use rag_rat_db::meta::{read_meta, set_meta};
 
 use super::*;
 
@@ -128,7 +128,7 @@ fn reencode_legacy_f32_blobs_batched(
 /// back to the sentinel — re-walking from the head is correct (already-int8 rows are skipped),
 /// never wrong.
 fn load_cursor(conn: &Connection) -> anyhow::Result<(i64, String)> {
-    let Some(raw) = meta(conn, VECTOR_INT8_REENCODE_CURSOR_META)? else {
+    let Some(raw) = read_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META)? else {
         return Ok((i64::MIN, String::new()));
     };
     let Some((chunk_id, model_id)) = raw.split_once('\n') else {
@@ -238,7 +238,7 @@ pub(crate) fn reencode_legacy_vectors_if_needed(
     conn: &Connection,
     deadline: Option<Instant>,
 ) -> anyhow::Result<usize> {
-    if meta(conn, VECTOR_INT8_REENCODE_DONE_META)?.is_some() {
+    if read_meta(conn, VECTOR_INT8_REENCODE_DONE_META)?.is_some() {
         return Ok(0);
     }
     reencode_and_mark_if_complete(conn, deadline)
@@ -470,7 +470,7 @@ mod tests {
 
         // First call converts and sets the gate.
         assert_eq!(reencode_legacy_vectors_if_needed(&conn, None).unwrap(), 1);
-        assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
+        assert_eq!(read_meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
 
         // Insert a fresh f32 row AFTER the gate is set — the second call must be a no-op (it does
         // not even run the detect query), so the new row stays f32. This models the invariant that
@@ -490,12 +490,12 @@ mod tests {
 
         assert_eq!(reencode_legacy_vectors_now_within(&conn, None).unwrap(), 1);
         // ... and it leaves the gate set, so a later maintenance pass skips the full scan.
-        assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
+        assert_eq!(read_meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
         assert_eq!(reencode_legacy_vectors_if_needed(&conn, None).unwrap(), 0);
     }
 
     fn stored_cursor(conn: &Connection) -> Option<String> {
-        meta(conn, VECTOR_INT8_REENCODE_CURSOR_META).unwrap()
+        read_meta(conn, VECTOR_INT8_REENCODE_CURSOR_META).unwrap()
     }
 
     #[test]
@@ -514,7 +514,7 @@ mod tests {
         let converted = reencode_legacy_vectors_if_needed(&conn, Some(past)).unwrap();
         assert_eq!(converted, 0, "an expired deadline converts nothing");
         assert_eq!(count_remaining_f32(&conn), 6, "all rows still f32");
-        assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap(), None, "gate unset");
+        assert_eq!(read_meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap(), None, "gate unset");
         assert_eq!(stored_cursor(&conn), None, "no cursor persisted (no batch ran)");
     }
 
@@ -548,7 +548,7 @@ mod tests {
         let converted = reencode_legacy_vectors_if_needed(&conn, None).unwrap();
         assert_eq!(converted, 4, "resumes the remaining rows, not all 6");
         assert_eq!(count_remaining_f32(&conn), 0, "all rows now int8");
-        assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
+        assert_eq!(read_meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
         assert_eq!(stored_cursor(&conn), None, "cursor cleared on completion");
     }
 
@@ -564,7 +564,7 @@ mod tests {
         let far = Instant::now() + std::time::Duration::from_secs(3600);
         assert_eq!(reencode_legacy_vectors_if_needed(&conn, Some(far)).unwrap(), 3);
         assert_eq!(count_remaining_f32(&conn), 0);
-        assert_eq!(meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
+        assert_eq!(read_meta(&conn, VECTOR_INT8_REENCODE_DONE_META).unwrap().as_deref(), Some("1"));
         assert_eq!(stored_cursor(&conn), None);
     }
 }

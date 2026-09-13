@@ -347,7 +347,7 @@ pub(crate) fn install_model2vec_model(conn: &Connection, model_id: &str) -> anyh
 
 #[cfg(test)]
 mod seed_active_embedding_model_tests {
-    use rag_rat_db::meta::meta;
+    use rag_rat_db::meta::read_meta;
 
     use super::*;
 
@@ -480,8 +480,8 @@ mod seed_active_embedding_model_tests {
         // are all gone — `active_embedding_model_id` returns to the hash fallback.
         assert!(repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().is_none());
         assert!(repo_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap().is_none());
-        assert!(meta(&conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META).unwrap().is_none());
-        assert!(meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META).unwrap().is_none());
+        assert!(read_meta(&conn, ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META).unwrap().is_none());
+        assert!(read_meta(&conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META).unwrap().is_none());
         assert_eq!(active_embedding_model_id(&conn).unwrap(), HASH);
         assert!(
             !active_embedding_model_seed_owed(&conn, None).unwrap(),

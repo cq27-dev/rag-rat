@@ -20,7 +20,7 @@ use std::time::Instant;
 use rag_rat_base::config::RemoteEmbeddingConfig;
 use rag_rat_base::embedding_models::EmbeddingModelSpec;
 use rag_rat_base::time::now_ms;
-use rag_rat_db::meta::{meta, set_meta};
+use rag_rat_db::meta::{read_meta, set_meta};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -656,7 +656,7 @@ fn tune_cache_key(k: TuneKey<'_>) -> String {
 }
 
 fn read_cache(conn: &Connection) -> TuneCacheFile {
-    meta(conn, TUNE_CACHE_META_KEY)
+    read_meta(conn, TUNE_CACHE_META_KEY)
         .ok()
         .flatten()
         .and_then(|json| serde_json::from_str(&json).ok())

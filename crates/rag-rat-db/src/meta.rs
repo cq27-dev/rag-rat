@@ -291,9 +291,3 @@ pub fn meta_values_with_prefix(conn: &Connection, prefix: &str) -> anyhow::Resul
     let rows = stmt.query_map([prefix], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
-
-pub fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
-        .optional()?)
-}
