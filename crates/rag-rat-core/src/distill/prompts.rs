@@ -667,8 +667,8 @@ pub(crate) fn render_context(input: &PromptInput, budget: &PromptBudget) -> Stri
         bounded_untrusted(&input.kind, 50),
         bounded_untrusted(&input.key, 100)
     ));
-    out.push_str(&format!("TITLE: {}\n", neutralize(&truncate_chars(input.title.trim(), 500))));
-    out.push_str(&format!("OPENED: {}\n\n", neutralize(&truncate_chars(input.opened.trim(), 100))));
+    out.push_str(&format!("TITLE: {}\n", bounded_untrusted(&input.title, 500)));
+    out.push_str(&format!("OPENED: {}\n\n", bounded_untrusted(&input.opened, 100)));
     out.push_str("THREAD UNITS (cite these numbers as evidence):\n");
     render_units(&mut out, &input.units, budget.units);
 
@@ -693,14 +693,11 @@ pub(crate) fn render_context(input: &PromptInput, budget: &PromptBudget) -> Stri
                 bounded_untrusted(&x.kind, 50),
                 bounded_untrusted(&x.key, 100),
                 bounded_untrusted(&x.ref_kind, 50),
-                neutralize(&truncate_chars(x.title.trim(), XREF_TEXT_RENDER_CHARS))
+                bounded_untrusted(&x.title, XREF_TEXT_RENDER_CHARS)
             ));
             let opening = x.opening.trim();
             if !opening.is_empty() {
-                out.push_str(&format!(
-                    " — {}",
-                    neutralize(&truncate_chars(opening, XREF_TEXT_RENDER_CHARS))
-                ));
+                out.push_str(&format!(" — {}", bounded_untrusted(opening, XREF_TEXT_RENDER_CHARS)));
             }
             out.push('\n');
         }
@@ -886,7 +883,7 @@ fn render_partner(out: &mut String, partner: &PartnerThread, max_bytes: usize) {
         "\nPARTNER THREAD (#{}, {}, do NOT cite its units): {}\n",
         bounded_untrusted(&partner.key, 100),
         bounded_untrusted(&partner.kind, 50),
-        neutralize(&truncate_chars(partner.title.trim(), 200)),
+        bounded_untrusted(&partner.title, 200),
     );
     let header = truncate_bytes(&header, max_bytes);
     out.push_str(header);
@@ -970,9 +967,9 @@ fn render_fix_context(out: &mut String, input: &PromptInput, budget: &PromptBudg
         for s in input.symbols.iter().take(budget.max_symbols) {
             out.push_str(&format!(
                 "  {}  ({}, {})\n",
-                neutralize(&truncate_chars(s.name.trim(), 120)),
-                neutralize(&truncate_chars(s.kind.trim(), 80)),
-                neutralize(&truncate_chars(s.file.trim(), 200)),
+                bounded_untrusted(&s.name, 120),
+                bounded_untrusted(&s.kind, 80),
+                bounded_untrusted(&s.file, 200),
             ));
         }
     }
