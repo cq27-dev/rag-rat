@@ -271,7 +271,7 @@ pub fn purge_and_vacuum_with_wait<C>(
     // the deconfigure below (a new flight can't reload a deleted config), the repo's papertrail
     // stays purged. The two lock sets are disjoint (autosync never takes the write lock;
     // index/rm never take the flight lock), so acquiring both cannot deadlock.
-    let papertrail_lock_path = locks::papertrail_lock_path(database, repo_id);
+    let papertrail_lock_path = locks::FlightKind::Papertrail.lock_path(database, repo_id);
     let _papertrail_lock = match locks::FileLock::try_acquire(&papertrail_lock_path)? {
         Some(lock) => lock,
         None => {
@@ -995,7 +995,8 @@ mod tests {
         };
         drop(db);
 
-        let lock_path = rag_rat_base::locks::papertrail_lock_path(&config.database, &repo_id);
+        let lock_path =
+            rag_rat_base::locks::FlightKind::Papertrail.lock_path(&config.database, &repo_id);
         let (held_tx, held_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let holder = std::thread::spawn(move || {

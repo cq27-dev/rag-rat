@@ -28,7 +28,7 @@ use std::fs;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-use crate::locks::FileLock;
+use crate::locks::{FileLock, FlightKind};
 
 /// A payload coalesced across concurrent single-flight triggers, and serialized to the marker file.
 ///
@@ -92,10 +92,20 @@ pub struct SingleFlight<P> {
 }
 
 impl<P: FlightPayload> SingleFlight<P> {
-    /// Construct from the three flight paths (see the module docs). Use the `*_lock_path` /
-    /// `*_pending_path` / `*_marker_lock_path` helpers in [`crate::locks`] to derive them.
+    /// Construct from the three flight paths (see the module docs). Production flights use
+    /// [`Self::for_flight`], which derives all three from one [`FlightKind`].
     pub fn new(flight_lock: PathBuf, marker: PathBuf, marker_lock: PathBuf) -> Self {
         Self { flight_lock, marker, marker_lock, _payload: PhantomData }
+    }
+
+    /// The per-repo flight for `kind`: its flight lock, pending marker, and marker lock beside
+    /// `database`, keyed by `repo_id`.
+    pub fn for_flight(kind: FlightKind, database: &Path, repo_id: &str) -> Self {
+        Self::new(
+            kind.lock_path(database, repo_id),
+            kind.pending_path(database, repo_id),
+            kind.marker_lock_path(database, repo_id),
+        )
     }
 
     /// The flight lock path — for a caller (e.g. an explicit foreground command) that acquires the

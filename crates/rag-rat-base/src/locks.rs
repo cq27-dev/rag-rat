@@ -187,7 +187,7 @@ fn lock_discriminator(repo_id: &str) -> String {
 /// still contend. The concurrent access to the SQLite file itself is serialized by WAL, not this
 /// lock. Resolve `repo_id` before opening via [`write_lock_repo_id`].
 pub fn write_lock_path(database: &Path, repo_id: &str) -> PathBuf {
-    lock_dir(database).join(format!("rag-rat-write-{}.lock", lock_discriminator(repo_id)))
+    per_repo_lock_path(database, "write", repo_id, "lock")
 }
 
 /// The directory lock files live in: the database's parent, CANONICALIZED. Two symlink-aliased
@@ -269,62 +269,75 @@ pub fn sync_session_lock_path(database: &Path) -> PathBuf {
     lock_dir(database).join("rag-rat-sync.lock")
 }
 
-/// Per-DB, PER-REPO maintenance coordination lock, held by the running `rag-rat maintenance`
-/// command for its whole pass so the multiple git hooks a single amend/merge/rebase fires coalesce
-/// into one pass instead of each running a full discover (#267). Keyed by `repo_id` (A6) like
-/// [`write_lock_path`], so a maintenance pass on one repo never coalesces (or blocks) an unrelated
-/// repo's. Separate from the write lock so it only coordinates CLI maintenance invocations — the
-/// pass itself still takes the write lock internally.
-pub fn maintenance_lock_path(database: &Path, repo_id: &str) -> PathBuf {
-    lock_dir(database).join(format!("rag-rat-maintenance-{}.lock", lock_discriminator(repo_id)))
+/// A per-DB, PER-REPO lock file beside the database, `rag-rat-<stem>-<discriminator>.<suffix>`.
+/// Keyed by `repo_id` (A6) like [`write_lock_path`], so one repo's lock never serializes (or
+/// coalesces) an unrelated repo's.
+fn per_repo_lock_path(database: &Path, stem: &str, repo_id: &str, suffix: &str) -> PathBuf {
+    lock_dir(database).join(format!("rag-rat-{stem}-{}.{suffix}", lock_discriminator(repo_id)))
 }
 
-/// Marker a coalesced `maintenance` trigger sets to ask the in-flight runner to run one more pass
-/// after the current one, so a change that arrived mid-pass is still covered (#267). Per-repo (A6),
-/// pairing with the per-repo [`maintenance_lock_path`].
-pub fn maintenance_pending_path(database: &Path, repo_id: &str) -> PathBuf {
-    lock_dir(database).join(format!("rag-rat-maintenance-{}.pending", lock_discriminator(repo_id)))
+/// A per-repo coalescing flight run under the shared [`crate::single_flight`] coordinator
+/// (#267/#660): the RUNNER holds [`FlightKind::lock_path`] for its whole pass, and a coalesced
+/// trigger merges its request into [`FlightKind::pending_path`] instead of queueing a redundant
+/// pass. Every flight is separate from the repo [`write_lock_path`]: it only serializes its own
+/// runners. [`crate::single_flight::SingleFlight::for_flight`] wires all three files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlightKind {
+    /// Held by the running `rag-rat maintenance` command for its whole pass so the multiple git
+    /// hooks a single amend/merge/rebase fires coalesce into one pass instead of each running a
+    /// full discover (#267). It only coordinates CLI maintenance invocations — the pass itself
+    /// still takes the write lock internally. The marker asks the in-flight runner for one more
+    /// pass after the current one, so a change that arrived mid-pass is still covered.
+    Maintenance,
+    /// Papertrail auto-sync (#592), held for one whole coalesced papertrail run so at most ONE
+    /// mirror flight per repository is in the air across every trigger source — watcher timer
+    /// ticks, git-hook maintenance, other processes. Separate from [`FlightKind::Maintenance`]: a
+    /// mirror flight waits on the NETWORK (pages, rate-governor sleeps) and must neither hold up
+    /// nor be held up by ordinary index maintenance. The flight never holds the repo
+    /// [`write_lock_path`] — its commits are short synchronous transactions serialized by SQLite
+    /// itself. The marker CONTENT is the strongest coalesced request token (`evaluate` /
+    /// `incremental` / `full`), merged max-wins so a queued full walk is never weakened by a later
+    /// incremental trigger.
+    Papertrail,
+    /// Edit-driven reindex (#661), held by the one detached `rag-rat edit-reindex` runner for its
+    /// whole scoped pass so a burst of PostToolUse edit hooks coalesces into a single scoped
+    /// reindex instead of N serialized multi-second processes. The scoped pass still takes the
+    /// write lock (with a timeout, never blocking) internally. The marker CONTENT is the
+    /// newline-joined UNION of edited paths, merged set-union so a runner covers every path queued
+    /// while it was mid-pass.
+    EditReindex,
 }
 
-/// Serializes every read-modify-write of the maintenance pending marker, pairing with
-/// [`maintenance_pending_path`] under the shared [`crate::single_flight`] coordinator (#660). The
-/// pre-#660 empty-file marker used only touch/remove/exists and needed no lock; the generic
-/// coordinator serializes the marker so its exit handoff can release the flight lock under the same
-/// hold that observed an empty marker (closing the mid-pass-trigger race the empty-file loop had).
-pub fn maintenance_marker_lock_path(database: &Path, repo_id: &str) -> PathBuf {
-    lock_dir(database)
-        .join(format!("rag-rat-maintenance-{}.pending.lock", lock_discriminator(repo_id)))
-}
+impl FlightKind {
+    fn stem(self) -> &'static str {
+        match self {
+            Self::Maintenance => "maintenance",
+            Self::Papertrail => "papertrail",
+            Self::EditReindex => "edit-reindex",
+        }
+    }
 
-/// Per-DB, PER-REPO papertrail auto-sync flight lock (#592), held for one whole coalesced
-/// papertrail run so at most ONE mirror flight per repository is in the air across every trigger
-/// source — watcher timer ticks, git-hook maintenance, other processes. Separate from
-/// [`maintenance_lock_path`]: a mirror flight waits on the NETWORK (pages, rate-governor sleeps)
-/// and must neither hold up nor be held up by ordinary index maintenance. The flight never holds
-/// the repo [`write_lock_path`] — its commits are short synchronous transactions serialized by
-/// SQLite itself.
-pub fn papertrail_lock_path(database: &Path, repo_id: &str) -> PathBuf {
-    lock_dir(database).join(format!("rag-rat-papertrail-{}.lock", lock_discriminator(repo_id)))
-}
+    /// The flight lock the RUNNER holds for its whole pass.
+    pub fn lock_path(self, database: &Path, repo_id: &str) -> PathBuf {
+        per_repo_lock_path(database, self.stem(), repo_id, "lock")
+    }
 
-/// Marker a coalesced papertrail trigger sets to ask the in-flight runner for one follow-up
-/// evaluation, pairing with [`papertrail_lock_path`] exactly as the maintenance marker pairs with
-/// its lock (#267 pattern). The file CONTENT is the strongest coalesced request token
-/// (`evaluate` / `incremental` / `full`), merged max-wins so a queued full walk is never weakened
-/// by a later incremental trigger. Every read-modify-write of the marker runs under
-/// [`papertrail_marker_lock_path`].
-pub fn papertrail_pending_path(database: &Path, repo_id: &str) -> PathBuf {
-    lock_dir(database).join(format!("rag-rat-papertrail-{}.pending", lock_discriminator(repo_id)))
-}
+    /// The marker a coalesced trigger merges its request into, asking the in-flight runner for a
+    /// follow-up pass. Every read-modify-write of it runs under [`FlightKind::marker_lock_path`].
+    pub fn pending_path(self, database: &Path, repo_id: &str) -> PathBuf {
+        per_repo_lock_path(database, self.stem(), repo_id, "pending")
+    }
 
-/// Serializes every read-modify-write of the pending marker: without it two coalescing
-/// contenders can interleave their max-merge and a weaker request overwrites a queued full walk.
-/// Distinct from [`papertrail_lock_path`] — the RUNNER holds that one for the whole
-/// network-bound flight, while this lock is held only for the microseconds of one marker update
-/// (runner and contenders alike), so contenders never wait on the flight.
-pub fn papertrail_marker_lock_path(database: &Path, repo_id: &str) -> PathBuf {
-    lock_dir(database)
-        .join(format!("rag-rat-papertrail-{}.pending.lock", lock_discriminator(repo_id)))
+    /// Serializes every read-modify-write of the pending marker: without it two coalescing
+    /// contenders can interleave their merge and a weaker request overwrites a queued stronger
+    /// one, and the runner's exit handoff could not release the flight lock under the same hold
+    /// that observed an empty marker (the mid-pass-trigger race, #660). Distinct from
+    /// [`FlightKind::lock_path`] — the RUNNER holds that one for the whole pass, while this lock is
+    /// held only for the microseconds of one marker update (runner and contenders alike), so
+    /// contenders never wait on the flight.
+    pub fn marker_lock_path(self, database: &Path, repo_id: &str) -> PathBuf {
+        per_repo_lock_path(database, self.stem(), repo_id, "pending.lock")
+    }
 }
 
 /// Per-DB, PER-REPO distill drain flight lock, held across one whole model-bound drain including
@@ -332,35 +345,7 @@ pub fn papertrail_marker_lock_path(database: &Path, repo_id: &str) -> PathBuf {
 /// lock covers only short extraction, preparation, and per-result persistence phases, so a model
 /// call never blocks unrelated repo writers.
 pub fn distill_lock_path(database: &Path, repo_id: &str) -> PathBuf {
-    lock_dir(database).join(format!("rag-rat-distill-{}.lock", lock_discriminator(repo_id)))
-}
-
-/// Per-DB, PER-REPO edit-driven reindex flight lock (#661), held by the one detached
-/// `rag-rat edit-reindex` runner for its whole scoped pass so a burst of PostToolUse edit hooks
-/// coalesces into a single scoped reindex instead of N serialized multi-second processes. Keyed by
-/// `repo_id` (A6) like [`write_lock_path`]. Separate from [`maintenance_lock_path`] and the write
-/// lock — it only serializes the edit-hook runners; the scoped pass still takes the write lock
-/// (with a timeout, never blocking) internally.
-pub fn edit_reindex_lock_path(database: &Path, repo_id: &str) -> PathBuf {
-    lock_dir(database).join(format!("rag-rat-edit-reindex-{}.lock", lock_discriminator(repo_id)))
-}
-
-/// Marker into which a coalesced edit-reindex trigger merges its edited path(s), pairing with
-/// [`edit_reindex_lock_path`] under the shared [`crate::single_flight`] coordinator (#660/#661).
-/// The CONTENT is the newline-joined UNION of edited paths, merged set-union so a runner covers
-/// every path queued while it was mid-pass. Every read-modify-write runs under
-/// [`edit_reindex_marker_lock_path`].
-pub fn edit_reindex_pending_path(database: &Path, repo_id: &str) -> PathBuf {
-    lock_dir(database).join(format!("rag-rat-edit-reindex-{}.pending", lock_discriminator(repo_id)))
-}
-
-/// Serializes every read-modify-write of the edit-reindex pending marker, pairing with
-/// [`edit_reindex_pending_path`]. Distinct from [`edit_reindex_lock_path`] — the RUNNER holds that
-/// one for the whole scoped pass, while this lock is held only for the microseconds of one marker
-/// update (runner and contenders alike), so contenders never wait on the pass.
-pub fn edit_reindex_marker_lock_path(database: &Path, repo_id: &str) -> PathBuf {
-    lock_dir(database)
-        .join(format!("rag-rat-edit-reindex-{}.pending.lock", lock_discriminator(repo_id)))
+    per_repo_lock_path(database, "distill", repo_id, "lock")
 }
 
 /// Order two repo ids by the CANONICAL LOCK ORDER (see the module doc): lexicographic on the
@@ -586,9 +571,13 @@ pub fn socket_lock_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
 /// disposable workspace discovery directory, so deleting `.rag-rat/` cannot unlink a held lock
 /// and elect a second server for the same worktree.
 pub fn lens_server_lock_path_for(config: &Config, worktree_root: &Path) -> PathBuf {
-    let base =
-        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
-    base.join("locks").join(format!("{}.lens.lock", worktree_hash(worktree_root)))
+    lock_base(config).join("locks").join(format!("{}.lens.lock", worktree_hash(worktree_root)))
+}
+
+/// The directory the per-worktree listener locks and sockets hang off for a `Config`: the index
+/// database's directory (shared across a repo's worktrees), or the root when it has none.
+fn lock_base(config: &Config) -> PathBuf {
+    config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone())
 }
 
 /// Where the elected listener binds. Prefers a `sockets/` sibling of `locks/` under the shared
@@ -604,17 +593,13 @@ pub fn hook_socket_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
 /// Single source of truth for the hook socket path given a `Config`. Shared by the MCP listener
 /// and the CLI client so the two cannot diverge.
 pub fn hook_socket_path_for(config: &Config) -> PathBuf {
-    let base =
-        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
-    hook_socket_path(&base, &config.root)
+    hook_socket_path(&lock_base(config), &config.root)
 }
 
 /// Single source of truth for the hook socket election-lock path given a `Config`. Shared by the
 /// MCP listener and the CLI client so the two cannot diverge.
 pub fn hook_socket_lock_path_for(config: &Config) -> PathBuf {
-    let base =
-        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
-    socket_lock_path(&base, &config.root)
+    socket_lock_path(&lock_base(config), &config.root)
 }
 
 /// Inner implementation: builds the candidate path cascade with an explicit `runtime_base` so the
@@ -801,8 +786,8 @@ mod tests {
         assert_ne!(write_lock_path(db, "aaaa11112222"), write_lock_path(db, "bbbb33334444"));
         assert_eq!(write_lock_path(db, "aaaa11112222"), write_lock_path(db, "aaaa11112222"));
         assert_ne!(
-            maintenance_lock_path(db, "aaaa11112222"),
-            maintenance_lock_path(db, "bbbb33334444")
+            FlightKind::Maintenance.lock_path(db, "aaaa11112222"),
+            FlightKind::Maintenance.lock_path(db, "bbbb33334444")
         );
         // The schema lock ignores the repo entirely (one migration serializer per DB file).
         assert_eq!(schema_lock_path(db), schema_lock_path(db));
@@ -819,8 +804,35 @@ mod tests {
         assert_eq!(distill, distill_lock_path(db, "aaaa11112222"));
         assert!(distill.to_string_lossy().ends_with("rag-rat-distill-aaaa11112222.lock"));
         assert_ne!(distill, write_lock_path(db, "aaaa11112222"));
-        assert_ne!(distill, papertrail_lock_path(db, "aaaa11112222"));
-        assert_ne!(distill, edit_reindex_lock_path(db, "aaaa11112222"));
+        assert_ne!(distill, FlightKind::Papertrail.lock_path(db, "aaaa11112222"));
+        assert_ne!(distill, FlightKind::EditReindex.lock_path(db, "aaaa11112222"));
+    }
+
+    /// The flight files are persisted on disk beside the DB and shared with already-running
+    /// processes of the same version, so their names are pinned byte-for-byte.
+    #[test]
+    fn flight_file_names_are_pinned() {
+        let db = Path::new("/repo/.rag-rat/index.sqlite");
+        let name = |path: PathBuf| path.file_name().unwrap().to_string_lossy().into_owned();
+        for (kind, stem) in [
+            (FlightKind::Maintenance, "maintenance"),
+            (FlightKind::Papertrail, "papertrail"),
+            (FlightKind::EditReindex, "edit-reindex"),
+        ] {
+            assert_eq!(
+                name(kind.lock_path(db, "aaaa11112222")),
+                format!("rag-rat-{stem}-aaaa11112222.lock")
+            );
+            assert_eq!(
+                name(kind.pending_path(db, "aaaa11112222")),
+                format!("rag-rat-{stem}-aaaa11112222.pending")
+            );
+            assert_eq!(
+                name(kind.marker_lock_path(db, "aaaa11112222")),
+                format!("rag-rat-{stem}-aaaa11112222.pending.lock")
+            );
+        }
+        assert_eq!(name(write_lock_path(db, "aaaa11112222")), "rag-rat-write-aaaa11112222.lock");
     }
 
     #[cfg(unix)]
@@ -864,7 +876,10 @@ mod tests {
         assert_ne!(sync_session_lock_path(db), schema_lock_path(db));
         assert_ne!(sync_session_lock_path(db), registry_lock_path(db));
         assert_ne!(sync_session_lock_path(db), write_lock_path(db, "aaaa11112222"));
-        assert_ne!(sync_session_lock_path(db), maintenance_lock_path(db, "aaaa11112222"));
+        assert_ne!(
+            sync_session_lock_path(db),
+            FlightKind::Maintenance.lock_path(db, "aaaa11112222")
+        );
     }
 
     #[test]

@@ -90,10 +90,10 @@ fn run_with_config(config: &Config, paths: &[PathBuf]) -> anyhow::Result<()> {
         return Ok(());
     }
     let lock_repo = locks::write_lock_repo_id(config);
-    let flight = SingleFlight::<PathSet>::new(
-        locks::edit_reindex_lock_path(&config.database, &lock_repo),
-        locks::edit_reindex_pending_path(&config.database, &lock_repo),
-        locks::edit_reindex_marker_lock_path(&config.database, &lock_repo),
+    let flight = SingleFlight::<PathSet>::for_flight(
+        locks::FlightKind::EditReindex,
+        &config.database,
+        &lock_repo,
     );
     flight.run(PathSet(initial), |paths| scoped_reindex(config, paths))?;
     Ok(())

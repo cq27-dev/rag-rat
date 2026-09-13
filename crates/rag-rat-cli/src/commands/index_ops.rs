@@ -407,10 +407,10 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // that coalesce mid-pass and releases the flight lock (via the exit handoff) BEFORE this call
     // returns — so the papertrail trigger below runs UNLOCKED, as before (a network-bound mirror
     // flight must not make concurrent git triggers coalesce-skip their ordinary index passes).
-    let flight = rag_rat_base::single_flight::SingleFlight::<()>::new(
-        rag_rat_base::locks::maintenance_lock_path(&config.database, &lock_repo),
-        rag_rat_base::locks::maintenance_pending_path(&config.database, &lock_repo),
-        rag_rat_base::locks::maintenance_marker_lock_path(&config.database, &lock_repo),
+    let flight = rag_rat_base::single_flight::SingleFlight::<()>::for_flight(
+        rag_rat_base::locks::FlightKind::Maintenance,
+        &config.database,
+        &lock_repo,
     );
     let mut report = match flight.run((), |()| {
         Ok(rag_rat_base::single_flight::Step::Ran(run_maintenance_pass(config, args, &trigger)?))
@@ -1146,9 +1146,7 @@ mod tests {
 
     #[test]
     fn maintenance_coalesces_a_concurrent_trigger() {
-        use rag_rat_base::locks::{
-            FileLock, maintenance_lock_path, maintenance_pending_path, write_lock_repo_id,
-        };
+        use rag_rat_base::locks::{FileLock, FlightKind, write_lock_repo_id};
 
         // #267: a single amend/merge/rebase fires several git hooks, each backgrounding
         // `rag-rat maintenance`. A concurrent trigger must coalesce — skip its pass and set the
@@ -1186,7 +1184,7 @@ mod tests {
         IndexDatabase::rebuild(&config).unwrap();
 
         let lock_repo = write_lock_repo_id(&config);
-        let pending = maintenance_pending_path(&config.database, &lock_repo);
+        let pending = FlightKind::Maintenance.pending_path(&config.database, &lock_repo);
         let args = super::MaintenanceArgs {
             trigger: Some("post-rewrite".to_string()),
             max_seconds: Some(0), // skip the embedding reconcile; we only assert coalescing
@@ -1196,9 +1194,10 @@ mod tests {
         };
 
         // Hold the coordination lock to simulate an in-flight maintenance pass.
-        let held = FileLock::try_acquire(&maintenance_lock_path(&config.database, &lock_repo))
-            .unwrap()
-            .unwrap();
+        let held =
+            FileLock::try_acquire(&FlightKind::Maintenance.lock_path(&config.database, &lock_repo))
+                .unwrap()
+                .unwrap();
         assert!(!pending.exists());
         // A concurrent trigger coalesces: it does NOT run a pass; it sets the rerun marker.
         super::maintenance(&config, &args).unwrap();
@@ -1379,7 +1378,9 @@ mod papertrail_hook_tests {
         // The flight consumed its own coordination state: no pending marker survives a run.
         let lock_repo = rag_rat_base::locks::write_lock_repo_id(&config);
         assert!(
-            !rag_rat_base::locks::papertrail_pending_path(&config.database, &lock_repo).exists()
+            !rag_rat_base::locks::FlightKind::Papertrail
+                .pending_path(&config.database, &lock_repo)
+                .exists()
         );
     }
 
@@ -1424,7 +1425,7 @@ mod papertrail_hook_tests {
     /// mirror-free.
     #[test]
     fn coalesced_hook_trigger_still_fires_papertrail() {
-        use rag_rat_base::locks::{FileLock, maintenance_lock_path, write_lock_repo_id};
+        use rag_rat_base::locks::{FileLock, FlightKind, write_lock_repo_id};
 
         let root = rag_rat_base::test_scratch::ScratchDir::new("cli-papertrail-coalesced");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1433,9 +1434,10 @@ mod papertrail_hook_tests {
         IndexDatabase::rebuild(&config).unwrap();
 
         let lock_repo = write_lock_repo_id(&config);
-        let held = FileLock::try_acquire(&maintenance_lock_path(&config.database, &lock_repo))
-            .unwrap()
-            .unwrap();
+        let held =
+            FileLock::try_acquire(&FlightKind::Maintenance.lock_path(&config.database, &lock_repo))
+                .unwrap()
+                .unwrap();
         let args = |trigger: &str| super::MaintenanceArgs {
             trigger: Some(trigger.to_string()),
             max_seconds: Some(0),

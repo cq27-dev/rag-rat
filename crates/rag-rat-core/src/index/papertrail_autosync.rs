@@ -89,11 +89,7 @@ pub fn run(config: &Config, request: AutosyncRequest) -> anyhow::Result<Autosync
 /// identity). Rebuilt per attempt: the identity can upgrade mid-flight (a shallow clone resolving
 /// its portable id), which re-keys every flight path.
 fn flight(config: &Config, lock_repo: &str) -> SingleFlight<AutosyncRequest> {
-    SingleFlight::new(
-        locks::papertrail_lock_path(&config.database, lock_repo),
-        locks::papertrail_pending_path(&config.database, lock_repo),
-        locks::papertrail_marker_lock_path(&config.database, lock_repo),
-    )
+    SingleFlight::for_flight(locks::FlightKind::Papertrail, &config.database, lock_repo)
 }
 
 /// One scheduled flight pass under the held flight lock, mapped to a single-flight [`Step`]:
@@ -241,10 +237,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let database = tmp.path().join("locks/index.sqlite");
         let single_flight = || {
-            SingleFlight::<AutosyncRequest>::new(
-                locks::papertrail_lock_path(&database, "repo"),
-                locks::papertrail_pending_path(&database, "repo"),
-                locks::papertrail_marker_lock_path(&database, "repo"),
+            SingleFlight::<AutosyncRequest>::for_flight(
+                locks::FlightKind::Papertrail,
+                &database,
+                "repo",
             )
         };
         std::thread::scope(|scope| {
@@ -313,7 +309,7 @@ mod tests {
         });
         assert!(ran >= 1, "at least one trigger must have run the flight");
         let lock_repo = locks::write_lock_repo_id(&config);
-        let pending = locks::papertrail_pending_path(&config.database, &lock_repo);
+        let pending = locks::FlightKind::Papertrail.pending_path(&config.database, &lock_repo);
         assert!(
             !pending.exists(),
             "an accepted trigger was orphaned in the marker ({ran} ran, {coalesced} coalesced)"
@@ -328,7 +324,7 @@ mod tests {
         assert!(matches!(outcome, AutosyncOutcome::Disabled));
         assert!(!config.database.exists(), "a disabled trigger must not create the database");
         let lock_repo = locks::write_lock_repo_id(&config);
-        assert!(!locks::papertrail_pending_path(&config.database, &lock_repo).exists());
+        assert!(!locks::FlightKind::Papertrail.pending_path(&config.database, &lock_repo).exists());
     }
 
     #[test]
@@ -349,13 +345,14 @@ mod tests {
         IndexDatabase::rebuild(&config).unwrap();
 
         let lock_repo = locks::write_lock_repo_id(&config);
-        let held =
-            FileLock::try_acquire(&locks::papertrail_lock_path(&config.database, &lock_repo))
-                .unwrap()
-                .unwrap();
+        let held = FileLock::try_acquire(
+            &locks::FlightKind::Papertrail.lock_path(&config.database, &lock_repo),
+        )
+        .unwrap()
+        .unwrap();
         let outcome = run(&config, AutosyncRequest::Incremental).unwrap();
         assert!(matches!(outcome, AutosyncOutcome::Coalesced));
-        let pending = locks::papertrail_pending_path(&config.database, &lock_repo);
+        let pending = locks::FlightKind::Papertrail.pending_path(&config.database, &lock_repo);
         assert_eq!(fs::read_to_string(&pending).unwrap(), "incremental");
         // A second, stronger trigger upgrades the queued request in place.
         let outcome = run(&config, AutosyncRequest::Full).unwrap();
@@ -417,7 +414,7 @@ mod tests {
             .unwrap();
         assert!(full_walk_ms.is_some());
         let lock_repo = locks::write_lock_repo_id(&config);
-        assert!(!locks::papertrail_pending_path(&config.database, &lock_repo).exists());
+        assert!(!locks::FlightKind::Papertrail.pending_path(&config.database, &lock_repo).exists());
     }
 
     /// The non-creating gate: a trigger firing before `rag-rat index` ever created the store
@@ -444,7 +441,7 @@ mod tests {
         // The signal is queued even though no store exists yet: a first index pass racing
         // this trigger must not lose it.
         let lock_repo = locks::write_lock_repo_id(&config);
-        let pending = locks::papertrail_pending_path(&config.database, &lock_repo);
+        let pending = locks::FlightKind::Papertrail.pending_path(&config.database, &lock_repo);
         assert_eq!(fs::read_to_string(&pending).unwrap(), "incremental");
 
         let error = run_manual(&config, true, || {}).unwrap_err().to_string();
@@ -493,7 +490,7 @@ mod tests {
         assert_eq!(cursor_rows, 0);
         // The accepted signal is queued for the first post-index trigger, at full strength.
         let lock_repo = locks::write_lock_repo_id(&config);
-        let pending = locks::papertrail_pending_path(&config.database, &lock_repo);
+        let pending = locks::FlightKind::Papertrail.pending_path(&config.database, &lock_repo);
         assert_eq!(fs::read_to_string(&pending).unwrap(), "full");
 
         // The first index pass unlocks automatic sync (the flight then runs, absorbing the
@@ -522,7 +519,7 @@ mod tests {
         config.allow_empty = true;
         IndexDatabase::rebuild(&config).unwrap();
         let lock_repo = locks::write_lock_repo_id(&config);
-        let lock_path = locks::papertrail_lock_path(&config.database, &lock_repo);
+        let lock_path = locks::FlightKind::Papertrail.lock_path(&config.database, &lock_repo);
         let held = FileLock::try_acquire(&lock_path).unwrap().unwrap();
 
         let waited = std::sync::atomic::AtomicBool::new(false);
@@ -542,7 +539,7 @@ mod tests {
         });
         assert!(waited.load(std::sync::atomic::Ordering::Relaxed), "the wait is announced");
         // No degraded follow-up was queued anywhere.
-        assert!(!locks::papertrail_pending_path(&config.database, &lock_repo).exists());
+        assert!(!locks::FlightKind::Papertrail.pending_path(&config.database, &lock_repo).exists());
     }
 
     /// Manual sync holds the shared flight lock for its whole pass, then drains any follow-up
@@ -586,11 +583,13 @@ mod tests {
         assert!(report.bindings[0].completed_full_walk);
 
         // Everything queued was drained and the flight lock released.
-        assert!(!locks::papertrail_pending_path(&config.database, &lock_repo).exists());
+        assert!(!locks::FlightKind::Papertrail.pending_path(&config.database, &lock_repo).exists());
         assert!(
-            FileLock::try_acquire(&locks::papertrail_lock_path(&config.database, &lock_repo))
-                .unwrap()
-                .is_some()
+            FileLock::try_acquire(
+                &locks::FlightKind::Papertrail.lock_path(&config.database, &lock_repo)
+            )
+            .unwrap()
+            .is_some()
         );
     }
 
@@ -643,7 +642,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor_rows, 0);
-        assert!(!locks::papertrail_pending_path(&config.database, stale_repo).exists());
+        assert!(!locks::FlightKind::Papertrail.pending_path(&config.database, stale_repo).exists());
         assert!(FileLock::try_acquire(&stale_lock_path).unwrap().is_some());
     }
 

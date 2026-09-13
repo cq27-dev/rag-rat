@@ -34,13 +34,8 @@ fn path_set_merge_is_a_union() {
 fn concurrent_edit_triggers_coalesce_into_the_path_union() {
     let tmp = tempfile::TempDir::new().unwrap();
     let database = tmp.path().join("locks/index.sqlite");
-    let single_flight = || {
-        SingleFlight::<PathSet>::new(
-            locks::edit_reindex_lock_path(&database, "repo"),
-            locks::edit_reindex_pending_path(&database, "repo"),
-            locks::edit_reindex_marker_lock_path(&database, "repo"),
-        )
-    };
+    let single_flight =
+        || SingleFlight::<PathSet>::for_flight(locks::FlightKind::EditReindex, &database, "repo");
     std::thread::scope(|scope| {
         for contender in 0..8 {
             let sf = single_flight();
