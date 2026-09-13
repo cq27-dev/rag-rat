@@ -55,7 +55,7 @@ use crate::local_device;
 use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
 
-type EntryHash = [u8; 32];
+type AccountEntryHash = [u8; 32];
 
 /// The key epoch a stream's content key first mints at. C4.4 lazy rotation bumps it on device
 /// removal; C4.3a only ever mints the initial epoch.
@@ -68,7 +68,7 @@ pub fn ensure_repo_incarnation(
     conn: &Connection,
     repo_id: &str,
     now_ms: i64,
-) -> anyhow::Result<Option<EntryHash>> {
+) -> anyhow::Result<Option<AccountEntryHash>> {
     let _durability = bootstrap::AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let Some(LocalAccountRef { account_id, genesis_hash }) = bootstrap::local_account_ref(&tx)?
@@ -118,7 +118,7 @@ pub fn advance_repo_incarnation_in_tx(
     tx: &Transaction<'_>,
     repo_id: &str,
     now_ms: i64,
-) -> anyhow::Result<EntryHash> {
+) -> anyhow::Result<AccountEntryHash> {
     let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?
         .context("cannot author a repository incarnation before the local account is minted")?;
     let predecessor_ref = match super::storage::repo_incarnation_state(tx, account_id, repo_id)? {
@@ -198,7 +198,7 @@ pub fn mint_and_author_stream_key_wrap_in_tx(
     tx: &Transaction<'_>,
     stream_id: StreamId,
     now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     let key = ContentKey::generate()?;
     author_stream_key_wrap_in_tx(tx, stream_id, &key, INITIAL_KEY_EPOCH, now_ms)
 }
@@ -210,7 +210,7 @@ pub fn mint_and_author_stream_key_wrap_in_tx(
 pub enum RotationOutcome {
     /// Rotation was needed and this (owner) device authored a fresh higher-epoch `StreamKeyWrap`.
     /// Every op the rotation authored — a large roster's fan-out spans several (#764).
-    Rotated(Vec<EntryHash>),
+    Rotated(Vec<AccountEntryHash>),
     /// No rotation needed — every recipient of the current wrap is still roster-effective (or the
     /// stream has no current wrap at all, so there is nothing to rotate).
     Current,
@@ -249,7 +249,7 @@ pub fn rotate_stream_key_in_tx(
     tx: &Transaction<'_>,
     stream_id: StreamId,
     now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     let account_id = bootstrap::local_account_ref(tx)?
         .context(
             "cannot rotate a StreamKeyWrap before the store's local account is minted (call \
@@ -427,7 +427,7 @@ fn author_stream_key_wrap_in_tx(
     key: &ContentKey,
     key_epoch: u64,
     now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     let LocalAccountRef { account_id, .. } = bootstrap::local_account_ref(tx)?.context(
         "cannot author a StreamKeyWrap before the store's local account is minted (call \
          local_account first)",
@@ -566,7 +566,7 @@ fn author_stream_key_wrap_batch_in_tx(
     tx: &Transaction<'_>,
     wraps: &[StreamKeyWrap],
     now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     if wraps.is_empty() {
         return Ok(Vec::new());
     }
@@ -742,7 +742,7 @@ mod tests {
     }
 
     /// Run the mint seam in its own IMMEDIATE txn and commit — the shape a live caller uses.
-    fn mint_committed(conn: &Connection, stream: StreamId) -> EntryHash {
+    fn mint_committed(conn: &Connection, stream: StreamId) -> AccountEntryHash {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
         let hashes =
             mint_and_author_stream_key_wrap_in_tx(&tx, stream, NOW).expect("mint + author");
@@ -759,7 +759,7 @@ mod tests {
             .unwrap()
     }
 
-    fn status(conn: &Connection, hash: &EntryHash) -> Option<(String, Option<String>)> {
+    fn status(conn: &Connection, hash: &AccountEntryHash) -> Option<(String, Option<String>)> {
         conn.query_row(
             "SELECT status, detail FROM account_entry_status WHERE entry_hash = ?1",
             [hash.as_slice()],
@@ -769,7 +769,7 @@ mod tests {
     }
 
     /// Decode the stored `StreamKeyWrap` op for one authored entry hash.
-    fn stored_wrap(conn: &Connection, hash: &EntryHash) -> StreamKeyWrap {
+    fn stored_wrap(conn: &Connection, hash: &AccountEntryHash) -> StreamKeyWrap {
         let signed_bytes: Vec<u8> = conn
             .query_row(
                 "SELECT signed_bytes FROM account_entries WHERE entry_hash = ?1",
@@ -786,7 +786,7 @@ mod tests {
         wrap
     }
 
-    fn header_of(conn: &Connection, hash: &EntryHash) -> AccountEntryHeader {
+    fn header_of(conn: &Connection, hash: &AccountEntryHash) -> AccountEntryHeader {
         let signed_bytes: Vec<u8> = conn
             .query_row(
                 "SELECT signed_bytes FROM account_entries WHERE entry_hash = ?1",
@@ -876,9 +876,9 @@ mod tests {
         conn: &Connection,
         account: AccountId,
         signer: &crate::device::DeviceSecret,
-        authority_ref: EntryHash,
+        authority_ref: AccountEntryHash,
         wrap: &StreamKeyWrap,
-    ) -> EntryHash {
+    ) -> AccountEntryHash {
         let LocalAccountRef { genesis_hash, .. } =
             bootstrap::local_account_ref(conn).unwrap().unwrap();
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
@@ -1881,7 +1881,7 @@ mod tests {
     }
 
     /// Rotate the stream key in its own IMMEDIATE txn and commit — the shape a live caller uses.
-    fn rotate_committed(conn: &Connection, stream: StreamId) -> EntryHash {
+    fn rotate_committed(conn: &Connection, stream: StreamId) -> AccountEntryHash {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
         let hashes = rotate_stream_key_in_tx(&tx, stream, NOW).expect("rotate");
         tx.commit().unwrap();
@@ -1904,7 +1904,7 @@ mod tests {
         account: AccountId,
         fp: crate::op::DeviceFingerprint,
         log: u8,
-    ) -> Option<(u64, EntryHash)> {
+    ) -> Option<(u64, AccountEntryHash)> {
         let tx = conn.unchecked_transaction().unwrap();
         authoring::account_chain_tail(&tx, account, fp, log).unwrap()
     }
@@ -1916,9 +1916,9 @@ mod tests {
         conn: &Connection,
         account: AccountId,
         signer: &crate::device::DeviceSecret,
-        authority_ref: EntryHash,
+        authority_ref: AccountEntryHash,
         op: &AccountOp,
-    ) -> EntryHash {
+    ) -> AccountEntryHash {
         use crate::account::ops as control_ops;
 
         let signer_fp = signer.public().fingerprint();
@@ -1959,7 +1959,11 @@ mod tests {
 
     /// Author a control op under the founder (the local device) citing its own genesis incarnation,
     /// in its own IMMEDIATE txn, and refold — the shape that publishes a roster mutation.
-    fn author_control_op(conn: &Connection, account: AccountId, op: &AccountOp) -> EntryHash {
+    fn author_control_op(
+        conn: &Connection,
+        account: AccountId,
+        op: &AccountOp,
+    ) -> AccountEntryHash {
         use crate::account::ops as control_ops;
 
         let founder = local_device(conn, NOW).unwrap();

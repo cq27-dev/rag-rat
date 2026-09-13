@@ -24,7 +24,7 @@ use super::super::envelope::AccountEntryHeader;
 use super::super::fold::SECRETS_LOG;
 use crate::op::DeviceFingerprint;
 
-type EntryHash = [u8; 32];
+type AccountEntryHash = [u8; 32];
 
 /// The chain one secrets cut bounds: `(account, device)` on `log: SECRETS_LOG`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,7 +68,7 @@ impl ChainLink for AccountEntryHeader {
         self.seq
     }
 
-    fn prev_hash(&self) -> Option<EntryHash> {
+    fn prev_hash(&self) -> Option<AccountEntryHash> {
         self.prev_hash
     }
 }
@@ -78,7 +78,7 @@ impl ChainLink for AccountEntryHeader {
 /// `eligible` is the caller's authority verdict + the slot-eligible non-evaluable entries.
 pub(super) fn select_accepted_branch(
     candidates: &[SecretsCandidate],
-    eligible: &HashSet<EntryHash>,
+    eligible: &HashSet<AccountEntryHash>,
     pins: &[BranchPin],
     view: &dyn HeaderView,
 ) -> BranchSelection {
@@ -115,7 +115,7 @@ mod tests {
         }
     }
 
-    fn header(seq: u64, prev_hash: Option<EntryHash>) -> AccountEntryHeader {
+    fn header(seq: u64, prev_hash: Option<AccountEntryHash>) -> AccountEntryHeader {
         AccountEntryHeader {
             account_id: AccountId::from_bytes(ACCOUNT),
             log_id: SECRETS_LOG,
@@ -132,7 +132,7 @@ mod tests {
         }
     }
 
-    fn linear() -> HashMap<EntryHash, AccountEntryHeader> {
+    fn linear() -> HashMap<AccountEntryHash, AccountEntryHeader> {
         HashMap::from([
             ([0x0a; 32], header(0, None)),
             ([0x0b; 32], header(1, Some([0x0a; 32]))),
@@ -140,7 +140,7 @@ mod tests {
         ])
     }
 
-    fn candidates(view: &HashMap<EntryHash, AccountEntryHeader>) -> Vec<SecretsCandidate> {
+    fn candidates(view: &HashMap<AccountEntryHash, AccountEntryHeader>) -> Vec<SecretsCandidate> {
         let mut rows: Vec<SecretsCandidate> = view
             .iter()
             .map(|(entry_hash, header)| SecretsCandidate {
@@ -152,7 +152,7 @@ mod tests {
         rows
     }
 
-    fn all(view: &HashMap<EntryHash, AccountEntryHeader>) -> HashSet<EntryHash> {
+    fn all(view: &HashMap<AccountEntryHash, AccountEntryHeader>) -> HashSet<AccountEntryHash> {
         view.keys().copied().collect()
     }
 

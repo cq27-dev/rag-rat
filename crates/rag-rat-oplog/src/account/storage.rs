@@ -24,9 +24,9 @@ use crate::device::{DevicePublic, DeviceX25519Public};
 use crate::op::DeviceFingerprint;
 use crate::stream::{AccessMode, StreamId};
 
-type EntryHash = [u8; 32];
-type BranchKey = (u8, DeviceFingerprint, Option<EntryHash>);
-type BranchChild = (u64, EntryHash);
+type AccountEntryHash = [u8; 32];
+type BranchKey = (u8, DeviceFingerprint, Option<AccountEntryHash>);
+type BranchChild = (u64, AccountEntryHash);
 type BranchChildren = HashMap<BranchKey, Vec<BranchChild>>;
 
 // Operational admission limits, not wire-validity limits. At the §18a envelope maximum these cap
@@ -45,12 +45,12 @@ const CANDIDATE_BYTES_GLOBAL_MAX: usize = 64 * 1024 * 1024;
 
 struct AccountProjection {
     history: fold::AccountAuthHistory,
-    accepted: HashSet<EntryHash>,
-    forked: HashSet<EntryHash>,
+    accepted: HashSet<AccountEntryHash>,
+    forked: HashSet<AccountEntryHash>,
 }
 
 struct AccountStateFold {
-    statuses: HashMap<EntryHash, EntryStatus>,
+    statuses: HashMap<AccountEntryHash, EntryStatus>,
     affected_streams: Vec<StreamId>,
     rejected_content_promotions: content::ContentPromotionOutcome,
 }
@@ -74,7 +74,7 @@ enum PreVerifyInsert {
 #[derive(Debug, Default, Eq, PartialEq)]
 struct PromotionOutcome {
     scope: Option<CapacityScope>,
-    entry_hashes: Vec<EntryHash>,
+    entry_hashes: Vec<AccountEntryHash>,
 }
 
 /// The operational admission budget that prevented an otherwise valid ingest from being stored.
@@ -112,19 +112,19 @@ pub enum IngestOutcome {
     IngestedWithRejectedPromotions {
         status: String,
         scope: CapacityScope,
-        entry_hashes: Vec<EntryHash>,
+        entry_hashes: Vec<AccountEntryHash>,
     },
     IngestedWithRejectedContentPromotions {
         status: String,
         scope: content::ContentCapacityScope,
-        entry_hashes: Vec<EntryHash>,
+        entry_hashes: Vec<AccountEntryHash>,
     },
     IngestedWithRejectedAccountAndContentPromotions {
         status: String,
         account_scope: CapacityScope,
-        account_entry_hashes: Vec<EntryHash>,
+        account_entry_hashes: Vec<AccountEntryHash>,
         content_scope: content::ContentCapacityScope,
-        content_entry_hashes: Vec<EntryHash>,
+        content_entry_hashes: Vec<AccountEntryHash>,
     },
 }
 
@@ -348,7 +348,7 @@ fn authenticate_entry(
 
 fn stored_status_for_exact_envelope(
     conn: &Connection,
-    entry_hash: &EntryHash,
+    entry_hash: &AccountEntryHash,
     signed_bytes: &[u8],
 ) -> rusqlite::Result<Option<String>> {
     conn.query_row(
@@ -408,7 +408,7 @@ pub fn backfill_authority_projection(tx: &Transaction<'_>) -> rusqlite::Result<(
 pub fn roster_ref_effective(
     conn: &Connection,
     account_id: AccountId,
-    roster_ref: EntryHash,
+    roster_ref: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
@@ -429,7 +429,7 @@ pub fn roster_ref_effective(
 fn load_roster_fact(
     conn: &Connection,
     account_id: AccountId,
-    roster_ref: &EntryHash,
+    roster_ref: &AccountEntryHash,
 ) -> anyhow::Result<Option<(fold::RosterAuthority, i64, Option<i64>)>> {
     let row: Option<(Vec<u8>, String, i64, Option<i64>)> = conn
         .query_row(
@@ -452,7 +452,7 @@ fn load_roster_fact(
 pub fn roster_content_authority(
     conn: &Connection,
     account_id: AccountId,
-    roster_ref: EntryHash,
+    roster_ref: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
     stream_id: StreamId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterContentAuthority>> {
@@ -475,7 +475,7 @@ pub fn roster_content_authority(
 pub fn roster_content_authority_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
-    roster_ref: EntryHash,
+    roster_ref: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
     stream_id: StreamId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterContentAuthority>> {
@@ -519,7 +519,7 @@ pub fn roster_content_authority_in_snapshot(
 pub fn owner_control_authority(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: EntryHash,
+    owner_id: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     owner_chain_authority(conn, account_id, owner_id, device_fingerprint, AuthorityChain::Control)
@@ -531,7 +531,7 @@ pub fn owner_control_authority(
 pub fn owner_control_authority_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: EntryHash,
+    owner_id: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     owner_chain_authority_in_snapshot(
@@ -546,7 +546,7 @@ pub fn owner_control_authority_in_snapshot(
 pub fn owner_secrets_authority(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: EntryHash,
+    owner_id: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     owner_chain_authority(conn, account_id, owner_id, device_fingerprint, AuthorityChain::Secrets)
@@ -559,7 +559,7 @@ pub fn owner_secrets_authority(
 pub fn owner_secrets_authority_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: EntryHash,
+    owner_id: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     owner_chain_authority_in_snapshot(
@@ -591,7 +591,7 @@ impl AuthorityChain {
 fn owner_chain_authority(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: EntryHash,
+    owner_id: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
     chain: AuthorityChain,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
@@ -603,7 +603,7 @@ fn owner_chain_authority(
 fn owner_chain_authority_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: EntryHash,
+    owner_id: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
     chain: AuthorityChain,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
@@ -708,7 +708,7 @@ fn owner_chain_authority_in_snapshot(
 pub(in crate::account) fn verify_stored_snapshots(
     conn: &Connection,
     account_id: AccountId,
-) -> anyhow::Result<Vec<(EntryHash, snapshot::verify::SnapshotVerdict)>> {
+) -> anyhow::Result<Vec<(AccountEntryHash, snapshot::verify::SnapshotVerdict)>> {
     let rows = load_candidates(conn, account_id)?;
     let held: Vec<envelope::VerifiedAccountEntry> =
         rows.iter().map(|row| row.verified.clone()).collect();
@@ -740,7 +740,7 @@ pub(in crate::account) fn verify_stored_snapshots(
 /// it cites is still open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::account) struct UsableSnapshot {
-    pub(in crate::account) entry_hash: EntryHash,
+    pub(in crate::account) entry_hash: AccountEntryHash,
     pub(in crate::account) targets: Vec<snapshot::ops::SnapshotTarget>,
 }
 
@@ -822,7 +822,7 @@ pub(in crate::account) fn selected_snapshot(
 pub fn owner_incarnation_effective(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: EntryHash,
+    owner_id: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
@@ -851,7 +851,7 @@ type StoredGrantRow = (Vec<u8>, Vec<u8>, String, i64, Option<i64>);
 pub fn grant_effective(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: EntryHash,
+    grant_id: AccountEntryHash,
     stream_id: StreamId,
     grantee_account_id: AccountId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantAuthority>> {
@@ -865,7 +865,7 @@ pub fn grant_effective(
 pub fn grant_effective_in_snapshot(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: EntryHash,
+    grant_id: AccountEntryHash,
     stream_id: StreamId,
     grantee_account_id: AccountId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantAuthority>> {
@@ -902,7 +902,7 @@ pub fn effective_writer_grant(
     owner_account_id: AccountId,
     stream_id: StreamId,
     grantee_account_id: AccountId,
-) -> anyhow::Result<Option<EntryHash>> {
+) -> anyhow::Result<Option<AccountEntryHash>> {
     let grant_id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT grant_id FROM account_stream_grants
@@ -932,7 +932,7 @@ pub fn open_writer_grants(
     owner_account_id: AccountId,
     stream_id: StreamId,
     grantee_account_id: AccountId,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     let mut stmt = conn.prepare(
         "SELECT grant_id FROM account_stream_grants
          WHERE owner_account_id = ?1 AND stream_id = ?2 AND grantee_account_id = ?3
@@ -958,7 +958,7 @@ pub fn open_writer_grants(
 /// One row of the owner-facing grant listing (`sync grants`).
 #[derive(Debug, Clone)]
 pub struct StreamGrantListing {
-    pub grant_id: EntryHash,
+    pub grant_id: AccountEntryHash,
     pub grantee_account_id: AccountId,
     /// The projected role token (`reader`/`writer`).
     pub role: String,
@@ -1116,7 +1116,7 @@ pub fn account_holds_effective_public_writer_grant(
 pub fn grant_effective_for_device(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: EntryHash,
+    grant_id: AccountEntryHash,
     stream_id: StreamId,
     grantee_account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
@@ -1137,7 +1137,7 @@ pub fn grant_effective_for_device(
 pub fn grant_effective_for_device_in_snapshot(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: EntryHash,
+    grant_id: AccountEntryHash,
     stream_id: StreamId,
     grantee_account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
@@ -1178,7 +1178,7 @@ pub fn stream_owner_effective(
     conn: &Connection,
     account_id: AccountId,
     stream_id: StreamId,
-) -> anyhow::Result<fold::AuthorityQuery<EntryHash>> {
+) -> anyhow::Result<fold::AuthorityQuery<AccountEntryHash>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
     stream_owner_effective_in_snapshot(&read_tx, account_id, stream_id)
 }
@@ -1189,7 +1189,7 @@ pub fn stream_owner_effective_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
     stream_id: StreamId,
-) -> anyhow::Result<fold::AuthorityQuery<EntryHash>> {
+) -> anyhow::Result<fold::AuthorityQuery<AccountEntryHash>> {
     let row: Option<(Vec<u8>, i64)> = conn
         .query_row(
             "SELECT own_id, effective_at FROM account_stream_ownership
@@ -1209,7 +1209,7 @@ pub fn stream_owner_effective_in_snapshot(
 pub(super) fn grant_device_cut(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: EntryHash,
+    grant_id: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<Option<DeviceCut>>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
@@ -1232,7 +1232,7 @@ pub(super) fn grant_device_cut(
 fn load_grant_device_cut(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: EntryHash,
+    grant_id: AccountEntryHash,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<Option<DeviceCut>> {
     let row: Option<(Vec<u8>, Vec<u8>)> = conn
@@ -1456,7 +1456,7 @@ pub(in crate::account) fn effective_owner_incarnation_for_device(
     conn: &Connection,
     account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
-) -> anyhow::Result<Option<EntryHash>> {
+) -> anyhow::Result<Option<AccountEntryHash>> {
     let owner_id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT owner_id FROM account_owner_incarnations
@@ -1472,7 +1472,7 @@ pub(in crate::account) fn effective_owner_incarnation_for_device(
 fn missing_reference<T>(
     conn: &Connection,
     account_id: AccountId,
-    reference: &EntryHash,
+    reference: &AccountEntryHash,
 ) -> anyhow::Result<fold::AuthorityQuery<T>> {
     let stored_account: Option<Vec<u8>> = conn
         .query_row(
@@ -1930,7 +1930,7 @@ fn derive_account_projection(rows: &[CandidateRow]) -> AccountProjection {
             .map(|row| row.verified.clone())
             .collect();
         let history = fold::fold_account(&entries);
-        let effective: HashSet<EntryHash> = rows
+        let effective: HashSet<AccountEntryHash> = rows
             .iter()
             .filter(|row| {
                 !forked.contains(&row.entry_hash)
@@ -1942,7 +1942,8 @@ fn derive_account_projection(rows: &[CandidateRow]) -> AccountProjection {
             .collect();
         let selected = select_coherent_branches(rows, &effective);
         let accepted = close_selection_over_authority(rows, selected);
-        let newly_forked: Vec<EntryHash> = effective.difference(&accepted).copied().collect();
+        let newly_forked: Vec<AccountEntryHash> =
+            effective.difference(&accepted).copied().collect();
         if newly_forked.is_empty() {
             return AccountProjection { history, accepted, forked };
         }
@@ -1956,8 +1957,8 @@ fn derive_account_projection(rows: &[CandidateRow]) -> AccountProjection {
 /// Select one contiguous effective hash-chain per `(log_id, device)` (§16.2).
 fn select_coherent_branches(
     rows: &[CandidateRow],
-    effective: &HashSet<EntryHash>,
-) -> HashSet<EntryHash> {
+    effective: &HashSet<AccountEntryHash>,
+) -> HashSet<AccountEntryHash> {
     // Effective entries indexed by the (log, device, prev_hash) parent slot they chain from; a
     // chain root keys on `None`.
     let mut children = BranchChildren::new();
@@ -1999,10 +2000,10 @@ fn select_coherent_branches(
 /// incarnation DAG rather than only one edge.
 fn close_selection_over_authority(
     rows: &[CandidateRow],
-    mut selected: HashSet<EntryHash>,
-) -> HashSet<EntryHash> {
+    mut selected: HashSet<AccountEntryHash>,
+) -> HashSet<AccountEntryHash> {
     loop {
-        let invalid: Vec<EntryHash> = rows
+        let invalid: Vec<AccountEntryHash> = rows
             .iter()
             .filter(|row| selected.contains(&row.entry_hash))
             .filter(|row| {
@@ -2044,7 +2045,7 @@ struct CandidateRow {
 /// slice a caller supplies — there is no wrong set to hand it.
 pub(in crate::account) struct AccountEntriesView {
     held: Vec<VerifiedAccountEntry>,
-    accepted: HashSet<EntryHash>,
+    accepted: HashSet<AccountEntryHash>,
 }
 
 impl AccountEntriesView {
@@ -2063,7 +2064,7 @@ impl AccountEntriesView {
     pub(in crate::account) fn accepted_control_heads(
         &self,
     ) -> Vec<snapshot::ops::CoveredWatermark> {
-        let mut heads: HashMap<DeviceFingerprint, (u64, EntryHash)> = HashMap::new();
+        let mut heads: HashMap<DeviceFingerprint, (u64, AccountEntryHash)> = HashMap::new();
         for entry in &self.held {
             if entry.header.log_id != fold::CONTROL_LOG
                 || !self.accepted.contains(&entry.entry_hash)
@@ -2742,7 +2743,7 @@ pub(super) fn list_effective_roster_x25519_pubkeys(
     let mut out = Vec::with_capacity(rows.len());
     for (fp, roster_ref) in rows {
         let fingerprint = DeviceFingerprint::from_bytes(fixed(&fp)?);
-        let roster_ref: EntryHash = fixed(&roster_ref)?;
+        let roster_ref: AccountEntryHash = fixed(&roster_ref)?;
         out.push((fingerprint, enrollment_x25519(conn, account_id, &roster_ref, fingerprint)?));
     }
     Ok(out)
@@ -2800,7 +2801,7 @@ pub(super) fn effective_roster_entry_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
     fingerprint: DeviceFingerprint,
-) -> anyhow::Result<Option<(EntryHash, ops::DeviceRole)>> {
+) -> anyhow::Result<Option<(AccountEntryHash, ops::DeviceRole)>> {
     let row: Option<(Vec<u8>, String)> = conn
         .query_row(
             "SELECT roster_ref, role FROM account_roster_history
@@ -2847,7 +2848,7 @@ pub(crate) fn device_is_effective_writer(
 fn enrollment_x25519(
     conn: &Connection,
     account_id: AccountId,
-    roster_ref: &EntryHash,
+    roster_ref: &AccountEntryHash,
     fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<DeviceX25519Public> {
     let signed_bytes: Vec<u8> = conn
@@ -2935,7 +2936,7 @@ fn insert_pre_verify(
 fn enforce_pre_verify_budget(
     conn: &Connection,
     account_id: AccountId,
-    inserted_signed_hash: &EntryHash,
+    inserted_signed_hash: &AccountEntryHash,
 ) -> rusqlite::Result<PreVerifyInsert> {
     let outcome = PRE_VERIFY.enforce_budget(
         conn,
@@ -4452,7 +4453,7 @@ mod tests {
         sign_content_entry(&member.secret, &header, &crate::op::encode(&op)).unwrap()
     }
 
-    fn owner_demote(dev: &Dev, owner_id: EntryHash) -> AccountOp {
+    fn owner_demote(dev: &Dev, owner_id: AccountEntryHash) -> AccountOp {
         AccountOp::OwnerDemote {
             device_fingerprint: dev.fp,
             owner_id,
@@ -4466,7 +4467,7 @@ mod tests {
         account_id: AccountId,
         subject: &Dev,
         new_seq: u64,
-        new_entry_hash: EntryHash,
+        new_entry_hash: AccountEntryHash,
     ) -> AccountOp {
         AccountOp::CutExtend {
             chain_kind: super::super::ops::ChainKind::Ctrl,

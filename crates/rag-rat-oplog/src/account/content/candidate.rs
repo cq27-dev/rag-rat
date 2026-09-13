@@ -20,16 +20,16 @@ use crate::account::AccountId;
 use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
 
-type EntryHash = [u8; 32];
+type AccountEntryHash = [u8; 32];
 
 /// A read view over `/3` candidates keyed by `entry_hash` — the seam the walks use without
 /// depending on storage.
 pub(super) trait HeaderView {
-    fn header(&self, entry_hash: &EntryHash) -> Option<&ContentEntryHeader>;
+    fn header(&self, entry_hash: &AccountEntryHash) -> Option<&ContentEntryHeader>;
 }
 
-impl HeaderView for HashMap<EntryHash, ContentEntryHeader> {
-    fn header(&self, entry_hash: &EntryHash) -> Option<&ContentEntryHeader> {
+impl HeaderView for HashMap<AccountEntryHash, ContentEntryHeader> {
+    fn header(&self, entry_hash: &AccountEntryHash) -> Option<&ContentEntryHeader> {
         self.get(entry_hash)
     }
 }
@@ -62,8 +62,8 @@ pub(super) type ContentCandidate = Candidate<ContentEntryHeader>;
 /// A withheld watermark or a missing mid-chain link is UNDECIDED, and says so with its cause; it
 /// never flips an on/off verdict (I11), because the entries that would decide it may still arrive.
 pub(super) fn ancestry(
-    target: &EntryHash,
-    watermark: &EntryHash,
+    target: &AccountEntryHash,
+    watermark: &AccountEntryHash,
     view: &dyn HeaderView,
 ) -> AncestryRelation {
     if view.header(watermark).is_none() {
@@ -109,7 +109,7 @@ pub(super) enum CutBinding {
 /// Validate that a cut's watermark names the exact `(coordinate, seq)` its register bounds (§11.3).
 pub(super) fn validate_cut_target(
     seq: u64,
-    watermark: &EntryHash,
+    watermark: &AccountEntryHash,
     expected: &ChainCoordinate,
     view: &dyn HeaderView,
 ) -> CutBinding {
@@ -137,7 +137,7 @@ impl ChainLink for ContentEntryHeader {
         self.seq
     }
 
-    fn prev_hash(&self) -> Option<EntryHash> {
+    fn prev_hash(&self) -> Option<AccountEntryHash> {
         self.prev_hash
     }
 }
@@ -149,7 +149,7 @@ impl ChainLink for ContentEntryHeader {
 /// which is why the shared pin order is total over `(seq, watermark)`.
 pub(super) fn select_accepted_branch(
     candidates: &[ContentCandidate],
-    eligible: &HashSet<EntryHash>,
+    eligible: &HashSet<AccountEntryHash>,
     pins: &[BranchPin],
     view: &dyn HeaderView,
 ) -> BranchSelection {
@@ -179,7 +179,7 @@ mod tests {
         }
     }
 
-    fn header(seq: u64, prev_hash: Option<EntryHash>) -> ContentEntryHeader {
+    fn header(seq: u64, prev_hash: Option<AccountEntryHash>) -> ContentEntryHeader {
         ContentEntryHeader {
             stream_id: StreamId::from_bytes(STREAM),
             author_account_id: AccountId::from_bytes(AUTHOR),
@@ -197,7 +197,7 @@ mod tests {
     }
 
     /// A linear chain a(seq0) <- b(seq1) <- c(seq2).
-    fn linear() -> HashMap<EntryHash, ContentEntryHeader> {
+    fn linear() -> HashMap<AccountEntryHash, ContentEntryHeader> {
         HashMap::from([
             ([0x0a; 32], header(0, None)),
             ([0x0b; 32], header(1, Some([0x0a; 32]))),
@@ -205,7 +205,7 @@ mod tests {
         ])
     }
 
-    fn candidates(view: &HashMap<EntryHash, ContentEntryHeader>) -> Vec<ContentCandidate> {
+    fn candidates(view: &HashMap<AccountEntryHash, ContentEntryHeader>) -> Vec<ContentCandidate> {
         let mut rows: Vec<ContentCandidate> = view
             .iter()
             .map(|(entry_hash, header)| ContentCandidate {
@@ -218,7 +218,7 @@ mod tests {
         rows
     }
 
-    fn all(view: &HashMap<EntryHash, ContentEntryHeader>) -> HashSet<EntryHash> {
+    fn all(view: &HashMap<AccountEntryHash, ContentEntryHeader>) -> HashSet<AccountEntryHash> {
         view.keys().copied().collect()
     }
 
@@ -495,7 +495,7 @@ mod tests {
         // Chain depth is attacker-controlled: every walk here is iterative, and this is the test
         // that keeps it that way.
         let mut view = HashMap::new();
-        let mut prev: Option<EntryHash> = None;
+        let mut prev: Option<AccountEntryHash> = None;
         for seq in 0..2000u64 {
             let mut entry_hash = [0u8; 32];
             entry_hash[..8].copy_from_slice(&seq.to_be_bytes());

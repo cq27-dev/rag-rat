@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::ops::ControlFlow;
 
-type EntryHash = [u8; 32];
+type AccountEntryHash = [u8; 32];
 
 /// The header fields the branch walks read: which dense chain an entry extends, its slot on that
 /// chain, and the predecessor it names.
@@ -20,13 +20,13 @@ pub(in crate::account) trait ChainLink {
 
     fn coordinate(&self) -> Self::Coordinate;
     fn seq(&self) -> u64;
-    fn prev_hash(&self) -> Option<EntryHash>;
+    fn prev_hash(&self) -> Option<AccountEntryHash>;
 }
 
 /// One candidate the refold classifies: its hash plus the header the walks read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::account) struct Candidate<H> {
-    pub(in crate::account) entry_hash: EntryHash,
+    pub(in crate::account) entry_hash: AccountEntryHash,
     pub(in crate::account) header: H,
 }
 
@@ -37,7 +37,7 @@ pub(in crate::account) struct Candidate<H> {
 pub(in crate::account) struct BranchPin<C> {
     pub(in crate::account) coordinate: C,
     pub(in crate::account) seq: u64,
-    pub(in crate::account) watermark: EntryHash,
+    pub(in crate::account) watermark: AccountEntryHash,
 }
 
 /// The branch-selection verdict for one refold.
@@ -50,13 +50,13 @@ pub(in crate::account) struct BranchPin<C> {
 /// valid work for being late; the acceptance predicate parks it as `missing_predecessor` instead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in crate::account) struct BranchSelection {
-    pub(in crate::account) accepted: HashSet<EntryHash>,
-    pub(in crate::account) forked: HashSet<EntryHash>,
+    pub(in crate::account) accepted: HashSet<AccountEntryHash>,
+    pub(in crate::account) forked: HashSet<AccountEntryHash>,
 }
 
 /// Eligible entries indexed by the `(chain, prev_hash)` parent slot they extend; a chain root keys
 /// on `None`. Several entries under one key are an equivocation — the slot selection resolves them.
-type BranchChildren<C> = HashMap<(C, Option<EntryHash>), Vec<(u64, EntryHash)>>;
+type BranchChildren<C> = HashMap<(C, Option<AccountEntryHash>), Vec<(u64, AccountEntryHash)>>;
 
 /// Select one contiguous accepted chain per coordinate from the eligible candidates (§16.2).
 ///
@@ -74,8 +74,8 @@ type BranchChildren<C> = HashMap<(C, Option<EntryHash>), Vec<(u64, EntryHash)>>;
 ///    compute identically.
 pub(in crate::account) fn select_accepted_branch<H: ChainLink>(
     candidates: &[Candidate<H>],
-    eligible: &HashSet<EntryHash>,
-    pinned_branch: impl Fn(H::Coordinate) -> HashSet<EntryHash>,
+    eligible: &HashSet<AccountEntryHash>,
+    pinned_branch: impl Fn(H::Coordinate) -> HashSet<AccountEntryHash>,
 ) -> BranchSelection {
     let mut children = BranchChildren::new();
     let mut chains: HashSet<H::Coordinate> = HashSet::new();
@@ -92,7 +92,7 @@ pub(in crate::account) fn select_accepted_branch<H: ChainLink>(
     let mut rooted = HashSet::new();
     for chain in chains {
         let pinned = pinned_branch(chain);
-        let mut parent: Option<EntryHash> = None;
+        let mut parent: Option<AccountEntryHash> = None;
         // A seq is dense from 0, so the chain ends at the first slot no eligible child fills.
         // Bounded by the candidate count: every step consumes one distinct entry.
         for slot in 0..candidates.len() as u64 {
@@ -124,11 +124,11 @@ pub(in crate::account) fn select_accepted_branch<H: ChainLink>(
 fn collect_rooted<C: Copy + Eq + Hash>(
     chain: C,
     children: &BranchChildren<C>,
-    rooted: &mut HashSet<EntryHash>,
+    rooted: &mut HashSet<AccountEntryHash>,
 ) {
     // Breadth-first from the roots (`prev_hash` null at seq 0), stepping exactly one slot per link,
     // so a gap in the chain simply strands everything above it.
-    let mut frontier: Vec<(Option<EntryHash>, u64)> = vec![(None, 0)];
+    let mut frontier: Vec<(Option<AccountEntryHash>, u64)> = vec![(None, 0)];
     while let Some((parent, slot)) = frontier.pop() {
         let Some(kids) = children.get(&(chain, parent)) else {
             continue;
@@ -160,8 +160,8 @@ pub(in crate::account) fn pinned_branch<'v, H: ChainLink + 'v>(
     chain: H::Coordinate,
     pins: &[BranchPin<H::Coordinate>],
     admits: impl Fn(&BranchPin<H::Coordinate>) -> bool,
-    lookup: impl Fn(&EntryHash) -> Option<&'v H>,
-) -> HashSet<EntryHash> {
+    lookup: impl Fn(&AccountEntryHash) -> Option<&'v H>,
+) -> HashSet<AccountEntryHash> {
     let Some(pin) = pins
         .iter()
         .filter(|pin| pin.coordinate == chain)
@@ -201,15 +201,15 @@ pub(in crate::account) enum WalkEnd {
 /// Iterative with a visited guard: chain depth is attacker-controlled, and a hash cycle would need
 /// a sha256 collision but a corrupt row must not spin forever either.
 pub(in crate::account) fn walk_back<'v, H: ChainLink + 'v>(
-    watermark: &EntryHash,
-    lookup: impl Fn(&EntryHash) -> Option<&'v H>,
-    mut visit: impl FnMut(&EntryHash, &H) -> ControlFlow<()>,
+    watermark: &AccountEntryHash,
+    lookup: impl Fn(&AccountEntryHash) -> Option<&'v H>,
+    mut visit: impl FnMut(&AccountEntryHash, &H) -> ControlFlow<()>,
 ) -> WalkEnd {
     let Some(head) = lookup(watermark) else {
         return WalkEnd::MissingLink;
     };
     let chain = head.coordinate();
-    let mut visited: HashSet<EntryHash> = HashSet::new();
+    let mut visited: HashSet<AccountEntryHash> = HashSet::new();
     let mut current = *watermark;
     loop {
         let Some(header) = lookup(&current) else {

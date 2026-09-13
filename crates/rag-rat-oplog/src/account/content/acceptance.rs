@@ -18,7 +18,7 @@ use crate::account::{
 };
 use crate::stream::StreamId;
 
-type EntryHash = [u8; 32];
+type AccountEntryHash = [u8; 32];
 
 /// Why an ancestry walk against a cut watermark could not be decided (mirrors the account fold's
 /// `UnknownCause`: a withheld watermark parks, and never flips a verdict — I11).
@@ -67,7 +67,7 @@ pub struct CitedOwnership {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CitedRosterAuthority {
     pub account_id: AccountId,
-    pub roster_ref: EntryHash,
+    pub roster_ref: AccountEntryHash,
     pub stream_id: StreamId,
     pub authority: RosterContentAuthority,
 }
@@ -75,7 +75,7 @@ pub struct CitedRosterAuthority {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CitedGrantAuthority {
     pub owner_account_id: AccountId,
-    pub grant_id: EntryHash,
+    pub grant_id: AccountEntryHash,
     pub authority: GrantDeviceAuthority,
 }
 
@@ -171,10 +171,10 @@ impl ContentAcceptance {
 #[derive(Clone)]
 pub struct ContentAcceptanceInput<'a, F>
 where
-    F: Fn(EntryHash, EntryHash) -> AncestryRelation,
+    F: Fn(AccountEntryHash, AccountEntryHash) -> AncestryRelation,
 {
     pub header: &'a ContentEntryHeader,
-    pub entry_hash: EntryHash,
+    pub entry_hash: AccountEntryHash,
     pub owner_account_id: AccountId,
     pub dense_predecessor_reachable: bool,
     pub branch_selected: bool,
@@ -191,7 +191,7 @@ pub fn evaluate_content_acceptance<F>(
     input: &ContentAcceptanceInput<'_, F>,
 ) -> Result<ContentAcceptance, ContentAcceptanceInputError>
 where
-    F: Fn(EntryHash, EntryHash) -> AncestryRelation,
+    F: Fn(AccountEntryHash, AccountEntryHash) -> AncestryRelation,
 {
     if let Some(verdict) = authority_verdict(input)? {
         return Ok(verdict);
@@ -227,7 +227,7 @@ pub fn authority_verdict<F>(
     input: &ContentAcceptanceInput<'_, F>,
 ) -> Result<Option<ContentAcceptance>, ContentAcceptanceInputError>
 where
-    F: Fn(EntryHash, EntryHash) -> AncestryRelation,
+    F: Fn(AccountEntryHash, AccountEntryHash) -> AncestryRelation,
 {
     // Provenance first: a freshness verdict computed for another account, or for a shorter
     // assertion than the header makes, decides nothing about THIS entry.
@@ -376,11 +376,11 @@ fn invalid_citation(
 fn combine_boundaries<F>(
     boundaries: &[AuthorityBoundary],
     seq: u64,
-    entry_hash: EntryHash,
+    entry_hash: AccountEntryHash,
     ancestry: &F,
 ) -> Option<ContentAcceptance>
 where
-    F: Fn(EntryHash, EntryHash) -> AncestryRelation,
+    F: Fn(AccountEntryHash, AccountEntryHash) -> AncestryRelation,
 {
     let rank = boundaries.iter().fold(0, |rank, boundary| {
         let candidate = match *boundary {
@@ -413,7 +413,7 @@ mod tests {
     use crate::account::{DeviceCut, DeviceRole, GrantAuthority};
     use crate::op::DeviceFingerprint;
 
-    const ENTRY_HASH: EntryHash = [9; 32];
+    const ENTRY_HASH: AccountEntryHash = [9; 32];
     fn owner() -> AccountId {
         AccountId::from_bytes([5; 32])
     }
@@ -422,7 +422,11 @@ mod tests {
         AccountId::from_bytes([6; 32])
     }
 
-    fn header(author: AccountId, grant_id: Option<EntryHash>, seq: u64) -> ContentEntryHeader {
+    fn header(
+        author: AccountId,
+        grant_id: Option<AccountEntryHash>,
+        seq: u64,
+    ) -> ContentEntryHeader {
         ContentEntryHeader {
             stream_id: StreamId::from_bytes([1; 32]),
             author_account_id: author,

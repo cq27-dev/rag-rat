@@ -42,13 +42,13 @@ use super::ops::{SnapshotOp, SnapshotTarget};
 use super::{projection, verify};
 use crate::identity::LocalDevice;
 
-type EntryHash = [u8; 32];
+type AccountEntryHash = [u8; 32];
 
 /// What an authoring attempt did. Only `Authored` mints an entry; the rest are ordinary states this
 /// device can be in, reported so a caller can tell "nothing to do" from "something went wrong".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotAuthorOutcome {
-    Authored(EntryHash),
+    Authored(AccountEntryHash),
     /// This device holds no open owner incarnation, so it has no authority to cite.
     NotAnOpenOwner,
     /// The account is contested; a snapshot of it would be refused by every verifier.

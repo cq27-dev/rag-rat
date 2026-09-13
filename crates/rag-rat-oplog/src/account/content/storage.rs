@@ -35,7 +35,7 @@ pub(super) fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
     bytes.try_into().map_err(|_| anyhow::anyhow!("expected {N} bytes, got {}", bytes.len()))
 }
 
-type EntryHash = [u8; 32];
+type AccountEntryHash = [u8; 32];
 
 const PENDING_REFOLD_CONTENT_CANDIDATE: i64 = 1;
 const PENDING_REFOLD_ACCOUNT_CHANGE: i64 = 2;
@@ -86,7 +86,7 @@ pub enum ContentIngestOutcome {
 #[derive(Debug, Default)]
 pub(in crate::account) struct ContentPromotionOutcome {
     pub(in crate::account) scope: Option<ContentCapacityScope>,
-    pub(in crate::account) entry_hashes: Vec<EntryHash>,
+    pub(in crate::account) entry_hashes: Vec<AccountEntryHash>,
 }
 
 /// Ingest one REMOTE, untrusted `/3` content envelope: resolve its roster key, verify the
@@ -203,7 +203,7 @@ pub fn content_ingest(
 
 fn stored_candidate_bytes(
     conn: &Connection,
-    entry_hash: &EntryHash,
+    entry_hash: &AccountEntryHash,
 ) -> rusqlite::Result<Option<Vec<u8>>> {
     conn.query_row(
         "SELECT signed_bytes FROM content_entries WHERE entry_hash = ?1",
@@ -308,7 +308,7 @@ fn park_pre_verify(
 fn enforce_pre_verify_budget(
     tx: &Transaction<'_>,
     author: super::super::AccountId,
-    inserted_hash: &EntryHash,
+    inserted_hash: &AccountEntryHash,
 ) -> rusqlite::Result<ContentIngestOutcome> {
     let outcome = PRE_VERIFY.enforce_budget(
         tx,
@@ -647,7 +647,7 @@ fn reclassify_chain(tx: &Transaction<'_>, entry: &VerifiedContentEntry) -> anyho
 /// Every authority fact one candidate is evaluated against, resolved once from the current fold so
 /// the two evaluator phases (eligibility, then the finished verdict) read one consistent snapshot.
 struct ResolvedEntry {
-    entry_hash: EntryHash,
+    entry_hash: AccountEntryHash,
     header: ContentEntryHeader,
     owner_account_id: AccountId,
     dense_predecessor_reachable: bool,
@@ -796,13 +796,13 @@ pub(super) fn refold_content_stream(
     tx.execute("UPDATE content_entries SET accepted = 0 WHERE stream_id = ?1", [stream_id
         .to_bytes()
         .as_slice()])?;
-    let handled: HashSet<EntryHash> = resolved.iter().map(|r| r.entry_hash).collect();
+    let handled: HashSet<AccountEntryHash> = resolved.iter().map(|r| r.entry_hash).collect();
     declassify_rows_absent_from(tx, stream_id, &handled)?;
     if resolved.is_empty() {
         store_stream_clock(tx, stream_id, 0)?;
         return Ok(());
     }
-    let view: HashMap<EntryHash, ContentEntryHeader> =
+    let view: HashMap<AccountEntryHash, ContentEntryHeader> =
         resolved.iter().map(|r| (r.entry_hash, r.header.clone())).collect();
 
     // Phase 1 — eligibility. An entry the authority pass condemns or rejects must NOT compete for a
@@ -835,7 +835,8 @@ pub(super) fn refold_content_stream(
     //    NEITHER `accepted` nor `forked` — it lost no contest. Passing `branch_selected = false`
     //    would make the evaluator call it `Forked`, a terminal loser state it is not; only the real
     //    losers in `selection.forked` fork, and a stranded entry parks (recoverable).
-    let mut raw: HashMap<EntryHash, ContentAcceptance> = HashMap::with_capacity(resolved.len());
+    let mut raw: HashMap<AccountEntryHash, ContentAcceptance> =
+        HashMap::with_capacity(resolved.len());
     for r in &resolved {
         let selected = selection.accepted.contains(&r.entry_hash);
         let verdict = verdict_for(r, &view, selected, EvaluatorPhase::Finished)?
@@ -847,7 +848,7 @@ pub(super) fn refold_content_stream(
     // [`bounded_advance_walk`]): a revoked writer's condemned entries stop projecting, but an
     // honest dependent that minted against them while they were accepted must not park — or
     // revocation, the designed repair path, would itself wedge the dependent chain.
-    let condemned: Vec<(EntryHash, &ContentEntryHeader)> = resolved
+    let condemned: Vec<(AccountEntryHash, &ContentEntryHeader)> = resolved
         .iter()
         .filter(|r| matches!(raw.get(&r.entry_hash), Some(ContentAcceptance::Condemned(_))))
         .map(|r| (r.entry_hash, &r.header))
@@ -1664,9 +1665,9 @@ pub fn settle_pending_content_refold_for_stream_in_tx(
 fn prefix_closed_accepted(
     resolved: &[ResolvedEntry],
     selection: &BranchSelection,
-    raw: &HashMap<EntryHash, ContentAcceptance>,
-) -> HashSet<EntryHash> {
-    let mut chains: HashMap<ChainCoordinate, Vec<(u64, EntryHash)>> = HashMap::new();
+    raw: &HashMap<AccountEntryHash, ContentAcceptance>,
+) -> HashSet<AccountEntryHash> {
+    let mut chains: HashMap<ChainCoordinate, Vec<(u64, AccountEntryHash)>> = HashMap::new();
     for r in resolved {
         if selection.accepted.contains(&r.entry_hash) {
             let coordinate = ChainCoordinate {
@@ -1714,10 +1715,10 @@ fn prefix_closed_accepted(
 /// 2. **Bounded advance** — [`bounded_advance_demotions`].
 fn lamport_advance_clamped(
     resolved: &[ResolvedEntry],
-    mut accepted: HashSet<EntryHash>,
-    condemned: &[(EntryHash, &ContentEntryHeader)],
-) -> (HashSet<EntryHash>, HashSet<EntryHash>, u64) {
-    let entries: Vec<(EntryHash, &ContentEntryHeader)> = resolved
+    mut accepted: HashSet<AccountEntryHash>,
+    condemned: &[(AccountEntryHash, &ContentEntryHeader)],
+) -> (HashSet<AccountEntryHash>, HashSet<AccountEntryHash>, u64) {
+    let entries: Vec<(AccountEntryHash, &ContentEntryHeader)> = resolved
         .iter()
         .filter(|r| accepted.contains(&r.entry_hash))
         .map(|r| (r.entry_hash, &r.header))
@@ -1733,7 +1734,7 @@ fn lamport_advance_clamped(
 /// branch selection (or the `content_accepted_slot` index, for stored legacy rows) has already
 /// resolved forks — or a same-seq fork sibling would misread as a backwards tick.
 fn monotonicity_cuts(
-    entries: &[(EntryHash, &ContentEntryHeader)],
+    entries: &[(AccountEntryHash, &ContentEntryHeader)],
 ) -> HashMap<ChainCoordinate, u64> {
     let mut chains: HashMap<ChainCoordinate, Vec<&ContentEntryHeader>> = HashMap::new();
     for (_, header) in entries {
@@ -1772,11 +1773,11 @@ fn monotonicity_cuts(
 /// [`chain_cut_demotions`]) and the final running max — the stream's clock floor, which the fold
 /// persists for the O(1) ingest-gate and authoring-mint reads.
 fn bounded_advance_walk(
-    entries: &[(EntryHash, &ContentEntryHeader)],
-    floor: &[(EntryHash, &ContentEntryHeader)],
+    entries: &[(AccountEntryHash, &ContentEntryHeader)],
+    floor: &[(AccountEntryHash, &ContentEntryHeader)],
     mut cut: HashMap<ChainCoordinate, u64>,
 ) -> (HashMap<ChainCoordinate, u64>, u64) {
-    let mut rows: Vec<(u64, EntryHash, &ContentEntryHeader, bool)> = entries
+    let mut rows: Vec<(u64, AccountEntryHash, &ContentEntryHeader, bool)> = entries
         .iter()
         .map(|(hash, header)| (header.lamport, *hash, *header, true))
         .chain(floor.iter().map(|(hash, header)| (header.lamport, *hash, *header, false)))
@@ -1898,9 +1899,9 @@ fn store_stream_clock(
 
 /// Every entry of `entries` sitting at or above its chain's cut.
 fn chain_cut_demotions(
-    entries: &[(EntryHash, &ContentEntryHeader)],
+    entries: &[(AccountEntryHash, &ContentEntryHeader)],
     cut: &HashMap<ChainCoordinate, u64>,
-) -> HashSet<EntryHash> {
+) -> HashSet<AccountEntryHash> {
     let mut demoted = HashSet::new();
     for (hash, header) in entries {
         if cut.get(&ChainCoordinate::of(header)).is_some_and(|&seq| header.seq >= seq) {
@@ -1955,7 +1956,7 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
         return Ok(());
     }
     struct LegacyRow {
-        entry_hash: EntryHash,
+        entry_hash: AccountEntryHash,
         header: ContentEntryHeader,
         accepted: bool,
         condemned: bool,
@@ -1988,7 +1989,7 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
         }
     }
     for members in streams.into_values() {
-        let accepted: Vec<(EntryHash, &ContentEntryHeader)> = members
+        let accepted: Vec<(AccountEntryHash, &ContentEntryHeader)> = members
             .iter()
             .filter(|row| row.accepted)
             .map(|row| (row.entry_hash, &row.header))
@@ -1996,7 +1997,7 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
         // Condemned rows prop the clock exactly as they do at the fold (see
         // [`bounded_advance_walk`]): without them, a store whose poison basis was already
         // condemned would purge the honest dependents that minted against it.
-        let condemned: Vec<(EntryHash, &ContentEntryHeader)> = members
+        let condemned: Vec<(AccountEntryHash, &ContentEntryHeader)> = members
             .iter()
             .filter(|row| row.condemned)
             .map(|row| (row.entry_hash, &row.header))
@@ -2016,13 +2017,13 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
         // Close over stored hash descendants: a row chained onto a doomed row can never regain a
         // stored predecessor, so it retires too — but ONLY the doomed branch; a valid sibling at
         // the same (chain, seq) is untouched.
-        let mut children: HashMap<[u8; 32], Vec<EntryHash>> = HashMap::new();
+        let mut children: HashMap<[u8; 32], Vec<AccountEntryHash>> = HashMap::new();
         for row in &members {
             if let Some(previous) = row.header.prev_hash {
                 children.entry(previous).or_default().push(row.entry_hash);
             }
         }
-        let mut frontier: Vec<EntryHash> = doomed.iter().copied().collect();
+        let mut frontier: Vec<AccountEntryHash> = doomed.iter().copied().collect();
         while let Some(parent) = frontier.pop() {
             for child in children.get(&parent).into_iter().flatten() {
                 if doomed.insert(*child) {
@@ -2129,7 +2130,7 @@ pub fn backfill_content_lamport(conn: &Connection) -> rusqlite::Result<()> {
 fn declassify_rows_absent_from(
     tx: &Transaction<'_>,
     stream_id: StreamId,
-    handled: &HashSet<EntryHash>,
+    handled: &HashSet<AccountEntryHash>,
 ) -> anyhow::Result<()> {
     let hashes: Vec<Vec<u8>> = {
         let mut stmt = tx.prepare("SELECT entry_hash FROM content_entries WHERE stream_id = ?1")?;
@@ -2157,7 +2158,7 @@ enum EvaluatorPhase {
 /// ancestry closure walks `view`, so the input never outlives it; both callers evaluate inline.
 fn verdict_for(
     r: &ResolvedEntry,
-    view: &HashMap<EntryHash, ContentEntryHeader>,
+    view: &HashMap<AccountEntryHash, ContentEntryHeader>,
     branch_selected: bool,
     phase: EvaluatorPhase,
 ) -> anyhow::Result<Option<ContentAcceptance>> {
@@ -2193,7 +2194,7 @@ fn resolve_stream_authority(
     owner_account_id: AccountId,
 ) -> anyhow::Result<Vec<ResolvedEntry>> {
     let headers = load_stream_headers(tx, stream_id)?;
-    let view: HashMap<EntryHash, ContentEntryHeader> =
+    let view: HashMap<AccountEntryHash, ContentEntryHeader> =
         headers.iter().map(|(hash, header)| (*hash, header.clone())).collect();
     let reachable = reachable_entries(&view);
 
@@ -2315,9 +2316,14 @@ fn resolve_stream_authority(
 /// a fresh instance per `resolve_stream_authority`, never shared across refolds.
 #[derive(Default)]
 struct AuthorityCaches {
-    roster:
-        HashMap<(AccountId, EntryHash, DeviceFingerprint), AuthorityQuery<CitedRosterAuthority>>,
-    grant: HashMap<(EntryHash, AccountId, DeviceFingerprint), AuthorityQuery<CitedGrantAuthority>>,
+    roster: HashMap<
+        (AccountId, AccountEntryHash, DeviceFingerprint),
+        AuthorityQuery<CitedRosterAuthority>,
+    >,
+    grant: HashMap<
+        (AccountEntryHash, AccountId, DeviceFingerprint),
+        AuthorityQuery<CitedGrantAuthority>,
+    >,
     held_control_log: HashMap<AccountId, u64>,
     contested: HashMap<AccountId, bool>,
 }
@@ -2355,7 +2361,7 @@ impl AuthorityCaches {
 fn load_stream_headers(
     tx: &Transaction<'_>,
     stream_id: StreamId,
-) -> anyhow::Result<Vec<(EntryHash, ContentEntryHeader)>> {
+) -> anyhow::Result<Vec<(AccountEntryHash, ContentEntryHeader)>> {
     let mut stmt = tx.prepare(
         "SELECT entry_hash, signed_bytes FROM content_entries WHERE stream_id = ?1
          ORDER BY entry_hash", // deterministic load order (selection is order-free regardless)
@@ -2398,7 +2404,7 @@ fn declassify_stream_to_structural(
     stream_id: StreamId,
 ) -> anyhow::Result<()> {
     let headers = load_stream_headers(tx, stream_id)?;
-    let view: HashMap<EntryHash, ContentEntryHeader> =
+    let view: HashMap<AccountEntryHash, ContentEntryHeader> =
         headers.iter().map(|(hash, header)| (*hash, header.clone())).collect();
     let reachable = reachable_entries(&view);
     // Clear `accepted` for the WHOLE stream first — including any undecodable row absent from
@@ -2426,9 +2432,11 @@ fn declassify_stream_to_structural(
 /// at the per-author candidate cap (thousands) a long peer-supplied chain could burn tens of
 /// millions of lookups on a single ingest — an availability footgun. Here every entry is enqueued
 /// once and every `prev_hash` edge is followed once.
-fn reachable_entries(view: &HashMap<EntryHash, ContentEntryHeader>) -> HashSet<EntryHash> {
-    let mut by_prev: HashMap<EntryHash, Vec<&EntryHash>> = HashMap::new();
-    let mut queue: VecDeque<&EntryHash> = VecDeque::new();
+fn reachable_entries(
+    view: &HashMap<AccountEntryHash, ContentEntryHeader>,
+) -> HashSet<AccountEntryHash> {
+    let mut by_prev: HashMap<AccountEntryHash, Vec<&AccountEntryHash>> = HashMap::new();
+    let mut queue: VecDeque<&AccountEntryHash> = VecDeque::new();
     for (hash, header) in view {
         match header.prev_hash {
             // A chain root: seq 0 with no predecessor. A `prev_hash`-less entry at seq > 0 is
@@ -2557,7 +2565,7 @@ fn map_roster(
 fn map_grant(
     query: AuthorityQuery<crate::account::GrantDeviceAuthority>,
     owner_account_id: AccountId,
-    grant_id: EntryHash,
+    grant_id: AccountEntryHash,
 ) -> AuthorityQuery<CitedGrantAuthority> {
     match query {
         AuthorityQuery::Effective(authority) =>
@@ -2570,7 +2578,7 @@ fn map_grant(
 /// Write one entry's verdict: the taxonomy status string, and `accepted = 1` only for `Accepted`.
 fn write_verdict(
     tx: &Transaction<'_>,
-    entry_hash: &EntryHash,
+    entry_hash: &AccountEntryHash,
     verdict: ContentAcceptance,
 ) -> rusqlite::Result<()> {
     tx.execute(
@@ -2588,7 +2596,7 @@ fn write_verdict(
 
 fn set_status(
     tx: &Transaction<'_>,
-    entry_hash: &EntryHash,
+    entry_hash: &AccountEntryHash,
     status: ContentStatus,
 ) -> rusqlite::Result<()> {
     tx.execute(
@@ -2599,7 +2607,7 @@ fn set_status(
     Ok(())
 }
 
-fn status_for(tx: &Transaction<'_>, hash: &EntryHash) -> rusqlite::Result<Option<String>> {
+fn status_for(tx: &Transaction<'_>, hash: &AccountEntryHash) -> rusqlite::Result<Option<String>> {
     tx.query_row(
         "SELECT status FROM content_entry_status WHERE entry_hash = ?1",
         [hash.as_slice()],
@@ -3032,7 +3040,7 @@ mod tests {
     fn roster(
         conn: &Connection,
         secret: &DeviceSecret,
-    ) -> (super::super::super::AccountId, EntryHash) {
+    ) -> (super::super::super::AccountId, AccountEntryHash) {
         let (account_id, signed) = signed_roster(secret);
         conn.execute(
             "INSERT INTO account_entries(entry_hash, account_id, log_id, device_fingerprint, seq,
@@ -3085,7 +3093,7 @@ mod tests {
         founder: &DeviceSecret,
         member: &DeviceSecret,
         account_id: super::super::super::AccountId,
-        genesis_hash: EntryHash,
+        genesis_hash: AccountEntryHash,
     ) -> super::super::super::envelope::SignedAccountEntry {
         signed_device_add_at(founder, member, account_id, 1, genesis_hash, genesis_hash, 1)
     }
@@ -3095,8 +3103,8 @@ mod tests {
         member: &DeviceSecret,
         account_id: super::super::super::AccountId,
         seq: u64,
-        previous: EntryHash,
-        genesis_hash: EntryHash,
+        previous: AccountEntryHash,
+        genesis_hash: AccountEntryHash,
         auth_len: u64,
     ) -> super::super::super::envelope::SignedAccountEntry {
         let op = AccountOp::DeviceAdd {
@@ -3127,9 +3135,9 @@ mod tests {
     fn content(
         secret: &DeviceSecret,
         account_id: super::super::super::AccountId,
-        roster_ref: EntryHash,
+        roster_ref: AccountEntryHash,
         seq: u64,
-        previous: Option<EntryHash>,
+        previous: Option<AccountEntryHash>,
     ) -> SignedContentEntry {
         let header = ContentEntryHeader {
             stream_id: StreamId::from_bytes([0x44; 32]),
@@ -3493,7 +3501,7 @@ mod tests {
         row(4, stranger, outsider, 0, false); // never granted this stream
         row(5, owner, member, 0, true); // the owner's own rows are served on their own
 
-        let relayed: Vec<EntryHash> = relayed_content_entries(&conn, owner)
+        let relayed: Vec<AccountEntryHash> = relayed_content_entries(&conn, owner)
             .unwrap()
             .into_iter()
             .map(|entry| entry.entry_hash)
@@ -4058,9 +4066,9 @@ mod tests {
     /// it at `u64::MAX`, always `Ahead`, which would park every accept path), body `0xf6`.
     #[derive(Clone, Copy)]
     struct ContentSpec {
-        grant_id: Option<EntryHash>,
+        grant_id: Option<AccountEntryHash>,
         seq: u64,
-        previous: Option<EntryHash>,
+        previous: Option<AccountEntryHash>,
         auth_len: u64,
         body: u8,
         /// `None` mints the honest clock (`seq + 1`); `Some` forges an arbitrary header lamport,
@@ -4079,7 +4087,7 @@ mod tests {
     fn authored(
         secret: &DeviceSecret,
         author: AccountId,
-        roster_ref: EntryHash,
+        roster_ref: AccountEntryHash,
         spec: ContentSpec,
     ) -> SignedContentEntry {
         let header = ContentEntryHeader {
@@ -4104,7 +4112,7 @@ mod tests {
     fn authored_op(
         secret: &DeviceSecret,
         author: AccountId,
-        roster_ref: EntryHash,
+        roster_ref: AccountEntryHash,
         spec: ContentSpec,
         memory_op: &crate::op::MemoryOp,
     ) -> SignedContentEntry {
@@ -4164,7 +4172,7 @@ mod tests {
 
     fn seed_roster_fact(
         conn: &Connection,
-        roster_ref: EntryHash,
+        roster_ref: AccountEntryHash,
         account: AccountId,
         device: &DeviceSecret,
         role: &str,
@@ -4185,7 +4193,7 @@ mod tests {
 
     fn seed_roster_content_cut(
         conn: &Connection,
-        roster_ref: EntryHash,
+        roster_ref: AccountEntryHash,
         account: AccountId,
         seq: u64,
         watermark: [u8; 32],
@@ -4207,7 +4215,7 @@ mod tests {
 
     fn seed_grant(
         conn: &Connection,
-        grant_id: EntryHash,
+        grant_id: AccountEntryHash,
         owner: AccountId,
         grantee: AccountId,
         role: &str,
@@ -4233,7 +4241,7 @@ mod tests {
     /// pin.
     fn seed_closed_grant_with_cut(
         conn: &Connection,
-        grant_id: EntryHash,
+        grant_id: AccountEntryHash,
         owner: AccountId,
         grantee: AccountId,
         role: &str,
@@ -4280,7 +4288,7 @@ mod tests {
         .unwrap();
     }
 
-    fn verdict(conn: &Connection, entry_hash: &EntryHash) -> (String, i64) {
+    fn verdict(conn: &Connection, entry_hash: &AccountEntryHash) -> (String, i64) {
         conn.query_row(
             "SELECT s.status, e.accepted FROM content_entries e
              JOIN content_entry_status s ON s.entry_hash = e.entry_hash

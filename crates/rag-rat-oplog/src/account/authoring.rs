@@ -34,7 +34,7 @@ use crate::local_device;
 use crate::op::DeviceFingerprint;
 use crate::stream::{self, StreamId};
 
-type EntryHash = [u8; 32];
+type AccountEntryHash = [u8; 32];
 
 /// Ensure the repo's `/2` owner stream is owned by the store's local account, authoring exactly one
 /// `StreamOwn` if the ownership fact is not already present, and return the `/2` `stream_id`.
@@ -194,10 +194,10 @@ fn author_account_op_in_tx(
     tx: &Transaction<'_>,
     device: &LocalDevice,
     account_id: AccountId,
-    genesis_hash: EntryHash,
+    genesis_hash: AccountEntryHash,
     op: &AccountOp,
     now_ms: i64,
-) -> anyhow::Result<EntryHash> {
+) -> anyhow::Result<AccountEntryHash> {
     let fingerprint = device.fingerprint();
     // Chain from the control-log tail. Post-genesis the tail is never empty (the genesis is seq 0);
     // an empty chain here means the caller skipped the mint, which is a programming error.
@@ -402,7 +402,7 @@ pub fn author_device_add_in_tx(
     joiner: EnrollingDevice,
     role: ops::DeviceRole,
     now_ms: i64,
-) -> anyhow::Result<EntryHash> {
+) -> anyhow::Result<AccountEntryHash> {
     author_device_add_with_promotion_in_tx(tx, joiner, role, now_ms, DeviceAddPromotion::Retry)
 }
 
@@ -413,7 +413,7 @@ pub fn author_enrollment_device_add_in_tx(
     joiner: EnrollingDevice,
     role: ops::DeviceRole,
     now_ms: i64,
-) -> anyhow::Result<EntryHash> {
+) -> anyhow::Result<AccountEntryHash> {
     author_device_add_with_promotion_in_tx(tx, joiner, role, now_ms, DeviceAddPromotion::Defer)
 }
 
@@ -429,7 +429,7 @@ fn author_device_add_with_promotion_in_tx(
     role: ops::DeviceRole,
     now_ms: i64,
     promotion: DeviceAddPromotion,
-) -> anyhow::Result<EntryHash> {
+) -> anyhow::Result<AccountEntryHash> {
     validate_device_add_label(joiner.label.as_deref())?;
     let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
         "cannot enroll a device before the store's local account is minted (call local_account \
@@ -504,7 +504,7 @@ pub fn author_stream_grant_in_tx(
     grantee_account_id: AccountId,
     role: ops::GrantRole,
     now_ms: i64,
-) -> anyhow::Result<EntryHash> {
+) -> anyhow::Result<AccountEntryHash> {
     let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
         "cannot author a stream grant before the store's local account is minted (call \
          local_account first)",
@@ -578,9 +578,9 @@ impl RevokeReason {
 pub struct StreamRevocation {
     /// The WRITER grants this revoke closed — plural, because double-granting authors two
     /// effective grant ids and leaving either open would leave the grantee writing.
-    pub grant_ids: Vec<EntryHash>,
+    pub grant_ids: Vec<AccountEntryHash>,
     /// The authored `StreamRevoke` entries, one per closed grant.
-    pub revoke_ids: Vec<EntryHash>,
+    pub revoke_ids: Vec<AccountEntryHash>,
     /// The chain cuts each revoke carries — what prior work stays valid.
     pub cuts: Vec<ops::DeviceCut>,
 }
@@ -693,7 +693,7 @@ pub(super) fn account_chain_tail(
     account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
     log_id: u8,
-) -> anyhow::Result<Option<(u64, EntryHash)>> {
+) -> anyhow::Result<Option<(u64, AccountEntryHash)>> {
     let row: Option<(i64, Vec<u8>)> = tx
         .query_row(
             "SELECT seq, entry_hash FROM account_entries
@@ -710,7 +710,7 @@ pub(super) fn account_chain_tail(
     row.map(|(seq, hash)| {
         let seq = u64::try_from(seq)
             .map_err(|_| anyhow::anyhow!("account chain tail seq is negative: {seq}"))?;
-        let hash: EntryHash = hash
+        let hash: AccountEntryHash = hash
             .as_slice()
             .try_into()
             .map_err(|_| anyhow::anyhow!("entry_hash is not 32 bytes"))?;

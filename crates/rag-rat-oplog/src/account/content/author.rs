@@ -44,7 +44,7 @@ use crate::op::{self, DeviceFingerprint, MemoryOp};
 use crate::stream::StreamId;
 use crate::{LocalDevice, content_projection, local_device};
 
-type EntryHash = [u8; 32];
+type AccountEntryHash = [u8; 32];
 
 /// The PROVEN worst-case byte overhead a signed `/3` content entry adds around an op body —
 /// `signed_bytes.len() - payload.len()` maximized over every header field value and every payload
@@ -135,7 +135,7 @@ pub fn content_op_is_sealed_authorable(op: &MemoryOp) -> bool {
 /// The `/3` chain tail for one `(stream, author, device)` coordinate: its highest-`seq` entry.
 struct ContentChainTail {
     seq: u64,
-    entry_hash: EntryHash,
+    entry_hash: AccountEntryHash,
 }
 
 /// Author `ops` as owner-authored `/3` content on `stream_id` WITHIN the caller's transaction:
@@ -150,7 +150,7 @@ pub fn author_content_batch_in_tx(
     stream_id: StreamId,
     ops: &[MemoryOp],
     now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     // Owner-authored: the store's single local account is both author and owner. Resolve it (and
     // its genesis entry hash, the `roster_ref`) from the pointer WITHOUT minting — the account
     // must already exist.
@@ -185,9 +185,9 @@ struct BatchAuthoring<'a> {
     stream_id: StreamId,
     account_id: AccountId,
     device: &'a LocalDevice,
-    roster_ref: EntryHash,
+    roster_ref: AccountEntryHash,
     /// `None` for the stream owner; the delegating grant for a contributor.
-    grant_id: Option<EntryHash>,
+    grant_id: Option<AccountEntryHash>,
     owner_auth_len: u64,
     author_auth_len: u64,
 }
@@ -200,7 +200,7 @@ fn author_batch_in_tx(
     authoring: &BatchAuthoring<'_>,
     ops: &[MemoryOp],
     now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     let BatchAuthoring {
         stream_id,
         account_id,
@@ -312,10 +312,10 @@ pub fn author_grantee_content_batch_in_tx(
     tx: &Transaction<'_>,
     stream_id: StreamId,
     owner_account_id: AccountId,
-    grant_id: EntryHash,
+    grant_id: AccountEntryHash,
     ops: &[MemoryOp],
     now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?
         .context("cannot author granted /3 content before the store's local account is minted")?;
     anyhow::ensure!(
@@ -413,7 +413,7 @@ pub fn author_prepared_content_batch_in_tx(
     ops: &[MemoryOp],
     prepared: &PreparedContentAuthoring,
     now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     if ops.is_empty() {
         return Ok(Vec::new());
     }
@@ -460,7 +460,7 @@ pub fn author_content_batch(
     ops: &[MemoryOp],
     policy: SealPolicy,
     now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     // An empty batch authors nothing, so it must run NO key management: the `Sealed` arm would
     // otherwise rotate or mint + commit the stream's first `StreamKeyWrap`, and on an unkeyed owned
     // stream that committed wrap arms the downgrade ratchet — permanently blocking later plaintext
@@ -646,7 +646,7 @@ fn seal_and_author_in_tx(
     key: &ContentKey,
     device: &LocalDevice,
     now_ms: i64,
-) -> anyhow::Result<Vec<EntryHash>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?
         .context("cannot author sealed /3 content before the store's local account is minted")?;
     let fingerprint = device.fingerprint();
@@ -872,7 +872,7 @@ fn batch_lamport(lamport_base: u64, index: usize) -> anyhow::Result<u64> {
 /// The current `/3` status of one entry, or `None` if the refold wrote no status row for it.
 fn content_status(
     tx: &Transaction<'_>,
-    entry_hash: &EntryHash,
+    entry_hash: &AccountEntryHash,
 ) -> rusqlite::Result<Option<String>> {
     tx.query_row(
         "SELECT status FROM content_entry_status WHERE entry_hash = ?1",
@@ -1176,14 +1176,18 @@ mod tests {
     }
 
     /// Run the in-tx seam in its own IMMEDIATE txn and commit — the shape a live mutation uses.
-    fn author_committed(conn: &Connection, stream: StreamId, ops: &[MemoryOp]) -> Vec<EntryHash> {
+    fn author_committed(
+        conn: &Connection,
+        stream: StreamId,
+        ops: &[MemoryOp],
+    ) -> Vec<AccountEntryHash> {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
         let hashes = author_content_batch_in_tx(&tx, stream, ops, NOW).expect("author batch");
         tx.commit().unwrap();
         hashes
     }
 
-    fn genesis_ref(conn: &Connection) -> EntryHash {
+    fn genesis_ref(conn: &Connection) -> AccountEntryHash {
         conn.query_row(
             "SELECT genesis_entry_hash FROM oplog_local_account WHERE id = 0",
             [],
@@ -1199,7 +1203,7 @@ mod tests {
         content_chain_tail(&tx, stream, account, fingerprint).unwrap()
     }
 
-    fn stored_status(conn: &Connection, entry_hash: &EntryHash) -> Option<String> {
+    fn stored_status(conn: &Connection, entry_hash: &AccountEntryHash) -> Option<String> {
         conn.query_row(
             "SELECT status FROM content_entry_status WHERE entry_hash = ?1",
             [entry_hash.as_slice()],
@@ -1209,7 +1213,7 @@ mod tests {
         .unwrap()
     }
 
-    fn header_of(conn: &Connection, entry_hash: &EntryHash) -> ContentEntryHeader {
+    fn header_of(conn: &Connection, entry_hash: &AccountEntryHash) -> ContentEntryHeader {
         let signed_bytes: Vec<u8> = conn
             .query_row(
                 "SELECT signed_bytes FROM content_entries WHERE entry_hash = ?1",
@@ -1780,7 +1784,7 @@ mod tests {
         conn: &Connection,
         account: AccountId,
         op: &crate::account::ops::AccountOp,
-    ) -> EntryHash {
+    ) -> AccountEntryHash {
         use crate::account::envelope::{
             AccountEntryHeader, VerifiedAccountEntry, sign_account_entry,
         };
@@ -1829,9 +1833,9 @@ mod tests {
         conn: &Connection,
         account: AccountId,
         signer: &crate::device::DeviceSecret,
-        authority_ref: EntryHash,
+        authority_ref: AccountEntryHash,
         op: &crate::account::ops::AccountOp,
-    ) -> EntryHash {
+    ) -> AccountEntryHash {
         use crate::account::envelope::{
             AccountEntryHeader, VerifiedAccountEntry, sign_account_entry,
         };
@@ -1881,7 +1885,7 @@ mod tests {
         account: AccountId,
         fp: DeviceFingerprint,
         log: u8,
-    ) -> Option<(u64, EntryHash)> {
+    ) -> Option<(u64, AccountEntryHash)> {
         let tx = conn.unchecked_transaction().unwrap();
         crate::account::authoring::account_chain_tail(&tx, account, fp, log).unwrap()
     }

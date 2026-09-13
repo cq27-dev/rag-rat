@@ -34,12 +34,12 @@ use super::acceptance::{
 use super::candidate::{self, BranchPin, SecretsCandidate, SecretsCoordinate};
 use super::ops::{self, DecodedSecretsOp};
 
-type EntryHash = [u8; 32];
+type AccountEntryHash = [u8; 32];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoIncarnationState {
     Absent,
-    Current(EntryHash),
+    Current(AccountEntryHash),
     Contested,
 }
 
@@ -66,7 +66,7 @@ pub fn repo_incarnation_state(
 /// One log-1 candidate resolved against the current fold. A non-evaluable entry carries no facts —
 /// it is slot-eligible but its verdict is fixed at `retained_unfolded`.
 struct ResolvedSecretsEntry {
-    entry_hash: EntryHash,
+    entry_hash: AccountEntryHash,
     header: AccountEntryHeader,
     dense_predecessor_reachable: bool,
     facts: Option<WrapFacts>,
@@ -89,9 +89,9 @@ impl ResolvedSecretsEntry {
 
 /// The authority facts for one evaluable `StreamKeyWrap`, all read from ONE fold snapshot.
 struct WrapFacts {
-    authority_ref: Option<EntryHash>,
+    authority_ref: Option<AccountEntryHash>,
     owner_authority: AuthorityQuery<OwnerChainAuthority>,
-    ownership: Option<AuthorityQuery<EntryHash>>,
+    ownership: Option<AuthorityQuery<AccountEntryHash>>,
     freshness: CitedFreshness,
     /// The owning account's contested state (§12) — identical for every entry this refold.
     contested: bool,
@@ -115,13 +115,13 @@ enum Phase {
 pub(in crate::account) fn refold_secrets_log(
     tx: &Transaction<'_>,
     account_id: AccountId,
-    statuses: &mut HashMap<EntryHash, EntryStatus>,
+    statuses: &mut HashMap<AccountEntryHash, EntryStatus>,
 ) -> anyhow::Result<()> {
     let headers = load_secrets_headers(tx, account_id)?;
     if headers.is_empty() {
         return Ok(());
     }
-    let view: HashMap<EntryHash, AccountEntryHeader> =
+    let view: HashMap<AccountEntryHash, AccountEntryHeader> =
         headers.iter().map(|(hash, header, _)| (*hash, header.clone())).collect();
     let reachable = reachable_entries(&view);
     let resolved = resolve_secrets_entries(tx, account_id, &headers, &reachable)?;
@@ -149,7 +149,7 @@ pub(in crate::account) fn refold_secrets_log(
     // Phase 2 — the finished verdict, made prefix-closed, then the write. A non-evaluable winner is
     // prefix-TRANSPARENT: it does not accept itself but does not break the accepted prefix for its
     // descendants (B-2).
-    let mut raw: HashMap<EntryHash, SecretsAcceptance> = HashMap::new();
+    let mut raw: HashMap<AccountEntryHash, SecretsAcceptance> = HashMap::new();
     for r in &resolved {
         if r.is_evaluable() {
             let selected = selection.accepted.contains(&r.entry_hash);
@@ -197,7 +197,7 @@ pub(in crate::account) fn refold_secrets_log(
 /// wrap.
 fn verdict_for(
     r: &ResolvedSecretsEntry,
-    view: &HashMap<EntryHash, AccountEntryHeader>,
+    view: &HashMap<AccountEntryHash, AccountEntryHeader>,
     branch_selected: bool,
     phase: Phase,
 ) -> anyhow::Result<Option<SecretsAcceptance>> {
@@ -214,7 +214,7 @@ fn verdict_for(
         branch_selected,
         freshness: facts.freshness,
         contested: facts.contested,
-        ancestry: |target: EntryHash, watermark: EntryHash| {
+        ancestry: |target: AccountEntryHash, watermark: AccountEntryHash| {
             ancestry_relation(target, watermark, view)
         },
     };
@@ -232,7 +232,7 @@ fn verdict_for(
 fn load_secrets_headers(
     tx: &Transaction<'_>,
     account_id: AccountId,
-) -> anyhow::Result<Vec<(EntryHash, AccountEntryHeader, Vec<u8>)>> {
+) -> anyhow::Result<Vec<(AccountEntryHash, AccountEntryHeader, Vec<u8>)>> {
     let mut stmt = tx.prepare(
         "SELECT entry_hash, signed_bytes FROM account_entries
          WHERE account_id = ?1 AND log_id = ?2
@@ -264,9 +264,11 @@ fn load_secrets_headers(
 /// The entries whose dense secrets chain is fully held back to seq 0, in ONE O(n) forward pass from
 /// the chain roots (mirrors `content::storage::reachable_entries`). A secrets chain is dense per
 /// `(account, device)` on `log: SECRETS_LOG`.
-fn reachable_entries(view: &HashMap<EntryHash, AccountEntryHeader>) -> HashSet<EntryHash> {
-    let mut by_prev: HashMap<EntryHash, Vec<&EntryHash>> = HashMap::new();
-    let mut queue: VecDeque<&EntryHash> = VecDeque::new();
+fn reachable_entries(
+    view: &HashMap<AccountEntryHash, AccountEntryHeader>,
+) -> HashSet<AccountEntryHash> {
+    let mut by_prev: HashMap<AccountEntryHash, Vec<&AccountEntryHash>> = HashMap::new();
+    let mut queue: VecDeque<&AccountEntryHash> = VecDeque::new();
     for (hash, header) in view {
         match header.prev_hash {
             None if header.seq == 0 => queue.push_back(hash),
@@ -304,8 +306,8 @@ fn reachable_entries(view: &HashMap<EntryHash, AccountEntryHeader>) -> HashSet<E
 fn resolve_secrets_entries(
     tx: &Transaction<'_>,
     account_id: AccountId,
-    headers: &[(EntryHash, AccountEntryHeader, Vec<u8>)],
-    reachable: &HashSet<EntryHash>,
+    headers: &[(AccountEntryHash, AccountEntryHeader, Vec<u8>)],
+    reachable: &HashSet<AccountEntryHash>,
 ) -> anyhow::Result<Vec<ResolvedSecretsEntry>> {
     // The account's contested state is the same for every entry — read it once (§12).
     let contested = storage::account_is_contested(tx, account_id)?;
@@ -329,8 +331,11 @@ fn resolve_secrets_entries(
 /// sharing one owner incarnation resolves each fact once.
 #[derive(Default)]
 struct Caches {
-    owner: HashMap<(EntryHash, crate::op::DeviceFingerprint), AuthorityQuery<OwnerChainAuthority>>,
-    ownership: HashMap<crate::stream::StreamId, AuthorityQuery<EntryHash>>,
+    owner: HashMap<
+        (AccountEntryHash, crate::op::DeviceFingerprint),
+        AuthorityQuery<OwnerChainAuthority>,
+    >,
+    ownership: HashMap<crate::stream::StreamId, AuthorityQuery<AccountEntryHash>>,
     held_control_log: Option<u64>,
 }
 
@@ -442,9 +447,9 @@ fn branch_pins(resolved: &[ResolvedSecretsEntry]) -> Vec<BranchPin> {
 fn prefix_closed_accepted(
     resolved: &[ResolvedSecretsEntry],
     selection: &BranchSelection,
-    raw: &HashMap<EntryHash, SecretsAcceptance>,
-) -> HashSet<EntryHash> {
-    let mut chains: HashMap<SecretsCoordinate, Vec<(u64, EntryHash, bool)>> = HashMap::new();
+    raw: &HashMap<AccountEntryHash, SecretsAcceptance>,
+) -> HashSet<AccountEntryHash> {
+    let mut chains: HashMap<SecretsCoordinate, Vec<(u64, AccountEntryHash, bool)>> = HashMap::new();
     for r in resolved {
         if selection.accepted.contains(&r.entry_hash) {
             let coordinate = SecretsCoordinate {
@@ -479,14 +484,15 @@ fn rewrite_repo_incarnation_projection(
     tx: &Transaction<'_>,
     account_id: AccountId,
     resolved: &[ResolvedSecretsEntry],
-    accepted: &HashSet<EntryHash>,
+    accepted: &HashSet<AccountEntryHash>,
 ) -> anyhow::Result<()> {
     let account = account_id.to_bytes();
     tx.execute("DELETE FROM account_repo_incarnation_current WHERE account_id = ?1", [
         account.as_slice()
     ])?;
 
-    let mut by_repo: HashMap<String, Vec<(EntryHash, Option<EntryHash>)>> = HashMap::new();
+    let mut by_repo: HashMap<String, Vec<(AccountEntryHash, Option<AccountEntryHash>)>> =
+        HashMap::new();
     for entry in resolved {
         let Some(op) = &entry.incarnation else { continue };
         if !accepted.contains(&entry.entry_hash) {
@@ -496,12 +502,12 @@ fn rewrite_repo_incarnation_projection(
     }
 
     for (repo_id, nodes) in by_repo {
-        let held: HashSet<EntryHash> = nodes.iter().map(|(hash, _)| *hash).collect();
-        let roots: Vec<EntryHash> = nodes
+        let held: HashSet<AccountEntryHash> = nodes.iter().map(|(hash, _)| *hash).collect();
+        let roots: Vec<AccountEntryHash> = nodes
             .iter()
             .filter_map(|(hash, predecessor)| predecessor.is_none().then_some(*hash))
             .collect();
-        let mut children: HashMap<EntryHash, Vec<EntryHash>> = HashMap::new();
+        let mut children: HashMap<AccountEntryHash, Vec<AccountEntryHash>> = HashMap::new();
         let mut contested = roots.len() != 1;
         for (hash, predecessor) in &nodes {
             if let Some(predecessor) = predecessor {
@@ -544,9 +550,9 @@ fn rewrite_repo_incarnation_projection(
 /// `Accepted`, and OVERWRITE the caller's status map (S4).
 fn write_secrets_verdict(
     tx: &Transaction<'_>,
-    entry_hash: &EntryHash,
+    entry_hash: &AccountEntryHash,
     verdict: SecretsAcceptance,
-    statuses: &mut HashMap<EntryHash, EntryStatus>,
+    statuses: &mut HashMap<AccountEntryHash, EntryStatus>,
 ) -> rusqlite::Result<()> {
     let (status, detail) = verdict.as_db_pair();
     tx.execute(
@@ -566,8 +572,8 @@ fn write_secrets_verdict(
 /// Map the account-log ancestry verdict into the evaluator's `AncestryRelation` (both name a
 /// withheld watermark and a missing mid-chain link apart — I11).
 fn ancestry_relation(
-    target: EntryHash,
-    watermark: EntryHash,
+    target: AccountEntryHash,
+    watermark: AccountEntryHash,
     view: &dyn HeaderView,
 ) -> AncestryRelation {
     // The seq is unused by the ancestry walk (it follows `prev_hash` from the watermark hash), so a

@@ -18,7 +18,7 @@ use super::super::{
     EntryStatus, OwnerChainAuthority,
 };
 
-type EntryHash = [u8; 32];
+type AccountEntryHash = [u8; 32];
 
 /// Why an ancestry walk against a cut watermark could not be decided (mirrors the account fold's
 /// `UnknownCause`: a withheld watermark parks, and never flips a verdict — I11).
@@ -126,20 +126,20 @@ impl SecretsAcceptance {
 #[derive(Clone)]
 pub(in crate::account) struct SecretsAcceptanceInput<F>
 where
-    F: Fn(EntryHash, EntryHash) -> AncestryRelation,
+    F: Fn(AccountEntryHash, AccountEntryHash) -> AncestryRelation,
 {
     /// The owning account — the account whose secrets log carries this wrap.
     pub(in crate::account) account_id: AccountId,
-    pub(in crate::account) entry_hash: EntryHash,
+    pub(in crate::account) entry_hash: AccountEntryHash,
     pub(in crate::account) seq: u64,
     /// The header's `authority_ref` — the cited owner incarnation id (null ⇒ reject).
-    pub(in crate::account) authority_ref: Option<EntryHash>,
+    pub(in crate::account) authority_ref: Option<AccountEntryHash>,
     /// The cited owner incarnation resolved via `owner_secrets_authority` (the two secrets
     /// boundaries).
     pub(in crate::account) owner_authority: AuthorityQuery<OwnerChainAuthority>,
     /// The account's ownership of the wrap's stream (`stream_owner_effective`).
     /// Required for key wraps; repository-incarnation artifacts carry no content stream.
-    pub(in crate::account) ownership: Option<AuthorityQuery<EntryHash>>,
+    pub(in crate::account) ownership: Option<AuthorityQuery<AccountEntryHash>>,
     /// The header's asserted control-fold length (`auth_len`) — the value `freshness` must have
     /// been computed against (provenance).
     pub(in crate::account) asserted_auth_len: u64,
@@ -156,7 +156,7 @@ pub(in crate::account) fn evaluate_secrets_acceptance<F>(
     input: &SecretsAcceptanceInput<F>,
 ) -> Result<SecretsAcceptance, SecretsAcceptanceInputError>
 where
-    F: Fn(EntryHash, EntryHash) -> AncestryRelation,
+    F: Fn(AccountEntryHash, AccountEntryHash) -> AncestryRelation,
 {
     if let Some(verdict) = authority_verdict(input)? {
         return Ok(verdict);
@@ -189,7 +189,7 @@ pub(in crate::account) fn authority_verdict<F>(
     input: &SecretsAcceptanceInput<F>,
 ) -> Result<Option<SecretsAcceptance>, SecretsAcceptanceInputError>
 where
-    F: Fn(EntryHash, EntryHash) -> AncestryRelation,
+    F: Fn(AccountEntryHash, AccountEntryHash) -> AncestryRelation,
 {
     // Provenance first: a freshness verdict computed for another account, or against a different
     // asserted length than this header makes, decides nothing about THIS entry. Both components are
@@ -279,11 +279,11 @@ fn invalid_owner_citation(
 fn combine_boundaries<F>(
     boundaries: &[AuthorityBoundary],
     seq: u64,
-    entry_hash: EntryHash,
+    entry_hash: AccountEntryHash,
     ancestry: &F,
 ) -> Option<SecretsAcceptance>
 where
-    F: Fn(EntryHash, EntryHash) -> AncestryRelation,
+    F: Fn(AccountEntryHash, AccountEntryHash) -> AncestryRelation,
 {
     let rank = boundaries.iter().fold(0, |rank, boundary| {
         let candidate = match *boundary {
@@ -314,8 +314,8 @@ where
 mod tests {
     use super::*;
 
-    const ENTRY_HASH: EntryHash = [9; 32];
-    const OWNER_ID: EntryHash = [7; 32];
+    const ENTRY_HASH: AccountEntryHash = [9; 32];
+    const OWNER_ID: AccountEntryHash = [7; 32];
 
     fn account() -> AccountId {
         AccountId::from_bytes([5; 32])
@@ -337,7 +337,8 @@ mod tests {
     fn base(
         owner_authority: AuthorityQuery<OwnerChainAuthority>,
         relation: AncestryRelation,
-    ) -> SecretsAcceptanceInput<impl Fn(EntryHash, EntryHash) -> AncestryRelation> {
+    ) -> SecretsAcceptanceInput<impl Fn(AccountEntryHash, AccountEntryHash) -> AncestryRelation>
+    {
         SecretsAcceptanceInput {
             account_id: account(),
             entry_hash: ENTRY_HASH,
