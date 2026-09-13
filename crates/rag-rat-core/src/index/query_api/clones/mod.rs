@@ -114,7 +114,7 @@ const _: () = assert!(
 pub(crate) const HYDRATION_CHUNK: usize = 900;
 
 use rag_rat_clones::refine::cache::{
-    RefineMode, refine_compute_and_store_budgeted, refine_lookup, refinement_key,
+    RefineMode, RefineRequest, refine_compute_and_store_budgeted, refine_lookup, refinement_key,
 };
 use rag_rat_clones::refine::split::coherence_split;
 
@@ -579,12 +579,14 @@ impl IndexDatabase {
         // half falls back to the canonical-first member when it is `None`.
         let refinement = refine_compute_and_store_budgeted(
             conn,
-            &key,
-            &class.language,
-            mode,
-            &members,
-            class.similarity_min,
-            class.medoid_symbol_id,
+            &RefineRequest {
+                key: &key,
+                language: &class.language,
+                mode,
+                members: &members,
+                similarity_min: class.similarity_min,
+                medoid_symbol_id: class.medoid_symbol_id,
+            },
             Some(global_refine_cells),
         )?;
         apply_refinement(class, refinement);

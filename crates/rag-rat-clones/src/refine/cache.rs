@@ -224,43 +224,41 @@ pub fn refine_lookup(
     ))
 }
 
+/// One clone class's refine inputs: everything the compute half needs besides the connection and
+/// the cross-class cell allowance.
+#[derive(Clone, Copy)]
+pub struct RefineRequest<'a> {
+    /// The content-addressed cache key from [`refinement_key`].
+    pub key: &'a str,
+    pub language: &'a str,
+    pub mode: RefineMode,
+    pub members: &'a [RefineMember],
+    /// The Plan-2 pairwise floor for the class — it feeds the v2 confidence band only, not the
+    /// cache key (the key is purely structural).
+    pub similarity_min: f64,
+    /// The class's bag-overlap medoid (Plan 4b §1.1) — threaded out by `build_class` and passed
+    /// straight through as the anti-unify spine anchor; `None` falls back to the canonical-first
+    /// `(struct_hash, path, start_byte)` member.
+    pub medoid_symbol_id: Option<i64>,
+}
+
 /// COMPUTE + WRITE: run the full anti-unification (medoid-anchored star LCS → template + variation
 /// points → proposed signature), score it with the metavar-profile-aware v2 formulas, persist the
-/// full `clone_refinements` row keyed by `refinement_key`, and return the computed refinement. This
-/// is the expensive half (the star alignment + the INSERT) and REQUIRES a writable connection —
-/// call it only after [`refine_lookup`] missed AND the caller confirmed the connection is
+/// full `clone_refinements` row keyed by the request's key, and return the computed refinement.
+/// This is the expensive half (the star alignment + the INSERT) and REQUIRES a writable connection
+/// — call it only after [`refine_lookup`] missed AND the caller confirmed the connection is
 /// read-write (otherwise the INSERT errors with `SQLITE_READONLY`, which is the deliberate signal
 /// the read path uses to retry read-write — see `refine_class_in_place`).
 ///
-/// `medoid_symbol_id` is the class's bag-overlap medoid (Plan 4b §1.1) — threaded out by
-/// `build_class` and passed straight through as the anti-unify spine anchor; `None` falls back to
-/// the canonical-first `(struct_hash, path, start_byte)` member.
-///
-/// `similarity_min` is the Plan-2 pairwise floor for the class — it feeds the v2 confidence band
-/// only, not the cache key (the key is purely structural). Plan 4b persists the REAL payload: the
-/// rendered anti-unification `template`, the serialized `variation_points` + `proposed_signature`,
-/// and the REAL `anti_unify_coverage` (`fixed_spine_columns / total_spine_columns`, no longer the
-/// 4a `lcs_ratio` proxy).
+/// Plan 4b persists the REAL payload: the rendered anti-unification `template`, the serialized
+/// `variation_points` + `proposed_signature`, and the REAL `anti_unify_coverage`
+/// (`fixed_spine_columns / total_spine_columns`, no longer the 4a `lcs_ratio` proxy).
 #[cfg(test)]
 pub(crate) fn refine_compute_and_store(
     conn: &Connection,
-    refinement_key: &str,
-    language: &str,
-    mode: RefineMode,
-    members: &[RefineMember],
-    similarity_min: f64,
-    medoid_symbol_id: Option<i64>,
+    request: &RefineRequest<'_>,
 ) -> anyhow::Result<CachedRefinement> {
-    refine_compute_and_store_budgeted(
-        conn,
-        refinement_key,
-        language,
-        mode,
-        members,
-        similarity_min,
-        medoid_symbol_id,
-        None,
-    )
+    refine_compute_and_store_budgeted(conn, request, None)
 }
 
 /// [`refine_compute_and_store`] with an OPTIONAL shared CROSS-CLASS cell allowance
@@ -274,17 +272,19 @@ pub(crate) fn refine_compute_and_store(
 /// so cached classes don't consume the global budget. DETERMINISM: the per-class budget is a pure
 /// function of `*remaining` at entry and the driver refines classes in a fixed provisional-ROI
 /// order, so the same input always truncates at the same class/pair — byte-identical output.
-#[allow(clippy::too_many_arguments)]
 pub fn refine_compute_and_store_budgeted(
     conn: &Connection,
-    refinement_key: &str,
-    language: &str,
-    mode: RefineMode,
-    members: &[RefineMember],
-    similarity_min: f64,
-    medoid_symbol_id: Option<i64>,
+    request: &RefineRequest<'_>,
     mut global_remaining: Option<&mut u64>,
 ) -> anyhow::Result<CachedRefinement> {
+    let RefineRequest {
+        key: refinement_key,
+        language,
+        mode,
+        members,
+        similarity_min,
+        medoid_symbol_id,
+    } = *request;
     // MODE COHERENCE (#275): a Baseline row must be oracle-independent — it survives
     // `invalidate_scip_refinements`, so its payload may never depend on attached monikers. The
     // driver only attaches monikers when it probed Scip; this assert keeps a future caller from
@@ -392,30 +392,15 @@ pub fn refine_compute_and_store_budgeted(
 /// [`refine_compute_and_store`]. Requires a writable connection on a cache miss. The RO-aware read
 /// path (`refine_class_in_place`) calls the two halves directly so it can probe the cache on a
 /// read-only connection and surface `SQLITE_READONLY` BEFORE any expensive compute.
-///
-/// `medoid_symbol_id` threads the anti-unify spine anchor through to the compute half (Plan 4b).
 #[cfg(test)]
 pub(crate) fn refine_class(
     conn: &Connection,
-    refinement_key: &str,
-    language: &str,
-    mode: RefineMode,
-    members: &[RefineMember],
-    similarity_min: f64,
-    medoid_symbol_id: Option<i64>,
+    request: &RefineRequest<'_>,
 ) -> anyhow::Result<CachedRefinement> {
-    if let Some(cached) = refine_lookup(conn, refinement_key, mode)? {
+    if let Some(cached) = refine_lookup(conn, request.key, request.mode)? {
         return Ok(cached);
     }
-    refine_compute_and_store(
-        conn,
-        refinement_key,
-        language,
-        mode,
-        members,
-        similarity_min,
-        medoid_symbol_id,
-    )
+    refine_compute_and_store(conn, request)
 }
 
 /// Drop every NON-baseline refinement row (#275, finding 3): an `oracle run` rewrites the
@@ -451,6 +436,19 @@ mod tests {
     use crate::normalize::{NodeSpan, normalize_baseline_spanned};
     use crate::refine::align::LCS_MAX_SEQ_TOKENS;
     use crate::tokens;
+
+    /// A `rust` baseline request at the unit similarity floor with no medoid — the shape nearly
+    /// every cache test refines.
+    fn baseline_request<'a>(key: &'a str, members: &'a [RefineMember]) -> RefineRequest<'a> {
+        RefineRequest {
+            key,
+            language: "rust",
+            mode: RefineMode::Baseline,
+            members,
+            similarity_min: 1.0,
+            medoid_symbol_id: None,
+        }
+    }
 
     /// Build a `RefineMember` from a Rust snippet, mirroring `load_refine_members`: parse, descend
     /// to the first `function` symbol, span-normalize (so `node_spans.len() == seq.len()`),
@@ -593,16 +591,8 @@ mod tests {
         ];
         let key = refinement_key("rust", RefineMode::Baseline, &["h1".into(), "h2".into()], &[]);
 
-        let refinement = refine_compute_and_store(
-            &conn,
-            &key,
-            "rust",
-            RefineMode::Baseline,
-            &members,
-            1.0,
-            None,
-        )
-        .unwrap();
+        let refinement =
+            refine_compute_and_store(&conn, &baseline_request(&key, &members)).unwrap();
         assert!(refinement.lcs_sampled, "long-member compute must set lcs_sampled (proxy path)");
         let rows: i64 =
             conn.query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0)).unwrap();
@@ -629,16 +619,7 @@ mod tests {
         let key = refinement_key("rust", RefineMode::Baseline, &["h1".into(), "h2".into()], &[]);
 
         // COLD compute: the length proxy engages → lcs_sampled = true, and it is PERSISTED.
-        let cold = refine_compute_and_store(
-            &conn,
-            &key,
-            "rust",
-            RefineMode::Baseline,
-            &members,
-            1.0,
-            None,
-        )
-        .unwrap();
+        let cold = refine_compute_and_store(&conn, &baseline_request(&key, &members)).unwrap();
         assert!(cold.lcs_sampled, "cold compute on long seqs must set lcs_sampled");
 
         // Confirm the bit landed in the row (1, not the DEFAULT 0).
@@ -713,14 +694,12 @@ mod tests {
         );
 
         // Miss: compute + persist one row.
-        let first =
-            refine_class(&conn, &key, "rust", RefineMode::Baseline, &members, 1.0, None).unwrap();
+        let first = refine_class(&conn, &baseline_request(&key, &members)).unwrap();
         assert_eq!(count_rows(&conn), 1, "the miss persists exactly one row");
         assert!(first.lcs_ratio > 0.99, "identical sequences ⇒ near-perfect lcs_ratio");
 
         // Hit: same key serves the cache, no new row.
-        let second =
-            refine_class(&conn, &key, "rust", RefineMode::Baseline, &members, 1.0, None).unwrap();
+        let second = refine_class(&conn, &baseline_request(&key, &members)).unwrap();
         assert_eq!(count_rows(&conn), 1, "the hit must NOT grow the row count");
         assert_eq!(
             first.confidence, second.confidence,
@@ -789,16 +768,7 @@ mod tests {
             &discriminators_for(&members),
         );
 
-        let computed = refine_compute_and_store(
-            &conn,
-            &key,
-            "rust",
-            RefineMode::Baseline,
-            &members,
-            1.0,
-            None,
-        )
-        .unwrap();
+        let computed = refine_compute_and_store(&conn, &baseline_request(&key, &members)).unwrap();
         // The payload is non-trivial: a real template + a non-empty VP array + a non-stub
         // signature.
         assert!(!computed.template.is_empty(), "computed template must be non-empty");
@@ -881,16 +851,8 @@ mod tests {
 
         // Recompute: writes the row at the current version with the REAL payload (INSERT OR REPLACE
         // over the same class_key PRIMARY KEY).
-        let recomputed = refine_compute_and_store(
-            &conn,
-            &key,
-            "rust",
-            RefineMode::Baseline,
-            &members,
-            1.0,
-            None,
-        )
-        .unwrap();
+        let recomputed =
+            refine_compute_and_store(&conn, &baseline_request(&key, &members)).unwrap();
         assert_ne!(recomputed.template, "STALE 4A SKELETON", "must recompute the real template");
         assert_ne!(recomputed.variation_points_json, "[]", "recompute fills the real VP array");
 
@@ -931,16 +893,8 @@ mod tests {
         let hashes_a: Vec<String> = class_a.iter().map(|m| m.struct_hash.clone()).collect();
         let discs_a = discriminators_for(&class_a);
         let key_a = refinement_key("rust", RefineMode::Baseline, &hashes_a, &discs_a);
-        let computed_a = refine_compute_and_store(
-            &conn,
-            &key_a,
-            "rust",
-            RefineMode::Baseline,
-            &class_a,
-            1.0,
-            None,
-        )
-        .unwrap();
+        let computed_a =
+            refine_compute_and_store(&conn, &baseline_request(&key_a, &class_a)).unwrap();
 
         // Re-key the SAME content (same struct_hash multiset + same source bytes) → same key, same
         // template (cache hit).
@@ -961,16 +915,8 @@ mod tests {
         let key_b =
             refinement_key("rust", RefineMode::Baseline, &hashes_b, &discriminators_for(&class_b));
         assert_ne!(key_a, key_b, "different content must address a different refinement");
-        let computed_b = refine_compute_and_store(
-            &conn,
-            &key_b,
-            "rust",
-            RefineMode::Baseline,
-            &class_b,
-            1.0,
-            None,
-        )
-        .unwrap();
+        let computed_b =
+            refine_compute_and_store(&conn, &baseline_request(&key_b, &class_b)).unwrap();
         assert_ne!(
             computed_a.template, computed_b.template,
             "structurally different classes must not share a template"
@@ -1022,26 +968,10 @@ mod tests {
         );
 
         // Compute A, then B. Two distinct keys → two distinct rows, each with its OWN payload.
-        let computed_a = refine_compute_and_store(
-            &conn,
-            &key_a,
-            "rust",
-            RefineMode::Baseline,
-            &class_a,
-            1.0,
-            None,
-        )
-        .unwrap();
-        let computed_b = refine_compute_and_store(
-            &conn,
-            &key_b,
-            "rust",
-            RefineMode::Baseline,
-            &class_b,
-            1.0,
-            None,
-        )
-        .unwrap();
+        let computed_a =
+            refine_compute_and_store(&conn, &baseline_request(&key_a, &class_a)).unwrap();
+        let computed_b =
+            refine_compute_and_store(&conn, &baseline_request(&key_b, &class_b)).unwrap();
         let rows: i64 =
             conn.query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 2, "two source-distinct classes persist two distinct rows");
@@ -1101,18 +1031,12 @@ mod tests {
         let discs = discriminators_for(&members);
         let base_key = refinement_key("rust", RefineMode::Baseline, &hashes, &discs);
         let scip_key = refinement_key("rust", RefineMode::Scip, &hashes, &discs);
-        refine_compute_and_store(
-            &conn,
-            &base_key,
-            "rust",
-            RefineMode::Baseline,
-            &members,
-            1.0,
-            None,
-        )
+        refine_compute_and_store(&conn, &baseline_request(&base_key, &members)).unwrap();
+        refine_compute_and_store(&conn, &RefineRequest {
+            mode: RefineMode::Scip,
+            ..baseline_request(&scip_key, &members)
+        })
         .unwrap();
-        refine_compute_and_store(&conn, &scip_key, "rust", RefineMode::Scip, &members, 1.0, None)
-            .unwrap();
 
         let dropped = invalidate_scip_refinements(&conn).unwrap();
         assert_eq!(dropped, 1, "exactly the scip row is dropped");
@@ -1156,16 +1080,7 @@ mod tests {
         assert_eq!(key1, key2, "byte-identical source → same content key (true dupe)");
 
         // Compute class 1 → persists one row.
-        let computed1 = refine_compute_and_store(
-            &conn,
-            &key1,
-            "rust",
-            RefineMode::Baseline,
-            &class1,
-            1.0,
-            None,
-        )
-        .unwrap();
+        let computed1 = refine_compute_and_store(&conn, &baseline_request(&key1, &class1)).unwrap();
         let rows_after_1: i64 =
             conn.query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0)).unwrap();
         assert_eq!(rows_after_1, 1, "class 1 persists one row");
