@@ -470,37 +470,12 @@ pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
     policy: AuthPolicy,
     now_ms: i64,
 ) -> Result<SessionReport, SyncFailure> {
-    let local_node = *endpoint.id().as_bytes();
     // The `alpn` selects the STREAM the dialer wants — [`SYNC_ALPN`] for the account log,
     // [`CONTENT_SYNC_ALPN`] for `/3` content — and must match `store`'s type. The acceptor routes
     // to the matching store by the negotiated ALPN.
-    //
-    // Bound every peer-controlled wait explicitly (mirroring `accept_and_sync`), rather than
-    // inheriting a transport dependency's idle default: a dead or unreachable configured peer must
-    // fail this dial promptly — a device-side sync holds the per-database session lock while it
-    // runs.
-    let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, alpn))
-        .await
-        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("dial timed out".into())))?
-        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
-    let remote_node = *conn.remote_id().as_bytes();
-    let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.open_bi())
-        .await
-        .map_err(|_| {
-            SyncFailure::Endpoint(EndpointError::Connect("opening a stream timed out".into()))
-        })?
-        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
-    let (capabilities, _admission) = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
-        role: AuthRole::Dialer,
-        account_id: store.account_id(),
-        local_node,
-        remote_node,
-        policy,
-        now_ms,
-        pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
-    })
-    .await
-    .map_err(SyncFailure::Auth)?;
+    let account_id = store.account_id();
+    let AuthedDial { conn, send, recv, capabilities } =
+        dial_authed(endpoint, peer, alpn, &*store, account_id, policy, now_ms).await?;
     let report = run_session(store, send, recv, AuthRole::Dialer, capabilities)
         .await
         .map_err(SyncFailure::Session)?;
@@ -519,38 +494,74 @@ pub async fn connect_and_table_sync<S: TableSyncStore + NodeAuth>(
     store: &mut S,
     now_ms: i64,
 ) -> Result<TableSessionReport, SyncFailure> {
-    let local_node = *endpoint.id().as_bytes();
-    let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, TABLE_SYNC_ALPN))
-        .await
-        .map_err(|_| {
-            SyncFailure::Endpoint(EndpointError::Connect("table-sync dial timed out".into()))
-        })?
-        .map_err(|error| SyncFailure::Endpoint(EndpointError::Connect(error.to_string())))?;
-    let remote_node = *conn.remote_id().as_bytes();
-    let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.open_bi())
-        .await
-        .map_err(|_| {
-            SyncFailure::Endpoint(EndpointError::Connect(
-                "opening a table-sync stream timed out".into(),
-            ))
-        })?
-        .map_err(|error| SyncFailure::Endpoint(EndpointError::Connect(error.to_string())))?;
-    let (capabilities, _admission) = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
-        role: AuthRole::Dialer,
-        account_id: store.account_id(),
-        local_node,
-        remote_node,
-        policy: AuthPolicy::Closed,
+    let account_id = store.account_id();
+    let AuthedDial { conn, send, recv, capabilities } = dial_authed(
+        endpoint,
+        peer,
+        TABLE_SYNC_ALPN,
+        &*store,
+        account_id,
+        AuthPolicy::Closed,
         now_ms,
-        pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
-    })
-    .await
-    .map_err(SyncFailure::Auth)?;
+    )
+    .await?;
     let report = run_table_session(store, send, recv, AuthRole::Dialer, capabilities)
         .await
         .map_err(SyncFailure::TableSession)?;
     conn.close(0u32.into(), b"done");
     Ok(report)
+}
+
+/// A dialed connection past the mutual auth phase, its session stream open.
+struct AuthedDial {
+    conn: IrohConnection,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+    capabilities: SessionCapabilities,
+}
+
+/// Dial `peer` on `alpn`, open the session stream, and run the dialer side of the auth phase under
+/// `policy` — no inventory moves until it passes. Every peer-controlled wait is bounded explicitly
+/// (mirroring `accept_and_sync`) rather than inheriting a transport dependency's idle default: a
+/// dead or unreachable configured peer must fail the dial promptly — a device-side sync holds the
+/// per-database session lock while it runs.
+async fn dial_authed<A: NodeAuth>(
+    endpoint: &Endpoint,
+    peer: impl Into<EndpointAddr>,
+    alpn: &[u8],
+    auth: &A,
+    account_id: [u8; 32],
+    policy: AuthPolicy,
+    now_ms: i64,
+) -> Result<AuthedDial, SyncFailure> {
+    // A table-sync dial names its stream in the timeout messages.
+    let lane = if alpn == TABLE_SYNC_ALPN { "table-sync " } else { "" };
+    let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, alpn))
+        .await
+        .map_err(|_| connect_failed(format!("{lane}dial timed out")))?
+        .map_err(|error| connect_failed(error.to_string()))?;
+    let remote_node = *conn.remote_id().as_bytes();
+    let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.open_bi())
+        .await
+        .map_err(|_| connect_failed(format!("opening a {lane}stream timed out")))?
+        .map_err(|error| connect_failed(error.to_string()))?;
+    let (capabilities, _admission) = run_auth_phase(&mut send, &mut recv, auth, AuthConfig {
+        role: AuthRole::Dialer,
+        account_id,
+        local_node: *endpoint.id().as_bytes(),
+        remote_node,
+        policy,
+        now_ms,
+        pre_auth_timeout: DEFAULT_PRE_AUTH_TIMEOUT,
+    })
+    .await
+    .map_err(SyncFailure::Auth)?;
+    Ok(AuthedDial { conn, send, recv, capabilities })
+}
+
+/// A connection-stage failure: dialing, accepting, or opening a stream.
+fn connect_failed(message: impl Into<String>) -> SyncFailure {
+    SyncFailure::Endpoint(EndpointError::Connect(message.into()))
 }
 
 /// The most times a dialer re-runs a sync session against ONE peer before giving up on convergence
@@ -592,11 +603,8 @@ pub struct ReconcileReport {
 /// advertises only a bounded inventory, so a peer may re-offer already-held entries every round and
 /// the session never fully quiets; the round cap then stops it with `converged = false`, the honest
 /// outcome given the deliberate absence of a remainder-reconcile protocol for such stores.
-fn reconcile_step(report: &SessionReport, rounds_done: usize, max_rounds: usize) -> ReconcileStep {
-    let quiet = report.entries_newly_stored == 0
-        && report.entries_sent == 0
-        && report.entries_received == 0;
-    if quiet {
+fn reconcile_step(moved: bool, rounds_done: usize, max_rounds: usize) -> ReconcileStep {
+    if !moved {
         ReconcileStep::Stop { converged: true }
     } else if rounds_done >= max_rounds {
         // Still moving at the cap: the store may not be complete yet — a later maintenance pass
@@ -611,6 +619,39 @@ fn reconcile_step(report: &SessionReport, rounds_done: usize, max_rounds: usize)
 enum ReconcileStep {
     Continue,
     Stop { converged: bool },
+}
+
+/// Running totals across a reconciliation's rounds, shared by the account/content and table loops.
+#[derive(Debug, Default)]
+struct RoundTally {
+    rounds: usize,
+    entries_newly_stored: usize,
+    entries_sent: usize,
+}
+
+impl RoundTally {
+    /// Fold one finished round in and return whether it moved anything — stored, sent, OR
+    /// received; see [`reconcile_step`] for why all three count.
+    fn record(&mut self, newly_stored: usize, sent: usize, received: usize) -> bool {
+        self.rounds += 1;
+        self.entries_newly_stored += newly_stored;
+        self.entries_sent += sent;
+        newly_stored > 0 || sent > 0 || received > 0
+    }
+
+    fn report(
+        &self,
+        converged: bool,
+        peer_capability: crate::auth::PeerCapability,
+    ) -> ReconcileReport {
+        ReconcileReport {
+            rounds: self.rounds,
+            entries_newly_stored: self.entries_newly_stored,
+            entries_sent: self.entries_sent,
+            converged,
+            peer_capability,
+        }
+    }
 }
 
 /// Dial `peer` repeatedly, running one [`connect_and_sync`] session per round until the transfer
@@ -628,23 +669,14 @@ pub async fn connect_and_reconcile<S: SyncStore + NodeAuth>(
     now_ms: impl Fn() -> i64,
     max_rounds: usize,
 ) -> Result<ReconcileReport, SyncFailure> {
-    let mut entries_newly_stored = 0;
-    let mut entries_sent = 0;
-    let mut rounds = 0;
+    let mut tally = RoundTally::default();
     loop {
         let report =
             connect_and_sync(endpoint, peer.clone(), alpn, store, policy, now_ms()).await?;
-        rounds += 1;
-        entries_newly_stored += report.entries_newly_stored;
-        entries_sent += report.entries_sent;
-        if let ReconcileStep::Stop { converged } = reconcile_step(&report, rounds, max_rounds) {
-            return Ok(ReconcileReport {
-                rounds,
-                entries_newly_stored,
-                entries_sent,
-                converged,
-                peer_capability: report.peer_capability,
-            });
+        let moved =
+            tally.record(report.entries_newly_stored, report.entries_sent, report.entries_received);
+        if let ReconcileStep::Stop { converged } = reconcile_step(moved, tally.rounds, max_rounds) {
+            return Ok(tally.report(converged, report.peer_capability));
         }
     }
 }
@@ -657,38 +689,17 @@ pub async fn connect_and_table_reconcile<S: TableSyncStore + NodeAuth>(
     now_ms: impl Fn() -> i64,
     max_rounds: usize,
 ) -> Result<ReconcileReport, SyncFailure> {
-    let mut entries_newly_stored = 0;
-    let mut entries_sent = 0;
-    let mut rounds = 0;
+    let mut tally = RoundTally::default();
     loop {
         let report = connect_and_table_sync(endpoint, peer.clone(), store, now_ms()).await?;
-        rounds += 1;
-        entries_newly_stored += report.entries_newly_stored;
-        entries_sent += report.entries_sent;
-        let session = SessionReport {
-            entries_sent: report.entries_sent,
-            entries_received: report.entries_received,
-            entries_newly_stored: report.entries_newly_stored,
+        // A pending continuation is more data to move, so it keeps the loop going like any round
+        // that moved entries.
+        let moved =
+            tally.record(report.entries_newly_stored, report.entries_sent, report.entries_received)
+                || report.continuation_pending;
+        if let ReconcileStep::Stop { converged } = reconcile_step(moved, tally.rounds, max_rounds) {
             // `/5` is pinned `Closed`, so a session that ran at all was roster-authorized.
-            peer_capability: crate::auth::PeerCapability::ReadWrite,
-        };
-        let step = if report.continuation_pending {
-            if rounds >= max_rounds {
-                ReconcileStep::Stop { converged: false }
-            } else {
-                ReconcileStep::Continue
-            }
-        } else {
-            reconcile_step(&session, rounds, max_rounds)
-        };
-        if let ReconcileStep::Stop { converged } = step {
-            return Ok(ReconcileReport {
-                rounds,
-                entries_newly_stored,
-                entries_sent,
-                converged,
-                peer_capability: crate::auth::PeerCapability::ReadWrite,
-            });
+            return Ok(tally.report(converged, crate::auth::PeerCapability::ReadWrite));
         }
     }
 }
@@ -711,29 +722,26 @@ pub async fn accept_and_sync<S: SyncStore + NodeAuth>(
     now_ms: impl Fn() -> i64,
 ) -> Result<SessionReport, SyncFailure> {
     let local_node = *endpoint.id().as_bytes();
-    let incoming = endpoint
-        .accept()
-        .await
-        .ok_or_else(|| SyncFailure::Endpoint(EndpointError::Connect("endpoint closed".into())))?;
+    let incoming = endpoint.accept().await.ok_or_else(|| connect_failed("endpoint closed"))?;
     let conn = timeout(DEFAULT_IDLE_TIMEOUT, incoming)
         .await
-        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("handshake timed out".into())))?
-        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
+        .map_err(|_| connect_failed("handshake timed out"))?
+        .map_err(|e| connect_failed(e.to_string()))?;
     let remote_node = *conn.remote_id().as_bytes();
     // This single-stream acceptor serves ONLY the account-log ALPN. The endpoint binds the content
     // ALPN too (for `accept_and_dispatch`), so a content client could negotiate it and land here —
     // reject it rather than run a content connection against the account-log store.
     if conn.alpn() != SYNC_ALPN {
         conn.close(0u32.into(), b"wrong-alpn");
-        return Err(SyncFailure::Endpoint(EndpointError::Connect(format!(
+        return Err(connect_failed(format!(
             "this acceptor serves only the account-log ALPN, got {:?}",
             conn.alpn()
-        ))));
+        )));
     }
     let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.accept_bi())
         .await
-        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("peer opened no stream".into())))?
-        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
+        .map_err(|_| connect_failed("peer opened no stream"))?
+        .map_err(|e| connect_failed(e.to_string()))?;
     // Read the clock only now that a peer has connected — NOT before the accept wait above. A
     // long-idle server whose stamp/verify time predated the wait would treat a peer's freshly
     // minted binding (and its own) as future-skewed and reject the session.
@@ -788,14 +796,11 @@ where
 /// Accept and complete the transport handshake for one inbound connection. Kept separate from
 /// [`dispatch_connection`] so a resident host can keep accepting while prior sessions reconcile.
 pub async fn accept_connection(endpoint: &Endpoint) -> Result<IrohConnection, SyncFailure> {
-    let incoming = endpoint
-        .accept()
-        .await
-        .ok_or_else(|| SyncFailure::Endpoint(EndpointError::Connect("endpoint closed".into())))?;
+    let incoming = endpoint.accept().await.ok_or_else(|| connect_failed("endpoint closed"))?;
     timeout(DEFAULT_IDLE_TIMEOUT, incoming)
         .await
-        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("handshake timed out".into())))?
-        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))
+        .map_err(|_| connect_failed("handshake timed out"))?
+        .map_err(|e| connect_failed(e.to_string()))
 }
 
 /// Inbound connections admitted per second in steady state once the burst is spent. Sized to clear
@@ -928,10 +933,7 @@ pub async fn accept_connection_within_rate(
     limiter: &mut GlobalAcceptRateLimiter,
     now_ms: impl Fn() -> i64,
 ) -> Result<Option<IrohConnection>, SyncFailure> {
-    let incoming = endpoint
-        .accept()
-        .await
-        .ok_or_else(|| SyncFailure::Endpoint(EndpointError::Connect("endpoint closed".into())))?;
+    let incoming = endpoint.accept().await.ok_or_else(|| connect_failed("endpoint closed"))?;
     // Read the clock only NOW that a peer has connected — `accept()` can idle arbitrarily long, and
     // a timestamp taken before the wait would under-credit the bucket's refill and wrongly
     // refuse a connection arriving after a load-then-idle stretch.
@@ -941,8 +943,8 @@ pub async fn accept_connection_within_rate(
     }
     let conn = timeout(DEFAULT_IDLE_TIMEOUT, incoming)
         .await
-        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("handshake timed out".into())))?
-        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
+        .map_err(|_| connect_failed("handshake timed out"))?
+        .map_err(|e| connect_failed(e.to_string()))?;
     Ok(Some(conn))
 }
 
@@ -1048,10 +1050,7 @@ async fn run_dispatched<C: SyncStore>(
             }
         },
         // Enrollment is its own exchange, routed (or refused) before authorization.
-        SyncAlpn::Enroll =>
-            return Err(SyncFailure::Endpoint(EndpointError::Connect(
-                "enrollment has no sync session".into(),
-            ))),
+        SyncAlpn::Enroll => return Err(connect_failed("enrollment has no sync session")),
     };
     // Keep the acceptor alive until the dialer reads its final acknowledgement and closes.
     let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
@@ -1077,9 +1076,7 @@ where
     // serve the WRONG account's content if they differed. Our callers always pass same-account
     // stores; enforce it for the public generic API before any connection is accepted.
     if account_store.account_id() != content_store.account_id() {
-        return Err(SyncFailure::Endpoint(EndpointError::Connect(
-            "account and content stores are for different accounts".into(),
-        )));
+        return Err(connect_failed("account and content stores are for different accounts"));
     }
     let remote_node = *conn.remote_id().as_bytes();
     let alpn = conn.alpn().to_vec();
@@ -1090,14 +1087,12 @@ where
     // fails cleanly here instead of after the peer has completed authorization.
     let Ok(stream) = SyncAlpn::try_from(alpn.as_slice()) else {
         conn.close(0u32.into(), b"unknown-alpn");
-        return Err(SyncFailure::Endpoint(EndpointError::Connect(format!(
-            "peer negotiated an unknown ALPN {alpn:?}"
-        ))));
+        return Err(connect_failed(format!("peer negotiated an unknown ALPN {alpn:?}")));
     };
     let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.accept_bi())
         .await
-        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("peer opened no stream".into())))?
-        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
+        .map_err(|_| connect_failed("peer opened no stream"))?
+        .map_err(|e| connect_failed(e.to_string()))?;
     if stream == SyncAlpn::Enroll {
         let enrollment_database = account_store.connection();
         // The acceptor consumes one of the enrollment database's OWN invites and authors the
@@ -1106,12 +1101,12 @@ where
         // account — and report that as a successful enrollment — while sync connections keep
         // serving the stores' account. Refuse BEFORE redemption (the irreversible boundary).
         let matches = enrollment_database_matches(enrollment_database, account_store.account_id())
-            .map_err(|error| SyncFailure::Endpoint(EndpointError::Connect(error.to_string())))?;
+            .map_err(|error| connect_failed(error.to_string()))?;
         if !matches {
             conn.close(0u32.into(), b"enrollment-account-mismatch");
-            return Err(SyncFailure::Endpoint(EndpointError::Connect(
-                "enrollment database belongs to a different account than the sync stores".into(),
-            )));
+            return Err(connect_failed(
+                "enrollment database belongs to a different account than the sync stores",
+            ));
         }
         let outcome =
             run_enrollment_acceptor(&mut recv, &mut send, enrollment_database, remote_node, now_ms)
@@ -1186,9 +1181,7 @@ impl<'a> HostedAccount<'a> {
         policy: AuthPolicy,
     ) -> Result<Self, SyncFailure> {
         if sync.account_id() != content.account_id() {
-            return Err(SyncFailure::Endpoint(EndpointError::Connect(
-                "account and content stores are for different accounts".into(),
-            )));
+            return Err(connect_failed("account and content stores are for different accounts"));
         }
         Ok(Self { sync, content, policy })
     }
@@ -1225,15 +1218,13 @@ pub async fn dispatch_connection_multi(
         Ok(stream @ (SyncAlpn::Account | SyncAlpn::Content | SyncAlpn::Table)) => stream,
         Ok(SyncAlpn::Enroll) | Err(()) => {
             conn.close(0u32.into(), b"unknown-alpn");
-            return Err(SyncFailure::Endpoint(EndpointError::Connect(format!(
-                "multi-account host does not serve ALPN {alpn:?}"
-            ))));
+            return Err(connect_failed(format!("multi-account host does not serve ALPN {alpn:?}")));
         },
     };
     let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.accept_bi())
         .await
-        .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("peer opened no stream".into())))?
-        .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
+        .map_err(|_| connect_failed("peer opened no stream"))?
+        .map_err(|e| connect_failed(e.to_string()))?;
     // Read the clock only now that a peer has connected (see `accept_and_sync`).
     let auth_now_ms = now_ms();
     let table_alpn = stream == SyncAlpn::Table;
@@ -1358,37 +1349,25 @@ mod tests {
 
     #[test]
     fn reconcile_step_loops_until_a_fully_quiet_round() {
-        let quiet = SessionReport::default();
+        let moved = |newly_stored, sent, received| {
+            RoundTally::default().record(newly_stored, sent, received)
+        };
         // Nothing moved in either direction — the fixpoint.
-        assert_eq!(reconcile_step(&quiet, 1, 8), ReconcileStep::Stop { converged: true });
+        let quiet = moved(0, 0, 0);
+        assert_eq!(reconcile_step(quiet, 1, 8), ReconcileStep::Stop { converged: true });
         // Each direction of movement, on its own, keeps the loop going under the cap: `stored`
         // (local promotion), `received` (peer still has data), and `sent` (our push may have made
         // the acceptor evict — a quiet confirmation round must prove the re-push landed).
-        let stored = SessionReport {
-            entries_sent: 0,
-            entries_received: 0,
-            entries_newly_stored: 2,
-            peer_capability: crate::auth::PeerCapability::ReadWrite,
-        };
-        let received = SessionReport {
-            entries_sent: 0,
-            entries_received: 5,
-            entries_newly_stored: 0,
-            peer_capability: crate::auth::PeerCapability::ReadWrite,
-        };
-        let sent = SessionReport {
-            entries_sent: 3,
-            entries_received: 0,
-            entries_newly_stored: 0,
-            peer_capability: crate::auth::PeerCapability::ReadWrite,
-        };
-        for report in [&stored, &received, &sent] {
-            assert_eq!(reconcile_step(report, 1, 8), ReconcileStep::Continue);
+        let stored = moved(2, 0, 0);
+        let received = moved(0, 0, 5);
+        let sent = moved(0, 3, 0);
+        for round in [stored, received, sent] {
+            assert_eq!(reconcile_step(round, 1, 8), ReconcileStep::Continue);
         }
         // Still moving at the cap stops UN-converged so a later maintenance pass continues.
-        assert_eq!(reconcile_step(&sent, 8, 8), ReconcileStep::Stop { converged: false });
+        assert_eq!(reconcile_step(sent, 8, 8), ReconcileStep::Stop { converged: false });
         // A quiet round at the cap is still the converged fixpoint.
-        assert_eq!(reconcile_step(&quiet, 8, 8), ReconcileStep::Stop { converged: true });
+        assert_eq!(reconcile_step(quiet, 8, 8), ReconcileStep::Stop { converged: true });
     }
 
     /// A configured-peers-only resolve: nothing published, nothing to open.
