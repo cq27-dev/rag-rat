@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.2](https://github.com/cq27-dev/rag-rat/compare/v0.23.1...v0.23.2) - 2026-09-13
+
+### Added
+
+- *(sync)* publish each symbol anchor's scope so a rebind between twin impls follows ([#1303](https://github.com/cq27-dev/rag-rat/pull/1303))
+- *(sync)* relay contributors' logs and memories through the owner's sessions ([#1293](https://github.com/cq27-dev/rag-rat/pull/1293))
+- *(sync)* admit a grantor's relayed grantee entries in its sessions ([#1292](https://github.com/cq27-dev/rag-rat/pull/1292))
+
+### Fixed
+
+- *(sync)* converge a returning memory's held rows when no baseline was parked ([#1309](https://github.com/cq27-dev/rag-rat/pull/1309))
+- *(sync)* keep a binding's authored anchor on the wire and resolve it locally ([#1306](https://github.com/cq27-dev/rag-rat/pull/1306))
+- *(sync)* re-apply a synced memory's anchors and source hash when its author republishes ([#1275](https://github.com/cq27-dev/rag-rat/pull/1275))
+- *(oplog)* let a revoking cut vouch for the ops authored concurrently with it ([#1313](https://github.com/cq27-dev/rag-rat/pull/1313))
+- *(sync)* keep a removed synced memory's bindings and park its anchor baseline ([#1305](https://github.com/cq27-dev/rag-rat/pull/1305))
+- *(sync)* keep one foreign account's pull failure from stopping the rest ([#1300](https://github.com/cq27-dev/rag-rat/pull/1300))
+- *(consolidate)* leave other accounts' memories out of the legacy import ([#1299](https://github.com/cq27-dev/rag-rat/pull/1299))
+- *(oplog)* measure content freshness against the held control log ([#1296](https://github.com/cq27-dev/rag-rat/pull/1296))
+- *(sync)* clear the drain watermarks when a repository is purged ([#1289](https://github.com/cq27-dev/rag-rat/pull/1289))
+- *(oplog)* credit a revoking cut with the control ops it condemns ([#1302](https://github.com/cq27-dev/rag-rat/pull/1302))
+- *(oplog)* never compact away an entry that still carries a row ([#1291](https://github.com/cq27-dev/rag-rat/pull/1291))
+- *(sync)* count only unaccepted candidates against the content receive budgets ([#1288](https://github.com/cq27-dev/rag-rat/pull/1288))
+- *(sync)* bound the account/content session's writes by the idle timeout ([#1287](https://github.com/cq27-dev/rag-rat/pull/1287))
+
+### Other
+
+- *(base)* hold the data-dir env lock in the config tests that read the global store path ([#1290](https://github.com/cq27-dev/rag-rat/pull/1290))
+
 ## [0.23.1](https://github.com/cq27-dev/rag-rat/compare/v0.23.0...v0.23.1) - 2026-09-10
 
 ### Added
