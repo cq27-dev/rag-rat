@@ -1656,35 +1656,101 @@ fn copy_model_state(source: &Connection, tx: &Connection, repo_id: &str) -> anyh
     Ok(count)
 }
 
-/// Merge the owner-stream seal policy as a one-way ratchet. The only persisted value this binary
-/// understands is `sealed`; absence means no explicit intent. A sealed source must seal the target,
-/// while a target already sealed remains sealed across retries even if the legacy source is absent.
-/// Unknown values on either side fail closed before consolidation's reconciliation authoring.
+/// `repo_meta[key]` in the legacy SOURCE index — a single-repo store, so the key alone selects it.
+fn source_repo_meta(source: &Connection, key: &str) -> anyhow::Result<Option<String>> {
+    Ok(source
+        .query_row("SELECT value FROM repo_meta WHERE key = ?1 LIMIT 1", [key], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten())
+}
+
+/// `repo_meta[key]` for `repo_id` in the consolidation target.
+fn target_repo_meta(tx: &Connection, repo_id: &str, key: &str) -> anyhow::Result<Option<String>> {
+    Ok(tx
+        .query_row(
+            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = ?2",
+            params![repo_id, key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// A `repo_meta` setting whose only persisted token is `token` — absence means no explicit intent.
+struct SingleTokenMeta {
+    key: &'static str,
+    token: &'static str,
+    /// Names the setting in the unknown-token refusal.
+    what: &'static str,
+}
+
+const SEAL_POLICY_META: SingleTokenMeta = SingleTokenMeta {
+    key: MEMORY_STREAM_SEAL_POLICY_META_KEY,
+    token: "sealed",
+    what: "memory stream seal policy",
+};
+
+const ACCESS_MODE_META: SingleTokenMeta = SingleTokenMeta {
+    key: MEMORY_STREAM_ACCESS_MODE_META_KEY,
+    token: "public",
+    what: "memory stream access mode",
+};
+
+impl SingleTokenMeta {
+    /// The `(source, target)` values, refusing when either side holds a token this binary does not
+    /// understand — before any of consolidation's reconciliation authoring.
+    fn read_both(
+        &self,
+        source: &Connection,
+        tx: &Connection,
+        repo_id: &str,
+    ) -> anyhow::Result<(Option<String>, Option<String>)> {
+        let source_value = source_repo_meta(source, self.key)?;
+        let target_value = target_repo_meta(tx, repo_id, self.key)?;
+        for (side, value) in
+            [("legacy source", source_value.as_deref()), ("target", target_value.as_deref())]
+        {
+            if let Some(value) = value
+                && value != self.token
+            {
+                anyhow::bail!(
+                    "{side} repo `{repo_id}` has unknown {} `{value}`; refusing to consolidate",
+                    self.what
+                );
+            }
+        }
+        Ok((source_value, target_value))
+    }
+
+    /// Carry a present source value onto an ABSENT target — the merge's only write. Returns the
+    /// rows written.
+    fn carry_onto_absent_target(
+        &self,
+        tx: &Connection,
+        repo_id: &str,
+        (source_value, target_value): &(Option<String>, Option<String>),
+    ) -> anyhow::Result<u64> {
+        if source_value.is_some() && target_value.is_none() {
+            Ok(tx.execute(
+                "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, ?3)",
+                params![repo_id, self.key, self.token],
+            )? as u64)
+        } else {
+            Ok(0)
+        }
+    }
+}
+
 /// Carry the source's trust pin onto the target — see the `memory_stream_pin` entry in the
 /// classification on [`CARRIED_META_KEYS`]. Returns the rows written.
 fn merge_stream_pin(source: &Connection, tx: &Connection, repo_id: &str) -> anyhow::Result<u64> {
-    let source_meta = |key: &str| -> anyhow::Result<Option<String>> {
-        Ok(source
-            .query_row("SELECT value FROM repo_meta WHERE key = ?1 LIMIT 1", [key], |row| {
-                row.get::<_, Option<String>>(0)
-            })
-            .optional()?
-            .flatten())
-    };
-    let target_meta = |key: &str| -> anyhow::Result<Option<String>> {
-        Ok(tx
-            .query_row(
-                "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = ?2",
-                params![repo_id, key],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten())
-    };
+    let target_meta = |key: &str| target_repo_meta(tx, repo_id, key);
     // The EFFECTIVE pin: a store from before the pin existed, or one still subscribed, records its
     // trust decision only as the subscription owner.
-    let Some(source_pin) = source_meta(MEMORY_STREAM_PIN_META_KEY)?
-        .or(source_meta(MEMORY_SUBSCRIPTION_OWNER_META_KEY)?)
+    let Some(source_pin) = source_repo_meta(source, MEMORY_STREAM_PIN_META_KEY)?
+        .or(source_repo_meta(source, MEMORY_SUBSCRIPTION_OWNER_META_KEY)?)
     else {
         return Ok(0);
     };
@@ -1742,49 +1808,17 @@ fn retire_pin_import(conn: &Connection, repo_id: &str) -> rusqlite::Result<usize
     ])
 }
 
+/// Merge the owner-stream seal policy as a one-way ratchet. The only persisted value this binary
+/// understands is `sealed`; absence means no explicit intent. A sealed source must seal the target,
+/// while a target already sealed remains sealed across retries even if the legacy source is absent.
+/// Unknown values on either side fail closed before consolidation's reconciliation authoring.
 fn merge_stream_seal_policy(
     source: &Connection,
     tx: &Connection,
     repo_id: &str,
 ) -> anyhow::Result<u64> {
-    let source_value: Option<String> = source
-        .query_row(
-            "SELECT value FROM repo_meta WHERE key = ?1 LIMIT 1",
-            [MEMORY_STREAM_SEAL_POLICY_META_KEY],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    let target_value: Option<String> = tx
-        .query_row(
-            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = ?2",
-            params![repo_id, MEMORY_STREAM_SEAL_POLICY_META_KEY],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-
-    for (side, value) in
-        [("legacy source", source_value.as_deref()), ("target", target_value.as_deref())]
-    {
-        if let Some(value) = value
-            && value != "sealed"
-        {
-            anyhow::bail!(
-                "{side} repo `{repo_id}` has unknown memory stream seal policy `{value}`; \
-                 refusing to consolidate"
-            );
-        }
-    }
-
-    if source_value.is_some() && target_value.is_none() {
-        Ok(tx.execute(
-            "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, 'sealed')",
-            params![repo_id, MEMORY_STREAM_SEAL_POLICY_META_KEY],
-        )? as u64)
-    } else {
-        Ok(0)
-    }
+    let sides = SEAL_POLICY_META.read_both(source, tx, repo_id)?;
+    SEAL_POLICY_META.carry_onto_absent_target(tx, repo_id, &sides)
 }
 
 /// Merge the owner-stream ACCESS MODE. Unlike the seal ratchet there is NO safe winner: access mode
@@ -1799,40 +1833,12 @@ fn merge_stream_access_mode(
     tx: &Connection,
     repo_id: &str,
 ) -> anyhow::Result<u64> {
-    let source_value: Option<String> = source
-        .query_row(
-            "SELECT value FROM repo_meta WHERE key = ?1 LIMIT 1",
-            [MEMORY_STREAM_ACCESS_MODE_META_KEY],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    let target_value: Option<String> = tx
-        .query_row(
-            "SELECT value FROM repo_meta WHERE repo_id = ?1 AND key = ?2",
-            params![repo_id, MEMORY_STREAM_ACCESS_MODE_META_KEY],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-
-    for (side, value) in
-        [("legacy source", source_value.as_deref()), ("target", target_value.as_deref())]
-    {
-        if let Some(value) = value
-            && value != "public"
-        {
-            anyhow::bail!(
-                "{side} repo `{repo_id}` has unknown memory stream access mode `{value}`; \
-                 refusing to consolidate"
-            );
-        }
-    }
+    let sides = ACCESS_MODE_META.read_both(source, tx, repo_id)?;
 
     // Two explicit-but-disagreeing modes have no safe winner. With only `public`/absent this can
     // only be source-`public` vs target-`public` (agree) today; the guard future-proofs a
     // `private` token.
-    if let (Some(s), Some(t)) = (source_value.as_deref(), target_value.as_deref())
+    if let (Some(s), Some(t)) = (sides.0.as_deref(), sides.1.as_deref())
         && s != t
     {
         anyhow::bail!(
@@ -1841,14 +1847,7 @@ fn merge_stream_access_mode(
         );
     }
 
-    if source_value.is_some() && target_value.is_none() {
-        Ok(tx.execute(
-            "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, 'public')",
-            params![repo_id, MEMORY_STREAM_ACCESS_MODE_META_KEY],
-        )? as u64)
-    } else {
-        Ok(0)
-    }
+    ACCESS_MODE_META.carry_onto_absent_target(tx, repo_id, &sides)
 }
 
 /// Carry the active model's `ai_models` READINESS onto the target when the legacy DB holds it
