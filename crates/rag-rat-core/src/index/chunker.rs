@@ -6,6 +6,14 @@ use crate::index::parser;
 
 pub const MAX_STRUCTURAL_PARSE_BYTES: usize = 512_000;
 
+/// Line cap per chunk for the line-split fallback over oversized and generated files, which are
+/// chunked without a structural parse.
+const TEXT_SPLIT_LINES: usize = 160;
+/// Line cap per chunk when a parsed symbol's span is split into `qname#<n>` continuations.
+const SYMBOL_SPLIT_LINES: usize = 120;
+/// Line cap per chunk for the uncovered (between-symbol) context spans.
+const UNCOVERED_SPAN_SPLIT_LINES: usize = 80;
+
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub kind: &'static str,
@@ -26,7 +34,7 @@ pub struct Chunk {
 
 pub fn chunks_for_file(path: &Path, language: Language, text: &str) -> Vec<Chunk> {
     if text.len() > MAX_STRUCTURAL_PARSE_BYTES && language != Language::Markdown {
-        return split_text_chunks(path, "code", text, 160);
+        return split_text_chunks(path, "code", text, TEXT_SPLIT_LINES);
     }
     match language {
         Language::Markdown => markdown_chunks(text),
@@ -35,7 +43,7 @@ pub fn chunks_for_file(path: &Path, language: Language, text: &str) -> Vec<Chunk
 }
 
 pub fn generated_chunks_for_file(path: &Path, text: &str) -> Vec<Chunk> {
-    split_text_chunks(path, "generated", text, 160)
+    split_text_chunks(path, "generated", text, TEXT_SPLIT_LINES)
 }
 
 fn markdown_chunks(text: &str) -> Vec<Chunk> {
@@ -108,7 +116,9 @@ pub fn code_chunks_for_symbols(
             continue;
         }
         for (part_idx, part) in
-            split_symbol(span_text, span_start, symbol.start_line, 120).into_iter().enumerate()
+            split_symbol(span_text, span_start, symbol.start_line, SYMBOL_SPLIT_LINES)
+                .into_iter()
+                .enumerate()
         {
             let mut chunk = make_chunk(
                 "code",
@@ -195,7 +205,9 @@ fn push_uncovered_chunk(
         return;
     }
     for (part_idx, part) in
-        split_symbol(span_text, span_start, start_line, 80).into_iter().enumerate()
+        split_symbol(span_text, span_start, start_line, UNCOVERED_SPAN_SPLIT_LINES)
+            .into_iter()
+            .enumerate()
     {
         chunks.push(make_chunk(
             "code",

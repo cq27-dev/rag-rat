@@ -1,5 +1,10 @@
 use rag_rat_base::hash::hex_sha256;
 
+/// Version stamped on every anchor this module builds.
+const ANCHOR_VERSION: i64 = 1;
+/// Lines hashed on each side of a chunk boundary for the start/end context hashes.
+const ANCHOR_CONTEXT_RADIUS: usize = 2;
+
 #[derive(Debug, Clone)]
 pub struct ChunkAnchor {
     pub version: i64,
@@ -36,15 +41,14 @@ pub fn anchor_for_lines(
     end_line: usize,
     lines: &[&str],
 ) -> ChunkAnchor {
-    let radius = 2;
     ChunkAnchor {
-        version: 1,
+        version: ANCHOR_VERSION,
         normalized_hash: hash_normalized(text),
         start_boundary_hash: boundary_hash(lines, start_line),
         end_boundary_hash: boundary_hash(lines, end_line),
-        start_context_hash: context_hash(lines, start_line, radius),
-        end_context_hash: context_hash(lines, end_line, radius),
-        context_radius: i64::try_from(radius).unwrap_or(2),
+        start_context_hash: context_hash(lines, start_line, ANCHOR_CONTEXT_RADIUS),
+        end_context_hash: context_hash(lines, end_line, ANCHOR_CONTEXT_RADIUS),
+        context_radius: ANCHOR_CONTEXT_RADIUS as i64,
     }
 }
 
@@ -89,10 +93,9 @@ fn relocate(stored_text: &str, anchor: &ChunkAnchor, current_text: &str) -> Opti
         if hash_normalized(&candidate) == wanted_hash {
             let start_boundary = boundary_hash(&lines, start);
             let end_boundary = boundary_hash(&lines, end);
-            let start_context =
-                context_hash(&lines, start, usize::try_from(anchor.context_radius).unwrap_or(2));
-            let end_context =
-                context_hash(&lines, end, usize::try_from(anchor.context_radius).unwrap_or(2));
+            let radius = usize::try_from(anchor.context_radius).unwrap_or(ANCHOR_CONTEXT_RADIUS);
+            let start_context = context_hash(&lines, start, radius);
+            let end_context = context_hash(&lines, end, radius);
             if start_boundary == anchor.start_boundary_hash
                 || end_boundary == anchor.end_boundary_hash
                 || start_context == anchor.start_context_hash
