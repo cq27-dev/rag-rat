@@ -38,6 +38,24 @@ pub(crate) struct BatchSpec {
     /// unset — empirically confirmed: a token after an astral character lands at the UTF-16 count.
     /// Reading them as the UTF-32 fallback mis-converts past astral characters.
     pub(crate) assumed_position_encoding: ::scip::types::PositionEncoding,
+    /// The root-level marker a tool-driven run needs, or `None` when the binary alone suffices. A
+    /// pre-built `--scip` path never asks.
+    pub(crate) prerequisite: Option<RootMarker>,
+}
+
+/// A root-level marker a batch backend needs before a tool-driven run: any one of `files` present
+/// at the checkout root satisfies it; otherwise `hint` names what is missing and how to fix it.
+/// Answerable from the root alone — no corpus, no checkout ceiling.
+pub(crate) struct RootMarker {
+    pub(crate) files: &'static [&'static str],
+    pub(crate) hint: fn(root: &Path) -> String,
+}
+
+impl RootMarker {
+    /// The block reason, or `None` when a marker file is present at `root`.
+    pub(crate) fn blocked(&self, root: &Path) -> Option<String> {
+        (!self.files.iter().any(|name| root.join(name).exists())).then(|| (self.hint)(root))
+    }
 }
 
 /// How to prove a versioned binary can emit a SCIP index. Distinct from "is it installed", which
@@ -72,18 +90,28 @@ impl BatchSpec {
         let spec = match tool {
             OracleTool::RustAnalyzer => Self {
                 command: rust_analyzer_command,
+                prerequisite: None,
                 capability: ScipCapability::SubcommandHelpSucceeds("scip"),
                 exit_code_reflects_diagnostics: false,
                 assumed_position_encoding: Unspecified,
             },
             OracleTool::ScipClang => Self {
                 command: scip_clang_command,
+                prerequisite: Some(RootMarker {
+                    files: &["compile_commands.json"],
+                    hint: scip_clang_prerequisite_hint,
+                }),
                 capability: ScipCapability::VersionSuffices,
                 exit_code_reflects_diagnostics: false,
                 assumed_position_encoding: Unspecified,
             },
             OracleTool::ScipPython => Self {
                 command: scip_python_command,
+                // scip-python's "deps must be installed" prerequisite has no single sentinel file
+                // to check (it's whatever the corpus `prepare` venv installs); a failed environment
+                // shows up as a near-zero moniker count the report health gate catches, so there's
+                // nothing to block on here.
+                prerequisite: None,
                 capability: ScipCapability::SubcommandHelpSucceeds("index"),
                 // scip-python exits non-zero on unresolved imports while still writing a usable
                 // index, which is the ordinary state of a checkout whose deps are partly installed.
@@ -92,12 +120,44 @@ impl BatchSpec {
             },
             OracleTool::ScipTypescript => Self {
                 command: scip_typescript_command,
+                // scip-typescript needs a `tsconfig.json` at the root: with `--infer-tsconfig` it
+                // would otherwise WRITE one into the checkout (confirmed against v0.4.0), violating
+                // the read-only-on-source contract — so we don't pass that flag and instead require
+                // a real tsconfig (the TS analog of scip-clang's compile_commands.json).
+                // Cross-package deps (`node_modules`) are the corpus `prepare` step's job; a
+                // missing one is NOT reliably caught by the moniker-count gate (scip-typescript
+                // mints local monikers from package.json regardless of node_modules) — only
+                // external resolution drops. A dedicated external-resolution health signal is
+                // tracked in #185.
+                prerequisite: Some(RootMarker {
+                    files: &["tsconfig.json"],
+                    hint: scip_typescript_prerequisite_hint,
+                }),
                 capability: ScipCapability::SubcommandHelpSucceeds("index"),
                 exit_code_reflects_diagnostics: false,
                 assumed_position_encoding: Utf16,
             },
             OracleTool::ScipJava => Self {
                 command: scip_java_command,
+                // scip-java indexes THROUGH the build, so it needs a recognizable build at the
+                // root. This backend advertises Kotlin only, and scip-java's automatic indexer
+                // supports Kotlin for GRADLE only — Maven Kotlin (`kotlin-maven-plugin`) is
+                // unsupported upstream
+                // (https://sourcegraph.github.io/scip-java/docs/getting-started.html#supported-build-tools).
+                // So a Maven-only (`pom.xml`) Kotlin checkout must report Blocked, not run
+                // scip-java and fail — accepting `pom.xml` would turn a clean block into a failed
+                // run + background retries (#193).
+                //
+                // The sentinel set mirrors scip-java's own `GradleBuildTool.usedInCurrentDirectory`
+                // EXACTLY (v0.12.3) so this gate agrees with what the tool will actually detect:
+                // scip-java does NOT recognize `settings.gradle.kts`, and DOES recognize the
+                // `gradlew` wrapper — accepting the former or omitting the latter would let a
+                // checkout pass the gate then fail with "no Gradle tool", or block a wrapper-only
+                // root scip-java could index.
+                prerequisite: Some(RootMarker {
+                    files: &["settings.gradle", "gradlew", "build.gradle", "build.gradle.kts"],
+                    hint: scip_java_prerequisite_hint,
+                }),
                 capability: ScipCapability::SubcommandHelpSucceeds("index"),
                 exit_code_reflects_diagnostics: false,
                 assumed_position_encoding: Utf16,
@@ -188,4 +248,32 @@ fn scip_java_command(program: &str, root: &Path, output: &Path) -> Command {
         .arg("--output")
         .arg(output);
     cmd
+}
+
+fn scip_clang_prerequisite_hint(root: &Path) -> String {
+    format!(
+        "scip-clang requires a compile_commands.json at {} — generate one (e.g. `bear -- make`, \
+         CMake `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, or the kernel's \
+         scripts/clang-tools/gen_compile_commands.py), or pass a pre-built index with `--scip \
+         <path>`.",
+        root.display()
+    )
+}
+
+fn scip_typescript_prerequisite_hint(root: &Path) -> String {
+    format!(
+        "scip-typescript requires a tsconfig.json at {} — add one to the project (most TypeScript \
+         projects ship one), or pass a pre-built index with `--scip <path>`.",
+        root.display()
+    )
+}
+
+fn scip_java_prerequisite_hint(root: &Path) -> String {
+    format!(
+        "scip-java requires a Gradle build at {} (build.gradle, build.gradle.kts, \
+         settings.gradle, or gradlew) — it indexes Kotlin through the Gradle build (Maven Kotlin \
+         is unsupported by scip-java's auto-indexer); or pass a pre-built index with `--scip \
+         <path>`.",
+        root.display()
+    )
 }
