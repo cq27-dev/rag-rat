@@ -1,0 +1,40 @@
+name: runner-maintenance
+
+# Housekeeping for the persistent self-hosted runners. Each keeps a cargo target dir outside its
+# checkout so builds stay warm between jobs, and every feature set and profile CI builds leaves its
+# own artifacts there, while old dependency versions are never removed — left alone, the dirs grew
+# by ~50 GB a day. This caps each one by evicting the oldest artifacts (a warm build touches what it
+# uses, so what goes is what nothing has needed for longest) and prunes dangling Docker layers left
+# by bench image rebuilds. Runs on any `ci` runner: they share one home, so one job reaches every
+# runner's dir. Age-based sweeping does not work here — a busy day touches everything.
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ci
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Cap every runner's cargo target dir
+        run: |
+          set -euo pipefail
+          export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+          command -v cargo-sweep >/dev/null || cargo install --locked cargo-sweep
+          # cargo-sweep reads the target dir through `cargo metadata` of a checkout; this one serves
+          # for every dir, since they were all built from this workspace.
+          for dir in "$HOME"/actions-runner*/cargo-target "$HOME"/cargo-target-coverage; do
+            [ -d "$dir" ] || continue
+            echo "== $dir: $(du -sh "$dir" | cut -f1) before"
+            CARGO_TARGET_DIR="$dir" cargo sweep --maxsize 30GB
+            echo "== $dir: $(du -sh "$dir" | cut -f1) after"
+          done
+      - name: Prune dangling Docker layers
+        run: docker image prune -f
+      - name: Report
+        run: df -h /
