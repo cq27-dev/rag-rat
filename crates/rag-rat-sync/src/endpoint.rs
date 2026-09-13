@@ -823,6 +823,38 @@ const EGRESS_REFILL_BYTES_PER_SEC: f64 = 16.0 * 1024.0 * 1024.0;
 /// Bytes servable in one instantaneous burst before the steady-state ceiling applies.
 const EGRESS_BURST_BYTES: f64 = 64.0 * 1024.0 * 1024.0;
 
+/// The token bucket both global limiters share: a balance refilled by elapsed time and capped at
+/// `burst`, so idle time never accrues unbounded credit. Each limiter keeps its own spend rule.
+#[derive(Debug)]
+struct TokenBucket {
+    tokens: f64,
+    burst: f64,
+    refill_per_sec: f64,
+    last_ms: Option<i64>,
+}
+
+impl TokenBucket {
+    /// A bucket that starts with its whole burst available.
+    fn full(burst: f64, refill_per_sec: f64) -> Self {
+        Self { tokens: burst, burst, refill_per_sec, last_ms: None }
+    }
+
+    /// Credit the time elapsed since the last call (capped at `burst`) and return the balance.
+    /// `now_ms` is injected so refill is deterministically testable.
+    fn refill(&mut self, now_ms: i64) -> f64 {
+        if let Some(last) = self.last_ms {
+            let elapsed_secs = (now_ms - last).max(0) as f64 / 1000.0;
+            self.tokens = (self.tokens + elapsed_secs * self.refill_per_sec).min(self.burst);
+        }
+        self.last_ms = Some(now_ms);
+        self.tokens
+    }
+
+    fn spend(&mut self, cost: f64) {
+        self.tokens -= cost;
+    }
+}
+
 /// A GLOBAL inbound-connection rate limiter: one token bucket bounding total accept rate regardless
 /// of peer identity. Per-peer-by-node-id limiting is the wrong lever — an iroh node id is a keypair
 /// mintable in microseconds, so a flood rotates ids and evades any per-id bucket while making the
@@ -831,10 +863,7 @@ const EGRESS_BURST_BYTES: f64 = 64.0 * 1024.0 * 1024.0;
 /// is correct for a live-traffic control (contrast the durable byte ceilings on the ingest paths).
 #[derive(Debug)]
 pub struct GlobalAcceptRateLimiter {
-    tokens: f64,
-    burst: f64,
-    refill_per_sec: f64,
-    last_ms: Option<i64>,
+    bucket: TokenBucket,
 }
 
 impl Default for GlobalAcceptRateLimiter {
@@ -845,12 +874,7 @@ impl Default for GlobalAcceptRateLimiter {
 
 impl GlobalAcceptRateLimiter {
     pub fn new() -> Self {
-        Self {
-            tokens: ACCEPT_BURST,
-            burst: ACCEPT_BURST,
-            refill_per_sec: ACCEPT_REFILL_PER_SEC,
-            last_ms: None,
-        }
+        Self { bucket: TokenBucket::full(ACCEPT_BURST, ACCEPT_REFILL_PER_SEC) }
     }
 
     /// Refill by the time elapsed since the last call (capped at `burst`, so idle time never
@@ -858,13 +882,8 @@ impl GlobalAcceptRateLimiter {
     /// empty — the connection should be refused. `now_ms` is injected so refill is
     /// deterministically testable.
     pub fn allow(&mut self, now_ms: i64) -> bool {
-        if let Some(last) = self.last_ms {
-            let elapsed_secs = (now_ms - last).max(0) as f64 / 1000.0;
-            self.tokens = (self.tokens + elapsed_secs * self.refill_per_sec).min(self.burst);
-        }
-        self.last_ms = Some(now_ms);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.bucket.refill(now_ms) >= 1.0 {
+            self.bucket.spend(1.0);
             true
         } else {
             false
@@ -879,10 +898,7 @@ impl GlobalAcceptRateLimiter {
 /// and transient: a restart resetting to full burst is correct for live-traffic control.
 #[derive(Debug)]
 pub struct GlobalEgressLimiter {
-    tokens: f64,
-    burst: f64,
-    refill_per_sec: f64,
-    last_ms: Option<i64>,
+    bucket: TokenBucket,
 }
 
 impl Default for GlobalEgressLimiter {
@@ -893,12 +909,7 @@ impl Default for GlobalEgressLimiter {
 
 impl GlobalEgressLimiter {
     pub fn new() -> Self {
-        Self {
-            tokens: EGRESS_BURST_BYTES,
-            burst: EGRESS_BURST_BYTES,
-            refill_per_sec: EGRESS_REFILL_BYTES_PER_SEC,
-            last_ms: None,
-        }
+        Self { bucket: TokenBucket::full(EGRESS_BURST_BYTES, EGRESS_REFILL_BYTES_PER_SEC) }
     }
 
     /// Refill by elapsed time (capped at `burst`), then, IF any credit remains, spend `bytes` (the
@@ -908,13 +919,8 @@ impl GlobalEgressLimiter {
     /// only throttled, and the unsent tail is re-offered by the next session's inventory diff.
     /// `now_ms` injected for deterministic tests.
     pub fn allow(&mut self, bytes: usize, now_ms: i64) -> bool {
-        if let Some(last) = self.last_ms {
-            let elapsed_secs = (now_ms - last).max(0) as f64 / 1000.0;
-            self.tokens = (self.tokens + elapsed_secs * self.refill_per_sec).min(self.burst);
-        }
-        self.last_ms = Some(now_ms);
-        if self.tokens > 0.0 {
-            self.tokens -= bytes as f64;
+        if self.bucket.refill(now_ms) > 0.0 {
+            self.bucket.spend(bytes as f64);
             true
         } else {
             false
