@@ -357,302 +357,354 @@ pub(crate) struct EventLoop<'a, W: notify::Watcher> {
     pub(crate) fleet_trigger: &'a mut (dyn FnMut(&Path) + Send),
 }
 
+/// The event loop's scheduling state, built once per [`EventLoop::run`] and threaded through its
+/// message handlers.
+struct LoopState {
+    debounce: Debounce,
+    fleet_debounce: Debounce,
+    /// Periodic backstop (covers event-blind filesystems + missed events). Counts from the last
+    /// ALL-scoped pass, so event-scoped passes can't postpone it (#577 review); `new` assumes the
+    /// startup catch-up (an `All` pass) was just dispatched.
+    sweep: SweepClock,
+    /// Minimum inter-pass cooldown (#823): the next event-driven pass dispatches no sooner than
+    /// this long after the previous pass completed, so sustained editing can't run passes
+    /// back-to-back off a debounce that elapsed mid-pass. Watcher-event-loop-only: the startup
+    /// catch-up (dispatched before this loop) and the hook/CLI `maintenance_pass*` entry points
+    /// are not rate-limited.
+    cooldown: PassCooldown,
+    /// The papertrail evaluation deadline (#592): fires even on a filesystem-idle watcher, so the
+    /// freshness probe and the daily full-walk backstop run on time without any events. A `None`
+    /// interval — no resolved tracker bindings, or a zeroed cadence — is never due. The first tick
+    /// is one full interval after startup: the scheduling policy's persisted freshness makes an
+    /// eager boot-time evaluation redundant, and startup already runs the catch-up index pass.
+    papertrail_clock: IntervalClock,
+    papertrail_scheduler: PapertrailScheduler,
+    live_oracle_wake_at: Option<Instant>,
+    /// The overlay scope accumulated while the debounce is armed (#577): every firing event merges
+    /// its contribution, and the union rides the next dispatched pass. Cleared ONLY on dispatch,
+    /// like the debounce itself — mid-pass events keep accumulating for the coalesced follow-up.
+    pending_overlay_scope: Option<OverlayScope>,
+    /// The watch-placement failure count this loop has already flushed to `repo_meta`. The
+    /// between-pass drain compares the live counter against this and persists + warns on any
+    /// rise, so a drop the post-pass resync introduced (after the pass worker persisted) still
+    /// surfaces — in `index_status` AND the log — on a periodic-sweep-disabled watcher with no
+    /// further events (#658 review).
+    last_flushed_placement_failures: u64,
+}
+
 impl<W: notify::Watcher> EventLoop<'_, W> {
     /// Run until `stop`; returns whether a final shutdown refresh is owed (the debounce is still
     /// armed — events arrived after the last dispatched pass).
     pub(crate) fn run(mut self) -> bool {
-        let mut debounce = Debounce::new(
-            Duration::from_millis(self.config.watch.debounce_ms),
-            Duration::from_millis(self.config.watch.max_latency_ms),
-        );
-        let mut fleet_debounce = Debounce::new(FLEET_DEBOUNCE, FLEET_MAX_LATENCY);
-        // Periodic backstop (covers event-blind filesystems + missed events). Counts from the
-        // last ALL-scoped pass, so event-scoped passes can't postpone it (#577 review); `new`
-        // assumes the startup catch-up (an `All` pass) was just dispatched.
-        let periodic = (self.config.watch.periodic_sweep_secs > 0)
-            .then(|| Duration::from_secs(self.config.watch.periodic_sweep_secs));
-        let mut sweep = SweepClock::new(periodic, Instant::now());
-        // Minimum inter-pass cooldown (#823): the next event-driven pass dispatches no sooner
-        // than this long after the previous pass completed, so sustained editing can't run
-        // passes back-to-back off a debounce that elapsed mid-pass. Watcher-event-loop-only:
-        // the startup catch-up (dispatched before this loop) and the hook/CLI
-        // `maintenance_pass*` entry points are not rate-limited.
-        let mut cooldown = PassCooldown::new(
-            (self.config.watch.pass_cooldown_secs > 0)
-                .then(|| Duration::from_secs(self.config.watch.pass_cooldown_secs)),
-        );
-        // The papertrail evaluation deadline (#592): fires even on a filesystem-idle watcher, so
-        // the freshness probe and the daily full-walk backstop run on time without any events.
-        // A `None` interval — no resolved tracker bindings, or a zeroed cadence — is never due.
-        // The first tick is one full interval after startup: the scheduling policy's persisted
-        // freshness makes an eager boot-time evaluation redundant, and startup already runs the
-        // catch-up index pass.
-        let mut papertrail_clock =
-            IntervalClock::new(self.papertrail_tx.and(self.papertrail_interval), Instant::now());
-        let mut papertrail_scheduler = PapertrailScheduler::new();
-        let mut live_oracle_wake_at: Option<Instant> = None;
-        // The overlay scope accumulated while the debounce is armed (#577): every firing event
-        // merges its contribution, and the union rides the next dispatched pass. Cleared ONLY on
-        // dispatch, like the debounce itself — mid-pass events keep accumulating for the
-        // coalesced follow-up.
-        let mut pending_overlay_scope: Option<OverlayScope> = None;
-        // The watch-placement failure count this loop has already flushed to `repo_meta`. The
-        // between-pass drain at the loop tail compares the live counter against this and persists +
-        // warns on any rise, so a drop the post-pass resync introduced (after the pass worker
-        // persisted) still surfaces — in `index_status` AND the log — on a periodic-sweep-disabled
-        // watcher with no further events (#658 review).
-        let mut last_flushed_placement_failures = 0u64;
+        let mut state = self.initial_state();
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
-            let now = Instant::now();
-            // While a pass is in flight its fire condition stays due (the debounce only resets on
-            // dispatch), so recomputing those deadlines would spin the loop — the `PassDone`
-            // message is what wakes it. The fleet debounce still shapes the wait: the trigger
-            // must fire DURING a long pass, not after it (#506). The papertrail deadline shapes
-            // BOTH branches for the same reason: an in-flight maintenance pass must not postpone
-            // a due probe (#592).
-            let wait = if self.scheduler.in_flight() {
-                [fleet_debounce.due_in(now), papertrail_clock.due_in(now)]
-                    .into_iter()
-                    .flatten()
-                    .min()
-                    .unwrap_or(IDLE_WAIT)
-            } else {
-                [
-                    // The debounce deadline is floored by the cooldown's remaining time (#823):
-                    // a debounce that elapsed during the pass stays fireable while dispatch is
-                    // held back, so an unfloored deadline would wake the loop every iteration —
-                    // the same spin the in-flight branch above avoids. The sweep deadline is
-                    // deliberately NOT floored: the periodic backstop overrides the cooldown, so
-                    // its wake must arrive on time.
-                    cooldown.gate_debounce_wait(&debounce, now),
-                    fleet_debounce.due_in(now),
-                    sweep.due_in(now),
-                    papertrail_clock.due_in(now),
-                    live_oracle_wake_at.map(|at| at.saturating_duration_since(now)),
-                ]
-                .into_iter()
-                .flatten()
-                .min()
-                .unwrap_or(IDLE_WAIT)
-            };
+            let wait = self.next_wait(&state, Instant::now());
             match self.rx.recv_timeout(wait) {
-                Ok(LoopMsg::Fs(Ok(event))) => {
-                    let now = Instant::now();
-                    // A rescan means the backend dropped events, so anything could have vanished
-                    // unseen — including a watched directory that was deleted and recreated.
-                    // Rebuild the whole watch state before classifying, or a record left over
-                    // from before the gap suppresses the placement that recovers it (#1269).
-                    if event.need_rescan() {
-                        self.worktree_registry = rebuild_watch_state_after_rescan(
-                            self.notify_watcher,
-                            self.counters,
-                            self.config,
-                            self.target_dirs,
-                            self.ignore,
-                            self.linked_worktrees,
-                            self.fleet_bin,
-                        );
-                    }
-                    // Place watches on newly-appeared, non-ignored directories REGARDLESS of
-                    // relevance (#332). Target dirs are watched NON-recursively (#331), so notify
-                    // won't auto-descend into a new subdir — and a bare `mkdir src/foo` is NOT
-                    // `event_is_relevant` (a directory is extensionless → not a target FILE), so
-                    // gating this on the relevance check below would leave the new dir unwatched
-                    // and its files invisible until the periodic sweep (or forever, if it is
-                    // disabled). A directory MOVED in (`mv pkg src/pkg`) arrives as a rename, not
-                    // a Create — `watch_created_dirs` handles both. Its own cheap filter
-                    // (Create/rename + is-dir + not-ignored) makes calling it on every
-                    // event correct. When it places a watch, arm the debounce even if the
-                    // directory event itself is extensionless and therefore not relevant: the
-                    // newly-created dir can already contain files that need the pass to discover
-                    // them. The watch keeps SUBSEQUENT edits firing. Gates each path on real-dir +
-                    // target relation + not-ignored, and recompiles the matcher for a moved-in
-                    // nested `.gitignore` (#332).
-                    if let Some(scope) = event_requests_maintenance(
-                        self.notify_watcher,
-                        self.counters,
-                        &event,
-                        self.config,
-                        self.target_dirs,
-                        self.ignore,
-                        self.linked_worktrees,
-                        self.worktree_registry.as_deref(),
-                    ) {
-                        debounce.on_event(now);
-                        pending_overlay_scope = Some(match pending_overlay_scope.take() {
-                            Some(pending) => pending.merge(scope),
-                            None => scope,
-                        });
-                        // A `.gitignore` mutation changed the rules — recompile so subsequent
-                        // events are classified against current rules, not the matcher
-                        // this watcher booted with.
-                        if kind_is_mutation(&event.kind)
-                            && event.paths.iter().any(|path| is_gitignore_path(path))
-                        {
-                            // PLACEMENT, not just classification, must track the new rules (#332):
-                            // a removed ignore rule UN-ignores a subtree the startup walk skipped,
-                            // so re-walk and add watches for it now — otherwise edits inside it
-                            // never fire. notify's `watch()` is idempotent for an
-                            // already-watched path, so re-walking only ADDS the
-                            // newly-eligible dirs. (A newly-IGNORED subtree keeps its
-                            // now-stale watches — harmless wasted watches; full unwatch
-                            // bookkeeping is deferred.)
-                            recompile_ignore_and_place_watches(
-                                self.notify_watcher,
-                                self.counters,
-                                self.config,
-                                self.target_dirs,
-                                self.ignore,
-                                self.linked_worktrees,
-                            );
-                        }
-                    }
-                    if event_targets_binary(self.fleet_bin, &event) {
-                        fleet_debounce.on_event(now);
-                    }
-                },
+                Ok(LoopMsg::Fs(Ok(event))) => self.on_fs_event(&mut state, &event),
                 Ok(LoopMsg::Fs(Err(_))) => {},
                 Ok(LoopMsg::PassDone { live_oracle_wake_in }) => {
-                    self.scheduler.on_done();
-                    let done_at = Instant::now();
-                    live_oracle_wake_at =
-                        live_oracle_wake_in.and_then(|delay| done_at.checked_add(delay));
-                    sweep.on_pass_done(done_at);
-                    // The cooldown counts from pass COMPLETION (#823) — the armed debounce below
-                    // is typically long-elapsed by now, and without this the next iteration
-                    // would dispatch the follow-up immediately, back-to-back.
-                    cooldown.on_pass_done(done_at);
-                    // Refresh the live linked-worktree set after every pass. Existing checkout
-                    // paths can switch branches and therefore branch-local target sets; rebuilding
-                    // the state keeps classification, ignore matchers, and watch placement in one
-                    // place. Removed checkout paths can still have stale backend watches
-                    // (harmless; their overlay is GC-pruned), but no stale `LinkedWorktreeWatch`
-                    // state remains active.
-                    sync_linked_worktrees_after_pass(
-                        self.notify_watcher,
-                        self.counters,
-                        self.config,
-                        self.linked_worktrees,
-                    );
-                    // A resync-introduced watch-placement drop is picked up by the between-pass
-                    // drain at the tail of this loop (it runs every iteration), not here — see
-                    // there.
+                    self.on_pass_done(&mut state, live_oracle_wake_in);
                 },
-                Ok(LoopMsg::PapertrailDone) => {
-                    if let Some(request_tx) = self.papertrail_tx
-                        && let Some(follow_up) = papertrail_scheduler.on_done()
-                    {
-                        let _ = request_tx.send(follow_up);
-                    }
-                },
+                Ok(LoopMsg::PapertrailDone) => self.on_papertrail_done(&mut state),
                 Ok(LoopMsg::Wake) => {},
                 Err(RecvTimeoutError::Timeout) => {},
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             let now = Instant::now();
-            // The papertrail tick enqueues a schedule EVALUATION, never an unconditional mirror:
-            // the per-binding policy decides skip / probe / incremental / full, and the daily
-            // full-walk backstop rides the same evaluation. Independent of the debounce and of
-            // `scheduler.in_flight()`, so ordinary maintenance never delays it; redundant ticks
-            // coalesce in `PapertrailScheduler` (and cross-process in the flight's pending
-            // marker).
-            if papertrail_clock.due(now) {
-                papertrail_clock.on_tick(now);
-                if let Some(request_tx) = self.papertrail_tx
-                    && let Some(request) = papertrail_scheduler.admit(AutosyncRequest::Evaluate)
-                {
-                    let _ = request_tx.send(request);
-                }
-            }
-            let periodic_due = sweep.due(now);
-            let live_oracle_wake_due = live_oracle_wake_at.is_some_and(|at| now >= at);
-            // The cooldown (#823) holds back only the DEBOUNCE-driven dispatch; a due periodic
-            // sweep dispatches regardless — the missed-event backstop is never starved by the
-            // cooldown.
-            if periodic_due
-                || live_oracle_wake_due
-                || (debounce.should_fire(now) && cooldown.ready(now))
+            self.tick_papertrail(&mut state, now);
+            self.maybe_dispatch(&mut state, now);
+            self.maybe_fire_fleet(&mut state, now);
+            self.drain_placement_failures(&mut state);
+        }
+        state.debounce.fire_at().is_some()
+    }
+
+    fn initial_state(&self) -> LoopState {
+        let watch = &self.config.watch;
+        LoopState {
+            debounce: Debounce::new(
+                Duration::from_millis(watch.debounce_ms),
+                Duration::from_millis(watch.max_latency_ms),
+            ),
+            fleet_debounce: Debounce::new(FLEET_DEBOUNCE, FLEET_MAX_LATENCY),
+            sweep: SweepClock::new(
+                (watch.periodic_sweep_secs > 0)
+                    .then(|| Duration::from_secs(watch.periodic_sweep_secs)),
+                Instant::now(),
+            ),
+            cooldown: PassCooldown::new(
+                (watch.pass_cooldown_secs > 0)
+                    .then(|| Duration::from_secs(watch.pass_cooldown_secs)),
+            ),
+            papertrail_clock: IntervalClock::new(
+                self.papertrail_tx.and(self.papertrail_interval),
+                Instant::now(),
+            ),
+            papertrail_scheduler: PapertrailScheduler::new(),
+            live_oracle_wake_at: None,
+            pending_overlay_scope: None,
+            last_flushed_placement_failures: 0,
+        }
+    }
+
+    /// How long to block on the loop channel before the next deadline needs servicing.
+    fn next_wait(&self, state: &LoopState, now: Instant) -> Duration {
+        // While a pass is in flight its fire condition stays due (the debounce only resets on
+        // dispatch), so recomputing those deadlines would spin the loop — the `PassDone`
+        // message is what wakes it. The fleet debounce still shapes the wait: the trigger
+        // must fire DURING a long pass, not after it (#506). The papertrail deadline shapes
+        // BOTH branches for the same reason: an in-flight maintenance pass must not postpone
+        // a due probe (#592).
+        if self.scheduler.in_flight() {
+            [state.fleet_debounce.due_in(now), state.papertrail_clock.due_in(now)]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(IDLE_WAIT)
+        } else {
+            [
+                // The debounce deadline is floored by the cooldown's remaining time (#823):
+                // a debounce that elapsed during the pass stays fireable while dispatch is
+                // held back, so an unfloored deadline would wake the loop every iteration —
+                // the same spin the in-flight branch above avoids. The sweep deadline is
+                // deliberately NOT floored: the periodic backstop overrides the cooldown, so
+                // its wake must arrive on time.
+                state.cooldown.gate_debounce_wait(&state.debounce, now),
+                state.fleet_debounce.due_in(now),
+                state.sweep.due_in(now),
+                state.papertrail_clock.due_in(now),
+                state.live_oracle_wake_at.map(|at| at.saturating_duration_since(now)),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(IDLE_WAIT)
+        }
+    }
+
+    fn on_fs_event(&mut self, state: &mut LoopState, event: &notify::Event) {
+        let now = Instant::now();
+        // A rescan means the backend dropped events, so anything could have vanished
+        // unseen — including a watched directory that was deleted and recreated.
+        // Rebuild the whole watch state before classifying, or a record left over
+        // from before the gap suppresses the placement that recovers it (#1269).
+        if event.need_rescan() {
+            self.worktree_registry = rebuild_watch_state_after_rescan(
+                self.notify_watcher,
+                self.counters,
+                self.config,
+                self.target_dirs,
+                self.ignore,
+                self.linked_worktrees,
+                self.fleet_bin,
+            );
+        }
+        // Place watches on newly-appeared, non-ignored directories REGARDLESS of
+        // relevance (#332). Target dirs are watched NON-recursively (#331), so notify
+        // won't auto-descend into a new subdir — and a bare `mkdir src/foo` is NOT
+        // `event_is_relevant` (a directory is extensionless → not a target FILE), so
+        // gating this on the relevance check below would leave the new dir unwatched
+        // and its files invisible until the periodic sweep (or forever, if it is
+        // disabled). A directory MOVED in (`mv pkg src/pkg`) arrives as a rename, not
+        // a Create — `watch_created_dirs` handles both. Its own cheap filter
+        // (Create/rename + is-dir + not-ignored) makes calling it on every
+        // event correct. When it places a watch, arm the debounce even if the
+        // directory event itself is extensionless and therefore not relevant: the
+        // newly-created dir can already contain files that need the pass to discover
+        // them. The watch keeps SUBSEQUENT edits firing. Gates each path on real-dir +
+        // target relation + not-ignored, and recompiles the matcher for a moved-in
+        // nested `.gitignore` (#332).
+        if let Some(scope) = event_requests_maintenance(
+            self.notify_watcher,
+            self.counters,
+            event,
+            self.config,
+            self.target_dirs,
+            self.ignore,
+            self.linked_worktrees,
+            self.worktree_registry.as_deref(),
+        ) {
+            state.debounce.on_event(now);
+            state.pending_overlay_scope = Some(match state.pending_overlay_scope.take() {
+                Some(pending) => pending.merge(scope),
+                None => scope,
+            });
+            // A `.gitignore` mutation changed the rules — recompile so subsequent
+            // events are classified against current rules, not the matcher
+            // this watcher booted with.
+            if kind_is_mutation(&event.kind)
+                && event.paths.iter().any(|path| is_gitignore_path(path))
             {
-                // The periodic sweep is the missed-event backstop, so it refreshes every overlay;
-                // an event-driven pass carries the roots accumulated above (#577). When both are
-                // due at once, `All` is the superset — and because the sweep clock counts from
-                // the last All COMPLETION, sustained event churn escalates a pass to `All` every
-                // interval instead of postponing the backstop.
-                let overlay_scope = if periodic_due {
-                    OverlayScope::All
-                } else {
-                    pending_overlay_scope
-                        .clone()
-                        .unwrap_or_else(|| OverlayScope::Linked(BTreeSet::new()))
-                };
-                if let Some(request) = self.scheduler.dispatch(overlay_scope) {
-                    // The scheduler may widen the scope (gc-cadence passes force `All`), so read
-                    // the DISPATCHED request's scope, not the one handed in.
-                    if let PassRequest::Maintenance { overlay_scope, .. } = &request {
-                        sweep.on_dispatch(matches!(overlay_scope, OverlayScope::All));
-                    }
-                    let _ = self.pass_tx.send(request);
-                    // Every pass services the resident tail. Its completion re-arms the next
-                    // backlog retry or idle-shutdown deadline when needed.
-                    live_oracle_wake_at = None;
-                    // Reset ONLY on dispatch: while a pass is in flight the armed debounce (and
-                    // the scope accumulated with it) is the record that a follow-up is owed, and
-                    // it fires as soon as `PassDone` lands.
-                    debounce.reset();
-                    pending_overlay_scope = None;
-                }
-            }
-            if fleet_debounce.should_fire(now)
-                && let Some(bin) = self.fleet_bin
-            {
-                // Signal the fleet (this process last) to hot-upgrade to the freshly installed
-                // binary.
-                (self.fleet_trigger)(bin);
-                fleet_debounce.reset();
-            }
-            // Between-pass watch-placement-failure drain (#658 review). Runs every loop iteration —
-            // the loop wakes at least every `IDLE_WAIT`, so even a periodic-sweep-disabled watcher
-            // with no further filesystem events reaches here within one idle tick. Gated on a RISE
-            // in the counter (two atomic loads on the healthy path — negligible), so it opens the
-            // DB only when a placement newly failed. The pass worker persists at pass
-            // start, but the post-pass linked-worktree resync places watches AFTER
-            // that; this is what surfaces such a drop while the watcher keeps running.
-            // The `warn!` is emitted here (once per new batch via the coalesced
-            // counter) so the log signal fires even when the flush is deferred, and the
-            // flush is NON-blocking: a busy DB / held write lock leaves `last_flushed` unadvanced
-            // so the next tick retries. It never dispatches a pass, so it cannot re-drive the
-            // resync and loop.
-            let (_, current_placement_failures) = self.counters.counts();
-            if current_placement_failures > last_flushed_placement_failures {
-                if let Some(total) = self.counters.newly_warnable_failures() {
-                    // The recovery path differs by config: with the periodic sweep ON, the
-                    // unwatched subtree is re-scanned each interval; with it DISABLED
-                    // (`periodic_sweep_secs = 0`) there is no backstop, so edits beneath the
-                    // dropped watch can go unindexed until an event-driven pass happens to touch it
-                    // or the operator reindexes — don't promise a sweep that won't run.
-                    let recovery = if self.config.watch.periodic_sweep_secs > 0 {
-                        "falling back to the periodic sweep"
-                    } else {
-                        "and the periodic sweep is DISABLED, so edits beneath an unwatched \
-                         directory may go unindexed until the next event-driven pass or a reindex"
-                    };
-                    tracing::warn!(
-                        target: "rag_rat_core::watch",
-                        watch_placement_failures = total,
-                        periodic_sweep_secs = self.config.watch.periodic_sweep_secs,
-                        "watch placement failed for one or more directories ({recovery}); on Linux \
-                         this is usually fs.inotify.max_user_watches exhaustion"
-                    );
-                }
-                if flush_watch_placement_failures(self.config, self.counters, Duration::ZERO) {
-                    last_flushed_placement_failures = current_placement_failures;
-                }
+                // PLACEMENT, not just classification, must track the new rules (#332):
+                // a removed ignore rule UN-ignores a subtree the startup walk skipped,
+                // so re-walk and add watches for it now — otherwise edits inside it
+                // never fire. notify's `watch()` is idempotent for an
+                // already-watched path, so re-walking only ADDS the
+                // newly-eligible dirs. (A newly-IGNORED subtree keeps its
+                // now-stale watches — harmless wasted watches; full unwatch
+                // bookkeeping is deferred.)
+                recompile_ignore_and_place_watches(
+                    self.notify_watcher,
+                    self.counters,
+                    self.config,
+                    self.target_dirs,
+                    self.ignore,
+                    self.linked_worktrees,
+                );
             }
         }
-        debounce.fire_at().is_some()
+        if event_targets_binary(self.fleet_bin, event) {
+            state.fleet_debounce.on_event(now);
+        }
+    }
+
+    fn on_pass_done(&mut self, state: &mut LoopState, live_oracle_wake_in: Option<Duration>) {
+        self.scheduler.on_done();
+        let done_at = Instant::now();
+        state.live_oracle_wake_at =
+            live_oracle_wake_in.and_then(|delay| done_at.checked_add(delay));
+        state.sweep.on_pass_done(done_at);
+        // The cooldown counts from pass COMPLETION (#823) — the armed debounce is typically
+        // long-elapsed by now, and without this the next iteration would dispatch the follow-up
+        // immediately, back-to-back.
+        state.cooldown.on_pass_done(done_at);
+        // Refresh the live linked-worktree set after every pass. Existing checkout
+        // paths can switch branches and therefore branch-local target sets; rebuilding
+        // the state keeps classification, ignore matchers, and watch placement in one
+        // place. Removed checkout paths can still have stale backend watches
+        // (harmless; their overlay is GC-pruned), but no stale `LinkedWorktreeWatch`
+        // state remains active.
+        sync_linked_worktrees_after_pass(
+            self.notify_watcher,
+            self.counters,
+            self.config,
+            self.linked_worktrees,
+        );
+        // A resync-introduced watch-placement drop is picked up by `drain_placement_failures`,
+        // which runs every loop iteration, not here.
+    }
+
+    fn on_papertrail_done(&self, state: &mut LoopState) {
+        if let Some(request_tx) = self.papertrail_tx
+            && let Some(follow_up) = state.papertrail_scheduler.on_done()
+        {
+            let _ = request_tx.send(follow_up);
+        }
+    }
+
+    /// The papertrail tick enqueues a schedule EVALUATION, never an unconditional mirror: the
+    /// per-binding policy decides skip / probe / incremental / full, and the daily full-walk
+    /// backstop rides the same evaluation. Independent of the debounce and of
+    /// `scheduler.in_flight()`, so ordinary maintenance never delays it; redundant ticks coalesce
+    /// in `PapertrailScheduler` (and cross-process in the flight's pending marker).
+    fn tick_papertrail(&self, state: &mut LoopState, now: Instant) {
+        if state.papertrail_clock.due(now) {
+            state.papertrail_clock.on_tick(now);
+            if let Some(request_tx) = self.papertrail_tx
+                && let Some(request) = state.papertrail_scheduler.admit(AutosyncRequest::Evaluate)
+            {
+                let _ = request_tx.send(request);
+            }
+        }
+    }
+
+    /// Hand the pass worker a maintenance request when a sweep, a live-oracle wake, or the
+    /// debounce (past its cooldown) is due.
+    fn maybe_dispatch(&mut self, state: &mut LoopState, now: Instant) {
+        let periodic_due = state.sweep.due(now);
+        let live_oracle_wake_due = state.live_oracle_wake_at.is_some_and(|at| now >= at);
+        // The cooldown (#823) holds back only the DEBOUNCE-driven dispatch; a due periodic
+        // sweep dispatches regardless — the missed-event backstop is never starved by the
+        // cooldown.
+        if !(periodic_due
+            || live_oracle_wake_due
+            || (state.debounce.should_fire(now) && state.cooldown.ready(now)))
+        {
+            return;
+        }
+        // The periodic sweep is the missed-event backstop, so it refreshes every overlay;
+        // an event-driven pass carries the roots accumulated since the last dispatch (#577).
+        // When both are due at once, `All` is the superset — and because the sweep clock counts
+        // from the last All COMPLETION, sustained event churn escalates a pass to `All` every
+        // interval instead of postponing the backstop.
+        let overlay_scope = if periodic_due {
+            OverlayScope::All
+        } else {
+            state
+                .pending_overlay_scope
+                .clone()
+                .unwrap_or_else(|| OverlayScope::Linked(BTreeSet::new()))
+        };
+        if let Some(request) = self.scheduler.dispatch(overlay_scope) {
+            // The scheduler may widen the scope (gc-cadence passes force `All`), so read
+            // the DISPATCHED request's scope, not the one handed in.
+            if let PassRequest::Maintenance { overlay_scope, .. } = &request {
+                state.sweep.on_dispatch(matches!(overlay_scope, OverlayScope::All));
+            }
+            let _ = self.pass_tx.send(request);
+            // Every pass services the resident tail. Its completion re-arms the next
+            // backlog retry or idle-shutdown deadline when needed.
+            state.live_oracle_wake_at = None;
+            // Reset ONLY on dispatch: while a pass is in flight the armed debounce (and
+            // the scope accumulated with it) is the record that a follow-up is owed, and
+            // it fires as soon as `PassDone` lands.
+            state.debounce.reset();
+            state.pending_overlay_scope = None;
+        }
+    }
+
+    fn maybe_fire_fleet(&mut self, state: &mut LoopState, now: Instant) {
+        if state.fleet_debounce.should_fire(now)
+            && let Some(bin) = self.fleet_bin
+        {
+            // Signal the fleet (this process last) to hot-upgrade to the freshly installed
+            // binary.
+            (self.fleet_trigger)(bin);
+            state.fleet_debounce.reset();
+        }
+    }
+
+    /// Between-pass watch-placement-failure drain (#658 review). Runs every loop iteration — the
+    /// loop wakes at least every `IDLE_WAIT`, so even a periodic-sweep-disabled watcher with no
+    /// further filesystem events reaches here within one idle tick. Gated on a RISE in the counter
+    /// (two atomic loads on the healthy path — negligible), so it opens the DB only when a
+    /// placement newly failed. The pass worker persists at pass start, but the post-pass
+    /// linked-worktree resync places watches AFTER that; this is what surfaces such a drop while
+    /// the watcher keeps running. The `warn!` is emitted here (once per new batch via the
+    /// coalesced counter) so the log signal fires even when the flush is deferred, and the flush
+    /// is NON-blocking: a busy DB / held write lock leaves `last_flushed` unadvanced so the next
+    /// tick retries. It never dispatches a pass, so it cannot re-drive the resync and loop.
+    fn drain_placement_failures(&self, state: &mut LoopState) {
+        let (_, current_placement_failures) = self.counters.counts();
+        if current_placement_failures <= state.last_flushed_placement_failures {
+            return;
+        }
+        if let Some(total) = self.counters.newly_warnable_failures() {
+            // The recovery path differs by config: with the periodic sweep ON, the
+            // unwatched subtree is re-scanned each interval; with it DISABLED
+            // (`periodic_sweep_secs = 0`) there is no backstop, so edits beneath the
+            // dropped watch can go unindexed until an event-driven pass happens to touch it
+            // or the operator reindexes — don't promise a sweep that won't run.
+            let recovery = if self.config.watch.periodic_sweep_secs > 0 {
+                "falling back to the periodic sweep"
+            } else {
+                "and the periodic sweep is DISABLED, so edits beneath an unwatched directory may \
+                 go unindexed until the next event-driven pass or a reindex"
+            };
+            tracing::warn!(
+                target: "rag_rat_core::watch",
+                watch_placement_failures = total,
+                periodic_sweep_secs = self.config.watch.periodic_sweep_secs,
+                "watch placement failed for one or more directories ({recovery}); on Linux \
+                 this is usually fs.inotify.max_user_watches exhaustion"
+            );
+        }
+        if flush_watch_placement_failures(self.config, self.counters, Duration::ZERO) {
+            state.last_flushed_placement_failures = current_placement_failures;
+        }
     }
 }
 
