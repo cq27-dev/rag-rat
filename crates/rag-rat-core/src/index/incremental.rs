@@ -817,9 +817,7 @@ impl IndexDatabase {
                 let changes = git_changed_paths(&config.root)?;
                 // `changes.changed` IS the full dirty set (git status), so a dirty `Cargo.toml` is
                 // already in it; `files` ⊆ `changes.changed`, so this is complete for Changed.
-                let manifest_in_change_set =
-                    paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
-                        || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path));
+                let manifest_in_change_set = changes.includes_cargo_toml();
                 let files = collect_changed_index_files(config, &changes)?;
                 self.prepare_from_files_and_changes(
                     files,
@@ -852,12 +850,10 @@ impl IndexDatabase {
                 // walk (taken later, in the caller) so it is not affected by this snapshot.
                 let changes = git_changed_paths(&config.root).unwrap_or_default();
                 let plan = discovery_plan(self.storage.connection(), config, &changes)?;
-                let manifest_in_change_set =
-                    paths_include_cargo_toml(changes.changed.iter().map(PathBuf::as_path))
-                        || paths_include_cargo_toml(changes.deleted.iter().map(PathBuf::as_path))
-                        || paths_include_cargo_toml(
-                            plan.files.iter().map(|file| file.relative_path.as_path()),
-                        );
+                let manifest_in_change_set = changes.includes_cargo_toml()
+                    || paths_include_cargo_toml(
+                        plan.files.iter().map(|file| file.relative_path.as_path()),
+                    );
                 let carried_ids = plan.carried;
                 let deleted = plan.deleted;
                 let files = self.assign_file_scopes(plan.files, &changes);
@@ -1307,6 +1303,14 @@ impl IndexDatabase {
 /// removal also triggers the refresh.
 fn paths_include_cargo_toml<'a>(mut paths: impl Iterator<Item = &'a Path>) -> bool {
     paths.any(is_cargo_toml)
+}
+
+impl GitChangedPaths {
+    /// Whether the change set changed or deleted a `Cargo.toml` — the git-status half of the
+    /// manifest-refresh signal both Changed and Discover passes compute.
+    fn includes_cargo_toml(&self) -> bool {
+        paths_include_cargo_toml(self.changed.iter().chain(&self.deleted).map(PathBuf::as_path))
+    }
 }
 
 fn is_cargo_toml(path: &Path) -> bool {
