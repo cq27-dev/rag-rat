@@ -33,7 +33,7 @@ pub use compact::CompactPass;
 // Curated crate-facing surface (mod.rs is the index, not the junk drawer): the migration
 // ladder and `register_repo` adoption re-derive persisted finding ids after re-stamping
 // `repo_id`.
-pub use findings::{ReviewVerdict, ReviewedFinding};
+pub use findings::{FindingKind, ReviewVerdict, ReviewedFinding};
 pub use findings::{rederive_finding_ids, review_dream_finding};
 // The single-turn chat client the verdict/compact passes consume lives in `rag-rat-llm`
 // (`rag_rat_llm::chat`): the CLI builds one from `[llm.dream.remote]` and hands the borrowed
@@ -64,7 +64,7 @@ pub(crate) use rag_rat_query::memory::evidence as verify;
 /// the stable id. It carries no id/status because neither exists until the sync writes the row.
 #[derive(Debug, Clone, Serialize)]
 pub struct DreamFinding {
-    pub kind: String,
+    pub kind: FindingKind,
     pub subject: String,
     pub evidence: String,
     pub rank: f64,
@@ -143,14 +143,12 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> anyhow::Result<DreamR
     // always; the verify kinds only when `--verify` ran. Without this, a plain `dream` after a
     // `dream --verify` would resolve the open `memory_unverifiable` / `memory_divergence` findings
     // it never re-evaluated, silently dropping real worklist items until the next verify run.
-    let mut resolve_kinds: Vec<&str> = findings::BASE_FINDING_KINDS.to_vec();
     if opts.verify {
         findings.extend(findings::unverifiable_findings(conn)?);
         findings.extend(verdict::divergence_findings(conn)?);
-        resolve_kinds.extend_from_slice(findings::VERIFY_FINDING_KINDS);
     }
     let (opened, refreshed, superseded, resolved) =
-        findings::sync(conn, &findings, opts.now_ms, &resolve_kinds)?;
+        findings::sync(conn, &findings, opts.now_ms, FindingKind::computed_by(opts.verify))?;
 
     // emit the OPEN worklist from the store (post-sync); each finding's exposed rank is its
     // base_rank DECAYED by age since first_seen (effective_rank) — a stale unreviewed finding

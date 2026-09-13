@@ -37,13 +37,11 @@ use super::DreamFinding;
 use super::failure::{
     self, DreamFailureReason, DreamModelFailure, DreamModelPass, FailureStamp, RecordFailure,
 };
+use super::findings::FindingKind;
 use super::verify::{
     self, EvidencePack, IdentifierResolution, ResolutionKind, VerificationQueueEntry,
     evidence_pack, verification_queue,
 };
-
-/// Rank for a `memory_divergence` finding — high, but below a broken-anchor's pass-0 signal.
-const DIVERGENCE_RANK: f64 = 0.8;
 
 /// The verdict-pass configuration handed to [`run_verdict_pass`]: the model to ask and how many
 /// queued memories it may check this run (the runner stops once that many entries reach the model
@@ -982,14 +980,14 @@ pub(super) fn divergence_findings(conn: &Connection) -> rusqlite::Result<Vec<Dre
         let direction = row.direction.unwrap_or_else(|| Direction::Unknown.as_db_str().to_string());
         let cited = compact_evidence(row.evidence_json.as_deref());
         out.push(DreamFinding {
-            kind: "memory_divergence".into(),
+            kind: FindingKind::MemoryDivergence,
             subject: row.memory_id,
             // Evidence is derived from the STORED row, so it is stable across skip-runs (refresh,
             // not supersede) and only changes when a re-check rewrites the row.
             evidence: format!(
                 "model verdict: diverged (direction: {direction}); cited: {cited} [reality]"
             ),
-            rank: DIVERGENCE_RANK,
+            rank: FindingKind::MemoryDivergence.base_rank(),
         });
     }
     Ok(out)

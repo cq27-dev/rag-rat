@@ -20,12 +20,61 @@ use super::DreamFinding;
 /// enough to be worth a coverage-gap finding.
 const COVERAGE_RANK_POOL: usize = 500;
 
-/// The finding kinds a plain `dream` run always computes (no `--verify`) — the resolve pass may
-/// close a stale one even when this run produced zero of them.
-pub(super) const BASE_FINDING_KINDS: &[&str] = &["coverage_gap", "stale_reference"];
-/// The extra kinds the verify pass computes; only resolvable on a `--verify` run (else a plain
-/// `dream` would wrongly resolve findings a prior verify run opened — the kind was not evaluated).
-pub(super) const VERIFY_FINDING_KINDS: &[&str] = &["memory_unverifiable", "memory_divergence"];
+/// The closed set of `dream_findings.kind` tokens the finding builders emit. A stored row keeps its
+/// kind as a string (`WorklistFinding::kind`); the resolve sweep parses it back to decide whether
+/// this run computed that kind.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, strum::EnumString, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    CoverageGap,
+    StaleReference,
+    MemoryUnverifiable,
+    MemoryDivergence,
+}
+
+impl FindingKind {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token; `None` outside the closed set.
+    pub(crate) fn from_db_str(value: &str) -> Option<Self> {
+        value.parse().ok()
+    }
+
+    /// The rank a finding of this kind carries. `coverage_gap` scales it by the symbol's importance
+    /// normalized to the top uncovered symbol; the other kinds carry it as is.
+    pub(crate) fn base_rank(self) -> f64 {
+        match self {
+            Self::CoverageGap => 1.0,
+            Self::StaleReference => 0.5,
+            Self::MemoryUnverifiable => 0.9,
+            // High, but below a broken anchor's pass-0 `memory_unverifiable` signal.
+            Self::MemoryDivergence => 0.8,
+        }
+    }
+
+    /// The kinds a run computes, and so the only kinds its resolve sweep may close. The base kinds
+    /// run always — the sweep may close a stale one even when the run produced zero of them. The
+    /// verify kinds join only on a `--verify` run: a plain `dream` did not evaluate them, so
+    /// resolving would drop findings a prior verify run opened.
+    pub(crate) fn computed_by(verify: bool) -> &'static [Self] {
+        if verify {
+            &[
+                Self::CoverageGap,
+                Self::StaleReference,
+                Self::MemoryUnverifiable,
+                Self::MemoryDivergence,
+            ]
+        } else {
+            &[Self::CoverageGap, Self::StaleReference]
+        }
+    }
+}
 
 fn claim_hash(kind: &str, subject: &str, evidence: &str) -> String {
     let mut h = Sha256::new();
@@ -232,11 +281,11 @@ pub(super) fn coverage_gap(conn: &Connection, limit: usize) -> anyhow::Result<Ve
             top_score = sym.score.max(f64::MIN_POSITIVE);
         }
         out.push(DreamFinding {
-            kind: "coverage_gap".into(),
+            kind: FindingKind::CoverageGap,
             subject,
             evidence: "load-bearing symbol (scoped weighted PageRank), no memory binding [E0]"
                 .into(),
-            rank: sym.score / top_score,
+            rank: FindingKind::CoverageGap.base_rank() * sym.score / top_score,
         });
     }
     Ok(out)
@@ -282,10 +331,10 @@ pub(super) fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFi
         gone.dedup();
         if !gone.is_empty() {
             out.push(DreamFinding {
-                kind: "stale_reference".into(),
+                kind: FindingKind::StaleReference,
                 subject: id,
                 evidence: format!("references unresolved path(s): {} [E0]", gone.join(", ")),
-                rank: 0.5,
+                rank: FindingKind::StaleReference.base_rank(),
             });
         }
     }
@@ -327,7 +376,7 @@ pub(super) fn sync(
     conn: &Connection,
     findings: &[DreamFinding],
     now_ms: i64,
-    resolve_kinds: &[&str],
+    resolve_kinds: &[FindingKind],
 ) -> rusqlite::Result<(usize, usize, usize, usize)> {
     // IMMEDIATE, not the default DEFERRED: take the write lock at BEGIN so the per-finding
     // SELECT-then-INSERT in `sync_in_tx` is atomic against a concurrent writer. A DEFERRED txn
@@ -371,10 +420,10 @@ pub(super) fn sync(
 /// here (rather than letting the loop's supersede race silently drop one) makes the survivor
 /// deterministic. See the call site for the failure it guards (#261).
 fn dedup_by_kind_subject(findings: &[DreamFinding]) -> Vec<&DreamFinding> {
-    let mut position: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut position: HashMap<(FindingKind, &str), usize> = HashMap::new();
     let mut order: Vec<&DreamFinding> = Vec::new();
     for f in findings {
-        let key = (f.kind.as_str(), f.subject.as_str());
+        let key = (f.kind, f.subject.as_str());
         match position.get(&key) {
             // Keep the winner's SLOT (first-seen order) but swap in the higher-ranked claim.
             Some(&idx) =>
@@ -394,7 +443,7 @@ fn sync_in_tx(
     conn: &Connection,
     findings: &[DreamFinding],
     now_ms: i64,
-    resolve_kinds: &[&str],
+    resolve_kinds: &[FindingKind],
 ) -> rusqlite::Result<(usize, usize, usize, usize)> {
     let (mut opened, mut refreshed, mut superseded, mut resolved) = (0, 0, 0, 0);
     // Dedup the INPUT by (kind, subject) first (#261). Two findings sharing a (kind, subject) but
@@ -415,8 +464,9 @@ fn sync_in_tx(
         None => (String::new(), String::new()),
     };
     for f in findings {
-        let ch = claim_hash(&f.kind, &f.subject, &f.evidence);
-        seen.insert((f.kind.clone(), f.subject.clone()));
+        let kind = f.kind.as_db_str();
+        let ch = claim_hash(kind, &f.subject, &f.evidence);
+        seen.insert((kind.to_string(), f.subject.clone()));
         // Look up by the EXACT claim (incl. its current status) — NOT status-blind, or an evidence
         // flip-back (A→B→A) or a resolved-then-reappears would match a terminal row and silently
         // refresh it, stranding the actually-current finding. Scoped to the active repo so a
@@ -427,7 +477,7 @@ fn sync_in_tx(
                     "SELECT id, status FROM dream_findings WHERE kind = ?1 AND subject = ?2 AND \
                      claim_hash = ?3{repo_clause}"
                 ),
-                rusqlite::params![f.kind, f.subject, ch],
+                rusqlite::params![kind, f.subject, ch],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok();
@@ -441,7 +491,7 @@ fn sync_in_tx(
                      kind = ?2 AND subject = ?3 AND id != ?1 AND status IN \
                      ('open','accepted','dismissed'){repo_clause}"
                 ),
-                rusqlite::params![id, f.kind, f.subject],
+                rusqlite::params![id, kind, f.subject],
             )
         };
         match existing {
@@ -467,14 +517,14 @@ fn sync_in_tx(
             },
             // brand-new claim for this (kind, subject): open fresh + supersede prior current rows
             None => {
-                let id = finding_id(&scope, &f.kind, &f.subject, &ch);
+                let id = finding_id(&scope, kind, &f.subject, &ch);
                 conn.execute(
                     &format!(
                         "INSERT INTO dream_findings({repo_col}id, kind, subject, claim_hash, \
                          evidence, base_rank, status, first_seen_at_ms, last_seen_at_ms) \
                          VALUES({repo_val}?1,?2,?3,?4,?5,?6,'open',?7,?7)"
                     ),
-                    rusqlite::params![id, f.kind, f.subject, ch, f.evidence, f.rank, now_ms],
+                    rusqlite::params![id, kind, f.subject, ch, f.evidence, f.rank, now_ms],
                 )?;
                 opened += 1;
                 superseded += supersede_others(&id)?;
@@ -494,7 +544,8 @@ fn sync_in_tx(
     for (id, kind, subject) in current {
         // Only resolve within the kinds this run computed — a kind not evaluated this run keeps its
         // open findings (a plain `dream` must not resolve a prior `--verify` run's findings).
-        if resolve_kinds.contains(&kind.as_str()) && !seen.contains(&(kind, subject)) {
+        let computed = FindingKind::from_db_str(&kind).is_some_and(|k| resolve_kinds.contains(&k));
+        if computed && !seen.contains(&(kind, subject)) {
             conn.execute("UPDATE dream_findings SET status = 'resolved' WHERE id = ?1", [&id])?;
             resolved += 1;
         }
@@ -608,15 +659,31 @@ mod tests {
     use super::super::tests::{mem_db, set_repo};
     use super::*;
 
+    #[test]
+    fn finding_kind_tokens_are_exact_and_round_trip() {
+        let kinds = [
+            (FindingKind::CoverageGap, "coverage_gap"),
+            (FindingKind::StaleReference, "stale_reference"),
+            (FindingKind::MemoryUnverifiable, "memory_unverifiable"),
+            (FindingKind::MemoryDivergence, "memory_divergence"),
+        ];
+        for (kind, token) in kinds {
+            assert_eq!(kind.as_db_str(), token);
+            assert_eq!(FindingKind::from_db_str(token), Some(kind));
+            assert_eq!(serde_json::to_value(kind).unwrap(), token, "serialized as the same token");
+        }
+        assert_eq!(FindingKind::computed_by(true).len(), kinds.len(), "a verify run computes all");
+    }
+
     // A single coverage_gap finding, synced into the active repo; returns its id.
     fn seed_one_finding(c: &Connection, subject: &str, now_ms: i64) -> String {
         let f = vec![DreamFinding {
-            kind: "coverage_gap".into(),
+            kind: FindingKind::CoverageGap,
             subject: subject.into(),
             evidence: "7 callers".into(),
             rank: 0.5,
         }];
-        sync(c, &f, now_ms, BASE_FINDING_KINDS).unwrap();
+        sync(c, &f, now_ms, FindingKind::computed_by(false)).unwrap();
         // By subject alone (not status): a re-sync after a review leaves the row non-'open', and
         // the caller still needs its id.
         c.query_row("SELECT id FROM dream_findings WHERE subject = ?1", [subject], |r| r.get(0))
@@ -675,7 +742,7 @@ mod tests {
         set_repo(&c, "r");
         let id = seed_one_finding(&c, "x::F", 1000);
         // A run that reports nothing resolves the open finding.
-        sync(&c, &[], 2000, BASE_FINDING_KINDS).unwrap();
+        sync(&c, &[], 2000, FindingKind::computed_by(false)).unwrap();
         assert_eq!(status_and_reviewed(&c, &id).0, "resolved");
         let err = review_dream_finding(&c, &id, ReviewVerdict::Accept, 3000).unwrap_err();
         assert!(err.to_string().contains("not reviewable"), "got: {err}");
@@ -751,18 +818,18 @@ mod tests {
         let c = mem_db();
         let finding = || {
             vec![DreamFinding {
-                kind: "coverage_gap".into(),
+                kind: FindingKind::CoverageGap,
                 subject: "x::F".into(),
                 evidence: "7 callers".into(),
                 rank: 0.5,
             }]
         };
         set_repo(&c, "repo-a");
-        sync(&c, &finding(), 1000, BASE_FINDING_KINDS).unwrap();
+        sync(&c, &finding(), 1000, FindingKind::computed_by(false)).unwrap();
         set_repo(&c, "repo-b");
         // Pre-fix this is a PK violation, not an UPDATE: the scoped lookup misses repo-a's row and
         // the insert derives the same repo-blind id.
-        sync(&c, &finding(), 2000, BASE_FINDING_KINDS).unwrap();
+        sync(&c, &finding(), 2000, FindingKind::computed_by(false)).unwrap();
 
         let rows: Vec<(String, String)> = c
             .prepare(
@@ -829,30 +896,30 @@ mod tests {
     fn sync_is_idempotent_and_supersedes_on_change() {
         let c = mem_db();
         let f1 = vec![DreamFinding {
-            kind: "coverage_gap".into(),
+            kind: FindingKind::CoverageGap,
             subject: "x::F".into(),
             evidence: "10 callers".into(),
             rank: 1.0,
         }];
-        let (o, r, s, res) = sync(&c, &f1, 1000, BASE_FINDING_KINDS).unwrap();
+        let (o, r, s, res) = sync(&c, &f1, 1000, FindingKind::computed_by(false)).unwrap();
         assert_eq!((o, r, s, res), (1, 0, 0, 0), "first run opens");
-        let (o, r, _, _) = sync(&c, &f1, 2000, BASE_FINDING_KINDS).unwrap();
+        let (o, r, _, _) = sync(&c, &f1, 2000, FindingKind::computed_by(false)).unwrap();
         assert_eq!((o, r), (0, 1), "same finding refreshes, no duplicate");
         // material change -> supersede prior, open fresh
         let f2 = vec![DreamFinding {
-            kind: "coverage_gap".into(),
+            kind: FindingKind::CoverageGap,
             subject: "x::F".into(),
             evidence: "40 callers".into(),
             rank: 1.0,
         }];
-        let (o, _, s, _) = sync(&c, &f2, 3000, BASE_FINDING_KINDS).unwrap();
+        let (o, _, s, _) = sync(&c, &f2, 3000, FindingKind::computed_by(false)).unwrap();
         assert_eq!((o, s), (1, 1), "changed evidence supersedes + opens fresh");
         let opened: i64 = c
             .query_row("SELECT COUNT(*) FROM dream_findings WHERE status='open'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(opened, 1, "exactly one open finding for the (kind,subject)");
         // run with no findings -> the (kind,subject) resolves
-        let (_, _, _, res) = sync(&c, &[], 4000, BASE_FINDING_KINDS).unwrap();
+        let (_, _, _, res) = sync(&c, &[], 4000, FindingKind::computed_by(false)).unwrap();
         assert_eq!(res, 1, "absent finding resolves");
     }
 
@@ -861,7 +928,7 @@ mod tests {
         let c = mem_db();
         let cg = |ev: &str, rank: f64| {
             vec![DreamFinding {
-                kind: "coverage_gap".into(),
+                kind: FindingKind::CoverageGap,
                 subject: "x::F".into(),
                 evidence: ev.into(),
                 rank,
@@ -882,9 +949,9 @@ mod tests {
             .unwrap()
         };
         // A -> B -> A: the flip-back must leave A current with A's evidence, NOT strand B as open.
-        sync(&c, &cg("10 callers", 0.1), 1000, BASE_FINDING_KINDS).unwrap();
-        sync(&c, &cg("40 callers", 0.9), 2000, BASE_FINDING_KINDS).unwrap();
-        sync(&c, &cg("10 callers", 0.1), 3000, BASE_FINDING_KINDS).unwrap();
+        sync(&c, &cg("10 callers", 0.1), 1000, FindingKind::computed_by(false)).unwrap();
+        sync(&c, &cg("40 callers", 0.9), 2000, FindingKind::computed_by(false)).unwrap();
+        sync(&c, &cg("10 callers", 0.1), 3000, FindingKind::computed_by(false)).unwrap();
         assert_eq!(count(&c, "open"), 1, "exactly one open row after flip-back");
         assert_eq!(
             open_evidence(&c),
@@ -892,9 +959,9 @@ mod tests {
             "current (A) is open, not stale B"
         );
         // resolve, then reappear with the SAME evidence: must revive to open, not stay resolved.
-        sync(&c, &[], 4000, BASE_FINDING_KINDS).unwrap();
+        sync(&c, &[], 4000, FindingKind::computed_by(false)).unwrap();
         assert!(count(&c, "resolved") >= 1, "absent finding resolves");
-        sync(&c, &cg("10 callers", 0.1), 5000, BASE_FINDING_KINDS).unwrap();
+        sync(&c, &cg("10 callers", 0.1), 5000, FindingKind::computed_by(false)).unwrap();
         assert_eq!(count(&c, "open"), 1, "reappearing resolved finding is revived to open");
     }
 
@@ -1053,20 +1120,20 @@ mod tests {
         // Now the higher-ranked claim is the single open row and nothing is superseded.
         let findings = vec![
             DreamFinding {
-                kind: "coverage_gap".into(),
+                kind: FindingKind::CoverageGap,
                 subject: "x::F".into(),
                 evidence: "lo".into(),
                 rank: 0.2,
             },
             DreamFinding {
-                kind: "coverage_gap".into(),
+                kind: FindingKind::CoverageGap,
                 subject: "x::F".into(),
                 evidence: "hi".into(),
                 rank: 0.9,
             },
         ];
         let (opened, _refreshed, superseded, _resolved) =
-            sync(&c, &findings, 100, BASE_FINDING_KINDS).unwrap();
+            sync(&c, &findings, 100, FindingKind::computed_by(false)).unwrap();
         assert_eq!(opened, 1, "exactly one finding opens for the (kind, subject)");
         assert_eq!(superseded, 0, "no within-run supersede race");
         let rows: Vec<(String, String)> = c
@@ -1101,7 +1168,7 @@ mod tests {
         b.busy_timeout(std::time::Duration::ZERO).unwrap();
         b.execute_batch("BEGIN IMMEDIATE").unwrap(); // hold the write lock
 
-        let err = sync(&a, &[], 1, BASE_FINDING_KINDS).unwrap_err();
+        let err = sync(&a, &[], 1, FindingKind::computed_by(false)).unwrap_err();
         assert!(
             rag_rat_db::storage::is_busy(&anyhow::Error::new(err)),
             "an empty sync under a concurrently-held writer must fail busy — proving BEGIN \
@@ -1152,13 +1219,13 @@ pub(super) fn unverifiable_findings(conn: &Connection) -> rusqlite::Result<Vec<D
             format!(": {}", identifiers.join(", "))
         };
         out.push(DreamFinding {
-            kind: "memory_unverifiable".into(),
+            kind: FindingKind::MemoryUnverifiable,
             subject: memory_id,
             evidence: format!(
                 "no live binding and none of {} identifier(s) resolve in the index{named} [E0]",
                 identifiers.len(),
             ),
-            rank: 0.9,
+            rank: FindingKind::MemoryUnverifiable.base_rank(),
         });
     }
     Ok(out)
