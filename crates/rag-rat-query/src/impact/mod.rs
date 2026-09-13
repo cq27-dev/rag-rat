@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub(crate) use select::*;
 use serde::Serialize;
 
-use crate::graph::{self, GraphHop, GraphResolutionMode, GraphTraversalOptions};
+use crate::graph::{self, Direction, GraphHop, GraphResolutionMode, GraphTraversalOptions};
 use crate::memory::{self, CompactRepoMemoryEvidence, RepoMemoryEvidence};
 use crate::symbol::SymbolHit;
 
@@ -190,13 +190,13 @@ pub fn impact_surface(
 fn oracle_ranked_neighbors(
     conn: &Connection,
     symbol: &str,
-    reverse: bool,
+    direction: Direction,
     limit: u32,
     graph_options: &GraphTraversalOptions,
     enrich: &impl Fn(&mut Vec<GraphHop>) -> anyhow::Result<bool>,
 ) -> anyhow::Result<Vec<GraphHop>> {
     let overfetch = graph::oracle_overfetch_limit(limit);
-    let mut hops = graph::traverse_with_options(conn, symbol, reverse, overfetch, graph_options)?;
+    let mut hops = graph::traverse_with_options(conn, symbol, direction, overfetch, graph_options)?;
     if enrich(&mut hops)? {
         hops.sort_by_key(|hop| graph::effective_confidence_rank(&hop.confidence));
     }
@@ -257,12 +257,18 @@ fn gather_sections(
     // completeness counts) sees the SAME truncated, re-ranked window the report returns.
     // `enrich` is a no-op for callers without an oracle pass (e.g. tests), so the lists
     // collapse back to the plain heuristic top-`limit`.
-    let direct_semantic_callers =
-        oracle_ranked_neighbors(conn, &symbol.qualified_name, true, limit, &graph_options, enrich)?;
+    let direct_semantic_callers = oracle_ranked_neighbors(
+        conn,
+        &symbol.qualified_name,
+        Direction::Callers,
+        limit,
+        &graph_options,
+        enrich,
+    )?;
     let direct_semantic_callees = oracle_ranked_neighbors(
         conn,
         &symbol.qualified_name,
-        false,
+        Direction::Callees,
         limit,
         &graph_options,
         enrich,
@@ -508,8 +514,22 @@ fn impact_surface_from_targets(
         );
     }
 
-    graph_neighbors(conn, &targets, &target_names, true, resolution_mode, &mut surface)?;
-    graph_neighbors(conn, &targets, &target_names, false, resolution_mode, &mut surface)?;
+    graph_neighbors(
+        conn,
+        &targets,
+        &target_names,
+        Direction::Callers,
+        resolution_mode,
+        &mut surface,
+    )?;
+    graph_neighbors(
+        conn,
+        &targets,
+        &target_names,
+        Direction::Callees,
+        resolution_mode,
+        &mut surface,
+    )?;
     import_export_dependents(conn, &targets, &target_names, &mut surface)?;
     same_file_siblings(conn, &targets, &mut surface)?;
 

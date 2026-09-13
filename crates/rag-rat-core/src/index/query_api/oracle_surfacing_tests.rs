@@ -1405,7 +1405,7 @@ fn find_callers_without_oracle_matches_heuristic_order() {
     let heuristic = rag_rat_query::graph::traverse_with_options(
         db.storage.connection(),
         "target",
-        true,
+        rag_rat_query::graph::Direction::Callers,
         limit,
         &grouped,
     )

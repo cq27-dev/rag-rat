@@ -3,7 +3,7 @@
 
 use rag_rat_query::graph::{
     self, Callsite, CompareGraphScipQuery, CompareGraphScipReport, CompareGraphScipSummary,
-    CompareGraphTextQuery, CompareGraphTextReport, CompareGraphTextSummary, GraphHop,
+    CompareGraphTextQuery, CompareGraphTextReport, CompareGraphTextSummary, Direction, GraphHop,
     GraphOnlyEdge, GraphResolutionMode, GraphScipContradiction, GraphTraversalOptions,
     GraphTraversalQuery, GraphTraversalReport, LogicalSymbol, LogicalSymbolVariant,
     MatchedGraphTextHit, TextOnlyHit,
@@ -20,7 +20,7 @@ impl IndexDatabase {
     }
 
     pub fn find_callers(&self, symbol: &str, limit: u32) -> anyhow::Result<Vec<GraphHop>> {
-        graph::traverse(self.storage.connection(), symbol, true, limit)
+        graph::traverse(self.storage.connection(), symbol, Direction::Callers, limit)
     }
 
     /// `check_library_usage` (#114): join the active checkout's `resolved-external` call sites to
@@ -184,7 +184,7 @@ impl IndexDatabase {
         let mut hops = graph::traverse_with_options(
             self.storage.connection(),
             symbol,
-            reverse,
+            if reverse { Direction::Callers } else { Direction::Callees },
             overfetch,
             options,
         )?;
@@ -206,7 +206,7 @@ impl IndexDatabase {
     }
 
     pub fn trace_callees(&self, symbol: &str, limit: u32) -> anyhow::Result<Vec<GraphHop>> {
-        graph::traverse(self.storage.connection(), symbol, false, limit)
+        graph::traverse(self.storage.connection(), symbol, Direction::Callees, limit)
     }
 
     pub fn trace_callees_with_options(
@@ -237,7 +237,7 @@ impl IndexDatabase {
         let mut summary = graph::traversal_summary(
             self.storage.connection(),
             &symbol.qualified_name,
-            reverse,
+            if reverse { Direction::Callers } else { Direction::Callees },
             limit,
             &options,
             results.len(),
@@ -294,7 +294,7 @@ impl IndexDatabase {
         let mut graph_edges = graph::traverse_with_options(
             self.storage.connection(),
             &symbol.qualified_name,
-            true,
+            Direction::Callers,
             limit,
             &options,
         )?;

@@ -155,7 +155,7 @@ fn syntactic(symbol_id: i64) -> GraphTraversalOptions {
 }
 
 fn callers(conn: &Connection, symbol: &str, options: &GraphTraversalOptions) -> Vec<GraphHop> {
-    traverse_with_options(conn, symbol, true, 100, options).unwrap()
+    traverse_with_options(conn, symbol, Direction::Callers, 100, options).unwrap()
 }
 
 /// One resolved caller plus three the resolver left unbound: the summary must confess to the three.
@@ -179,7 +179,8 @@ fn summary_counts_unresolved_call_sites_the_seed_could_not_reach() {
     let options = syntactic(target);
     let hops = callers(&conn, "a.rs::target", &options);
     let summary =
-        traversal_summary(&conn, "a.rs::target", true, 100, &options, hops.len()).unwrap();
+        traversal_summary(&conn, "a.rs::target", Direction::Callers, 100, &options, hops.len())
+            .unwrap();
 
     assert_eq!(summary.unresolved, 3, "three receiver-qualified call sites are unreachable");
     assert_eq!(summary.total_matching_edges, 4);
@@ -214,7 +215,9 @@ fn an_ambiguous_short_name_does_not_absorb_unrelated_unresolved_calls() {
     // The summary limit sits BETWEEN the gated candidate count (1) and the ungated one (4):
     // `truncated` is `total_matching_edges > limit`, so only a limit the absorbed candidates
     // would overrun tells the two apart. At a limit above both, the assertion holds either way.
-    let summary = traversal_summary(&conn, "a.rs::target", true, 2, &options, hops.len()).unwrap();
+    let summary =
+        traversal_summary(&conn, "a.rs::target", Direction::Callers, 2, &options, hops.len())
+            .unwrap();
 
     assert_eq!(hops.len(), 1, "the one bound call site is still the only caller");
     assert_eq!(summary.unresolved, 0, "an ambiguous short name claims no unresolved candidate");
@@ -249,7 +252,8 @@ fn a_cfg_split_seed_still_counts_the_call_sites_it_could_not_reach() {
     };
     let hops = callers(&conn, "a.rs::target", &options);
     let summary =
-        traversal_summary(&conn, "a.rs::target", true, 100, &options, hops.len()).unwrap();
+        traversal_summary(&conn, "a.rs::target", Direction::Callers, 100, &options, hops.len())
+            .unwrap();
 
     assert!(hops.is_empty(), "no heuristic arm reaches a receiver-qualified name");
     assert_eq!(summary.unresolved, 3, "the cfg twin is the seed, not a rival for its name");
@@ -283,7 +287,8 @@ fn oracle_verdicts_seed_the_call_sites_the_resolver_left_unbound() {
     assert_eq!(callers(&conn, "a.rs::target", &options).len(), 4, "all four call sites come back");
 
     // …and the summary stops calling them hidden, so they are counted once, not twice.
-    let summary = traversal_summary(&conn, "a.rs::target", true, 100, &options, 4).unwrap();
+    let summary =
+        traversal_summary(&conn, "a.rs::target", Direction::Callers, 100, &options, 4).unwrap();
     assert_eq!(summary.total_matching_edges, 4);
     // The compiler resolved the three; only tree-sitter left them unbound. Counting them as
     // unresolved reports a fully recalled, compiler-verified answer as the least complete one.
@@ -349,7 +354,9 @@ fn an_oracle_seeded_caller_outranks_a_name_guess_under_a_tight_limit() {
     add_upgrade_verdict(&conn, "a.rs", "sha-a", 100, target, TOOL_VERSION);
     install_scope_view(&conn, COMMIT, "").unwrap();
 
-    let hops = traverse_with_options(&conn, "a.rs::target", true, 1, &syntactic(target)).unwrap();
+    let hops =
+        traverse_with_options(&conn, "a.rs::target", Direction::Callers, 1, &syntactic(target))
+            .unwrap();
     assert_eq!(hops.len(), 1);
     assert_eq!(hops[0].target_qualified_name.as_deref(), Some("h::target"));
 }

@@ -1500,9 +1500,15 @@ fn graph_traversal_summary_counts_match_the_live_rows_during_a_dead_generation_w
 
     let options = rag_rat_query::graph::GraphTraversalOptions::default();
     let rows = db.find_callers("callee", 50).unwrap();
-    let summary =
-        rag_rat_query::graph::traversal_summary(conn, "callee", true, 50, &options, rows.len())
-            .unwrap();
+    let summary = rag_rat_query::graph::traversal_summary(
+        conn,
+        "callee",
+        rag_rat_query::graph::Direction::Callers,
+        50,
+        &options,
+        rows.len(),
+    )
+    .unwrap();
     assert_eq!(rows.len(), 1, "exactly one LIVE caller of callee");
     assert_eq!(
         summary.total_matching_edges,

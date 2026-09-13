@@ -3,15 +3,15 @@ use super::*;
 pub fn traverse(
     conn: &Connection,
     symbol: &str,
-    reverse: bool,
+    direction: Direction,
     limit: u32,
 ) -> anyhow::Result<Vec<GraphHop>> {
-    traverse_with_options(conn, symbol, reverse, limit, &GraphTraversalOptions::default())
+    traverse_with_options(conn, symbol, direction, limit, &GraphTraversalOptions::default())
 }
 pub fn traverse_with_options(
     conn: &Connection,
     symbol: &str,
-    reverse: bool,
+    direction: Direction,
     limit: u32,
     options: &GraphTraversalOptions,
 ) -> anyhow::Result<Vec<GraphHop>> {
@@ -19,13 +19,14 @@ pub fn traverse_with_options(
     let quoted = quoted_placeholders(edge_kinds.len());
     let unique_short_name = unique_symbol_name(conn, short_name(symbol))?;
     let mode = options.resolution_mode;
-    let sql = if reverse {
-        let oracle_edge_ids = reverse_oracle_seeded_edge_ids(conn, symbol, options)?;
-        let predicate =
-            reverse_predicate(mode, options.logical_symbol_id.is_some(), &oracle_edge_ids);
-        let tier = reverse_tier(mode, &oracle_edge_ids);
-        format!(
-            "
+    let sql = match direction {
+        Direction::Callers => {
+            let oracle_edge_ids = reverse_oracle_seeded_edge_ids(conn, symbol, options)?;
+            let predicate =
+                reverse_predicate(mode, options.logical_symbol_id.is_some(), &oracle_edge_ids);
+            let tier = reverse_tier(mode, &oracle_edge_ids);
+            format!(
+                "
             SELECT COALESCE(from_qn.value, edges.from_name) AS from_symbol,
                    COALESCE(to_qn.value, edges.to_name) AS to_symbol,
                    edges.id AS edge_id,
@@ -40,7 +41,7 @@ pub fn traverse_with_options(
                    source_files.path AS callsite_path,
                    COALESCE(NULLIF(edges.source_start_line, 0), 1) AS callsite_start_line,
                    COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), \
-             1) AS callsite_end_line,
+                 1) AS callsite_end_line,
                    {tier} AS match_tier
             FROM edges
             JOIN files source_files ON source_files.id = edges.source_file_id
@@ -56,13 +57,14 @@ pub fn traverse_with_options(
                 edges.from_name
             LIMIT ?5
             "
-        )
-    } else {
-        let predicate = forward_source_predicate(mode, options.logical_symbol_id.is_some());
-        let target_filter = forward_target_filter(mode, options);
-        let visibility_filter = forward_visibility_filter(options);
-        format!(
-            "
+            )
+        },
+        Direction::Callees => {
+            let predicate = forward_source_predicate(mode, options.logical_symbol_id.is_some());
+            let target_filter = forward_target_filter(mode, options);
+            let visibility_filter = forward_visibility_filter(options);
+            format!(
+                "
             SELECT COALESCE(from_qn.value, edges.from_name) AS from_symbol,
                    COALESCE(to_qn.value, edges.to_name) AS to_symbol,
                    edges.id AS edge_id,
@@ -77,7 +79,7 @@ pub fn traverse_with_options(
                    source_files.path AS callsite_path,
                    COALESCE(NULLIF(edges.source_start_line, 0), 1) AS callsite_start_line,
                    COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), \
-             1) AS callsite_end_line,
+                 1) AS callsite_end_line,
                    0 AS match_tier
             FROM edges
             JOIN files source_files ON source_files.id = edges.source_file_id
@@ -95,7 +97,8 @@ pub fn traverse_with_options(
                 edges.to_name
             LIMIT ?5
             "
-        )
+            )
+        },
     };
     let params = traversal_params(symbol, limit, &edge_kinds, options, unique_short_name);
     let mut stmt = conn.prepare(&sql)?;
@@ -168,7 +171,7 @@ pub(crate) fn dedupe_hops(hops: &mut Vec<GraphHop>) {
 pub fn traversal_summary(
     conn: &Connection,
     symbol: &str,
-    reverse: bool,
+    direction: Direction,
     limit: u32,
     options: &GraphTraversalOptions,
     returned_count: usize,
@@ -180,27 +183,31 @@ pub fn traversal_summary(
     // Computed ONCE for both the summary counts and the hidden-candidate count below: the two must
     // describe the same admitted population as `traverse_with_options`, or the summary would report
     // an oracle-seeded caller as a hidden unresolved candidate (double-counting it).
-    let oracle_edge_ids =
-        if reverse { reverse_oracle_seeded_edge_ids(conn, symbol, options)? } else { Vec::new() };
-    let sql = if reverse {
-        let predicate =
-            reverse_predicate(mode, options.logical_symbol_id.is_some(), &oracle_edge_ids);
-        // An oracle-seeded row is one the COMPILER resolved, and the heuristic left `to_symbol_id`
-        // NULL on it — so the buckets below would file it as unresolved and drive
-        // `completeness_risk` to `high` on the very answer the seeding made complete. It gets its
-        // own count and is excluded from the heuristic buckets, which report what tree-sitter alone
-        // concluded. A verdict CONFIRMING an already-resolved edge is not in this population —
-        // `exact_verified` already speaks for it.
-        let compiler_only = oracle_seed_in_list(&oracle_edge_ids)
-            .map(|list| format!("({list} AND edges.to_symbol_id IS NULL)"));
-        let compiler_verified = match &compiler_only {
-            Some(expr) => format!("SUM(CASE WHEN {expr} THEN 1 ELSE 0 END)"),
-            None => "0".to_string(),
-        };
-        let heuristic =
-            compiler_only.as_ref().map(|expr| format!("NOT {expr} AND ")).unwrap_or_default();
-        format!(
-            "
+    let oracle_edge_ids = match direction {
+        Direction::Callers => reverse_oracle_seeded_edge_ids(conn, symbol, options)?,
+        Direction::Callees => Vec::new(),
+    };
+    let sql = match direction {
+        Direction::Callers => {
+            let predicate =
+                reverse_predicate(mode, options.logical_symbol_id.is_some(), &oracle_edge_ids);
+            // An oracle-seeded row is one the COMPILER resolved, and the heuristic left
+            // `to_symbol_id` NULL on it — so the buckets below would file it as
+            // unresolved and drive `completeness_risk` to `high` on the very answer the
+            // seeding made complete. It gets its own count and is excluded from the
+            // heuristic buckets, which report what tree-sitter alone concluded. A
+            // verdict CONFIRMING an already-resolved edge is not in this population —
+            // `exact_verified` already speaks for it.
+            let compiler_only = oracle_seed_in_list(&oracle_edge_ids)
+                .map(|list| format!("({list} AND edges.to_symbol_id IS NULL)"));
+            let compiler_verified = match &compiler_only {
+                Some(expr) => format!("SUM(CASE WHEN {expr} THEN 1 ELSE 0 END)"),
+                None => "0".to_string(),
+            };
+            let heuristic =
+                compiler_only.as_ref().map(|expr| format!("NOT {expr} AND ")).unwrap_or_default();
+            format!(
+                "
             SELECT
                 COUNT(*),
                 SUM(CASE WHEN edges.to_symbol_id IS NOT NULL THEN 1 ELSE 0 END),
@@ -216,13 +223,14 @@ pub fn traversal_summary(
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
             "
-        )
-    } else {
-        let predicate = forward_source_predicate(mode, options.logical_symbol_id.is_some());
-        let target_filter = forward_target_filter(mode, options);
-        let visibility_filter = forward_visibility_filter(options);
-        format!(
-            "
+            )
+        },
+        Direction::Callees => {
+            let predicate = forward_source_predicate(mode, options.logical_symbol_id.is_some());
+            let target_filter = forward_target_filter(mode, options);
+            let visibility_filter = forward_visibility_filter(options);
+            format!(
+                "
             SELECT
                 COUNT(*),
                 SUM(CASE WHEN edges.to_symbol_id IS NOT NULL THEN 1 ELSE 0 END),
@@ -240,7 +248,8 @@ pub fn traversal_summary(
               AND ({target_filter})
               AND ({visibility_filter})
             "
-        )
+            )
+        },
     };
     let params = traversal_params(symbol, limit, &edge_kinds, options, unique_short_name);
     let mut summary = conn.query_row(&sql, params_from_iter(params), |row| {
@@ -262,7 +271,7 @@ pub fn traversal_summary(
     let hidden_unresolved = hidden_unresolved_candidate_count(
         conn,
         symbol,
-        reverse,
+        direction,
         &edge_kinds,
         options,
         unique_short_name,
@@ -279,7 +288,7 @@ pub fn traversal_summary(
     // are invisible, as are external/entry-point callers. Escalate a `low` to `medium` and
     // attach a note so "0 callers" isn't trusted as complete. (Forward `trace_callees` with 0
     // callees is a genuine leaf — left alone.)
-    if reverse && summary.total_matching_edges == 0 {
+    if direction == Direction::Callers && summary.total_matching_edges == 0 {
         if summary.completeness_risk == "low" {
             summary.completeness_risk = "medium".to_string();
         }
@@ -391,7 +400,7 @@ pub(crate) fn completeness_risk(summary: &GraphTraversalSummary) -> &'static str
 pub(crate) fn hidden_unresolved_candidate_count(
     conn: &Connection,
     symbol: &str,
-    reverse: bool,
+    direction: Direction,
     edge_kinds: &[String],
     options: &GraphTraversalOptions,
     unique_short_name: bool,
@@ -399,16 +408,18 @@ pub(crate) fn hidden_unresolved_candidate_count(
 ) -> anyhow::Result<u64> {
     let mode = options.resolution_mode;
     let quoted = quoted_placeholders(edge_kinds.len());
-    let sql = if reverse {
-        let predicate =
-            reverse_predicate(mode, options.logical_symbol_id.is_some(), oracle_edge_ids);
-        let short_name_arm = if short_name_identifies_seed_alone(conn, symbol, options)? {
-            "\n                OR edges.to_name_id = (SELECT id FROM name_strings WHERE value = ?3)"
-        } else {
-            ""
-        };
-        format!(
-            "
+    let sql = match direction {
+        Direction::Callers => {
+            let predicate =
+                reverse_predicate(mode, options.logical_symbol_id.is_some(), oracle_edge_ids);
+            let short_name_arm = if short_name_identifies_seed_alone(conn, symbol, options)? {
+                "\n                OR edges.to_name_id = (SELECT id FROM name_strings WHERE value \
+                 = ?3)"
+            } else {
+                ""
+            };
+            format!(
+                "
             SELECT COUNT(*)
             FROM edges
             JOIN files source_files ON source_files.id = edges.source_file_id
@@ -422,13 +433,15 @@ pub(crate) fn hidden_unresolved_candidate_count(
                 OR edges.target_qualified_name LIKE ?2{short_name_arm}
               )
             "
-        )
-    } else {
-        let source_predicate = forward_source_predicate(mode, options.logical_symbol_id.is_some());
-        let target_filter = forward_target_filter(mode, options);
-        let visibility_filter = forward_visibility_filter(options);
-        format!(
-            "
+            )
+        },
+        Direction::Callees => {
+            let source_predicate =
+                forward_source_predicate(mode, options.logical_symbol_id.is_some());
+            let target_filter = forward_target_filter(mode, options);
+            let visibility_filter = forward_visibility_filter(options);
+            format!(
+                "
             SELECT COUNT(*)
             FROM edges
             JOIN files source_files ON source_files.id = edges.source_file_id
@@ -439,7 +452,8 @@ pub(crate) fn hidden_unresolved_candidate_count(
               AND edges.to_symbol_id IS NULL
               AND coalesce(({target_filter}) AND ({visibility_filter}), 0) = 0
             "
-        )
+            )
+        },
     };
     let params = traversal_params(symbol, 0, edge_kinds, options, unique_short_name);
     let count = conn.query_row(&sql, params_from_iter(params), |row| count_col(row, 0))?;

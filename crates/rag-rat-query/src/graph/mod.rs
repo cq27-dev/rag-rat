@@ -39,6 +39,15 @@ pub struct GraphTraversalOptions {
     pub logical_symbol_id: Option<i64>,
 }
 
+/// Which way a traversal crosses edges from its seed symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Edges INTO the seed — who calls it (`find_callers`).
+    Callers,
+    /// Edges OUT of the seed — what it calls (`trace_callees`).
+    Callees,
+}
+
 #[derive(Debug, Serialize)]
 pub struct GraphTraversalReport {
     pub query: GraphTraversalQuery,
