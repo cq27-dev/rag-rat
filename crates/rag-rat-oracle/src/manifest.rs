@@ -209,11 +209,6 @@ impl ToolManifest {
         }
     }
 
-    /// The cheap capability check that a versioned binary can actually emit a SCIP index — its
-    /// shape is tool-specific. `rust-analyzer` emits via a `scip` subcommand (`scip --help` must
-    /// exit 0; a stripped build without it is `Blocked`, #82 P3). `scip-clang` IS the SCIP
-    /// emitter — it has no subcommand — so a successful `--version` (already detected) is the
-    /// capability signal and this is a no-op `true`.
     /// Whether a versioned binary can actually emit a SCIP index — declared per backend as
     /// [`crate::backend::spec::ScipCapability`]. A tool with no batch declaration is never asked to
     /// emit one, so it trivially can.

@@ -818,7 +818,7 @@ impl OracleTool {
     /// Whether a BATCH DRIVER can invoke this tool as an indexer — `oracle run`, the background
     /// auto-run loop, the init-wizard tool listing, and [`produce_scip_with_tool`]. `false` ONLY
     /// for the live LSP tools, which write per-pass verdicts from the watcher and have no
-    /// its `BatchSpec` invocation builder.
+    /// `BatchSpec` invocation builder.
     ///
     /// This is DISPATCH ONLY. It used to answer read-side precedence and run coverage as well;
     /// those are [`Self::authority`] and [`Self::coverage`] now, because a tool can be a

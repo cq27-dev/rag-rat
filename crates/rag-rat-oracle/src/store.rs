@@ -1176,10 +1176,6 @@ pub(crate) fn write_edge_oracle(
     Ok(())
 }
 
-/// Record an oracle run, returning its row id. `stats_json` is an opaque `OracleReport` snapshot.
-/// `worktree_id` scopes the run to the active checkout so the status read's `last_run_meta` can
-/// distinguish this checkout's run from a sibling worktree's run under the same
-/// `(tool, tool_version, commit_sha)`.
 /// Record a run stamped at `now_ms()`. Test-only convenience over [`record_oracle_run_at`]; every
 /// production path threads the real start time through `record_oracle_run_at` (#145).
 #[cfg(test)]
@@ -1204,6 +1200,10 @@ pub(crate) fn record_oracle_run(
     )
 }
 
+/// Record an oracle run, returning its row id. `stats_json` is an opaque `OracleReport` snapshot.
+/// `worktree_id` scopes the run to the active checkout so the status read's `last_run_meta` can
+/// distinguish this checkout's run from a sibling worktree's run under the same
+/// `(tool, tool_version, commit_sha)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_oracle_run_at(
     conn: &Connection,

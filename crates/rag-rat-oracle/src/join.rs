@@ -272,8 +272,8 @@ fn definition_has_extent(start: usize, end: usize) -> bool {
     start < end
 }
 
-/// Tally one verdict into the report's counters. Returns whether a row should be written
-/// (every verdict writes a row; the `None` no-op is handled by the caller).
+/// Tally one verdict into the report's counters. Every verdict writes a row; the `None` no-op is
+/// handled by the caller.
 pub(crate) fn tally(report: &mut OracleReport, kind: OracleResolutionKind) {
     match kind {
         OracleResolutionKind::Upgrade => report.upgraded += 1,
