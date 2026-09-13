@@ -247,7 +247,7 @@ pub(crate) fn run_in_tx(
         let verdict = join::classify_edge(&JoinInput {
             callee_start_byte: candidate.callee_start_byte,
             callee_end_byte: candidate.callee_end_byte,
-            confidence: &candidate.confidence,
+            confidence: candidate.confidence,
             heuristic_symbol_id: candidate.to_symbol_id,
             occurrences,
             index: &index,
@@ -719,8 +719,9 @@ fn count_low_confidence_with_oracle(
 ) -> anyhow::Result<u64> {
     let count: i64 = conn.query_row(
         &format!(
-            "SELECT COUNT(*){} AND edges.confidence IN ('NameOnly', 'Ambiguous')",
-            store::edge_oracle_scope_join(conn)?
+            "SELECT COUNT(*){} AND edges.confidence IN {}",
+            store::edge_oracle_scope_join(conn)?,
+            store::HeuristicConfidence::LOW_SQL,
         ),
         rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
         |row| row.get(0),
@@ -743,9 +744,9 @@ fn count_low_confidence_upgrades(
 ) -> anyhow::Result<u64> {
     let count: i64 = conn.query_row(
         &format!(
-            "SELECT COUNT(*){} AND edge_oracle.kind = 'upgrade' AND edges.confidence IN \
-             ('NameOnly', 'Ambiguous')",
-            store::edge_oracle_scope_join(conn)?
+            "SELECT COUNT(*){} AND edge_oracle.kind = 'upgrade' AND edges.confidence IN {}",
+            store::edge_oracle_scope_join(conn)?,
+            store::HeuristicConfidence::LOW_SQL,
         ),
         rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
         |row| row.get(0),
@@ -770,8 +771,9 @@ fn count_upgradeable_low_confidence(
     let count: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(*){} AND edge_oracle.kind IN ('upgrade', 'resolved-external') AND \
-             edges.confidence IN ('NameOnly', 'Ambiguous')",
-            store::edge_oracle_scope_join(conn)?
+             edges.confidence IN {}",
+            store::edge_oracle_scope_join(conn)?,
+            store::HeuristicConfidence::LOW_SQL,
         ),
         rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
         |row| row.get(0),
@@ -798,9 +800,10 @@ fn count_unresolved_candidates(
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.callee_start_byte IS NOT NULL
-          AND edges.confidence IN ('NameOnly', 'Ambiguous')
+          AND edges.confidence IN {low}
           AND {scope}
         ",
+            low = store::HeuristicConfidence::LOW_SQL,
             scope = store::active_checkout_file_predicate("?1", "?2"),
         ),
         rusqlite::params![commit_sha, worktree_id],

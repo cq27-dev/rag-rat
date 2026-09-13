@@ -55,15 +55,17 @@ pub(crate) fn resolution_before_counts(
         SELECT
           COUNT(*),
           COUNT(*) FILTER (
-            WHERE edges.confidence IN ('Exact', 'Syntactic') AND edges.to_symbol_id IS NOT NULL
+            WHERE edges.confidence IN {resolved} AND edges.to_symbol_id IS NOT NULL
           ),
-          COUNT(*) FILTER (WHERE edges.confidence IN ('NameOnly', 'Ambiguous'))
+          COUNT(*) FILTER (WHERE edges.confidence IN {low})
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.callee_start_byte IS NOT NULL
           AND edges.callee_end_byte IS NOT NULL
           AND {scope}
         ",
+            resolved = HeuristicConfidence::RESOLVED_SQL,
+            low = HeuristicConfidence::LOW_SQL,
         ),
         params![commit_sha, worktree_id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -140,7 +142,8 @@ pub(crate) struct EdgeJoinCandidate {
     pub(crate) source_end_byte: i64,
     pub(crate) callee_start_byte: i64,
     pub(crate) callee_end_byte: i64,
-    pub(crate) confidence: String,
+    /// The heuristic confidence band; `None` for a token outside the known bands.
+    pub(crate) confidence: Option<HeuristicConfidence>,
     /// The edge's kind (`calls_name`, `references_type`, `uses_macro`, …). Only `calls_name` edges
     /// belong to the *call* population the recall metric measures; non-call kinds also carry a
     /// callee byte range (so they join), but must NOT count toward the covered-call side of
@@ -148,6 +151,65 @@ pub(crate) struct EdgeJoinCandidate {
     pub(crate) edge_kind: String,
     /// The heuristic's resolved target symbol id, if any (for confirm/contradict).
     pub(crate) to_symbol_id: Option<i64>,
+}
+
+/// The heuristic resolver's confidence band on an edge (`edges.confidence`) — the indexer's token
+/// set, parsed once where the oracle reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+pub(crate) enum HeuristicConfidence {
+    Exact,
+    Syntactic,
+    NameOnly,
+    Ambiguous,
+}
+
+impl HeuristicConfidence {
+    /// `edges.confidence IN …` list of the bands that count as an in-corpus resolution.
+    pub(crate) const RESOLVED_SQL: &'static str = "('Exact', 'Syntactic')";
+    /// `edges.confidence IN …` list of the low-confidence population the oracle's upgrade and
+    /// recovery metrics range over.
+    pub(crate) const LOW_SQL: &'static str = "('NameOnly', 'Ambiguous')";
+
+    // The oracle only reads this column; the token spelling is pinned by the round-trip test.
+    #[cfg(test)]
+    pub(crate) fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// `None` for a token outside the four bands, which then reads as not resolved in corpus.
+    pub(crate) fn from_db_str(value: &str) -> Option<Self> {
+        value.parse().ok()
+    }
+}
+
+#[cfg(test)]
+mod heuristic_confidence_tests {
+    use super::HeuristicConfidence;
+
+    #[test]
+    fn tokens_round_trip_and_the_sql_lists_spell_them() {
+        for (band, token) in [
+            (HeuristicConfidence::Exact, "Exact"),
+            (HeuristicConfidence::Syntactic, "Syntactic"),
+            (HeuristicConfidence::NameOnly, "NameOnly"),
+            (HeuristicConfidence::Ambiguous, "Ambiguous"),
+        ] {
+            assert_eq!(band.as_db_str(), token);
+            assert_eq!(HeuristicConfidence::from_db_str(token), Some(band));
+        }
+        assert_eq!(HeuristicConfidence::from_db_str("bogus"), None);
+        let sql_list = |a: HeuristicConfidence, b: HeuristicConfidence| {
+            format!("('{}', '{}')", a.as_db_str(), b.as_db_str())
+        };
+        assert_eq!(
+            HeuristicConfidence::RESOLVED_SQL,
+            sql_list(HeuristicConfidence::Exact, HeuristicConfidence::Syntactic)
+        );
+        assert_eq!(
+            HeuristicConfidence::LOW_SQL,
+            sql_list(HeuristicConfidence::NameOnly, HeuristicConfidence::Ambiguous)
+        );
+    }
 }
 
 /// The edge kind that denotes a *call* — the only population the recall metric measures. Other
@@ -319,7 +381,7 @@ pub(crate) fn edge_join_candidates(
             source_end_byte: row.get(4)?,
             callee_start_byte: row.get(5)?,
             callee_end_byte: row.get(6)?,
-            confidence: row.get(7)?,
+            confidence: HeuristicConfidence::from_db_str(&row.get::<_, String>(7)?),
             edge_kind: row.get(8)?,
             to_symbol_id: row.get(9)?,
         })
@@ -647,7 +709,7 @@ fn edge_join_candidates_in_paths(
             source_end_byte: row.get(4)?,
             callee_start_byte: row.get(5)?,
             callee_end_byte: row.get(6)?,
-            confidence: row.get(7)?,
+            confidence: HeuristicConfidence::from_db_str(&row.get::<_, String>(7)?),
             edge_kind: row.get(8)?,
             to_symbol_id: row.get(9)?,
         })

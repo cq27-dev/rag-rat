@@ -15,7 +15,7 @@
 //! different target.
 
 use super::scip::{ScipIndex, ScipOccurrence};
-use super::store::SymbolSpan;
+use super::store::{HeuristicConfidence, SymbolSpan};
 use super::{OracleReport, OracleResolutionKind};
 
 /// The classification for one edge candidate after the join — what to write to `edge_oracle`, or
@@ -39,7 +39,8 @@ pub(crate) struct JoinInput<'a> {
     pub(crate) callee_start_byte: i64,
     pub(crate) callee_end_byte: i64,
     /// The heuristic confidence on the edge (`Exact` / `Syntactic` / `NameOnly` / `Ambiguous`).
-    pub(crate) confidence: &'a str,
+    /// `None` for a token outside the known bands.
+    pub(crate) confidence: Option<HeuristicConfidence>,
     /// The heuristic's resolved target symbol id, if any.
     pub(crate) heuristic_symbol_id: Option<i64>,
     /// Occurrences in the edge's source document (byte-keyed).
@@ -110,7 +111,7 @@ fn classify_resolved(input: &JoinInput<'_>, oracle_symbol_id: i64) -> OracleReso
 /// SCIP occurrence but must apply the IDENTICAL confirm/contradict/upgrade taxonomy so live and
 /// batch verdicts are interchangeable downstream.
 pub(crate) fn classify_in_corpus(
-    confidence: &str,
+    confidence: Option<HeuristicConfidence>,
     heuristic_symbol_id: Option<i64>,
     oracle_symbol_id: i64,
     logical_symbol_of: &dyn Fn(i64) -> Option<i64>,
@@ -173,8 +174,12 @@ fn classify_external(input: &JoinInput<'_>) -> OracleResolutionKind {
 /// Whether the heuristic already resolved this edge to an in-corpus symbol: an `Exact`/`Syntactic`
 /// confidence carrying a concrete `to_symbol_id`. This is the precondition for a confirm/contradict
 /// verdict (there is a heuristic claim to agree or disagree with).
-fn heuristic_resolved_in_corpus(confidence: &str, heuristic_symbol_id: Option<i64>) -> bool {
-    matches!(confidence, "Exact" | "Syntactic") && heuristic_symbol_id.is_some()
+fn heuristic_resolved_in_corpus(
+    confidence: Option<HeuristicConfidence>,
+    heuristic_symbol_id: Option<i64>,
+) -> bool {
+    matches!(confidence, Some(HeuristicConfidence::Exact | HeuristicConfidence::Syntactic))
+        && heuristic_symbol_id.is_some()
 }
 
 /// The occurrence whose byte range contains the callee token. Prefers a reference occurrence (the

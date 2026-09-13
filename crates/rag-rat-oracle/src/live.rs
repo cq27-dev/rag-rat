@@ -837,7 +837,7 @@ pub fn live_oracle_pass(
             let logical_symbol_of =
                 |id: i64| -> Option<i64> { logical_cache.borrow().get(&id).copied().flatten() };
             let kind = join::classify_in_corpus(
-                &candidate.confidence,
+                candidate.confidence,
                 candidate.to_symbol_id,
                 symbol_id,
                 &logical_symbol_of,
@@ -1158,7 +1158,7 @@ mod tests {
             source_end_byte: 10,
             callee_start_byte: 4,
             callee_end_byte: 9,
-            confidence: "NameOnly".to_string(),
+            confidence: Some(store::HeuristicConfidence::NameOnly),
             edge_kind: "calls_name".to_string(),
             to_symbol_id: None,
         };
@@ -1186,7 +1186,7 @@ mod tests {
             source_end_byte: 10,
             callee_start_byte: 4,
             callee_end_byte: 9,
-            confidence: "NameOnly".to_string(),
+            confidence: Some(store::HeuristicConfidence::NameOnly),
             edge_kind: "calls_name".to_string(),
             to_symbol_id: None,
         };
