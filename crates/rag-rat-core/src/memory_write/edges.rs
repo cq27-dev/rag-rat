@@ -11,7 +11,7 @@ use rag_rat_query::memory::{
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
-use super::authoring;
+use super::{authoring, reconcile};
 
 pub(crate) fn add_edge(
     conn: &Connection,
@@ -88,7 +88,7 @@ pub(crate) fn add_edge(
     let now = now_ms();
     // Backfill the pre-existing history (idempotent) + the edge INSERT + the EdgeAdd op in ONE
     // transaction (strict-atomic); the write via `conn` participates in the open txn.
-    authoring::backfill_memory_oplog(conn, now)?;
+    reconcile::backfill_memory_oplog(conn, now)?;
     let prepared = authoring::prepare_live_content_authoring(conn, now)?;
     // Authored write: the EdgeAdd op is signed op-log content, so commit durably (#560).
     let _durability = authoring::AuthoredDurability::begin(conn)?;
@@ -153,7 +153,7 @@ pub(crate) fn remove_edge(conn: &Connection, edge_key: &str) -> anyhow::Result<b
     let scope = memory_repo_scope(conn)?;
     let repo_clause = periphery_edge_scope_clause(&scope);
     let now = now_ms();
-    authoring::backfill_memory_oplog(conn, now)?;
+    reconcile::backfill_memory_oplog(conn, now)?;
     let prepared = authoring::prepare_live_content_authoring(conn, now)?;
     // Authored write: the EdgeRemove tombstone is signed op-log content, so commit durably (#560).
     let _durability = authoring::AuthoredDurability::begin(conn)?;

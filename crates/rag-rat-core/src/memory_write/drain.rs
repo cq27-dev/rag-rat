@@ -1,5 +1,5 @@
 //! Draining accepted `/3` content into `repo_memories` / `repo_node_edges` — the REVERSE of the
-//! local reconcile (`authoring::reconcile_owner_stream_for_repo`, which authors local rows INTO the
+//! local reconcile (`reconcile::reconcile_owner_stream_for_repo`, which authors local rows INTO the
 //! signed `/3` log). Here, a stream's accepted projection is mirrored back OUT into the local
 //! memory tables as `origin='synced'` rows, so a memory authored on one device becomes a real,
 //! searchable local row on another device of the same account.
@@ -127,9 +127,9 @@ pub(super) fn authoritative_content_stream(
     // local derivation.
     // Lazily: a contributing repo must not pay for the subscription lookup on every drain, and a
     // corrupt `memory_subscription_owner` value must not error a drain that never consults it.
-    let foreign_owner = match super::authoring::contribution_owner_account(conn, repo_id)? {
+    let foreign_owner = match super::ownership::contribution_owner_account(conn, repo_id)? {
         Some(owner) => Some(owner),
-        None => super::authoring::subscription_owner_account(conn, repo_id)?,
+        None => super::ownership::subscription_owner_account(conn, repo_id)?,
     };
     if let Some(owner) = foreign_owner
         && rag_rat_oplog::read_local_account(conn)? != Some(owner)
@@ -141,7 +141,7 @@ pub(super) fn authoritative_content_stream(
     // rather than an empty Private one. `None` = no local account minted yet ⇒ nothing could
     // have been authored/ingested onto this stream ⇒ nothing to drain (the analog of an
     // unstable scope).
-    let mode = super::authoring::owner_stream_access_mode(conn, repo_id)?;
+    let mode = super::ownership::owner_stream_access_mode(conn, repo_id)?;
     rag_rat_oplog::owned_stream_v2_id_with_mode(conn, repo_id, mode)
 }
 
@@ -5068,7 +5068,7 @@ mod tests {
 
         // The reconcile runs: the synced row is excluded from re-authoring (origin gate), and it is
         // also already in the projection, so nothing is appended to the immutable /3 log.
-        crate::memory_write::authoring::backfill_memory_oplog(&conn, 6_000).unwrap();
+        crate::memory_write::reconcile::backfill_memory_oplog(&conn, 6_000).unwrap();
         assert_eq!(
             content_entry_count(&conn),
             entries_before,

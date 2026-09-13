@@ -14,7 +14,7 @@ use rag_rat_query::memory::{
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
-use super::authoring;
+use super::{authoring, reconcile};
 
 pub(crate) fn create_memory(
     conn: &Connection,
@@ -69,7 +69,7 @@ pub(crate) fn create_memory(
     // Backfill the pre-existing history BEFORE this live entry (idempotent; a cheap no-op once the
     // chain exists), then do the table writes + the op-append in ONE transaction so they commit —
     // or roll back — together (strict-atomic). Writes via `conn` participate in the open txn.
-    authoring::backfill_memory_oplog(conn, now)?;
+    reconcile::backfill_memory_oplog(conn, now)?;
     let prepared = authoring::prepare_live_content_authoring(conn, now)?;
     // Authored write: commit durably so a `memory_create` that returned success survives power loss
     // (#560). FULL for this transaction only; the connection restores NORMAL on drop.
@@ -143,7 +143,7 @@ pub(crate) fn update_memory(
     // Backfill (idempotent) before opening our txn, then open an IMMEDIATE txn so the current-row
     // READ and the UPDATE are ONE atomic unit — a racing writer cannot flip the status between the
     // read and the write and desync the table from the op-log projection.
-    authoring::backfill_memory_oplog(conn, now)?;
+    reconcile::backfill_memory_oplog(conn, now)?;
     let prepared = authoring::prepare_live_content_authoring(conn, now)?;
     // Authored write (content / status / obsolete): commit durably (#560), NORMAL restored on drop.
     let _durability = authoring::AuthoredDurability::begin(conn)?;
@@ -281,7 +281,7 @@ pub(crate) fn rebind_memory(
     // minted — a memory authored under a `local:` shallow-clone id, or by a pre-#532 binary —
     // prepares `None` and `author_in_owner_stream` returns Ok having written nothing. That was
     // harmless while a rebind authored no op, and silently drops the snapshot now that it does.
-    authoring::backfill_memory_oplog(conn, now)?;
+    reconcile::backfill_memory_oplog(conn, now)?;
     // Prepared BEFORE the txn, like the create path: minting the account self-transacts and cannot
     // nest inside the one opened below.
     let prepared = authoring::prepare_live_content_authoring(conn, now)?;
