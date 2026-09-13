@@ -8,8 +8,7 @@ mod memory_features;
 fn migration_052_adds_oplog_storage_tables() {
     const OPLOG_TABLES: [&str; 4] =
         ["oplog_entries", "oplog_projected_nodes", "oplog_projected_edges", "oplog_meta"];
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // V053 now holds the absolute tip pin (migration_053's test); this drops to the symbolic
     // `current_version == LATEST` freshness check.
     assert_eq!(
@@ -41,8 +40,7 @@ fn migration_052_adds_oplog_storage_tables() {
 
 #[test]
 fn migration_053_scopes_the_oplog_by_stream_and_adds_fork_evidence() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // V054 now holds the absolute tip pin (migration_054's test); this drops to the symbolic
     // `current_version == LATEST` freshness check.
     assert_eq!(
@@ -107,8 +105,7 @@ fn migration_053_scopes_the_oplog_by_stream_and_adds_fork_evidence() {
 
 #[test]
 fn migration_054_adds_the_single_row_device_identity_table() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // The absolute-tip pin moved to `migration_055_*` (V055 is the tip now); this drops to the
     // symbolic check, per the ladder convention.
     assert_eq!(
@@ -172,8 +169,7 @@ fn migration_054_adds_the_single_row_device_identity_table() {
 
 #[test]
 fn migration_055_adds_the_binding_downgrade_marker_column() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // The absolute tip pin lives with the newest migration's test (`migration_057_*` now); this
     // drops to the symbolic `current_version == LATEST` freshness check.
     assert_eq!(
@@ -206,8 +202,7 @@ fn migration_055_adds_the_binding_downgrade_marker_column() {
 
 #[test]
 fn migration_056_adds_the_git_change_couplings_table() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // The absolute tip pin lives with the newest migration's test (`migration_057_*` now); this
     // drops to the symbolic `current_version == LATEST` freshness check.
     assert_eq!(
@@ -262,8 +257,7 @@ fn migration_056_adds_the_git_change_couplings_table() {
 
 #[test]
 fn migration_057_adds_the_external_symbols_table() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // The absolute tip pin moved to `migration_058_*` (V058 is the tip now); this drops to the
     // symbolic `current_version == LATEST` check, per the ladder convention.
     assert_eq!(
@@ -398,8 +392,7 @@ fn migration_057_adds_the_external_symbols_table() {
 
 #[test]
 fn migration_058_adds_the_oplog_device_x25519_columns() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // V058 is no longer the tip — symbolic tip check.
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
@@ -453,8 +446,7 @@ fn migration_058_adds_the_oplog_device_x25519_columns() {
 
 #[test]
 fn migration_059_creates_the_account_candidate_dag() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // V059 is no longer the tip (the absolute pin moved to the V060 papertrail test).
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
@@ -506,8 +498,7 @@ fn migration_059_creates_the_account_candidate_dag() {
 
 #[test]
 fn migration_064_creates_account_authority_shadow_tables() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     for table in [
         "account_auth_state",
         "account_roster_history",
@@ -560,8 +551,7 @@ fn migration_064_creates_account_authority_shadow_tables() {
 
 #[test]
 fn migration_065_adds_historical_authority_boundaries() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert!(conn_table_exists(&conn, "account_roster_content_boundaries"));
     for table in ["account_roster_history", "account_owner_incarnations"] {
         for column in [
@@ -584,8 +574,7 @@ fn migration_065_adds_historical_authority_boundaries() {
 
 #[test]
 fn migration_066_adds_the_content_candidate_dag() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     for table in ["content_entries", "content_entry_status", "content_pre_verify"] {
         assert!(conn_table_exists(&conn, table), "V066 creates {table}");
     }
@@ -662,8 +651,7 @@ fn migration_066_adds_the_content_candidate_dag() {
 fn migration_068_hides_suppressed_edge_candidates() {
     // The absolute-tip pin moved to `migration_069_*` (V069 is the tip now); this drops to the
     // symbolic `current_version == LATEST` freshness check, per the ladder convention.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -727,8 +715,7 @@ fn migration_068_hides_suppressed_edge_candidates() {
 fn migration_069_adds_the_local_account_pointer() {
     // The absolute-tip pin moved to `migration_070_*` (V070 is the tip now); this drops to the
     // symbolic `current_version == LATEST` freshness check, per the ladder convention.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -816,8 +803,7 @@ fn migration_069_adds_the_local_account_pointer() {
 fn migration_070_adds_the_content_projected_tables() {
     // The absolute-tip pin moved to `migration_071_*` (V071 is the tip now); this drops to the
     // symbolic `current_version == LATEST` freshness check, per the ladder convention.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -900,8 +886,7 @@ fn migration_070_adds_the_content_projected_tables() {
 fn migration_071_indexes_edge_target_qname() {
     // The absolute-tip pin moved to `migration_072_*` (V072 is the tip now); this drops to the
     // symbolic `current_version == LATEST` freshness check, per the ladder convention.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -946,8 +931,7 @@ fn migration_071_indexes_edge_target_qname() {
 
 #[test]
 fn migration_072_queues_pending_refold() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     // The deferred-refold work queue exists with just its stream_id primary key.
     assert!(
@@ -1126,8 +1110,7 @@ fn migration_046_deferred_absence_and_reconverges_from_torn_state() {
 fn applying_the_schema_records_migration_provenance() {
     use rusqlite::OptionalExtension;
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     let read = |key: &str| -> Option<String> {
         conn.query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
             .optional()
@@ -1155,8 +1138,7 @@ fn applying_the_schema_records_migration_provenance() {
 /// ceiling AND who last migrated the store, so the fleet outage is diagnosable from the error text.
 #[test]
 fn newer_schema_refusal_names_the_migrating_binary_and_ceiling() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap(); // stamps provenance for THIS binary
+    let conn = fresh_conn(); // stamps provenance for THIS binary
     // Fabricate a Newer schema: an applied migration this binary doesn't know.
     conn.execute(
         "INSERT INTO schema_version(id, applied_at_ms, checksum, description) VALUES \
@@ -1185,8 +1167,7 @@ fn newer_schema_refusal_names_the_migrating_binary_and_ceiling() {
 fn forward_migration_records_migration_provenance() {
     use rusqlite::OptionalExtension;
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // Roll back one migration and clear provenance, then forward-migrate.
     conn.execute(
         "DELETE FROM schema_version WHERE id = (SELECT id FROM schema_version ORDER BY id DESC \
@@ -1250,8 +1231,7 @@ fn migration_087_adds_table_sync_tables() {
     );
 
     // The full ladder ends with the tables present and records V087.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     for t in added {
         assert!(schema::table_exists(&conn, t).unwrap(), "the full ladder ends with {t}");
@@ -1272,8 +1252,7 @@ fn migration_087_adds_table_sync_tables() {
 /// generation from its actual postings.
 #[test]
 fn migration_088_caches_the_generation_posting_row_count() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -1360,8 +1339,7 @@ fn migration_089_adds_sync_invites() {
         "a consumed invite must persist its complete replay identity and receipt",
     );
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row("SELECT COUNT(*) FROM schema_version WHERE id = '089_sync_invites'", [], |row| {
@@ -1389,8 +1367,7 @@ fn migration_090_adds_account_candidate_reservations() {
         "a reservation cannot hold a negative entry count",
     );
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
@@ -1459,8 +1436,7 @@ fn migration_092_normalizes_invite_receipts() {
         .unwrap();
     assert_eq!(manifest.len(), 64, "the re-applied migration preserves stored manifests");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
@@ -1564,8 +1540,7 @@ fn migration_096_holds_entries_awaiting_a_chain_predecessor() {
         .unwrap();
     assert!(ddl.to_ascii_uppercase().contains("STRICT"), "the table is STRICT: {ddl}");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
@@ -1641,8 +1616,7 @@ fn migration_095_records_the_table_spec_version() {
     );
     assert!(missing_version.is_err(), "a published hash always states the column set it covers");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
@@ -1749,8 +1723,7 @@ fn migration_093_adds_table_sync_projection_state() {
     );
     assert!(duplicate.is_err(), "a stream id resolves to one apply context");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
@@ -1765,8 +1738,7 @@ fn migration_093_adds_table_sync_projection_state() {
 /// V100 (#976) adds receiver_type_hint_id to edges_data and updates the edges view.
 #[test]
 fn migration_100_receiver_type_hint_interning() {
-    let bare = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&bare, &crate::index::migration_hooks()).unwrap();
+    let bare = fresh_conn();
     schema::migrations::apply_receiver_type_hint_interning(&bare).unwrap();
     schema::migrations::apply_receiver_type_hint_interning(&bare).expect("replay is a no-op");
     assert!(schema::column_exists(&bare, "edges_data", "receiver_type_hint_id").unwrap());
@@ -1841,8 +1813,7 @@ fn migration_101_file_graph_version_provenance() {
 fn migration_103_syncable_memory_bindings() {
     assert_eq!(schema::LATEST_SCHEMA_VERSION, 125, "move this pin with the next schema migration");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     conn.execute_batch(
         "INSERT INTO repos(repo_id, display_name, registered_at_ms)
              VALUES ('repo-a', 'repo-a', 0);
@@ -1972,8 +1943,7 @@ fn migration_103_syncable_memory_bindings() {
 /// projected anchor set; every column is nullable, and a replay over a current store is a no-op.
 #[test]
 fn migration_120_memory_applied_anchor_snapshot() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     for (table, column) in [
         ("repo_memories", "anchors_applied_digest"),
         ("repo_memories", "source_hash_applied"),
@@ -2000,8 +1970,7 @@ fn migration_120_memory_applied_anchor_snapshot() {
 /// in; keyed by repo so a repo purge sweeps it, and a replay over a current store is a no-op.
 #[test]
 fn migration_122_memory_parked_anchor_baselines() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     let strict: i64 = conn
         .query_row(
             "SELECT strict FROM pragma_table_list
@@ -2045,8 +2014,7 @@ fn migration_122_memory_parked_anchor_baselines() {
 /// stay the author's. A replay over a current store is a no-op.
 #[test]
 fn migration_123_memory_binding_resolution() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     let columns: Vec<(String, i64)> = conn
         .prepare(
             "SELECT name, \"notnull\" FROM pragma_table_info('repo_memory_bindings')
@@ -2105,8 +2073,7 @@ fn migration_123_memory_binding_resolution() {
 /// winning set. A replay over a current store is a no-op.
 #[test]
 fn migration_124_content_projected_superseded_anchors() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     let column: Option<(String, i64)> = conn
         .query_row(
             "SELECT type, \"notnull\" FROM pragma_table_info('content_projected_nodes')
@@ -2132,8 +2099,7 @@ fn migration_124_content_projected_superseded_anchors() {
 /// V104 (#997) adds the durable re-adoption worklist and audit provenance.
 #[test]
 fn migration_104_table_sync_readoption() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     let work_strict: i64 = conn
         .query_row(
@@ -2166,8 +2132,7 @@ fn migration_104_table_sync_readoption() {
 /// V105 (#1127) adds the per-chain retained floor for accepted-entry compaction.
 #[test]
 fn migration_105_table_sync_retained_floors() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     let strict: i64 = conn
         .query_row(
@@ -2191,8 +2156,7 @@ fn migration_105_table_sync_retained_floors() {
 /// V106 (#1127) makes the re-adoption audit's original entry hash nullable for compacted winners.
 #[test]
 fn migration_106_readoption_audit_nullable_winner() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     let nullable: i64 = conn
         .query_row(
@@ -2249,8 +2213,7 @@ fn migration_091_adds_account_candidate_reservation_targets() {
         .unwrap();
     assert_eq!(targets, 3, "the backfill recovers reserved_entries - 1 covered targets");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
@@ -2265,8 +2228,7 @@ fn migration_091_adds_account_candidate_reservation_targets() {
 
 #[test]
 fn migration_094_tracks_lens_enrichment_changes_in_constant_time() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     conn.execute(
         "INSERT INTO papertrail_refs(
              tracker, project, item_key, item_kind, ref_kind, source_kind, source_path,
@@ -2448,8 +2410,7 @@ fn migration_094_tracks_lens_enrichment_changes_in_constant_time() {
 /// binary that did not do the work.
 #[test]
 fn migration_097_records_the_same_ladder_entry_on_every_platform() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     let status = schema::status(&conn).unwrap();
     assert_eq!(status.current_version, schema::LATEST_SCHEMA_VERSION);
     // `Compatible` is the load-bearing half: a ledger row that recorded a DIFFERENT checksum on
@@ -2481,8 +2442,7 @@ fn migration_097_records_the_same_ladder_entry_on_every_platform() {
 /// Windows upgrade — exactly the failure V097 exists to prevent, one table at a time.
 #[test]
 fn migration_097_covers_every_worktree_id_column_in_the_schema() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     let mut stmt = conn
         .prepare(
@@ -2563,8 +2523,7 @@ fn a_store_below_the_first_refold_step_migrates_to_the_tip() {
         Ok(())
     }
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     let mut post_refold_at_tip: Vec<String> = conn_table_columns(&conn, "content_projected_nodes")
         .into_iter()

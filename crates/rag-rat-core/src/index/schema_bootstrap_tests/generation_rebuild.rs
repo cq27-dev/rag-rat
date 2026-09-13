@@ -95,8 +95,7 @@ fn reader_sees_path(db_path: &Path, root: &Path, path: &str) -> bool {
 /// this checks the tip SYMBOLICALLY and never needs a bump when a later migration lands.)
 #[test]
 fn migration_043_adds_generation_to_the_files_unique_key() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,

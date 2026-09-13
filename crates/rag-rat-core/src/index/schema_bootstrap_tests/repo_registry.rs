@@ -74,8 +74,7 @@ fn meta_present(conn: &rusqlite::Connection, table: &str, key: &str) -> bool {
 /// the symbolic `current_version == LATEST_SCHEMA_VERSION` check (the hardcoded-LATEST footgun).
 #[test]
 fn migration_038_creates_repos_registry_tables() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
 
     assert_eq!(conn_table_columns(&conn, "repos"), vec![
         "repo_id",
@@ -141,8 +140,7 @@ fn v038_registry_ddl_is_self_contained_and_introduces_the_registry() {
 /// A V037 index gains the registry on `migrate_forward`.
 #[test]
 fn migration_038_forward_migrates_a_v037_index() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
 
     // Revert to the V037 shape: remove future triggers before their repo_meta target, drop
     // children before the parent (FK), then drop the ledger rows.
@@ -193,8 +191,7 @@ fn migration_038_forward_migrates_a_v037_index() {
 /// repo, no placeholder remains, and the working-tree root is recorded.
 #[test]
 fn register_repo_adopts_the_placeholder() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
 
     let returned = register_repo(
         &conn,
@@ -228,8 +225,7 @@ fn register_repo_adopts_the_placeholder() {
 /// would strand under the retired id and vanish from the active scope.
 #[test]
 fn register_repo_repoints_distill_rows_from_the_placeholder() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     conn.execute(
         "INSERT INTO papertrail_distill
              (tracker, project, item_kind, item_key, distill_input_hash, pipeline_version,
@@ -312,8 +308,7 @@ fn register_repo_repoints_distill_rows_from_the_placeholder() {
 /// then.
 #[test]
 fn reapplying_schema_after_adoption_does_not_resurrect_the_placeholder() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     register_repo(
         &conn,
         &identity("repo-abc", "myrepo"),
@@ -344,8 +339,7 @@ fn reapplying_schema_after_adoption_does_not_resurrect_the_placeholder() {
 /// under it (never resurrected under the placeholder).
 #[test]
 fn reapplying_schema_after_adoption_keeps_single_repo_id_and_repo_meta_under_the_real_id() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     // As V039 leaves a not-yet-adopted DB: per-repo meta under the placeholder.
     rag_rat_db::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "source_root", "/src/repo").unwrap();
     rag_rat_db::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms", "9").unwrap();
@@ -404,8 +398,7 @@ fn reapplying_schema_after_adoption_keeps_single_repo_id_and_repo_meta_under_the
 /// error, DB unchanged; then a real registration still adopts cleanly.
 #[test]
 fn register_repo_refuses_the_reserved_placeholder_and_stays_adoptable() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
 
     let err = register_repo(
         &conn,
@@ -443,8 +436,7 @@ fn register_repo_refuses_the_reserved_placeholder_and_stays_adoptable() {
 /// id.
 #[test]
 fn register_repo_refuses_an_empty_or_whitespace_repo_id() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
 
     for blank in ["", "   "] {
         let err = register_repo(
@@ -466,8 +458,7 @@ fn register_repo_refuses_an_empty_or_whitespace_repo_id() {
 /// Re-registering the same repo+root is a no-op (no duplicate rows).
 #[test]
 fn register_repo_is_idempotent() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     let id = identity("repo-abc", "myrepo");
 
     register_repo(&conn, &id, Path::new("/src/myrepo"), 1, &crate::index::migration_hooks())
@@ -483,8 +474,7 @@ fn register_repo_is_idempotent() {
 /// `repo_roots` row without minting a new repo.
 #[test]
 fn register_repo_appends_a_second_root() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     let id = identity("repo-abc", "myrepo");
 
     register_repo(&conn, &id, Path::new("/src/myrepo"), 1, &crate::index::migration_hooks())
@@ -508,8 +498,7 @@ fn register_repo_appends_a_second_root() {
 /// re-pointed.
 #[test]
 fn register_repo_registers_a_second_repo_in_a_consolidated_db() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     register_repo(
         &conn,
         &identity("repo-abc", "a"),
@@ -544,8 +533,7 @@ fn register_repo_registers_a_second_repo_in_a_consolidated_db() {
 /// `current_version == LATEST` check.)
 #[test]
 fn migration_039_relocates_per_repo_meta_and_leaves_global_keys() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -599,8 +587,7 @@ fn migration_039_relocates_per_repo_meta_and_leaves_global_keys() {
 /// relocation on `migrate_forward`.
 #[test]
 fn migration_039_forward_migrates_a_v038_index() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
 
     // Simulate the V038 state: per-repo keys still in the GLOBAL tables, ledger reverted to 38.
     upsert_meta(&conn, "index_meta", "indexed_at_ms", "5000");
@@ -724,8 +711,7 @@ fn v039_leaves_reclassified_global_keys_in_index_meta() {
 /// them.
 #[test]
 fn register_repo_adoption_relocates_repo_meta_rows() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     // As V039 leaves it: per-repo meta under the placeholder.
     rag_rat_db::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "source_root", "/src/repo").unwrap();
     rag_rat_db::meta::set_repo_meta(&conn, LEGACY_REPO_ID, "indexed_at_ms", "9").unwrap();
@@ -764,8 +750,7 @@ fn register_repo_adoption_relocates_repo_meta_rows() {
 #[test]
 fn recorded_root_helpers_report_membership_and_earliest() {
     use rag_rat_db::schema::{earliest_recorded_root, repo_has_recorded_root};
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     let id = identity("repo-x", "repo-x");
     // First root A (registered_at 100), then a second checkout B (registered_at 200).
     register_repo(&conn, &id, Path::new("/checkout-a"), 100, &crate::index::migration_hooks())
@@ -800,8 +785,7 @@ fn recorded_root_helpers_report_membership_and_earliest() {
 /// after — the connection-level stand-in the per-repo accessors resolve until A3.
 #[test]
 fn single_repo_id_returns_the_sole_repo() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     assert_eq!(
         schema::sole_repo_id(&conn).unwrap(),
         LEGACY_REPO_ID,
@@ -828,8 +812,7 @@ fn single_repo_id_returns_the_sole_repo() {
 #[test]
 fn repo_meta_accessors_round_trip_and_scope_by_repo() {
     use rag_rat_db::meta::{delete_repo_meta, repo_meta, set_repo_meta, set_repo_meta_if_changed};
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     // A second repos row so the (repo_id, key) scoping is observable (inserted directly — the
     // phase-A single-repo invariant is about register_repo, not the storage layer).
     conn.execute(
@@ -1116,8 +1099,7 @@ fn seed_pre_v040_commit(conn: &rusqlite::Connection, hash: &str, subject: &str) 
 /// `current_version == LATEST` check.)
 #[test]
 fn migration_040_scopes_core_tables() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -1278,8 +1260,7 @@ fn migration_040_reunites_active_model_provenance_meta_into_repo_meta() {
 /// A V039 index forward-migrates to V040 on `migrate_forward` — reaching LATEST.
 #[test]
 fn migration_040_forward_migrates_a_v039_index() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     truncate_schema_to(&conn, 39);
     assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
     schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
@@ -1811,8 +1792,7 @@ fn register_repo_adds_an_unrelated_repo_without_upgrading_the_local_incumbent() 
     let x_boundary = head_commit_hash(&repo_x);
     let repo_y = real_git_repo("unrelated-y"); // an independent root — no shared history with X.
 
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     let local_id = "local:beefbeefcafe";
     register_repo(
         &conn,
@@ -1846,8 +1826,7 @@ fn register_repo_adds_an_unrelated_repo_without_upgrading_the_local_incumbent() 
 #[test]
 fn register_repo_refuses_a_local_upgrade_without_a_recorded_boundary() {
     let repo = real_git_repo("no-boundary");
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     // Register the local incumbent with an EMPTY boundary — nothing to prove against.
     let local_id = "local:nobound00";
     register_repo(
@@ -1878,8 +1857,7 @@ fn register_repo_refuses_a_local_upgrade_without_a_recorded_boundary() {
 /// onto another (which would be data loss). The incumbent is left exactly as it was.
 #[test]
 fn register_repo_adds_a_second_portable_repo_without_repointing_the_incumbent() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     register_repo(
         &conn,
         &identity("portable-a", "a"),
@@ -1915,8 +1893,7 @@ fn second_shallow_clone_late_upgrades_into_the_existing_portable_repo() {
     let root_b = real_git_repo("late-b");
     let boundary_b = head_commit_hash(&root_b);
 
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
 
     // A's story already completed: the portable id P is registered at A's root (the in-place
     // upgrade path, covered by its own tests) and carries A's authored + derived data.
@@ -2073,8 +2050,7 @@ fn second_shallow_clone_late_upgrades_into_the_existing_portable_repo() {
 /// write path refuses). `None` declines the fast path so the read-write open surfaces the refusal.
 #[test]
 fn read_only_resolver_declines_a_pin_onto_a_root_owned_by_another_repo() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     register_repo(
         &conn,
         &identity("repo-a", "a"),
@@ -2110,8 +2086,7 @@ fn read_only_resolver_declines_a_pin_onto_a_root_owned_by_another_repo() {
 /// view"), aborting the first index of a fresh keyless DB in an identity-bearing repo.
 #[test]
 fn adoption_repoints_files_through_a_connection_carrying_the_scope_view() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     // A placeholder-scoped file row awaiting adoption.
     conn.execute(
         "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
@@ -2153,8 +2128,7 @@ fn upgrade_picks_the_root_matching_incumbent_among_two_shallow_clones() {
     let repo = real_git_repo("two-shallow"); // clone B's working tree — the one that deepens.
     let boundary = head_commit_hash(&repo);
 
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     // Clone A: a SIBLING shallow clone of the same upstream at a DIFFERENT root, whose id sorts
     // FIRST — the incumbent a boundary-only scan would wrongly pick (its boundary is equally
     // reachable from the deepened HEAD).
@@ -2211,8 +2185,7 @@ fn upgrade_picks_the_root_matching_incumbent_among_two_shallow_clones() {
 /// recorded-root route (`LIMIT 1` over two owners) non-deterministic.
 #[test]
 fn idempotent_reregistration_refuses_a_root_owned_by_another_repo() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     register_repo(
         &conn,
         &identity("repo-abc", "a"),
@@ -2343,8 +2316,7 @@ fn concurrent_registrations_on_a_shared_db_both_succeed() {
 /// NEW, unclaimed root is instead a genuinely new shallow repo and registers fresh.)
 #[test]
 fn register_repo_refuses_a_local_only_downgrade_of_an_owned_root() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     register_repo(
         &conn,
         &identity("portable-a", "a"),
@@ -2551,8 +2523,7 @@ fn unshallow_upgrades_a_shallow_clone_index_from_local_to_portable_in_place() {
 /// the config's own repo even for a non-git root that has no derivable identity.
 #[test]
 fn resolve_config_repo_id_binds_a_recorded_root_over_the_sole_pick() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     // Repo A adopted (sorts first). A sibling repo B seeded directly with its recorded root — the
     // A7 consolidated shape (register_repo forbids a second real repo before A7).
     register_repo(
@@ -2606,8 +2577,7 @@ fn resolve_config_repo_id_returns_none_for_a_rejected_pin() {
     run_git(&root, &["config", "user.name", "t"]);
     run_git(&root, &["commit", "-q", "--allow-empty", "-m", "genesis"]);
 
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     register_repo(
         &conn,
         &identity("repo-a", "a"),
@@ -2640,8 +2610,7 @@ fn resolve_config_repo_id_returns_none_for_a_new_unregistered_pin() {
     run_git(&root, &["config", "user.name", "t"]);
     run_git(&root, &["commit", "-q", "--allow-empty", "-m", "genesis"]);
 
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     // The root is registered (and recorded) under repo-a — so the pre-fix by-root fallback would
     // resolve the new pin to repo-a.
     register_repo(
@@ -2684,8 +2653,7 @@ fn resolve_config_repo_id_returns_none_for_a_newly_portable_local_incumbent() {
         rag_rat_base::repo_identity::resolve_repo_identity(&root, None).unwrap().repo_id;
     assert!(!portable_id.starts_with("local:"), "full history → a portable root id");
 
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     // Incumbent: registered (and root recorded) under a machine-local id, as a prior shallow index.
     register_repo(
         &conn,
@@ -2902,8 +2870,7 @@ fn seed_pre_v041_github_schema(conn: &rusqlite::Connection) {
 /// below). Every papertrail table carries a direct `repo_id` from birth.
 #[test]
 fn fresh_apply_scopes_the_papertrail_tables_by_repo_id() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -3175,8 +3142,7 @@ fn migration_041_leaves_github_rows_at_the_placeholder_on_a_consolidated_db() {
 /// separately at ADOPTION (see `register_repo_repoints_papertrail_rows_to_the_real_id`).
 #[test]
 fn a_syncing_repo_is_isolated_from_stranded_placeholder_papertrail_rows() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // The state the consolidated-DB gate leaves: papertrail rows stranded under the placeholder
     // on a two-real-repo DB.
     conn.execute_batch(&format!(
@@ -3298,8 +3264,7 @@ fn a_syncing_repo_is_isolated_from_stranded_placeholder_papertrail_rows() {
 /// A V040 index forward-migrates to V041 on `migrate_forward` — reaching LATEST.
 #[test]
 fn migration_041_forward_migrates_a_v040_index() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     truncate_schema_to(&conn, 40);
     assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
     schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
@@ -3359,8 +3324,7 @@ fn seed_pre_v042_periphery_schema(conn: &rusqlite::Connection) {
 /// pin.
 #[test]
 fn migration_042_is_the_latest_tip_and_scopes_periphery() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // V042 is no longer the ABSOLUTE tip (V043 adds files.generation, V044 widens the github keys);
     // the tip pin lives with the newest migration's test (`v044_widens_the_github_natural_keys_...`
     // in github_papertrail). Here just assert `apply` reaches LATEST — V042 is on the way to the
@@ -3597,8 +3561,7 @@ fn migration_042_leaves_periphery_rows_at_the_placeholder_on_a_consolidated_db()
 /// A V041 index forward-migrates to V042 on `migrate_forward` — reaching LATEST.
 #[test]
 fn migration_042_forward_migrates_a_v041_index() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     truncate_schema_to(&conn, 41);
     assert_eq!(schema::status(&conn).unwrap().state, schema::SchemaState::Older);
     schema::migrate_forward(&conn, &crate::index::migration_hooks()).unwrap();
@@ -3792,8 +3755,7 @@ fn full_ladder_v037_to_v042_scopes_both_workstreams_data() {
 /// EMPTY section instead of the adopted rows.
 #[test]
 fn adoption_repoints_change_couplings_consistently_with_its_stamp() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     // A derived coupling row + a CONSISTENT freshness stamp (head h1 + params 1), both under the
     // placeholder — the shape a legacy single-repo index carries pre-adoption.
@@ -3856,8 +3818,7 @@ fn adoption_repoints_change_couplings_consistently_with_its_stamp() {
 /// shared bindings to an arbitrary owner instead of treating the split as ambiguous.
 #[test]
 fn realign_skips_a_group_whose_members_disagree_on_their_owner() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
     conn.execute(
         "INSERT INTO files(repo_id, path, language, kind, sha256, modified_at_ms, indexed_at_ms,
@@ -3917,8 +3878,7 @@ fn realign_skips_a_group_whose_members_disagree_on_their_owner() {
 /// re-points `repo_id`.
 #[test]
 fn realign_still_moves_a_group_of_canonically_equal_scopes() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
     conn.execute(
         "INSERT INTO files(repo_id, path, language, kind, sha256, modified_at_ms, indexed_at_ms,

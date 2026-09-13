@@ -951,8 +951,7 @@ fn clone_substrate_has_token_bag_blob_and_no_postings_on_fresh_and_migrated_dbs(
     // BLOB column rides `symbol_fingerprints`. V029 still CREATEs the postings table; V032 drops it
     // (R5 — V029 is never edited), so after apply()/migrate_forward the postings table must be GONE
     // and the column present. The other clone tables (refinements, df) survive.
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     for table in ["symbol_fingerprints", "clone_token_df", "clone_refinements"] {
         let n: i64 = conn
             .query_row(
@@ -984,8 +983,7 @@ fn clone_substrate_has_token_bag_blob_and_no_postings_on_fresh_and_migrated_dbs(
     assert!(matches!(status.state, rag_rat_db::schema::SchemaState::Compatible));
 
     // Migrated DB: a DB driven through migrate_forward reaches the same post-V032 shape.
-    let conn2 = rusqlite::Connection::open_in_memory().expect("open2");
-    rag_rat_db::schema::apply(&conn2, &crate::index::migration_hooks()).expect("apply2"); // already-latest is a no-op forward
+    let conn2 = fresh_conn(); // already-latest is a no-op forward
     rag_rat_db::schema::migrate_forward(&conn2, &crate::index::migration_hooks())
         .expect("migrate_forward");
     let postings: i64 = conn2

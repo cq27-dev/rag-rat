@@ -18,12 +18,6 @@ fn repo() -> String {
     rag_rat_base::repo_identity::LEGACY_REPO_ID.to_string()
 }
 
-fn fresh_conn() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
-    conn
-}
-
 fn add_file(conn: &Connection, path: &str, generated: i64) {
     conn.execute(
         "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \

@@ -10,12 +10,6 @@ use super::*;
 
 // ---- raw-schema helpers (in-memory, full ladder) ----
 
-fn apply_schema() -> rusqlite::Connection {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
-    conn
-}
-
 fn insert_file(conn: &rusqlite::Connection, path: &str, sha: &str, kind: &str, generation: i64) {
     conn.execute(
         "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
@@ -78,7 +72,7 @@ const FOLD_TRIGGERS: [&str; 3] =
 /// "schema at LATEST after apply" check per the ladder convention.
 #[test]
 fn content_digest_state_has_live_fold_triggers() {
-    let conn = apply_schema();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
 
     let (state, rows) = digest_stored(&conn);
@@ -94,7 +88,7 @@ fn content_digest_state_has_live_fold_triggers() {
 /// MUST call `ensure_content_digest` again.
 #[test]
 fn a_files_table_rebuild_drops_the_fold_triggers_and_ensure_recreates_them() {
-    let conn = apply_schema();
+    let conn = fresh_conn();
     insert_file(&conn, "a.rs", "aa", "source", 1);
     for trigger in FOLD_TRIGGERS {
         assert!(object_exists(&conn, "trigger", trigger));
@@ -126,7 +120,7 @@ fn a_files_table_rebuild_drops_the_fold_triggers_and_ensure_recreates_them() {
 
 #[test]
 fn triggers_hold_parity_through_insert_tombstone_flip_delete_and_purge() {
-    let conn = apply_schema();
+    let conn = fresh_conn();
     insert_file(&conn, "a.rs", "aa", "source", 1);
     insert_file(&conn, "b.rs", "bb", "docs", 1);
     assert_trigger_parity(&conn);
@@ -175,7 +169,7 @@ fn triggers_hold_parity_through_insert_tombstone_flip_delete_and_purge() {
 /// counter/content-stability pin). Digest is invariant under insert order / rowid.
 #[test]
 fn digest_is_a_multiset_not_a_set_and_is_order_invariant() {
-    let conn = apply_schema();
+    let conn = fresh_conn();
     insert_file(&conn, "dup.rs", "same", "source", 1);
     let one = digest_stored(&conn);
 
@@ -192,10 +186,10 @@ fn digest_is_a_multiset_not_a_set_and_is_order_invariant() {
 
     // Order / rowid invariance: a second DB inserting the same multiset in the opposite order and
     // at different rowids lands on the identical digest.
-    let other = apply_schema();
+    let other = fresh_conn();
     insert_file(&other, "z.rs", "zz", "source", 7);
     insert_file(&other, "a.rs", "aa", "source", 3);
-    let reverse = apply_schema();
+    let reverse = fresh_conn();
     insert_file(&reverse, "a.rs", "aa", "source", 9);
     insert_file(&reverse, "z.rs", "zz", "source", 4);
     assert_eq!(
@@ -329,7 +323,7 @@ fn poisoned_state_is_read_verbatim_then_parity_heals() {
 /// the migration actually runs under) by re-running the idempotent applier.
 #[test]
 fn migration_restamps_fresh_legacy_stamps_but_leaves_stale_ones() {
-    let conn = apply_schema();
+    let conn = fresh_conn();
     // repo_meta.repo_id REFERENCES repos (files.repo_id does not), so register the repo before
     // arming a quiet candidate for it.
     conn.execute(

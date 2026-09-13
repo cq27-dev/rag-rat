@@ -586,8 +586,7 @@ fn parser_failures_report_paths() {
 /// creates them; no legacy github_* tables are ever created), and re-apply is idempotent.
 #[test]
 fn v060_creates_the_papertrail_tables_on_fresh_apply() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -636,8 +635,7 @@ fn v060_creates_the_papertrail_tables_on_fresh_apply() {
 
 #[test]
 fn migration_063_persists_mirror_resume_state() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     let columns = conn_table_columns(&conn, "papertrail_sync_cursor");
     assert!(columns.contains(&"comment_high_mark_at".to_string()));
     assert!(columns.contains(&"comment_page_token".to_string()));
@@ -666,8 +664,7 @@ fn migration_063_persists_mirror_resume_state() {
 
 #[test]
 fn migration_067_persists_binding_health() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     let columns = conn_table_columns(&conn, "papertrail_sync_cursor");
     for name in [
         "last_attempt_ms",
@@ -711,8 +708,7 @@ fn migration_067_persists_binding_health() {
 
 #[test]
 fn migration_063_checksum_replays_the_pre_replay_flag_shape() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     conn.execute("ALTER TABLE papertrail_sync_cursor DROP COLUMN item_delta_replay_required", [])
         .unwrap();
     conn.execute(
@@ -739,8 +735,7 @@ fn migration_063_checksum_replays_the_pre_replay_flag_shape() {
 /// providers), but not twice under one kind.
 #[test]
 fn v060_keys_let_two_repos_cache_the_same_item_and_fold_item_kind() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     let insert_item = |repo_id: &str, kind: &str| {
         conn.execute(
             "INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, \
@@ -906,8 +901,7 @@ fn migration_045_duplicates_children_per_owning_repo_and_keeps_orphans() {
 /// and a re-sync by either repo replaces ITS OWN copy in place without evicting the sibling's.
 #[test]
 fn both_repos_keep_a_shared_items_comments_across_syncs() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
     )

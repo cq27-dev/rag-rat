@@ -4,8 +4,7 @@ use super::*;
 fn migration_073_builds_the_distill_substrate() {
     // The absolute-tip pin moved to `migration_074_*` (V074 is the tip now); this drops to the
     // symbolic `current_version == LATEST` freshness check, per the ladder convention.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -81,8 +80,7 @@ fn migration_073_backfills_state_normalized_from_the_provider_truthful_pair() {
     // carry state='closed' + merged_at — a consumer filtering raw `WHERE state='closed'` silently
     // drops every merged GitLab MR. The backfill derives the normalized value for pre-V073 rows;
     // rerunning it is a no-op for already-stamped rows (idempotent replay).
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     let insert = |key: &str, state: &str, merged_at: Option<&str>| {
         conn.execute(
             "INSERT INTO papertrail_items(tracker, project, item_kind, item_key, url, state, \
@@ -121,8 +119,7 @@ fn migration_073_backfills_state_normalized_from_the_provider_truthful_pair() {
 fn migration_074_refreshes_the_edges_view() {
     // The absolute-tip pin moved to `migration_076_*` (V076 is the tip now); this drops to the
     // symbolic `current_version == LATEST` freshness check, per the ladder convention.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -201,8 +198,7 @@ fn migration_074_refreshes_the_edges_view() {
 
 #[test]
 fn migration_075_materializes_edge_visibility() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     conn.execute(
         "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
          commit_sha, worktree_id) VALUES ('App.swift', 'swift', 'source', 'sha', 0, 0, 'head', '')",
@@ -299,8 +295,7 @@ fn migration_075_materializes_edge_visibility() {
 
 #[test]
 fn migration_076_adds_sync_security_events() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     // Simulate a pre-V076 DB: the table's DDL is not part of truncate_schema_to (it rolls the
     // ledger only), so drop it, then roll the ledger back to V075.
@@ -339,8 +334,7 @@ fn migration_076_adds_sync_security_events() {
 
 #[test]
 fn migration_077_builds_the_distill_record_store() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -552,8 +546,7 @@ fn migration_078_distinguishes_candidates_from_selections() {
         .unwrap();
     assert_eq!(selected, 1, "replaying V078 does not erase a later model selection");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let v78_recorded: i64 = conn
         .query_row(
@@ -668,8 +661,7 @@ fn migration_079_builds_safe_input_snapshots() {
         .unwrap();
     assert_eq!(sources, 2, "replay preserves existing snapshots");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
@@ -774,8 +766,7 @@ fn migration_080_builds_enriched_context_snapshots() {
         .unwrap();
     assert_eq!(diffs, 2, "replay preserves existing diff snapshots");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
@@ -848,8 +839,7 @@ fn migration_081_adds_evidence_source_part() {
         .unwrap();
     assert_eq!(rows, 2, "an idempotent re-apply preserves existing evidence rows");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     let recorded: i64 = conn
         .query_row(
@@ -864,8 +854,7 @@ fn migration_081_adds_evidence_source_part() {
 #[test]
 fn migration_082_accounts_for_content_refold_work() {
     // The `LATEST_SCHEMA_VERSION` pin lives on `migration_084_*`, the current tip.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     let insert_candidate =
         |conn: &rusqlite::Connection, hash: u8, stream: u8, signed_bytes: &[u8], received_at_ms| {
@@ -1062,8 +1051,7 @@ fn migration_082_accounts_for_content_refold_work() {
 /// would keep serving the old `cfg_variant` for every multi-member group indefinitely.
 #[test]
 fn migration_083_relabels_logical_groups_by_evidence() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     // Two `files` ROWS for one path — what a worktree-overlay or commit scope produces.
     for (id, worktree) in [(1_i64, "base"), (2_i64, "wt")] {
@@ -1264,8 +1252,7 @@ fn migration_084_links_chunks_to_symbols() {
     assert_eq!(relinked, linked, "an idempotent re-apply preserves the backfilled links");
 
     // Full ladder: the tip provisions cleanly and records V084 with the column present.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     assert!(
         schema::column_exists(&conn, "chunks", "symbol_id").unwrap(),
@@ -1344,8 +1331,7 @@ fn migration_085_adds_origin_and_edge_present() {
     );
 
     // The full ladder ends with the columns present and records V085.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     for (t, c) in added {
         assert!(schema::column_exists(&conn, t, c).unwrap(), "the full ladder ends with {t}.{c}");

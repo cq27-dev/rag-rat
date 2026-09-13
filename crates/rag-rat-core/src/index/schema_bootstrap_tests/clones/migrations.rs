@@ -6,8 +6,7 @@ use super::*;
 /// dropping the column + deleting the V032 ledger row (making the schema Older), then replays.
 #[test]
 fn migration_032_adds_token_bag_drops_postings() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
 
     // --- Simulate a V031-era index: postings table present, no token_bag column ---
     conn.execute_batch(
@@ -66,8 +65,7 @@ fn migration_032_adds_token_bag_drops_postings() {
 /// `clone_edges` with the content-key endpoints; the deferred postings table is NOT created.
 #[test]
 fn migration_034_adds_content_anchored_clone_graph_tables() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
 
     // --- Simulate a V033-era index: clone-graph tables absent, schema rolled back to V033 ---
     conn.execute_batch(
@@ -155,8 +153,7 @@ fn migration_034_adds_content_anchored_clone_graph_tables() {
 /// back one step, then asserts `migrate_forward` re-adds it.
 #[test]
 fn migration_035_adds_symbols_is_test() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
 
     conn.execute_batch("ALTER TABLE symbols DROP COLUMN is_test;").expect("revert to V034 shape");
     truncate_schema_to(&conn, 34);
@@ -187,8 +184,7 @@ fn migration_035_adds_symbols_is_test() {
 /// current embeddings so vectors survive the next reindex.
 #[test]
 fn migration_036_adds_content_addressed_embedding_cache() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
 
     conn.execute_batch("DROP TABLE embedding_cache;").expect("revert to V035 shape");
     truncate_schema_to(&conn, 35);
@@ -218,8 +214,7 @@ fn migration_036_adds_content_addressed_embedding_cache() {
 /// (review R2). Also drives the forward-migration path from a V036 index.
 #[test]
 fn migration_037_adds_content_anchored_clone_subblock_postings() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     // NB: V037 is no longer the schema tip (V038 added the repos registry), so this test no longer
     // pins LATEST_SCHEMA_VERSION to an absolute number — that pin lives on the current-tip test.
 
@@ -345,9 +340,8 @@ fn migration_037_adds_content_anchored_clone_subblock_postings() {
 /// `migrate_forward` and asserting the column is present and a direct SELECT succeeds.
 #[test]
 fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
     // Start from a fully-applied schema (includes V029 DDL which already has lcs_sampled).
-    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).expect("apply");
+    let conn = fresh_conn();
     assert_eq!(
         rag_rat_db::schema::status(&conn).unwrap().current_version,
         rag_rat_db::schema::LATEST_SCHEMA_VERSION,
@@ -542,9 +536,7 @@ fn migration_031_edge_oracle_no_fk_content_key() {
 /// instance of the #248 bug to FIX (re-anchor on a content key + drop the FK), not to allowlist.
 #[test]
 fn no_table_has_a_reindex_cascading_fk_to_a_volatile_parent() {
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks())
-        .expect("apply reaches LATEST");
+    let conn = fresh_conn();
 
     // Every declared oracle-derived table exists and is implicitly covered by the scan below (a
     // typo in the const would otherwise drift from reality unnoticed). The const stays the
@@ -581,9 +573,7 @@ fn no_table_has_a_reindex_cascading_fk_to_a_volatile_parent() {
     // NEGATIVE SUB-ASSERTION (the trip-wire has teeth): a synthetic table WITH a cascading FK to a
     // volatile parent (`edges_data`) IS flagged by the scan — proving a future offender would not
     // slip through. Built on its own connection so the production scan above stays clean.
-    let probe = rusqlite::Connection::open_in_memory().expect("open probe");
-    rag_rat_db::schema::apply(&probe, &crate::index::migration_hooks())
-        .expect("apply reaches LATEST");
+    let probe = fresh_conn();
     probe
         .execute_batch(
             "CREATE TABLE __trip_wire_probe__(

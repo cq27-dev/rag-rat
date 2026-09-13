@@ -5,8 +5,7 @@ fn v026_recreates_chunk_fts_contentless_and_repopulates() {
     // #77 Phase 2: chunk_fts becomes a CONTENTLESS FTS5 index. Fresh apply yields a contentless
     // table that supports delete-by-rowid (contentless_delete=1); the forward-migrate (V026)
     // converts an existing external-content table and repopulates it from chunks.text.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     let fts_sql: String = conn
         .query_row("SELECT sql FROM sqlite_master WHERE name = 'chunk_fts'", [], |r| r.get(0))
@@ -319,8 +318,7 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
 
 #[test]
 fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
@@ -369,8 +367,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
 /// there.
 #[test]
 fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // Simulate a pre-V022 index: drop the V022 artifacts and its schema_version row. (SQLite ≥3.35
     // supports DROP COLUMN; the bundled rusqlite is current.)
     conn.execute_batch(
@@ -416,8 +413,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
 /// string indexes do not.
 #[test]
 fn v028_fresh_apply_interns_symbol_qualified_names() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     for table in ["symbols", "logical_symbols"] {
         let cols = conn_table_columns(&conn, table);
@@ -447,8 +443,7 @@ fn v028_fresh_apply_interns_symbol_qualified_names() {
 /// forward-migrated row reconstructable to the SAME qualified name as before.
 #[test]
 fn v028_forward_migrate_interns_and_drops_the_inline_column() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     // Seed a file + a symbol + a logical symbol in the CURRENT (interned) shape.
     conn.execute(
@@ -658,8 +653,7 @@ fn gc_preserves_a_name_strings_entry_referenced_only_by_a_symbol() {
 /// margin so a future blow-up surfaces here.
 #[test]
 fn name_strings_max_id_stays_in_the_three_byte_range() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // Seed a representative spread of interned names across edges + symbols.
     conn.execute(
         "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
@@ -829,8 +823,7 @@ fn has_test_code_backfill_is_case_sensitive() {
     // set the flag for an uppercase `TEST(` that a freshly-indexed file (whose
     // `contains("test(")` is false) leaves at 0 — a migrated-vs-reindexed divergence. `instr`
     // is case-sensitive, so they agree.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // V024's backfill reads chunks.text, which V027 retired; this test exercises the backfill as a
     // pre-V027 forward-migrate would, so re-add the column it reads.
     conn.execute("ALTER TABLE chunks ADD COLUMN text TEXT NOT NULL DEFAULT ''", []).unwrap();

@@ -581,8 +581,7 @@ fn gc_prunes_a_dead_oracle_run_on_a_single_repo_db() {
 /// stay globally unique — the repo dimension lives INSIDE the derivation, not in a composite PK).
 #[test]
 fn identical_content_in_two_repos_yields_distinct_logical_symbols() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     let key = crate::index::graph_index::LogicalSymbolKey {
         language: "rust".to_string(),

@@ -780,8 +780,7 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
 fn v025_creates_chunk_text_compression_tables() {
     // #77 Phase 2: the chunk_text (zstd blob) + chunk_text_dict (shared dictionary) tables exist
     // after a fresh apply (baseline) AND a forward-migrate (V025).
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     for t in ["chunk_text", "chunk_text_dict"] {
         assert!(conn_table_exists(&conn, t), "{t} created on fresh apply");

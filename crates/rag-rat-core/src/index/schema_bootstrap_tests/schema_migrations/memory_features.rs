@@ -5,8 +5,7 @@ use super::*;
 /// pin lives on the newest migration's test; this one uses only symbolic latest checks.
 #[test]
 fn migration_046_creates_the_verification_tables_on_fresh_apply() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     assert_eq!(
         schema::status(&conn).unwrap().current_version,
         schema::LATEST_SCHEMA_VERSION,
@@ -56,8 +55,7 @@ fn migration_046_creates_the_verification_tables_on_fresh_apply() {
 /// table. Carries the absolute schema-tip pin now that V047 is newest.
 #[test]
 fn migration_047_creates_the_model_failure_table_on_fresh_apply() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // The absolute-tip pin moved to `migration_048_*` (V048 is the tip now); this test keeps the
     // symbolic "schema at LATEST after apply" check and its V047 table coverage.
     assert_eq!(
@@ -110,8 +108,7 @@ fn migration_047_creates_the_model_failure_table_on_fresh_apply() {
 
 #[test]
 fn migration_048_adds_the_memory_payload_json_column() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // Symbolic freshness check — the absolute tip pin lives on the NEWEST migration's test
     // (migration_050_*), per the ladder convention.
     assert_eq!(
@@ -133,8 +130,7 @@ fn migration_048_adds_the_memory_payload_json_column() {
 
 #[test]
 fn migration_049_adds_the_repo_node_edges_table() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // Symbolic freshness check — the absolute tip pin lives on the NEWEST migration's test
     // (migration_050_*), per the ladder convention.
     assert_eq!(
@@ -193,8 +189,7 @@ fn migration_050_adds_the_postings_path_index_and_delta_counter() {
         .unwrap()
             > 0
     };
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // Symbolic freshness check (the absolute tip pin lives on the NEWEST migration's test —
     // migration_051 — per the ladder convention).
     assert_eq!(
@@ -259,8 +254,7 @@ fn migration_050_adds_the_postings_path_index_and_delta_counter() {
 
 #[test]
 fn migration_051_adds_clone_df_epoch_and_backfills_existing_generations() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // V052 now holds the absolute tip pin (migration_052's test); this drops to the symbolic
     // `current_version == LATEST` freshness check.
     assert_eq!(

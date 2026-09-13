@@ -985,6 +985,13 @@ fn fingerprinted_symbol_id_for_ref(db: &IndexDatabase, qualified_name: &str) -> 
         .unwrap_or_else(|e| panic!("no fingerprinted symbol id for ref {qualified_name}: {e}"))
 }
 
+/// A fresh in-memory connection with the full schema applied through the index's migration hooks.
+fn fresh_conn() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    conn
+}
+
 // Unix-only: the fixture needs a file whose NAME contains `\`, which Windows forbids. Gating the
 // module — rather than each item inside it — keeps its helpers from becoming `dead_code` on a
 // platform where none of its tests compile in.

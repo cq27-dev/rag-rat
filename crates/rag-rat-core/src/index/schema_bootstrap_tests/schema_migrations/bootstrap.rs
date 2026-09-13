@@ -687,8 +687,7 @@ fn compatible_open_refuses_dirty_and_newer_schema() {
 /// partial schema migration detected" until a manual `index --full`.
 #[test]
 fn forward_migrate_replay_never_touches_the_dirty_marker() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     truncate_schema_to(&conn, 50);
 
     // Audit every write that targets the marker: the stamp (the INSERT half of `INSERT OR
@@ -726,8 +725,7 @@ fn forward_migrate_replay_never_touches_the_dirty_marker() {
 /// `SQLITE_BUSY` during the V050→V051 step.
 #[test]
 fn forward_migrate_step_failure_leaves_a_retryable_older_schema_not_dirty() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     truncate_schema_to(&conn, 50);
 
     conn.execute_batch(
@@ -773,8 +771,7 @@ fn forward_migrate_step_failure_leaves_a_retryable_older_schema_not_dirty() {
 /// Every avoided write is one fewer `SQLITE_BUSY` hazard against concurrent ordinary writers.
 #[test]
 fn forward_migrate_when_nothing_is_owed_leaves_the_ledger_untouched() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
 
     conn.execute_batch(
         "
@@ -811,8 +808,7 @@ fn forward_migrate_when_nothing_is_owed_leaves_the_ledger_untouched() {
 /// older binary's failed mid-replay migrate; new binaries no longer stamp it on replay.)
 #[test]
 fn apply_clears_a_stranded_dirty_marker() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     conn.execute(
         "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
          VALUES ('__dirty__', 1, '', 'partial migration in progress')",
@@ -839,8 +835,7 @@ fn apply_clears_a_stranded_dirty_marker() {
 /// is actually present.
 #[test]
 fn forward_migrate_replay_preserves_chunk_summaries() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     // Seed a bare summary row (FK off — the parent chunk chain is irrelevant to what this test
     // pins: the replay must not touch the rows).
     conn.execute_batch(
@@ -925,8 +920,7 @@ fn a_failed_first_provision_reads_dirty_with_the_failure_recorded() {
 /// as "provision owed" so the 001 row is refreshed as well.
 #[test]
 fn apply_recovers_a_baseline_checksum_mismatch() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let conn = fresh_conn();
     conn.execute(
         "UPDATE schema_version SET checksum = 'sha256:corrupted'
          WHERE id = '001_sqlite_storage_baseline'",
