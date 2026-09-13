@@ -7,6 +7,189 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.2](https://github.com/cq27-dev/rag-rat/compare/v0.23.1...v0.23.2) - 2026-09-13
+
+### Added
+
+- *(sync)* publish each symbol anchor's scope so a rebind between twin impls follows ([#1303](https://github.com/cq27-dev/rag-rat/pull/1303))
+- *(sync)* relay contributors' logs and memories through the owner's sessions ([#1293](https://github.com/cq27-dev/rag-rat/pull/1293))
+- *(sync)* admit a grantor's relayed grantee entries in its sessions ([#1292](https://github.com/cq27-dev/rag-rat/pull/1292))
+
+### Fixed
+
+- *(sync)* converge a returning memory's held rows when no baseline was parked ([#1309](https://github.com/cq27-dev/rag-rat/pull/1309))
+- *(sync)* keep a binding's authored anchor on the wire and resolve it locally ([#1306](https://github.com/cq27-dev/rag-rat/pull/1306))
+- *(sync)* re-apply a synced memory's anchors and source hash when its author republishes ([#1275](https://github.com/cq27-dev/rag-rat/pull/1275))
+- *(oplog)* let a revoking cut vouch for the ops authored concurrently with it ([#1313](https://github.com/cq27-dev/rag-rat/pull/1313))
+- *(sync)* keep a removed synced memory's bindings and park its anchor baseline ([#1305](https://github.com/cq27-dev/rag-rat/pull/1305))
+- *(sync)* keep one foreign account's pull failure from stopping the rest ([#1300](https://github.com/cq27-dev/rag-rat/pull/1300))
+- *(consolidate)* leave other accounts' memories out of the legacy import ([#1299](https://github.com/cq27-dev/rag-rat/pull/1299))
+- *(oplog)* measure content freshness against the held control log ([#1296](https://github.com/cq27-dev/rag-rat/pull/1296))
+- *(sync)* clear the drain watermarks when a repository is purged ([#1289](https://github.com/cq27-dev/rag-rat/pull/1289))
+- *(oplog)* credit a revoking cut with the control ops it condemns ([#1302](https://github.com/cq27-dev/rag-rat/pull/1302))
+- *(oplog)* never compact away an entry that still carries a row ([#1291](https://github.com/cq27-dev/rag-rat/pull/1291))
+- *(sync)* count only unaccepted candidates against the content receive budgets ([#1288](https://github.com/cq27-dev/rag-rat/pull/1288))
+- *(sync)* bound the account/content session's writes by the idle timeout ([#1287](https://github.com/cq27-dev/rag-rat/pull/1287))
+
+### Other
+
+- *(core)* type the reconcile report status as ReconcileStatus
+- *(cli)* render the Embedding step's pickers through one cursor_list widget
+- *(cli)* type the maintenance-hook report status and lift the long sync notes
+- *(cli)* dispatch sync commands through one exhaustive match
+- *(cli)* type the wizard's remote-mode choice instead of a usize
+- *(cli)* share the write-and-setup tail between the two init flows
+- *(cli)* route the blocking CLI write-lock acquisitions through one helper
+- *(cli)* give the --json fork one helper and one flag conversion
+- *(cli)* read the clock through rag_rat_base::time::now_ms and drop the dream pass unwraps
+- *(dream)* move the verify zero-work probe beside the verdict runner
+- *(core)* split consolidate::run_inner into named phases
+- *(base)* derive per-repo flight paths from one FlightKind
+- *(base)* back the config token enums with strum
+- *(llm)* pass the throughput sweep entry points parameter structs
+- *(core)* pass the active checkout through query_api as a CheckoutRef
+- *(core)* key checkout scope resolution and set_context on CheckoutKey
+- *(oracle)* pass the checkout scope as one CheckoutRef instead of a string pair
+- *(core)* carry the traversal Direction through query_api instead of a bool
+- *(query)* replace the reverse traversal flag with a Direction enum
+- *(core)* re-attach the contribution_owner_account doc comment to its function
+- *(core)* give memory_write's tests one home beside their modules
+- *(core)* split memory_write authoring into ownership, reconcile and grants modules
+- *(core)* split EventLoop::run into message handlers over a LoopState
+- *(core)* share one IntervalClock and request-worker spawner in the watcher
+- *(core)* lift distill extraction and record writing into named phases
+- *(core)* share one clear_model_junctions between extraction and the drain
+- *(core)* key distill extraction by the shared ThreadKey
+- *(core)* parse closing-edge closer kind and source into their enums
+- *(core)* partition eval expectations into hits and misses in one helper
+- *(core)* collect rusqlite rows with the collect idiom instead of push loops
+- *(core)* route every untrusted prompt field through bounded_untrusted
+- *(core)* split reconcile_with_options_progress into named phases
+- *(core)* share one fresh_conn fixture across the schema bootstrap tests
+- *(core)* type the active-model provenance flag
+- *(core)* make the options form the one public reconcile entry point
+- *(core)* share compare_graph_to_scip's report envelope and contradiction mapping
+- *(core)* build the early reconcile reports from the empty-report constructor
+- *(core)* import rag_rat_query modules in the query_api graph, importance and memory files
+- *(core)* split the poison-sibling harness into seed, assert and test files
+- *(core)* split graph_index into logical-key, reference, drift-heal and freshness modules
+- *(core)* keep the language edge extractor entry points thin
+- *(core)* give tree-sitter child scans an owning named_children iterator
+- *(core)* split resolve_symbol into named resolution stages
+- *(core)* type the persisted edge resolution reason
+- *(core)* build both resolve drivers' requests through one resolve_reference
+- *(core)* share the resolver's unique-or-logical-variant rule across stages
+- *(core)* read receiver-type retry rules off ReceiverTypeIdentity
+- *(clones)* pass the refine inputs as one RefineRequest
+- *(dream)* drop the vestigial queue budget parameter
+- *(query)* curate the memory module index with explicit re-exports
+- *(query)* collapse the three file-mention section helpers into one
+- *(core)* share the overlay-refresh transaction envelope between both routes
+- *(core)* give finalize_overlay_refresh a parameter struct and a manifest signal
+- *(core)* move the consolidate, remove and adoption-hint test modules to sibling files
+- *(core)* share the consolidation repo_meta reads and single-token merge
+- *(core)* build the IndexDatabase handle in one constructor
+- *(core)* name the overlay-basis meta key in one helper
+- *(core)* route the git-availability test guard through test_git
+- *(core)* curate the index module's re-export surface
+- *(core)* lift the rebuild publish and incremental open/write phases into methods
+- *(core)* route the index transaction dance through in_immediate_txn
+- *(core)* name the file-write and write-origin modes
+- *(core)* type the persisted chunk kind as ChunkKind
+- *(core)* name the incremental pass's write effects
+- *(core)* read the scope row once for both incremental skip gates
+- *(core)* name the chunk-split line caps and anchor constants
+- *(core)* ask GitChangedPaths whether it touched a Cargo.toml
+- *(db)* settle the kv meta accessors on rusqlite::Result and move the watch-placement flush out
+- *(db)* delete the duplicate meta reader
+- *(papertrail)* type ref kind, ref source kind and doc kind as strum enums
+- *(llm)* return a named ProvisionedEmbedding from the provisioning path
+- *(llm)* re-attach detached doc comments and drop stale provider notes
+- *(deps)* audit and bump the Rust and cookbook dependencies ([#1315](https://github.com/cq27-dev/rag-rat/pull/1315))
+- *(mcp)* answer every symbol tool's select_symbol outcome through one helper
+- *(mcp)* build graph_tool's traversal options once
+- *(mcp)* split the hook listener's serve_one and type its request kind
+- *(mcp)* serve the file and symbol-hop lenses through shared route bodies
+- *(mcp)* build every symbol tool's selector through one spelling
+- *(mcp)* pin that every catalog tool has its own description and arg schema
+- *(base)* settle base tests on ScratchDir and split config tests by subject
+- *(base)* give Config a Default for struct-update construction
+- *(base)* share the remote-serving validation between chat and embedding blocks
+- *(base)* split Config::load into named resolution phases
+- *(base)* pass the log policy to sweep_retention by name
+- *(base)* move ConfigError into config/error.rs
+- *(base)* route worktree_hash through hash::hex_lower
+- *(base)* hold the data-dir env lock in the config tests that read the global store path ([#1290](https://github.com/cq27-dev/rag-rat/pull/1290))
+- *(db)* split register_repo_inner and name its root-recording mode
+- *(db)* declare the additive migration roster in one ordered macro block
+- *(db)* type the purge id sets as an enum
+- *(db)* route every guarded ALTER TABLE ADD COLUMN through add_column_if_missing
+- *(papertrail)* lift GitHub's Search continuation out of items_page
+- *(papertrail)* thread the mirror walk through a MirrorWalk context
+- *(papertrail)* type the attested walk phase and split its node parsers
+- *(papertrail)* name the attested walk's SQL questions and bind their enum tokens
+- *(papertrail)* route ref grammar passes through one GrammarScope
+- *(papertrail)* share the mirror cursor's walk-progress reset
+- *(papertrail)* generate the ProviderClient trait delegation from one method list
+- *(llm)* split the cookbook provisioning core into named steps
+- *(llm)* derive probe embedder params from one base instead of four literals
+- *(llm)* route the eval dim probe through the shared embed request path
+- *(llm)* share one OpenAI-compatible HTTP transport between the embed and chat clients
+- *(llm)* share the endpoint authority parse between log sanitizing and loopback checks
+- *(oracle)* give run_in_tx's drift gates a DriftGates home and lift its trailing passes
+- *(oracle)* split live_oracle_pass into a version transition, a per-file resolver, and a shared status
+- *(oracle)* collapse the live pass's repeated drift and readiness blocks
+- *(oracle)* key the live prerequisite gate on readiness and put batch markers on BatchSpec
+- *(oracle)* type the heuristic confidence instead of matching string literals
+- *(oracle)* fix four doc comments that contradict their code
+- *(query)* split impact_surface_report_for_symbol into gather and truncation phases
+- *(query)* bind traversal parameters as typed values and drop the padding predicate
+- *(query)* give the wide memory report structs a construction seam
+- *(query)* type memory binding kinds and anchor statuses
+- *(query)* hoist the confidence ORDER BY ladder into one const
+- *(query)* splice the resolved-operator guard instead of re-typing it
+- *(query)* deduplicate like_escape and untangle misleading helper name pairs
+- *(dream)* share one ask-once-retry-once loop between the model passes
+- *(dream)* type the finding status lifecycle
+- *(dream)* make finding kinds a strum-backed FindingKind
+- *(dream)* back Verdict and Direction with strum tokens
+- *(dream)* build each failure stamp once and reuse it
+- *(clones)* re-attach the fingerprint_symbols doc comment to its function
+- *(clones)* split anti_unify_with_budget into named stages
+- *(clones)* thread the anti-unify descent through a Descent context
+- *(clones)* share one CellBudget between the fidelity and template lanes
+- *(clones)* measure class fidelity through one function and a result struct
+- *(clones)* keep one literal-leaf predicate and one string-body kind list
+- *(clones)* give Confidence one derived ordering
+- *(clones)* name the v2 scoring constants and share the non-value-majority test
+- *(clones)* scope the dead_code allowance to the items that need it
+- *(oplog)* rename the account-private entry-hash aliases to AccountEntryHash
+- *(oplog)* move the largest table-sync test modules to sibling files
+- *(oplog)* share the account test fixtures and one fixed-width reader
+- *(oplog)* split fold_account_pass into its named depth stages
+- *(oplog)* split the table-sync schema lint into named rules
+- *(oplog)* give op-log entry hashes an EntryHash newtype
+- *(oplog)* type the account entry status instead of passing strings
+- *(oplog)* share one pin-aware branch selection between content and secrets
+- *(oplog)* author owner and grantee content batches through one skeleton
+- *(oplog)* share one pre-verify queue between account and content ingest
+- *(oplog)* pass table-sync ingest context as parameter structs
+- *(oplog)* name each projector-generation table snapshot once
+- *(oplog)* read a roster fact through one helper
+- *(oplog)* select the owner authority chain by enum, not a SQL string
+- *(oplog)* share one LWW clock body between row clocks and tombstones
+- *(oplog)* absorb the infallible CBOR write once in an encoder seam
+- *(oplog)* share one CBOR helper set from cbor.rs
+- *(oplog)* route sign_entry through sign_entry_from_op_bytes
+- *(sync)* split enrollment.rs into a module directory by job
+- *(sync)* screen invite redemptions through one function per invite kind
+- *(sync)* share the authenticated dial and the reconcile round tally
+- *(sync)* share the role-ordered completion acknowledgement between session lanes
+- *(sync)* route acceptor streams through a SyncAlpn enum and one dispatch tail
+- *(sync)* derive the sync error types with thiserror
+- *(sync)* carry the session serving policy as SessionLimits
+- *(sync)* share one token bucket between the global accept and egress limiters
+
 ## [0.23.1](https://github.com/cq27-dev/rag-rat/compare/v0.23.0...v0.23.1) - 2026-09-10
 
 ### Added
