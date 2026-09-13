@@ -187,13 +187,17 @@ impl IndexDatabase {
     /// counts (#659 review).
     pub(super) fn finalize_overlay_refresh(
         &self,
-        source_root: &Path,
-        worktree_id: &str,
-        counts: OverlayChangeCounts,
-        manifest_changed: bool,
-        logical_rebuild: OverlayLogicalRebuild,
-        mut grouping: graph_index::LogicalGroupingUpkeep,
+        finalize: OverlayFinalize<'_>,
     ) -> anyhow::Result<()> {
+        let OverlayFinalize {
+            source_root,
+            worktree_id,
+            counts,
+            manifest,
+            logical_rebuild,
+            mut grouping,
+        } = finalize;
+        let manifest_changed = manifest == ManifestSignal::Changed;
         if counts.any_changed() {
             // #820: a tombstone or prune removes a whole file's keys from the grouped corpus —
             // never key-stable, whatever the indexed half of the delta looked like.

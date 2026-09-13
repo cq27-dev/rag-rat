@@ -131,5 +131,24 @@ impl OverlayChangeCounts {
     }
 }
 
+/// Whether an overlay refresh saw its manifest (`Cargo.toml`) change — the signal that refreshes
+/// the package scope even when no source row changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestSignal {
+    Changed,
+    Unchanged,
+}
+
+/// What [`IndexDatabase::finalize_overlay_refresh`] finalizes: one overlay refresh's scope, row
+/// changes, manifest signal and logical-grouping verdict.
+struct OverlayFinalize<'a> {
+    source_root: &'a Path,
+    worktree_id: &'a str,
+    counts: OverlayChangeCounts,
+    manifest: ManifestSignal,
+    logical_rebuild: OverlayLogicalRebuild,
+    grouping: graph_index::LogicalGroupingUpkeep,
+}
+
 #[cfg(test)]
 mod tests;

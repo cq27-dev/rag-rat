@@ -127,14 +127,18 @@ impl IndexDatabase {
                 Vec::new()
             };
             let pruned = pruned_paths.len();
-            self.finalize_overlay_refresh(
-                &source_root,
-                &worktree_id,
-                OverlayChangeCounts { indexed, tombstoned, pruned },
-                delta.manifest_changed,
-                tail.logical_rebuild,
-                applied.outcome.logical,
-            )?;
+            self.finalize_overlay_refresh(OverlayFinalize {
+                source_root: &source_root,
+                worktree_id: &worktree_id,
+                counts: OverlayChangeCounts { indexed, tombstoned, pruned },
+                manifest: if delta.manifest_changed {
+                    ManifestSignal::Changed
+                } else {
+                    ManifestSignal::Unchanged
+                },
+                logical_rebuild: tail.logical_rebuild,
+                grouping: applied.outcome.logical,
+            })?;
             // #824: the basis write rides the SAME transaction as the rows it proves current —
             // previously a separate autocommit per worktree per pass (an extra WAL-dirtying
             // commit each). Un-gated on the counts: a COMPLETE no-change refresh must still
@@ -347,15 +351,15 @@ impl IndexDatabase {
             }
             let pruned = pruned_paths.len();
             // No global prune: a partial path set is not authoritative over the whole overlay. The
-            // supplied-manifest package refresh is the caller's job, so `manifest_changed = false`.
-            self.finalize_overlay_refresh(
-                &source_root,
-                &worktree_id,
-                OverlayChangeCounts { indexed, tombstoned, pruned },
-                false,
+            // supplied-manifest package refresh is the caller's job, so the manifest is Unchanged.
+            self.finalize_overlay_refresh(OverlayFinalize {
+                source_root: &source_root,
+                worktree_id: &worktree_id,
+                counts: OverlayChangeCounts { indexed, tombstoned, pruned },
+                manifest: ManifestSignal::Unchanged,
                 logical_rebuild,
-                applied.outcome.logical,
-            )?;
+                grouping: applied.outcome.logical,
+            })?;
             let changed_paths = applied
                 .planned
                 .into_iter()
