@@ -473,10 +473,7 @@ pub fn resolve_auth_header(
 /// stripping the scheme then the path/port, tolerating a bracketed IPv6 literal. Shared with the
 /// chat client (`chat.rs`) so both HTTP paths classify loopback identically.
 pub(crate) fn endpoint_is_loopback(endpoint: &str) -> bool {
-    let after_scheme = endpoint.split_once("://").map_or(endpoint, |(_, rest)| rest);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
-    // Strip userinfo (`user:pass@host`) if present.
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host_port = url_authority(endpoint);
     let host = match host_port.strip_prefix('[') {
         // Bracketed IPv6 literal: `[::1]:11434` → `::1`.
         Some(rest) => rest.split(']').next().unwrap_or(rest),
@@ -485,6 +482,15 @@ pub(crate) fn endpoint_is_loopback(endpoint: &str) -> bool {
     };
     matches!(host.trim().to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
         || host.starts_with("127.")
+}
+
+/// The `host[:port]` of an endpoint URL: the scheme, path/query/fragment, and any `user:pass@`
+/// userinfo stripped. The one authority parse behind both loopback classification and
+/// credential-free endpoint logging (`sanitize_endpoint`), so the two can't disagree on the host.
+pub(crate) fn url_authority(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
+    authority.rsplit_once('@').map_or(authority, |(_, host_port)| host_port)
 }
 
 impl Embedder for OpenAiEmbedder {
