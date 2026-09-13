@@ -2,14 +2,9 @@
 //! (computed from the engine's shared parse), token-bag postings, and the refine/antiunify
 //! pipeline that upgrades candidate pairs into ranked clone classes. The engine supplies
 //! parsed ASTs and symbol spans; this crate never parses or reads engine state upward.
-
-//! Clone-detection fingerprint substrate (#215 Phase 1): a scope-independent structural
-//! fingerprint per function symbol, computed during indexing.
-
-// `NormalizerKind::Scip` + `from_db_str` are the Plan-3 SCIP token-space surface (a separate
-// `normalizer_kind='scip'` postings space, used only at refine/ranking when every member has it).
-// They are dead until Plan 3 lands; the rest of the module is live (R4's candidate read uses it).
-#![allow(dead_code)]
+//!
+//! The fingerprint substrate (#215 Phase 1) is a scope-independent structural fingerprint per
+//! function symbol, computed during indexing.
 
 pub mod bag_blob;
 pub mod normalize;
@@ -84,6 +79,10 @@ impl NormalizerKind {
         self.into()
     }
 
+    // The read half of the SCIP token-space surface (a separate `normalizer_kind='scip'` postings
+    // space, used only at refine/ranking when every member has it); only the round-trip test
+    // reads a token back until that reader lands.
+    #[allow(dead_code)]
     pub(crate) fn from_db_str(value: &str) -> Option<Self> {
         value.parse().ok()
     }

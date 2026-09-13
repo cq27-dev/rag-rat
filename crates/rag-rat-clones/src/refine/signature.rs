@@ -57,6 +57,9 @@ pub(crate) enum Typedness {
 }
 
 impl Typedness {
+    // The machine-token contract the serde rename must match; only the round-trip tests read it
+    // directly, since the band reaches storage through the serialized signature payload.
+    #[allow(dead_code)]
     pub fn as_db_str(&self) -> &'static str {
         (*self).into()
     }
@@ -1211,7 +1214,6 @@ mod tests {
                             let closure = if dc { 1 } else { 0 };
                             let profile = MetavarProfile {
                                 total,
-                                value: total - closure - g,
                                 closure,
                                 typ: 0,
                                 gapped: g,
@@ -1243,7 +1245,6 @@ mod tests {
         let profiles = vec![
             MetavarProfile {
                 total: 1,
-                value: 1,
                 closure: 0,
                 typ: 0,
                 gapped: 0,
@@ -1252,7 +1253,6 @@ mod tests {
             },
             MetavarProfile {
                 total: 5,
-                value: 2,
                 closure: 2,
                 typ: 1,
                 gapped: 0,
@@ -1261,7 +1261,6 @@ mod tests {
             },
             MetavarProfile {
                 total: 12,
-                value: 3,
                 closure: 7,
                 typ: 2,
                 gapped: 2,

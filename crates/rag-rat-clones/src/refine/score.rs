@@ -63,7 +63,6 @@ use super::antiunify::{MetavarKind, Template};
 #[derive(Debug, Clone)]
 pub(crate) struct MetavarProfile {
     pub(crate) total: usize,
-    pub(crate) value: usize,
     pub(crate) closure: usize,
     pub(crate) typ: usize,
     pub(crate) gapped: usize,
@@ -101,7 +100,6 @@ pub(crate) fn metavar_profile(template: &Template) -> MetavarProfile {
 
     MetavarProfile {
         total: value + closure + typ + gapped,
-        value,
         closure,
         typ,
         gapped,
@@ -243,7 +241,6 @@ mod tests {
     fn clean_profile() -> MetavarProfile {
         MetavarProfile {
             total: 1,
-            value: 1,
             closure: 0,
             typ: 0,
             gapped: 0,
@@ -263,24 +260,11 @@ mod tests {
         let ratios = [0.0, 0.5, 0.65, 0.70, 0.80, 0.90, 0.95, 1.0];
         let profiles = [
             clean_profile(),
-            MetavarProfile { gapped: 1, total: 2, value: 1, ..clean_profile() },
-            MetavarProfile {
-                differing_callee: true,
-                closure: 1,
-                total: 2,
-                value: 1,
-                ..clean_profile()
-            },
-            MetavarProfile { closure: 3, typ: 1, total: 4, value: 0, ..clean_profile() },
+            MetavarProfile { gapped: 1, total: 2, ..clean_profile() },
+            MetavarProfile { differing_callee: true, closure: 1, total: 2, ..clean_profile() },
+            MetavarProfile { closure: 3, typ: 1, total: 4, ..clean_profile() },
             MetavarProfile { anti_unify_coverage: 0.4, ..clean_profile() },
-            MetavarProfile {
-                total: 10,
-                value: 5,
-                closure: 3,
-                typ: 2,
-                gapped: 0,
-                ..clean_profile()
-            },
+            MetavarProfile { total: 10, closure: 3, typ: 2, gapped: 0, ..clean_profile() },
         ];
         for &r in &ratios {
             for &s in &ratios {
@@ -304,15 +288,9 @@ mod tests {
         let ratios = [0.0, 0.3, 0.5, 0.7, 0.85, 0.9, 0.95, 1.0, 1.5];
         let profiles = [
             clean_profile(),
-            MetavarProfile { gapped: 2, total: 3, value: 1, ..clean_profile() },
-            MetavarProfile {
-                differing_callee: true,
-                closure: 1,
-                total: 2,
-                value: 1,
-                ..clean_profile()
-            },
-            MetavarProfile { total: 12, value: 2, closure: 8, typ: 2, ..clean_profile() },
+            MetavarProfile { gapped: 2, total: 3, ..clean_profile() },
+            MetavarProfile { differing_callee: true, closure: 1, total: 2, ..clean_profile() },
+            MetavarProfile { total: 12, closure: 8, typ: 2, ..clean_profile() },
             MetavarProfile { anti_unify_coverage: 0.3, ..clean_profile() },
         ];
         for &r in &ratios {
@@ -329,7 +307,6 @@ mod tests {
         // A class with a differing callee must band at most Medium, even with perfect LCS/sim.
         let profile = MetavarProfile {
             total: 1,
-            value: 0,
             closure: 1,
             typ: 0,
             gapped: 0,

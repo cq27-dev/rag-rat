@@ -226,6 +226,7 @@ impl EmittedSpan {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn hi(&self) -> usize {
         match *self {
             EmittedSpan::Raw(_, hi)

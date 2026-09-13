@@ -241,6 +241,7 @@ pub fn refine_lookup(
 /// rendered anti-unification `template`, the serialized `variation_points` + `proposed_signature`,
 /// and the REAL `anti_unify_coverage` (`fixed_spine_columns / total_spine_columns`, no longer the
 /// 4a `lcs_ratio` proxy).
+#[cfg(test)]
 pub(crate) fn refine_compute_and_store(
     conn: &Connection,
     refinement_key: &str,
@@ -393,6 +394,7 @@ pub fn refine_compute_and_store_budgeted(
 /// read-only connection and surface `SQLITE_READONLY` BEFORE any expensive compute.
 ///
 /// `medoid_symbol_id` threads the anti-unify spine anchor through to the compute half (Plan 4b).
+#[cfg(test)]
 pub(crate) fn refine_class(
     conn: &Connection,
     refinement_key: &str,
