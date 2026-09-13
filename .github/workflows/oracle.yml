@@ -176,7 +176,9 @@ jobs:
               # the single line to change when un-pinning. Copy the proxy to an absolute path on PATH
               # so the oracle's `rust-analyzer scip` probe finds it.
               ra="$(rustup which rust-analyzer)"
-              install -m 0755 "$ra" "$RUNNER_TEMP/bin/rust-analyzer"
+              # A symlink, not a copy: the binary finds librustc_driver through an rpath relative
+              # to its real location, so a copy elsewhere fails to load.
+              ln -sf "$ra" "$RUNNER_TEMP/bin/rust-analyzer"
               rust-analyzer --version ;;
             scip-clang)
               curl --proto '=https' --tlsv1.2 -sSfL \
@@ -205,11 +207,14 @@ jobs:
       - name: Run the oracle for ${{ matrix.corpus }}
         env:
           CORPUS: ${{ matrix.corpus }}
-          RAG_RAT_BIN: target/release/rag-rat
           ORACLE_WORK: ${{ runner.temp }}/oracle-${{ matrix.corpus }}
           REPORT_OUT: ${{ runner.temp }}/${{ matrix.corpus }}-report.json
           RAG_RAT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: bash tools/oracle-run.sh
+        # The binary sits under the cargo target dir in use — a self-hosted runner keeps one outside
+        # the checkout — not necessarily under ./target.
+        run: |
+          export RAG_RAT_BIN="${CARGO_TARGET_DIR:-$PWD/target}/release/rag-rat"
+          bash tools/oracle-run.sh
 
       - name: Upload resolution report
         if: always()

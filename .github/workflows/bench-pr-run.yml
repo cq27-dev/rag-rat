@@ -52,18 +52,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - name: Cache iai-callgrind-runner
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/bin/iai-callgrind-runner
-          key: iai-runner-0.16.1
+      # The runner is persistent: the iai runner stays installed in its cargo home, and the bench
+      # corpus in the directory its `RAG_RAT_BENCH_CORPUS` names, so neither needs a cache step.
       - name: Install iai-callgrind-runner
         run: command -v iai-callgrind-runner || cargo install --locked iai-callgrind-runner@0.16.1
-      - name: Cache bench corpus (cargo 0.97.1)
-        uses: actions/cache@v5
-        with:
-          path: target/bench-corpus
-          key: bench-corpus-cargo-0.97.1
 
       - name: Run benchmarks (save raw output; no gating here)
         # Capture stdout only — the adapters parse the benchmark report from stdout; cargo/valgrind

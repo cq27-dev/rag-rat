@@ -91,7 +91,8 @@ jobs:
         if: runner.environment == 'github-hosted'
       - uses: taiki-e/install-action@nextest
       # Hash embedder only (no model downloads). Tests run in parallel; the `ci` profile emits a
-      # JUnit report at target/nextest/ci/junit.xml.
+      # JUnit report at target/nextest/ci/junit.xml — nextest's store dir is workspace-relative, so
+      # this holds wherever the cargo target dir points.
       - name: Run tests (nextest)
         run: cargo nextest run --workspace --no-default-features --locked --profile ci
       - name: Upload test results to Codecov
