@@ -223,24 +223,13 @@ impl IndexDatabase {
         // pins that `open` counts more than the base-scoped `open_config`).
         let active_generation = schema::live_files_generation(storage.connection(), &repo_id)?;
         write_repo_generation_view(storage.connection(), &repo_id, active_generation)?;
-        let db = Self {
+        let db = Self::new_handle(
             storage,
-            active_repo_id: repo_id,
-            active_commit_sha: String::new(),
-            active_worktree_id: String::new(),
+            repo_id,
             active_generation,
-            papertrail: papertrail::PapertrailContext::default(),
-            config: None,
-            _identity_lock: None,
-            drift_snapshot: std::sync::Mutex::new(None),
-            lens_clone_graph_cache: std::sync::Arc::default(),
-            edge_rewrite_capture: std::sync::atomic::AtomicBool::new(false),
-            logical_rederive_capture: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            overlay_status_walks: std::sync::atomic::AtomicUsize::new(0),
-        };
+            papertrail::PapertrailContext::default(),
+            None,
+        );
         if matches!(mode, BareOpenMode::ConfigLess) {
             db.ensure_graph_index_current()?;
             db.ensure_generated_flags_current()?;
@@ -250,27 +239,16 @@ impl IndexDatabase {
 
     pub fn open_config(config: &Config) -> anyhow::Result<Self> {
         let storage = Self::open_and_migrate(&config.database)?;
-        let mut db = Self {
+        let mut db = Self::new_handle(
             storage,
-            active_repo_id: String::new(),
-            active_commit_sha: String::new(),
-            active_worktree_id: String::new(),
-            active_generation: 0,
+            String::new(),
+            0,
             // Real usage: resolve the tracker context (config bindings, or auto-detect from the
             // git remote) here, at the boundary. rebuild/open (used by tests and the bare index
             // command) leave it offline.
-            papertrail: papertrail::PapertrailContext::resolve(config),
-            config: Some(config.clone()),
-            _identity_lock: None,
-            drift_snapshot: std::sync::Mutex::new(None),
-            lens_clone_graph_cache: std::sync::Arc::default(),
-            edge_rewrite_capture: std::sync::atomic::AtomicBool::new(false),
-            logical_rederive_capture: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            overlay_status_walks: std::sync::atomic::AtomicUsize::new(0),
-        };
+            papertrail::PapertrailContext::resolve(config),
+            Some(config.clone()),
+        );
         db.storage.set_source_root(config.root.clone());
         // Register/adopt BEFORE anything repo-scoped runs, then install the scope context so the
         // model-manifest heal + seed below resolve the correct repo (in a consolidated DB the sole-
@@ -444,24 +422,13 @@ impl IndexDatabase {
         };
         storage.set_source_root(config.root.clone());
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
-        let mut db = Self {
+        let mut db = Self::new_handle(
             storage,
-            active_repo_id: repo_id,
-            active_commit_sha: String::new(),
-            active_worktree_id: String::new(),
-            active_generation: 0,
-            papertrail: papertrail::PapertrailContext::resolve(config),
-            config: Some(config.clone()),
-            _identity_lock: None,
-            drift_snapshot: std::sync::Mutex::new(None),
-            lens_clone_graph_cache: std::sync::Arc::default(),
-            edge_rewrite_capture: std::sync::atomic::AtomicBool::new(false),
-            logical_rederive_capture: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            overlay_status_walks: std::sync::atomic::AtomicUsize::new(0),
-        };
+            repo_id,
+            0,
+            papertrail::PapertrailContext::resolve(config),
+            Some(config.clone()),
+        );
         // Install the scope context BEFORE the heal-owed gates: `set_context` mirrors the resolved
         // `repo_id` into `temp.connection_context` (writable even on a read-only main DB), so the
         // gates below that resolve `active_repo_id` from the connection (the model manifest + the
@@ -609,14 +576,33 @@ impl IndexDatabase {
         if schema::status(storage.connection())?.state != schema::SchemaState::Compatible {
             Self::apply_schema_under_lock(path, storage.connection())?;
         }
-        Ok(Self {
+        Ok(Self::new_handle(
             storage,
-            active_repo_id: String::new(),
+            String::new(),
+            0,
+            papertrail::PapertrailContext::default(),
+            None,
+        ))
+    }
+
+    /// The one `IndexDatabase` constructor: the connection plus the four fields that differ per
+    /// open path; the commit/worktree context starts empty (installed later by `set_context`) and
+    /// every per-pass capture flag, cache and snapshot starts idle.
+    fn new_handle(
+        storage: IndexConnection,
+        active_repo_id: String,
+        active_generation: i64,
+        papertrail: papertrail::PapertrailContext,
+        config: Option<Config>,
+    ) -> Self {
+        Self {
+            storage,
+            active_repo_id,
             active_commit_sha: String::new(),
             active_worktree_id: String::new(),
-            active_generation: 0,
-            papertrail: papertrail::PapertrailContext::default(),
-            config: None,
+            active_generation,
+            papertrail,
+            config,
             _identity_lock: None,
             drift_snapshot: std::sync::Mutex::new(None),
             lens_clone_graph_cache: std::sync::Arc::default(),
@@ -626,7 +612,7 @@ impl IndexDatabase {
             logical_symbol_rebuilds: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             overlay_status_walks: std::sync::atomic::AtomicUsize::new(0),
-        })
+        }
     }
 
     /// Run `schema::apply` under the GLOBAL schema-migration lock, RE-CHECKING the state once the
