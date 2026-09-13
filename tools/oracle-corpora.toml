@@ -92,7 +92,7 @@ tool      = "scip-clang"
 # the `.h` headers as C++ too (a `cpp` binding claims `.h` — see Language::target_extensions), so
 # calls to header-declared methods resolve to their in-corpus definitions instead of going external.
 # Tests/tools off keeps the build to the library TUs; scip-clang indexes all 31 in a couple seconds.
-prepare   = ["cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DYAML_CPP_BUILD_TESTS=OFF -DYAML_CPP_BUILD_TOOLS=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5", "cp build/compile_commands.json ."]
+prepare   = ["cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DYAML_CPP_BUILD_TESTS=OFF -DYAML_CPP_BUILD_TOOLS=OFF", "cp build/compile_commands.json ."]
 bindings  = { cpp = ["src", "include"] }
 # Thresholds sit ABOVE the src-only baseline (no `.h` indexed: ~4600 edges, ~3400 examined, ~350
 # monikers) and below the src+include run (~9200 / ~5800 / ~1040), so this corpus actually GUARDS C++
