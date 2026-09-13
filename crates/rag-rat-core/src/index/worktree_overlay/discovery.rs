@@ -189,12 +189,22 @@ pub(super) fn resolve_overlay_scope(
     config: &Config,
     linked_path: &Path,
 ) -> anyhow::Result<Option<ResolvedOverlayScope>> {
+    // A root with no discoverable repository has no linked siblings at all, so an overlay request
+    // against it is an error, not a silent fall-back to base: the fall-back below is for a
+    // `linked_path` that is not a sibling of a repo we DID find. Discovery starts from the root's
+    // physical path, so a root that is a symlink out of its repository lands here too.
+    let base_repo = rag_rat_base::repo_discover::discover_repo(&config.root).map_err(|err| {
+        anyhow::anyhow!(
+            "cannot scope a worktree overlay: no git repository is discoverable from the index \
+             root {}: {err}",
+            config.root.display(),
+        )
+    })?;
     let (base_sha, worktree_id) =
         git_context::resolve_worktree_scope(&config.root, Some(linked_path));
     if worktree_id == git_context::worktree_id_of(&config.root) {
         return Ok(None);
     }
-    let base_repo = rag_rat_base::repo_discover::discover_repo(&config.root)?;
     let linked_repo = rag_rat_base::repo_discover::discover_repo(linked_path)?;
     let (config_subdir, source_root) =
         linked_config_subdir_and_root(&config.root, &base_repo, &linked_repo, linked_path)?;

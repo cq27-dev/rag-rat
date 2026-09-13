@@ -28,8 +28,19 @@ pub fn discover_repo(root: &Path) -> Result<gix::Repository, Box<gix::discover::
     // Box the error: gix's `discover::Error` is a large enum, and an unboxed large `Err` bloats
     // every `Result` this returns (clippy::result_large_err). Callers use `.ok()` or `?`
     // (anyhow), both of which handle the box transparently.
-    match gix::discover(root) {
+    match gix::discover_opts(root, Default::default(), path_first_open_options()) {
         Ok(repo) => Ok(repo),
         Err(_) => gix::discover_with_environment_overrides(root).map_err(Box::new),
     }
+}
+
+/// Open options for the path-first branch: the `GIT_*` environment is not consulted. gix applies
+/// `GIT_WORK_TREE` as `core.worktree` while opening the repository it discovered upward from the
+/// path — the very hijack this function exists to prevent — unless the `GIT_*` prefix is denied.
+/// Nothing this crate reads from a repository (history, status, blame, the hooks path) depends
+/// on a `GIT_*` variable.
+fn path_first_open_options() -> gix::open::Options {
+    let mut permissions = gix::open::Permissions::default();
+    permissions.env.git_prefix = gix::sec::Permission::Deny;
+    gix::open::Options::default().permissions(permissions)
 }
