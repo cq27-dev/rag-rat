@@ -145,19 +145,15 @@ pub(crate) fn tune_remote_concurrency(
     // is cacheable) except: `concurrency` is the fan-out being measured, and
     // `request_timeout_s` is bounded by the tune budget so one blocking probe can't hold the
     // box for the full HTTP timeout.
+    let live = ProvisionedEmbedderParams::for_remote(
+        endpoint,
+        auth_token,
+        remote,
+        spec.model_id,
+        spec.dim,
+    );
     let build = |concurrency: u32, request_timeout_s: u64| -> OpenAiEmbedder {
-        OpenAiEmbedder::from_provisioned(ProvisionedEmbedderParams {
-            endpoint,
-            embed_path: remote.backend.embed_path(),
-            auth_token,
-            server_model: remote.model.trim(),
-            selected_model_id: spec.model_id,
-            dim: spec.dim,
-            request_timeout_s,
-            batch_size,
-            concurrency,
-            max_batch_chars: remote.max_batch_chars,
-        })
+        OpenAiEmbedder::from_provisioned(live.probe_variant(concurrency, request_timeout_s))
     };
 
     let per_text_chars = probe_text_chars(max_embedding_chars);
@@ -246,19 +242,10 @@ pub fn benchmark_remote_concurrency(
     let per_text_chars = probe_text_chars(max_embedding_chars);
     let request_texts =
         effective_request_texts(batch_size, remote.max_batch_chars, max_embedding_chars);
+    let live =
+        ProvisionedEmbedderParams::for_remote(endpoint, auth_token, remote, selected_model_id, dim);
     let build = |concurrency: u32, request_timeout_s: u64| -> OpenAiEmbedder {
-        OpenAiEmbedder::from_provisioned(ProvisionedEmbedderParams {
-            endpoint,
-            embed_path: remote.backend.embed_path(),
-            auth_token,
-            server_model: remote.model.trim(),
-            selected_model_id,
-            dim,
-            request_timeout_s,
-            batch_size,
-            concurrency,
-            max_batch_chars: remote.max_batch_chars,
-        })
+        OpenAiEmbedder::from_provisioned(live.probe_variant(concurrency, request_timeout_s))
     };
     measure_candidates(MeasureParams {
         candidates: candidates.to_vec(),
@@ -292,20 +279,12 @@ pub fn measure_remote_dim(
     auth_token: Option<&str>,
     remote: &RemoteEmbeddingConfig,
 ) -> anyhow::Result<usize> {
-    let embedder = OpenAiEmbedder::from_provisioned(ProvisionedEmbedderParams {
-        endpoint,
-        embed_path: remote.backend.embed_path(),
-        auth_token,
-        server_model: remote.model.trim(),
-        selected_model_id: remote.model.trim(),
-        // A placeholder dim: `probe_dim` never checks against it (it reads the true length off the
-        // response), so any non-zero value is fine.
-        dim: 1,
-        request_timeout_s: remote.request_timeout_s,
-        batch_size: remote.batch_size.max(1),
-        concurrency: 1,
-        max_batch_chars: remote.max_batch_chars,
-    });
+    // A placeholder dim: `probe_dim` never checks against it (it reads the true length off the
+    // response), so any non-zero value is fine.
+    let params =
+        ProvisionedEmbedderParams::for_remote(endpoint, auth_token, remote, remote.model.trim(), 1);
+    let embedder =
+        OpenAiEmbedder::from_provisioned(params.probe_variant(1, remote.request_timeout_s));
     embedder
         .probe_dim()
         .map_err(|err| anyhow::anyhow!("dim probe failed for `{}`: {err}", remote.model))

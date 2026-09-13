@@ -658,16 +658,14 @@ fn provision_and_build_cancellable(
         None => cap,
     };
     let embedder = OpenAiEmbedder::from_provisioned(ProvisionedEmbedderParams {
-        endpoint: &provisioned.endpoint,
-        embed_path: effective_remote.backend.embed_path(),
-        auth_token: provisioned.auth_token.as_deref(),
-        server_model: effective_remote.model.trim(),
-        selected_model_id: spec.model_id,
-        dim: spec.dim,
-        request_timeout_s: effective_remote.request_timeout_s,
-        batch_size: effective_remote.batch_size,
         concurrency: client_concurrency,
-        max_batch_chars: effective_remote.max_batch_chars,
+        ..ProvisionedEmbedderParams::for_remote(
+            &provisioned.endpoint,
+            provisioned.auth_token.as_deref(),
+            &effective_remote,
+            spec.model_id,
+            spec.dim,
+        )
     });
     Ok((embedder, provisioned, effective_remote, client_concurrency))
 }

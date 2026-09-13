@@ -78,6 +78,7 @@ pub struct OpenAiEmbedder {
 /// Construction params for [`OpenAiEmbedder::from_provisioned`] — groups the handshake outputs
 /// (`endpoint`, `auth_token`) with the model identity + transport knobs so the constructor takes
 /// one struct instead of positional args.
+#[derive(Clone, Copy)]
 pub struct ProvisionedEmbedderParams<'a> {
     /// The serving endpoint from the cookbook handshake (`https://...`).
     pub endpoint: &'a str,
@@ -100,6 +101,38 @@ pub struct ProvisionedEmbedderParams<'a> {
     pub concurrency: u32,
     /// Max total input characters per `/v1/embeddings` request.
     pub max_batch_chars: usize,
+}
+
+impl<'a> ProvisionedEmbedderParams<'a> {
+    /// Params for an embedder against the box at `endpoint`: the route, server model, timeout,
+    /// batch/char caps and concurrency cap all come from `remote`; the model identity
+    /// (`selected_model_id` + `dim`) is the caller's.
+    pub(crate) fn for_remote(
+        endpoint: &'a str,
+        auth_token: Option<&'a str>,
+        remote: &'a RemoteEmbeddingConfig,
+        selected_model_id: &'a str,
+        dim: usize,
+    ) -> Self {
+        Self {
+            endpoint,
+            embed_path: remote.backend.embed_path(),
+            auth_token,
+            server_model: remote.model.trim(),
+            selected_model_id,
+            dim,
+            request_timeout_s: remote.request_timeout_s,
+            batch_size: remote.batch_size,
+            concurrency: remote.bounded_concurrency(),
+            max_batch_chars: remote.max_batch_chars,
+        }
+    }
+
+    /// The same box and model at a different client fan-out and per-request timeout — how the
+    /// throughput sweep builds one probe embedder per concurrency candidate.
+    pub(crate) fn probe_variant(&self, concurrency: u32, request_timeout_s: u64) -> Self {
+        Self { concurrency, request_timeout_s, ..*self }
+    }
 }
 
 struct BuildParams<'a> {
