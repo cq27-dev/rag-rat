@@ -81,7 +81,7 @@ pub fn init_logging(config: &Config, role: Role) -> LogHandle {
 fn try_init(config: &Config, role: &Role, env: Option<String>) -> anyhow::Result<LogHandle> {
     let log = &config.log;
     std::fs::create_dir_all(&log.dir)?;
-    retention::sweep_retention(&log.dir, log.retention_days, log.max_files, log.max_file_bytes);
+    retention::sweep_retention(log);
 
     // Filter precedence: RAG_RAT_LOG (if set) overrides the config level+filter; an invalid value
     // falls back to the config level rather than aborting.

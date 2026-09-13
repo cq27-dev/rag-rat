@@ -1,5 +1,6 @@
-use std::path::Path;
 use std::time::{Duration, SystemTime};
+
+use crate::config::LogConfig;
 
 /// How recently a file must have been touched to be spared regardless of process liveness — a
 /// belt-and-suspenders guard beside the pid-liveness check (e.g. across a pid recycle).
@@ -18,12 +19,8 @@ const RECENT_SECS: u64 = 300;
 /// count > `max_files` — but ONLY where process liveness is verifiable (unix). On a platform
 /// without a liveness probe none of the rules run (a live-but-idle log is indistinguishable from a
 /// dead one), so per-process files simply accumulate there until a proper probe lands.
-pub(super) fn sweep_retention(
-    dir: &Path,
-    retention_days: u64,
-    max_files: u64,
-    max_file_bytes: u64,
-) {
+pub(super) fn sweep_retention(log: &LogConfig) {
+    let &LogConfig { ref dir, retention_days, max_files, max_file_bytes, .. } = log;
     let recent_cutoff = SystemTime::now().checked_sub(Duration::from_secs(RECENT_SECS));
     let mut candidates: Vec<(std::path::PathBuf, SystemTime, u64)> = Vec::new();
     let mut protected: u64 = 0;
@@ -134,6 +131,12 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{rag_rat_log_pid, sweep_retention};
+    use crate::config::LogConfig;
+
+    /// The default policy aimed at `dir`; each test overrides the retention fields it exercises.
+    fn log_config(dir: &std::path::Path) -> LogConfig {
+        LogConfig { dir: dir.to_path_buf(), ..LogConfig::default() }
+    }
 
     /// A pid above Linux's default `pid_max` — `kill(_, 0)` reports it gone, so files named with it
     /// are always treated as belonging to a dead process (deterministic in tests).
@@ -172,12 +175,12 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::UNIX_EPOCH)
             .unwrap();
-        sweep_retention(
-            dir.path(),
-            /* days */ 7,
-            /* max_files */ 0,
-            /* max_bytes */ 0,
-        );
+        sweep_retention(&LogConfig {
+            retention_days: 7,
+            max_files: 0,
+            max_file_bytes: 0,
+            ..log_config(dir.path())
+        });
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2, "the aged-out file is gone");
     }
 
@@ -186,12 +189,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Dead pid but touched just now → spared by the recent-mtime window (every platform).
         write_log(dir.path(), &format!("mcp-{DEAD_PID}-9.log"), 8192, 0);
-        sweep_retention(
-            dir.path(),
-            /* days */ 1,
-            /* max_files */ 1,
-            /* max_bytes */ 1,
-        );
+        sweep_retention(&LogConfig {
+            retention_days: 1,
+            max_files: 1,
+            max_file_bytes: 1,
+            ..log_config(dir.path())
+        });
         assert!(
             dir.path().join(format!("mcp-{DEAD_PID}-9.log")).exists(),
             "recent file not pruned"
@@ -203,12 +206,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A non-rag-rat `*.log` in a shared dir must never be a candidate.
         write_log(dir.path(), "some-other-app.log", 8192, 7 * 86_400);
-        sweep_retention(
-            dir.path(),
-            /* days */ 1,
-            /* max_files */ 1,
-            /* max_bytes */ 1,
-        );
+        sweep_retention(&LogConfig {
+            retention_days: 1,
+            max_files: 1,
+            max_file_bytes: 1,
+            ..log_config(dir.path())
+        });
         assert!(dir.path().join("some-other-app.log").exists(), "foreign log untouched");
     }
 
@@ -220,7 +223,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_log(dir.path(), &format!("mcp-{DEAD_PID}-1.log"), 4096, 3600);
         write_log(dir.path(), &format!("mcp-{DEAD_PID}-2.log"), 1, 3600);
-        sweep_retention(dir.path(), 0, 0, /* max_bytes */ 1024);
+        sweep_retention(&LogConfig {
+            retention_days: 0,
+            max_files: 0,
+            max_file_bytes: 1024,
+            ..log_config(dir.path())
+        });
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -237,12 +245,12 @@ mod tests {
         // sweep.
         let live = std::process::id();
         write_log(dir.path(), &format!("mcp-{live}-1.log"), 8192, 3600);
-        sweep_retention(
-            dir.path(),
-            /* days */ 1,
-            /* max_files */ 1,
-            /* max_bytes */ 1,
-        );
+        sweep_retention(&LogConfig {
+            retention_days: 1,
+            max_files: 1,
+            max_file_bytes: 1,
+            ..log_config(dir.path())
+        });
         assert!(
             dir.path().join(format!("mcp-{live}-1.log")).exists(),
             "live-process log not pruned"
@@ -262,12 +270,12 @@ mod tests {
             write_log(dir.path(), &format!("mcp-{DEAD_PID}-{i}.log"), 1, 3600);
         }
         // `days` high so the age rule doesn't fire — this exercises the count rule alone.
-        sweep_retention(
-            dir.path(),
-            /* days */ 3650,
-            /* max_files */ 2,
-            /* max_bytes */ 0,
-        );
+        sweep_retention(&LogConfig {
+            retention_days: 3650,
+            max_files: 2,
+            max_file_bytes: 0,
+            ..log_config(dir.path())
+        });
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
