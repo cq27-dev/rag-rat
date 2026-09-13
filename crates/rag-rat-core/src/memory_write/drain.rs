@@ -685,13 +685,18 @@ fn applied_snapshot(
 /// then that set wins (by identity — see [`converge_bindings`]): it is how a rebind reaches a
 /// receiver already holding the old bindings.
 ///
-/// Bindings present with no digest recorded arrived some other way — `anchors/1` from the author's
-/// own account, a seed from before the digest existed, or a rebind made here. The digest is
-/// recorded WITHOUT replacing them, which would only undo the relocation loop's work. But only a
-/// target match says they are the author's set: when any held row is not one the published set
-/// names with the same target, it is a stale seed, a local rebind, or a row whose target has since
-/// moved, and the author's hash is kept off them. The same check runs on every pass that would
-/// stamp, so a later hash-only pass keeps it off them too.
+/// Bindings present with no digest recorded arrived some other way — `anchors/1` from a sibling
+/// device, or a seed from before the digest existed — and are some device's image of SOME
+/// publication. Which one decides what happens to them (see [`held_is_superseded_image`]): the
+/// current publication's image is recorded as applied and left alone; the image of a publication
+/// another account made and the fold has superseded — a device joining the account, or re-syncing
+/// after a purge, holding rows a sibling parked a baseline for but it never held (#1304) — is
+/// converged, judged against the rows' own authored kind and signature; rows matching no such
+/// publication — a sibling's rebind or republication whose own set has yet to fold here, an older
+/// binary's relocation — are recorded and left for the set that explains them. A set the local
+/// account authored, or one the fold could not attribute, is never converged here. The author's
+/// hash lands only on rows that match the published set by target, checked on every pass that
+/// would stamp, so a later hash-only pass keeps it off rows that are not the author's.
 ///
 /// The hash is applied when it or the set changes, so a hash published for a set this store already
 /// holds lands without touching the bindings. That pairs safely because a rebind always publishes
@@ -735,10 +740,23 @@ fn apply_published_anchors(
         changed |= converge_bindings(tx, repo_id, &node.node_id, anchors, &held, None, &[])?;
     }
     if set_changed {
-        // Bindings held with no digest recorded arrived some other way: the set is recorded
-        // against them rather than replacing them. A local memory's held bindings are its creator's
-        // own last set, which another account's set supersedes on first sight.
-        if held.is_empty() || (!own && (applied.digest.is_some() || applied.local)) {
+        // Bindings held with no digest recorded converge only when they are the image of a
+        // publication the fold has superseded (`held_is_superseded_image`): the current image is
+        // recorded as it is, rows of no known publication wait for the set that explains them. A
+        // local memory's held bindings are its creator's own last set, which another account's set
+        // supersedes on first sight.
+        if held.is_empty()
+            || (!own
+                && (applied.digest.is_some()
+                    || applied.local
+                    || (node.anchors_author.is_some()
+                        && held_is_superseded_image(
+                            &held,
+                            anchors,
+                            &node.superseded_anchors,
+                            local_account,
+                        ))))
+        {
             let previous = decode_applied_targets(applied.targets.as_deref());
             let scopes = published_anchor_scopes(repo_id, node);
             changed |= converge_bindings(
@@ -871,6 +889,60 @@ fn same_target(
         && held.tracker == anchor.tracker
         && held.project == anchor.project
         && held.item_key == anchor.item_key
+}
+
+/// Whether the held rows are the published set's image — what this store would hold had it
+/// converged on exactly this publication: every seedable held row names a published anchor's target
+/// under the same `created_at_ms`, and every anchor this store would install is held. The stamp is
+/// the publication: a rebind restamps every row with one clock value, `anchors/1` carries it
+/// verbatim and no local write touches it, so it tells one publication's image from a republish of
+/// the same targets, which the target columns cannot (`ANCHOR_MATCHES_BINDING_SQL` reads it the
+/// same way). Kinds this store never installs are outside the comparison, as they are outside
+/// [`converge_bindings`].
+fn held_is_published_image(
+    held: &[rag_rat_oplog::PortableAnchor],
+    anchors: &[rag_rat_oplog::PortableAnchor],
+) -> bool {
+    let seedable = |anchor: &&rag_rat_oplog::PortableAnchor| {
+        SEEDABLE_BINDING_KINDS.contains(&anchor.binding_kind.as_str())
+    };
+    held.iter().filter(seedable).all(|row| {
+        anchors
+            .iter()
+            .any(|anchor| same_target(row, anchor) && row.created_at_ms == anchor.created_at_ms)
+    }) && anchors
+        .iter()
+        .filter(seedable)
+        .filter(|anchor| !anchor.binding_id.is_empty())
+        .all(|anchor| held.iter().any(|row| same_row(row, anchor)))
+}
+
+/// Whether rows held with no applied set are the image of a publication ANOTHER account made and
+/// the fold has SUPERSEDED (`superseded`, see `ProjectedContentNode::superseded_anchors`) — and not
+/// of the published set itself — so converging them on the published set brings them up to date
+/// without undoing anything. Rows matching no such publication are not touched: they may be a
+/// sibling's rebind whose own set has yet to fold here, and overwriting them would republish the
+/// older rows to every device of the account through `anchors/1`, with nothing left to restore the
+/// rebind once its set arrives as this account's own. A superseded publication this account made
+/// is excluded for the same reason: a sibling's later republication of the unchanged set keeps the
+/// same stamps, so the image alone cannot tell the two apart, and that later one arrives as this
+/// account's own too. Another account's republication of one of its own sets arrives as a set
+/// change and converges. The match is by publication, the stamp included, and needs at least one
+/// seedable held row: kinds this store never installs are outside it, and a set of them alone is no
+/// image of anything.
+fn held_is_superseded_image(
+    held: &[rag_rat_oplog::PortableAnchor],
+    anchors: &[rag_rat_oplog::PortableAnchor],
+    superseded: &[rag_rat_oplog::SupersededAnchorSet],
+    local_account: Option<&rag_rat_oplog::AccountId>,
+) -> bool {
+    held.iter().any(|row| SEEDABLE_BINDING_KINDS.contains(&row.binding_kind.as_str()))
+        && !held_is_published_image(held, anchors)
+        && superseded.iter().any(|set| {
+            set.author.is_some()
+                && set.author.as_ref() != local_account
+                && held_is_published_image(held, &set.anchors)
+        })
 }
 
 /// The identity of a published anchor set: its byte-canonical op encoding, hashed. The fold has
@@ -1933,12 +2005,12 @@ mod tests {
         );
     }
 
-    /// Bindings a synced memory got some other way — an older seed, a rebind made here — are
-    /// recorded against the snapshot without being replaced, which would undo the relocation
-    /// loop's work. They are not the set the author published, so its hash stays off them; only a
-    /// LATER set the author publishes replaces them, and brings its hash.
+    /// A set the fold could not attribute to an account (`anchors_author` NULL) may be this
+    /// account's own, so rows held under it with no applied set are recorded, not converged: they
+    /// are not the set the author published, so its hash stays off them, and only a LATER set
+    /// replaces them and brings its hash.
     #[test]
-    fn bindings_the_drain_did_not_install_are_kept_until_the_author_publishes_a_new_set() {
+    fn bindings_held_under_an_unattributed_set_are_kept_until_the_author_publishes_a_new_set() {
         let conn = scoped_conn();
         let stream = StreamId::from_bytes([0x44; 32]);
         seed_projected_node_with_anchors(&conn, stream, "mem_peer", None);
@@ -2554,14 +2626,16 @@ mod tests {
         assert_eq!(bindings_of(&conn, "mem_peer"), vec![("chunk".to_string(), "43".to_string())]);
     }
 
-    /// The record-only branch matches by TARGET, not identity alone. A struct binding kept from
-    /// before the upgrade shares a qualified name with the impl its author has since published;
-    /// that hash describes the impl, and stamping it beside the struct's target would read as
-    /// drift.
+    /// A held row is matched by TARGET, not identity alone. A struct binding kept from before the
+    /// upgrade shares a qualified name with the impl its author has since published: it is the
+    /// image of the publication the impl superseded, so on first sight the row converges on the
+    /// impl — marked `retargeted`, judged against its own struct — and the hash, which describes
+    /// the impl, is stamped beside it.
     #[test]
-    fn a_kept_binding_whose_target_moved_does_not_take_the_published_hash() {
+    fn a_kept_binding_whose_target_moved_converges_and_takes_the_published_hash() {
         let conn = scoped_conn();
         let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
         seed_projected_node_with_anchors(&conn, stream, "mem_peer", None);
         drain_worker(&conn, stream, 1_000);
         conn.execute(
@@ -2574,6 +2648,15 @@ mod tests {
         )
         .unwrap();
 
+        // The struct was published first; the impl superseded it.
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::Run")]),
+        );
+        set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "struct");
+        let struct_set = projected_anchors_json(&conn, stream, "mem_peer");
         seed_projected_node_with_anchors(
             &conn,
             stream,
@@ -2581,10 +2664,393 @@ mod tests {
             Some(&[("symbol", "src/lib.rs::Run")]),
         );
         set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "impl");
+        set_projected_superseded_anchors(&conn, stream, "mem_peer", &foreign, &[struct_set]);
         set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
         drain_worker(&conn, stream, 2_000);
 
-        assert_eq!(source_hash_of(&conn, "mem_peer"), None);
+        assert_eq!(
+            binding_of(&conn, "mem_peer"),
+            Some((
+                Some("impl".to_string()),
+                Some(rag_rat_query::memory::RETARGETED_REASON.to_string())
+            )),
+        );
+        assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_A.to_string()));
+    }
+
+    /// Rows held with no applied set and no parked baseline — a device that joined the account,
+    /// or re-synced after a purge, while the memory was condemned everywhere — are the image of
+    /// the set the siblings last converged to. When the memory returns under a rebind, the fold
+    /// has superseded that set, so the rows converge on the published one at once: nothing else on
+    /// this device would ever move them, since every later pass sees an unchanged set (#1304).
+    #[test]
+    fn a_returning_memory_with_rows_held_and_nothing_parked_converges_on_its_rebind() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
+        // The rows arrived through `anchors/1`; the memory never existed here.
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                 symbol_kind, anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'symbol', 'src/lib.rs::Run', 'src/lib.rs', 1, 2, 'struct',
+                 'unverified', 3)",
+            [REPO],
+        )
+        .unwrap();
+        assert!(memory_by_id(&conn, "mem_peer").unwrap().is_none());
+        assert!(parked_digest(&conn, "mem_peer").is_none());
+
+        // The publication the rows are the image of, then the rebind that superseded it.
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::Run")]),
+        );
+        set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "struct");
+        set_projected_anchor_stamp(&conn, stream, "mem_peer", 3);
+        let struct_set = projected_anchors_json(&conn, stream, "mem_peer");
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::Run")]),
+        );
+        set_projected_anchor_field(&conn, stream, "mem_peer", "symbol_kind", "impl");
+        set_projected_superseded_anchors(&conn, stream, "mem_peer", &foreign, &[struct_set]);
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        drain_worker(&conn, stream, 1_000);
+
+        assert!(memory_by_id(&conn, "mem_peer").unwrap().is_some());
+        assert_eq!(
+            binding_of(&conn, "mem_peer"),
+            Some((
+                Some("impl".to_string()),
+                Some(rag_rat_query::memory::RETARGETED_REASON.to_string())
+            )),
+            "the held struct row is an older image and converges on the impl",
+        );
+        assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_A.to_string()));
+        let digest: Option<String> = conn
+            .query_row(
+                "SELECT anchors_applied_digest FROM repo_memories WHERE id = 'mem_peer'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(digest.is_some(), "the set is recorded as applied");
+    }
+
+    /// The image is judged as a whole: a superseded image that still matches SOME of the published
+    /// anchors — the author rebound one of two, or added one — is converged too, so the changed
+    /// anchor lands and the added one is installed, while the matching row is refreshed in place.
+    #[test]
+    fn a_superseded_image_matching_part_of_the_published_set_still_converges() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
+        for id in ["src/lib.rs::a", "src/lib.rs::b"] {
+            conn.execute(
+                "INSERT INTO repo_memory_bindings(
+                     repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                     anchor_status, created_at_ms)
+                 VALUES (?1, 'mem_peer', 'symbol', ?2, 'src/lib.rs', 1, 2, 'current', 3)",
+                params![REPO, id],
+            )
+            .unwrap();
+        }
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::a"), ("symbol", "src/lib.rs::b")]),
+        );
+        set_projected_anchor_stamp(&conn, stream, "mem_peer", 3);
+        let first = projected_anchors_json(&conn, stream, "mem_peer");
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::a"), ("symbol", "src/lib.rs::c")]),
+        );
+        set_projected_superseded_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            &foreign,
+            std::slice::from_ref(&first),
+        );
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![
+            ("symbol".to_string(), "src/lib.rs::a".to_string()),
+            ("symbol".to_string(), "src/lib.rs::c".to_string()),
+        ]);
+        assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_A.to_string()));
+
+        // The author adds an anchor to a set this store holds the exact image of.
+        conn.execute("DELETE FROM repo_memories WHERE id = 'mem_peer'", []).unwrap();
+        conn.execute("DELETE FROM repo_memory_parked_baselines WHERE memory_id = 'mem_peer'", [])
+            .unwrap();
+        let second = projected_anchors_json(&conn, stream, "mem_peer");
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[
+                ("symbol", "src/lib.rs::a"),
+                ("symbol", "src/lib.rs::c"),
+                ("symbol", "src/lib.rs::d"),
+            ]),
+        );
+        set_projected_superseded_anchors(&conn, stream, "mem_peer", &foreign, &[first, second]);
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        drain_worker(&conn, stream, 2_000);
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![
+            ("symbol".to_string(), "src/lib.rs::a".to_string()),
+            ("symbol".to_string(), "src/lib.rs::c".to_string()),
+            ("symbol".to_string(), "src/lib.rs::d".to_string()),
+        ]);
+    }
+
+    /// Held rows that are the image of no publication the fold has seen — a sibling's rebind whose
+    /// set has yet to fold here — are recorded, not converged: converging would republish the older
+    /// rows to the sibling through `anchors/1`. The set that explains them converges when it
+    /// arrives, as any set change does.
+    #[test]
+    fn rows_of_no_known_publication_wait_for_the_set_that_explains_them() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                 anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'symbol', 'src/lib.rs::newer', 'src/lib.rs', 1, 2, 'current',
+                 9)",
+            [REPO],
+        )
+        .unwrap();
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::older")]),
+        );
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::newer".to_string()
+        )]);
+        assert_eq!(source_hash_of(&conn, "mem_peer"), None, "not the author's rows for that hash");
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::newest")]),
+        );
+        set_projected_anchor_stamp(&conn, stream, "mem_peer", 11);
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_B));
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        drain_worker(&conn, stream, 2_000);
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::newest".to_string()
+        )]);
+        assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_B.to_string()));
+    }
+
+    /// The rows a sibling's OWN rebind left, received ahead of the set it published: the foreign
+    /// set folded here is older, but the rows match none of its superseded publications, so they
+    /// are kept — and when the sibling's set folds as this account's own, `anchors/1` is its
+    /// carrier and the rows stand.
+    #[test]
+    fn a_siblings_own_rebind_rows_are_kept_until_its_set_folds() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (own, foreign) = own_and_foreign_accounts(&conn);
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                 anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'symbol', 'src/lib.rs::ours', 'src/lib.rs', 1, 2, 'current',
+                 5)",
+            [REPO],
+        )
+        .unwrap();
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::first")]),
+        );
+        set_projected_anchor_stamp(&conn, stream, "mem_peer", 3);
+        let first = projected_anchors_json(&conn, stream, "mem_peer");
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::theirs")]),
+        );
+        set_projected_superseded_anchors(&conn, stream, "mem_peer", &foreign, &[first]);
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(
+            bindings_of(&conn, "mem_peer"),
+            vec![("symbol".to_string(), "src/lib.rs::ours".to_string())],
+            "rows of no known publication are not overwritten by an older foreign set",
+        );
+
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::ours")]),
+        );
+        set_projected_anchor_stamp(&conn, stream, "mem_peer", 5);
+        set_projected_anchors_author(&conn, stream, "mem_peer", &own);
+        drain_worker(&conn, stream, 2_000);
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::ours".to_string()
+        )]);
+    }
+
+    /// A superseded publication THIS account made is never converged on: a sibling's later
+    /// republication of the unchanged set (the anchor sweep keeps the stamps) is the same image,
+    /// and it arrives as this account's own, which nothing converges — so rows matching the older
+    /// one may be that republication's, and overwriting them would stand for good.
+    #[test]
+    fn a_superseded_publication_of_this_account_is_not_converged_on() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (own, foreign) = own_and_foreign_accounts(&conn);
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                 anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'symbol', 'src/lib.rs::ours', 'src/lib.rs', 1, 2, 'current',
+                 5)",
+            [REPO],
+        )
+        .unwrap();
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::ours")]),
+        );
+        set_projected_anchor_stamp(&conn, stream, "mem_peer", 5);
+        let ours = projected_anchors_json(&conn, stream, "mem_peer");
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::theirs")]),
+        );
+        set_projected_superseded_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            &own,
+            std::slice::from_ref(&ours),
+        );
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::ours".to_string()
+        )]);
+
+        // The same image, published by another account, IS stale history.
+        conn.execute("DELETE FROM repo_memories WHERE id = 'mem_peer'", []).unwrap();
+        set_projected_superseded_anchors(&conn, stream, "mem_peer", &foreign, &[ours]);
+        drain_worker(&conn, stream, 2_000);
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::theirs".to_string()
+        )]);
+    }
+
+    /// Rows of kinds this store never installs are no image of anything: a sibling's chunk rebind
+    /// held alone beside an older foreign set whose predecessor is known stays as it is, rather
+    /// than gaining that set's symbol rows beside it.
+    #[test]
+    fn unseedable_rows_alone_are_never_a_superseded_image() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                 anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'chunk', '42', 'src/lib.rs', 1, 2, 'current', 9)",
+            [REPO],
+        )
+        .unwrap();
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::first")]),
+        );
+        let first = projected_anchors_json(&conn, stream, "mem_peer");
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::second")]),
+        );
+        set_projected_superseded_anchors(&conn, stream, "mem_peer", &foreign, &[first]);
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        drain_worker(&conn, stream, 1_000);
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![("chunk".to_string(), "42".to_string())]);
+    }
+
+    /// A kind the drain never installs sits outside the image check as it sits outside the
+    /// converge: a chunk row beside the exact image of the published set does not make the image
+    /// stale, so the symbol row keeps its resolution — and keeps the author's hash off, as before.
+    #[test]
+    fn a_chunk_row_beside_the_published_image_does_not_make_it_stale() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        let (_, foreign) = own_and_foreign_accounts(&conn);
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, start_line, end_line,
+                 anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'symbol', 'src/lib.rs::run', 'src/lib.rs', 1, 2, 'current',
+                 7),
+                    (?1, 'mem_peer', 'chunk', '42', 'src/lib.rs', 1, 2, 'current', 7)",
+            [REPO],
+        )
+        .unwrap();
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        set_projected_anchors_author(&conn, stream, "mem_peer", &foreign);
+        drain_worker(&conn, stream, 1_000);
+        let status: String = conn
+            .query_row(
+                "SELECT anchor_status FROM repo_memory_bindings
+                 WHERE memory_id = 'mem_peer' AND binding_kind = 'symbol'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "current", "the image is left as it is");
+        assert_eq!(source_hash_of(&conn, "mem_peer"), None, "the chunk is not the author's");
     }
 
     /// The validate loop rewrites a binding's location in place for the SAME target — here a
@@ -2993,6 +3459,52 @@ mod tests {
     }
 
     /// Set one field of the first anchor in a projected node's published snapshot.
+    /// The projected set's JSON as stored, for handing to [`set_projected_superseded_anchors`]
+    /// before a later publication replaces it.
+    fn projected_anchors_json(conn: &Connection, stream: StreamId, node_id: &str) -> String {
+        conn.query_row(
+            "SELECT anchors_json FROM content_projected_nodes WHERE stream_id = ?1 AND node_id = \
+             ?2",
+            params![stream.to_bytes().as_slice(), node_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Record the publications the fold superseded for a node, oldest first and all by one author,
+    /// as the projector writes them beside the winning set.
+    fn set_projected_superseded_anchors(
+        conn: &Connection,
+        stream: StreamId,
+        node_id: &str,
+        author: &rag_rat_oplog::AccountId,
+        sets: &[String],
+    ) {
+        let hex = rag_rat_base::hash::hex_lower(&author.to_bytes());
+        let rows: Vec<String> = sets
+            .iter()
+            .map(|anchors| format!("{{\"author\":\"{hex}\",\"anchors\":{anchors}}}"))
+            .collect();
+        conn.execute(
+            "UPDATE content_projected_nodes SET superseded_anchors_json = ?3
+             WHERE stream_id = ?1 AND node_id = ?2",
+            params![stream.to_bytes().as_slice(), node_id, format!("[{}]", rows.join(","))],
+        )
+        .unwrap();
+    }
+
+    /// Restamp every anchor of a projected set with one publication clock, as a rebind does.
+    fn set_projected_anchor_stamp(conn: &Connection, stream: StreamId, node_id: &str, ms: i64) {
+        conn.execute(
+            "UPDATE content_projected_nodes
+             SET anchors_json = (SELECT json_group_array(json_set(value, '$.created_at_ms', ?3))
+                                   FROM json_each(anchors_json))
+             WHERE stream_id = ?1 AND node_id = ?2",
+            params![stream.to_bytes().as_slice(), node_id, ms],
+        )
+        .unwrap();
+    }
+
     fn set_projected_anchor_field(
         conn: &Connection,
         stream: StreamId,

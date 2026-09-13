@@ -1839,7 +1839,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 123, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 124, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
@@ -2094,6 +2094,34 @@ fn migration_123_memory_binding_resolution() {
     let recorded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM schema_version WHERE id = '123_memory_binding_resolution'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
+}
+
+/// V124 (#1304) adds the anchor sets a projected node's register superseded, nullable, beside the
+/// winning set. A replay over a current store is a no-op.
+#[test]
+fn migration_124_content_projected_superseded_anchors() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let column: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT type, \"notnull\" FROM pragma_table_info('content_projected_nodes')
+             WHERE name = 'superseded_anchors_json'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(column, Some(("TEXT".to_string(), 0)), "a nullable TEXT column");
+    schema::migrations::apply_content_projected_superseded_anchors(&conn).unwrap();
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version
+             WHERE id = '124_content_projected_superseded_anchors'",
             [],
             |row| row.get(0),
         )
@@ -2513,7 +2541,8 @@ fn a_store_below_the_first_refold_step_migrates_to_the_tip() {
     /// The `content_projected_nodes` columns that arrive AFTER the last refold step, and so are
     /// the ones the refold can outrun. The probe below is a bare fn pointer, so it needs a const;
     /// the assertion against the tip is what keeps the const honest.
-    const POST_REFOLD_COLUMNS: &[&str] = &["anchors_json", "source_text_hash", "anchors_author"];
+    const POST_REFOLD_COLUMNS: &[&str] =
+        &["anchors_json", "source_text_hash", "anchors_author", "superseded_anchors_json"];
 
     fn refold_probe(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
         for column in POST_REFOLD_COLUMNS {
