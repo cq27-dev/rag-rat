@@ -7,48 +7,12 @@
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rag_rat_base::config::Config;
 use rag_rat_papertrail::{AutosyncRequest, PapertrailContext};
 
-use super::pass::LoopMsg;
-
-/// Clock for the periodic papertrail evaluation deadline, pure like `Debounce` / `SweepClock`
-/// (clock injected). `None` interval — no resolved tracker bindings, or a zeroed cadence —
-/// means never due. The first tick is one full interval after startup: the scheduling policy's
-/// persisted freshness makes an eager boot-time evaluation redundant, and startup already runs
-/// the catch-up index pass.
-#[derive(Debug)]
-pub(crate) struct PapertrailClock {
-    interval: Option<Duration>,
-    last_tick: Instant,
-}
-
-impl PapertrailClock {
-    pub(crate) fn new(interval: Option<Duration>, now: Instant) -> Self {
-        Self { interval, last_tick: now }
-    }
-
-    pub(crate) fn on_tick(&mut self, now: Instant) {
-        self.last_tick = now;
-    }
-
-    /// `None` when disabled OR when the configured cadence overflows `Instant` arithmetic — a
-    /// deadline beyond the platform's monotonic range never arrives, and a bare `+` would panic
-    /// the watcher on its first wait computation.
-    fn deadline(&self) -> Option<Instant> {
-        self.interval.and_then(|interval| self.last_tick.checked_add(interval))
-    }
-
-    pub(crate) fn due(&self, now: Instant) -> bool {
-        self.deadline().is_some_and(|at| now >= at)
-    }
-
-    pub(crate) fn due_in(&self, now: Instant) -> Option<Duration> {
-        self.deadline().map(|at| at.saturating_duration_since(now))
-    }
-}
+use super::pass::{self, LoopMsg};
 
 /// The watcher's evaluation cadence: the tightest configured deadline (the probe interval and
 /// the daily full-walk backstop share one wake-up), or `None` when the repo resolves no tracker
@@ -107,15 +71,8 @@ pub(crate) fn spawn_papertrail_worker(
     done_tx: Sender<LoopMsg>,
     mut run_request: impl FnMut(AutosyncRequest) + Send + 'static,
 ) -> Option<JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("rag-rat-papertrail".to_string())
-        .spawn(move || {
-            while let Ok(request) = request_rx.recv() {
-                run_request(request);
-                if done_tx.send(LoopMsg::PapertrailDone).is_err() {
-                    return;
-                }
-            }
-        })
-        .ok()
+    pass::spawn_request_worker("rag-rat-papertrail", request_rx, done_tx, move |request| {
+        run_request(request);
+        LoopMsg::PapertrailDone
+    })
 }

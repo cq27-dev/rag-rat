@@ -39,11 +39,11 @@ pub use overlay::{
 #[cfg(test)]
 pub(crate) use overlay::{enclosing_worktree_id, overlay_needs_embed, partition_paths_by_worktree};
 #[cfg(test)]
-pub(crate) use papertrail::{PapertrailClock, PapertrailScheduler, papertrail_tick_interval};
+pub(crate) use papertrail::{PapertrailScheduler, papertrail_tick_interval};
 pub use pass::{CLONE_GRAPH_QUIET_MS, maintenance_pass, maintenance_pass_or_skip};
 #[cfg(test)]
 pub(crate) use pass::{
-    Debounce, GC_EVERY_PASSES, LoopMsg, PassCooldown, PassRequest, PassScheduler,
+    Debounce, GC_EVERY_PASSES, IntervalClock, LoopMsg, PassCooldown, PassRequest, PassScheduler,
     STARTUP_CATCHUP_RUN_GC, SweepClock, base_embedding_backlog_needs_tail,
     base_tail_forced_by_state, maybe_checkpoint_wal, should_run_base_tail, spawn_pass_worker,
     startup_catchup_pass,

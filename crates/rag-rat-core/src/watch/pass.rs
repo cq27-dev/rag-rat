@@ -71,6 +71,39 @@ impl Debounce {
     }
 }
 
+/// A periodic deadline, pure like [`Debounce`] (clock injected): due one `interval` after the last
+/// tick. A `None` interval is never due.
+#[derive(Debug)]
+pub(crate) struct IntervalClock {
+    interval: Option<Duration>,
+    last_tick: Instant,
+}
+
+impl IntervalClock {
+    pub(crate) fn new(interval: Option<Duration>, now: Instant) -> Self {
+        Self { interval, last_tick: now }
+    }
+
+    pub(crate) fn on_tick(&mut self, now: Instant) {
+        self.last_tick = now;
+    }
+
+    /// `None` when disabled OR when the configured cadence overflows `Instant` arithmetic — a
+    /// deadline beyond the platform's monotonic range never arrives, and a bare `+` would panic
+    /// the watcher on its first wait computation.
+    fn deadline(&self) -> Option<Instant> {
+        self.interval.and_then(|interval| self.last_tick.checked_add(interval))
+    }
+
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        self.deadline().is_some_and(|at| now >= at)
+    }
+
+    pub(crate) fn due_in(&self, now: Instant) -> Option<Duration> {
+        self.deadline().map(|at| at.saturating_duration_since(now))
+    }
+}
+
 /// Clock for the periodic all-worktrees sweep backstop, pure like [`Debounce`] (clock injected).
 /// It measures time since the last **`All`-scoped** pass COMPLETED — not since any pass (#577
 /// review): an event-scoped pass doesn't perform the sweep's duties (refreshing unlisted
@@ -78,9 +111,8 @@ impl Debounce {
 /// the next pass to `All` once the interval elapses rather than keep postponing the backstop.
 #[derive(Debug)]
 pub(crate) struct SweepClock {
-    /// `None` disables the periodic sweep (`periodic_sweep_secs = 0`) — never due.
-    interval: Option<Duration>,
-    last_sweep: Instant,
+    /// A `None` interval disables the periodic sweep (`periodic_sweep_secs = 0`) — never due.
+    clock: IntervalClock,
     /// Whether the pass currently in flight sweeps every worktree. Starts `true`: the startup
     /// catch-up (an `All` pass) is dispatched just before the event loop runs.
     in_flight_sweeps_all: bool,
@@ -88,7 +120,7 @@ pub(crate) struct SweepClock {
 
 impl SweepClock {
     pub(crate) fn new(interval: Option<Duration>, now: Instant) -> Self {
-        Self { interval, last_sweep: now, in_flight_sweeps_all: true }
+        Self { clock: IntervalClock::new(interval, now), in_flight_sweeps_all: true }
     }
 
     pub(crate) fn on_dispatch(&mut self, scope_is_all: bool) {
@@ -98,16 +130,16 @@ impl SweepClock {
     /// A pass completed; only an `All`-scoped one resets the backstop interval.
     pub(crate) fn on_pass_done(&mut self, now: Instant) {
         if self.in_flight_sweeps_all {
-            self.last_sweep = now;
+            self.clock.on_tick(now);
         }
     }
 
     pub(crate) fn due(&self, now: Instant) -> bool {
-        self.interval.is_some_and(|p| now >= self.last_sweep + p)
+        self.clock.due(now)
     }
 
     pub(crate) fn due_in(&self, now: Instant) -> Option<Duration> {
-        self.interval.map(|p| (self.last_sweep + p).saturating_duration_since(now))
+        self.clock.due_in(now)
     }
 }
 
@@ -254,12 +286,25 @@ pub(crate) fn spawn_pass_worker(
     done_tx: Sender<LoopMsg>,
     mut run_pass_request: impl FnMut(&PassRequest) -> Option<Duration> + Send + 'static,
 ) -> Option<JoinHandle<()>> {
+    spawn_request_worker("rag-rat-watch-pass", pass_rx, done_tx, move |request| LoopMsg::PassDone {
+        live_oracle_wake_in: run_pass_request(&request),
+    })
+}
+
+/// Spawn a named worker thread that runs each request from `rx` and answers the event loop with
+/// the [`LoopMsg`] `run` returns. The worker exits when the request channel closes or the loop
+/// hangs up.
+pub(crate) fn spawn_request_worker<R: Send + 'static>(
+    name: &str,
+    rx: Receiver<R>,
+    done_tx: Sender<LoopMsg>,
+    mut run: impl FnMut(R) -> LoopMsg + Send + 'static,
+) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
-        .name("rag-rat-watch-pass".to_string())
+        .name(name.to_string())
         .spawn(move || {
-            while let Ok(request) = pass_rx.recv() {
-                let live_oracle_wake_in = run_pass_request(&request);
-                if done_tx.send(LoopMsg::PassDone { live_oracle_wake_in }).is_err() {
+            while let Ok(request) = rx.recv() {
+                if done_tx.send(run(request)).is_err() {
                     return;
                 }
             }

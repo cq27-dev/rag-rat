@@ -14,10 +14,10 @@ use rag_rat_papertrail::AutosyncRequest;
 
 use super::live_oracle::LiveOracleTail;
 use super::overlay::OverlayScope;
-use super::papertrail::{self, PapertrailClock, PapertrailScheduler};
+use super::papertrail::{self, PapertrailScheduler};
 use super::pass::{
-    Debounce, LoopMsg, PassCooldown, PassRequest, PassScheduler, SKIP_TIMEOUT, SweepClock,
-    maintenance_pass_scoped, spawn_pass_worker, startup_catchup_pass,
+    Debounce, IntervalClock, LoopMsg, PassCooldown, PassRequest, PassScheduler, SKIP_TIMEOUT,
+    SweepClock, maintenance_pass_scoped, spawn_pass_worker, startup_catchup_pass,
 };
 use super::placement::{
     LinkedWorktreeWatches, WatchPlacementCounters, event_requests_maintenance,
@@ -383,8 +383,12 @@ impl<W: notify::Watcher> EventLoop<'_, W> {
         );
         // The papertrail evaluation deadline (#592): fires even on a filesystem-idle watcher, so
         // the freshness probe and the daily full-walk backstop run on time without any events.
+        // A `None` interval — no resolved tracker bindings, or a zeroed cadence — is never due.
+        // The first tick is one full interval after startup: the scheduling policy's persisted
+        // freshness makes an eager boot-time evaluation redundant, and startup already runs the
+        // catch-up index pass.
         let mut papertrail_clock =
-            PapertrailClock::new(self.papertrail_tx.and(self.papertrail_interval), Instant::now());
+            IntervalClock::new(self.papertrail_tx.and(self.papertrail_interval), Instant::now());
         let mut papertrail_scheduler = PapertrailScheduler::new();
         let mut live_oracle_wake_at: Option<Instant> = None;
         // The overlay scope accumulated while the debounce is armed (#577): every firing event

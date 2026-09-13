@@ -4244,11 +4244,11 @@ fn shutdown_discover_skips_when_write_lock_is_held() {
 #[test]
 fn papertrail_clock_is_never_due_without_an_interval_and_rearms_on_tick() {
     let start = Instant::now();
-    let disabled = PapertrailClock::new(None, start);
+    let disabled = IntervalClock::new(None, start);
     assert!(!disabled.due(start + Duration::from_secs(86_400)));
     assert_eq!(disabled.due_in(start), None);
 
-    let mut clock = PapertrailClock::new(Some(Duration::from_secs(900)), start);
+    let mut clock = IntervalClock::new(Some(Duration::from_secs(900)), start);
     assert!(!clock.due(start + Duration::from_secs(899)));
     assert!(clock.due(start + Duration::from_secs(900)));
     clock.on_tick(start + Duration::from_secs(900));
@@ -4257,7 +4257,7 @@ fn papertrail_clock_is_never_due_without_an_interval_and_rearms_on_tick() {
 
     // A cadence that overflows Instant arithmetic is a deadline that never arrives — it must
     // not panic the watcher's wait computation.
-    let oversized = PapertrailClock::new(Some(Duration::from_secs(u64::MAX)), start);
+    let oversized = IntervalClock::new(Some(Duration::from_secs(u64::MAX)), start);
     assert!(!oversized.due(start + Duration::from_secs(86_400)));
     assert_eq!(oversized.due_in(start), None);
 }
