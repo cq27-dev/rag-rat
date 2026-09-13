@@ -56,8 +56,7 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         | SyncCommand::Unsubscribe
         | SyncCommand::Uncontribute => {},
     }
-    let lock_repo = locks::write_lock_repo_id(config);
-    let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    let _lock = crate::repo_write_lock(config)?;
     let db = open_index(config)?;
     match &args.command {
         SyncCommand::Enable => {

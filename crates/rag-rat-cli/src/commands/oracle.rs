@@ -41,8 +41,7 @@ pub(crate) fn with_oracle_write_lock<T>(
     config: &Config,
     body: impl FnOnce(&IndexDatabase) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
-    let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    let _lock = crate::repo_write_lock(config)?;
     let db = open_index(config)?;
     body(&db)
 }

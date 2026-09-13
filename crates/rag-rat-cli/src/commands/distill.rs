@@ -14,9 +14,7 @@ pub(crate) fn distill(config: &Config, args: &DistillArgs) -> anyhow::Result<()>
             // lock like every other CLI writer — otherwise a concurrent generation switch can pin
             // the scope views to a stale generation and mine anchors from stale symbols. Held for
             // the whole pass.
-            let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
-            let _lock =
-                rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+            let _lock = crate::repo_write_lock(config)?;
             let db = open_index(config)?;
             // Route through the shared renderer so the global `--json` flag is honored (the report
             // is `Serialize`); TOON otherwise.
@@ -35,8 +33,7 @@ fn drain(config: &Config, limit: u32) -> anyhow::Result<()> {
     // Keep the ordinary writer lock short: extraction and the prepared-work decision need it, but
     // provisioning and inference can take minutes and are serialized by the flight lock instead.
     let (pending, active_repo_id) = {
-        let _write_lock =
-            rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+        let _write_lock = crate::repo_write_lock(config)?;
         let db = open_index(config)?;
         db.distill_extract()?;
         let pending = db.distill_pending_count()?;

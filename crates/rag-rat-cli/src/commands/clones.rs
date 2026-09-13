@@ -11,8 +11,7 @@ pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
     // `--precompute`: the WRITER path — build/refresh the persisted clone-edge graph (#286) under a
     // write lock (mirroring `maintenance`), then print the build report instead of a clone listing.
     if args.precompute {
-        let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
-        let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+        let _lock = crate::repo_write_lock(config)?;
         let db = open_index(config)?;
         let report: rag_rat_core::index::CloneEdgeReport =
             db.precompute_clone_graph(args.max_seconds)?;

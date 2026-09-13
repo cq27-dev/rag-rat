@@ -27,8 +27,7 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     // indexer block for the run's duration. That is acceptable because `dream --verify/--compact`
     // is an EXPLICIT, human-invoked batch command run at most a few times a day — not a hot path.
     // A finer-grained lock (release during model I/O) is deferred until that cadence proves wrong.
-    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
-    let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    let _lock = crate::repo_write_lock(config)?;
     let db = open_index(config)?;
     let now_ms = rag_rat_base::time::now_ms();
 

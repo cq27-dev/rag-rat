@@ -576,8 +576,7 @@ fn run_maintenance_pass(
     // Serialize with the background watcher (and other writers) OF THIS REPO. The hook backgrounds
     // this command, so blocking here never holds up the git operation; busy_timeout backstops the
     // query-path heal. Per-repo write lock (A6).
-    let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
-    let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
+    let _lock = crate::repo_write_lock(config)?;
     tracing::debug!(target: "rag_rat_core::maintenance", phase = "lock_acquired", elapsed_ms = started.elapsed().as_millis() as u64, "write lock acquired");
 
     // #427: the core refuses a first-time-empty registration (a post-commit/checkout hook on a repo
