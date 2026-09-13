@@ -201,10 +201,7 @@ fn spawn_detached_version_refresh(config: &rag_rat_base::config::Config) {
     let database = config.database.clone();
     std::thread::spawn(move || {
         loop {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
+            let now = rag_rat_base::time::now_ms();
             if version_check::needs_refresh(
                 version_check::read_cache(&database).as_ref(),
                 now,

@@ -32,10 +32,7 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     let lock_repo = rag_rat_base::locks::write_lock_repo_id(config);
     let _lock = rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     let db = open_index(config)?;
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    let now_ms = rag_rat_base::time::now_ms();
 
     // REVIEW mode: `rag-rat dream <FINDING_ID> --accept|--dismiss|--reset` applies a human verdict
     // to ONE finding and prints it — it does NOT run the worklist/model passes. The verdict is
@@ -119,10 +116,14 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     } else {
         None
     };
-    let verdict_pass = (args.verify && model.is_some())
-        .then(|| rag_rat_dream::VerdictPass { model: model.as_ref().unwrap(), budget });
-    let compact_pass = (args.compact && model.is_some())
-        .then(|| rag_rat_dream::CompactPass { model: model.as_ref().unwrap(), budget });
+    let verdict_pass = model
+        .as_ref()
+        .filter(|_| args.verify)
+        .map(|model| rag_rat_dream::VerdictPass { model, budget });
+    let compact_pass = model
+        .as_ref()
+        .filter(|_| args.compact)
+        .map(|model| rag_rat_dream::CompactPass { model, budget });
     let report = db.dream_run_with_passes(opts, verdict_pass, compact_pass)?;
     print_output(&report)
 }
