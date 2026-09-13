@@ -43,6 +43,110 @@ impl SearchKind {
     }
 }
 
+impl SearchContinuation {
+    /// Consume one GitHub Search backfill page — `value`, fetched for `cursor`, with its
+    /// `next_url` link — resuming the continuation the cursor carries (or starting a fresh Issue
+    /// phase below its cutoff). Keeps the items at or above the phase's timestamp-tie boundary,
+    /// then picks the next leg: this phase's next page, the Issue→PullRequest flip (whose first
+    /// page URL `pr_search_url` builds from the cycle cutoff), or the end of the cycle. Returns
+    /// the kept items, the next cursor, and the backfill boundary to persist once the cycle ends.
+    fn advance(
+        cursor: &PageCursor,
+        value: &Value,
+        next_url: Option<String>,
+        pr_search_url: impl FnOnce(&str) -> anyhow::Result<String>,
+    ) -> anyhow::Result<(Vec<Value>, Option<PageCursor>, Option<String>)> {
+        let page = search_items(value)?;
+        let mut state = match cursor.provider_state.as_deref() {
+            Some(state) => serde_json::from_str::<SearchContinuation>(state)?,
+            None => SearchContinuation {
+                kind: SearchKind::Issue,
+                cycle_before: cursor.updated_before.clone(),
+                cycle_boundary: None,
+                boundary: None,
+                total_count: None,
+                fetched: 0,
+            },
+        };
+        // Pre-split cursors represent one combined issue/PR Search stream. Finish that persisted
+        // stream at its original tie boundary; switching it into the split cycle would lose the
+        // outer backfill boundary when the new PR phase is empty.
+        let legacy_combined = cursor.provider_state.is_some()
+            && state.cycle_before.is_none()
+            && state.cycle_boundary.is_none();
+        if !legacy_combined {
+            state.cycle_before = state.cycle_before.or_else(|| cursor.updated_before.clone());
+        }
+        if state.boundary.is_none() {
+            state.boundary = search_boundary(page)?;
+            state.total_count = value["total_count"].as_u64();
+            state.fetched = 0;
+            state.cycle_boundary =
+                safe_search_boundary(state.cycle_boundary.take(), state.boundary.clone());
+        }
+        state.fetched = state.fetched.saturating_add(page.len());
+        let mut reached_older_item = false;
+        let mut values = Vec::new();
+        for item in page {
+            let updated_at = search_item_updated_at(item)?;
+            if state.boundary.as_deref().is_some_and(|boundary| updated_at < boundary) {
+                reached_older_item = true;
+                break;
+            }
+            values.push(item.clone());
+        }
+        let next_url = (!reached_older_item).then_some(next_url).flatten();
+        if next_url.is_none()
+            && !reached_older_item
+            && let Some(total_count) = state.total_count
+        {
+            anyhow::ensure!(
+                u64::try_from(state.fetched).unwrap_or(u64::MAX) >= total_count,
+                "GitHub Search capped the result set before the timestamp tie was drained"
+            );
+        }
+        let next = if let Some(page_token) = next_url {
+            Some(PageCursor {
+                stream: Some(SEARCH_BACKFILL_STREAM.to_string()),
+                updated_before: if legacy_combined {
+                    state.boundary.clone()
+                } else {
+                    state.cycle_boundary.clone().or_else(|| state.cycle_before.clone())
+                },
+                page_token: Some(page_token),
+                provider_state: Some(serde_json::to_string(&state)?),
+                ..PageCursor::default()
+            })
+        } else if state.kind == SearchKind::Issue && !legacy_combined {
+            let cycle_before = state
+                .cycle_before
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("GitHub Search continuation lost its cutoff"))?;
+            state.kind = SearchKind::PullRequest;
+            state.boundary = None;
+            state.total_count = None;
+            state.fetched = 0;
+            Some(PageCursor {
+                stream: Some(SEARCH_BACKFILL_STREAM.to_string()),
+                updated_before: state.cycle_boundary.clone().or_else(|| Some(cycle_before.clone())),
+                page_token: Some(pr_search_url(&cycle_before)?),
+                provider_state: Some(serde_json::to_string(&state)?),
+                ..PageCursor::default()
+            })
+        } else {
+            None
+        };
+        let boundary = if legacy_combined && next.is_none() {
+            state.boundary.clone()
+        } else {
+            (state.kind == SearchKind::PullRequest && next.is_none())
+                .then(|| state.cycle_boundary.clone())
+                .flatten()
+        };
+        Ok((values, next, boundary))
+    }
+}
+
 pub(crate) struct GitHubClient {
     api_origin: String,
     core: Transport,
@@ -391,101 +495,9 @@ impl PapertrailClient for GitHubClient {
         };
         let (value, next_url) = self.get_json(transport, &url).await?;
         let (values, next, backfill_boundary) = if search {
-            let page = search_items(&value)?;
-            let mut state = match cursor.provider_state.as_deref() {
-                Some(state) => serde_json::from_str::<SearchContinuation>(state)?,
-                None => SearchContinuation {
-                    kind: SearchKind::Issue,
-                    cycle_before: cursor.updated_before.clone(),
-                    cycle_boundary: None,
-                    boundary: None,
-                    total_count: None,
-                    fetched: 0,
-                },
-            };
-            // Pre-split cursors represent one combined issue/PR Search stream. Finish that
-            // persisted stream at its original tie boundary; switching it into the split cycle
-            // would lose the outer backfill boundary when the new PR phase is empty.
-            let legacy_combined = cursor.provider_state.is_some()
-                && state.cycle_before.is_none()
-                && state.cycle_boundary.is_none();
-            if !legacy_combined {
-                state.cycle_before = state.cycle_before.or_else(|| cursor.updated_before.clone());
-            }
-            if state.boundary.is_none() {
-                state.boundary = search_boundary(page)?;
-                state.total_count = value["total_count"].as_u64();
-                state.fetched = 0;
-                state.cycle_boundary =
-                    safe_search_boundary(state.cycle_boundary.take(), state.boundary.clone());
-            }
-            state.fetched = state.fetched.saturating_add(page.len());
-            let mut reached_older_item = false;
-            let mut values = Vec::new();
-            for item in page {
-                let updated_at = search_item_updated_at(item)?;
-                if state.boundary.as_deref().is_some_and(|boundary| updated_at < boundary) {
-                    reached_older_item = true;
-                    break;
-                }
-                values.push(item.clone());
-            }
-            let next_url = (!reached_older_item).then_some(next_url).flatten();
-            if next_url.is_none()
-                && !reached_older_item
-                && let Some(total_count) = state.total_count
-            {
-                anyhow::ensure!(
-                    u64::try_from(state.fetched).unwrap_or(u64::MAX) >= total_count,
-                    "GitHub Search capped the result set before the timestamp tie was drained"
-                );
-            }
-            let next = if let Some(page_token) = next_url {
-                Some(PageCursor {
-                    stream: Some(SEARCH_BACKFILL_STREAM.to_string()),
-                    updated_before: if legacy_combined {
-                        state.boundary.clone()
-                    } else {
-                        state.cycle_boundary.clone().or_else(|| state.cycle_before.clone())
-                    },
-                    page_token: Some(page_token),
-                    provider_state: Some(serde_json::to_string(&state)?),
-                    ..PageCursor::default()
-                })
-            } else if state.kind == SearchKind::Issue && !legacy_combined {
-                let cycle_before = state
-                    .cycle_before
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("GitHub Search continuation lost its cutoff"))?;
-                state.kind = SearchKind::PullRequest;
-                state.boundary = None;
-                state.total_count = None;
-                state.fetched = 0;
-                Some(PageCursor {
-                    stream: Some(SEARCH_BACKFILL_STREAM.to_string()),
-                    updated_before: state
-                        .cycle_boundary
-                        .clone()
-                        .or_else(|| Some(cycle_before.clone())),
-                    page_token: Some(self.search_url(
-                        project,
-                        &cycle_before,
-                        SearchKind::PullRequest,
-                    )?),
-                    provider_state: Some(serde_json::to_string(&state)?),
-                    ..PageCursor::default()
-                })
-            } else {
-                None
-            };
-            let boundary = if legacy_combined && next.is_none() {
-                state.boundary.clone()
-            } else {
-                (state.kind == SearchKind::PullRequest && next.is_none())
-                    .then(|| state.cycle_boundary.clone())
-                    .flatten()
-            };
-            (values, next, boundary)
+            SearchContinuation::advance(cursor, &value, next_url, |cycle_before| {
+                self.search_url(project, cycle_before, SearchKind::PullRequest)
+            })?
         } else {
             (
                 value
