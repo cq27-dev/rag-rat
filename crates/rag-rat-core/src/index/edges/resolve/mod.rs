@@ -1025,22 +1025,9 @@ pub(crate) fn resolve_symbol<'a>(
     // [`ReceiverTypeIdentity`]): only Local identities resolve here — External and Ambiguous
     // never bind to local symbols. A qualified local hint additionally earns the conservative
     // tail fallback below; a bare one IS its own tail.
-    let has_local_receiver_type = matches!(
-        request.receiver_type,
-        Some(
-            ReceiverTypeIdentity::LocalQualified(_)
-                | ReceiverTypeIdentity::LocalQualifiedExact(_)
-                | ReceiverTypeIdentity::LocalUnqualified(_)
-        )
-    );
-    let receiver_type = match request.receiver_type {
-        Some(ReceiverTypeIdentity::LocalQualified(path)) => Some((path, true, true, false)),
-        Some(ReceiverTypeIdentity::LocalQualifiedExact(path)) => Some((path, true, false, true)),
-        Some(ReceiverTypeIdentity::LocalUnqualified(name)) => Some((name, false, false, false)),
-        Some(ReceiverTypeIdentity::ExternalQualified(_) | ReceiverTypeIdentity::Ambiguous)
-        | None => None,
-    };
-    if let Some((type_hint, qualified, allow_tail, alias_exact)) = receiver_type {
+    let receiver_owner = request.receiver_type.and_then(ReceiverTypeIdentity::local_owner);
+    let has_local_receiver_type = receiver_owner.is_some();
+    if let (Some(identity), Some(type_hint)) = (request.receiver_type, receiver_owner) {
         let target = format!("{type_hint}::{}", request.name);
         let target_normalized = receiver_scope_path(&target, request.source_language);
         // A bare, non-import-bound receiver names this package's own type, and `Worker::run` is
@@ -1126,9 +1113,10 @@ pub(crate) fn resolve_symbol<'a>(
         // (`Worker::run`) verbatim, so retry with the type's tail — `try_scope` still requires
         // the tail to name exactly one viable target (or one logical symbol's variants), so this
         // never widens into guessing.
-        if qualified && (allow_tail || alias_exact) {
+        if identity.allows_tail_retry() || identity.requires_alias_file() {
             let tail_target = format!("{}::{}", qn_tail(type_hint), request.name);
-            if let Some((symbol, reason)) = try_scope(&tail_target, alias_exact) {
+            if let Some((symbol, reason)) = try_scope(&tail_target, identity.requires_alias_file())
+            {
                 return Some((symbol, EdgeConfidence::Syntactic, reason));
             }
         }
@@ -1136,7 +1124,7 @@ pub(crate) fn resolve_symbol<'a>(
         // A suffix retry is meaningful only for an already-qualified LOCAL identity. Applying it
         // to a bare root-module `Worker` would let it bind `inner::Worker::run`, undoing the
         // lexical canonicalization that keeps same-tail owners isolated.
-        if qualified && allow_tail {
+        if identity.allows_tail_retry() {
             let scope_suffix = format!("::{target}");
             let scope_normalized_suffix = format!("::{target_normalized}");
             let receiver_suffix_matches = index
@@ -1326,16 +1314,6 @@ pub(crate) fn resolve_symbol<'a>(
     if rust_receiver_fallback && !has_local_receiver_type {
         return None;
     }
-    let receiver_owner = has_local_receiver_type
-        .then_some(match request.receiver_type {
-            Some(
-                ReceiverTypeIdentity::LocalQualified(path)
-                | ReceiverTypeIdentity::LocalQualifiedExact(path)
-                | ReceiverTypeIdentity::LocalUnqualified(path),
-            ) => Some(path),
-            _ => None,
-        })
-        .flatten();
     let short = short_name(request.name);
     // A reference that carried a qualifier or a receiver has already had its qualified shape tried
     // above; reaching the bare-name fallback means that shape found nothing. Some target kinds are

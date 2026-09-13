@@ -897,6 +897,29 @@ impl<'a> ReceiverTypeIdentity<'a> {
             (RootOrigin::Local, false) => Self::LocalUnqualified(hint),
         })
     }
+
+    /// The owner path a LOCAL identity resolves through; `None` for external or ambiguous
+    /// evidence, which never binds a local symbol.
+    pub(crate) fn local_owner(self) -> Option<&'a str> {
+        match self {
+            Self::LocalQualified(path)
+            | Self::LocalQualifiedExact(path)
+            | Self::LocalUnqualified(path) => Some(path),
+            Self::ExternalQualified(_) | Self::Ambiguous => None,
+        }
+    }
+
+    /// A module-qualified lexical hint may retry with its type tail, and with a scope suffix,
+    /// when the complete owner is absent. A bare name is already its own tail.
+    pub(crate) fn allows_tail_retry(self) -> bool {
+        matches!(self, Self::LocalQualified(_))
+    }
+
+    /// An alias-derived owner may retry its tail only against a symbol whose defining file's
+    /// module path agrees with the alias's owner prefix.
+    pub(crate) fn requires_alias_file(self) -> bool {
+        matches!(self, Self::LocalQualifiedExact(_))
+    }
 }
 
 pub(crate) struct ResolveSymbolRequest<'a> {
