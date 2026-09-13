@@ -214,7 +214,9 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
     }
 
     let result =
-        mirror_binding_inner(conn, binding, trackers, client, &mut cursor, &mut report).await;
+        MirrorWalk { conn, binding, trackers, client, cursor: &mut cursor, report: &mut report }
+            .run()
+            .await;
     match result {
         Ok(()) => {
             // Stage 2 (#702): the attested-closers walk runs after the item/comment walk so its
@@ -258,277 +260,16 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
     }
 }
 
-async fn mirror_binding_inner<C: PapertrailClient>(
-    conn: &Connection,
-    binding: &ResolvedTracker,
-    trackers: &[ResolvedTracker],
-    client: &C,
-    cursor: &mut MirrorCursor,
-    report: &mut MirrorBindingReport,
-) -> anyhow::Result<()> {
-    let previous_high = cursor.high_mark_at.clone();
-    if !cursor.full_rewalk
-        && let Some(high) = previous_high.as_deref()
-    {
-        if cursor.item_delta_in_progress {
-            cursor.item_delta_scan_since.get_or_insert_with(|| overlap_timestamp(high));
-            save_cursor(conn, binding, cursor, false)?;
-            sync_item_delta(conn, binding, trackers, client, cursor, report).await?;
-        } else {
-            let probe = client
-                .freshness_probe(&binding.project, &FreshnessProbe {
-                    updated_since: Some(high.to_string()),
-                    etag: cursor.probe_etag.clone(),
-                })
-                .await?;
-            cursor.probe_etag = probe.etag;
-            // A quiet probe must not starve an OWED replay: when the prior delta left its
-            // conservative frontier below the probe target, the boundary replay has to run even
-            // if nothing new moved — some providers (GitLab) report a timestamp tie as
-            // not_modified, and the stranded boundary row would otherwise wait for the daily
-            // full walk. probe.latest is None on that path, which sync_item_delta already
-            // treats as "replay against the durable high mark".
-            if !probe.not_modified || cursor.item_delta_replay_required {
-                cursor.item_delta_in_progress = true;
-                cursor.item_delta_scan_since = Some(overlap_timestamp(high));
-                cursor.item_delta_high_mark_at = probe.latest;
-                save_cursor(conn, binding, cursor, false)?;
-                sync_item_delta(conn, binding, trackers, client, cursor, report).await?;
-            } else {
-                report.probe_not_modified = true;
-                save_cursor(conn, binding, cursor, false)?;
-            }
-        }
-        sync_comment_delta(conn, binding, trackers, client, cursor, report).await?;
-    }
-
-    while !cursor.backfill_done {
-        let boundary =
-            cursor.low_mark_at.clone().unwrap_or_else(|| INITIAL_BACKFILL_BOUNDARY.to_string());
-        let request = cursor.backfill_page_cursor.clone().unwrap_or_else(|| PageCursor {
-            updated_before: Some(boundary.clone()),
-            ..PageCursor::default()
-        });
-        let page = client.items_page(&binding.project, &request).await?;
-        if page.items.is_empty() && page.next.is_none() && page.backfill_boundary.is_none() {
-            cursor.backfill_done = true;
-            cursor.high_mark_at.get_or_insert_with(|| EMPTY_PROJECT_HIGH_MARK.to_string());
-            cursor.backfill_processed_keys.clear();
-            // The consumed continuation must not outlive the walk: a chained provider leg (the
-            // request that produced THIS empty page) was persisted as `backfill_page_cursor` on
-            // the previous iteration, and leaving it behind makes `continuation()` misread the
-            // COMPLETED walk as interrupted work forever.
-            cursor.backfill_page_cursor = None;
-            save_cursor(conn, binding, cursor, false)?;
-            break;
-        }
-        if let Some(next) = &page.next {
-            ensure_cursor_advanced(&request, next, "backfill")?;
-        }
-        store_item_page_resumably(
-            conn,
-            binding,
-            trackers,
-            client,
-            &page.items,
-            PageLane::Backfill,
-            cursor,
-            report,
-        )
-        .await?;
-        if cursor.high_mark_at.is_none() {
-            cursor.high_mark_at = max_item_updated_at(&page.items);
-        }
-        if let Some(next) = page.next {
-            cursor.backfill_page_cursor = Some(next);
-            save_cursor(conn, binding, cursor, false)?;
-            continue;
-        }
-        let next_low = page
-            .backfill_boundary
-            .or_else(|| min_item_updated_at(&page.items))
-            .or_else(|| request.page_token.as_ref().and_then(|_| request.updated_before.clone()))
-            .ok_or_else(|| anyhow::anyhow!("backfill page has no updated_at boundary"))?;
-        anyhow::ensure!(next_low < boundary, "backfill boundary did not advance below {boundary}");
-        cursor.low_mark_at = Some(next_low);
-        cursor.backfill_page_cursor = None;
-        cursor.backfill_processed_keys.clear();
-        save_cursor(conn, binding, cursor, false)?;
-    }
-    if previous_high.is_none() || cursor.full_rewalk {
-        sync_comment_delta(conn, binding, trackers, client, cursor, report).await?;
-    }
-    if cursor.full_rewalk {
-        let tx = conn.unchecked_transaction()?;
-        report.pruned_items += prune_missing(&tx, binding)?;
-        rebuild_fts(&tx)?;
-        cursor.full_rewalk = false;
-        save_cursor(&tx, binding, cursor, true)?;
-        tx.commit()?;
-    }
-    Ok(())
-}
-
-async fn sync_item_delta<C: PapertrailClient>(
-    conn: &Connection,
-    binding: &ResolvedTracker,
-    trackers: &[ResolvedTracker],
-    client: &C,
-    cursor: &mut MirrorCursor,
-    report: &mut MirrorBindingReport,
-) -> anyhow::Result<()> {
-    let mut request = PageCursor {
-        updated_since: cursor.item_delta_scan_since.clone(),
-        page_token: cursor.item_delta_page_token.clone(),
-        ..PageCursor::default()
-    };
-    loop {
-        let page = client.items_page(&binding.project, &request).await?;
-        let first_page_high = request
-            .page_token
-            .is_none()
-            .then(|| page.items.iter().filter_map(|item| item.updated_at.clone()).max());
-        let next = if let Some(mut next) = page.next {
-            next.updated_since = cursor.item_delta_scan_since.clone();
-            next.updated_before = None;
-            ensure_cursor_advanced(&request, &next, "item delta")?;
-            Some(next)
-        } else {
-            None
-        };
-        if let Some(first_page_high) = first_page_high {
-            // GitHub's updated-order REST pages are mutable. Once pagination is present, only
-            // the first page is a proven consumed prefix: an edit can move a row from that page
-            // later and shift an unseen boundary row behind the current offset. Persisting the
-            // first page's inclusive upper timestamp makes the next scan replay that boundary.
-            // A single physical page consumed the whole observed window, but still must not
-            // jump to a probe timestamp that the list response did not contain.
-            let reached_probe =
-                if cursor.item_delta_replay_required && cursor.item_delta_high_mark_at.is_none() {
-                    first_page_high == cursor.high_mark_at
-                } else {
-                    first_page_high == cursor.item_delta_high_mark_at && next.is_none()
-                };
-            cursor.item_delta_high_mark_at = first_page_high;
-            cursor.item_delta_replay_required = !reached_probe;
-            if cursor.item_delta_replay_required {
-                // The next run must probe unconditionally so this conservative frontier is
-                // replayed even when the prior probe's ETag is otherwise still current.
-                cursor.probe_etag = None;
-            }
-        }
-        store_item_page_resumably(
-            conn,
-            binding,
-            trackers,
-            client,
-            &page.items,
-            PageLane::Delta,
-            cursor,
-            report,
-        )
-        .await?;
-        if let Some(next) = next {
-            cursor.delta_processed_keys.clear();
-            cursor.item_delta_page_token = next.page_token.clone();
-            cursor.item_delta_in_progress = true;
-            save_cursor(conn, binding, cursor, false)?;
-            request = next;
-        } else {
-            cursor.high_mark_at =
-                max_timestamp(cursor.high_mark_at.take(), cursor.item_delta_high_mark_at.take());
-            cursor.delta_processed_keys.clear();
-            cursor.item_delta_page_token = None;
-            cursor.item_delta_scan_since = None;
-            cursor.item_delta_in_progress = false;
-            save_cursor(conn, binding, cursor, false)?;
-            break;
-        }
-    }
-    Ok(())
-}
-
-async fn sync_comment_delta<C: PapertrailClient>(
-    conn: &Connection,
-    binding: &ResolvedTracker,
-    trackers: &[ResolvedTracker],
-    client: &C,
-    cursor: &mut MirrorCursor,
-    report: &mut MirrorBindingReport,
-) -> anyhow::Result<()> {
-    // A legacy shared watermark may seed every stream exactly once. Never seed a stream from the
-    // aggregate while this loop is advancing siblings: that recreates the cross-stream race this
-    // map exists to prevent. A provider stream added later starts from scratch, which is safe.
-    let legacy_high = cursor
-        .comment_stream_cursors
-        .is_empty()
-        .then(|| cursor.comment_high_mark_at.clone())
-        .flatten();
-    for stream in client.comment_streams() {
-        let state =
-            cursor.comment_stream_cursors.entry((*stream).to_string()).or_insert_with(|| {
-                CommentStreamCursor {
-                    high_mark_at: legacy_high.clone(),
-                    page_token: None,
-                    scan_since: None,
-                    scan_high_mark_at: None,
-                }
-            });
-        let scan_since = state.scan_since.clone().unwrap_or_else(|| {
-            state.high_mark_at.as_deref().map(overlap_timestamp).unwrap_or_default()
-        });
-        let mut request = PageCursor {
-            stream: Some((*stream).to_string()),
-            updated_since: (!scan_since.is_empty()).then_some(scan_since.clone()),
-            page_token: state.page_token.clone(),
-            ..PageCursor::default()
-        };
-        loop {
-            let page = client.comments_page(&binding.project, &request).await?;
-            let first_page_high = request.page_token.is_none().then(|| {
-                page.comments.iter().filter_map(|comment| comment.updated_at.clone()).max()
-            });
-            let next = if let Some(mut next) = page.next {
-                anyhow::ensure!(
-                    next.stream.as_deref().is_none_or(|next_stream| next_stream == *stream),
-                    "comment pagination crossed from `{stream}` into another stream"
-                );
-                next.stream = Some((*stream).to_string());
-                next.updated_since = (!scan_since.is_empty()).then_some(scan_since.clone());
-                ensure_cursor_advanced(&request, &next, "repository comment")?;
-                Some(next)
-            } else {
-                None
-            };
-            store_repo_comments(conn, binding, trackers, &page.comments, report)?;
-            let state = cursor.comment_stream_cursors.get_mut(*stream).expect("stream inserted");
-            if let Some(first_page_high) = first_page_high {
-                // As with item deltas, a mutable continuation proves no more than the first
-                // ascending page. Replaying its inclusive upper boundary prevents offset shifts
-                // from stranding an unseen or stale comment below the durable watermark.
-                state.scan_high_mark_at = first_page_high;
-            }
-            // The provider-confirmed frontier is trusted on EVERY page — providers only set it
-            // for immutable append-only feeds (see CommentsPage::frontier). Folding each page's
-            // frontier carries a drained multi-page window past its LAST page, where the
-            // first-page comment maximum alone would pin a busy window forever.
-            if page.frontier.is_some() {
-                state.scan_high_mark_at =
-                    max_timestamp(state.scan_high_mark_at.take(), page.frontier.clone());
-            }
-            state.page_token = next.as_ref().and_then(|next| next.page_token.clone());
-            state.scan_since = next.as_ref().map(|_| scan_since.clone());
-            if next.is_none() {
-                state.high_mark_at =
-                    max_timestamp(state.high_mark_at.take(), state.scan_high_mark_at.take());
-            }
-            cursor.comment_high_mark_at = common_comment_high_mark(&cursor.comment_stream_cursors);
-            save_cursor(conn, binding, cursor, false)?;
-            let Some(next) = next else { break };
-            request = next;
-        }
-    }
-    Ok(())
+/// One binding's resumable mirror walk: the connection and binding it writes for, the configured
+/// tracker set its ref mining parses against, the provider client it pages, and the cursor and
+/// report every stage advances.
+struct MirrorWalk<'a, C> {
+    conn: &'a Connection,
+    binding: &'a ResolvedTracker,
+    trackers: &'a [ResolvedTracker],
+    client: &'a C,
+    cursor: &'a mut MirrorCursor,
+    report: &'a mut MirrorBindingReport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -536,66 +277,6 @@ async fn sync_comment_delta<C: PapertrailClient>(
 enum PageLane {
     Delta,
     Backfill,
-}
-
-// One over the lint cap: the resumable walk threads (binding, trackers, cursor, report) through
-// every stage, and bundling two of them into a one-off struct here would just rename the train.
-#[allow(clippy::too_many_arguments)]
-async fn store_item_page_resumably<C: PapertrailClient>(
-    conn: &Connection,
-    binding: &ResolvedTracker,
-    trackers: &[ResolvedTracker],
-    client: &C,
-    items: &[PapertrailItem],
-    lane: PageLane,
-    cursor: &mut MirrorCursor,
-    report: &mut MirrorBindingReport,
-) -> anyhow::Result<()> {
-    if let Some(active) = cursor.item_thread_cursor.clone() {
-        if let Some(item) = items.iter().find(|item| {
-            item.item_kind.as_db_str() == active.item.kind && item.item_key == active.item.key
-        }) {
-            let current = processed_item(item);
-            if current != active.item {
-                let mut item = item.clone();
-                client.enrich_item(&mut item).await?;
-                if binding.tracks(item.tags.iter().map(String::as_str)) {
-                    begin_item_thread(conn, binding, trackers, &item, lane, cursor, report)?;
-                } else {
-                    report.pruned_items +=
-                        usize::from(delete_item(conn, binding, item.item_kind, &item.item_key)?);
-                    cursor.item_thread_cursor = None;
-                    mark_processed(cursor, lane, current);
-                    save_cursor(conn, binding, cursor, false)?;
-                }
-            }
-        }
-        if cursor.item_thread_cursor.is_some() {
-            resume_item_thread(conn, binding, trackers, client, cursor, report).await?;
-        }
-    }
-    for item in items {
-        let key = processed_item(item);
-        let already_stored = match lane {
-            PageLane::Delta => cursor.delta_processed_keys.contains(&key),
-            PageLane::Backfill => cursor.backfill_processed_keys.contains(&key),
-        };
-        if already_stored {
-            continue;
-        }
-        let mut item = item.clone();
-        client.enrich_item(&mut item).await?;
-        if binding.tracks(item.tags.iter().map(String::as_str)) {
-            begin_item_thread(conn, binding, trackers, &item, lane, cursor, report)?;
-            resume_item_thread(conn, binding, trackers, client, cursor, report).await?;
-        } else {
-            report.pruned_items +=
-                usize::from(delete_item(conn, binding, item.item_kind, &item.item_key)?);
-            mark_processed(cursor, lane, key);
-            save_cursor(conn, binding, cursor, false)?;
-        }
-    }
-    Ok(())
 }
 
 fn processed_item(item: &PapertrailItem) -> ProcessedItem {
@@ -606,131 +287,434 @@ fn processed_item(item: &PapertrailItem) -> ProcessedItem {
     }
 }
 
-fn begin_item_thread(
-    conn: &Connection,
-    binding: &ResolvedTracker,
-    trackers: &[ResolvedTracker],
-    item: &PapertrailItem,
-    lane: PageLane,
-    cursor: &mut MirrorCursor,
-    report: &mut MirrorBindingReport,
-) -> anyhow::Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    store_item(&tx, binding.provider, item)?;
-    // #702: the item's own text is mined in the same transaction — refs (`source_kind='item'`)
-    // and, for a change request with closing keywords, the text-tier closing edge.
-    sync::mine_item_refs(&tx, binding.provider, trackers, item)?;
-    replace_tags(&tx, binding, item)?;
-    if cursor.full_rewalk {
-        mark_full_seen(&tx, binding, item)?;
-    }
-    cursor.item_thread_cursor = Some(ItemThreadCursor {
-        item: processed_item(item),
-        lane,
-        stream_index: 0,
-        page_cursor: None,
-        seen_comment_ids: BTreeSet::new(),
-        previous_comment_ids: None,
-        saw_pagination: false,
-    });
-    save_cursor(&tx, binding, cursor, false)?;
-    tx.commit()?;
-    report.stored_items += 1;
-    Ok(())
-}
+impl<C: PapertrailClient> MirrorWalk<'_, C> {
+    async fn run(&mut self) -> anyhow::Result<()> {
+        let previous_high = self.cursor.high_mark_at.clone();
+        if !self.cursor.full_rewalk
+            && let Some(high) = previous_high.as_deref()
+        {
+            if self.cursor.item_delta_in_progress {
+                self.cursor.item_delta_scan_since.get_or_insert_with(|| overlap_timestamp(high));
+                save_cursor(self.conn, self.binding, self.cursor, false)?;
+                self.sync_item_delta().await?;
+            } else {
+                let probe = self
+                    .client
+                    .freshness_probe(&self.binding.project, &FreshnessProbe {
+                        updated_since: Some(high.to_string()),
+                        etag: self.cursor.probe_etag.clone(),
+                    })
+                    .await?;
+                self.cursor.probe_etag = probe.etag;
+                // A quiet probe must not starve an OWED replay: when the prior delta left its
+                // conservative frontier below the probe target, the boundary replay has to run even
+                // if nothing new moved — some providers (GitLab) report a timestamp tie as
+                // not_modified, and the stranded boundary row would otherwise wait for the daily
+                // full walk. probe.latest is None on that path, which sync_item_delta already
+                // treats as "replay against the durable high mark".
+                if !probe.not_modified || self.cursor.item_delta_replay_required {
+                    self.cursor.item_delta_in_progress = true;
+                    self.cursor.item_delta_scan_since = Some(overlap_timestamp(high));
+                    self.cursor.item_delta_high_mark_at = probe.latest;
+                    save_cursor(self.conn, self.binding, self.cursor, false)?;
+                    self.sync_item_delta().await?;
+                } else {
+                    self.report.probe_not_modified = true;
+                    save_cursor(self.conn, self.binding, self.cursor, false)?;
+                }
+            }
+            self.sync_comment_delta().await?;
+        }
 
-async fn resume_item_thread<C: PapertrailClient>(
-    conn: &Connection,
-    binding: &ResolvedTracker,
-    trackers: &[ResolvedTracker],
-    client: &C,
-    cursor: &mut MirrorCursor,
-    report: &mut MirrorBindingReport,
-) -> anyhow::Result<()> {
-    loop {
-        let thread = cursor.item_thread_cursor.clone().expect("active item thread");
-        let kind = ItemKind::from_db_str(&thread.item.kind)?;
-        let streams = client.item_comment_streams(kind);
-        let Some(stream) = streams.get(thread.stream_index) else {
-            if thread.saw_pagination
-                && thread.previous_comment_ids.as_ref() != Some(&thread.seen_comment_ids)
-            {
-                // GitHub item-comment continuations are mutable page numbers. Require two
-                // identical complete walks before treating absence as deletion; a row shifted
-                // behind one walk is rediscovered by the next instead of being pruned locally.
-                let active = cursor.item_thread_cursor.as_mut().expect("active item thread");
-                active.previous_comment_ids = Some(thread.seen_comment_ids);
-                active.seen_comment_ids.clear();
-                active.stream_index = 0;
-                active.page_cursor = None;
-                save_cursor(conn, binding, cursor, false)?;
+        while !self.cursor.backfill_done {
+            let boundary = self
+                .cursor
+                .low_mark_at
+                .clone()
+                .unwrap_or_else(|| INITIAL_BACKFILL_BOUNDARY.to_string());
+            let request = self.cursor.backfill_page_cursor.clone().unwrap_or_else(|| PageCursor {
+                updated_before: Some(boundary.clone()),
+                ..PageCursor::default()
+            });
+            let page = self.client.items_page(&self.binding.project, &request).await?;
+            if page.items.is_empty() && page.next.is_none() && page.backfill_boundary.is_none() {
+                self.cursor.backfill_done = true;
+                self.cursor.high_mark_at.get_or_insert_with(|| EMPTY_PROJECT_HIGH_MARK.to_string());
+                self.cursor.backfill_processed_keys.clear();
+                // The consumed continuation must not outlive the walk: a chained provider leg (the
+                // request that produced THIS empty page) was persisted as `backfill_page_cursor` on
+                // the previous iteration, and leaving it behind makes `continuation()` misread the
+                // COMPLETED walk as interrupted work forever.
+                self.cursor.backfill_page_cursor = None;
+                save_cursor(self.conn, self.binding, self.cursor, false)?;
+                break;
+            }
+            if let Some(next) = &page.next {
+                ensure_cursor_advanced(&request, next, "backfill")?;
+            }
+            self.store_item_page_resumably(&page.items, PageLane::Backfill).await?;
+            if self.cursor.high_mark_at.is_none() {
+                self.cursor.high_mark_at = max_item_updated_at(&page.items);
+            }
+            if let Some(next) = page.next {
+                self.cursor.backfill_page_cursor = Some(next);
+                save_cursor(self.conn, self.binding, self.cursor, false)?;
                 continue;
             }
-            let tx = conn.unchecked_transaction()?;
-            prune_unseen_item_comments(
-                &tx,
-                binding,
-                kind,
-                &thread.item.key,
-                &thread.seen_comment_ids,
-            )?;
-            cursor.item_thread_cursor = None;
-            mark_processed(cursor, thread.lane, thread.item);
-            save_cursor(&tx, binding, cursor, false)?;
+            let next_low = page
+                .backfill_boundary
+                .or_else(|| min_item_updated_at(&page.items))
+                .or_else(|| {
+                    request.page_token.as_ref().and_then(|_| request.updated_before.clone())
+                })
+                .ok_or_else(|| anyhow::anyhow!("backfill page has no updated_at boundary"))?;
+            anyhow::ensure!(
+                next_low < boundary,
+                "backfill boundary did not advance below {boundary}"
+            );
+            self.cursor.low_mark_at = Some(next_low);
+            self.cursor.backfill_page_cursor = None;
+            self.cursor.backfill_processed_keys.clear();
+            save_cursor(self.conn, self.binding, self.cursor, false)?;
+        }
+        if previous_high.is_none() || self.cursor.full_rewalk {
+            self.sync_comment_delta().await?;
+        }
+        if self.cursor.full_rewalk {
+            let tx = self.conn.unchecked_transaction()?;
+            self.report.pruned_items += prune_missing(&tx, self.binding)?;
+            rebuild_fts(&tx)?;
+            self.cursor.full_rewalk = false;
+            save_cursor(&tx, self.binding, self.cursor, true)?;
             tx.commit()?;
-            return Ok(());
-        };
-        let request = thread.page_cursor.clone().unwrap_or_else(|| PageCursor {
-            stream: Some((*stream).to_string()),
+        }
+        Ok(())
+    }
+
+    async fn sync_item_delta(&mut self) -> anyhow::Result<()> {
+        let mut request = PageCursor {
+            updated_since: self.cursor.item_delta_scan_since.clone(),
+            page_token: self.cursor.item_delta_page_token.clone(),
             ..PageCursor::default()
+        };
+        loop {
+            let page = self.client.items_page(&self.binding.project, &request).await?;
+            let first_page_high = request
+                .page_token
+                .is_none()
+                .then(|| page.items.iter().filter_map(|item| item.updated_at.clone()).max());
+            let next = if let Some(mut next) = page.next {
+                next.updated_since = self.cursor.item_delta_scan_since.clone();
+                next.updated_before = None;
+                ensure_cursor_advanced(&request, &next, "item delta")?;
+                Some(next)
+            } else {
+                None
+            };
+            if let Some(first_page_high) = first_page_high {
+                // GitHub's updated-order REST pages are mutable. Once pagination is present, only
+                // the first page is a proven consumed prefix: an edit can move a row from that page
+                // later and shift an unseen boundary row behind the current offset. Persisting the
+                // first page's inclusive upper timestamp makes the next scan replay that boundary.
+                // A single physical page consumed the whole observed window, but still must not
+                // jump to a probe timestamp that the list response did not contain.
+                let reached_probe = if self.cursor.item_delta_replay_required
+                    && self.cursor.item_delta_high_mark_at.is_none()
+                {
+                    first_page_high == self.cursor.high_mark_at
+                } else {
+                    first_page_high == self.cursor.item_delta_high_mark_at && next.is_none()
+                };
+                self.cursor.item_delta_high_mark_at = first_page_high;
+                self.cursor.item_delta_replay_required = !reached_probe;
+                if self.cursor.item_delta_replay_required {
+                    // The next run must probe unconditionally so this conservative frontier is
+                    // replayed even when the prior probe's ETag is otherwise still current.
+                    self.cursor.probe_etag = None;
+                }
+            }
+            self.store_item_page_resumably(&page.items, PageLane::Delta).await?;
+            if let Some(next) = next {
+                self.cursor.delta_processed_keys.clear();
+                self.cursor.item_delta_page_token = next.page_token.clone();
+                self.cursor.item_delta_in_progress = true;
+                save_cursor(self.conn, self.binding, self.cursor, false)?;
+                request = next;
+            } else {
+                self.cursor.high_mark_at = max_timestamp(
+                    self.cursor.high_mark_at.take(),
+                    self.cursor.item_delta_high_mark_at.take(),
+                );
+                self.cursor.delta_processed_keys.clear();
+                self.cursor.item_delta_page_token = None;
+                self.cursor.item_delta_scan_since = None;
+                self.cursor.item_delta_in_progress = false;
+                save_cursor(self.conn, self.binding, self.cursor, false)?;
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn sync_comment_delta(&mut self) -> anyhow::Result<()> {
+        // A legacy shared watermark may seed every stream exactly once. Never seed a stream from
+        // the aggregate while this loop is advancing siblings: that recreates the
+        // cross-stream race this map exists to prevent. A provider stream added later
+        // starts from scratch, which is safe.
+        let legacy_high = self
+            .cursor
+            .comment_stream_cursors
+            .is_empty()
+            .then(|| self.cursor.comment_high_mark_at.clone())
+            .flatten();
+        for stream in self.client.comment_streams() {
+            let state =
+                self.cursor.comment_stream_cursors.entry((*stream).to_string()).or_insert_with(
+                    || CommentStreamCursor {
+                        high_mark_at: legacy_high.clone(),
+                        page_token: None,
+                        scan_since: None,
+                        scan_high_mark_at: None,
+                    },
+                );
+            let scan_since = state.scan_since.clone().unwrap_or_else(|| {
+                state.high_mark_at.as_deref().map(overlap_timestamp).unwrap_or_default()
+            });
+            let mut request = PageCursor {
+                stream: Some((*stream).to_string()),
+                updated_since: (!scan_since.is_empty()).then_some(scan_since.clone()),
+                page_token: state.page_token.clone(),
+                ..PageCursor::default()
+            };
+            loop {
+                let page = self.client.comments_page(&self.binding.project, &request).await?;
+                let first_page_high = request.page_token.is_none().then(|| {
+                    page.comments.iter().filter_map(|comment| comment.updated_at.clone()).max()
+                });
+                let next = if let Some(mut next) = page.next {
+                    anyhow::ensure!(
+                        next.stream.as_deref().is_none_or(|next_stream| next_stream == *stream),
+                        "comment pagination crossed from `{stream}` into another stream"
+                    );
+                    next.stream = Some((*stream).to_string());
+                    next.updated_since = (!scan_since.is_empty()).then_some(scan_since.clone());
+                    ensure_cursor_advanced(&request, &next, "repository comment")?;
+                    Some(next)
+                } else {
+                    None
+                };
+                store_repo_comments(
+                    self.conn,
+                    self.binding,
+                    self.trackers,
+                    &page.comments,
+                    self.report,
+                )?;
+                let state =
+                    self.cursor.comment_stream_cursors.get_mut(*stream).expect("stream inserted");
+                if let Some(first_page_high) = first_page_high {
+                    // As with item deltas, a mutable continuation proves no more than the first
+                    // ascending page. Replaying its inclusive upper boundary prevents offset shifts
+                    // from stranding an unseen or stale comment below the durable watermark.
+                    state.scan_high_mark_at = first_page_high;
+                }
+                // The provider-confirmed frontier is trusted on EVERY page — providers only set it
+                // for immutable append-only feeds (see CommentsPage::frontier). Folding each page's
+                // frontier carries a drained multi-page window past its LAST page, where the
+                // first-page comment maximum alone would pin a busy window forever.
+                if page.frontier.is_some() {
+                    state.scan_high_mark_at =
+                        max_timestamp(state.scan_high_mark_at.take(), page.frontier.clone());
+                }
+                state.page_token = next.as_ref().and_then(|next| next.page_token.clone());
+                state.scan_since = next.as_ref().map(|_| scan_since.clone());
+                if next.is_none() {
+                    state.high_mark_at =
+                        max_timestamp(state.high_mark_at.take(), state.scan_high_mark_at.take());
+                }
+                self.cursor.comment_high_mark_at =
+                    common_comment_high_mark(&self.cursor.comment_stream_cursors);
+                save_cursor(self.conn, self.binding, self.cursor, false)?;
+                let Some(next) = next else { break };
+                request = next;
+            }
+        }
+        Ok(())
+    }
+
+    async fn store_item_page_resumably(
+        &mut self,
+        items: &[PapertrailItem],
+        lane: PageLane,
+    ) -> anyhow::Result<()> {
+        if let Some(active) = self.cursor.item_thread_cursor.clone() {
+            if let Some(item) = items.iter().find(|item| {
+                item.item_kind.as_db_str() == active.item.kind && item.item_key == active.item.key
+            }) {
+                let current = processed_item(item);
+                if current != active.item {
+                    let mut item = item.clone();
+                    self.client.enrich_item(&mut item).await?;
+                    if self.binding.tracks(item.tags.iter().map(String::as_str)) {
+                        self.begin_item_thread(&item, lane)?;
+                    } else {
+                        self.report.pruned_items += usize::from(delete_item(
+                            self.conn,
+                            self.binding,
+                            item.item_kind,
+                            &item.item_key,
+                        )?);
+                        self.cursor.item_thread_cursor = None;
+                        mark_processed(self.cursor, lane, current);
+                        save_cursor(self.conn, self.binding, self.cursor, false)?;
+                    }
+                }
+            }
+            if self.cursor.item_thread_cursor.is_some() {
+                self.resume_item_thread().await?;
+            }
+        }
+        for item in items {
+            let key = processed_item(item);
+            let already_stored = match lane {
+                PageLane::Delta => self.cursor.delta_processed_keys.contains(&key),
+                PageLane::Backfill => self.cursor.backfill_processed_keys.contains(&key),
+            };
+            if already_stored {
+                continue;
+            }
+            let mut item = item.clone();
+            self.client.enrich_item(&mut item).await?;
+            if self.binding.tracks(item.tags.iter().map(String::as_str)) {
+                self.begin_item_thread(&item, lane)?;
+                self.resume_item_thread().await?;
+            } else {
+                self.report.pruned_items += usize::from(delete_item(
+                    self.conn,
+                    self.binding,
+                    item.item_kind,
+                    &item.item_key,
+                )?);
+                mark_processed(self.cursor, lane, key);
+                save_cursor(self.conn, self.binding, self.cursor, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_item_thread(&mut self, item: &PapertrailItem, lane: PageLane) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        store_item(&tx, self.binding.provider, item)?;
+        // #702: the item's own text is mined in the same transaction — refs (`source_kind='item'`)
+        // and, for a change request with closing keywords, the text-tier closing edge.
+        sync::mine_item_refs(&tx, self.binding.provider, self.trackers, item)?;
+        replace_tags(&tx, self.binding, item)?;
+        if self.cursor.full_rewalk {
+            mark_full_seen(&tx, self.binding, item)?;
+        }
+        self.cursor.item_thread_cursor = Some(ItemThreadCursor {
+            item: processed_item(item),
+            lane,
+            stream_index: 0,
+            page_cursor: None,
+            seen_comment_ids: BTreeSet::new(),
+            previous_comment_ids: None,
+            saw_pagination: false,
         });
-        let page = match client
-            .item_comments_page(&binding.project, kind, &thread.item.key, &request)
-            .await
-        {
-            Ok(page) => page,
-            Err(error) if is_item_not_found(&error) => {
-                // GitHub deliberately uses 404 both for absent and inaccessible resources, and
-                // a stale comment continuation says nothing about the parent. Unpin ordinary
-                // sync without erasing the last complete cache; a successful full rewalk owns
-                // authoritative item pruning.
-                let tx = conn.unchecked_transaction()?;
-                cursor.item_thread_cursor = None;
-                mark_processed(cursor, thread.lane, thread.item);
-                save_cursor(&tx, binding, cursor, false)?;
+        save_cursor(&tx, self.binding, self.cursor, false)?;
+        tx.commit()?;
+        self.report.stored_items += 1;
+        Ok(())
+    }
+
+    async fn resume_item_thread(&mut self) -> anyhow::Result<()> {
+        loop {
+            let thread = self.cursor.item_thread_cursor.clone().expect("active item thread");
+            let kind = ItemKind::from_db_str(&thread.item.kind)?;
+            let streams = self.client.item_comment_streams(kind);
+            let Some(stream) = streams.get(thread.stream_index) else {
+                if thread.saw_pagination
+                    && thread.previous_comment_ids.as_ref() != Some(&thread.seen_comment_ids)
+                {
+                    // GitHub item-comment continuations are mutable page numbers. Require two
+                    // identical complete walks before treating absence as deletion; a row shifted
+                    // behind one walk is rediscovered by the next instead of being pruned locally.
+                    let active =
+                        self.cursor.item_thread_cursor.as_mut().expect("active item thread");
+                    active.previous_comment_ids = Some(thread.seen_comment_ids);
+                    active.seen_comment_ids.clear();
+                    active.stream_index = 0;
+                    active.page_cursor = None;
+                    save_cursor(self.conn, self.binding, self.cursor, false)?;
+                    continue;
+                }
+                let tx = self.conn.unchecked_transaction()?;
+                prune_unseen_item_comments(
+                    &tx,
+                    self.binding,
+                    kind,
+                    &thread.item.key,
+                    &thread.seen_comment_ids,
+                )?;
+                self.cursor.item_thread_cursor = None;
+                mark_processed(self.cursor, thread.lane, thread.item);
+                save_cursor(&tx, self.binding, self.cursor, false)?;
                 tx.commit()?;
                 return Ok(());
-            },
-            Err(error) => return Err(error),
-        };
-        let next = page.next;
-        if let Some(next) = &next {
-            anyhow::ensure!(
-                next.stream.as_deref().is_none_or(|next_stream| next_stream == *stream),
-                "item-comment pagination crossed from `{stream}` into another stream"
-            );
-            ensure_cursor_advanced(&request, next, "item comment")?;
+            };
+            let request = thread.page_cursor.clone().unwrap_or_else(|| PageCursor {
+                stream: Some((*stream).to_string()),
+                ..PageCursor::default()
+            });
+            let page = match self
+                .client
+                .item_comments_page(&self.binding.project, kind, &thread.item.key, &request)
+                .await
+            {
+                Ok(page) => page,
+                Err(error) if is_item_not_found(&error) => {
+                    // GitHub deliberately uses 404 both for absent and inaccessible resources, and
+                    // a stale comment continuation says nothing about the parent. Unpin ordinary
+                    // sync without erasing the last complete cache; a successful full rewalk owns
+                    // authoritative item pruning.
+                    let tx = self.conn.unchecked_transaction()?;
+                    self.cursor.item_thread_cursor = None;
+                    mark_processed(self.cursor, thread.lane, thread.item);
+                    save_cursor(&tx, self.binding, self.cursor, false)?;
+                    tx.commit()?;
+                    return Ok(());
+                },
+                Err(error) => return Err(error),
+            };
+            let next = page.next;
+            if let Some(next) = &next {
+                anyhow::ensure!(
+                    next.stream.as_deref().is_none_or(|next_stream| next_stream == *stream),
+                    "item-comment pagination crossed from `{stream}` into another stream"
+                );
+                ensure_cursor_advanced(&request, next, "item comment")?;
+            }
+            let active = self.cursor.item_thread_cursor.as_mut().expect("active item thread");
+            active
+                .seen_comment_ids
+                .extend(page.comments.iter().map(|comment| comment.comment_id.clone()));
+            if let Some(mut next) = next {
+                next.stream = Some((*stream).to_string());
+                active.page_cursor = Some(next);
+                active.saw_pagination = true;
+            } else {
+                active.stream_index += 1;
+                active.page_cursor = None;
+            }
+            let tx = self.conn.unchecked_transaction()?;
+            for comment in &page.comments {
+                store_comment(&tx, self.binding.provider, comment)?;
+                sync::mine_comment_refs(&tx, self.binding.provider, self.trackers, comment)?;
+            }
+            save_cursor(&tx, self.binding, self.cursor, false)?;
+            tx.commit()?;
+            self.report.stored_comments += page.comments.len();
         }
-        let active = cursor.item_thread_cursor.as_mut().expect("active item thread");
-        active
-            .seen_comment_ids
-            .extend(page.comments.iter().map(|comment| comment.comment_id.clone()));
-        if let Some(mut next) = next {
-            next.stream = Some((*stream).to_string());
-            active.page_cursor = Some(next);
-            active.saw_pagination = true;
-        } else {
-            active.stream_index += 1;
-            active.page_cursor = None;
-        }
-        let tx = conn.unchecked_transaction()?;
-        for comment in &page.comments {
-            store_comment(&tx, binding.provider, comment)?;
-            sync::mine_comment_refs(&tx, binding.provider, trackers, comment)?;
-        }
-        save_cursor(&tx, binding, cursor, false)?;
-        tx.commit()?;
-        report.stored_comments += page.comments.len();
     }
 }
 
