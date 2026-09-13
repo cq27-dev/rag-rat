@@ -62,3 +62,25 @@ pub fn is_test_path(path: impl AsRef<Path>) -> bool {
         || stem.ends_with("Tests")
         || stem.ends_with("TestCase")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_generated_path;
+
+    #[test]
+    fn generated_dirs_match_at_any_depth_including_root() {
+        // Nested and root-level codegen dirs both count (#202 review P2): the old
+        // `contains("/generated/")` needed a leading separator and missed the root case.
+        assert!(is_generated_path("packages/held-core/src/generated/foo.ts"));
+        assert!(is_generated_path("generated/bindings.rs"));
+        assert!(is_generated_path("generated-web/foo.ts"));
+        assert!(is_generated_path("apps/web/src/generated-web/bar.ts"));
+        // Declaration / wasm-bindgen output by suffix.
+        assert!(is_generated_path("types/index.d.ts"));
+        assert!(is_generated_path("pkg/app_bg.wasm.d.ts"));
+        // Hand-written source is not generated — and a substring near-miss must not false-positive.
+        assert!(!is_generated_path("src/lib.rs"));
+        assert!(!is_generated_path("src/pre-generated-data/seed.rs"));
+        assert!(!is_generated_path("src/generator.rs"));
+    }
+}

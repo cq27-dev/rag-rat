@@ -7,6 +7,36 @@ use rag_rat_clones as clones;
 
 use super::*;
 
+/// A source file a pass will index: where it lives, what it parses as, and the
+/// `(commit_sha, worktree_id)` scope its row is written under.
+#[derive(Debug, Clone)]
+pub(crate) struct IndexFile {
+    pub(super) full_path: PathBuf,
+    pub(super) relative_path: PathBuf,
+    pub(super) language: Language,
+    pub(super) kind: TargetKind,
+    pub(super) commit_sha: String,
+    pub(super) worktree_id: String,
+}
+
+/// The `(commit_sha, worktree_id)` scope a heal writes a file row under: the base commit scope,
+/// or the worktree overlay for a dirty / commit-less checkout.
+#[derive(Debug, Clone)]
+pub(super) struct FileScope {
+    pub(super) commit_sha: String,
+    pub(super) worktree_id: String,
+}
+
+impl FileScope {
+    pub(super) fn commit(commit_sha: String) -> Self {
+        Self { commit_sha, worktree_id: String::new() }
+    }
+
+    pub(super) fn worktree(worktree_id: String) -> Self {
+        Self { commit_sha: String::new(), worktree_id }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedIndexFile {
     pub(crate) file: IndexFile,

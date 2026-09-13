@@ -15,6 +15,8 @@ pub mod remove;
 
 mod adoption_hints;
 pub(crate) mod change_coupling;
+// #77 Phase 2 chunk-text compression. pub(crate) so the read layer (`crate::query`) can decompress
+// stored blobs, not just the index write path.
 pub(crate) mod chunk_text_store;
 pub(crate) mod corpus;
 mod discovery;
@@ -37,8 +39,6 @@ mod prep;
 mod query_api;
 mod rebuild;
 mod staleness;
-// #77 Phase 2 chunk-text compression. pub(crate) so the read layer (`crate::query`) can decompress
-// stored blobs, not just the index write path.
 mod util;
 mod worktree_overlay;
 pub use adoption_hints::{
@@ -46,9 +46,12 @@ pub use adoption_hints::{
     is_root_already_indexed, same_identity_join_note, would_discover_any_file,
 };
 pub use discovery::DiscoveryStatus;
-pub(crate) use discovery::*;
+pub(crate) use discovery::{discovery_plan, target_for_path};
 pub use git_context::resolve_git_context;
-pub(crate) use git_context::*;
+pub(crate) use git_context::{
+    GitChangedPaths, git_changed_paths, head_sha, is_worktree_dirty, live_worktree_contexts,
+    resolve_worktree_scope, worktree_id_of,
+};
 
 /// The domain builders the db layer's migrations/adoption may invoke (see
 /// `rag_rat_db::hooks::MigrationHooks`) — constructed here because this crate is the one that
@@ -84,7 +87,15 @@ pub use lifecycle::{
 };
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
 pub use parser_failures::ParserFailure;
-pub(crate) use prep::*;
+use prep::FileScope;
+pub(crate) use prep::{
+    IndexFile, PreparedChunk, PreparedIndexFile, canonicalize_nearest_ancestor,
+    collect_changed_index_files, collect_index_files, explicit_index_files_and_changes,
+    index_wave_size, join_git_history_prepare, lexically_normalized_within_root,
+    path_crosses_symlink, prepare_files_with_progress, prepare_index_content_from_text,
+    resolves_within_root, root_relative_path, should_report_file_progress,
+    spawn_git_history_prepare, spawn_git_history_prepare_with_plan,
+};
 pub(crate) use query_api::CloneDeltaHint;
 pub use query_api::{
     CLONE_DELTA_MAX_FILES, CandidateCloneClass, CloneCheckInput, CloneCompleteness,
@@ -103,7 +114,11 @@ pub use query_api::{
     WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport, WorktreeOverlay, reclaim_freelist_at,
 };
 pub use schema::RegisteredRepo;
-pub(crate) use util::*;
+#[cfg(test)]
+pub(crate) use util::table_row_count;
+pub(crate) use util::{
+    file_metadata_ms, path_string_for_seed, scoped_chunk_row_count, text_has_test_marker,
+};
 pub(crate) use worktree_overlay::linked_source_root;
 pub use worktree_overlay::{
     ChangedPathsCoverage, OverlayBasisUpdate, OverlayLogicalRebuild, OverlayRefreshTail,
@@ -452,12 +467,6 @@ pub enum IndexError {
 }
 
 #[derive(Debug)]
-struct FileRow {
-    language: Language,
-    kind: TargetKind,
-}
-
-#[derive(Debug)]
 struct GraphReindexFile {
     id: i64,
     path: String,
@@ -477,38 +486,6 @@ struct GraphPathRow {
     indexed_revision: String,
 }
 
-#[derive(Debug)]
-struct IndexedFile {
-    path: String,
-    sha256: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct IndexFile {
-    full_path: PathBuf,
-    relative_path: PathBuf,
-    language: Language,
-    kind: TargetKind,
-    commit_sha: String,
-    worktree_id: String,
-}
-
-#[derive(Debug, Clone)]
-struct FileScope {
-    commit_sha: String,
-    worktree_id: String,
-}
-
-impl FileScope {
-    fn commit(commit_sha: String) -> Self {
-        Self { commit_sha, worktree_id: String::new() }
-    }
-
-    fn worktree(worktree_id: String) -> Self {
-        Self { commit_sha: String::new(), worktree_id }
-    }
-}
-
 #[cfg(test)]
 mod schema_bootstrap_tests;
 
@@ -517,25 +494,3 @@ mod schema_bootstrap_tests;
 // `assert_sibling_intact`. See the module docs for what it enforces and how to opt out.
 #[cfg(test)]
 pub(crate) mod poison_sibling;
-
-#[cfg(test)]
-mod generated_path_tests {
-    use rag_rat_base::path_class::is_generated_path;
-
-    #[test]
-    fn generated_dirs_match_at_any_depth_including_root() {
-        // Nested and root-level codegen dirs both count (#202 review P2): the old
-        // `contains("/generated/")` needed a leading separator and missed the root case.
-        assert!(is_generated_path("packages/held-core/src/generated/foo.ts"));
-        assert!(is_generated_path("generated/bindings.rs"));
-        assert!(is_generated_path("generated-web/foo.ts"));
-        assert!(is_generated_path("apps/web/src/generated-web/bar.ts"));
-        // Declaration / wasm-bindgen output by suffix.
-        assert!(is_generated_path("types/index.d.ts"));
-        assert!(is_generated_path("pkg/app_bg.wasm.d.ts"));
-        // Hand-written source is not generated — and a substring near-miss must not false-positive.
-        assert!(!is_generated_path("src/lib.rs"));
-        assert!(!is_generated_path("src/pre-generated-data/seed.rs"));
-        assert!(!is_generated_path("src/generator.rs"));
-    }
-}

@@ -6,6 +6,20 @@ use rag_rat_base::time::now_ms;
 
 use super::*;
 
+/// The target identity of an indexed file row — what a heal re-parses the file as.
+#[derive(Debug)]
+pub(super) struct FileRow {
+    pub(super) language: Language,
+    pub(super) kind: TargetKind,
+}
+
+/// An indexed file's path and content digest.
+#[derive(Debug)]
+pub(super) struct IndexedFile {
+    pub(super) path: String,
+    pub(super) sha256: String,
+}
+
 /// One exact-scope-key file row, as [`IndexDatabase::scope_row_state`] reads it for the incremental
 /// write phase's skip gates.
 pub(super) struct ScopeRowState {
