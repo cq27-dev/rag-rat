@@ -29,6 +29,12 @@ use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
 use crate::{cbor, content_projection, identity};
 
+/// A stored fixed-width blob as an array. The content layer keeps its own wrong-length wording
+/// (`expected N bytes, got M`), distinct from the account layer's [`crate::account::id::fixed`].
+pub(super) fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
+    bytes.try_into().map_err(|_| anyhow::anyhow!("expected {N} bytes, got {}", bytes.len()))
+}
+
 type EntryHash = [u8; 32];
 
 const PENDING_REFOLD_CONTENT_CANDIDATE: i64 = 1;
@@ -2989,10 +2995,6 @@ pub fn content_created_by(
     Ok(created)
 }
 
-fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
-    bytes.try_into().map_err(|_| anyhow::anyhow!("expected {N} bytes, got {}", bytes.len()))
-}
-
 #[cfg(test)]
 mod tests {
     use rag_rat_db::schema;
@@ -3006,6 +3008,12 @@ mod tests {
     use crate::account::ops::entry_type;
     use crate::device::{DeviceSecret, DeviceX25519Secret};
     use crate::stream::StreamId;
+
+    #[test]
+    fn fixed_reports_the_content_wrong_length_wording() {
+        let err = fixed::<32>(&[0; 1]).unwrap_err();
+        assert_eq!(err.to_string(), "expected 32 bytes, got 1");
+    }
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -7331,9 +7339,9 @@ mod tests {
         };
         use crate::account::id::account_id_from_genesis_payload;
         use crate::account::ops::{self as account_ops, AccountOp, entry_type};
+        use crate::account::test_support::Dev;
         use crate::account::{AccountId, DeviceRole};
-        use crate::device::{DeviceSecret, DeviceX25519Secret};
-        use crate::op::DeviceFingerprint;
+        use crate::device::DeviceSecret;
 
         /// The normalized verdict both folds must agree on — the effect the cut has on ONE target
         /// entry, projected out of each fold's own taxonomy.
@@ -7356,25 +7364,6 @@ mod tests {
         enum Target {
             BeyondCut,
             UnderCut,
-        }
-
-        /// A seed-deterministic account-fold test device.
-        struct Dev {
-            secret: DeviceSecret,
-            fp: DeviceFingerprint,
-            ed: [u8; 32],
-            x: [u8; 32],
-        }
-
-        impl Dev {
-            fn new(seed: u8) -> Self {
-                let secret = DeviceSecret::from_seed(&[seed; 32]);
-                let public = secret.public();
-                let x = DeviceX25519Secret::from_seed(&[seed.wrapping_add(0x80); 32])
-                    .public()
-                    .to_bytes();
-                Dev { fp: public.fingerprint(), ed: public.to_bytes(), x, secret }
-            }
         }
 
         /// A minimal account-log authoring fixture: it threads each device's `(seq, prev)` chain

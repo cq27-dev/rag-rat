@@ -40,6 +40,8 @@ mod registers;
 mod secrets;
 mod snapshot;
 mod storage;
+#[cfg(test)]
+mod test_support;
 
 // The in-tx `/2`-ownership ensure seam + the two read-only `/2`-stream resolvers (C3.4b-ii, #676):
 // `owned_stream_v2_id` (pure derivation — the live seam's stream resolver) and

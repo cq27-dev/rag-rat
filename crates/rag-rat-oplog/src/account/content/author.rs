@@ -39,7 +39,7 @@ use super::super::limits::CONTENT_ENVELOPE_MAX_BYTES;
 use super::super::secrets::{self, SealingKeyOutcome};
 use super::super::{AccountId, storage as account_storage};
 use super::envelope::{self, ContentEntryHeader, VerifiedContentEntry};
-use super::storage as content_storage;
+use super::storage::{self as content_storage, fixed};
 use crate::op::{self, DeviceFingerprint, MemoryOp};
 use crate::stream::StreamId;
 use crate::{LocalDevice, content_projection, local_device};
@@ -880,10 +880,6 @@ fn content_status(
         |row| row.get(0),
     )
     .optional()
-}
-
-fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
-    bytes.try_into().map_err(|_| anyhow::anyhow!("expected {N} bytes, got {}", bytes.len()))
 }
 
 #[cfg(test)]

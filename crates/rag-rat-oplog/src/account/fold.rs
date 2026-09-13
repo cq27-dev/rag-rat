@@ -2677,28 +2677,12 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
 mod tests {
     use super::*;
     use crate::account::envelope::{sign_account_entry, verify_account_signed};
+    use crate::account::test_support::Dev;
     use crate::account::{AccountId, ops as account_ops, snapshot};
     use crate::device::{DeviceSecret, DeviceX25519Secret};
     use crate::stream::{StreamId, StreamSpec, StreamSpecV2};
 
-    /// A seed-deterministic test device: its ed25519 signer + fingerprint + the pubkeys a
-    /// Genesis/DeviceAdd op carries.
-    struct Dev {
-        secret: DeviceSecret,
-        fp: DeviceFingerprint,
-        ed: [u8; 32],
-        x: [u8; 32],
-    }
-
     impl Dev {
-        fn new(seed: u8) -> Self {
-            let secret = DeviceSecret::from_seed(&[seed; 32]);
-            let public = secret.public();
-            let x =
-                DeviceX25519Secret::from_seed(&[seed.wrapping_add(0x80); 32]).public().to_bytes();
-            Dev { fp: public.fingerprint(), ed: public.to_bytes(), x, secret }
-        }
-
         /// A distinct device from a wide index (`new` only spans a `u8`) — for building long
         /// chains.
         fn seeded(i: u32) -> Self {

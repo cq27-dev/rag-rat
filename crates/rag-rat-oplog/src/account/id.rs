@@ -11,6 +11,11 @@ use minicbor::Encoder;
 use super::limits::ACCOUNT_ID_DOMAIN;
 use crate::cbor::{self, VecEncoderExt};
 
+/// A stored 32-byte (or other fixed-width) blob as an array — a wrong length is a corrupt row.
+pub(in crate::account) fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
+    bytes.try_into().map_err(|_| anyhow::anyhow!("stored blob is {} bytes, not {N}", bytes.len()))
+}
+
 /// An account's immutable, content-derived identity: `sha256` of the domain-tagged genesis
 /// commitment. The store-global key for a principal's roster, grants, and folds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

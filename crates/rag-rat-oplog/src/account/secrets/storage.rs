@@ -23,6 +23,7 @@ use super::super::candidate::{self as account_candidate, Ancestry, HeaderView, U
 use super::super::cut::Cut;
 use super::super::envelope::{self, AccountEntryHeader};
 use super::super::fold::{EntryStatus, SECRETS_LOG, SUPPORTED_OP_VERSION};
+use super::super::id::fixed;
 use super::super::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityQuery, OwnerChainAuthority, storage,
 };
@@ -581,10 +582,6 @@ fn ancestry_relation(
     }
 }
 
-fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
-    bytes.try_into().map_err(|_| anyhow::anyhow!("stored blob is {} bytes, not {N}", bytes.len()))
-}
-
 #[cfg(test)]
 mod tests {
     use minicbor::Encoder;
@@ -598,9 +595,9 @@ mod tests {
     use crate::account::keywrap::{ContentKey, WrapContext, seal_content_key};
     use crate::account::ops::{self as control_ops, AccountOp, DeviceRole};
     use crate::account::storage::{IngestOutcome, account_ingest, entry_status};
-    use crate::device::{DeviceSecret, DeviceX25519Public, DeviceX25519Secret};
-    use crate::op::DeviceFingerprint;
-    use crate::stream::{self, StreamId, StreamSpec, StreamSpecV2};
+    use crate::account::test_support::{Dev, control_op, stream_own};
+    use crate::device::DeviceX25519Public;
+    use crate::stream::StreamId;
 
     const NOW: i64 = 1_700_000_000_000;
 
@@ -608,23 +605,6 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
-    }
-
-    struct Dev {
-        secret: DeviceSecret,
-        fp: DeviceFingerprint,
-        ed: [u8; 32],
-        x: [u8; 32],
-    }
-
-    impl Dev {
-        fn new(seed: u8) -> Self {
-            let secret = DeviceSecret::from_seed(&[seed; 32]);
-            let public = secret.public();
-            let x =
-                DeviceX25519Secret::from_seed(&[seed.wrapping_add(0x80); 32]).public().to_bytes();
-            Dev { fp: public.fingerprint(), ed: public.to_bytes(), x, secret }
-        }
     }
 
     fn genesis(founder: &Dev) -> (AccountId, Vec<u8>, [u8; 32]) {
@@ -653,50 +633,6 @@ mod tests {
         };
         let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
         (account_id, signed.signed_bytes, signed.entry_hash)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn control_op(
-        account: AccountId,
-        signer: &Dev,
-        seq: u64,
-        prev: Option<[u8; 32]>,
-        authority_ref: Option<[u8; 32]>,
-        op: &AccountOp,
-    ) -> (Vec<u8>, [u8; 32]) {
-        let payload = control_ops::encode(op).unwrap();
-        let header = AccountEntryHeader {
-            account_id: account,
-            log_id: super::super::super::fold::CONTROL_LOG,
-            device_fingerprint: signer.fp,
-            seq,
-            prev_hash: prev,
-            parent_ref: None,
-            entry_type: control_ops::entry_type_of(op),
-            op_version: 1,
-            crypto_suite: 0,
-            auth_len: 1,
-            key_id: None,
-            authority_ref,
-        };
-        let signed = sign_account_entry(&signer.secret, &header, &payload).unwrap();
-        (signed.signed_bytes, signed.entry_hash)
-    }
-
-    fn stream_own(account: AccountId) -> (StreamId, AccountOp) {
-        let spec = StreamSpecV2 {
-            owner_account_id: account,
-            policy: StreamSpec {
-                repo_set: vec!["repo-a".to_string()],
-                kind_allow_list: None,
-                relation_policy: None,
-                node_overrides: Vec::new(),
-            },
-            access_mode: crate::stream::AccessMode::Private,
-        };
-        let stream_id = stream::derive_v2(&spec).unwrap();
-        let stream_spec_bytes = stream::canonical_spec_v2_bytes(&spec).unwrap();
-        (stream_id, AccountOp::StreamOwn { stream_id, stream_spec_bytes })
     }
 
     /// Build a `StreamKeyWrap` op sealing a seed-derived content key to `recipient`.

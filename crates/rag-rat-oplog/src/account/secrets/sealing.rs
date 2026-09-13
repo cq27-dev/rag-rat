@@ -16,6 +16,7 @@
 use anyhow::Context;
 use rusqlite::{Connection, params};
 
+use super::super::id::fixed;
 use super::super::keywrap::{self, ContentKey, KeyId, WrapContext};
 use super::super::{AccountId, bootstrap, content, envelope, fold, storage};
 use super::ops::{self, DecodedSecretsOp, StreamKeyWrap};
@@ -256,10 +257,6 @@ pub(super) fn live_stream_key_epochs(
     live.sort_by_key(|key| (key.stream_id.to_bytes(), key.key_epoch, key.key_id.to_bytes()));
     live.dedup();
     Ok(live)
-}
-
-fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
-    bytes.try_into().map_err(|_| anyhow::anyhow!("stored blob is {} bytes, not {N}", bytes.len()))
 }
 
 /// Whether an accepted `StreamKeyWrap` exists for `stream_id`. Unlike local key recovery, this is
@@ -602,14 +599,15 @@ mod tests {
     use crate::account::keywrap::{ContentKey, WrapContext, seal_content_key};
     use crate::account::ops::{self as control_ops, AccountOp, DeviceRole};
     use crate::account::storage::{IngestOutcome, account_ingest, account_is_contested};
+    use crate::account::test_support::{Dev, control_op, stream_own};
     use crate::account::{
         AccountId, ensure_owned_stream_v2_in_tx, local_account,
         mint_and_author_stream_key_wrap_in_tx,
     };
-    use crate::device::{DeviceSecret, DeviceX25519Public, DeviceX25519Secret};
+    use crate::device::DeviceX25519Public;
     use crate::identity::local_device;
     use crate::op::{self, DeviceFingerprint, MemoryOp};
-    use crate::stream::{self, StreamId, StreamSpec, StreamSpecV2};
+    use crate::stream::StreamId;
 
     const NOW: i64 = 1_700_000_000_000;
     const CONTROL_LOG: u8 = 0;
@@ -619,24 +617,6 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
-    }
-
-    /// A test device (an ed25519 signer + a matching x25519 encryption key).
-    struct Dev {
-        secret: DeviceSecret,
-        fp: DeviceFingerprint,
-        ed: [u8; 32],
-        x: [u8; 32],
-    }
-
-    impl Dev {
-        fn new(seed: u8) -> Self {
-            let secret = DeviceSecret::from_seed(&[seed; 32]);
-            let public = secret.public();
-            let x =
-                DeviceX25519Secret::from_seed(&[seed.wrapping_add(0x80); 32]).public().to_bytes();
-            Dev { fp: public.fingerprint(), ed: public.to_bytes(), x, secret }
-        }
     }
 
     fn genesis(founder: &Dev) -> (AccountId, Vec<u8>, [u8; 32]) {
@@ -665,50 +645,6 @@ mod tests {
         };
         let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
         (account_id, signed.signed_bytes, signed.entry_hash)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn control_op(
-        account: AccountId,
-        signer: &Dev,
-        seq: u64,
-        prev: Option<[u8; 32]>,
-        authority_ref: Option<[u8; 32]>,
-        op: &AccountOp,
-    ) -> (Vec<u8>, [u8; 32]) {
-        let payload = control_ops::encode(op).unwrap();
-        let header = AccountEntryHeader {
-            account_id: account,
-            log_id: CONTROL_LOG,
-            device_fingerprint: signer.fp,
-            seq,
-            prev_hash: prev,
-            parent_ref: None,
-            entry_type: control_ops::entry_type_of(op),
-            op_version: 1,
-            crypto_suite: 0,
-            auth_len: 1,
-            key_id: None,
-            authority_ref,
-        };
-        let signed = sign_account_entry(&signer.secret, &header, &payload).unwrap();
-        (signed.signed_bytes, signed.entry_hash)
-    }
-
-    fn stream_own(account: AccountId) -> (StreamId, AccountOp) {
-        let spec = StreamSpecV2 {
-            owner_account_id: account,
-            policy: StreamSpec {
-                repo_set: vec!["repo-a".to_string()],
-                kind_allow_list: None,
-                relation_policy: None,
-                node_overrides: Vec::new(),
-            },
-            access_mode: crate::stream::AccessMode::Private,
-        };
-        let stream_id = stream::derive_v2(&spec).unwrap();
-        let stream_spec_bytes = stream::canonical_spec_v2_bytes(&spec).unwrap();
-        (stream_id, AccountOp::StreamOwn { stream_id, stream_spec_bytes })
     }
 
     fn device_add(dev: &Dev, role: DeviceRole) -> AccountOp {

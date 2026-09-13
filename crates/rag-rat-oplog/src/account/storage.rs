@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry};
 use super::fold::{self, EntryStatus};
-use super::id::account_id_from_genesis_payload;
+use super::id::{account_id_from_genesis_payload, fixed};
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
 use super::{AccountId, content, secrets, snapshot};
@@ -3131,11 +3131,6 @@ fn is_device_add(verified: &VerifiedAccountEntry) -> bool {
         && verified.header.entry_type == ops::entry_type::DEVICE_ADD
 }
 
-/// A stored fixed-width blob as an array (errors, never panics, on a wrong-length value).
-fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
-    bytes.try_into().map_err(|_| anyhow::anyhow!("stored blob is {} bytes, not {N}", bytes.len()))
-}
-
 /// The projected status of a single entry (§16.3), or `None` if the entry isn't stored (e.g. it is
 /// still in the pre-verify queue). A read helper for queries.
 pub(super) fn entry_status(
@@ -3166,7 +3161,7 @@ mod tests {
     };
     use crate::account::envelope::sign_account_entry;
     use crate::account::ops::{ContentCut, DeviceCut, DeviceRole, GrantRole};
-    use crate::device::{DeviceSecret, DeviceX25519Secret};
+    use crate::account::test_support::Dev;
     use crate::stream::{self, StreamSpec, StreamSpecV2};
 
     const NOW: i64 = 1_700_000_000_000;
@@ -3255,23 +3250,6 @@ mod tests {
             None,
             "a device with no open owner incarnation resolves None",
         );
-    }
-
-    struct Dev {
-        secret: DeviceSecret,
-        fp: DeviceFingerprint,
-        ed: [u8; 32],
-        x: [u8; 32],
-    }
-
-    impl Dev {
-        fn new(seed: u8) -> Self {
-            let secret = DeviceSecret::from_seed(&[seed; 32]);
-            let public = secret.public();
-            let x =
-                DeviceX25519Secret::from_seed(&[seed.wrapping_add(0x80); 32]).public().to_bytes();
-            Dev { fp: public.fingerprint(), ed: public.to_bytes(), x, secret }
-        }
     }
 
     fn genesis(founder: &Dev) -> (AccountId, Vec<u8>, [u8; 32]) {
