@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use super::raw::RawIndex;
 use super::{
     self as config, Config, ConfigError, DistillLlmConfig, DreamLlmConfig, EmbeddingConfig,
     LlmConfig, LogConfig, MemoryConfig, OracleConfig, PapertrailConfig, RawConfig, RawTarget,
@@ -105,11 +106,6 @@ impl Config {
         let local_parse: Result<RawConfig, ConfigError> =
             toml::from_str::<RawConfig>(&text).map_err(ConfigError::from).and_then(validate_raw);
         let local_config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        // The topology subject must be a discoverable directory: a RELATIVE config path like
-        // `rag-rat.toml` has the EMPTY path as its parent (`Path::parent` yields `Some("")`, not
-        // `None`), which git discovery cannot open — it means the process cwd.
-        let local_checkout =
-            if local_config_dir.as_os_str().is_empty() { Path::new(".") } else { local_config_dir };
 
         // Best-effort resolution of what the LOCAL checkout's own `[index] root` names, taken
         // BEFORE the governing seam below picks a winner — used only to detect + report a re-anchor
@@ -124,75 +120,8 @@ impl Config {
             .ok()
         });
 
-        // THE GOVERNING SEAM (see the doc comment). Linked-ness comes from git TOPOLOGY — the
-        // checkout holding the config file vs the repo's designated main worktree
-        // ([`linked_worktree_main_root`]) — and governance is UNCONDITIONAL on that predicate.
-        // It must never hang off a root-anchoring proxy: a branch-only `[index] root` makes
-        // `anchor_root_to_main_worktree` return the local root unchanged, and an equality trigger
-        // would then let the branch config govern database/identity/models — the exact
-        // split-brain the seam exists to prevent (Codex batch 8, finding 3). Anchoring outcomes
-        // affect ROOT resolution only, never who governs.
-        let (mut raw, config_dir, root, target_validation_root) =
-            match config::linked_worktree_main_root(local_checkout) {
-                Some(main_top) => match governing_main_config(&main_top)? {
-                    Some((main_raw, main_config_dir)) => {
-                        let divergent = match &local_parse {
-                            Ok(local_raw) => *local_raw != main_raw,
-                            Err(_) => true,
-                        };
-                        if divergent {
-                            let ignored = crate::paths::canonicalize_or_simplified(path);
-                            let invalid_note =
-                                if local_parse.is_err() { " (also invalid)" } else { "" };
-                            eprintln!(
-                                "rag-rat: ignoring branch config{invalid_note} {} — in a linked \
-                                 worktree the main worktree's config governs ({}); edit that file \
-                                 instead",
-                                ignored.display(),
-                                main_config_dir.join("rag-rat.toml").display(),
-                            );
-                        }
-                        // Re-derive root from MAIN's own config, exactly as loading it directly
-                        // would (its root is already the main worktree — anchoring is identity).
-                        let main_root =
-                            config::normalize_existing_dir(&main_config_dir.join(
-                                main_raw.index.root.clone().unwrap_or_else(|| ".".to_string()),
-                            ))?;
-                        (main_raw, main_config_dir, main_root.clone(), main_root)
-                    },
-                    None => {
-                        // Config-less main: the LOCAL config governs (best-effort, loudly), so
-                        // its validity is fatal exactly as in a non-linked checkout.
-                        let local_raw = local_parse?;
-                        eprintln!(
-                            "rag-rat: the main worktree has no rag-rat.toml; using {} until one \
-                             exists there (the repo's config belongs in the main worktree)",
-                            path.display(),
-                        );
-                        // Root stays anchored so the shared index still keys off the main
-                        // checkout; targets validate against the local checkout where they
-                        // exist (#219).
-                        let local_root = config::normalize_existing_dir(&local_config_dir.join(
-                            local_raw.index.root.clone().unwrap_or_else(|| ".".to_string()),
-                        ))?;
-                        let anchored_root = anchor_root_to_main_worktree(&local_root);
-                        (local_raw, local_config_dir.to_path_buf(), anchored_root, local_root)
-                    },
-                },
-                None => {
-                    // The config's own checkout is the main worktree (or there is no designated
-                    // main): the local config governs and its validity is fatal. Root anchoring
-                    // still applies for the exotic `[index] root` pointing into a linked
-                    // checkout (#218/#219) — an anchoring concern, not a governance one.
-                    let local_raw = local_parse?;
-                    let local_root = config::normalize_existing_dir(
-                        &local_config_dir
-                            .join(local_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
-                    )?;
-                    let anchored_root = anchor_root_to_main_worktree(&local_root);
-                    (local_raw, local_config_dir.to_path_buf(), anchored_root, local_root)
-                },
-            };
+        let GoverningConfig { mut raw, config_dir, root, target_validation_root } =
+            resolve_governing_raw(path, local_config_dir, local_parse)?;
 
         // #427: `root` may have ended up different from what the LOCAL checkout's own `[index]
         // root` names — either because a linked worktree's config was overridden wholesale by
@@ -201,39 +130,8 @@ impl Config {
         // can warn the operator they're indexing the main checkout, not the worktree they named.
         let source_root_reanchored_from = local_root_named.filter(|named| *named != root);
 
-        // The database path (A7 default flip): an explicit `database` key is honored as-is — the
-        // deprecated per-repo deployment, that repo stays un-consolidated and never syncs. ABSENT,
-        // the default is the CONSOLIDATED GLOBAL store, EXCEPT a pre-existing legacy
-        // `.rag-rat/index.sqlite` is kept (with a deprecation nudge toward `rag-rat consolidate`).
-        // Relative explicit paths (and the legacy path) resolve against the MAIN worktree TOP —
-        // NOT `root`, which may be a subdirectory — so every worktree of a repo AND any
-        // `root="<subdir>"` config land on the SAME index.
-        let db_base = config::main_worktree_root(&root).unwrap_or_else(|| root.clone());
-        let repo_id_override =
-            raw.index.repo_id.take().map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
-        let governing_database_key = raw.index.database.take();
-        let database_key_pinned = governing_database_key.is_some();
-        let database = match governing_database_key {
-            Some(db) if Path::new(&db).is_absolute() => PathBuf::from(db),
-            Some(db) => db_base.join(db),
-            // The keyless default probes the repo IDENTITY (root + the governing `[index]
-            // repo_id` pin): only an identity-BEARING root may land in the shared global store —
-            // see `default_database_with_disposition`.
-            None => config::resolve_default_database(&db_base, &root, repo_id_override.as_deref()),
-        };
-        // The identity gate's SECOND entrance (Codex batch 8, finding 5): an explicit pin AT the
-        // consolidated global store bypasses the keyless identity gate above, and an
-        // identity-less root (non-git, unborn HEAD) opening the shared store would fall through
-        // to adoption's sole-repo fallback — scoping this project onto whichever SIBLING repo
-        // sorts first. Refuse at resolution with the remedy. (The structural backstop for every
-        // other shared-path pin shape lives in `adopt_repo_from_config`: an identity-less open
-        // never sole-picks on a multi-repo database.)
-        if database_key_pinned
-            && Some(database.as_path()) == crate::data_dir::global_database_path().as_deref()
-            && !crate::repo_identity::identity_is_resolvable(&root, repo_id_override.as_deref())
-        {
-            return Err(ConfigError::GlobalPinWithoutIdentity);
-        }
+        let ResolvedDatabase { database, database_key_pinned, repo_id_override } =
+            resolve_database(&mut raw.index, &root)?;
         // Targets resolve from the GOVERNING config; validation runs against the checkout that
         // config describes (main when main governs; the local checkout on the config-less-main
         // fallback, tolerating branch-only dirs — #219). `ResolvedTarget.directories` are
@@ -242,31 +140,14 @@ impl Config {
         // `for_linked_worktree_overlay` and indexes the branch with it (#219).
         let targets = resolve_targets(&target_validation_root, raw.target_bindings, raw.target)?;
         let mut llm = LlmConfig::try_from(raw.llm)?;
-        // Resolve a RELATIVE cookbook recipe PATH against the GOVERNING config dir, not the
-        // process CWD (R6): the recipe is handed to `node`/`npx`, which resolve it against
-        // wherever reconcile/the watcher runs — ENOENT from a subdir or a daemon.
-        if let Some(remote) = llm.embedding.remote.as_mut()
-            && let Some(cookbook) = remote.cookbook.as_ref()
-            && let Some(resolved) = config::resolve_relative_cookbook_path(cookbook, &config_dir)
-        {
-            remote.cookbook = Some(resolved);
+        if let Some(remote) = llm.embedding.remote.as_mut() {
+            resolve_cookbook_in_place(&mut remote.cookbook, &config_dir);
         }
-        // Same relative-cookbook resolution for the dream remote — its recipe is handed to
-        // `node`/`npx` too, so a relative path must resolve against the config dir, not the process
-        // CWD. `remote` is not optional for dream (a local-Ollama connect default), so only the
-        // ephemeral case has a cookbook to rewrite.
-        if let Some(cookbook) = llm.dream.remote.cookbook.as_ref()
-            && let Some(resolved) = config::resolve_relative_cookbook_path(cookbook, &config_dir)
-        {
-            llm.dream.remote.cookbook = Some(resolved);
-        }
-        // Same relative-cookbook resolution for the distill remote (#704) — it rides the same
-        // `RemoteDreamConfig` and hands its recipe to `node`/`npx` too.
-        if let Some(cookbook) = llm.distill.remote.cookbook.as_ref()
-            && let Some(resolved) = config::resolve_relative_cookbook_path(cookbook, &config_dir)
-        {
-            llm.distill.remote.cookbook = Some(resolved);
-        }
+        // `remote` is not optional for dream (a local-Ollama connect default), so only the
+        // ephemeral case has a cookbook to rewrite; the distill remote (#704) rides the same
+        // `RemoteDreamConfig`.
+        resolve_cookbook_in_place(&mut llm.dream.remote.cookbook, &config_dir);
+        resolve_cookbook_in_place(&mut llm.distill.remote.cookbook, &config_dir);
         let watch = raw.watch.into();
         let version_check = raw.version_check.into();
         let oracle = raw.oracle.into();
@@ -278,15 +159,7 @@ impl Config {
         let papertrail =
             raw.papertrail.map(PapertrailConfig::try_from).transpose()?.unwrap_or_default();
         let mut log = LogConfig::try_from(raw.log)?;
-        // Finalize `dir`: empty (unset) → sibling of the db (`<db_parent>/logs`); a set value is
-        // resolved relative to the GOVERNING config dir (absolute honored).
-        log.dir = if log.dir.as_os_str().is_empty() {
-            database.parent().map(|p| p.join("logs")).unwrap_or_else(|| PathBuf::from("logs"))
-        } else if log.dir.is_absolute() {
-            log.dir.clone()
-        } else {
-            config_dir.join(&log.dir)
-        };
+        log.dir = finalize_log_dir(&log.dir, &database, &config_dir);
 
         Ok(Self {
             root,
@@ -337,6 +210,177 @@ impl Config {
             source_root_reanchored_from: None,
             allow_empty: false,
         }
+    }
+}
+
+/// Which config GOVERNS a load, and the roots it resolves to.
+struct GoverningConfig {
+    raw: RawConfig,
+    /// The governing config's directory: relative cookbook recipes and `[log] dir` resolve here.
+    config_dir: PathBuf,
+    /// The (main-anchored) index root.
+    root: PathBuf,
+    /// The checkout the governing config's targets validate against.
+    target_validation_root: PathBuf,
+}
+
+/// THE GOVERNING SEAM (see [`Config::load`]). Linked-ness comes from git TOPOLOGY — the checkout
+/// holding the config file vs the repo's designated main worktree ([`linked_worktree_main_root`])
+/// — and governance is UNCONDITIONAL on that predicate. It must never hang off a root-anchoring
+/// proxy: a branch-only `[index] root` makes `anchor_root_to_main_worktree` return the local root
+/// unchanged, and an equality trigger would then let the branch config govern
+/// database/identity/models — the exact split-brain the seam exists to prevent (Codex batch 8,
+/// finding 3). Anchoring outcomes affect ROOT resolution only, never who governs.
+///
+/// [`linked_worktree_main_root`]: config::linked_worktree_main_root
+fn resolve_governing_raw(
+    path: &Path,
+    local_config_dir: &Path,
+    local_parse: Result<RawConfig, ConfigError>,
+) -> Result<GoverningConfig, ConfigError> {
+    // The topology subject must be a discoverable directory: a RELATIVE config path like
+    // `rag-rat.toml` has the EMPTY path as its parent (`Path::parent` yields `Some("")`, not
+    // `None`), which git discovery cannot open — it means the process cwd.
+    let local_checkout =
+        if local_config_dir.as_os_str().is_empty() { Path::new(".") } else { local_config_dir };
+    Ok(match config::linked_worktree_main_root(local_checkout) {
+        Some(main_top) => match governing_main_config(&main_top)? {
+            Some((main_raw, main_config_dir)) => {
+                let divergent = match &local_parse {
+                    Ok(local_raw) => *local_raw != main_raw,
+                    Err(_) => true,
+                };
+                if divergent {
+                    let ignored = crate::paths::canonicalize_or_simplified(path);
+                    let invalid_note = if local_parse.is_err() { " (also invalid)" } else { "" };
+                    eprintln!(
+                        "rag-rat: ignoring branch config{invalid_note} {} — in a linked worktree \
+                         the main worktree's config governs ({}); edit that file instead",
+                        ignored.display(),
+                        main_config_dir.join("rag-rat.toml").display(),
+                    );
+                }
+                // Re-derive root from MAIN's own config, exactly as loading it directly would (its
+                // root is already the main worktree — anchoring is identity).
+                let main_root = config::normalize_existing_dir(
+                    &main_config_dir
+                        .join(main_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
+                )?;
+                GoverningConfig {
+                    raw: main_raw,
+                    config_dir: main_config_dir,
+                    root: main_root.clone(),
+                    target_validation_root: main_root,
+                }
+            },
+            None => {
+                // Config-less main: the LOCAL config governs (best-effort, loudly), so its
+                // validity is fatal exactly as in a non-linked checkout.
+                let local_raw = local_parse?;
+                eprintln!(
+                    "rag-rat: the main worktree has no rag-rat.toml; using {} until one exists \
+                     there (the repo's config belongs in the main worktree)",
+                    path.display(),
+                );
+                // Root stays anchored so the shared index still keys off the main checkout;
+                // targets validate against the local checkout where they exist (#219).
+                let local_root = config::normalize_existing_dir(
+                    &local_config_dir
+                        .join(local_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
+                )?;
+                GoverningConfig {
+                    raw: local_raw,
+                    config_dir: local_config_dir.to_path_buf(),
+                    root: anchor_root_to_main_worktree(&local_root),
+                    target_validation_root: local_root,
+                }
+            },
+        },
+        None => {
+            // The config's own checkout is the main worktree (or there is no designated main): the
+            // local config governs and its validity is fatal. Root anchoring still applies for the
+            // exotic `[index] root` pointing into a linked checkout (#218/#219) — an anchoring
+            // concern, not a governance one.
+            let local_raw = local_parse?;
+            let local_root = config::normalize_existing_dir(
+                &local_config_dir
+                    .join(local_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
+            )?;
+            GoverningConfig {
+                raw: local_raw,
+                config_dir: local_config_dir.to_path_buf(),
+                root: anchor_root_to_main_worktree(&local_root),
+                target_validation_root: local_root,
+            }
+        },
+    })
+}
+
+/// The governing config's database location and the identity keys that decide it.
+struct ResolvedDatabase {
+    database: PathBuf,
+    database_key_pinned: bool,
+    repo_id_override: Option<String>,
+}
+
+/// The database path (A7 default flip): an explicit `database` key is honored as-is — the
+/// deprecated per-repo deployment, that repo stays un-consolidated and never syncs. ABSENT, the
+/// default is the CONSOLIDATED GLOBAL store, EXCEPT a pre-existing legacy `.rag-rat/index.sqlite`
+/// is kept (with a deprecation nudge toward `rag-rat consolidate`). Relative explicit paths (and
+/// the legacy path) resolve against the MAIN worktree TOP — NOT `root`, which may be a
+/// subdirectory — so every worktree of a repo AND any `root="<subdir>"` config land on the SAME
+/// index. Takes the governing `repo_id` and `database` keys out of `index`.
+fn resolve_database(index: &mut RawIndex, root: &Path) -> Result<ResolvedDatabase, ConfigError> {
+    let db_base = config::main_worktree_root(root).unwrap_or_else(|| root.to_path_buf());
+    let repo_id_override =
+        index.repo_id.take().map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
+    let governing_database_key = index.database.take();
+    let database_key_pinned = governing_database_key.is_some();
+    let database = match governing_database_key {
+        Some(db) if Path::new(&db).is_absolute() => PathBuf::from(db),
+        Some(db) => db_base.join(db),
+        // The keyless default probes the repo IDENTITY (root + the governing `[index] repo_id`
+        // pin): only an identity-BEARING root may land in the shared global store — see
+        // `default_database_with_disposition`.
+        None => config::resolve_default_database(&db_base, root, repo_id_override.as_deref()),
+    };
+    // The identity gate's SECOND entrance (Codex batch 8, finding 5): an explicit pin AT the
+    // consolidated global store bypasses the keyless identity gate above, and an identity-less
+    // root (non-git, unborn HEAD) opening the shared store would fall through to adoption's
+    // sole-repo fallback — scoping this project onto whichever SIBLING repo sorts first. Refuse at
+    // resolution with the remedy. (The structural backstop for every other shared-path pin shape
+    // lives in `adopt_repo_from_config`: an identity-less open never sole-picks on a multi-repo
+    // database.)
+    if database_key_pinned
+        && Some(database.as_path()) == crate::data_dir::global_database_path().as_deref()
+        && !crate::repo_identity::identity_is_resolvable(root, repo_id_override.as_deref())
+    {
+        return Err(ConfigError::GlobalPinWithoutIdentity);
+    }
+    Ok(ResolvedDatabase { database, database_key_pinned, repo_id_override })
+}
+
+/// Resolve a RELATIVE cookbook recipe PATH against the GOVERNING config dir, not the process CWD
+/// (R6): the recipe is handed to `node`/`npx`, which resolve it against wherever
+/// reconcile/the watcher runs — ENOENT from a subdir or a daemon.
+fn resolve_cookbook_in_place(cookbook: &mut Option<String>, config_dir: &Path) {
+    if let Some(resolved) = cookbook
+        .as_deref()
+        .and_then(|recipe| config::resolve_relative_cookbook_path(recipe, config_dir))
+    {
+        *cookbook = Some(resolved);
+    }
+}
+
+/// Finalize `[log] dir`: empty (unset) → sibling of the db (`<db_parent>/logs`); a set value is
+/// resolved relative to the GOVERNING config dir (absolute honored).
+fn finalize_log_dir(dir: &Path, database: &Path, config_dir: &Path) -> PathBuf {
+    if dir.as_os_str().is_empty() {
+        database.parent().map(|p| p.join("logs")).unwrap_or_else(|| PathBuf::from("logs"))
+    } else if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        config_dir.join(dir)
     }
 }
 
