@@ -116,31 +116,7 @@ pub(super) fn sign_entry(
     lamport: u64,
     op: &MemoryOp,
 ) -> SignedEntry {
-    let device_fingerprint = secret.public().fingerprint();
-    let op_bytes = op::encode(op);
-    let body_bytes = encode_body(&BodyParts {
-        stream_id,
-        prev_hash,
-        lamport,
-        device_fingerprint,
-        op_bytes: &op_bytes,
-    });
-    let entry_hash = cbor::sha256(&body_bytes);
-    let signature = secret.sign(&body_bytes);
-    let signed_bytes = encode_signed(&body_bytes, &signature);
-    SignedEntry {
-        entry: VerifiedEntry {
-            stream_id,
-            prev_hash,
-            lamport,
-            device_fingerprint,
-            op_bytes,
-            entry_hash,
-        },
-        signature,
-        body_bytes,
-        signed_bytes,
-    }
+    sign_entry_from_op_bytes(secret, stream_id, prev_hash, lamport, op::encode(op))
 }
 
 /// Sign a body over ARBITRARY op bytes (not `op::encode` of a known [`MemoryOp`]). The table-sync
