@@ -51,7 +51,9 @@ jobs:
           # box — a job starting afterwards compiles first, behind the locks above, before it runs
           # anything. This runner's own dir is idle by construction and is always swept.
           own="${CARGO_TARGET_DIR:-}"
-          siblings_idle='[ "$(pgrep -c -f Runner.Worker)" -le 1 ]'
+          # By process name, not command line: a `-f` match would count the shell evaluating this
+          # very guard, whose command line names the worker.
+          siblings_idle='[ "$(pgrep -cx Runner.Worker)" -le 1 ]'
           # This runner's own dir first — nothing else runs on this runner — so the job always gets
           # its cleanup in even when a sibling stays busy for the whole wait (a benchmark, say).
           if [ -d "$own" ]; then
