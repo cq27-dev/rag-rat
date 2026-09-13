@@ -49,6 +49,7 @@ pub(crate) fn graph_neighbors(
     // operator. Graph traversal and graph metadata already require a resolved operator target;
     // impact must too.
     let resolved_operator_only = crate::graph::RESOLVED_OPERATOR_ONLY;
+    let confidence_order = crate::graph::CONFIDENCE_ORDER_SQL;
     let sql_for = |predicate: &str| {
         format!(
             "
@@ -69,12 +70,7 @@ pub(crate) fn graph_neighbors(
           AND ({predicate})
           AND {source_path_col} IS NOT NULL
         ORDER BY
-            CASE edges.confidence
-                WHEN 'Exact' THEN 0
-                WHEN 'Syntactic' THEN 1
-                WHEN 'NameOnly' THEN 2
-                ELSE 3
-            END,
+            {confidence_order},
             edges.edge_kind,
             {source_path_col},
             {source_symbol_col}

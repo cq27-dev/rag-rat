@@ -27,6 +27,15 @@ use super::*;
 pub(crate) const RESOLVED_OPERATOR_ONLY: &str =
     "(edges.edge_kind != 'uses_operator' OR edges.to_symbol_id IS NOT NULL)";
 
+/// The heuristic confidence ladder as an `ORDER BY` key over the stored `edges.confidence` tokens,
+/// strongest first. It must rank tokens in the same order as [`effective_confidence_rank`] ranks
+/// their normalized form (that ladder adds only the oracle `compiler` tier on top), which
+/// `confidence_order_sql_agrees_with_effective_confidence_rank` pins. Valid wherever the edges
+/// table is named or aliased `edges`.
+pub(crate) const CONFIDENCE_ORDER_SQL: &str = "CASE edges.confidence WHEN 'Exact' THEN 0 WHEN \
+                                               'Syntactic' THEN 1 WHEN 'NameOnly' THEN 2 ELSE 3 \
+                                               END";
+
 pub(crate) fn validate_edge_kinds(edge_kinds: &[String]) -> anyhow::Result<()> {
     for edge_kind in edge_kinds {
         if !is_optional_edge_kind(edge_kind) {

@@ -468,3 +468,16 @@ fn fuzzy_reaches_a_short_name_caller_that_syntactic_cannot() {
     );
     assert_eq!(name_only.confidence, "name_only");
 }
+
+/// The SQL ladder and the Rust ladder rank the same stored tokens in the same order. The Rust side
+/// adds the oracle `compiler` tier at 0, so every heuristic tier sits exactly one rank lower there.
+#[test]
+fn confidence_order_sql_agrees_with_effective_confidence_rank() {
+    let conn = Connection::open_in_memory().unwrap();
+    let sql = format!("SELECT {CONFIDENCE_ORDER_SQL} FROM (SELECT ?1 AS confidence) AS edges");
+    for token in ["Exact", "Syntactic", "NameOnly", "Ambiguous"] {
+        let sql_rank: i64 = conn.query_row(&sql, [token], |row| row.get(0)).unwrap();
+        let rust_rank = effective_confidence_rank(normalize_confidence(token));
+        assert_eq!(sql_rank + 1, i64::from(rust_rank), "{token}");
+    }
+}

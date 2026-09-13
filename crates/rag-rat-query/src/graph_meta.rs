@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::graph::RESOLVED_OPERATOR_ONLY;
+use crate::graph::{CONFIDENCE_ORDER_SQL, RESOLVED_OPERATOR_ONLY};
 use crate::{ReadChunk, SearchHit};
 
 const FULL_GRAPH_NOTE: &str = "Call graph is tree-sitter/syntactic, not compiler-resolved.";
@@ -372,12 +372,7 @@ fn callers(
           AND (edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL AND edges.to_name_id = \
          (SELECT id FROM name_strings WHERE value = ?2)))
         ORDER BY
-          CASE edges.confidence
-            WHEN 'Exact' THEN 0
-            WHEN 'Syntactic' THEN 1
-            WHEN 'NameOnly' THEN 2
-            ELSE 3
-          END,
+          {CONFIDENCE_ORDER_SQL},
           source_files.path,
           source_chunks.start_line
         LIMIT ?3
@@ -448,12 +443,7 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
           )
           AND {RESOLVED_OPERATOR_ONLY}
         ORDER BY
-          CASE edges.confidence
-            WHEN 'Exact' THEN 0
-            WHEN 'Syntactic' THEN 1
-            WHEN 'NameOnly' THEN 2
-            ELSE 3
-          END,
+          {CONFIDENCE_ORDER_SQL},
           source_chunks.start_line,
           edges.to_name
         LIMIT ?2
@@ -525,23 +515,18 @@ fn referenced_types(
     symbol_id: i64,
     limit: u32,
 ) -> anyhow::Result<Vec<TypeEvidence>> {
-    let mut stmt = conn.prepare_cached(
+    let mut stmt = conn.prepare_cached(&format!(
         "
         SELECT DISTINCT edges.to_name, edges.confidence
         FROM edges
         WHERE edges.from_symbol_id = ?1
           AND edges.edge_kind IN ('references_type', 'implements', 'extends')
         ORDER BY
-          CASE edges.confidence
-            WHEN 'Exact' THEN 0
-            WHEN 'Syntactic' THEN 1
-            WHEN 'NameOnly' THEN 2
-            ELSE 3
-          END,
+          {CONFIDENCE_ORDER_SQL},
           edges.to_name
         LIMIT ?2
         ",
-    )?;
+    ))?;
     let rows = stmt.query_map(params![symbol_id, i64::from(limit)], |row| {
         Ok(TypeEvidence {
             name: row.get(0)?,

@@ -51,12 +51,7 @@ pub fn traverse_with_options(
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
             ORDER BY match_tier,
-                CASE edges.confidence
-                    WHEN 'Exact' THEN 0
-                    WHEN 'Syntactic' THEN 1
-                    WHEN 'NameOnly' THEN 2
-                    ELSE 3
-                END,
+                {CONFIDENCE_ORDER_SQL},
                 edges.edge_kind,
                 edges.from_name
             LIMIT ?5
@@ -96,12 +91,7 @@ pub fn traverse_with_options(
               AND ({visibility_filter})
               AND ?4 IN ('true', 'false')
             ORDER BY
-                CASE edges.confidence
-                    WHEN 'Exact' THEN 0
-                    WHEN 'Syntactic' THEN 1
-                    WHEN 'NameOnly' THEN 2
-                    ELSE 3
-                END,
+                {CONFIDENCE_ORDER_SQL},
                 edges.edge_kind,
                 edges.to_name
             LIMIT ?5
