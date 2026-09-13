@@ -2,8 +2,7 @@ use super::*;
 
 /// The one spelling of a symbol tool's [`SymbolSelector`]: every symbol arg struct carries the same
 /// selector fields, and `symbol_id` is never caller-supplied. `language` is spelled at each call
-/// site because only `symbol_lookup` and the `*_for_symbol` ref tools let the caller pin one. The
-/// `ref` form clones the two names for a handler that still reads them after resolving.
+/// site because only `symbol_lookup` and the `*_for_symbol` ref tools let the caller pin one.
 macro_rules! selector_from {
     ($args:expr, language: $language:expr) => {
         SymbolSelector {
@@ -16,17 +15,34 @@ macro_rules! selector_from {
             limit: $args.limit,
         }
     };
-    (ref $args:expr, language: $language:expr) => {
-        SymbolSelector {
-            logical_symbol_id: $args.logical_symbol_id,
-            symbol_id: None,
-            symbol_path: $args.symbol_path.clone(),
-            symbol: $args.symbol.clone(),
-            language: $language,
-            allow_ambiguous: $args.allow_ambiguous,
-            limit: $args.limit,
-        }
-    };
+}
+
+/// A `select_symbol` outcome collapsed to what a symbol tool answers from. The contract every
+/// symbol tool shares lives here once: a disambiguation list is returned as-is, no match answers
+/// `null`, and a name-level answer is offered only when the caller opted into ambiguous matching
+/// and passed a bare name.
+enum SymbolAnswer {
+    /// The selector resolved one symbol.
+    Selected(Box<rag_rat_query::symbol::SymbolHit>),
+    /// Nothing resolved, the caller opted into ambiguous matching, and passed this bare name.
+    ByName(String),
+    /// The finished answer: `null`, or the disambiguation list.
+    Done(Value),
+}
+
+fn select_for_answer(
+    db: &IndexDatabase,
+    selector: &SymbolSelector,
+) -> anyhow::Result<SymbolAnswer> {
+    Ok(match db.select_symbol(selector)? {
+        Ok(Some(symbol)) => SymbolAnswer::Selected(Box::new(symbol)),
+        Ok(None) if selector.allow_ambiguous => match selector.symbol.clone() {
+            Some(name) => SymbolAnswer::ByName(name),
+            None => SymbolAnswer::Done(Value::Null),
+        },
+        Ok(None) => SymbolAnswer::Done(Value::Null),
+        Err(disambiguation) => SymbolAnswer::Done(json!(disambiguation)),
+    })
 }
 
 pub(crate) fn call_tool_with_db(
@@ -375,7 +391,6 @@ pub(crate) fn graph_tool(
     let limit = args.limit;
     let include_coverage = included(&args.include, GraphInclude::Coverage, false);
     let include_memories = included(&args.include, GraphInclude::Memories, true);
-    let allow_ambiguous = args.allow_ambiguous;
     // One traversal spec for both answers; only the resolved branch pins it to a symbol id.
     let mut options = GraphTraversalOptions {
         include_references: included(&args.include, GraphInclude::References, false),
@@ -387,10 +402,9 @@ pub(crate) fn graph_tool(
         symbol_id: None,
         logical_symbol_id: args.logical_symbol_id,
     };
-    let selector = selector_from!(ref args, language: None);
-    let selected = db.select_symbol(&selector)?;
-    match selected {
-        Ok(Some(symbol)) => {
+    let selector = selector_from!(args, language: None);
+    match select_for_answer(db, &selector)? {
+        SymbolAnswer::Selected(symbol) => {
             options.symbol_id = Some(symbol.symbol_id);
             let mut value = json!(db.graph_traversal_report(
                 if reverse { "find_callers" } else { "trace_callees" },
@@ -421,19 +435,15 @@ pub(crate) fn graph_tool(
             }
             Ok(value)
         },
-        Ok(None) if allow_ambiguous => {
-            let Some(symbol) = args.symbol.as_deref() else {
-                return Ok(Value::Null);
-            };
+        SymbolAnswer::ByName(symbol) => {
             let hops = if reverse {
-                db.find_callers_with_options(symbol, limit, &options)?
+                db.find_callers_with_options(&symbol, limit, &options)?
             } else {
-                db.trace_callees_with_options(symbol, limit, &options)?
+                db.trace_callees_with_options(&symbol, limit, &options)?
             };
             Ok(json!(hops))
         },
-        Ok(None) => Ok(Value::Null),
-        Err(disambiguation) => Ok(json!(disambiguation)),
+        SymbolAnswer::Done(answer) => Ok(answer),
     }
 }
 
@@ -441,17 +451,12 @@ pub(crate) fn docs_for_symbol_tool(
     db: &IndexDatabase,
     args: SymbolGraphArgs,
 ) -> anyhow::Result<Value> {
-    let selector = selector_from!(ref args, language: None);
-    match db.select_symbol(&selector)? {
-        Ok(Some(symbol)) => Ok(json!(db.docs_for_selected_symbol(&symbol, args.limit)?)),
-        Ok(None) if args.allow_ambiguous => {
-            let Some(symbol) = args.symbol.as_deref() else {
-                return Ok(Value::Null);
-            };
-            Ok(json!(db.docs_for_symbol(symbol, args.limit)?))
-        },
-        Ok(None) => Ok(Value::Null),
-        Err(disambiguation) => Ok(json!(disambiguation)),
+    let selector = selector_from!(args, language: None);
+    match select_for_answer(db, &selector)? {
+        SymbolAnswer::Selected(symbol) =>
+            Ok(json!(db.docs_for_selected_symbol(&symbol, args.limit)?)),
+        SymbolAnswer::ByName(symbol) => Ok(json!(db.docs_for_symbol(&symbol, args.limit)?)),
+        SymbolAnswer::Done(answer) => Ok(answer),
     }
 }
 
@@ -461,8 +466,8 @@ pub(crate) fn compare_graph_to_text_tool(
     resolution_mode: GraphResolutionMode,
 ) -> anyhow::Result<Value> {
     let selector = selector_from!(args, language: None);
-    match db.select_symbol(&selector)? {
-        Ok(Some(symbol)) => {
+    match select_for_answer(db, &selector)? {
+        SymbolAnswer::Selected(symbol) => {
             let options = GraphTraversalOptions {
                 include_references: included(&args.include, CompareInclude::References, false),
                 include_unresolved: included(&args.include, CompareInclude::Unresolved, false),
@@ -485,8 +490,9 @@ pub(crate) fn compare_graph_to_text_tool(
                 included(&args.include, CompareInclude::Tests, true)
             )?))
         },
-        Ok(None) => Ok(Value::Null),
-        Err(disambiguation) => Ok(json!(disambiguation)),
+        // The comparison walks a resolved symbol's edges; a bare name has none to compare.
+        SymbolAnswer::ByName(_) => Ok(Value::Null),
+        SymbolAnswer::Done(answer) => Ok(answer),
     }
 }
 
@@ -578,20 +584,15 @@ pub(crate) fn git_history_for_symbol_tool(
     args: SymbolRefArgs,
 ) -> anyhow::Result<Value> {
     let selector = symbol_ref_selector(args)?;
-    match db.select_symbol(&selector)? {
-        Ok(Some(symbol)) => Ok(json!(db.git_history_for_symbol(
+    match select_for_answer(db, &selector)? {
+        SymbolAnswer::Selected(symbol) => Ok(json!(db.git_history_for_symbol(
             &symbol.qualified_name,
             optional_language(Some(symbol.language.clone()))?,
             selector.limit
         )?)),
-        Ok(None) if selector.allow_ambiguous => {
-            let Some(symbol) = selector.symbol.as_deref() else {
-                return Ok(Value::Null);
-            };
-            Ok(json!(db.git_history_for_symbol(symbol, selector.language, selector.limit)?))
-        },
-        Ok(None) => Ok(Value::Null),
-        Err(disambiguation) => Ok(json!(disambiguation)),
+        SymbolAnswer::ByName(symbol) =>
+            Ok(json!(db.git_history_for_symbol(&symbol, selector.language, selector.limit)?)),
+        SymbolAnswer::Done(answer) => Ok(answer),
     }
 }
 
@@ -600,16 +601,12 @@ pub(crate) fn papertrail_for_symbol_tool(
     args: SymbolRefArgs,
 ) -> anyhow::Result<Value> {
     let selector = symbol_ref_selector(args)?;
-    match db.select_symbol(&selector)? {
-        Ok(Some(symbol)) => Ok(json!(db.papertrail_for_selected_symbol(&symbol, selector.limit)?)),
-        Ok(None) if selector.allow_ambiguous => {
-            let Some(symbol) = selector.symbol.as_deref() else {
-                return Ok(Value::Null);
-            };
-            Ok(json!(db.papertrail_for_symbol(symbol, selector.language, selector.limit)?))
-        },
-        Ok(None) => Ok(Value::Null),
-        Err(disambiguation) => Ok(json!(disambiguation)),
+    match select_for_answer(db, &selector)? {
+        SymbolAnswer::Selected(symbol) =>
+            Ok(json!(db.papertrail_for_selected_symbol(&symbol, selector.limit)?)),
+        SymbolAnswer::ByName(symbol) =>
+            Ok(json!(db.papertrail_for_symbol(&symbol, selector.language, selector.limit)?)),
+        SymbolAnswer::Done(answer) => Ok(answer),
     }
 }
 
@@ -636,20 +633,15 @@ pub(crate) fn impact_tool(
     };
     if args.logical_symbol_id.is_some() || args.symbol_path.is_some() || args.symbol.is_some() {
         let selector = selector_from!(args, language: None);
-        return match db.select_symbol(&selector)? {
+        return match select_for_answer(db, &selector)? {
             // The distilled-records drive-by lane (#705) is now part of the report itself — built,
             // capped, and truncation-signalled in `impact_surface_report_for_selected_symbol`.
-            Ok(Some(symbol)) => Ok(json!(
+            SymbolAnswer::Selected(symbol) => Ok(json!(
                 db.impact_surface_report_for_selected_symbol(&symbol, args.limit, &options)?
             )),
-            Ok(None) if selector.allow_ambiguous => {
-                let Some(symbol) = selector.symbol.as_deref() else {
-                    return Ok(Value::Null);
-                };
-                Ok(json!(db.impact_surface_with_options(symbol, args.limit, resolution_mode)?))
-            },
-            Ok(None) => Ok(Value::Null),
-            Err(disambiguation) => Ok(json!(disambiguation)),
+            SymbolAnswer::ByName(symbol) =>
+                Ok(json!(db.impact_surface_with_options(&symbol, args.limit, resolution_mode)?)),
+            SymbolAnswer::Done(answer) => Ok(answer),
         };
     }
     let Some(query) = args.query.as_deref() else {
@@ -664,10 +656,12 @@ pub(crate) fn memory_for_symbol_tool(
     memory_surface: MemorySurface,
 ) -> anyhow::Result<Value> {
     let selector = selector_from!(args, language: None);
-    match db.select_symbol(&selector)? {
-        Ok(Some(symbol)) => Ok(json!(db.memory_for_symbol(&symbol, args.limit, memory_surface)?)),
-        Ok(None) => Ok(Value::Null),
-        Err(disambiguation) => Ok(json!(disambiguation)),
+    match select_for_answer(db, &selector)? {
+        SymbolAnswer::Selected(symbol) =>
+            Ok(json!(db.memory_for_symbol(&symbol, args.limit, memory_surface)?)),
+        // Memories bind to a resolved symbol; there is no name-level answer to fall back to.
+        SymbolAnswer::ByName(_) => Ok(Value::Null),
+        SymbolAnswer::Done(answer) => Ok(answer),
     }
 }
 
