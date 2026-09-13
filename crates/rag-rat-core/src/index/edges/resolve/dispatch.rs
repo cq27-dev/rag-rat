@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use rusqlite::{Connection, params};
 
 use super::EdgeWriteScope;
-use crate::index::edges::{EdgeConfidence, EdgeKind, EdgeStringInterner};
+use crate::index::edges::{EdgeConfidence, EdgeKind, EdgeResolution, EdgeStringInterner};
 
 /// Cap on constructors × handlers materialized for one variant key. A catch-all message enum used
 /// in many sites would otherwise blow up quadratically into low-value edges; past this we skip the
@@ -55,7 +55,7 @@ pub(crate) fn synthesize_dispatch_edges(
     write: EdgeWriteScope<'_>,
 ) -> anyhow::Result<DispatchSynthesis> {
     let mut interner = EdgeStringInterner::default();
-    let dispatches_kind_id = interner.get(conn, EdgeKind::Dispatches.as_str())?;
+    let dispatches_kind_id = interner.get(conn, EdgeKind::Dispatches.as_db_str())?;
 
     // Idempotent re-run: drop any prior synthesized dispatches in the WRITE scope before rebuilding
     // them. `files` is the per-connection scope view (#89), so other checkouts are untouched; the
@@ -87,8 +87,8 @@ pub(crate) fn synthesize_dispatch_edges(
     // to the same enum — gating it out would just lose the dispatch (a recall miss, not safety).
     let ambiguous_enums = ambiguous_enum_names(conn)?;
 
-    let confidence_id = interner.get(conn, EdgeConfidence::Syntactic.as_str())?;
-    let resolution_id = interner.get(conn, "dispatch")?;
+    let confidence_id = interner.get(conn, EdgeConfidence::Syntactic.as_db_str())?;
+    let resolution_id = interner.get(conn, EdgeResolution::Dispatch.as_db_str())?;
     let mut result = DispatchSynthesis::default();
 
     for (variant, ctors) in &constructors {

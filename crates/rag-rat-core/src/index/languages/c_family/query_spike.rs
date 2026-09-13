@@ -116,7 +116,7 @@ std::vector<Item> make_items() {
     fn by_kind(candidates: &[EdgeCandidate]) -> BTreeMap<&str, usize> {
         let mut counts = BTreeMap::new();
         for candidate in candidates {
-            *counts.entry(candidate.edge_kind.as_str()).or_default() += 1;
+            *counts.entry(candidate.edge_kind.as_db_str()).or_default() += 1;
         }
         counts
     }
@@ -204,10 +204,10 @@ std::vector<Item> make_items() {
             let queried = query_edges_from_root(&path, language, &source, parsed.root(), &indexed)?;
             query_elapsed += started.elapsed();
             for candidate in &manual {
-                *manual_totals.entry(candidate.edge_kind.as_str().to_owned()).or_default() += 1;
+                *manual_totals.entry(candidate.edge_kind.as_db_str().to_owned()).or_default() += 1;
             }
             for candidate in &queried {
-                *query_totals.entry(candidate.edge_kind.as_str().to_owned()).or_default() += 1;
+                *query_totals.entry(candidate.edge_kind.as_db_str().to_owned()).or_default() += 1;
             }
             if format!("{manual:#?}") != format!("{queried:#?}") {
                 changed_files += 1;

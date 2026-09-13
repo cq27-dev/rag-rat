@@ -231,7 +231,7 @@ fn add_named_edge(
     conn.execute(
         "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution) VALUES \
          (?1, ?2, ?3, 'NameOnly', 'unresolved')",
-        params![source_file_id, to_name, edge_kind.as_str()],
+        params![source_file_id, to_name, edge_kind.as_db_str()],
     )
     .unwrap();
     conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
@@ -728,7 +728,7 @@ fn swift_local_receivers_override_external_bare_name_suppression() {
             resolved.unwrap_or_else(|| panic!("{receiver} must override external suppression"));
         assert_eq!(target.id, symbols[0].id);
         assert_eq!(confidence, EdgeConfidence::Syntactic);
-        assert_eq!(resolution, "target_name_fallback");
+        assert_eq!(resolution, ResolutionReason::TargetNameFallback);
     }
 }
 
@@ -760,7 +760,7 @@ fn external_receiver_type_hint_never_binds_locally() {
             .expect("a local Worker receiver resolves");
     assert_eq!(target.id, symbols[0].id);
     assert_eq!(confidence, EdgeConfidence::Syntactic);
-    assert_eq!(reason, "receiver_type");
+    assert_eq!(reason, ResolutionReason::ReceiverType);
 
     // Same call, but `Worker` came from `use external::Worker;` — the receiver-type branch must
     // not bind the call to the unrelated local `Worker::run`.
@@ -768,8 +768,8 @@ fn external_receiver_type_hint_never_binds_locally() {
         resolve_symbol(request(ReceiverTypeIdentity::ExternalQualified("Worker")), &index)
     {
         assert!(
-            !matches!(reason, "receiver_type" | "scope_degeneric"),
-            "externally-imported receiver type must not drive resolution, got {reason}"
+            !matches!(reason, ResolutionReason::ReceiverType | ResolutionReason::ScopeDegeneric),
+            "externally-imported receiver type must not drive resolution, got {reason:?}"
         );
     }
 }
@@ -1035,7 +1035,7 @@ fn a_bare_receiver_owner_does_not_cross_a_package_boundary() {
     let imported = resolve_symbol(request(None), &index)
         .expect("an import-bound receiver still reaches the crate it was imported from");
     assert_eq!(imported.0.id, symbols[0].id);
-    assert_eq!(imported.2, "receiver_type");
+    assert_eq!(imported.2, ResolutionReason::ReceiverType);
 }
 
 /// A receiver identity that is not local closes the bare-name fallback too. `ExternalQualified`
@@ -1120,7 +1120,7 @@ fn typed_self_receiver_keeps_trait_default_qualified_resolution() {
     )
     .expect("the trait-qualified target remains stronger than an unmatched receiver owner");
     assert_eq!(resolved.0.id, symbols[0].id);
-    assert_eq!(resolved.2, "scope_exact");
+    assert_eq!(resolved.2, ResolutionReason::ScopeExact);
 
     let bare = resolve_symbol(
         ResolveSymbolRequest {
@@ -1143,7 +1143,7 @@ fn typed_self_receiver_keeps_trait_default_qualified_resolution() {
     )
     .expect("a unique trait default method remains available through self");
     assert_eq!(bare.0.id, symbols[0].id);
-    assert_eq!(bare.2, "target_name_fallback");
+    assert_eq!(bare.2, ResolutionReason::TargetNameFallback);
 }
 
 #[test]
@@ -1189,7 +1189,7 @@ fn typed_local_receiver_reaches_only_compatible_trait_default() {
     )
     .expect("the concrete receiver may use a trait's default method");
     assert_eq!(resolved.0.scope_path, "Runs::run");
-    assert_eq!(resolved.2, "target_name_fallback");
+    assert_eq!(resolved.2, ResolutionReason::TargetNameFallback);
 }
 
 #[test]
@@ -1569,8 +1569,8 @@ fn two_trait_impls_on_one_type_decline_receiver_resolution() {
     );
     if let Some((_, _, reason)) = resolved {
         assert!(
-            !matches!(reason, "receiver_type" | "scope_degeneric"),
-            "two candidate trait impls must stay ambiguous, got {reason}"
+            !matches!(reason, ResolutionReason::ReceiverType | ResolutionReason::ScopeDegeneric),
+            "two candidate trait impls must stay ambiguous, got {reason:?}"
         );
     }
 
@@ -1596,7 +1596,7 @@ fn two_trait_impls_on_one_type_decline_receiver_resolution() {
     .expect("a single trait impl resolves through the normalized scope");
     assert_eq!(target.id, 1);
     assert_eq!(confidence, EdgeConfidence::Syntactic);
-    assert_eq!(reason, "scope_degeneric");
+    assert_eq!(reason, ResolutionReason::ScopeDegeneric);
 }
 
 /// The four pointer shapes of one owner as they are actually emitted.
@@ -1643,7 +1643,7 @@ fn a_written_path_binds_the_impl_whose_owner_it_spells() {
     .expect("a written path names exactly one impl");
     assert_eq!(target.id, 1);
     assert_eq!(confidence, EdgeConfidence::Syntactic);
-    assert_eq!(reason, "scope_degeneric");
+    assert_eq!(reason, ResolutionReason::ScopeDegeneric);
 }
 
 /// …and the same corpus through an INFERRED `W` receiver: autoref reaches every one of the four,

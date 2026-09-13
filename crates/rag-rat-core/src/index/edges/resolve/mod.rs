@@ -623,8 +623,8 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         // unresolved. (`dispatch_handle` DOES resolve — synthesis reads its handler
         // `to_symbol_id`.)
         if edge_kind == EdgeKind::DispatchConstruct {
-            let confidence_id = interner.get(conn, EdgeConfidence::NameOnly.as_str())?;
-            let resolution_id = interner.get(conn, "unresolved")?;
+            let confidence_id = interner.get(conn, EdgeConfidence::NameOnly.as_db_str())?;
+            let resolution_id = interner.get(conn, EdgeResolution::Unresolved.as_db_str())?;
             conn.prepare_cached(
                 "UPDATE edges_data
                  SET to_symbol_id = NULL, target_start_line = NULL, target_end_line = NULL,
@@ -635,7 +635,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                 edge_id,
                 confidence_id,
                 resolution_id,
-                edge_hidden_flag(edge_kind.as_str(), "unresolved"),
+                edge_hidden_flag(edge_kind, EdgeResolution::Unresolved),
             ])?;
             continue;
         }
@@ -661,16 +661,17 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                         (policy.unresolved_disposition)(edge_kind, evidence.as_deref())
                             == crate::index::languages::UnresolvedDisposition::Suppress
                     });
-            let confidence = if current_confidence == EdgeConfidence::Ambiguous.as_str() {
+            let confidence = if current_confidence == EdgeConfidence::Ambiguous.as_db_str() {
                 EdgeConfidence::Ambiguous
             } else {
                 EdgeConfidence::NameOnly
             };
             // prepare_cached: one UPDATE per edge; cache the statement so the SQL compiles once per
             // connection instead of on every call.
-            let resolution = if suppressed { "suppressed" } else { "unresolved" };
-            let confidence_id = interner.get(conn, confidence.as_str())?;
-            let resolution_id = interner.get(conn, resolution)?;
+            let resolution =
+                if suppressed { EdgeResolution::Suppressed } else { EdgeResolution::Unresolved };
+            let confidence_id = interner.get(conn, confidence.as_db_str())?;
+            let resolution_id = interner.get(conn, resolution.as_db_str())?;
             conn.prepare_cached(
                 "UPDATE edges_data
                  SET to_symbol_id = NULL,
@@ -685,12 +686,12 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                 edge_id,
                 confidence_id,
                 resolution_id,
-                edge_hidden_flag(edge_kind.as_str(), resolution),
+                edge_hidden_flag(edge_kind, resolution),
             ])?;
             continue;
         };
-        let confidence_id = interner.get(conn, confidence.as_str())?;
-        let resolution_id = interner.get(conn, reason)?;
+        let confidence_id = interner.get(conn, confidence.as_db_str())?;
+        let resolution_id = interner.get(conn, reason.as_db_str())?;
         conn.prepare_cached(
             "UPDATE edges_data
              SET to_symbol_id = ?2,
@@ -710,7 +711,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             resolution_id,
             // A re-resolved candidate un-hides (a previously suppressed Swift macro candidate
             // whose target appears later); a resolved dispatch_handle FACT stays hidden.
-            edge_hidden_flag(edge_kind.as_str(), reason),
+            edge_hidden_flag(edge_kind, EdgeResolution::Reason(reason)),
         ])?;
     }
     // #200: now that the dispatch FACT rows are resolved (handlers bound to symbols), synthesize
@@ -872,7 +873,7 @@ pub(crate) fn resolve_and_insert_edges(
                     confidence,
                     Some(symbol.start_line),
                     Some(symbol.end_line),
-                    reason,
+                    EdgeResolution::Reason(reason),
                 ),
                 None => {
                     let suppressed = crate::index::languages::resolver_policy_for_name(
@@ -892,7 +893,11 @@ pub(crate) fn resolve_and_insert_edges(
                         confidence,
                         None,
                         None,
-                        if suppressed { "suppressed" } else { "unresolved" },
+                        if suppressed {
+                            EdgeResolution::Suppressed
+                        } else {
+                            EdgeResolution::Unresolved
+                        },
                     )
                 },
             };
@@ -909,9 +914,9 @@ pub(crate) fn resolve_and_insert_edges(
         let target_qualified_name_id = interner.get_opt(conn, target_qualified_name)?;
         let receiver_hint_id = interner.get_opt(conn, receiver_hint)?;
         let receiver_type_hint_id = interner.get_opt(conn, receiver_type_hint)?;
-        let edge_kind_id = interner.get(conn, candidate.edge_kind.as_str())?;
-        let confidence_id = interner.get(conn, confidence.as_str())?;
-        let resolution_id = interner.get(conn, reason)?;
+        let edge_kind_id = interner.get(conn, candidate.edge_kind.as_db_str())?;
+        let confidence_id = interner.get(conn, confidence.as_db_str())?;
+        let resolution_id = interner.get(conn, reason.as_db_str())?;
         conn.prepare_cached(
             "
             INSERT INTO edges_data(
@@ -951,7 +956,7 @@ pub(crate) fn resolve_and_insert_edges(
             target_start_line,
             target_end_line,
             resolution_id,
-            edge_hidden_flag(candidate.edge_kind.as_str(), reason),
+            edge_hidden_flag(candidate.edge_kind, reason),
         ])?;
     }
     crate::index::mem_trace("edges: inserted, before index rebuild");
@@ -1036,7 +1041,7 @@ pub(crate) fn resolve_symbol<'a>(
         // as DISTINCT logical symbols and decline as ambiguous.
         let try_scope = |target: &str,
                          require_alias_file: bool|
-         -> Option<(&'a IndexedSymbol, &'static str)> {
+         -> Option<(&'a IndexedSymbol, ResolutionReason)> {
             let scope_exact = index
                 .by_scope_path
                 .get(target)
@@ -1051,7 +1056,7 @@ pub(crate) fn resolve_symbol<'a>(
                 })
                 .collect::<Vec<_>>();
             if let Some(hit) = unique_or_logical(&scope_exact) {
-                return Some((hit.symbol(), "receiver_type"));
+                return Some((hit.symbol(), ResolutionReason::ReceiverType));
             }
             // Reaching here means the exact stage found NOTHING or found an AMBIGUITY. Dropping
             // the raw candidates as "already tried" hides that ambiguity: two crates' plain
@@ -1080,7 +1085,8 @@ pub(crate) fn resolve_symbol<'a>(
                             || alias_owner_matches_symbol_file(type_hint, symbol))
                 })
                 .collect::<Vec<_>>();
-            unique_or_logical(&scope_normalized).map(|hit| (hit.symbol(), "scope_degeneric"))
+            unique_or_logical(&scope_normalized)
+                .map(|hit| (hit.symbol(), ResolutionReason::ScopeDegeneric))
         };
 
         if let Some((symbol, reason)) = try_scope(&target, false) {
@@ -1122,9 +1128,9 @@ pub(crate) fn resolve_symbol<'a>(
             if let Some(hit) = unique_or_logical(&receiver_suffix_matches) {
                 let symbol = hit.symbol();
                 let reason = if symbol.scope_path.ends_with(&scope_suffix) {
-                    "receiver_type"
+                    ResolutionReason::ReceiverType
                 } else {
-                    "scope_degeneric"
+                    ResolutionReason::ScopeDegeneric
                 };
                 return Some((symbol, EdgeConfidence::Syntactic, reason));
             }
@@ -1153,7 +1159,7 @@ pub(crate) fn resolve_symbol<'a>(
             .filter(|symbol| kind_matches(symbol))
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&scope_exact) {
-            return Some(hit.resolved(EdgeConfidence::Exact, "scope_exact"));
+            return Some(hit.resolved(EdgeConfidence::Exact, ResolutionReason::ScopeExact));
         }
         // Reaching here means the exact stage found NOTHING or found an AMBIGUITY. Either way the
         // raw candidates at the normalized key belong in this set: when normalization was a no-op
@@ -1183,7 +1189,11 @@ pub(crate) fn resolve_symbol<'a>(
             .filter(|symbol| kind_matches(symbol))
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&scope_normalized) {
-            return Some((hit.symbol(), EdgeConfidence::Syntactic, "scope_degeneric"));
+            return Some((
+                hit.symbol(),
+                EdgeConfidence::Syntactic,
+                ResolutionReason::ScopeDegeneric,
+            ));
         }
         let scope_suffix = format!("::{qualified}");
         let scope_matches = index
@@ -1195,7 +1205,7 @@ pub(crate) fn resolve_symbol<'a>(
             .filter(|symbol| kind_matches(symbol) && symbol.scope_path.ends_with(&scope_suffix))
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&scope_matches) {
-            return Some(hit.resolved(EdgeConfidence::Syntactic, "scope_suffix"));
+            return Some(hit.resolved(EdgeConfidence::Syntactic, ResolutionReason::ScopeSuffix));
         }
         // Exact qualified-name match (bucket entries already share `qualified_name == qualified`).
         if let Some(symbol) = index
@@ -1206,7 +1216,7 @@ pub(crate) fn resolve_symbol<'a>(
             .copied()
             .find(|symbol| kind_matches(symbol))
         {
-            return Some((symbol, EdgeConfidence::Exact, "exact"));
+            return Some((symbol, EdgeConfidence::Exact, ResolutionReason::Exact));
         }
         let suffix = format!("::{qualified}");
         let matches = index
@@ -1218,7 +1228,9 @@ pub(crate) fn resolve_symbol<'a>(
             .filter(|symbol| kind_matches(symbol) && symbol.qualified_name.ends_with(&suffix))
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&matches) {
-            return Some(hit.resolved(EdgeConfidence::Syntactic, "qualified_suffix"));
+            return Some(
+                hit.resolved(EdgeConfidence::Syntactic, ResolutionReason::QualifiedSuffix),
+            );
         }
         // Distinct qualified-name matches: the written path is ambiguous, and a bare-name guess
         // would be weaker evidence than that ambiguity.
@@ -1334,7 +1346,7 @@ pub(crate) fn resolve_symbol<'a>(
     }
     let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
     if let Some(hit) = unique_or_logical(matches) {
-        return Some(hit.resolved(EdgeConfidence::Syntactic, "target_name_fallback"));
+        return Some(hit.resolved(EdgeConfidence::Syntactic, ResolutionReason::TargetNameFallback));
     }
     let same_file = matches
         .iter()
@@ -1342,11 +1354,11 @@ pub(crate) fn resolve_symbol<'a>(
         .filter(|symbol| symbol.file_id == request.source_file_id)
         .collect::<Vec<_>>();
     unique_or_logical(&same_file)
-        .map(|hit| hit.resolved(EdgeConfidence::Syntactic, "same_file_name"))
+        .map(|hit| hit.resolved(EdgeConfidence::Syntactic, ResolutionReason::SameFileName))
 }
 
 /// A resolved binding: the target, the confidence stamped on the edge, and the persisted reason.
-pub(crate) type Resolved<'a> = (&'a IndexedSymbol, EdgeConfidence, &'static str);
+pub(crate) type Resolved<'a> = (&'a IndexedSymbol, EdgeConfidence, ResolutionReason);
 
 /// What one resolution stage may bind from its candidate set: a unique hit, or — when every
 /// candidate is a variant of ONE logical symbol ([`same_logical_symbol`]) — the first of them.
@@ -1366,10 +1378,11 @@ impl<'a> StageHit<'a> {
 
     /// Label the hit for a stage whose own reason names a single target: a unique hit takes
     /// the stage's confidence and reason, a logical variant is `Syntactic` / `logical_variant`.
-    fn resolved(self, confidence: EdgeConfidence, reason: &'static str) -> Resolved<'a> {
+    fn resolved(self, confidence: EdgeConfidence, reason: ResolutionReason) -> Resolved<'a> {
         match self {
             Self::Unique(symbol) => (symbol, confidence, reason),
-            Self::LogicalVariant(symbol) => (symbol, EdgeConfidence::Syntactic, "logical_variant"),
+            Self::LogicalVariant(symbol) =>
+                (symbol, EdgeConfidence::Syntactic, ResolutionReason::LogicalVariant),
         }
     }
 }

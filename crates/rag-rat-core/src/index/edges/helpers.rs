@@ -570,10 +570,12 @@ pub(crate) fn insert_candidates(
         let receiver_hint_id = intern_edge_string_opt(conn, candidate.receiver_hint.as_deref())?;
         let receiver_type_hint_id =
             intern_edge_string_opt(conn, candidate.receiver_type_hint.as_deref())?;
-        let edge_kind_id = intern_edge_string(conn, candidate.edge_kind.as_str())?;
-        let confidence_id = intern_edge_string(conn, candidate.confidence.as_str())?;
-        let resolution_id = intern_edge_string(conn, "unresolved")?;
-        let hidden = super::edge_hidden_flag(candidate.edge_kind.as_str(), "unresolved");
+        let edge_kind_id = intern_edge_string(conn, candidate.edge_kind.as_db_str())?;
+        let confidence_id = intern_edge_string(conn, candidate.confidence.as_db_str())?;
+        let resolution_id =
+            intern_edge_string(conn, super::EdgeResolution::Unresolved.as_db_str())?;
+        let hidden =
+            super::edge_hidden_flag(candidate.edge_kind, super::EdgeResolution::Unresolved);
         conn.prepare_cached(
             "
             INSERT INTO edges_data(

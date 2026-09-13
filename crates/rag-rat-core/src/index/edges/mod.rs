@@ -55,7 +55,7 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_db_str(self) -> &'static str {
         match self {
             Self::Imports => "imports",
             Self::Exports => "exports",
@@ -116,7 +116,7 @@ mod edge_kind_tests {
         ];
 
         for kind in kinds {
-            assert_eq!(EdgeKind::from_db_str(kind.as_str()).unwrap(), kind);
+            assert_eq!(EdgeKind::from_db_str(kind.as_db_str()).unwrap(), kind);
         }
         assert!(EdgeKind::from_db_str("unknown").is_err());
     }
@@ -129,10 +129,9 @@ mod edge_kind_tests {
 /// `WHERE hidden = 0` — a single integer compare per row, the point of materializing
 /// visibility — can trust it. The view's INSTEAD OF triggers and the V075 backfill mirror the
 /// same predicate in SQL.
-pub(crate) fn edge_hidden_flag(edge_kind: &str, resolution: &str) -> i64 {
-    let dispatch_fact = edge_kind == EdgeKind::DispatchConstruct.as_str()
-        || edge_kind == EdgeKind::DispatchHandle.as_str();
-    i64::from(dispatch_fact || resolution == "suppressed")
+pub(crate) fn edge_hidden_flag(edge_kind: EdgeKind, resolution: EdgeResolution) -> i64 {
+    let dispatch_fact = matches!(edge_kind, EdgeKind::DispatchConstruct | EdgeKind::DispatchHandle);
+    i64::from(dispatch_fact || resolution == EdgeResolution::Suppressed)
 }
 
 /// #734 test tripwire: assert `edges_data.hidden` agrees with the visibility predicate it
@@ -168,12 +167,86 @@ pub enum EdgeConfidence {
 }
 
 impl EdgeConfidence {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_db_str(self) -> &'static str {
         match self {
             Self::Exact => "Exact",
             Self::Syntactic => "Syntactic",
             Self::NameOnly => "NameOnly",
             Self::Ambiguous => "Ambiguous",
+        }
+    }
+}
+
+/// Which resolution stage bound an edge — persisted as `edges_data.resolution_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum ResolutionReason {
+    ReceiverType,
+    ScopeDegeneric,
+    ScopeExact,
+    ScopeSuffix,
+    Exact,
+    QualifiedSuffix,
+    LogicalVariant,
+    TargetNameFallback,
+    SameFileName,
+}
+
+impl ResolutionReason {
+    pub(crate) fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// The persisted `edges_data.resolution_id` vocabulary: the stage that bound the edge, or why it
+/// stayed unbound. Both vocabularies share the one column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeResolution {
+    Reason(ResolutionReason),
+    /// No stage could bind the reference.
+    Unresolved,
+    /// Unbound, and the language policy hides the candidate from the graph (see
+    /// [`edge_hidden_flag`]).
+    Suppressed,
+    /// Bound by dispatch synthesis, not by a resolution stage.
+    Dispatch,
+}
+
+impl EdgeResolution {
+    pub(crate) fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Reason(reason) => reason.as_db_str(),
+            Self::Unresolved => "unresolved",
+            Self::Suppressed => "suppressed",
+            Self::Dispatch => "dispatch",
+        }
+    }
+}
+
+#[cfg(test)]
+mod edge_resolution_tests {
+    use super::{EdgeResolution, ResolutionReason};
+
+    /// The tokens are persisted and read back by SQL (the `edges` view, `hidden` backfill, query
+    /// predicates), so each must stay exactly what it has always been.
+    #[test]
+    fn persisted_tokens_are_stable() {
+        let tokens = [
+            (EdgeResolution::Reason(ResolutionReason::ReceiverType), "receiver_type"),
+            (EdgeResolution::Reason(ResolutionReason::ScopeDegeneric), "scope_degeneric"),
+            (EdgeResolution::Reason(ResolutionReason::ScopeExact), "scope_exact"),
+            (EdgeResolution::Reason(ResolutionReason::ScopeSuffix), "scope_suffix"),
+            (EdgeResolution::Reason(ResolutionReason::Exact), "exact"),
+            (EdgeResolution::Reason(ResolutionReason::QualifiedSuffix), "qualified_suffix"),
+            (EdgeResolution::Reason(ResolutionReason::LogicalVariant), "logical_variant"),
+            (EdgeResolution::Reason(ResolutionReason::TargetNameFallback), "target_name_fallback"),
+            (EdgeResolution::Reason(ResolutionReason::SameFileName), "same_file_name"),
+            (EdgeResolution::Unresolved, "unresolved"),
+            (EdgeResolution::Suppressed, "suppressed"),
+            (EdgeResolution::Dispatch, "dispatch"),
+        ];
+        for (resolution, token) in tokens {
+            assert_eq!(resolution.as_db_str(), token);
         }
     }
 }

@@ -315,7 +315,7 @@ mod recovered_descendant_tests {
                             && old.source_span.start_byte == candidate.source_span.start_byte
                     })
                 })
-                .map(|edge| (edge.edge_kind.as_str(), edge.to_name.as_str()))
+                .map(|edge| (edge.edge_kind.as_db_str(), edge.to_name.as_str()))
                 .collect::<Vec<_>>();
             assert_eq!(recovered, expected, "{label}");
 
