@@ -18,7 +18,7 @@ permissions:
 jobs:
   sweep:
     runs-on: ci
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - name: Cap every runner's cargo target dir
@@ -32,14 +32,16 @@ jobs:
           # runner may be mid-build in the dir being swept. Hold every profile's `.cargo-lock` for the
           # sweep (the lock Cargo blocks on), so a build in progress finishes first and one starting
           # waits; the coverage dir's cycle-wide lock is held the same way.
+          # `guard` is re-checked once the locks are held: a sibling that finished compiling before
+          # the locks were taken may be running its tests, and only its worker process shows that;
+          # one that starts after the locks are taken blocks on them before it can run anything.
           sweep() {
-            local dir=$1; shift
+            local dir=$1 guard=$2
             local locks=()
             for lock in "$dir"/*/.cargo-lock "$dir"/*/*/.cargo-lock; do
               [ -e "$lock" ] && locks+=("$lock")
             done
-            if [ ${#locks[@]} -eq 0 ]; then CARGO_TARGET_DIR="$dir" cargo sweep --maxsize 30GB; return; fi
-            local cmd=(env "CARGO_TARGET_DIR=$dir" cargo sweep --maxsize 30GB)
+            local cmd=(bash -c "$guard || { echo '   skipped: a sibling started meanwhile'; exit 0; }; CARGO_TARGET_DIR=\"\$0\" cargo sweep --maxsize 30GB" "$dir")
             for lock in "${locks[@]}"; do cmd=(flock "$lock" "${cmd[@]}"); done
             "${cmd[@]}"
           }
@@ -49,18 +51,26 @@ jobs:
           # box — a job starting afterwards compiles first, behind the locks above, before it runs
           # anything. This runner's own dir is idle by construction and is always swept.
           own="${CARGO_TARGET_DIR:-}"
-          siblings_idle() { [ "$(pgrep -c -f 'Runner.Worker')" -le 1 ]; }
-          for _ in $(seq 1 60); do siblings_idle && break; sleep 30; done
+          siblings_idle='[ "$(pgrep -c -f Runner.Worker)" -le 1 ]'
+          # This runner's own dir first — nothing else runs on this runner — so the job always gets
+          # its cleanup in even when a sibling stays busy for the whole wait (a benchmark, say).
+          if [ -d "$own" ]; then
+            echo "== $own (own): $(du -sh "$own" | cut -f1) before"
+            sweep "$own" true
+            echo "== $own (own): $(du -sh "$own" | cut -f1) after"
+          fi
+          for _ in $(seq 1 20); do bash -c "$siblings_idle" && break; sleep 30; done
           for dir in "$HOME"/actions-runner*/cargo-target; do
-            [ -d "$dir" ] || continue
-            if [ "$dir" != "$own" ] && ! siblings_idle; then
+            [ -d "$dir" ] && [ "$dir" != "$own" ] || continue
+            if ! bash -c "$siblings_idle"; then
               echo "== $dir: skipped, a sibling runner is busy"
               continue
             fi
             echo "== $dir: $(du -sh "$dir" | cut -f1) before"
-            sweep "$dir"
+            sweep "$dir" "$siblings_idle"
             echo "== $dir: $(du -sh "$dir" | cut -f1) after"
           done
+          # The coverage dir's lock spans its whole build-and-test cycle, so it needs no guard.
           if [ -d "$HOME/cargo-target-coverage" ]; then
             echo "== coverage: $(du -sh "$HOME/cargo-target-coverage" | cut -f1) before"
             flock "$HOME/cargo-target-coverage.lock" env CARGO_TARGET_DIR="$HOME/cargo-target-coverage" cargo sweep --maxsize 30GB
