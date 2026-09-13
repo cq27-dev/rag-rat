@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rag_rat_base::time::now_ms;
 use rag_rat_db::schema::active_repo_id;
-use rag_rat_papertrail::{FixEdgeSource, ItemKind, OutcomeStatus};
+use rag_rat_papertrail::{CloserKind, ClosingEdgeSource, FixEdgeSource, ItemKind, OutcomeStatus};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
@@ -193,15 +193,15 @@ pub(crate) fn extract(
             // issue-vs-PR kind-correct, none of which a hand-rolled text scan gets right).
             let mut text_closing = false;
             for edge in issue_edges {
-                match edge.closer_kind.as_str() {
-                    "commit" => {
+                match edge.closer_kind {
+                    Some(CloserKind::Commit) => {
                         // A commit closer is an accepted fix edge; upgrade provenance and take the
                         // sha.
                         fix_shas.insert(edge.closer_key.clone());
-                        source = stronger_source(source, edge.source.as_str());
-                        text_closing |= edge.source == "text";
+                        source = stronger_source(source, edge.source);
+                        text_closing |= edge.source == Some(ClosingEdgeSource::Text);
                     },
-                    "change_request" => {
+                    Some(CloserKind::ChangeRequest) => {
                         // Only a MERGED PR in the SAME project is a real coalesce partner +
                         // fix-commit source; a closed-unmerged PR's
                         // merge_commit_sha is a trap (GitHub's ephemeral
@@ -213,8 +213,8 @@ pub(crate) fn extract(
                         if let Some(pr) = merged_prs.get(&partner_id) {
                             partners.insert(edge.closer_key.clone());
                             coalesced_away.insert(partner_id);
-                            source = stronger_source(source, edge.source.as_str());
-                            text_closing |= edge.source == "text";
+                            source = stronger_source(source, edge.source);
+                            text_closing |= edge.source == Some(ClosingEdgeSource::Text);
                             if let Some(commit) =
                                 edge.closer_commit.clone().or_else(|| pr.merge_commit_sha.clone())
                             {
@@ -222,7 +222,7 @@ pub(crate) fn extract(
                             }
                         }
                     },
-                    _ => {},
+                    None => {},
                 }
             }
             plans.push(RecordPlan {
@@ -342,12 +342,12 @@ pub(crate) fn extract(
     })
 }
 
-/// The stronger of the current fix-edge source and a newly seen closing-edge `source` token:
-/// provider outranks text outranks none. Unknown tokens are treated as text (a mined tier).
-fn stronger_source(current: FixEdgeSource, token: &str) -> FixEdgeSource {
-    let seen = if token == "provider" { FixEdgeSource::Provider } else { FixEdgeSource::Text };
+/// The stronger of the current fix-edge source and a newly seen closing-edge source: provider
+/// outranks text outranks none. An unknown source token (`None`) is treated as text (a mined tier).
+fn stronger_source(current: FixEdgeSource, seen: Option<ClosingEdgeSource>) -> FixEdgeSource {
     match (current, seen) {
-        (FixEdgeSource::Provider, _) | (_, FixEdgeSource::Provider) => FixEdgeSource::Provider,
+        (FixEdgeSource::Provider, _) | (_, Some(ClosingEdgeSource::Provider)) =>
+            FixEdgeSource::Provider,
         _ => FixEdgeSource::Text,
     }
 }
@@ -986,14 +986,16 @@ fn load_items(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<ItemRow>> 
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// A closing edge with its closed-set tokens parsed. A token outside the set reads as `None` rather
+/// than an error: an unknown closer kind contributes nothing and an unknown source ranks as text.
 struct ClosingEdgeRow {
     tracker: String,
     project: String,
     issue_key: String,
-    closer_kind: String,
+    closer_kind: Option<CloserKind>,
     closer_key: String,
     closer_commit: Option<String>,
-    source: String,
+    source: Option<ClosingEdgeSource>,
 }
 
 fn load_closing_edges(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<ClosingEdgeRow>> {
@@ -1006,10 +1008,10 @@ fn load_closing_edges(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<Cl
             tracker: row.get(0)?,
             project: row.get(1)?,
             issue_key: row.get(2)?,
-            closer_kind: row.get(3)?,
+            closer_kind: CloserKind::from_db_str(&row.get::<_, String>(3)?).ok(),
             closer_key: row.get(4)?,
             closer_commit: row.get(5)?,
-            source: row.get(6)?,
+            source: ClosingEdgeSource::from_db_str(&row.get::<_, String>(6)?).ok(),
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
