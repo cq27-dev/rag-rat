@@ -1409,12 +1409,14 @@ mod evidence_dream_tests {
         // pending.
         let c = mem_db();
         set_repo(&c, "r");
-        let opts =
-            crate::DreamOptions { now_ms: 1, limit: 10, verify: true, include_reviewed: false };
-        assert!(
-            !crate::model_work_pending(&c, opts, 10, true, true, "mock-chat-model").unwrap(),
-            "empty repo → no work"
-        );
+        // `verify` rides on DreamOptions (it gates the verdict pass); `compact` on the probe.
+        let pending = |verify: bool, compact: bool, budget: usize| {
+            let opts =
+                crate::DreamOptions { now_ms: 1, limit: 10, verify, include_reviewed: false };
+            let probe = crate::ModelWorkProbe { budget, compact, model_id: "mock-chat-model" };
+            crate::model_work_pending(&c, opts, probe).unwrap()
+        };
+        assert!(!pending(true, true, 10), "empty repo → no work");
 
         // An UNCITABLE prose-only memory (no identifiers, no bindings): verify is NOT model work,
         // but compaction WILL summarize it. The body must clear the compaction size gate — a note
@@ -1426,11 +1428,11 @@ mod evidence_dream_tests {
         );
         seed_memory(&c, "m1", "t", &uncitable, "r");
         assert!(
-            !crate::model_work_pending(&c, opts, 10, true, false, "mock-chat-model").unwrap(),
+            !pending(true, false, 10),
             "an all-uncitable verify queue is NOT model work — never cold-start a box for it"
         );
         assert!(
-            crate::model_work_pending(&c, opts, 10, false, true, "mock-chat-model").unwrap(),
+            pending(false, true, 10),
             "the same memory IS compact-pending (compaction has no uncitable short-circuit)"
         );
 
@@ -1443,12 +1445,9 @@ mod evidence_dream_tests {
         )
         .unwrap();
         seed_memory(&c, "m2", "t", "a note about `resolve_marker_token`", "r");
+        assert!(pending(true, false, 10), "a citable never-checked memory is verify-pending");
         assert!(
-            crate::model_work_pending(&c, opts, 10, true, false, "mock-chat-model").unwrap(),
-            "a citable never-checked memory is verify-pending"
-        );
-        assert!(
-            !crate::model_work_pending(&c, opts, 0, true, false, "mock-chat-model").unwrap(),
+            !pending(true, false, 0),
             "budget zero stops before considering the citable verify entry"
         );
         let inputs = checked_inputs_hash(&c, "m2", &Some("r".to_string())).unwrap();
@@ -1472,14 +1471,11 @@ mod evidence_dream_tests {
         })
         .unwrap();
         assert!(
-            !crate::model_work_pending(&c, opts, 10, true, false, "mock-chat-model").unwrap(),
+            !pending(true, false, 10),
             "a current deterministic failure is annotated work, not pending model work"
         );
 
-        assert!(
-            !crate::model_work_pending(&c, opts, 10, false, false, "mock-chat-model").unwrap(),
-            "neither flag → never pending"
-        );
+        assert!(!pending(false, false, 10), "neither flag → never pending");
     }
 
     #[test]

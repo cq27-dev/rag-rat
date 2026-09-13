@@ -1074,7 +1074,11 @@ fn dream_worklist_is_repo_scoped_end_to_end() {
         rag_rat_dream::DreamOptions { now_ms: 0, limit: 20, verify: true, include_reviewed: false };
     assert!(
         open_scoped(&repo_a, &data_dir)
-            .dream_model_work_pending(work_opts, 20, true, true, "mock-verdict-model")
+            .dream_model_work_pending(work_opts, rag_rat_dream::ModelWorkProbe {
+                budget: 20,
+                compact: true,
+                model_id: "mock-verdict-model",
+            })
             .unwrap(),
         "A's model pass has pending work (an un-verified memory) — the guard would provision"
     );

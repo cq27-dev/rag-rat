@@ -67,24 +67,12 @@ impl IndexDatabase {
     pub fn dream_model_work_pending(
         &self,
         opts: DreamOptions,
-        budget: usize,
-        verify: bool,
-        compact: bool,
-        model_id: &str,
+        probe: rag_rat_dream::ModelWorkProbe<'_>,
     ) -> anyhow::Result<bool> {
         // #582 review: the zero-work guard ranks chunk_fts (`dream::verify::text_probe`) —
         // read-only, so heal-and-retry is safe.
         crate::index::retry_once_on_fts_corruption(
-            || {
-                rag_rat_dream::model_work_pending(
-                    self.storage.connection(),
-                    opts,
-                    budget,
-                    verify,
-                    compact,
-                    model_id,
-                )
-            },
+            || rag_rat_dream::model_work_pending(self.storage.connection(), opts, probe),
             || self.heal_corrupt_fts(),
         )
     }

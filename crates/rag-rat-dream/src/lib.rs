@@ -277,58 +277,33 @@ pub(crate) fn bump_memory_lens_lanes(conn: &Connection, repo_id: &str) -> rusqli
     Ok(())
 }
 
+/// What the zero-work probe needs beyond [`DreamOptions`] (whose `verify` gates the verdict pass):
+/// the per-pass budget, whether the compaction pass will run, and the model whose recorded
+/// failures may block an entry.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelWorkProbe<'a> {
+    pub budget: usize,
+    pub compact: bool,
+    pub model_id: &'a str,
+}
+
 /// Whether the model passes would call the model AT ALL this run — the zero-work guard for
 /// EPHEMERAL `[llm.dream.remote]`. A fully churn-skipped (or all-uncitable) repo returns `false`,
 /// so `rag-rat dream --verify/--compact` never cold-starts a paid GPU box that would then do zero
-/// inference — mirroring the embedding path's "never provision for zero work" rule.
-///
-/// `verify` is CITABILITY-aware, not just queue-emptiness: `run_verdict_pass` records an UNCITABLE
-/// entry (prose-only / all-`NOT FOUND`, no excerpts) as a terminal row WITHOUT calling the model,
-/// so a queue whose every entry is uncitable is zero model work. The guard therefore builds each
-/// queued entry's evidence pack and returns `true` on the FIRST citable one — matching exactly what
-/// reaches the model. `compact` has no uncitable short-circuit (every queued memory is summarized),
-/// so a non-empty compaction queue IS model work. Runs once before provisioning, budget-capped, and
-/// short-circuits — the paid box it gates makes the extra pack builds worth it.
+/// inference — mirroring the embedding path's "never provision for zero work" rule. Each pass
+/// answers for itself, beside the runner it mirrors: [`verdict::verification_pending`] and
+/// [`compact::compaction_pending`]. Runs once before provisioning and short-circuits.
 pub fn model_work_pending(
     conn: &Connection,
     opts: DreamOptions,
-    budget: usize,
-    verify: bool,
-    compact: bool,
-    model_id: &str,
+    probe: ModelWorkProbe<'_>,
 ) -> anyhow::Result<bool> {
-    if verify {
-        let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
-        let repo_id = scope.as_deref().unwrap_or("__unassigned__");
-        let mut considered = 0usize;
-        for entry in verify::verification_queue(conn, opts.now_ms)? {
-            if considered >= budget {
-                break;
-            }
-            let inputs_hash = verify::checked_inputs_hash(conn, &entry.memory_id, &scope)?;
-            let content_hash = verify::note_content_hash(&entry.title, &entry.body);
-            let failure_stamp = failure::FailureStamp {
-                memory_id: &entry.memory_id,
-                repo_id,
-                pass: failure::DreamModelPass::Verify,
-                content_hash: &content_hash,
-                checked_inputs_hash: Some(&inputs_hash),
-                prompt_version: verdict::PROMPT_VERSION,
-                model_id,
-            };
-            if failure::blocking_failure_is_current(conn, &failure_stamp)? {
-                continue;
-            }
-            considered += 1;
-            if verify::evidence_pack(conn, &entry.memory_id)?.is_citable() {
-                return Ok(true);
-            }
-        }
-    }
-    if compact && compact::compaction_pending(conn, budget, model_id)? {
+    if opts.verify
+        && verdict::verification_pending(conn, opts.now_ms, probe.budget, probe.model_id)?
+    {
         return Ok(true);
     }
-    Ok(false)
+    Ok(probe.compact && compact::compaction_pending(conn, probe.budget, probe.model_id)?)
 }
 
 #[cfg(test)]

@@ -263,6 +263,48 @@ pub(super) fn run_verdict_pass(
     Ok(())
 }
 
+/// Whether [`run_verdict_pass`] would call the model at all — the verify half of the ephemeral
+/// zero-work guard ([`super::model_work_pending`]). It walks the runner's queue the runner's way:
+/// failure-blocked entries are skipped before the budget counts them. It is CITABILITY-aware, not
+/// just queue-emptiness: the runner records an UNCITABLE entry (prose-only / all-`NOT FOUND`, no
+/// excerpts) as a terminal row WITHOUT calling the model, so a queue whose every entry is uncitable
+/// is zero model work. The probe therefore builds each counted entry's evidence pack and answers
+/// `true` on the FIRST citable one — the paid box it gates makes the extra pack builds worth it.
+pub(super) fn verification_pending(
+    conn: &Connection,
+    now_ms: i64,
+    budget: usize,
+    model_id: &str,
+) -> anyhow::Result<bool> {
+    let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_id = scope.as_deref().unwrap_or("__unassigned__");
+    let mut considered = 0usize;
+    for entry in verification_queue(conn, now_ms)? {
+        if considered >= budget {
+            break;
+        }
+        let inputs_hash = verify::checked_inputs_hash(conn, &entry.memory_id, &scope)?;
+        let content_hash = verify::note_content_hash(&entry.title, &entry.body);
+        let failure_stamp = FailureStamp {
+            memory_id: &entry.memory_id,
+            repo_id,
+            pass: DreamModelPass::Verify,
+            content_hash: &content_hash,
+            checked_inputs_hash: Some(&inputs_hash),
+            prompt_version: PROMPT_VERSION,
+            model_id,
+        };
+        if failure::blocking_failure_is_current(conn, &failure_stamp)? {
+            continue;
+        }
+        considered += 1;
+        if evidence_pack(conn, &entry.memory_id)?.is_citable() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Ask the model once, parse, and run the fabrication guard: EVERY EVIDENCE line must appear in the
 /// rendered pack (whitespace-normalized substring). An unmatched citation rejects the completion
 /// and RETRIES ONCE; a second fabrication (or a model error) discards the verdict. A malformed /
