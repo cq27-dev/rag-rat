@@ -588,18 +588,29 @@ pub struct TuneRequest<'a> {
 /// [`OpenAiEmbedder`] against it. The single place that wires `cookbook` → `CookbookInput` →
 /// `CookbookProvisioner::provision` → `OpenAiEmbedder::from_provisioned`; shared by the reconcile
 /// ephemeral chunk path AND the install probe (status.rs) so the model→input→handshake→embedder
-/// chain isn't duplicated. The returned [`ProvisionedBox`] MUST be kept alive for as long as the
-/// embedder is used (its `Drop` is the box teardown).
-/// Returns `(embedder, box, persisted_remote, window_concurrency)`. `persisted_remote` keeps the
-/// user's `concurrency` CAP (for the active-config meta); `window_concurrency` is the tuned client
-/// knee (<= cap) — the embedder's real fan-out, which the reconcile path uses to size its selection
-/// window so it doesn't load a cap-wide window the embedder will only drain `knee`-at-a-time.
+/// chain isn't duplicated.
 pub fn provision_and_build(
     remote: &RemoteEmbeddingConfig,
     spec: &EmbeddingModelSpec,
     tune: Option<TuneRequest<'_>>,
-) -> anyhow::Result<(OpenAiEmbedder, ProvisionedBox, RemoteEmbeddingConfig, u32)> {
+) -> anyhow::Result<ProvisionedEmbedding> {
     provision_and_build_cancellable(remote, spec, || false, tune)
+}
+
+/// A provisioned ephemeral box plus the embedder built against it (see [`provision_and_build`]).
+pub struct ProvisionedEmbedding {
+    /// The embedder against the box, fanning out at `window_concurrency`.
+    pub embedder: OpenAiEmbedder,
+    /// The live box. MUST be kept alive for as long as `embedder` is used — its `Drop` is the box
+    /// teardown.
+    pub provisioned: ProvisionedBox,
+    /// The remote config to persist: keeps the user's `concurrency` CAP (for the active-config
+    /// meta), never the tuned knee.
+    pub persisted_remote: RemoteEmbeddingConfig,
+    /// The tuned client knee (<= cap) — the embedder's real fan-out, which the reconcile path uses
+    /// to size its selection window so it doesn't load a cap-wide window the embedder will only
+    /// drain `knee`-at-a-time.
+    pub window_concurrency: u32,
 }
 
 /// EVAL-ONLY (#346): provision an ephemeral cookbook box for `remote` + `spec` and hand the caller
@@ -616,9 +627,7 @@ pub fn provision_box_for_benchmark(
     remote: &RemoteEmbeddingConfig,
     spec: &EmbeddingModelSpec,
 ) -> anyhow::Result<ProvisionedBox> {
-    let (_embedder, provisioned, _effective_remote, _knee) =
-        provision_and_build_cancellable(remote, spec, || false, None)?;
-    Ok(provisioned)
+    Ok(provision_and_build_cancellable(remote, spec, || false, None)?.provisioned)
 }
 
 fn provision_and_build_cancellable(
@@ -626,7 +635,7 @@ fn provision_and_build_cancellable(
     spec: &EmbeddingModelSpec,
     cancel: impl Fn() -> bool,
     tune: Option<TuneRequest<'_>>,
-) -> anyhow::Result<(OpenAiEmbedder, ProvisionedBox, RemoteEmbeddingConfig, u32)> {
+) -> anyhow::Result<ProvisionedEmbedding> {
     let cookbook = remote
         .cookbook
         .as_deref()
@@ -669,7 +678,12 @@ fn provision_and_build_cancellable(
             spec.dim,
         )
     });
-    Ok((embedder, provisioned, effective_remote, client_concurrency))
+    Ok(ProvisionedEmbedding {
+        embedder,
+        provisioned,
+        persisted_remote: effective_remote,
+        window_concurrency: client_concurrency,
+    })
 }
 
 /// Init-wizard ephemeral spin-up TEST: provision a cookbook box for `remote` + `spec`, embed a
@@ -701,7 +715,7 @@ pub fn verify_ephemeral_remote_cancellable(
     // `_box` is bound (not `_`) so it lives to end of scope — `OpenAiEmbedder` holds only the
     // endpoint URL, not the process, so dropping the box early would tear down the server before
     // the ping. Drop at function exit is the teardown (SIGTERM → grace → SIGKILL on the group).
-    let (embedder, _box, _effective_remote, _knee) =
+    let ProvisionedEmbedding { embedder, provisioned: _box, .. } =
         provision_and_build_cancellable(remote, spec, cancel, None)?;
     embedder.embed_batch(&["ping".to_string()]).map_err(|err| {
         anyhow::anyhow!("ephemeral spin-up test embed failed for `{}`: {err}", spec.model_id)

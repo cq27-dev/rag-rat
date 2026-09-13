@@ -110,6 +110,6 @@ pub use providers::*;
 pub mod cookbook_internals {
     #[cfg(feature = "eval")]
     pub use crate::cookbook::provision_box_for_benchmark;
-    pub use crate::cookbook::{TuneRequest, provision_and_build};
+    pub use crate::cookbook::{ProvisionedEmbedding, TuneRequest, provision_and_build};
     pub use crate::openai::resolve_auth_header;
 }

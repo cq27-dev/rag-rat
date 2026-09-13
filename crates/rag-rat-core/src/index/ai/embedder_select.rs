@@ -4,7 +4,7 @@
 
 use rag_rat_base::config::RemoteEmbeddingConfig;
 use rag_rat_base::embedding_models::{self, Backend, EmbeddingModelSpec};
-use rag_rat_llm::cookbook_internals::provision_and_build;
+use rag_rat_llm::cookbook_internals::{ProvisionedEmbedding, provision_and_build};
 use rag_rat_llm::providers::*;
 use rusqlite::Connection;
 
@@ -246,14 +246,19 @@ pub(crate) fn acquire_chunk_embedder(
         };
         tracing::info!(target: "rag_rat_core::index::ai::providers", path = "provision_ephemeral", estimated_jobs = ?estimated_jobs, "explicit reconcile: provisioning ephemeral embedding box");
         return match provision_and_build(remote, spec, Some(tune)) {
-            Ok((embedder, provisioned, effective_remote, window_concurrency)) => {
+            Ok(ProvisionedEmbedding {
+                embedder,
+                provisioned,
+                persisted_remote,
+                window_concurrency,
+            }) => {
                 // Size the reconcile selection window by the EMBEDDER's real fan-out (the tuned
                 // knee), not the user's cap: `remote_reconcile_batch_size`
                 // multiplies by `concurrency`, so a 128-cap config with a knee of 4
                 // would otherwise load a 32x-too-wide window the embedder only
                 // drains 4-at-a-time. This `remote` is window-sizing only (NOT persisted
                 // — the active-config meta is written from the cap by `install_remote_model`).
-                let mut window_remote = effective_remote;
+                let mut window_remote = persisted_remote;
                 window_remote.concurrency = window_concurrency;
                 ChunkEmbedder::Ready {
                     embedder: Box::new(embedder),

@@ -68,13 +68,17 @@ pub(crate) fn install_remote_model(
         RemoteEmbeddingConfig,
     ) = if remote.is_ephemeral() {
         // The install probe just provisions + pings + tears down (a throwaway box), so it passes
-        // `None` (no throughput sweep — that runs at reconcile). It PERSISTS `tuned_remote`, which
-        // keeps the user's `concurrency` cap (the cap model never persists a tuned knee).
-        let (embedder, provisioned, tuned_remote, _knee) = provision_and_build(remote, spec, None)
-            .map_err(|err| {
-                anyhow::anyhow!("failed to provision ephemeral box for `{model_id}`: {err}")
-            })?;
-        (embedder, Some(provisioned), tuned_remote)
+        // `None` (no throughput sweep — that runs at reconcile). It PERSISTS `persisted_remote`,
+        // which keeps the user's `concurrency` cap (the cap model never persists a tuned knee).
+        let rag_rat_llm::cookbook_internals::ProvisionedEmbedding {
+            embedder,
+            provisioned,
+            persisted_remote,
+            ..
+        } = provision_and_build(remote, spec, None).map_err(|err| {
+            anyhow::anyhow!("failed to provision ephemeral box for `{model_id}`: {err}")
+        })?;
+        (embedder, Some(provisioned), persisted_remote)
     } else {
         let embedder = OpenAiEmbedder::from_remote_config(remote, spec.model_id, spec.dim)
             .map_err(|err| {
