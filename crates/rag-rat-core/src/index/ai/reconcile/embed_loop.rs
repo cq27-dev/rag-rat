@@ -1,3 +1,5 @@
+use rag_rat_base::config::RemoteEmbeddingConfig;
+
 use super::super::*;
 use super::{batch_write, policy_scan};
 
@@ -78,31 +80,7 @@ pub(crate) fn reconcile_with_options_progress(
     } else {
         None
     };
-    let started = now_ms();
-    set_reconcile_meta(conn, LAST_EMBEDDING_RECONCILE_STARTED_META, &started.to_string())?;
-    // Stamp the active repo (V042): `reconcile_attempts` carries `repo_id`, so the attempt is
-    // attributed to the repo whose reconcile this is — else the row defaults to the placeholder and
-    // the per-repo status read never sees it. Per-call literal prefix so the bound params are
-    // unchanged; pre-A5 uses the original 4-column shape. The finalize UPDATE keys the row by its
-    // autoincrement `id`, so it needs no repo predicate.
-    let (repo_col, repo_val) =
-        match rag_rat_db::schema::periphery_repo_scope(conn, "reconcile_attempts")? {
-            Some(repo_id) =>
-                ("repo_id, ".to_string(), format!("'{}', ", repo_id.replace('\'', "''"))),
-            None => (String::new(), String::new()),
-        };
-    conn.execute(
-        &format!(
-            "INSERT INTO reconcile_attempts({repo_col}started_at_ms, limit_count, status, \
-             batch_size) VALUES ({repo_val}?1, ?2, 'Running', ?3)"
-        ),
-        params![
-            started,
-            options.limit.map(i64::from),
-            i64::try_from(batch_size).unwrap_or(i64::MAX)
-        ],
-    )?;
-    let attempt_id = conn.last_insert_rowid();
+    let attempt_id = record_attempt_start(conn, &options, batch_size)?;
     let timer = Instant::now();
     // The chunk-embed embedder. For an EPHEMERAL active model on a provisioning reconcile, this
     // PROVISIONS a cookbook box (held by `_provisioned` for the whole loop — its `Drop` tears the
@@ -132,123 +110,72 @@ pub(crate) fn reconcile_with_options_progress(
     // NotReady path below DOES report policy skips
     // (`blocked_fastembed_reconcile_still_reports_policy_skips` pins that), so it runs the scan
     // like the Ready path.
-    let acquired = match acquired {
-        skip @ (ChunkEmbedder::SkipEphemeral | ChunkEmbedder::NoEphemeralWork) => {
-            // NoEphemeralWork is an EXPLICIT `rag-rat reconcile` with nothing to embed — still a
-            // good moment to certify the policy column after a version bump so later
-            // plans take the fast path. SkipEphemeral is a FREQUENT watcher/maintenance
-            // deferral and must stay cheap: no heal scan. (The heal itself no-ops
-            // unless the stamp is stale at the DEFAULT cap.)
-            if matches!(skip, ChunkEmbedder::NoEphemeralWork) {
-                policy_scan::maybe_heal_embedding_policy(conn, max_embedding_chars);
-            }
-            let (status, message) = match skip {
-                ChunkEmbedder::SkipEphemeral => (
-                    ReconcileStatus::Blocked,
-                    Some(
-                        "ephemeral remote embedding needs an explicit `rag-rat reconcile`, or a \
-                         REACHABLE local `[remote] query_endpoint` server to embed incremental \
-                         edits against (the watcher does not provision a GPU box)"
-                            .to_string(),
-                    ),
-                ),
-                // Already current → nothing to embed; no paid box was provisioned.
-                _ => (ReconcileStatus::Current, None),
-            };
-            let report = ReconcileReport {
-                status,
-                message,
-                ..batch_write::empty_current_reconcile_report(
-                    active_model_id.clone(),
-                    model_version.clone(),
-                    embedding_dim,
-                    batch_size,
-                    max_embedding_chars,
-                    &options,
-                )
-            };
-            finish_reconcile_attempt(conn, attempt_id, &report)?;
-            progress(ReconcileProgress::Started {
-                model_id: active_model_id,
-                total_chunks: 0,
-                batch_size,
-            });
-            progress(ReconcileProgress::Finished {
-                processed_chunks: 0,
-                embeddings_written: 0,
-                failed_chunks: 0,
-                blocked_chunks: 0,
-            });
-            return Ok(report);
-        },
-        other => other,
-    };
-
-    // Ready / NotReady: BOTH report the per-policy skip counts, so run the repo-wide policy summary
-    // now. (SkipEphemeral already returned above without paying it.) Self-heal the policy column
-    // first so this summary and every later reconcile/plan take the fast GROUP BY path.
-    policy_scan::maybe_heal_embedding_policy(conn, max_embedding_chars);
-    // The heal may have just repaired + re-certified the stamp (the stale/absent-stamp upgrade
-    // path). Re-derive certification NOW so the embed loop below reads the healed columns instead
-    // of re-parsing every candidate FromText for the whole run — the first post-upgrade reconcile
-    // is exactly the large-repo case this fast path targets (#725).
-    scan.stamped_policy = policy_scan::stamped_policy_certified(conn, max_embedding_chars)?;
-    let skipped_by_policy = policy_scan::embedding_policy_skip_summary(conn, max_embedding_chars)?;
-    let skipped_chunks = skipped_by_policy.values().sum();
-    let mut report = ReconcileReport {
-        skipped_chunks,
-        skipped_by_policy,
-        ..batch_write::empty_current_reconcile_report(
-            active_model_id.clone(),
-            model_version.clone(),
-            embedding_dim,
-            batch_size,
-            max_embedding_chars,
-            &options,
-        )
-    };
-
     // `_provisioned` MUST outlive the embed loop: its `Drop` is the box teardown. Bound at function
     // scope here (not inside the match) so it lives until the function returns.
-    let (embedder, _provisioned, remote_config, acquired_estimated_jobs) = match acquired {
-        ChunkEmbedder::Ready { embedder, provisioned, remote, estimated_jobs } =>
-            (embedder, provisioned, remote, estimated_jobs),
-        ChunkEmbedder::NotReady(err) => {
-            // Surface the cause (e.g. a cookbook provisioning failure with its captured stderr) so
-            // a remote outage isn't swallowed; the report keeps the actionable "install" hint AND
-            // the policy-skip counts already computed above.
-            eprintln!("rag-rat: chunk embedder unavailable: {err:#}");
-            report.status = ReconcileStatus::Blocked;
-            report.message = Some(format!(
-                "{active_model_id} model is not ready; run `rag-rat models install \
-                 {active_model_id}`"
-            ));
-            finish_reconcile_attempt(conn, attempt_id, &report)?;
-            progress(ReconcileProgress::Started {
-                model_id: active_model_id,
-                total_chunks: 0,
-                batch_size,
-            });
-            progress(ReconcileProgress::Finished {
-                processed_chunks: 0,
-                embeddings_written: 0,
-                failed_chunks: 0,
-                blocked_chunks: 0,
-            });
-            return Ok(report);
-        },
-        // SkipEphemeral / NoEphemeralWork already returned above.
-        ChunkEmbedder::SkipEphemeral | ChunkEmbedder::NoEphemeralWork => {
-            unreachable!("SkipEphemeral / NoEphemeralWork handled before the policy scan")
-        },
-    };
+    let (embedder, _provisioned, remote_config, acquired_estimated_jobs, mut report) =
+        match acquired {
+            ChunkEmbedder::Ready { embedder, provisioned, remote, estimated_jobs } => {
+                let report = heal_policy_and_report_skips(conn, &mut scan, &options, batch_size)?;
+                (embedder, provisioned, remote, estimated_jobs, report)
+            },
+            ChunkEmbedder::NotReady(err) => {
+                // Surface the cause (e.g. a cookbook provisioning failure with its captured
+                // stderr) so a remote outage isn't swallowed; the report keeps the actionable
+                // "install" hint AND the policy-skip counts.
+                let mut report =
+                    heal_policy_and_report_skips(conn, &mut scan, &options, batch_size)?;
+                eprintln!("rag-rat: chunk embedder unavailable: {err:#}");
+                report.status = ReconcileStatus::Blocked;
+                report.message = Some(format!(
+                    "{active_model_id} model is not ready; run `rag-rat models install \
+                     {active_model_id}`"
+                ));
+                return finish_attempt_without_embedding(conn, attempt_id, report, &mut progress);
+            },
+            skip @ (ChunkEmbedder::SkipEphemeral | ChunkEmbedder::NoEphemeralWork) => {
+                // NoEphemeralWork is an EXPLICIT `rag-rat reconcile` with nothing to embed — still
+                // a good moment to certify the policy column after a version bump so later
+                // plans take the fast path. SkipEphemeral is a FREQUENT watcher/maintenance
+                // deferral and must stay cheap: no heal scan. (The heal itself no-ops
+                // unless the stamp is stale at the DEFAULT cap.)
+                if matches!(skip, ChunkEmbedder::NoEphemeralWork) {
+                    policy_scan::maybe_heal_embedding_policy(conn, max_embedding_chars);
+                }
+                let (status, message) = match skip {
+                    ChunkEmbedder::SkipEphemeral => (
+                        ReconcileStatus::Blocked,
+                        Some(
+                            "ephemeral remote embedding needs an explicit `rag-rat reconcile`, or \
+                             a REACHABLE local `[remote] query_endpoint` server to embed \
+                             incremental edits against (the watcher does not provision a GPU box)"
+                                .to_string(),
+                        ),
+                    ),
+                    // Already current → nothing to embed; no paid box was provisioned.
+                    _ => (ReconcileStatus::Current, None),
+                };
+                let report = ReconcileReport {
+                    status,
+                    message,
+                    ..batch_write::empty_current_reconcile_report(
+                        active_model_id.clone(),
+                        model_version.clone(),
+                        embedding_dim,
+                        batch_size,
+                        max_embedding_chars,
+                        &options,
+                    )
+                };
+                return finish_attempt_without_embedding(conn, attempt_id, report, &mut progress);
+            },
+        };
     let selection_batch_size = remote_config
         .as_deref()
         .map(|remote| {
             batch_write::remote_reconcile_batch_size(remote, batch_size, options.max_seconds)
         })
         .unwrap_or(batch_size);
-    let mut progress_total_chunks = match preflight_estimated_jobs.or(acquired_estimated_jobs) {
+    let progress_total_chunks = match preflight_estimated_jobs.or(acquired_estimated_jobs) {
         Some(jobs) => jobs,
         None => estimated_reconcile_jobs(conn, &scan, &options)?,
     };
@@ -257,142 +184,16 @@ pub(crate) fn reconcile_with_options_progress(
         total_chunks: progress_total_chunks,
         batch_size,
     });
-
-    // Ordered candidate ids fetched ONCE (ids only, need-first). The loop walks them with a cursor
-    // and loads text per batch, so each chunk's text is read at most once — see
-    // `embedding_candidate_ids`. The processed set guards against a chunk being revisited (e.g.
-    // under --force, whose ordering does not reflect embedding state).
-    let candidate_ids = embedding_candidate_ids(
+    EmbedPass {
         conn,
-        if options.force { "" } else { scan.model_id },
-        options.changed_first,
-    )?;
-    // Snapshot the scoped file metadata ONCE for the whole loop, alongside `candidate_ids`. The
-    // per-batch chunk query joins this indexed temp table instead of probing the live `UNION ALL`
-    // scope view per chunk row (which is O(files) each) — see `snapshot_reconcile_scope_files`.
-    snapshot_reconcile_scope_files(conn)?;
-    // One dict decoder for the whole run: each `select_reconcile_batch` loads text for its batch
-    // from the compressed `chunk_text` store (#77 Phase 2), and reusing this decoder keeps the dict
-    // SELECT + dictionary prep to once per run rather than once per batch.
-    let dicts = rag_rat_query::chunk_text_dicts(conn)?;
-    let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
-    let mut cursor = 0usize;
-    let mut processed_ids: HashSet<i64> = HashSet::new();
-    let mut remaining = options.limit.map(u64::from);
-    loop {
-        if remaining == Some(0) {
-            break;
-        }
-        if options.max_seconds.is_some_and(|seconds| timer.elapsed().as_secs() >= seconds) {
-            report.status = ReconcileStatus::Partial;
-            report.message = Some(format!(
-                "max_seconds={} reached; rerun reconcile to continue",
-                options.max_seconds.unwrap_or_default()
-            ));
-            break;
-        }
-        let window_limit = remaining
-            .map(|value| value.min(u64::try_from(selection_batch_size).unwrap_or(u64::MAX)))
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(selection_batch_size);
-        // Pull the next ordered embed window while keeping each DB lookup under SQLite's default
-        // bind-variable limit. Selected jobs are appended in candidate order, so remote reconcile
-        // still hands the embedder one window large enough to fill its HTTP concurrency.
-        let mut window_jobs = Vec::new();
-        let mut ids_seen = 0usize;
-        while cursor < candidate_ids.len() && ids_seen < window_limit {
-            let id_limit = RECONCILE_SELECT_ID_BATCH_LIMIT.min(window_limit - ids_seen);
-            let mut batch_ids = Vec::with_capacity(id_limit);
-            while cursor < candidate_ids.len()
-                && batch_ids.len() < id_limit
-                && ids_seen < window_limit
-            {
-                let id = candidate_ids[cursor];
-                cursor += 1;
-                ids_seen = ids_seen.saturating_add(1);
-                if !processed_ids.contains(&id) {
-                    batch_ids.push(id);
-                }
-            }
-            if batch_ids.is_empty() {
-                break;
-            }
-            let selected = select_reconcile_batch(conn, &scan, &batch_ids, &options, &mut decoder)?;
-            window_jobs.extend(selected.jobs);
-        }
-        if window_jobs.is_empty() {
-            if cursor >= candidate_ids.len() {
-                break; // candidate list exhausted
-            }
-            // Every id in this window was filtered (ineligible/already current); keep walking the
-            // rest of the candidate list rather than stopping.
-            continue;
-        }
-        for job in &window_jobs {
-            processed_ids.insert(job.id);
-            *report.work_reasons.entry(job.reason.as_str().to_string()).or_default() += 1;
-            report.input_chars = report
-                .input_chars
-                .saturating_add(u64::try_from(job.input_chars).unwrap_or(u64::MAX));
-            if job.input_truncated {
-                report.truncated_inputs += 1;
-            }
-        }
-        let jobs_len = window_jobs.len();
-        let mut reused_jobs = Vec::new();
-        let mut to_embed_jobs = Vec::new();
-        for job in window_jobs {
-            match find_existing_embedding(conn, &active_model_id, &job.input_hash, embedding_dim)? {
-                Some(vector) => reused_jobs.push((job, vector)),
-                None => to_embed_jobs.push(job),
-            }
-        }
-
-        if !reused_jobs.is_empty() {
-            let (reused_jobs_slice, reused_vectors_slice): (Vec<_>, Vec<_>) =
-                reused_jobs.into_iter().unzip();
-            // The reused vectors were decoded from the content cache (int8 -> f32); writing them
-            // back re-encodes to int8 — a negligible re-quantization (codes shift at most one
-            // level), well within the int8 scheme's accepted recall cost.
-            write_current_embedding_batch(
-                conn,
-                embedder.as_ref(),
-                &model_version,
-                &reused_jobs_slice,
-                &reused_vectors_slice,
-            )?;
-            report.embeddings_written += u64::try_from(reused_jobs_slice.len()).unwrap_or(u64::MAX);
-        }
-
-        if !to_embed_jobs.is_empty() {
-            let (written, failed) = batch_write::embed_and_write_jobs(
-                conn,
-                embedder.as_ref(),
-                &model_version,
-                to_embed_jobs,
-                remote_config.as_deref(),
-            )?;
-            report.embeddings_written = report.embeddings_written.saturating_add(written);
-            report.failed_chunks = report.failed_chunks.saturating_add(failed);
-        }
-        report.processed_chunks = report
-            .embeddings_written
-            .saturating_add(report.failed_chunks)
-            .saturating_add(report.blocked_chunks);
-        if let Some(value) = remaining.as_mut() {
-            *value = value.saturating_sub(u64::try_from(jobs_len).unwrap_or(0));
-        }
-        progress_total_chunks = progress_total_chunks.max(report.processed_chunks);
-        progress(ReconcileProgress::Batch {
-            processed_chunks: report.embeddings_written
-                + report.failed_chunks
-                + report.blocked_chunks,
-            total_chunks: progress_total_chunks,
-            embeddings_written: report.embeddings_written,
-            failed_chunks: report.failed_chunks,
-            blocked_chunks: report.blocked_chunks,
-        });
+        scan: &scan,
+        options: &options,
+        embedder: embedder.as_ref(),
+        remote: remote_config.as_deref(),
+        selection_batch_size,
+        timer,
     }
+    .drain_candidate_windows(&mut report, progress_total_chunks, &mut progress)?;
     if report.failed_chunks > 0 {
         report.status = ReconcileStatus::Failed;
         report.message =
@@ -428,6 +229,259 @@ pub(crate) fn reconcile_with_options_progress(
         "reconcile complete"
     );
     Ok(report)
+}
+
+/// Record the run-start meta and insert this reconcile's `Running` attempt row, returning its id
+/// for [`finish_reconcile_attempt`].
+fn record_attempt_start(
+    conn: &Connection,
+    options: &ReconcileOptions,
+    batch_size: usize,
+) -> anyhow::Result<i64> {
+    let started = now_ms();
+    set_reconcile_meta(conn, LAST_EMBEDDING_RECONCILE_STARTED_META, &started.to_string())?;
+    // Stamp the active repo (V042): `reconcile_attempts` carries `repo_id`, so the attempt is
+    // attributed to the repo whose reconcile this is — else the row defaults to the placeholder and
+    // the per-repo status read never sees it. Per-call literal prefix so the bound params are
+    // unchanged; pre-A5 uses the original 4-column shape. The finalize UPDATE keys the row by its
+    // autoincrement `id`, so it needs no repo predicate.
+    let (repo_col, repo_val) =
+        match rag_rat_db::schema::periphery_repo_scope(conn, "reconcile_attempts")? {
+            Some(repo_id) =>
+                ("repo_id, ".to_string(), format!("'{}', ", repo_id.replace('\'', "''"))),
+            None => (String::new(), String::new()),
+        };
+    conn.execute(
+        &format!(
+            "INSERT INTO reconcile_attempts({repo_col}started_at_ms, limit_count, status, \
+             batch_size) VALUES ({repo_val}?1, ?2, 'Running', ?3)"
+        ),
+        params![
+            started,
+            options.limit.map(i64::from),
+            i64::try_from(batch_size).unwrap_or(i64::MAX)
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Ready and NotReady both report the per-policy skip counts, so run the repo-wide policy summary
+/// for them. (SkipEphemeral / NoEphemeralWork return without paying it.) Self-heal the policy
+/// column first so this summary and every later reconcile/plan take the fast GROUP BY path; the
+/// heal may have just repaired + re-certified the stamp (the stale/absent-stamp upgrade path), so
+/// re-derive `scan`'s certification NOW so the embed loop reads the healed columns instead of
+/// re-parsing every candidate FromText for the whole run — the first post-upgrade reconcile is
+/// exactly the large-repo case this fast path targets (#725). Returns the in-progress report.
+fn heal_policy_and_report_skips(
+    conn: &Connection,
+    scan: &mut EmbeddingScan<'_>,
+    options: &ReconcileOptions,
+    batch_size: usize,
+) -> anyhow::Result<ReconcileReport> {
+    policy_scan::maybe_heal_embedding_policy(conn, scan.max_embedding_chars);
+    scan.stamped_policy = policy_scan::stamped_policy_certified(conn, scan.max_embedding_chars)?;
+    let skipped_by_policy =
+        policy_scan::embedding_policy_skip_summary(conn, scan.max_embedding_chars)?;
+    Ok(ReconcileReport {
+        skipped_chunks: skipped_by_policy.values().sum(),
+        skipped_by_policy,
+        ..batch_write::empty_current_reconcile_report(
+            scan.model_id.to_string(),
+            scan.model_version.to_string(),
+            scan.dim,
+            batch_size,
+            scan.max_embedding_chars,
+            options,
+        )
+    })
+}
+
+/// Close an attempt that embedded nothing: persist `report`, then emit the empty Started/Finished
+/// progress pair every reconcile path reports.
+fn finish_attempt_without_embedding(
+    conn: &Connection,
+    attempt_id: i64,
+    report: ReconcileReport,
+    progress: &mut impl FnMut(ReconcileProgress),
+) -> anyhow::Result<ReconcileReport> {
+    finish_reconcile_attempt(conn, attempt_id, &report)?;
+    progress(ReconcileProgress::Started {
+        model_id: report.model_id.clone(),
+        total_chunks: 0,
+        batch_size: report.batch_size,
+    });
+    progress(ReconcileProgress::Finished {
+        processed_chunks: 0,
+        embeddings_written: 0,
+        failed_chunks: 0,
+        blocked_chunks: 0,
+    });
+    Ok(report)
+}
+
+/// The stable inputs of one reconcile's embed loop.
+struct EmbedPass<'a, 's> {
+    conn: &'a Connection,
+    scan: &'a EmbeddingScan<'s>,
+    options: &'a ReconcileOptions,
+    embedder: &'a dyn Embedder,
+    remote: Option<&'a RemoteEmbeddingConfig>,
+    selection_batch_size: usize,
+    timer: Instant,
+}
+
+impl EmbedPass<'_, '_> {
+    /// Walk the ordered candidate list in embed windows until the limit, the time budget, or the
+    /// list runs out, folding each window's outcome into `report` and emitting a Batch progress
+    /// event per window.
+    fn drain_candidate_windows(
+        &self,
+        report: &mut ReconcileReport,
+        mut progress_total_chunks: u64,
+        progress: &mut impl FnMut(ReconcileProgress),
+    ) -> anyhow::Result<()> {
+        let Self { conn, scan, options, embedder, remote, selection_batch_size, timer } = *self;
+        // Ordered candidate ids fetched ONCE (ids only, need-first). The loop walks them with a
+        // cursor and loads text per batch, so each chunk's text is read at most once — see
+        // `embedding_candidate_ids`. The processed set guards against a chunk being revisited
+        // (e.g. under --force, whose ordering does not reflect embedding state).
+        let candidate_ids = embedding_candidate_ids(
+            conn,
+            if options.force { "" } else { scan.model_id },
+            options.changed_first,
+        )?;
+        // Snapshot the scoped file metadata ONCE for the whole loop, alongside `candidate_ids`.
+        // The per-batch chunk query joins this indexed temp table instead of probing the live
+        // `UNION ALL` scope view per chunk row (which is O(files) each) — see
+        // `snapshot_reconcile_scope_files`.
+        snapshot_reconcile_scope_files(conn)?;
+        // One dict decoder for the whole run: each `select_reconcile_batch` loads text for its
+        // batch from the compressed `chunk_text` store (#77 Phase 2), and reusing this decoder
+        // keeps the dict SELECT + dictionary prep to once per run rather than once per batch.
+        let dicts = rag_rat_query::chunk_text_dicts(conn)?;
+        let mut decoder = rag_rat_db::text_compression::ChunkTextDecoder::new(&dicts);
+        let mut cursor = 0usize;
+        let mut processed_ids: HashSet<i64> = HashSet::new();
+        let mut remaining = options.limit.map(u64::from);
+        loop {
+            if remaining == Some(0) {
+                break;
+            }
+            if options.max_seconds.is_some_and(|seconds| timer.elapsed().as_secs() >= seconds) {
+                report.status = ReconcileStatus::Partial;
+                report.message = Some(format!(
+                    "max_seconds={} reached; rerun reconcile to continue",
+                    options.max_seconds.unwrap_or_default()
+                ));
+                break;
+            }
+            let window_limit = remaining
+                .map(|value| value.min(u64::try_from(selection_batch_size).unwrap_or(u64::MAX)))
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(selection_batch_size);
+            // Pull the next ordered embed window while keeping each DB lookup under SQLite's
+            // default bind-variable limit. Selected jobs are appended in candidate order, so
+            // remote reconcile still hands the embedder one window large enough to fill its HTTP
+            // concurrency.
+            let mut window_jobs = Vec::new();
+            let mut ids_seen = 0usize;
+            while cursor < candidate_ids.len() && ids_seen < window_limit {
+                let id_limit = RECONCILE_SELECT_ID_BATCH_LIMIT.min(window_limit - ids_seen);
+                let mut batch_ids = Vec::with_capacity(id_limit);
+                while cursor < candidate_ids.len()
+                    && batch_ids.len() < id_limit
+                    && ids_seen < window_limit
+                {
+                    let id = candidate_ids[cursor];
+                    cursor += 1;
+                    ids_seen = ids_seen.saturating_add(1);
+                    if !processed_ids.contains(&id) {
+                        batch_ids.push(id);
+                    }
+                }
+                if batch_ids.is_empty() {
+                    break;
+                }
+                let selected =
+                    select_reconcile_batch(conn, scan, &batch_ids, options, &mut decoder)?;
+                window_jobs.extend(selected.jobs);
+            }
+            if window_jobs.is_empty() {
+                if cursor >= candidate_ids.len() {
+                    break; // candidate list exhausted
+                }
+                // Every id in this window was filtered (ineligible/already current); keep walking
+                // the rest of the candidate list rather than stopping.
+                continue;
+            }
+            for job in &window_jobs {
+                processed_ids.insert(job.id);
+                *report.work_reasons.entry(job.reason.as_str().to_string()).or_default() += 1;
+                report.input_chars = report
+                    .input_chars
+                    .saturating_add(u64::try_from(job.input_chars).unwrap_or(u64::MAX));
+                if job.input_truncated {
+                    report.truncated_inputs += 1;
+                }
+            }
+            let jobs_len = window_jobs.len();
+            let mut reused_jobs = Vec::new();
+            let mut to_embed_jobs = Vec::new();
+            for job in window_jobs {
+                match find_existing_embedding(conn, scan.model_id, &job.input_hash, scan.dim)? {
+                    Some(vector) => reused_jobs.push((job, vector)),
+                    None => to_embed_jobs.push(job),
+                }
+            }
+
+            if !reused_jobs.is_empty() {
+                let (reused_jobs_slice, reused_vectors_slice): (Vec<_>, Vec<_>) =
+                    reused_jobs.into_iter().unzip();
+                // The reused vectors were decoded from the content cache (int8 -> f32); writing
+                // them back re-encodes to int8 — a negligible re-quantization (codes shift at most
+                // one level), well within the int8 scheme's accepted recall cost.
+                write_current_embedding_batch(
+                    conn,
+                    embedder,
+                    scan.model_version,
+                    &reused_jobs_slice,
+                    &reused_vectors_slice,
+                )?;
+                report.embeddings_written +=
+                    u64::try_from(reused_jobs_slice.len()).unwrap_or(u64::MAX);
+            }
+
+            if !to_embed_jobs.is_empty() {
+                let (written, failed) = batch_write::embed_and_write_jobs(
+                    conn,
+                    embedder,
+                    scan.model_version,
+                    to_embed_jobs,
+                    remote,
+                )?;
+                report.embeddings_written = report.embeddings_written.saturating_add(written);
+                report.failed_chunks = report.failed_chunks.saturating_add(failed);
+            }
+            report.processed_chunks = report
+                .embeddings_written
+                .saturating_add(report.failed_chunks)
+                .saturating_add(report.blocked_chunks);
+            if let Some(value) = remaining.as_mut() {
+                *value = value.saturating_sub(u64::try_from(jobs_len).unwrap_or(0));
+            }
+            progress_total_chunks = progress_total_chunks.max(report.processed_chunks);
+            progress(ReconcileProgress::Batch {
+                processed_chunks: report.embeddings_written
+                    + report.failed_chunks
+                    + report.blocked_chunks,
+                total_chunks: progress_total_chunks,
+                embeddings_written: report.embeddings_written,
+                failed_chunks: report.failed_chunks,
+                blocked_chunks: report.blocked_chunks,
+            });
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn finish_reconcile_attempt(
