@@ -12,71 +12,80 @@ devices, see `rag-rat sync --help` (`enable`, `init`, `join`).
 
 ## How devices reach each other
 
-**Only a device running `rag-rat sync serve` can receive a sync connection.** Everything else dials
-outward: the maintenance-hook pass that runs after a git action opens connections, reconciles, and
-exits. It never listens. A device is therefore in exactly one of two roles at a time — the
-per-database session lock enforces that:
+**A device can receive a sync connection only while a process on it holds the database's sync
+endpoint.** Two processes do — an active MCP session and `rag-rat sync serve` — and the per-database
+session lock lets only one of them hold it at a time. Anything else dials outward only:
 
-| Role | Command | Dials out | Accepts in |
+| Role | Started by | Dials out | Accepts in |
 |---|---|:-:|:-:|
-| **Host** | `rag-rat sync serve` (long-running) | no | yes |
-| **Device** | the git-hook pass (automatic) | yes | no |
+| **Active MCP session** | automatic — `rag-rat mcp` serving an indexed repo with sync enabled | yes | yes |
+| **Headless host** | `rag-rat sync serve` (long-running) | no | yes |
+| **Hook pass** | the git hook, when no MCP session is hosting | yes | no |
 
-Two consequences follow, and the first is a limitation rather than a design goal:
+- **Active MCP session.** The first `rag-rat mcp` process on a database starts a resident sync host
+  for it. The host accepts inbound sessions, reconciles its peers every `push_interval_secs`, and
+  advertises itself when `discoverable = true`. It needs a write-capable roster role (Member or
+  Owner) — a read-only device dials but does not host — and it lives exactly as long as that MCP
+  process.
+- **Hook pass.** After a git action the hook signals a live resident host (one that has heartbeated
+  in the last 30 seconds) and returns; the host reconciles on its next tick. With no live host the
+  hook falls back to a short dial-only pass: it opens connections, reconciles, and exits. It never
+  listens.
+- **Headless host.** `rag-rat sync serve` accepts connections and advertises with no agent session
+  open — for a machine that should be reachable at any hour.
 
-- **Two devices cannot currently sync directly with each other.** Neither is listening. This is not
-  a NAT problem — a device behind NAT is perfectly reachable through the relay *if something on it
-  is listening* — it is that the maintenance pass is a short batch job with nothing alive to accept.
-  Discovery does not help: it can say where a node is, not make it answer. Lifting this is
-  [#1079](https://github.com/cq27-dev/rag-rat/issues/1079); until then, arrange things as below.
-- **So you need at least one host today.** Every device reconciles *through* it: a device pushes
-  what the host lacks and pulls what it lacks, so changes reach the other devices on their next
-  pass. The host does not have to be dedicated or hosted anywhere — a desktop that is usually on is
-  a host.
+So **two devices sync directly whenever at least one of them has an agent session open** in an
+indexed repo; a laptop and a desktop need no dedicated host. What they cannot do is reach each other
+while both are idle, because a device without an MCP session only dials — and that is a question of
+process lifetime, not NAT: a device behind NAT is reachable through the relay whenever something on
+it is listening.
 
-Until #1079 lands the arrangement is therefore: **one or more always-on hosts, and any number of
-devices reconciling through them.**
+When sync has to work at any hour, keep one always-on host running `rag-rat sync serve` — a desktop
+that is usually on is enough. Devices reconcile *through* it: each pushes what the host lacks and
+pulls what it lacks, so changes reach the other devices on their next pass.
 
 ```toml
-# On the host — advertise it so devices can find it without hardcoding its node id
+# On a machine others should find without hardcoding its node id: a `sync serve` host, or a device
+# that usually has an agent session open
 [sync]
 discoverable = true
 ```
 
 ```bash
-# On the host
+# Optional: an always-on host, reachable with no agent session open
 rag-rat sync serve
 ```
 
 ```toml
-# On every device: nothing to set. `discoverable` is already false, and fetching is not gated on it.
+# On a device that only needs to reach others: nothing to set.
+# Fetching is not gated on `discoverable`.
 [sync]
 ```
 
-Devices find the host because **fetching is never gated on `discoverable`** — a device queries the
-discovery service and dials what it finds without advertising anything itself. That asymmetry is
-deliberate: a laptop behind NAT reaches the host without becoming reachable, or discoverable, in
-turn.
+Devices find advertised peers because **fetching is never gated on `discoverable`** — a device
+queries the discovery service and dials what it finds without advertising anything itself. That
+asymmetry is deliberate: a laptop behind NAT reaches a host without becoming reachable, or
+discoverable, in turn.
 
-### Why `discoverable` belongs only on hosts, for now
+### When to set `discoverable`
 
-Setting it on a device would announce an address that cannot accept a connection and that stops
-existing seconds later when the pass ends, while the announcement itself lives on for its whole TTL.
-Every device that discovered it would spend a dial that can only time out, and it would occupy one
-of the few per-tag slots a reachable host needs. The device-side pass therefore ignores the flag and
-only ever fetches; `discoverable` is read by `sync serve`.
+Set it on a `sync serve` host, and on any device that usually has an agent session open. The flag is
+read by whichever process holds the endpoint — `sync serve` or the resident MCP host — and never by
+the hook pass, which only ever fetches.
 
-This restriction is a consequence of the limitation above, not of the discovery design. Once
-devices can accept connections ([#1079](https://github.com/cq27-dev/rag-rat/issues/1079)) the flag
-becomes meaningful on any device, because a device that advertises itself will be reachable.
+Leave it off on a device whose agent sessions are short or rare. An announcement lives for its whole
+TTL, so once the MCP session that published it exits, every device that discovers it spends a dial
+that can only time out, and it occupies one of the per-tag slots reachable hosts need (see
+[The limits on discovery](#the-limits-on-discovery)).
 
 ### Scale
 
-Dials grow linearly with the number of devices — each device dials the host, not every other device
-— and only the hosts advertise, so the per-tag *slot* limit counts **hosts**, not devices. One or
-two hosts stay well inside it no matter how many devices sync through them. Device count reaches
-discovery by a different route: it sets the size of each announcement, which is the 25-device
-ceiling above.
+Each device dials the peers it discovers plus its pinned `server_peers`, so dials grow with devices
+times advertisers — and only machines with `discoverable = true` advertise, so the per-tag *slot*
+limit counts **advertisers**, not devices. Keeping advertising to one or two usually-reachable
+machines keeps both small no matter how many devices sync through them. Device count reaches
+discovery by a different route: it sets the size of each announcement, which is the device ceiling
+below.
 
 Adding hosts is how you spread load or place one nearer a group of devices; devices that dial more
 than one host also propagate changes between those hosts.
@@ -89,9 +98,10 @@ reachable through `server_peers`.
 
 **How many hosts can advertise.** The service holds at most 32 live announcements per account and
 evicts the oldest to make room rather than refusing a newcomer. A host renews at half the TTL, so it
-keeps about two live announcements of itself — **roughly sixteen hosts advertising at once**.
-Devices cost nothing here; they only fetch. Past that, hosts evict each other and discoverability
-**flaps**: a host findable this hour may not be next hour. Pin those hosts in `server_peers` instead.
+keeps about two live announcements of itself — **roughly sixteen hosts advertising at once**. A
+machine without `discoverable` costs nothing here; it only fetches. Past that, hosts evict each
+other and discoverability **flaps**: a host findable this hour may not be next hour. Pin those hosts
+in `server_peers` instead.
 
 **How many devices an account can have.** An announcement is sealed once per recipient, so it grows
 by one fixed-size wrap per roster-effective device against the service's publish limit — **a few
@@ -111,9 +121,9 @@ of its peers per pass and the rest on later passes.
 |---|---|---|
 | `relay_url` | the shipped relay | The iroh relay peers pin. Discovery is pinned to a single relay with no third-party directory, so **two devices can only reach each other if they share this value**. `RAG_RAT_SYNC_RELAY` overrides per invocation. |
 | `server_peers` | empty | Node ids dialed unconditionally, without consulting the discovery service. Tried before discovered peers. |
-| `push_interval_secs` | `300` | Minimum seconds between device-side sync attempts. `0` attempts on every trigger. Also sets the TTL a serving host publishes its announcement under. |
+| `push_interval_secs` | `300` | Minimum seconds between sync attempts — the resident MCP host's reconcile cadence, and the hook pass's rate limit. `0` attempts on every trigger. Also sets the TTL an advertising node publishes its announcement under. |
 | `discovery` | `true` | Use the peer-discovery service at all. `false` means peers come from `server_peers` and nowhere else — no queries, no announcements. |
-| `discoverable` | `false` | Advertise this node so devices can find it. Requires `discovery`. Read by `rag-rat sync serve` only — see [Why `discoverable` belongs only on hosts](#why-discoverable-belongs-only-on-hosts). Fetching is **not** gated on it. |
+| `discoverable` | `false` | Advertise this node so devices can find it. Requires `discovery`. Read by whichever process holds the endpoint (`rag-rat sync serve` or an active MCP session), never by the hook pass — see [When to set `discoverable`](#when-to-set-discoverable). Fetching is **not** gated on it. |
 | `discovery_node_id` | the shipped service | The discovery service's node id — a node id, not a URL; it is a separate peer reached through `relay_url`. `RAG_RAT_SYNC_DISCOVERY_NODE` overrides per invocation. |
 
 ### `server_peers` versus discovery
@@ -174,13 +184,20 @@ the repo has one **owner** account whose stream holds the shared set, and any nu
 The short version, one ticket end to end:
 
 ```bash
-# Owner, once: make the repo's memory stream public, then stay online with a one-time invite
+# Owner, once, on a dedicated public index: publish it, then stay online with a one-time invite
 rag-rat sync publish
 rag-rat sync invite-writer          # prints ragratinvite… and keeps serving
 
 # Teammate, in a checkout of the same repo:
 rag-rat sync contribute <ticket>
 ```
+
+**`sync publish` is one-way and account-wide.** Every later memory the account authors goes onto a
+public stream that anonymous readers can pull, and the command refuses an account that already holds
+private memories or has authored sealed content. Publish a fresh index dedicated to the shared set,
+not your working one: `sync publish --seed <index path>` first imports this repo's locally-authored
+memories from an existing index (peer-synced memories are left out), and re-running it re-mirrors
+from that source.
 
 Redeeming the ticket does the whole exchange the old two-paste flow left half-finished: the owner
 authors the Writer grant naming the teammate's account at redemption (no account ids change
@@ -194,12 +211,49 @@ For ongoing automatic sync in both directions, each side pins the other's servin
 syncing the CONTRIBUTOR's account, and vice versa — see the cross-account note under
 `server_peers`). The pieces are also available separately when a ticket exchange is impractical:
 `sync whoami` (the id to grant), `sync grant <id>` (owner side), `sync contribute <owner-id>` +
-`sync pull <owner-id>` (teammate side).
+`sync pull <owner-id>` (teammate side). `sync uncontribute` stops contributing: authoring returns to
+this store's own stream, the contributions already authored stay on the owner's stream, and the
+grant stays open until the owner revokes it.
 
 The owner stays in charge afterwards: `sync grants` lists who holds access, open and revoked, and
 `sync revoke <account> --reason …` closes it — `departed`/`rotated`/`superseded` keep the work
 this store has already accepted, `compromised` quarantines everything the grantee authored
 (`--keep-until <seq>@<device>` can carve one vouched prefix back in).
+
+### Subscribing read-only
+
+A reader who wants a published repo's memories without writing back subscribes instead of
+contributing. No grant is involved:
+
+```bash
+rag-rat sync subscribe              # owner named by the repo's checked-in .rag-rat-stream
+rag-rat sync subscribe <owner-id>   # or name the owner explicitly
+rag-rat sync unsubscribe
+```
+
+A publisher can check a `.rag-rat-stream` into the repo root so a clone needs no hand-carried id:
+
+```toml
+owner = "<64-hex account id, from the owner's `rag-rat sync whoami`>"
+peers = ["<node id of the owner's serving host>"]
+relay = "<relay URL, when the owner's host uses a non-default relay>"
+name = "<display name; never used for identity>"
+```
+
+Only `owner` carries authority. The first subscribe pins it, and a later commit naming a different
+owner is refused rather than followed — confirm the new id with the stream's owner and pass it
+explicitly to move the pin. `peers` and `relay` are routing hints followed as given, because every
+entry pulled is verified against the pinned account. In practice they are needed: discovery cannot
+find a foreign account's host, so a locator naming only the owner reaches nothing unless that host
+is already in `server_peers`. Nothing materializes until the owner's log reaches this store —
+automatic sync pulls it once the owner's host is reachable, or run `rag-rat sync pull <owner-id>`.
+
+**Subscribing replaces what the repo mirrors, and deletes.** Exactly one stream materializes a repo,
+so while subscribed it mirrors the owner's stream instead of this account's: memories this
+account's *other devices* synced here are removed, not marked stale. Memories authored in this store
+keep going to its own stream and stay. `sync unsubscribe` restores the removed set, except local
+binding work — a `memory rebind` made on a synced memory, and local edges onto it — because a
+re-drain seeds only the anchors each memory's author published.
 
 ## What each service learns
 
