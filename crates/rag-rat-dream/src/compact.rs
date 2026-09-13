@@ -32,7 +32,8 @@ pub(crate) use rag_rat_query::memory::evidence::COMPACT_PROMPT_VERSION;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::failure::{
-    self, DreamFailureReason, DreamModelFailure, DreamModelPass, FailureStamp, RecordFailure,
+    self, DreamFailureReason, DreamModelFailure, DreamModelPass, FailureStamp, Judgement,
+    RecordFailure,
 };
 
 /// The compaction-pass configuration handed to [`run_compact_pass`]: the model to ask and how many
@@ -226,24 +227,20 @@ fn obtain_summary(
     model: &dyn ChatModel,
     prompt: &str,
 ) -> rusqlite::Result<Result<String, DreamModelFailure>> {
-    for attempt in 1..=2 {
-        let raw = match model.complete(prompt) {
-            Ok(raw) => raw,
-            Err(err) => {
-                tracing::warn!(target: "rag_rat_core::dream::compact", attempt, %err, "compaction model call failed; skipping this memory");
-                return Ok(Err(DreamModelFailure::with_detail(
-                    DreamFailureReason::ModelCallFailed,
-                    err.to_string(),
-                )));
-            },
-        };
-        let summary = strip_think(&raw);
-        if guards::accepts(conn, summary)? {
-            return Ok(Ok(summary.to_string()));
-        }
-        tracing::warn!(target: "rag_rat_core::dream::compact", attempt, "compaction summary failed the acceptance guards");
-    }
-    Ok(Err(DreamModelFailure::new(DreamFailureReason::SummaryGuardRejected)))
+    failure::ask_with_one_retry(
+        model,
+        prompt,
+        DreamModelPass::Compact,
+        DreamFailureReason::SummaryGuardRejected,
+        |attempt, raw| {
+            let summary = strip_think(raw);
+            if guards::accepts(conn, summary)? {
+                return Ok(Judgement::Accept(summary.to_string()));
+            }
+            tracing::warn!(target: "rag_rat_core::dream::compact", attempt, "compaction summary failed the acceptance guards");
+            Ok(Judgement::Retry)
+        },
+    )
 }
 
 /// Drop a leading `<think>…</think>` reasoning block a thinking model may prepend (the default

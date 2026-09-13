@@ -5,6 +5,7 @@
 //! records the latter explicitly, with stable enum tokens and the same freshness stamps the
 //! producer queues already use.
 
+use rag_rat_llm::chat::ChatModel;
 use rusqlite::{Connection, OptionalExtension};
 
 /// Which model pass attempted a memory. Persisted in `memory_model_failures.pass`.
@@ -166,6 +167,54 @@ pub(crate) fn clear_failure(conn: &Connection, stamp: &FailureStamp<'_>) -> rusq
         rusqlite::params![stamp.repo_id, stamp.memory_id, stamp.pass.as_db_str()],
     )?;
     Ok(())
+}
+
+/// What a pass's acceptance check made of one completion.
+pub(crate) enum Judgement<T> {
+    Accept(T),
+    /// Rejected, but one more ask may do better (a fabricated citation, a guard miss).
+    Retry,
+    /// Rejected, and asking again cannot help (an unparseable completion).
+    Reject(DreamModelFailure),
+}
+
+/// The ask-once-retry-once loop both model passes run: ask `model`, let `judge` rule on the
+/// completion, and ask ONCE more when it answers [`Judgement::Retry`]. A model-call error ends the
+/// ask as `ModelCallFailed`, which is recorded for audit but never suppresses a later run; a second
+/// retry ends it as `exhausted`. `judge` may fail with its own error — the compaction guards read
+/// the index — and that aborts the ask instead of recording a model failure.
+pub(crate) fn ask_with_one_retry<T, E>(
+    model: &dyn ChatModel,
+    prompt: &str,
+    pass: DreamModelPass,
+    exhausted: DreamFailureReason,
+    mut judge: impl FnMut(u32, &str) -> Result<Judgement<T>, E>,
+) -> Result<Result<T, DreamModelFailure>, E> {
+    for attempt in 1..=2 {
+        let raw = match model.complete(prompt) {
+            Ok(raw) => raw,
+            Err(err) => {
+                match pass {
+                    DreamModelPass::Verify => {
+                        tracing::warn!(target: "rag_rat_core::dream::verdict", attempt, %err, "verdict model call failed; discarding this memory's verdict");
+                    },
+                    DreamModelPass::Compact => {
+                        tracing::warn!(target: "rag_rat_core::dream::compact", attempt, %err, "compaction model call failed; skipping this memory");
+                    },
+                }
+                return Ok(Err(DreamModelFailure::with_detail(
+                    DreamFailureReason::ModelCallFailed,
+                    err.to_string(),
+                )));
+            },
+        };
+        match judge(attempt, &raw)? {
+            Judgement::Accept(value) => return Ok(Ok(value)),
+            Judgement::Reject(failure) => return Ok(Err(failure)),
+            Judgement::Retry => {},
+        }
+    }
+    Ok(Err(DreamModelFailure::new(exhausted)))
 }
 
 fn bounded_detail(detail: &str) -> String {

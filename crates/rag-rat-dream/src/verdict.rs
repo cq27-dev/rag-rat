@@ -35,7 +35,8 @@ use rusqlite::Connection;
 
 use super::DreamFinding;
 use super::failure::{
-    self, DreamFailureReason, DreamModelFailure, DreamModelPass, FailureStamp, RecordFailure,
+    self, DreamFailureReason, DreamModelFailure, DreamModelPass, FailureStamp, Judgement,
+    RecordFailure,
 };
 use super::findings::FindingKind;
 use super::verify::{
@@ -317,33 +318,32 @@ fn obtain_verdict(
     note_body: &str,
     pack_text: &str,
 ) -> Result<AcceptedVerdict, DreamModelFailure> {
-    for attempt in 1..=2 {
-        let raw = match model.complete(prompt) {
-            Ok(raw) => raw,
-            Err(err) => {
-                tracing::warn!(target: "rag_rat_core::dream::verdict", attempt, %err, "verdict model call failed; discarding this memory's verdict");
-                return Err(DreamModelFailure::with_detail(
-                    DreamFailureReason::ModelCallFailed,
-                    err.to_string(),
-                ));
-            },
-        };
-        let Some(parsed) = parse_verdict(&raw) else {
-            // Malformed or a stray `unverifiable` — discard, no retry (not a citation fault).
-            tracing::debug!(target: "rag_rat_core::dream::verdict", "discarding unparseable/unverifiable verdict completion");
-            return Err(DreamModelFailure::new(DreamFailureReason::MalformedVerdict));
-        };
-        if verdict_is_grounded(note_title, note_body, pack_text, &parsed) {
-            return Ok(AcceptedVerdict {
-                verdict: parsed.verdict,
-                direction: parsed.direction,
-                evidence: parsed.evidence,
-            });
-        }
-        // Fabricated citation. Retry once, then discard.
-        tracing::warn!(target: "rag_rat_core::dream::verdict", attempt, "verdict cited a line absent from the evidence pack (possible fabrication)");
-    }
-    Err(DreamModelFailure::new(DreamFailureReason::FabricatedEvidence))
+    let Ok(verdict) = failure::ask_with_one_retry::<_, std::convert::Infallible>(
+        model,
+        prompt,
+        DreamModelPass::Verify,
+        DreamFailureReason::FabricatedEvidence,
+        |attempt, raw| {
+            let Some(parsed) = parse_verdict(raw) else {
+                // Malformed or a stray `unverifiable` — discard, no retry (not a citation fault).
+                tracing::debug!(target: "rag_rat_core::dream::verdict", "discarding unparseable/unverifiable verdict completion");
+                return Ok(Judgement::Reject(DreamModelFailure::new(
+                    DreamFailureReason::MalformedVerdict,
+                )));
+            };
+            if verdict_is_grounded(note_title, note_body, pack_text, &parsed) {
+                return Ok(Judgement::Accept(AcceptedVerdict {
+                    verdict: parsed.verdict,
+                    direction: parsed.direction,
+                    evidence: parsed.evidence,
+                }));
+            }
+            // Fabricated citation. Retry once, then discard.
+            tracing::warn!(target: "rag_rat_core::dream::verdict", attempt, "verdict cited a line absent from the evidence pack (possible fabrication)");
+            Ok(Judgement::Retry)
+        },
+    );
+    verdict
 }
 
 // ── Prompt + pack rendering ──────────────────────────────────────────────────────────────────
