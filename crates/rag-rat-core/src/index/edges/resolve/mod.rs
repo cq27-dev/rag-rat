@@ -985,7 +985,7 @@ pub(crate) fn resolve_and_insert_edges(
 pub(crate) fn resolve_symbol<'a>(
     request: ResolveSymbolRequest<'_>,
     index: &SymbolIndex<'a>,
-) -> Option<(&'a IndexedSymbol, EdgeConfidence, &'static str)> {
+) -> Option<Resolved<'a>> {
     let kind_matches = |symbol: &IndexedSymbol| {
         (request.edge_kind != EdgeKind::UsesMacro || symbol.kind == "macro")
             && crate::index::languages::target_matches_policy(
@@ -1064,11 +1064,8 @@ pub(crate) fn resolve_symbol<'a>(
                             || alias_owner_matches_symbol_file(type_hint, symbol))
                 })
                 .collect::<Vec<_>>();
-            match scope_exact.as_slice() {
-                [symbol] => return Some((*symbol, "receiver_type")),
-                [_, ..] if same_logical_symbol(&scope_exact) =>
-                    return Some((scope_exact[0], "receiver_type")),
-                _ => {},
+            if let Some(hit) = unique_or_logical(&scope_exact) {
+                return Some((hit.symbol(), "receiver_type"));
             }
             // Reaching here means the exact stage found NOTHING or found an AMBIGUITY. Dropping
             // the raw candidates as "already tried" hides that ambiguity: two crates' plain
@@ -1097,12 +1094,7 @@ pub(crate) fn resolve_symbol<'a>(
                             || alias_owner_matches_symbol_file(type_hint, symbol))
                 })
                 .collect::<Vec<_>>();
-            match scope_normalized.as_slice() {
-                [symbol] => Some((*symbol, "scope_degeneric")),
-                [_, ..] if same_logical_symbol(&scope_normalized) =>
-                    Some((scope_normalized[0], "scope_degeneric")),
-                _ => None,
-            }
+            unique_or_logical(&scope_normalized).map(|hit| (hit.symbol(), "scope_degeneric"))
         };
 
         if let Some((symbol, reason)) = try_scope(&target, false) {
@@ -1141,24 +1133,14 @@ pub(crate) fn resolve_symbol<'a>(
                                 .ends_with(&scope_normalized_suffix))
                 })
                 .collect::<Vec<_>>();
-            match receiver_suffix_matches.as_slice() {
-                [symbol] => {
-                    let reason = if symbol.scope_path.ends_with(&scope_suffix) {
-                        "receiver_type"
-                    } else {
-                        "scope_degeneric"
-                    };
-                    return Some((*symbol, EdgeConfidence::Syntactic, reason));
-                },
-                [_, ..] if same_logical_symbol(&receiver_suffix_matches) => {
-                    let reason = if receiver_suffix_matches[0].scope_path.ends_with(&scope_suffix) {
-                        "receiver_type"
-                    } else {
-                        "scope_degeneric"
-                    };
-                    return Some((receiver_suffix_matches[0], EdgeConfidence::Syntactic, reason));
-                },
-                _ => {},
+            if let Some(hit) = unique_or_logical(&receiver_suffix_matches) {
+                let symbol = hit.symbol();
+                let reason = if symbol.scope_path.ends_with(&scope_suffix) {
+                    "receiver_type"
+                } else {
+                    "scope_degeneric"
+                };
+                return Some((symbol, EdgeConfidence::Syntactic, reason));
             }
         }
     }
@@ -1184,11 +1166,8 @@ pub(crate) fn resolve_symbol<'a>(
             .copied()
             .filter(|symbol| kind_matches(symbol))
             .collect::<Vec<_>>();
-        match scope_exact.as_slice() {
-            [symbol] => return Some((*symbol, EdgeConfidence::Exact, "scope_exact")),
-            [_, ..] if same_logical_symbol(&scope_exact) =>
-                return Some((scope_exact[0], EdgeConfidence::Syntactic, "logical_variant")),
-            _ => {},
+        if let Some(hit) = unique_or_logical(&scope_exact) {
+            return Some(hit.resolved(EdgeConfidence::Exact, "scope_exact"));
         }
         // Reaching here means the exact stage found NOTHING or found an AMBIGUITY. Either way the
         // raw candidates at the normalized key belong in this set: when normalization was a no-op
@@ -1217,11 +1196,8 @@ pub(crate) fn resolve_symbol<'a>(
             .copied()
             .filter(|symbol| kind_matches(symbol))
             .collect::<Vec<_>>();
-        match scope_normalized.as_slice() {
-            [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "scope_degeneric")),
-            [_, ..] if same_logical_symbol(&scope_normalized) =>
-                return Some((scope_normalized[0], EdgeConfidence::Syntactic, "scope_degeneric")),
-            _ => {},
+        if let Some(hit) = unique_or_logical(&scope_normalized) {
+            return Some((hit.symbol(), EdgeConfidence::Syntactic, "scope_degeneric"));
         }
         let scope_suffix = format!("::{qualified}");
         let scope_matches = index
@@ -1232,11 +1208,8 @@ pub(crate) fn resolve_symbol<'a>(
             .copied()
             .filter(|symbol| kind_matches(symbol) && symbol.scope_path.ends_with(&scope_suffix))
             .collect::<Vec<_>>();
-        match scope_matches.as_slice() {
-            [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "scope_suffix")),
-            [_, ..] if same_logical_symbol(&scope_matches) =>
-                return Some((scope_matches[0], EdgeConfidence::Syntactic, "logical_variant")),
-            _ => {},
+        if let Some(hit) = unique_or_logical(&scope_matches) {
+            return Some(hit.resolved(EdgeConfidence::Syntactic, "scope_suffix"));
         }
         // Exact qualified-name match (bucket entries already share `qualified_name == qualified`).
         if let Some(symbol) = index
@@ -1258,13 +1231,13 @@ pub(crate) fn resolve_symbol<'a>(
             .copied()
             .filter(|symbol| kind_matches(symbol) && symbol.qualified_name.ends_with(&suffix))
             .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "qualified_suffix")),
-            [_, ..] if same_logical_symbol(&matches) => {
-                return Some((matches[0], EdgeConfidence::Syntactic, "logical_variant"));
-            },
-            [_, ..] => return None,
-            [] => {},
+        if let Some(hit) = unique_or_logical(&matches) {
+            return Some(hit.resolved(EdgeConfidence::Syntactic, "qualified_suffix"));
+        }
+        // Distinct qualified-name matches: the written path is ambiguous, and a bare-name guess
+        // would be weaker evidence than that ambiguity.
+        if !matches.is_empty() {
+            return None;
         }
         let projected_self = request.source_language == Some(Language::Rust.as_str())
             && request.receiver_hint == Some("Self")
@@ -1374,25 +1347,52 @@ pub(crate) fn resolve_symbol<'a>(
         return None;
     }
     let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
-    match matches {
-        [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "target_name_fallback")),
-        [_, ..] => {
-            if same_logical_symbol(matches) {
-                return Some((matches[0], EdgeConfidence::Syntactic, "logical_variant"));
-            }
-            let same_file = matches
-                .iter()
-                .copied()
-                .filter(|symbol| symbol.file_id == request.source_file_id)
-                .collect::<Vec<_>>();
-            match same_file.as_slice() {
-                [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "same_file_name")),
-                [_, ..] if same_logical_symbol(&same_file) =>
-                    Some((same_file[0], EdgeConfidence::Syntactic, "logical_variant")),
-                _ => None,
-            }
-        },
-        [] => None,
+    if let Some(hit) = unique_or_logical(matches) {
+        return Some(hit.resolved(EdgeConfidence::Syntactic, "target_name_fallback"));
+    }
+    let same_file = matches
+        .iter()
+        .copied()
+        .filter(|symbol| symbol.file_id == request.source_file_id)
+        .collect::<Vec<_>>();
+    unique_or_logical(&same_file)
+        .map(|hit| hit.resolved(EdgeConfidence::Syntactic, "same_file_name"))
+}
+
+/// A resolved binding: the target, the confidence stamped on the edge, and the persisted reason.
+pub(crate) type Resolved<'a> = (&'a IndexedSymbol, EdgeConfidence, &'static str);
+
+/// What one resolution stage may bind from its candidate set: a unique hit, or — when every
+/// candidate is a variant of ONE logical symbol ([`same_logical_symbol`]) — the first of them.
+/// Any other multi-candidate set is an ambiguity the stage must not choose between.
+#[derive(Clone, Copy)]
+enum StageHit<'a> {
+    Unique(&'a IndexedSymbol),
+    LogicalVariant(&'a IndexedSymbol),
+}
+
+impl<'a> StageHit<'a> {
+    fn symbol(self) -> &'a IndexedSymbol {
+        match self {
+            Self::Unique(symbol) | Self::LogicalVariant(symbol) => symbol,
+        }
+    }
+
+    /// Label the hit for a stage whose own reason names a single target: a unique hit takes
+    /// the stage's confidence and reason, a logical variant is `Syntactic` / `logical_variant`.
+    fn resolved(self, confidence: EdgeConfidence, reason: &'static str) -> Resolved<'a> {
+        match self {
+            Self::Unique(symbol) => (symbol, confidence, reason),
+            Self::LogicalVariant(symbol) => (symbol, EdgeConfidence::Syntactic, "logical_variant"),
+        }
+    }
+}
+
+fn unique_or_logical<'a>(candidates: &[&'a IndexedSymbol]) -> Option<StageHit<'a>> {
+    match candidates {
+        [symbol] => Some(StageHit::Unique(symbol)),
+        [first, ..] if same_logical_symbol(candidates) => Some(StageHit::LogicalVariant(first)),
+        _ => None,
     }
 }
 /// Whether a bare-name candidate is compatible with a receiver type that failed the scope passes.
