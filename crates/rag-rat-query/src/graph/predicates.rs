@@ -18,9 +18,9 @@ use super::*;
 /// A resolved row (`to_symbol_id IS NOT NULL`) is by definition bound to a real operator symbol, so
 /// requiring resolution is what separates the two.
 ///
-/// Valid wherever the edges table is named or aliased `edges`. `forward_visibility_filter` /
-/// `reverse_visibility_filter` below encode the same rule in positive form, inside their OR-chains,
-/// and `graph_meta` splices this guard directly.
+/// Valid wherever the edges table is named or aliased `edges`. `forward_visibility_filter` below
+/// encodes the same rule in positive form, inside its OR-chains; `graph_meta` and
+/// `impact::neighbors` splice this guard verbatim.
 /// `search_and_read_chunk_attach_bounded_graph_evidence` poisons the index with one unresolved
 /// operator edge and asserts EVERY consumer — search graph metadata and all three `impact_surface`
 /// resolution modes — leaves it out; impact was the lane that had been missing the guard.

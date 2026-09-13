@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
+use crate::graph::RESOLVED_OPERATOR_ONLY;
 use crate::{ReadChunk, SearchHit};
 
 const FULL_GRAPH_NOTE: &str = "Call graph is tree-sitter/syntactic, not compiler-resolved.";
@@ -255,17 +256,17 @@ fn count_callers(conn: &Connection, symbol: &PrimarySymbol) -> anyhow::Result<u6
     // the live generation's callsites (columns qualified because `files.id` would otherwise
     // collide with the `-id` edge term).
     let count = conn
-        .prepare_cached(
+        .prepare_cached(&format!(
             "
         SELECT COUNT(DISTINCT COALESCE(edges.from_symbol_id, -edges.id))
         FROM edges
         JOIN files source_files ON source_files.id = edges.source_file_id
         WHERE edges.edge_kind IN ('calls_name', 'constructs', 'uses_operator', 'uses_macro')
-          AND (edges.edge_kind != 'uses_operator' OR edges.to_symbol_id IS NOT NULL)
+          AND {RESOLVED_OPERATOR_ONLY}
           AND (edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL AND edges.to_name_id = \
              (SELECT id FROM name_strings WHERE value = ?2)))
         ",
-        )?
+        ))?
         .query_row(params![symbol.id, symbol.name], |row| row.get::<_, i64>(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
@@ -274,7 +275,7 @@ fn count_callees(conn: &Connection, symbol_id: i64) -> anyhow::Result<u64> {
     // Mirror the filter in `callees()` so `callee_count` (and thus the `truncated` flag) reflects
     // the callees actually surfaced — not the unresolved name-only std calls we hide.
     let count = conn
-        .prepare_cached(
+        .prepare_cached(&format!(
             "
         SELECT COUNT(DISTINCT COALESCE(CAST(to_symbol_id AS TEXT), to_name))
         FROM edges
@@ -285,12 +286,9 @@ fn count_callees(conn: &Connection, symbol_id: i64) -> anyhow::Result<u64> {
               OR to_symbol_id IS NOT NULL
               OR (confidence = 'Syntactic' AND target_qualified_name IS NOT NULL)
           )
-          AND (
-              edge_kind != 'uses_operator'
-              OR to_symbol_id IS NOT NULL
-          )
+          AND {RESOLVED_OPERATOR_ONLY}
         ",
-        )?
+        ))?
         .query_row([symbol_id], |row| row.get::<_, i64>(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
@@ -352,7 +350,7 @@ fn callers(
     symbol: &PrimarySymbol,
     limit: u32,
 ) -> anyhow::Result<Vec<CallerEvidence>> {
-    let mut stmt = conn.prepare_cached(
+    let mut stmt = conn.prepare_cached(&format!(
         "
         SELECT DISTINCT
                source_files.path,
@@ -370,7 +368,7 @@ fn callers(
           AND source_symbols.start_byte >= source_chunks.start_byte
           AND source_symbols.start_byte < source_chunks.end_byte
         WHERE edges.edge_kind IN ('calls_name', 'constructs', 'uses_operator', 'uses_macro')
-          AND (edges.edge_kind != 'uses_operator' OR edges.to_symbol_id IS NOT NULL)
+          AND {RESOLVED_OPERATOR_ONLY}
           AND (edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL AND edges.to_name_id = \
          (SELECT id FROM name_strings WHERE value = ?2)))
         ORDER BY
@@ -384,7 +382,7 @@ fn callers(
           source_chunks.start_line
         LIMIT ?3
         ",
-    )?;
+    ))?;
     let rows = stmt.query_map(params![symbol.id, symbol.name, expanded_limit(limit)], |row| {
         let path: String = row.get(0)?;
         let qualified_name: String = row.get(1)?;
@@ -413,7 +411,7 @@ fn callers(
 }
 
 fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<CalleeEvidence>> {
-    let mut stmt = conn.prepare_cached(
+    let mut stmt = conn.prepare_cached(&format!(
         "
         SELECT DISTINCT
                edges.to_name,
@@ -448,10 +446,7 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
               OR edges.to_symbol_id IS NOT NULL
               OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT NULL)
           )
-          AND (
-              edges.edge_kind != 'uses_operator'
-              OR edges.to_symbol_id IS NOT NULL
-          )
+          AND {RESOLVED_OPERATOR_ONLY}
         ORDER BY
           CASE edges.confidence
             WHEN 'Exact' THEN 0
@@ -463,7 +458,7 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
           edges.to_name
         LIMIT ?2
         ",
-    )?;
+    ))?;
     let rows = stmt.query_map(params![symbol_id, expanded_limit(limit)], |row| {
         let target: String = row.get(0)?;
         let path: Option<String> = row.get(1)?;
