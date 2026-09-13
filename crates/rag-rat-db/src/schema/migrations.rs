@@ -6767,6 +6767,41 @@ mod syncable_overlay_migration_tests {
         assert_eq!(rows, vec![(vec![0x41; 32], 3, 7), (vec![0x42; 32], 1, 0)]);
     }
 
+    /// V125 (#1301) queues every content stream for the next settle, exactly as V121 does, and
+    /// is idempotent on replay. The all-account refold it also triggers is a hook, exercised in the
+    /// op-log crate.
+    #[test]
+    fn v125_queues_every_content_stream_for_a_refold() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        conn.execute(
+            "INSERT INTO content_entries(
+                 entry_hash, stream_id, author_account_id, device_fingerprint, seq,
+                 prev_hash, grant_id, roster_ref, owner_auth_len, author_auth_len,
+                 accepted, signed_bytes, received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?5, ?5, 1, x'00', 0)",
+            rusqlite::params![
+                [0x31_u8; 32].as_slice(),
+                [0x41_u8; 32].as_slice(),
+                [0x11_u8; 32].as_slice(),
+                [0x12_u8; 32].as_slice(),
+                0_u64.to_be_bytes().as_slice(),
+                [0x13_u8; 32].as_slice(),
+            ],
+        )
+        .unwrap();
+        super::apply_refold_for_concurrent_cut_vouch(&conn).unwrap();
+        super::apply_refold_for_concurrent_cut_vouch(&conn).unwrap();
+        let rows: Vec<(Vec<u8>, i64)> = conn
+            .prepare("SELECT stream_id, reason_mask FROM content_streams_pending_refold")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![(vec![0x41; 32], 1)]);
+    }
+
     /// V114 adds the nullable denormalized lamport column and its partial accepted-rows index,
     /// and is idempotent on replay. The backfill itself is a hook (the lamport lives in the
     /// signed CBOR envelope), exercised in the op-log crate; with noop hooks the column simply
@@ -8489,6 +8524,18 @@ pub(crate) fn apply_refold_for_held_control_log_freshness(
          ON CONFLICT(stream_id) DO UPDATE SET
              reason_mask = content_streams_pending_refold.reason_mask | 1;",
     )
+}
+
+/// V125 (#1301): re-judge persisted verdicts once a revoking cut vouches for the ops authored
+/// concurrently with it.
+///
+/// Freshness is re-derived only when an account refolds, and content acceptance only when its
+/// stream does. A control op an older binary parked `auth_len_ahead` behind the ops a cut condemned
+/// stays parked in the persisted projection, and so does content that cited it, until unrelated
+/// entries arrive. `apply_and_record_migration` runs the all-account refold hook for this id; the
+/// body queues every content stream for the next settle, as V121 does.
+pub(crate) fn apply_refold_for_concurrent_cut_vouch(conn: &Connection) -> rusqlite::Result<()> {
+    apply_refold_for_held_control_log_freshness(conn)
 }
 
 /// V116 (#1179): rebuild `sync_invites` for cross-account WRITER invites.
