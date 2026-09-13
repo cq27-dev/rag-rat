@@ -18,7 +18,7 @@ rusqlite.workspace = true
 serde.workspace = true
 sha2.workspace = true
 tracing.workspace = true
-zstd = "0.13"
+zstd = "0.14"
 
 [dev-dependencies]
 tempfile.workspace = true

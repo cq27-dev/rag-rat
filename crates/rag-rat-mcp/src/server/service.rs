@@ -73,7 +73,8 @@ impl ServerHandler for RagRatService {
 #[cfg(test)]
 mod tests {
     use rmcp::model::ClientInfo;
-    use rmcp::{ClientHandler, ServiceExt};
+    use rmcp::service::serve_directly;
+    use rmcp::{ClientHandler, RoleClient};
 
     use super::*;
 
@@ -90,19 +91,29 @@ mod tests {
         }
     }
 
-    /// Drive `tools/list` through a real in-process client/server pair so the negotiated protocol
-    /// version reaches the handler exactly as it does over stdio.
+    /// Drive `tools/list` through a real in-process client/server pair with the protocol version
+    /// already agreed, the way the discover lifecycle leaves a peer: 2026-07-28 removed the
+    /// `initialize` handshake, so the handler sees the version exactly as it does over stdio.
     async fn list_tools_at(protocol_version: ProtocolVersion) -> ListToolsResult {
         let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
         let service = RagRatService::new_dormant(rag_rat_core::OutputFormat::Json);
+        let client_handler = VersionedClient { protocol_version: protocol_version.clone() };
+        let mut server_peer_info = ServerInfo::default();
+        server_peer_info.protocol_version = protocol_version;
+        let server = serve_directly::<RoleServer, _, _, _, _>(
+            service,
+            server_transport,
+            Some(client_handler.get_info()),
+        );
         let server = tokio::spawn(async move {
-            service.serve(server_transport).await?.waiting().await?;
+            server.waiting().await?;
             anyhow::Ok(())
         });
-        let client = VersionedClient { protocol_version }
-            .serve(client_transport)
-            .await
-            .expect("client should connect");
+        let client = serve_directly::<RoleClient, _, _, _, _>(
+            client_handler,
+            client_transport,
+            Some(server_peer_info.into()),
+        );
         let tools = client.list_tools(None).await.expect("tools/list should succeed");
         client.cancel().await.expect("client should cancel");
         server.await.expect("server task should join").expect("server should exit cleanly");

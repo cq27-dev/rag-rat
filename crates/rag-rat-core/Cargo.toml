@@ -30,7 +30,7 @@ futures-util.workspace = true
 gix.workspace = true
 httpdate.workspace = true
 iroh.workspace = true
-ignore = "0.4.31"
+ignore = "0.4.33"
 model2vec-rs = { version = "0.2.1", default-features = false, features = ["hf-hub", "fancy-regex"], optional = true }
 notify = "8.2.0"
 pulldown-cmark.workspace = true
@@ -62,7 +62,7 @@ unicase = "2.9"
 ureq.workspace = true
 # Dictionary-trained zstd compression of stored chunk text (#77 Phase 2). One shared dictionary
 # trained on a corpus sample (zdict_builder) + bulk one-shot compress/decompress per chunk blob.
-zstd = "0.13"
+zstd = "0.14"
 tree-sitter.workspace = true
 tree-sitter-c.workspace = true
 tree-sitter-cpp.workspace = true

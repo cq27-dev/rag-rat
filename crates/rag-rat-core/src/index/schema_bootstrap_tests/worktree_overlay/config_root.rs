@@ -143,8 +143,8 @@ fn a_config_root_resolving_outside_the_repo_fails_loudly_instead_of_mis_scoping(
     run_git(&linked, &["commit", "-q", "-m", "branch"]);
 
     // An in-repo directory that is really a link to somewhere outside it: lexically inside the
-    // working tree (so the repo still discovers), but it resolves elsewhere, so no subdir of the
-    // working tree describes it.
+    // working tree, but it resolves elsewhere. Discovery walks up from the physical path, so no
+    // repository is found from it, and no subdir of the working tree describes it either way.
     let outside = unique_temp_root();
     let _ = fs::remove_dir_all(&outside);
     fs::create_dir_all(&outside).unwrap();
