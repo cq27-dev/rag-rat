@@ -18,6 +18,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::distill::candidates::{self, AnchorCaps};
+use crate::distill::thread::{self, ThreadKey};
 use crate::distill::{prompts, units, validate};
 
 /// Bumped whenever the extraction/prompt contract changes in a way that invalidates existing
@@ -139,20 +140,11 @@ pub(crate) fn extract(
         // repo, issue/PR numbers are only unique per (tracker, project) — a repo can mirror several
         // tracker bindings — so keying by kind/key alone would collide same-numbered items across
         // projects. `merged_prs` drops the kind (always change_request).
-        let mut by_key: BTreeMap<(String, String, &'static str, String), &ItemRow> =
-            BTreeMap::new();
+        let mut by_key: BTreeMap<ThreadKey, &ItemRow> = BTreeMap::new();
         let mut merged_prs: BTreeMap<(String, String, String), &ItemRow> = BTreeMap::new();
         let mut closed_issues: Vec<&ItemRow> = Vec::new();
         for item in &items {
-            by_key.insert(
-                (
-                    item.tracker.clone(),
-                    item.project.clone(),
-                    item.kind.as_db_str(),
-                    item.key.clone(),
-                ),
-                item,
-            );
+            by_key.insert(ThreadKey::from(item), item);
             match item.kind {
                 ItemKind::Issue if item.state_normalized == "closed" => closed_issues.push(item),
                 ItemKind::ChangeRequest if item.state_normalized == "merged" => {
@@ -258,17 +250,7 @@ pub(crate) fn extract(
         }
 
         // The full set of records that SHOULD exist after this pass.
-        let planned: BTreeSet<RecordKey> = plans
-            .iter()
-            .map(|p| {
-                (
-                    p.tracker.clone(),
-                    p.project.clone(),
-                    p.kind.as_db_str().to_string(),
-                    p.key.clone(),
-                )
-            })
-            .collect();
+        let planned: BTreeSet<ThreadKey> = plans.iter().map(ThreadKey::from).collect();
 
         // The threads this device actually mirrors. A record whose thread is ABSENT here is "no
         // opinion, never delete" — not "delete": once `distill/1` replicates these records (#1135),
@@ -276,17 +258,7 @@ pub(crate) fn extract(
         // enrollment, or a roster peer without tracker credentials — exactly whom the roster-only
         // scope serves) would otherwise reconcile its empty plan into Removes that wipe the fleet's
         // distilled records. Only a thread STILL mirrored but no longer eligible is stale here.
-        let mirrored: BTreeSet<RecordKey> = items
-            .iter()
-            .map(|item| {
-                (
-                    item.tracker.clone(),
-                    item.project.clone(),
-                    item.kind.as_db_str().to_string(),
-                    item.key.clone(),
-                )
-            })
-            .collect();
+        let mirrored: BTreeSet<ThreadKey> = items.iter().map(ThreadKey::from).collect();
 
         let mut report = ExtractReport { eligible: plans.len(), ..Default::default() };
         // Reconcile against the planned set: a persisted record whose thread is still mirrored but
@@ -307,12 +279,12 @@ pub(crate) fn extract(
         // later drain never processes a duplicate coalesced PR or an ineligible thread.
         for queued in load_queue_keys(conn, &repo_id)? {
             if !planned.contains(&queued) {
-                let (tracker, project, kind, key) = &queued;
                 conn.execute(
-                    "DELETE FROM papertrail_distill_queue
-                     WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4
-                       AND item_key = ?5",
-                    params![repo_id, tracker, project, kind, key],
+                    &format!(
+                        "DELETE FROM papertrail_distill_queue WHERE {}",
+                        thread::THREAD_KEY_WHERE
+                    ),
+                    queued.params(&repo_id),
                 )?;
             }
         }
@@ -473,15 +445,13 @@ fn write_record(
     now: i64,
     opts: &ExtractOptions,
     plan: &RecordPlan,
-    by_key: &BTreeMap<(String, String, &'static str, String), &ItemRow>,
+    by_key: &BTreeMap<ThreadKey, &ItemRow>,
     repo: Option<&gix::Repository>,
 ) -> anyhow::Result<WriteOutcome> {
-    let item = by_key
-        .get(&(plan.tracker.clone(), plan.project.clone(), plan.kind.as_db_str(), plan.key.clone()))
-        .copied()
-        .ok_or_else(|| {
-            anyhow::anyhow!("record item {}#{} vanished mid-pass", plan.kind.as_db_str(), plan.key)
-        })?;
+    let thread_key = ThreadKey::from(plan);
+    let item = by_key.get(&thread_key).copied().ok_or_else(|| {
+        anyhow::anyhow!("record item {}#{} vanished mid-pass", plan.kind.as_db_str(), plan.key)
+    })?;
 
     // Snapshot exact source rows before deriving anything lossy. The snapshot, its hash, and the
     // skeleton are committed in this extraction transaction, so later mirror LWW edits cannot make
@@ -490,28 +460,15 @@ fn write_record(
     // Body length spans the whole coalesced thread (issue + partner PRs), so a thin issue body with
     // a substantial partner PR is not misclassified `thin`.
     let mut body_len = item.body.len();
-    let record_comments =
-        load_comments(conn, repo_id, &plan.tracker, &plan.project, plan.kind, &plan.key)?;
+    let record_comments = load_comments(conn, repo_id, &thread_key)?;
     let mut total_comments = record_comments.len();
     let mut review_comments = record_comments.iter().filter(|c| c.is_review).count();
     for partner in &plan.partners {
-        let partner_id = (
-            plan.tracker.clone(),
-            plan.project.clone(),
-            ItemKind::ChangeRequest.as_db_str(),
-            partner.clone(),
-        );
-        if let Some(pr) = by_key.get(&partner_id) {
+        let partner_key = plan.partner_key(partner);
+        if let Some(pr) = by_key.get(&partner_key) {
             body_len += pr.body.len();
         }
-        let partner_comments = load_comments(
-            conn,
-            repo_id,
-            &plan.tracker,
-            &plan.project,
-            ItemKind::ChangeRequest,
-            partner,
-        )?;
+        let partner_comments = load_comments(conn, repo_id, &partner_key)?;
         total_comments += partner_comments.len();
         review_comments += partner_comments.iter().filter(|c| c.is_review).count();
     }
@@ -600,24 +557,24 @@ fn write_record(
     // Record state drives model invalidation + enqueue. New/regenerated records need inference; an
     // unchanged record keeps its result unless the prompt contract changed. Input or prompt changes
     // clear every model-owned field before requeueing so stale findings never remain visible.
-    let state = record_state(conn, repo_id, plan, &input_hash, opts.pipeline_version)?;
+    let state = record_state(conn, repo_id, &thread_key, &input_hash, opts.pipeline_version)?;
     let regenerated = state == RecordState::Regenerated;
     let prompt_changed = state == RecordState::Unchanged
-        && match stored_prompt_version(conn, repo_id, plan)? {
+        && match stored_prompt_version(conn, repo_id, &thread_key)? {
             Some(version) => version != prompts::PROMPT_VERSION,
             // A queued NULL-stamped row is pending or previously failed, not legacy completed
             // output. Preserve its attempt diagnostics; the drain always renders the current
             // prompt. A NULL-stamped row with no queue entry needs recovery/reprocessing.
-            None => !queue_entry_exists(conn, repo_id, plan)?,
+            None => !queue_entry_exists(conn, repo_id, &thread_key)?,
         };
     let invalidate_model = regenerated || prompt_changed;
 
     // --- Persist: rebuild this thread's mechanical junctions, upsert the skeleton row (clearing
     // model columns on regeneration), rewrite junctions, queue.
     let rebuild_anchor_candidates = state != RecordState::Unchanged;
-    clear_mechanical_junctions(conn, repo_id, plan, rebuild_anchor_candidates)?;
+    clear_mechanical_junctions(conn, repo_id, &thread_key, rebuild_anchor_candidates)?;
     if invalidate_model {
-        clear_model_junctions(conn, repo_id, plan)?;
+        clear_model_junctions(conn, repo_id, &thread_key)?;
     }
     upsert_skeleton(conn, repo_id, now, opts, plan, invalidate_model, &SkeletonFacets {
         input_hash: &input_hash,
@@ -628,8 +585,8 @@ fn write_record(
         closing_keyword,
     })?;
     if state != RecordState::Unchanged {
-        replace_snapshot(conn, repo_id, plan, &snapshot)?;
-        replace_xrefs(conn, repo_id, plan, &xrefs)?;
+        replace_snapshot(conn, repo_id, &thread_key, &snapshot)?;
+        replace_xrefs(conn, repo_id, &thread_key, &xrefs)?;
     }
     // The fix-diff snapshot is rebuilt when the identity changed, and SELF-HEALED when an earlier
     // pass ran without a usable repo handle (bare/copied index, shallow clone): the rows are a
@@ -641,10 +598,10 @@ fn write_record(
         && anchors
             .iter()
             .any(|a| matches!(a.kind, candidates::AnchorKind::Symbol) && a.file_path.is_some())
-        && !fix_diff_rows_exist(conn, repo_id, plan)?;
+        && !fix_diff_rows_exist(conn, repo_id, &thread_key)?;
     if state != RecordState::Unchanged || diff_heal {
         let fix_diffs = fix_diff_snapshots(repo, &plan.fix_shas, &anchors);
-        replace_fix_diffs(conn, repo_id, plan, &fix_diffs)?;
+        replace_fix_diffs(conn, repo_id, &thread_key, &fix_diffs)?;
     }
     write_commits(conn, repo_id, now, plan, &plan.fix_shas)?;
     write_coalesced_edges(conn, repo_id, now, plan)?;
@@ -662,25 +619,30 @@ fn write_record(
 fn stored_prompt_version(
     conn: &Connection,
     repo_id: &str,
-    plan: &RecordPlan,
+    thread_key: &ThreadKey,
 ) -> anyhow::Result<Option<u32>> {
     let version = conn.query_row(
-        "SELECT prompt_version FROM papertrail_distill
-         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
-        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        &format!(
+            "SELECT prompt_version FROM papertrail_distill WHERE {}",
+            thread::THREAD_KEY_WHERE
+        ),
+        thread_key.params(repo_id),
         |row| row.get::<_, Option<i64>>(0),
     )?;
     version.map(u32::try_from).transpose().map_err(Into::into)
 }
 
-fn queue_entry_exists(conn: &Connection, repo_id: &str, plan: &RecordPlan) -> anyhow::Result<bool> {
+fn queue_entry_exists(
+    conn: &Connection,
+    repo_id: &str,
+    thread_key: &ThreadKey,
+) -> anyhow::Result<bool> {
     conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM papertrail_distill_queue
-             WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3
-               AND item_kind = ?4 AND item_key = ?5
-         )",
-        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM papertrail_distill_queue WHERE {})",
+            thread::THREAD_KEY_WHERE
+        ),
+        thread_key.params(repo_id),
         |row| row.get(0),
     )
     .map_err(Into::into)
@@ -691,15 +653,14 @@ fn queue_entry_exists(conn: &Connection, repo_id: &str, plan: &RecordPlan) -> an
 fn fix_diff_rows_exist(
     conn: &Connection,
     repo_id: &str,
-    plan: &RecordPlan,
+    thread_key: &ThreadKey,
 ) -> anyhow::Result<bool> {
     conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM papertrail_distill_fix_diffs
-             WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3
-               AND item_kind = ?4 AND item_key = ?5
-         )",
-        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM papertrail_distill_fix_diffs WHERE {})",
+            thread::THREAD_KEY_WHERE
+        ),
+        thread_key.params(repo_id),
         |row| row.get(0),
     )
     .map_err(Into::into)
@@ -855,7 +816,7 @@ fn build_thread_snapshot(
     repo_id: &str,
     plan: &RecordPlan,
     primary: &ItemRow,
-    by_key: &BTreeMap<(String, String, &'static str, String), &ItemRow>,
+    by_key: &BTreeMap<ThreadKey, &ItemRow>,
 ) -> anyhow::Result<ThreadSnapshot> {
     let mut snapshot = ThreadSnapshot { sources: Vec::new(), units: Vec::new() };
     append_item_snapshot(
@@ -863,16 +824,10 @@ fn build_thread_snapshot(
         SourceRole::Primary,
         None,
         primary,
-        load_comments(conn, repo_id, &plan.tracker, &plan.project, primary.kind, &primary.key)?,
+        load_comments(conn, repo_id, &ThreadKey::from(primary))?,
     );
     for (partner_ordinal, partner_key) in plan.partners.iter().enumerate() {
-        let partner_identity = (
-            plan.tracker.clone(),
-            plan.project.clone(),
-            ItemKind::ChangeRequest.as_db_str(),
-            partner_key.clone(),
-        );
-        let partner = by_key.get(&partner_identity).copied().ok_or_else(|| {
+        let partner = by_key.get(&plan.partner_key(partner_key)).copied().ok_or_else(|| {
             anyhow::anyhow!("coalesced partner change_request#{partner_key} vanished mid-pass")
         })?;
         append_item_snapshot(
@@ -880,7 +835,7 @@ fn build_thread_snapshot(
             SourceRole::Partner,
             Some(partner_ordinal),
             partner,
-            load_comments(conn, repo_id, &plan.tracker, &plan.project, partner.kind, &partner.key)?,
+            load_comments(conn, repo_id, &ThreadKey::from(partner))?,
         );
     }
     Ok(snapshot)
@@ -1030,33 +985,30 @@ struct CommentRow {
 fn load_comments(
     conn: &Connection,
     repo_id: &str,
-    tracker: &str,
-    project: &str,
-    kind: ItemKind,
-    key: &str,
+    thread_key: &ThreadKey,
 ) -> anyhow::Result<Vec<CommentRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT comment_id, body, review_state, author, author_kind, author_association,
                 CASE WHEN created_at IS NULL THEN NULL ELSE
                     CAST(strftime('%s', created_at) AS INTEGER) * 1000 +
                     CAST(substr(strftime('%f', created_at), 4, 3) AS INTEGER)
                 END
          FROM papertrail_comments
-         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5
+         WHERE {}
          ORDER BY created_at, comment_id",
-    )?;
-    let rows =
-        stmt.query_map(params![repo_id, tracker, project, kind.as_db_str(), key], |row| {
-            Ok(CommentRow {
-                comment_id: row.get(0)?,
-                body: row.get(1)?,
-                is_review: row.get::<_, Option<String>>(2)?.is_some(),
-                author: row.get(3)?,
-                author_kind: row.get(4)?,
-                author_association: row.get(5)?,
-                created_at_ms: row.get(6)?,
-            })
-        })?;
+        thread::THREAD_KEY_WHERE
+    ))?;
+    let rows = stmt.query_map(thread_key.params(repo_id), |row| {
+        Ok(CommentRow {
+            comment_id: row.get(0)?,
+            body: row.get(1)?,
+            is_review: row.get::<_, Option<String>>(2)?.is_some(),
+            author: row.get(3)?,
+            author_kind: row.get(4)?,
+            author_association: row.get(5)?,
+            created_at_ms: row.get(6)?,
+        })
+    })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1493,16 +1445,17 @@ enum RecordState {
 fn record_state(
     conn: &Connection,
     repo_id: &str,
-    plan: &RecordPlan,
+    thread_key: &ThreadKey,
     new_hash: &str,
     new_version: i64,
 ) -> anyhow::Result<RecordState> {
     let existing: Option<(String, i64)> = conn
         .query_row(
-            "SELECT distill_input_hash, pipeline_version FROM papertrail_distill
-             WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4
-               AND item_key = ?5",
-            params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+            &format!(
+                "SELECT distill_input_hash, pipeline_version FROM papertrail_distill WHERE {}",
+                thread::THREAD_KEY_WHERE
+            ),
+            thread_key.params(repo_id),
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -1514,15 +1467,11 @@ fn record_state(
     })
 }
 
-/// A persisted record's full thread identity: (tracker, project, kind_token, key).
-type RecordKey = (String, String, String, String);
-
 /// Delete a thread's distill record, all its junctions (mechanical AND model), and its queue entry
 /// — used to reconcile a record whose source thread is no longer eligible (reopened issue,
 /// un-merged PR) or that a later sync discovered is actually coalesced into another thread, so
 /// consumers never see a stale or duplicate record.
-fn delete_record(conn: &Connection, repo_id: &str, record: &RecordKey) -> anyhow::Result<()> {
-    let (tracker, project, kind, key) = record;
+fn delete_record(conn: &Connection, repo_id: &str, record: &ThreadKey) -> anyhow::Result<()> {
     for table in [
         "papertrail_distill",
         "papertrail_distill_record_commits",
@@ -1536,11 +1485,8 @@ fn delete_record(conn: &Connection, repo_id: &str, record: &RecordKey) -> anyhow
         "papertrail_distill_xrefs",
     ] {
         conn.execute(
-            &format!(
-                "DELETE FROM {table} WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND \
-                 item_kind = ?4 AND item_key = ?5"
-            ),
-            params![repo_id, tracker, project, kind, key],
+            &format!("DELETE FROM {table} WHERE {}", thread::THREAD_KEY_WHERE),
+            record.params(repo_id),
         )?;
     }
     // Delete every edge that TOUCHES this record — as SOURCE or DESTINATION — so no dangling
@@ -1552,27 +1498,33 @@ fn delete_record(conn: &Connection, repo_id: &str, record: &RecordKey) -> anyhow
          WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3
            AND ( (src_item_kind = ?4 AND src_item_key = ?5)
               OR (dst_item_kind = ?4 AND dst_item_key = ?5) )",
-        params![repo_id, tracker, project, kind, key],
+        record.params(repo_id),
     )?;
     Ok(())
 }
 
 /// Every distill record's full key currently persisted for `repo_id` — the reconciliation input.
-fn load_record_keys(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<RecordKey>> {
+fn load_record_keys(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<ThreadKey>> {
     load_keys_from(conn, repo_id, "papertrail_distill")
 }
 
 /// Every queued thread's full key for `repo_id` — the queue-reconciliation input.
-fn load_queue_keys(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<RecordKey>> {
+fn load_queue_keys(conn: &Connection, repo_id: &str) -> anyhow::Result<Vec<ThreadKey>> {
     load_keys_from(conn, repo_id, "papertrail_distill_queue")
 }
 
-fn load_keys_from(conn: &Connection, repo_id: &str, table: &str) -> anyhow::Result<Vec<RecordKey>> {
+fn load_keys_from(conn: &Connection, repo_id: &str, table: &str) -> anyhow::Result<Vec<ThreadKey>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT tracker, project, item_kind, item_key FROM {table} WHERE repo_id = ?1"
     ))?;
-    let rows =
-        stmt.query_map([repo_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+    let rows = stmt.query_map([repo_id], |row| {
+        Ok(ThreadKey {
+            tracker: row.get(0)?,
+            project: row.get(1)?,
+            item_kind: row.get(2)?,
+            item_key: row.get(3)?,
+        })
+    })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1656,20 +1608,20 @@ fn upsert_skeleton(
 fn clear_mechanical_junctions(
     conn: &Connection,
     repo_id: &str,
-    plan: &RecordPlan,
+    thread_key: &ThreadKey,
     clear_anchor_candidates: bool,
 ) -> anyhow::Result<()> {
     conn.execute(
-        "DELETE FROM papertrail_distill_record_commits
-         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
-        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        &format!(
+            "DELETE FROM papertrail_distill_record_commits WHERE {}",
+            thread::THREAD_KEY_WHERE
+        ),
+        thread_key.params(repo_id),
     )?;
     if clear_anchor_candidates {
         conn.execute(
-            "DELETE FROM papertrail_distill_anchors
-             WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3
-               AND item_kind = ?4 AND item_key = ?5",
-            params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+            &format!("DELETE FROM papertrail_distill_anchors WHERE {}", thread::THREAD_KEY_WHERE),
+            thread_key.params(repo_id),
         )?;
     }
     // Edges key their SOURCE thread as (src_item_kind, src_item_key). Clear ONLY the `coalesced`
@@ -1679,7 +1631,7 @@ fn clear_mechanical_junctions(
         "DELETE FROM papertrail_distill_edges
          WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND src_item_kind = ?4
            AND src_item_key = ?5 AND edge_kind = 'coalesced'",
-        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        thread_key.params(repo_id),
     )?;
     Ok(())
 }
@@ -1690,21 +1642,20 @@ fn clear_mechanical_junctions(
 fn clear_model_junctions(
     conn: &Connection,
     repo_id: &str,
-    plan: &RecordPlan,
+    thread_key: &ThreadKey,
 ) -> anyhow::Result<()> {
     for table in ["papertrail_distill_evidence", "papertrail_distill_alternatives"] {
         conn.execute(
-            &format!(
-                "DELETE FROM {table} WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND \
-                 item_kind = ?4 AND item_key = ?5"
-            ),
-            params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+            &format!("DELETE FROM {table} WHERE {}", thread::THREAD_KEY_WHERE),
+            thread_key.params(repo_id),
         )?;
     }
     conn.execute(
-        "UPDATE papertrail_distill_anchors SET selected = 0
-         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
-        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        &format!(
+            "UPDATE papertrail_distill_anchors SET selected = 0 WHERE {}",
+            thread::THREAD_KEY_WHERE
+        ),
+        thread_key.params(repo_id),
     )?;
     Ok(())
 }
@@ -1712,16 +1663,13 @@ fn clear_model_junctions(
 fn replace_snapshot(
     conn: &Connection,
     repo_id: &str,
-    plan: &RecordPlan,
+    thread_key: &ThreadKey,
     snapshot: &ThreadSnapshot,
 ) -> anyhow::Result<()> {
     for table in ["papertrail_distill_units", "papertrail_distill_sources"] {
         conn.execute(
-            &format!(
-                "DELETE FROM {table} WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND \
-                 item_kind = ?4 AND item_key = ?5"
-            ),
-            params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+            &format!("DELETE FROM {table} WHERE {}", thread::THREAD_KEY_WHERE),
+            thread_key.params(repo_id),
         )?;
     }
     for source in &snapshot.sources {
@@ -1733,10 +1681,10 @@ fn replace_snapshot(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
                      ?16, ?17, ?18)",
             params![
-                plan.tracker,
-                plan.project,
-                plan.kind.as_db_str(),
-                plan.key,
+                thread_key.tracker,
+                thread_key.project,
+                thread_key.item_kind,
+                thread_key.item_key,
                 source.ordinal as i64,
                 source.role.as_db_str(),
                 source.partner_ordinal.map(|value| value as i64),
@@ -1761,10 +1709,10 @@ fn replace_snapshot(
                   byte_end, repo_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                plan.tracker,
-                plan.project,
-                plan.kind.as_db_str(),
-                plan.key,
+                thread_key.tracker,
+                thread_key.project,
+                thread_key.item_kind,
+                thread_key.item_key,
                 unit.ordinal as i64,
                 unit.source_ordinal as i64,
                 unit.span.start as i64,
@@ -1781,13 +1729,12 @@ fn replace_snapshot(
 fn replace_fix_diffs(
     conn: &Connection,
     repo_id: &str,
-    plan: &RecordPlan,
+    thread_key: &ThreadKey,
     diffs: &[FixDiffSnapshot],
 ) -> anyhow::Result<()> {
     conn.execute(
-        "DELETE FROM papertrail_distill_fix_diffs
-         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
-        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        &format!("DELETE FROM papertrail_distill_fix_diffs WHERE {}", thread::THREAD_KEY_WHERE),
+        thread_key.params(repo_id),
     )?;
     for diff in diffs {
         conn.execute(
@@ -1795,10 +1742,10 @@ fn replace_fix_diffs(
                  (tracker, project, item_kind, item_key, commit_sha, path, patch, repo_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                plan.tracker,
-                plan.project,
-                plan.kind.as_db_str(),
-                plan.key,
+                thread_key.tracker,
+                thread_key.project,
+                thread_key.item_kind,
+                thread_key.item_key,
                 diff.commit_sha,
                 diff.path,
                 diff.patch,
@@ -1814,13 +1761,12 @@ fn replace_fix_diffs(
 fn replace_xrefs(
     conn: &Connection,
     repo_id: &str,
-    plan: &RecordPlan,
+    thread_key: &ThreadKey,
     xrefs: &[XrefSnapshot],
 ) -> anyhow::Result<()> {
     conn.execute(
-        "DELETE FROM papertrail_distill_xrefs
-         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4 AND item_key = ?5",
-        params![repo_id, plan.tracker, plan.project, plan.kind.as_db_str(), plan.key],
+        &format!("DELETE FROM papertrail_distill_xrefs WHERE {}", thread::THREAD_KEY_WHERE),
+        thread_key.params(repo_id),
     )?;
     for xref in xrefs {
         conn.execute(
@@ -1830,10 +1776,10 @@ fn replace_xrefs(
                   repo_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
-                plan.tracker,
-                plan.project,
-                plan.kind.as_db_str(),
-                plan.key,
+                thread_key.tracker,
+                thread_key.project,
+                thread_key.item_kind,
+                thread_key.item_key,
                 xref.ordinal as i64,
                 xref.target_tracker,
                 xref.target_project,
@@ -1973,6 +1919,40 @@ struct RecordPlan {
     /// A TEXT-tier closing edge links this issue — the canonical parser matched a closing keyword.
     /// Drives the closing-keyword status floor (issue records only).
     text_closing: bool,
+}
+
+impl RecordPlan {
+    /// The thread key of the coalesced partner change request `partner` in this record's project.
+    fn partner_key(&self, partner: &str) -> ThreadKey {
+        ThreadKey {
+            tracker: self.tracker.clone(),
+            project: self.project.clone(),
+            item_kind: ItemKind::ChangeRequest.as_db_str().to_owned(),
+            item_key: partner.to_owned(),
+        }
+    }
+}
+
+impl From<&RecordPlan> for ThreadKey {
+    fn from(plan: &RecordPlan) -> Self {
+        Self {
+            tracker: plan.tracker.clone(),
+            project: plan.project.clone(),
+            item_kind: plan.kind.as_db_str().to_owned(),
+            item_key: plan.key.clone(),
+        }
+    }
+}
+
+impl From<&ItemRow> for ThreadKey {
+    fn from(item: &ItemRow) -> Self {
+        Self {
+            tracker: item.tracker.clone(),
+            project: item.project.clone(),
+            item_kind: item.kind.as_db_str().to_owned(),
+            item_key: item.key.clone(),
+        }
+    }
 }
 
 /// Run `body` inside an IMMEDIATE transaction when the connection is in autocommit; otherwise run

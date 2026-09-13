@@ -15,6 +15,7 @@ use super::prompts::{
     self, AnchorContext, FixCommit, PartnerThread, PromptBudget, PromptInput, PromptUnit,
     SymbolContext,
 };
+use super::thread::ThreadKey;
 use super::{run_stats, validate};
 
 const MAX_STORED_ERROR_CHARS: usize = 2_000;
@@ -36,14 +37,6 @@ pub struct DistillDrainReport {
     /// `RecordOutput::normalize` repaired the model's formatting (a demoted backtick phrase or a
     /// deduped id), so the genuinely-clean guided rate is exactly `rung_serde - repaired_serde`.
     pub repaired_serde: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ThreadKey {
-    tracker: String,
-    project: String,
-    item_kind: String,
-    item_key: String,
 }
 
 #[derive(Debug, Clone)]

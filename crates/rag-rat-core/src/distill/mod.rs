@@ -18,6 +18,7 @@ mod extract;
 mod output;
 mod prompts;
 mod run_stats;
+mod thread;
 mod units;
 mod validate;
 
