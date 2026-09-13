@@ -62,11 +62,40 @@ pub(super) fn default_remote_model_for(local_model: &str, backend: RemoteBackend
     ollama_model_for(local_model).unwrap_or("all-minilm")
 }
 
-fn remote_mode(state: &WizardState) -> usize {
+/// The three remote-embedding choices the Embedding step lists, in list order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RemoteModeChoice {
+    /// No remote: embed locally.
+    Local,
+    Connect,
+    Ephemeral,
+}
+
+impl RemoteModeChoice {
+    const ALL: [Self; 3] = [Self::Local, Self::Connect, Self::Ephemeral];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn from_index(index: usize) -> Option<Self> {
+        Self::ALL.get(index).copied()
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Local => "none",
+            Self::Connect => "connect",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+}
+
+fn remote_mode(state: &WizardState) -> RemoteModeChoice {
     match state.draft.remote.as_ref().map(|r| &r.mode) {
-        Some(RemoteMode::Connect(_)) => 1,
-        Some(RemoteMode::Ephemeral(_)) => 2,
-        None => 0,
+        Some(RemoteMode::Connect(_)) => RemoteModeChoice::Connect,
+        Some(RemoteMode::Ephemeral(_)) => RemoteModeChoice::Ephemeral,
+        None => RemoteModeChoice::Local,
     }
 }
 
@@ -131,7 +160,7 @@ fn default_cookbook_command(state: &WizardState) -> String {
 pub(super) fn init_embedding_step(state: &WizardState) -> StepState {
     let rows = model_rows();
     let model_cursor = rows.iter().position(|(id, _)| id == &state.draft.model).unwrap_or(0);
-    let mode_cursor = remote_mode(state);
+    let mode_cursor = remote_mode(state).index();
     let backend = draft_backend(state);
     let backend_cursor = BACKENDS_BY_EFFICIENCY.iter().position(|&b| b == backend).unwrap_or(0);
     let cookbook_cursor = selected_cookbook_idx(state).unwrap_or(0);
@@ -229,15 +258,15 @@ pub(super) fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
     ])
     .split(cols[1]);
 
-    let modes = ["none", "connect", "ephemeral"];
-    let mode_items: Vec<ListItem> = modes
+    let current_mode = remote_mode(state);
+    let mode_items: Vec<ListItem> = RemoteModeChoice::ALL
         .iter()
         .enumerate()
-        .map(|(i, m)| {
-            let selected = if i == remote_mode(state) { "*" } else { " " };
+        .map(|(i, mode)| {
+            let selected = if *mode == current_mode { "*" } else { " " };
             let cursor = if i == *mode_cursor { ">" } else { " " };
             let style = if i == *mode_cursor { theme::selected() } else { theme::base() };
-            ListItem::new(format!("{cursor} [{selected}] {m}")).style(style)
+            ListItem::new(format!("{cursor} [{selected}] {}", mode.label())).style(style)
         })
         .collect();
     let focused = *focus == EmbedFocus::Mode;
@@ -277,12 +306,12 @@ pub(super) fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
         return;
     }
 
-    if rmode == 1 {
+    if rmode == RemoteModeChoice::Connect {
         let endpoint =
             Layout::vertical([Constraint::Length(ONE_LINE_FIELD_OUTER_HEIGHT), Constraint::Min(0)])
                 .split(right[1]);
         f.render_widget(one_line_field(ep, "endpoint", dim(EmbedFocus::Endpoint)), endpoint[0]);
-    } else if rmode == 2 {
+    } else if rmode == RemoteModeChoice::Ephemeral {
         let fields =
             Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(right[1]);
         let cookbook_entries = cookbook_choices(state);
@@ -391,7 +420,7 @@ pub(super) fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
         *focus == EmbedFocus::ServerModel,
     );
 
-    if rmode == 2 {
+    if rmode == RemoteModeChoice::Ephemeral {
         let bottom = Layout::horizontal([
             Constraint::Ratio(1, 5),
             Constraint::Ratio(1, 5),
@@ -705,7 +734,7 @@ pub(super) fn embed_focus(state: &WizardState) -> Option<EmbedFocus> {
     }
 }
 
-fn embed_focus_order(rmode: usize, model_none: bool) -> &'static [EmbedFocus] {
+fn embed_focus_order(rmode: RemoteModeChoice, model_none: bool) -> &'static [EmbedFocus] {
     const MODEL_ONLY: &[EmbedFocus] = &[EmbedFocus::Model];
     const LOCAL: &[EmbedFocus] = &[EmbedFocus::Model, EmbedFocus::Mode];
     const CONNECT: &[EmbedFocus] = &[
@@ -737,9 +766,9 @@ fn embed_focus_order(rmode: usize, model_none: bool) -> &'static [EmbedFocus] {
         MODEL_ONLY
     } else {
         match rmode {
-            1 => CONNECT,
-            2 => EPHEMERAL,
-            _ => LOCAL,
+            RemoteModeChoice::Connect => CONNECT,
+            RemoteModeChoice::Ephemeral => EPHEMERAL,
+            RemoteModeChoice::Local => LOCAL,
         }
     }
 }
@@ -930,18 +959,18 @@ fn select_embedding_focus(state: &mut WizardState) {
                 _ => 0,
             };
             let current = remote_mode(state);
-            if cursor != current {
+            if cursor != current.index() {
                 let existing = state.draft.remote.as_ref().cloned();
                 let default_cookbook = default_cookbook_command(state);
-                state.draft.remote = match cursor {
-                    0 => None,
-                    1 => Some(new_connect_remote_from(&state.draft.model, existing.as_ref())),
-                    2 => Some(new_ephemeral_remote_from(
+                state.draft.remote = match RemoteModeChoice::from_index(cursor) {
+                    Some(RemoteModeChoice::Connect) =>
+                        Some(new_connect_remote_from(&state.draft.model, existing.as_ref())),
+                    Some(RemoteModeChoice::Ephemeral) => Some(new_ephemeral_remote_from(
                         &state.draft.model,
                         existing.as_ref(),
                         &default_cookbook,
                     )),
-                    _ => None,
+                    Some(RemoteModeChoice::Local) | None => None,
                 };
                 // A new remote may default to a different backend than the cursor points at (e.g.
                 // ephemeral defaults to infinity while the fresh cursor is on ollama). Re-sync the
