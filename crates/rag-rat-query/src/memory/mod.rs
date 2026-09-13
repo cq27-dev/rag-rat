@@ -425,7 +425,7 @@ pub struct RepoMemoryValidationReport {
     pub unverified: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RepoMemoryEvidence {
     pub direct: Vec<RepoMemory>,
     pub path_crossed: Vec<RepoMemory>,
@@ -701,6 +701,37 @@ pub struct ResolvedBinding {
     pub call_path: Option<ResolvedCallPath>,
     pub source_text_hash: Option<String>,
     pub anchor_status: AnchorStatus,
+}
+
+impl ResolvedBinding {
+    /// A binding of `binding_kind` with every location and identity field unset — the base the
+    /// resolvers fill in with struct-update syntax, so each names only the fields it knows.
+    pub(crate) fn new(
+        binding_kind: BindingKind,
+        binding_id: String,
+        anchor_status: AnchorStatus,
+    ) -> Self {
+        Self {
+            binding_kind,
+            binding_id,
+            path: None,
+            start_line: None,
+            end_line: None,
+            logical_symbol_id: None,
+            symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            commit_hash: None,
+            tracker: None,
+            project: None,
+            item_key: None,
+            symbol_kind: None,
+            signature_hash: None,
+            call_path: None,
+            source_text_hash: None,
+            anchor_status,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1002,12 +1033,7 @@ mod tests {
     }
 
     fn evidence(memories: Vec<RepoMemory>) -> RepoMemoryEvidence {
-        RepoMemoryEvidence {
-            direct: memories,
-            path_crossed: Vec::new(),
-            call_path_crossed: Vec::new(),
-            stale: Vec::new(),
-        }
+        RepoMemoryEvidence { direct: memories, ..Default::default() }
     }
 
     #[test]

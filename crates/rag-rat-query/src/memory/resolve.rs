@@ -36,24 +36,12 @@ pub fn resolve_binding(
     }
     if let Some(commit_hash) = bind.commit_hash.as_deref() {
         return Ok(Some(ResolvedBinding {
-            binding_kind: BindingKind::Commit,
-            binding_id: commit_hash.to_string(),
-            path: None,
-            start_line: None,
-            end_line: None,
-            logical_symbol_id: None,
-            symbol_id: None,
-            chunk_id: None,
-            edge_id: None,
             commit_hash: Some(commit_hash.to_string()),
-            tracker: None,
-            project: None,
-            item_key: None,
-            symbol_kind: None,
-            signature_hash: None,
-            call_path: None,
-            source_text_hash: None,
-            anchor_status: AnchorStatus::Unverified,
+            ..ResolvedBinding::new(
+                BindingKind::Commit,
+                commit_hash.to_string(),
+                AnchorStatus::Unverified,
+            )
         }));
     }
     if let (Some(tracker), Some(project), Some(item_key)) =
@@ -63,24 +51,14 @@ pub fn resolve_binding(
         // free-form string the papertrail readers would never resolve.
         let tracker = rag_rat_papertrail::Tracker::from_db_str(tracker)?;
         return Ok(Some(ResolvedBinding {
-            binding_kind: BindingKind::Tracker,
-            binding_id: format!("{}:{project}#{item_key}", tracker.as_db_str()),
-            path: None,
-            start_line: None,
-            end_line: None,
-            logical_symbol_id: None,
-            symbol_id: None,
-            chunk_id: None,
-            edge_id: None,
-            commit_hash: None,
             tracker: Some(tracker.as_db_str().to_string()),
             project: Some(project.to_string()),
             item_key: Some(item_key.to_string()),
-            symbol_kind: None,
-            signature_hash: None,
-            call_path: None,
-            source_text_hash: None,
-            anchor_status: AnchorStatus::Unverified,
+            ..ResolvedBinding::new(
+                BindingKind::Tracker,
+                format!("{}:{project}#{item_key}", tracker.as_db_str()),
+                AnchorStatus::Unverified,
+            )
         }));
     }
     // Fell through every binding branch. A TRULY EMPTY target is an unanchored node (#463); a
@@ -109,26 +87,11 @@ pub(crate) fn normalize_dir(dir: &str) -> String {
 /// else "gone". The repo root (empty string) is current whenever any file is indexed.
 pub(crate) fn resolve_dir_binding(conn: &Connection, dir: &str) -> anyhow::Result<ResolvedBinding> {
     let dir = normalize_dir(dir);
-    let exists = dir_has_files(conn, &dir)?;
+    let status =
+        if dir_has_files(conn, &dir)? { AnchorStatus::Current } else { AnchorStatus::Gone };
     Ok(ResolvedBinding {
-        binding_kind: BindingKind::Dir,
-        binding_id: dir.clone(),
-        path: Some(dir),
-        start_line: None,
-        end_line: None,
-        logical_symbol_id: None,
-        symbol_id: None,
-        chunk_id: None,
-        edge_id: None,
-        commit_hash: None,
-        tracker: None,
-        project: None,
-        item_key: None,
-        symbol_kind: None,
-        signature_hash: None,
-        call_path: None,
-        source_text_hash: None,
-        anchor_status: if exists { AnchorStatus::Current } else { AnchorStatus::Gone },
+        path: Some(dir.clone()),
+        ..ResolvedBinding::new(BindingKind::Dir, dir, status)
     })
 }
 
@@ -165,24 +128,20 @@ pub(crate) fn resolve_logical_symbol_binding(
         None => (None, None),
     };
     Ok(ResolvedBinding {
-        binding_kind: BindingKind::LogicalSymbol,
-        binding_id: logical.qualified_name,
         path: Some(logical.path),
         start_line: chunk.as_ref().map(|chunk| chunk.start_line),
         end_line: chunk.as_ref().map(|chunk| chunk.end_line),
         logical_symbol_id: Some(logical_symbol_id),
         symbol_id: member_symbol_id,
         chunk_id: chunk.as_ref().map(|chunk| chunk.chunk_id),
-        edge_id: None,
-        commit_hash: None,
-        tracker: None,
-        project: None,
-        item_key: None,
         symbol_kind: kind,
         signature_hash: sig_hash,
-        call_path: None,
         source_text_hash: chunk.map(|chunk| chunk.text_hash),
-        anchor_status: AnchorStatus::Current,
+        ..ResolvedBinding::new(
+            BindingKind::LogicalSymbol,
+            logical.qualified_name,
+            AnchorStatus::Current,
+        )
     })
 }
 pub(crate) fn symbol_signal(
@@ -209,24 +168,16 @@ pub(crate) fn resolve_symbol_binding(
     let chunk = chunk_for_symbol(conn, symbol_id, &symbol.qualified_name)?;
     let (kind, sig_hash) = symbol_signal(conn, symbol_id)?;
     Ok(ResolvedBinding {
-        binding_kind: BindingKind::Symbol,
-        binding_id: symbol.qualified_name,
         path: Some(symbol.path),
         start_line: chunk.as_ref().map(|chunk| chunk.start_line),
         end_line: chunk.as_ref().map(|chunk| chunk.end_line),
         logical_symbol_id: symbol.logical_symbol_id,
         symbol_id: Some(symbol_id),
         chunk_id: chunk.as_ref().map(|chunk| chunk.chunk_id),
-        edge_id: None,
-        commit_hash: None,
-        tracker: None,
-        project: None,
-        item_key: None,
         symbol_kind: kind,
         signature_hash: sig_hash,
-        call_path: None,
         source_text_hash: chunk.map(|chunk| chunk.text_hash),
-        anchor_status: AnchorStatus::Current,
+        ..ResolvedBinding::new(BindingKind::Symbol, symbol.qualified_name, AnchorStatus::Current)
     })
 }
 pub(crate) fn resolve_chunk_binding(
@@ -237,8 +188,6 @@ pub(crate) fn resolve_chunk_binding(
         .ok_or_else(|| anyhow::anyhow!("chunk_id {chunk_id} not found"))?;
     let symbol_id = symbol_id_for_chunk(conn, &chunk)?;
     Ok(ResolvedBinding {
-        binding_kind: BindingKind::Chunk,
-        binding_id: chunk_id.to_string(),
         path: Some(chunk.path),
         start_line: Some(chunk.start_line),
         end_line: Some(chunk.end_line),
@@ -246,16 +195,8 @@ pub(crate) fn resolve_chunk_binding(
             .and_then(|id| logical_symbol_id_for_symbol(conn, id).ok().flatten()),
         symbol_id,
         chunk_id: Some(chunk_id),
-        edge_id: None,
-        commit_hash: None,
-        tracker: None,
-        project: None,
-        item_key: None,
-        symbol_kind: None,
-        signature_hash: None,
-        call_path: None,
         source_text_hash: Some(chunk.text_hash),
-        anchor_status: AnchorStatus::Current,
+        ..ResolvedBinding::new(BindingKind::Chunk, chunk_id.to_string(), AnchorStatus::Current)
     })
 }
 pub(crate) fn resolve_edge_binding(
@@ -265,24 +206,12 @@ pub(crate) fn resolve_edge_binding(
     let edge =
         edge_by_id(conn, edge_id)?.ok_or_else(|| anyhow::anyhow!("edge_id {edge_id} not found"))?;
     Ok(ResolvedBinding {
-        binding_kind: BindingKind::Edge,
-        binding_id: edge.fingerprint,
         path: Some(edge.path),
         start_line: Some(edge.start_line),
         end_line: Some(edge.end_line),
-        logical_symbol_id: None,
-        symbol_id: None,
-        chunk_id: None,
         edge_id: Some(edge_id),
-        commit_hash: None,
-        tracker: None,
-        project: None,
-        item_key: None,
-        symbol_kind: None,
-        signature_hash: None,
-        call_path: None,
         source_text_hash: Some(edge.source_hash),
-        anchor_status: AnchorStatus::Current,
+        ..ResolvedBinding::new(BindingKind::Edge, edge.fingerprint, AnchorStatus::Current)
     })
 }
 pub(crate) fn resolve_call_path_binding(
@@ -305,21 +234,7 @@ pub(crate) fn resolve_call_path_binding(
         ensure_logical_symbol_exists(conn, end_id)?;
     }
     Ok(ResolvedBinding {
-        binding_kind: BindingKind::CallPath,
-        binding_id: edge_sequence_hash.to_string(),
-        path: None,
-        start_line: None,
-        end_line: None,
         logical_symbol_id: bind.start_logical_symbol_id.or(bind.end_logical_symbol_id),
-        symbol_id: None,
-        chunk_id: None,
-        edge_id: None,
-        commit_hash: None,
-        tracker: None,
-        project: None,
-        item_key: None,
-        symbol_kind: None,
-        signature_hash: None,
         call_path: Some(ResolvedCallPath {
             start_logical_symbol_id: bind.start_logical_symbol_id,
             end_logical_symbol_id: bind.end_logical_symbol_id,
@@ -328,8 +243,11 @@ pub(crate) fn resolve_call_path_binding(
             // Client-supplied hash: no server-resolved edges to persist, so it stays unverified.
             edges: Vec::new(),
         }),
-        source_text_hash: None,
-        anchor_status: AnchorStatus::Unverified,
+        ..ResolvedBinding::new(
+            BindingKind::CallPath,
+            edge_sequence_hash.to_string(),
+            AnchorStatus::Unverified,
+        )
     })
 }
 pub(crate) fn resolve_path_binding(
@@ -345,28 +263,16 @@ pub(crate) fn resolve_path_binding(
             |row| row.get::<_, String>(0),
         )
         .optional()?;
+    let binding_id = match (start_line, end_line) {
+        (Some(start), Some(end)) => format!("{path}:{start}-{end}"),
+        _ => path.to_string(),
+    };
     Ok(ResolvedBinding {
-        binding_kind: BindingKind::Path,
-        binding_id: match (start_line, end_line) {
-            (Some(start), Some(end)) => format!("{path}:{start}-{end}"),
-            _ => path.to_string(),
-        },
         path: Some(path.to_string()),
         start_line,
         end_line,
-        logical_symbol_id: None,
-        symbol_id: None,
-        chunk_id: None,
-        edge_id: None,
-        commit_hash: None,
-        tracker: None,
-        project: None,
-        item_key: None,
-        symbol_kind: None,
-        signature_hash: None,
-        call_path: None,
         source_text_hash: file_hash,
-        anchor_status: AnchorStatus::Current,
+        ..ResolvedBinding::new(BindingKind::Path, binding_id, AnchorStatus::Current)
     })
 }
 pub(crate) fn chunk_by_id(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<ChunkAnchor>> {
@@ -1575,30 +1481,15 @@ pub(crate) fn resolve_call_path_from_edges(
     validate_len("path_summary", &path_summary, 500)?;
 
     Ok(ResolvedBinding {
-        binding_kind: BindingKind::CallPath,
-        binding_id: hash.clone(),
-        path: None,
-        start_line: None,
-        end_line: None,
         logical_symbol_id: bind.start_logical_symbol_id.or(bind.end_logical_symbol_id),
-        symbol_id: None,
-        chunk_id: None,
-        edge_id: None,
-        commit_hash: None,
-        tracker: None,
-        project: None,
-        item_key: None,
-        symbol_kind: None,
-        signature_hash: None,
         call_path: Some(ResolvedCallPath {
             start_logical_symbol_id: bind.start_logical_symbol_id,
             end_logical_symbol_id: bind.end_logical_symbol_id,
-            edge_sequence_hash: hash,
+            edge_sequence_hash: hash.clone(),
             path_summary,
             edges,
         }),
-        source_text_hash: None,
-        anchor_status: AnchorStatus::Current,
+        ..ResolvedBinding::new(BindingKind::CallPath, hash, AnchorStatus::Current)
     })
 }
 

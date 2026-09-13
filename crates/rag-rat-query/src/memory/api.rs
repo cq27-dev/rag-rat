@@ -231,12 +231,7 @@ pub fn memory_evidence_for_symbol(
     limit: u32,
 ) -> anyhow::Result<RepoMemoryEvidence> {
     let (direct, stale) = split_active_stale(memories_for_symbol(conn, symbol, limit)?);
-    Ok(RepoMemoryEvidence {
-        direct,
-        path_crossed: Vec::new(),
-        call_path_crossed: Vec::new(),
-        stale,
-    })
+    Ok(RepoMemoryEvidence { direct, stale, ..Default::default() })
 }
 pub fn memory_evidence_for_symbol_and_edges(
     conn: &Connection,

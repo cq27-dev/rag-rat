@@ -288,15 +288,7 @@ pub fn impact_surface_report_for_symbol(
             limit,
         )?
     } else {
-        (
-            RepoMemoryEvidence {
-                direct: Vec::new(),
-                path_crossed: Vec::new(),
-                call_path_crossed: Vec::new(),
-                stale: Vec::new(),
-            },
-            false,
-        )
+        (RepoMemoryEvidence::default(), false)
     };
     let mut caveats = vec![GRAPH_SYNTACTIC_CAVEAT.to_string()];
     if options.resolution_mode == GraphResolutionMode::Exact
