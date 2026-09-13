@@ -76,6 +76,34 @@ pub(crate) struct MetavarProfile {
     pub(crate) anti_unify_coverage: f64,
 }
 
+impl MetavarProfile {
+    /// Whether more than [`NON_VALUE_MAJORITY_FRACTION`] of the variation points are closure or
+    /// type params — the one predicate both v2 scores downgrade on.
+    fn non_value_majority(&self) -> bool {
+        self.total > 0
+            && (self.closure + self.typ) as f64 / self.total as f64 > NON_VALUE_MAJORITY_FRACTION
+    }
+}
+
+/// Fraction of non-value (closure + type) variation points above which a class is non-value
+/// majority.
+const NON_VALUE_MAJORITY_FRACTION: f64 = 0.5;
+/// Anti-unify coverage below which [`confidence_v2`] drops one band.
+const CONFIDENCE_COVERAGE_FLOOR: f64 = 0.7;
+
+/// Metavar counts at which [`refactorability_v2`]'s many-metavars penalty engages; the bands are
+/// exclusive, the severe one wins.
+const MANY_METAVARS_SEVERE: usize = 10;
+const MANY_METAVARS: usize = 5;
+const MANY_METAVARS_SEVERE_PENALTY: f64 = 0.70;
+const MANY_METAVARS_PENALTY: f64 = 0.85;
+const NON_VALUE_MAJORITY_PENALTY: f64 = 0.80;
+const GAPPED_PENALTY: f64 = 0.75;
+const DIFFERING_CALLEE_PENALTY: f64 = 0.85;
+/// Anti-unify coverage below which [`refactorability_v2`] applies [`LOW_COVERAGE_PENALTY`].
+const REFACTORABILITY_COVERAGE_FLOOR: f64 = 0.5;
+const LOW_COVERAGE_PENALTY: f64 = 0.70;
+
 /// Derive a [`MetavarProfile`] from the anti-unified template.
 pub(crate) fn metavar_profile(template: &Template) -> MetavarProfile {
     let mut value = 0usize;
@@ -134,10 +162,10 @@ pub(crate) fn confidence_v2(
     if profile.differing_callee {
         downgrades += 1;
     }
-    if profile.total > 0 && (profile.closure + profile.typ) as f64 / profile.total as f64 > 0.5 {
+    if profile.non_value_majority() {
         downgrades += 1;
     }
-    if profile.anti_unify_coverage < 0.7 {
+    if profile.anti_unify_coverage < CONFIDENCE_COVERAGE_FLOOR {
         downgrades += 1;
     }
 
@@ -171,26 +199,22 @@ pub(crate) fn refactorability_v2(lcs_ratio: f64, profile: &MetavarProfile) -> f6
 
     let mut factor = 1.0f64;
     // Many-metavar penalty (mutually exclusive bands; take the worse one).
-    if profile.total >= 10 {
-        factor *= 0.70;
-    } else if profile.total >= 5 {
-        factor *= 0.85;
+    if profile.total >= MANY_METAVARS_SEVERE {
+        factor *= MANY_METAVARS_SEVERE_PENALTY;
+    } else if profile.total >= MANY_METAVARS {
+        factor *= MANY_METAVARS_PENALTY;
     }
-    // High non-value fraction.
-    if profile.total > 0 && (profile.closure + profile.typ) as f64 / profile.total as f64 > 0.5 {
-        factor *= 0.80;
+    if profile.non_value_majority() {
+        factor *= NON_VALUE_MAJORITY_PENALTY;
     }
-    // Gapped.
     if profile.gapped > 0 {
-        factor *= 0.75;
+        factor *= GAPPED_PENALTY;
     }
-    // Differing callee.
     if profile.differing_callee {
-        factor *= 0.85;
+        factor *= DIFFERING_CALLEE_PENALTY;
     }
-    // Low coverage.
-    if profile.anti_unify_coverage < 0.5 {
-        factor *= 0.70;
+    if profile.anti_unify_coverage < REFACTORABILITY_COVERAGE_FLOOR {
+        factor *= LOW_COVERAGE_PENALTY;
     }
 
     // factor ∈ (0, 1] → product is in (0, 1] → result ≤ base. Clamp for float safety.
