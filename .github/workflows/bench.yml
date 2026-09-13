@@ -9,6 +9,18 @@ name: bench
 on:
   push:
     branches: [main]
+    # Only what can move a number: the benches and the replay both read the crates, and the
+    # replay's cases come from the fixtures. A docs- or CI-only merge on main ran the 40-minute
+    # replay for nothing.
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'evals/**'
+      - 'tests/fixtures/**'
+      - '.config/nextest.toml'
+      - 'tools/eval-report-bmf.py'
+      - '.github/workflows/bench.yml'
   # Manual trigger to REAPPLY the Bencher thresholds (this job runs `bencher run --thresholds-reset`
   # on `main`). Use it when the baseline drifts or thresholds get into a bad state without waiting
   # for the next push to main — PR runs clone `main`'s thresholds via `--start-point-clone-thresholds`.
@@ -81,17 +93,19 @@ jobs:
 
   # Search-quality headline (#19): commit-replay recall over the self-index at HEAD, tracked in
   # Bencher. recall@3 is the metric an agent actually feels — "did the right chunk land in the first
-  # 3 reads". The 200-case replay is ~8-10 min, so it lives HERE on main (post-merge), never on the
+  # 3 reads". The 200-case replay takes tens of minutes, so it lives HERE on main (post-merge), never on the
   # PR path: it would be both too slow to gate and too noisy to gate (the replay gold is each
   # commit's changed paths, so a single PR's recall delta is usually below the per-case noise floor).
   # Tracking only, NO `--err` — a real regression ALERTS via the statistical lower boundary on
   # recall@3; a noisy dip doesn't hard-fail the run. Same stance as the iai/criterion series above.
   eval_recall:
     name: search recall (commit-replay)
-    runs-on: ubicloud-standard-4
+    # CPU-bound end to end (the embedder and the 200-case replay); twice the cores halve the wall
+    # time at the same per-vCPU cost.
+    runs-on: ubicloud-standard-8
     if: github.ref == 'refs/heads/main'
     env:
-      BENCHER_TESTBED: ubicloud-standard-4
+      BENCHER_TESTBED: ubicloud-standard-8
       # Stable, cacheable location for the MiniLM ONNX download (fastembed honours this env var;
       # mirrors eval.yml). The model is immutable, so the cache key is static.
       RAG_RAT_MODEL_CACHE: ${{ github.workspace }}/.rag-rat-models
