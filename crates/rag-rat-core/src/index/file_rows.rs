@@ -6,6 +6,26 @@ use rag_rat_base::time::now_ms;
 
 use super::*;
 
+/// One exact-scope-key file row, as [`IndexDatabase::scope_row_state`] reads it for the incremental
+/// write phase's skip gates.
+pub(super) struct ScopeRowState {
+    /// Source-file disk mtime — the #561 concurrent-writer guard skips an overwrite when this is
+    /// NEWER than the prepared mtime (a lockless heal indexed a fresher version during the
+    /// OFF-lock prepare window). Disk mtime, not the indexing clock `indexed_at_ms`, keeps the
+    /// guard false-positive-free: the row's OWN prior stamp is always older-or-equal (edits only
+    /// advance mtime), and a tombstone's `modified_at_ms = 0` never blocks a resurrection.
+    pub(super) modified_at_ms: i64,
+    /// With `language` and `kind`, the identity the explicit-path no-op skip compares (#659
+    /// review): a CLEAN/reverted `index --paths` file matches and is not needlessly
+    /// removed+reinserted. `language`/`kind` are included so a TARGET identity change with
+    /// UNCHANGED bytes (an extension-precedence upgrade re-languages a path) is NOT skipped —
+    /// mirroring discovery's `(sha256, language, kind)` staleness
+    /// ([`super::discovery::target_for_path`] drift).
+    pub(super) sha256: String,
+    pub(super) language: String,
+    pub(super) kind: String,
+}
+
 impl IndexDatabase {
     /// #827: arm scoped-edge-rewrite capture for the duration of an incremental content-changed
     /// pass. Creates (idempotently) and clears `temp.edge_rewrite_files`; while armed, the write
@@ -325,62 +345,21 @@ impl IndexDatabase {
         Ok(restamped)
     }
 
-    /// The `modified_at_ms` (source-file mtime) of the CURRENT file row at `(active repo, path,
-    /// commit_sha, worktree_id, active generation)`, or `None` when no such row exists — the #561
-    /// concurrent-writer guard. The incremental write phase compares this against the mtime it
-    /// prepared: a row whose disk mtime is NEWER means a lockless heal indexed a fresher version
-    /// during the OFF-lock prepare window, so the caller skips its (now-stale) overwrite. Using
-    /// disk mtime (not the indexing clock `indexed_at_ms`) is what makes this
-    /// false-positive-free: the row's OWN prior stamp is always older-or-equal (edits only
-    /// advance mtime), so a legitimate re-index never trips the guard — only a genuinely newer
-    /// index does. A tombstone's `modified_at_ms = 0` never exceeds a real prepared mtime, so
-    /// it never blocks a resurrection. Point lookup on the V043 UNIQUE `(repo_id, path,
-    /// commit_sha, worktree_id, generation)`; direct `main.files` probe (not the scope view),
-    /// so it carries `repo_id` + `generation` explicitly like the other file-row probes here.
-    pub(super) fn scope_row_modified_at_ms(
+    /// The CURRENT file row at `(active repo, path, commit_sha, worktree_id, active generation)`,
+    /// or `None` when no such row exists — what the incremental write phase's two skip gates read.
+    /// Point lookup on the V043 UNIQUE `(repo_id, path, commit_sha, worktree_id, generation)`;
+    /// direct `main.files` probe (not the scope view), so it carries `repo_id` + `generation`
+    /// explicitly like the other file-row probes here.
+    pub(super) fn scope_row_state(
         &self,
         path: &Path,
         commit_sha: &str,
         worktree_id: &str,
-    ) -> anyhow::Result<Option<i64>> {
+    ) -> anyhow::Result<Option<ScopeRowState>> {
         self.storage
             .connection()
             .query_row(
-                "SELECT modified_at_ms FROM main.files
-                 WHERE repo_id = ?1 AND path = ?2 AND commit_sha = ?3 AND worktree_id = ?4
-                   AND generation = ?5",
-                params![
-                    self.active_repo_id,
-                    path_string(path),
-                    commit_sha,
-                    worktree_id,
-                    self.active_generation
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    /// The `(sha256, language, kind)` identity of the row for this exact scope key (`None` when no
-    /// such row exists) — the no-op-skip signal for the explicit-path flow: an `index --paths` over
-    /// a CLEAN/reverted file prepares a row whose identity matches the existing one, and
-    /// `write_prepared_incremental_files` skips the remove+insert so the row id and its chunk
-    /// embeddings are not needlessly churned (#659 review). Includes `language`/`kind` so a TARGET
-    /// identity change with UNCHANGED bytes (an extension-precedence upgrade re-languages a path
-    /// without touching its content) is NOT skipped — mirroring discovery's `(sha256, language,
-    /// kind)` staleness ([`super::discovery::target_for_path`] drift). Sibling of
-    /// [`Self::scope_row_modified_at_ms`].
-    pub(super) fn scope_row_identity(
-        &self,
-        path: &Path,
-        commit_sha: &str,
-        worktree_id: &str,
-    ) -> anyhow::Result<Option<(String, String, String)>> {
-        self.storage
-            .connection()
-            .query_row(
-                "SELECT sha256, language, kind FROM main.files
+                "SELECT modified_at_ms, sha256, language, kind FROM main.files
                  WHERE repo_id = ?1 AND path = ?2 AND commit_sha = ?3 AND worktree_id = ?4
                    AND generation = ?5",
                 params![
@@ -391,11 +370,12 @@ impl IndexDatabase {
                     self.active_generation
                 ],
                 |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
+                    Ok(ScopeRowState {
+                        modified_at_ms: row.get(0)?,
+                        sha256: row.get(1)?,
+                        language: row.get(2)?,
+                        kind: row.get(3)?,
+                    })
                 },
             )
             .optional()

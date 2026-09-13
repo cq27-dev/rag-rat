@@ -1209,6 +1209,17 @@ impl IndexDatabase {
                     kind: prepared_file.file.kind,
                 });
             }
+            // Both skip gates below read the same exact-scope-key row; fetch it once, and only when
+            // a gate applies to this file.
+            let scope_row = match &prepared_file.prepared {
+                Ok(_) if guard_concurrent_writes || mode_guard == Some(IndexMode::Paths) => self
+                    .scope_row_state(
+                        &prepared_file.file.relative_path,
+                        &prepared_file.file.commit_sha,
+                        &prepared_file.file.worktree_id,
+                    )?,
+                _ => None,
+            };
             // A lockless heal could have indexed a NEWER on-disk version of THIS exact scope key in
             // the off-lock prepare window (#561). Compare the CURRENT row's disk mtime to the one
             // we prepared: if the row already reflects a newer disk state, skip the
@@ -1219,12 +1230,8 @@ impl IndexDatabase {
             // path dirty for the next changed pass, so it can only DEFER, never strand.
             if guard_concurrent_writes
                 && let Ok(content) = &prepared_file.prepared
-                && let Some(row_modified_at_ms) = self.scope_row_modified_at_ms(
-                    &prepared_file.file.relative_path,
-                    &prepared_file.file.commit_sha,
-                    &prepared_file.file.worktree_id,
-                )?
-                && row_modified_at_ms > content.modified_at_ms
+                && let Some(row) = &scope_row
+                && row.modified_at_ms > content.modified_at_ms
             {
                 continue;
             }
@@ -1242,15 +1249,10 @@ impl IndexDatabase {
             // unchanged file — so neither wants this skip.
             if mode_guard == Some(IndexMode::Paths)
                 && let Ok(content) = &prepared_file.prepared
-                && self.scope_row_identity(
-                    &prepared_file.file.relative_path,
-                    &prepared_file.file.commit_sha,
-                    &prepared_file.file.worktree_id,
-                )? == Some((
-                    content.sha256.clone(),
-                    prepared_file.file.language.as_str().to_string(),
-                    prepared_file.file.kind.as_db_str().to_string(),
-                ))
+                && let Some(row) = &scope_row
+                && row.sha256 == content.sha256
+                && row.language == prepared_file.file.language.as_str()
+                && row.kind == prepared_file.file.kind.as_db_str()
             {
                 continue;
             }

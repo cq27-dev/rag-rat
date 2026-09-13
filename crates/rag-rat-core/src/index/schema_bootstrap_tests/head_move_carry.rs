@@ -70,11 +70,10 @@ fn chunk_ids_of_file(db: &IndexDatabase, file_id: i64) -> Vec<i64> {
 
 /// #561: the incremental write phase skips overwriting a scope key whose current row already has a
 /// NEWER disk mtime than the version it prepared (a concurrent lockless heal). The interleaving
-/// isn't unit-testable, but `scope_row_modified_at_ms` — the value the guard compares against the
-/// prepared mtime — is: it returns the row's `modified_at_ms` for the exact scope key, `None` for
-/// any other.
+/// isn't unit-testable, but `scope_row_state` — whose `modified_at_ms` the guard compares against
+/// the prepared mtime — is: it returns the row for the exact scope key, `None` for any other.
 #[test]
-fn scope_row_modified_at_ms_reads_the_scoped_disk_mtime() {
+fn scope_row_state_reads_the_scoped_disk_mtime() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -97,25 +96,20 @@ fn scope_row_modified_at_ms_reads_the_scoped_disk_mtime() {
         )
         .unwrap();
     let path = std::path::Path::new("src/lib.rs");
+    let mtime_at = |path: &std::path::Path, commit_sha: &str| {
+        db.scope_row_state(path, commit_sha, &worktree_id).unwrap().map(|row| row.modified_at_ms)
+    };
 
     // The guard reads this exact scope's mtime — the value it compares against the prepared mtime.
-    assert_eq!(
-        db.scope_row_modified_at_ms(path, &commit_sha, &worktree_id).unwrap(),
-        Some(modified_at_ms)
-    );
+    assert_eq!(mtime_at(path, &commit_sha), Some(modified_at_ms));
     // Scope-keyed: a different commit scope or a different path is a different row → None.
     assert_eq!(
-        db.scope_row_modified_at_ms(path, "deadbeefdeadbeef", &worktree_id).unwrap(),
+        mtime_at(path, "deadbeefdeadbeef"),
         None,
         "a different commit_sha is a different scope key"
     );
     assert_eq!(
-        db.scope_row_modified_at_ms(
-            std::path::Path::new("src/other.rs"),
-            &commit_sha,
-            &worktree_id
-        )
-        .unwrap(),
+        mtime_at(std::path::Path::new("src/other.rs"), &commit_sha),
         None,
         "a different path is a different scope key"
     );
