@@ -488,13 +488,11 @@ pub fn table_sync_ingest(
 ) -> anyhow::Result<TableSyncIngestOutcome> {
     ingest_against(
         conn,
-        account_id,
-        stream,
+        &IngestRoute { account_id, stream, registry: SYNCABLE_TABLES },
         expected_device,
         signed_bytes,
         now_ms,
         advertised_floor,
-        SYNCABLE_TABLES,
     )
 }
 
@@ -791,17 +789,24 @@ fn fixed32(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The route one ingest is validated against: the account, the stream it arrived on, and the
+/// registry that decides which tables that stream may carry.
+#[derive(Clone, Copy)]
+struct IngestRoute<'a> {
+    account_id: AccountId,
+    stream: &'a TableSyncStream,
+    registry: &'a [TableSpec],
+}
+
 fn ingest_against(
     conn: &Connection,
-    account_id: AccountId,
-    stream: &TableSyncStream,
+    route: &IngestRoute<'_>,
     expected_device: [u8; 32],
     signed_bytes: &[u8],
     now_ms: i64,
     advertised_floor: Option<(u64, [u8; 32])>,
-    registry: &[TableSpec],
 ) -> anyhow::Result<TableSyncIngestOutcome> {
+    let IngestRoute { account_id, stream, registry } = *route;
     if !validate_stream_against(conn, account_id, stream, registry)? {
         return Ok(TableSyncIngestOutcome::NoChange);
     }
@@ -954,8 +959,15 @@ mod tests {
         for route in [&stale, &unknown, &forged] {
             assert!(!validate_stream_against(&conn, account(), route, &[REPO_SPEC]).unwrap());
             assert_eq!(
-                ingest_against(&conn, account(), route, [0; 32], &[0], 0, None, &[REPO_SPEC])
-                    .unwrap(),
+                ingest_against(
+                    &conn,
+                    &IngestRoute { account_id: account(), stream: route, registry: &[REPO_SPEC] },
+                    [0; 32],
+                    &[0],
+                    0,
+                    None
+                )
+                .unwrap(),
                 TableSyncIngestOutcome::NoChange,
             );
         }
@@ -1692,23 +1704,38 @@ mod tests {
 
         let destination = restore(false);
         assert_eq!(
-            ingest_against(&destination, account, &route, [0; 32], &authored[0], 1, None, &[
-                REPO_SPEC
-            ])
+            ingest_against(
+                &destination,
+                &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+                [0; 32],
+                &authored[0],
+                1,
+                None
+            )
             .unwrap(),
             TableSyncIngestOutcome::NoChange,
         );
         assert_eq!(
-            ingest_against(&destination, account, &route, author, &authored[0], 1, None, &[
-                REPO_SPEC
-            ])
+            ingest_against(
+                &destination,
+                &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+                author,
+                &authored[0],
+                1,
+                None
+            )
             .unwrap(),
             TableSyncIngestOutcome::Stored,
         );
         assert_eq!(
-            ingest_against(&destination, account, &route, author, &authored[0], 2, None, &[
-                REPO_SPEC
-            ])
+            ingest_against(
+                &destination,
+                &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+                author,
+                &authored[0],
+                2,
+                None
+            )
             .unwrap(),
             TableSyncIngestOutcome::NoChange,
         );
@@ -1723,8 +1750,15 @@ mod tests {
 
         let removed = restore(true);
         assert_eq!(
-            ingest_against(&removed, account, &route, author, &authored[0], 1, None, &[REPO_SPEC])
-                .unwrap(),
+            ingest_against(
+                &removed,
+                &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+                author,
+                &authored[0],
+                1,
+                None
+            )
+            .unwrap(),
             TableSyncIngestOutcome::NoChange,
         );
         let accepted: i64 = removed
@@ -1876,13 +1910,11 @@ mod tests {
                 let floor = head.floor.filter(|(lamport, _)| *lamport == entry.lamport);
                 ingest_against(
                     peer,
-                    account,
-                    &route,
+                    &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
                     head.device_fingerprint,
                     &entry.signed_bytes,
                     1,
                     floor,
-                    &[REPO_SPEC],
                 )
                 .unwrap();
             }

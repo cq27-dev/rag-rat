@@ -431,8 +431,8 @@ pub(crate) fn ingest(
     store::assert_current_incarnation(tx, ctx.account_id, ctx.repo_id, ctx.incarnation_ref)?;
     let device = pubkey.fingerprint();
     let stream = scope_stream_id(ctx.repo_id, ctx.account_id, ctx.incarnation_ref, scope_id);
-    let (outcome, mut tail) =
-        ingest_one(tx, ctx, scope_id, signed_bytes, pubkey, advertised_floor)?;
+    let scope = IngestScope { ctx, scope_id, pubkey };
+    let (outcome, mut tail) = ingest_one(tx, &scope, signed_bytes, advertised_floor)?;
     let mut promoted = Vec::new();
     // Each accepted entry settles the held CHILDREN of two hashes, and both sets must be drained
     // or rows sit in the table forever, keyed to a hash no probe will ever revisit:
@@ -451,7 +451,7 @@ pub(crate) fn ingest(
     while let Some(accepted) = tail {
         if let Some(prev) = accepted.prev_hash {
             // Cannot advance the chain: the slot is already held by `accepted`.
-            drain_children(tx, ctx, scope_id, pubkey, stream, device, &prev, &mut promoted)?;
+            drain_children(tx, &scope, stream, device, &prev, &mut promoted)?;
         }
         // A held entry on ANOTHER device's chain citing this hash is structurally impossible (a
         // chain links only within its own device), and accepting this entry is the only moment that
@@ -460,16 +460,7 @@ pub(crate) fn ingest(
         let foreign =
             store::discard_foreign_chain_citations(tx, stream, device, &accepted.entry_hash)?;
         promoted.extend(std::iter::repeat_n(IngestOutcome::AbandonedBehindFork, foreign));
-        tail = drain_children(
-            tx,
-            ctx,
-            scope_id,
-            pubkey,
-            stream,
-            device,
-            &accepted.entry_hash,
-            &mut promoted,
-        )?;
+        tail = drain_children(tx, &scope, stream, device, &accepted.entry_hash, &mut promoted)?;
     }
     Ok(IngestReport { outcome, promoted })
 }
@@ -482,6 +473,15 @@ pub(crate) struct IngestReport {
     /// order. Reported individually rather than counted: promotion settles the CHAIN question, so
     /// a promoted entry can still be retained, quarantined, or deferred on its PAYLOAD.
     pub promoted: Vec<IngestOutcome>,
+}
+
+/// What every entry of one [`ingest`] call — the received entry and each held child it promotes —
+/// is ingested under: the sync context, the scope whose stream it rides, and the signer's key.
+#[derive(Clone, Copy)]
+struct IngestScope<'a> {
+    ctx: &'a SyncCtx<'a>,
+    scope_id: &'a str,
+    pubkey: &'a DevicePublic,
 }
 
 /// The entry an acceptance put at the chain tail — what a promotion probe keys on.
@@ -502,12 +502,9 @@ struct AcceptedEntry {
 /// A child that does not store is a fork, and its own held descendants are abandoned with it:
 /// nothing will ever put its hash on the chain, so they can never promote, and they cite a hash no
 /// future acceptance produces, so no probe would reach them either.
-#[allow(clippy::too_many_arguments)]
 fn drain_children(
     tx: &Transaction<'_>,
-    ctx: &SyncCtx<'_>,
-    scope_id: &str,
-    pubkey: &DevicePublic,
+    scope: &IngestScope<'_>,
     stream: crate::stream::StreamId,
     device: crate::op::DeviceFingerprint,
     parent_hash: &[u8; 32],
@@ -518,7 +515,7 @@ fn drain_children(
         // The advertised floor is deliberately NOT passed here: a promoted child is chain
         // continuation, not a candidate for adoption, and passing the floor would let an exact
         // match re-classify as RootAdopt where a promotion belongs.
-        let (outcome, stored) = ingest_one(tx, ctx, scope_id, &child.signed_bytes, pubkey, None)?;
+        let (outcome, stored) = ingest_one(tx, scope, &child.signed_bytes, None)?;
         promoted.push(outcome);
         match stored {
             Some(entry) => took_the_slot = Some(entry),
@@ -539,12 +536,11 @@ fn drain_children(
 /// silently fail to drive promotion.
 fn ingest_one(
     tx: &Transaction<'_>,
-    ctx: &SyncCtx<'_>,
-    scope_id: &str,
+    scope: &IngestScope<'_>,
     signed_bytes: &[u8],
-    pubkey: &DevicePublic,
     advertised_floor: Option<store::AdvertisedFloor>,
 ) -> anyhow::Result<(IngestOutcome, Option<AcceptedEntry>)> {
+    let IngestScope { ctx, scope_id, pubkey } = *scope;
     // Same refusal as the producer: an older binary must not re-park, under its own version, an
     // entry a newer projector already understood and folded.
     refold::assert_projector_not_newer(tx)?;
@@ -564,12 +560,14 @@ fn ingest_one(
     Ok(
         match store::accept_row_entry(
             tx,
-            ctx.account_id,
-            stream,
-            &scope_tables,
+            &store::AcceptCtx {
+                account_id: ctx.account_id,
+                expected_stream: stream,
+                expected_tables: &scope_tables,
+                pubkey,
+                now_ms: ctx.now_ms,
+            },
             signed_bytes,
-            pubkey,
-            ctx.now_ms,
             advertised_floor,
         )? {
             AcceptOutcome::Stored { op, meta, entry_hash, prev_hash } => {

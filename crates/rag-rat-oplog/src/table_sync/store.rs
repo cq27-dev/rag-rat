@@ -341,23 +341,31 @@ fn stream_max_lamport(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result<
     highest.map(u64::try_from).transpose().map_err(Into::into)
 }
 
+/// The stable context one [`accept_row_entry`] call verifies an entry against: whose account, which
+/// stream and tables it must name, the signer's key, and the clock. The entry bytes and any
+/// advertised floor are per-entry and travel beside it.
+#[derive(Clone, Copy)]
+pub(crate) struct AcceptCtx<'a> {
+    pub account_id: AccountId,
+    pub expected_stream: StreamId,
+    pub expected_tables: &'a [&'a str],
+    pub pubkey: &'a DevicePublic,
+    pub now_ms: i64,
+}
+
 /// Verify + chain-classify + store one foreign signed entry, expected on `expected_stream` under
 /// `pubkey`. A tampered/wrong-keyed entry or one naming a different stream is an `Err`; a chain gap
 /// or conflict is a (non-storing) [`AcceptOutcome`]. A chain-continuous entry is stored REGARDLESS
 /// of whether its payload is applicable, so one undecodable / unknown / out-of-scope payload cannot
 /// wedge every later entry from that device — storage is gated on the CHAIN, application on the
 /// PAYLOAD.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn accept_row_entry(
     tx: &Transaction<'_>,
-    account_id: AccountId,
-    expected_stream: StreamId,
-    expected_tables: &[&str],
+    ctx: &AcceptCtx<'_>,
     signed_bytes: &[u8],
-    pubkey: &DevicePublic,
-    now_ms: i64,
     advertised_floor: Option<AdvertisedFloor>,
 ) -> anyhow::Result<AcceptOutcome> {
+    let AcceptCtx { account_id, expected_stream, expected_tables, pubkey, now_ms } = *ctx;
     anyhow::ensure!(
         signed_bytes.len() <= super::TABLE_SYNC_ENTRY_MAX_BYTES,
         "table-sync signed entry is {} bytes, over the {}-byte transport limit",
@@ -1710,12 +1718,14 @@ mod tests {
         let tx = b.transaction().unwrap();
         let outcome = accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t"],
+            &AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t"],
+                pubkey: &secret.public(),
+                now_ms: 0,
+            },
             &signed.signed_bytes,
-            &secret.public(),
-            0,
             None,
         )
         .unwrap();
@@ -1752,12 +1762,14 @@ mod tests {
         let tx = remote.transaction().unwrap();
         let error = accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t"],
+            &AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t"],
+                pubkey: &secret.public(),
+                now_ms: 0,
+            },
             &forged.signed_bytes,
-            &secret.public(),
-            0,
             None,
         )
         .unwrap_err();
@@ -1791,13 +1803,15 @@ mod tests {
         assert!(matches!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 2
+                },
                 &first.signed_bytes,
-                &secret.public(),
-                2,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::Stored { .. }
@@ -1845,13 +1859,15 @@ mod tests {
             assert!(matches!(
                 accept_row_entry(
                     &tx,
-                    account(),
-                    stream(),
-                    &["t"],
+                    &AcceptCtx {
+                        account_id: account(),
+                        expected_stream: stream(),
+                        expected_tables: &["t"],
+                        pubkey: &secret.public(),
+                        now_ms: 0
+                    },
                     &candidate.signed_bytes,
-                    &secret.public(),
-                    0,
-                    None,
+                    None
                 )
                 .unwrap(),
                 AcceptOutcome::Stored { .. }
@@ -1908,13 +1924,15 @@ mod tests {
         assert!(matches!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &signed.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::Stored { .. }
@@ -1922,13 +1940,15 @@ mod tests {
         assert_eq!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &signed.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::AlreadyPresent,
@@ -1951,13 +1971,15 @@ mod tests {
         assert!(
             accept_row_entry(
                 &tx,
-                account(),
-                other,
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: other,
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &signed.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .is_err(),
             "an entry cannot be re-homed onto a stream it was not signed for",
@@ -1983,13 +2005,15 @@ mod tests {
         assert_eq!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["other"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["other"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &first.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::StoredInert {
@@ -2003,13 +2027,15 @@ mod tests {
         assert!(matches!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &second.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::Stored { .. },
@@ -2035,13 +2061,15 @@ mod tests {
         assert_eq!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &garbage.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::StoredInert {
@@ -2054,13 +2082,15 @@ mod tests {
         assert!(matches!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &valid.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::Stored { .. },
@@ -2084,13 +2114,15 @@ mod tests {
         assert!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &poison.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .is_err(),
             "an out-of-bound lamport is rejected before it can poison the stream counter",
@@ -2125,13 +2157,15 @@ mod tests {
             matches!(
                 accept_row_entry(
                     &tx,
-                    account(),
-                    stream(),
-                    &["t"],
+                    &AcceptCtx {
+                        account_id: account(),
+                        expected_stream: stream(),
+                        expected_tables: &["t"],
+                        pubkey: &secret.public(),
+                        now_ms: 0
+                    },
                     &at_bound.signed_bytes,
-                    &secret.public(),
-                    0,
-                    None,
+                    None
                 )
                 .unwrap(),
                 AcceptOutcome::Stored { .. },
@@ -2144,13 +2178,15 @@ mod tests {
         assert!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &beyond.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .is_err(),
             "a lamport one past the advance bound is refused",
@@ -2175,13 +2211,15 @@ mod tests {
         assert_eq!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &second.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::GapRetained,
@@ -2226,12 +2264,14 @@ mod tests {
             assert_eq!(
                 accept_row_entry(
                     &tx,
-                    account(),
-                    stream(),
-                    &["t"],
+                    &AcceptCtx {
+                        account_id: account(),
+                        expected_stream: stream(),
+                        expected_tables: &["t"],
+                        pubkey: &secret.public(),
+                        now_ms: 0
+                    },
                     bytes,
-                    &secret.public(),
-                    0,
                     None
                 )
                 .unwrap(),
@@ -2285,13 +2325,15 @@ mod tests {
         assert_eq!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &newcomer.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::GapRetained,
@@ -2331,13 +2373,15 @@ mod tests {
         assert_eq!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &far.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::GapChainFull,
@@ -2427,13 +2471,15 @@ mod tests {
         assert_eq!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &higher.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::GapChainFull,
@@ -2442,13 +2488,15 @@ mod tests {
         assert_eq!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &lower.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::GapRetained,
@@ -2488,12 +2536,14 @@ mod tests {
             for e in order {
                 accept_row_entry(
                     &tx,
-                    account(),
-                    stream(),
-                    &["t"],
+                    &AcceptCtx {
+                        account_id: account(),
+                        expected_stream: stream(),
+                        expected_tables: &["t"],
+                        pubkey: &secret.public(),
+                        now_ms: 0,
+                    },
                     &e.signed_bytes,
-                    &secret.public(),
-                    0,
                     None,
                 )
                 .unwrap();
@@ -2541,23 +2591,27 @@ mod tests {
         let tx = b.transaction().unwrap();
         accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t"],
+            &AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t"],
+                pubkey: &secret.public(),
+                now_ms: 0,
+            },
             &e1.signed_bytes,
-            &secret.public(),
-            0,
             None,
         )
         .unwrap();
         accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t"],
+            &AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t"],
+                pubkey: &secret.public(),
+                now_ms: 0,
+            },
             &e2.signed_bytes,
-            &secret.public(),
-            0,
             None,
         )
         .unwrap();
@@ -2566,13 +2620,15 @@ mod tests {
         assert_eq!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &fork.signed_bytes,
-                &secret.public(),
-                0,
-                None,
+                None
             )
             .unwrap(),
             AcceptOutcome::Fork,
@@ -2594,7 +2650,19 @@ mod tests {
         signed: &SignedEntry,
         pubkey: &DevicePublic,
     ) -> AcceptOutcome {
-        accept_row_entry(tx, acct, stream(), &["t"], &signed.signed_bytes, pubkey, 0, None).unwrap()
+        accept_row_entry(
+            tx,
+            &AcceptCtx {
+                account_id: acct,
+                expected_stream: stream(),
+                expected_tables: &["t"],
+                pubkey,
+                now_ms: 0,
+            },
+            &signed.signed_bytes,
+            None,
+        )
+        .unwrap()
     }
 
     fn stream_entry_count(tx: &Transaction<'_>) -> i64 {
@@ -2679,16 +2747,18 @@ mod tests {
         assert_eq!(
             accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t"],
+                &AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t"],
+                    pubkey: &secret.public(),
+                    now_ms: 0
+                },
                 &signed.signed_bytes,
-                &secret.public(),
-                0,
                 Some(AdvertisedFloor {
                     lamport: signed.entry.lamport,
                     entry_hash: signed.entry.entry_hash,
-                }),
+                })
             )
             .unwrap(),
             AcceptOutcome::Unauthorized,

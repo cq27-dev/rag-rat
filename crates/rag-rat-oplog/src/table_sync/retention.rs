@@ -580,12 +580,14 @@ mod tests {
         let tx = c.transaction().unwrap();
         let outcome = store::accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t_demo"],
+            &store::AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t_demo"],
+                pubkey: &device.secret().public(),
+                now_ms: 0,
+            },
             &forged.signed_bytes,
-            &device.secret().public(),
-            0,
             None,
         )
         .unwrap();
@@ -696,12 +698,14 @@ mod tests {
         let tx = b.transaction().unwrap();
         let outcome = store::accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t_demo"],
+            &store::AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t_demo"],
+                pubkey: &device.secret().public(),
+                now_ms: 0,
+            },
             &floor_bytes,
-            &device.secret().public(),
-            0,
             Some(store::AdvertisedFloor {
                 lamport: 2,
                 entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
@@ -758,12 +762,14 @@ mod tests {
         let tx = b.transaction().unwrap();
         let outcome = store::accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t_demo"],
+            &store::AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t_demo"],
+                pubkey: &device.secret().public(),
+                now_ms: 0,
+            },
             &floor_bytes,
-            &device.secret().public(),
-            0,
             Some(store::AdvertisedFloor {
                 lamport: 1,
                 entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
@@ -793,12 +799,14 @@ mod tests {
         let tx = b.transaction().unwrap();
         let outcome = store::accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t_demo"],
+            &store::AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t_demo"],
+                pubkey: &device.secret().public(),
+                now_ms: 0,
+            },
             &equivocation.signed_bytes,
-            &device.secret().public(),
-            0,
             Some(store::AdvertisedFloor { lamport: 3, entry_hash: equivocation.entry.entry_hash }),
         )
         .unwrap();
@@ -837,12 +845,14 @@ mod tests {
             let tx = b.transaction().unwrap();
             store::accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t_demo"],
+                &store::AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t_demo"],
+                    pubkey: &device.secret().public(),
+                    now_ms: 0,
+                },
                 &signed_bytes,
-                &device.secret().public(),
-                0,
                 None,
             )
             .unwrap();
@@ -854,12 +864,14 @@ mod tests {
         let tx = b.transaction().unwrap();
         let outcome = store::accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t_demo"],
+            &store::AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t_demo"],
+                pubkey: &device.secret().public(),
+                now_ms: 0,
+            },
             &bytes(4).1,
-            &device.secret().public(),
-            0,
             Some(store::AdvertisedFloor {
                 lamport: 4,
                 entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
@@ -875,12 +887,14 @@ mod tests {
         // The chain continues from the new root, and the skipped prefix is idempotent, not fork.
         let outcome = store::accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t_demo"],
+            &store::AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t_demo"],
+                pubkey: &device.secret().public(),
+                now_ms: 0,
+            },
             &bytes(5).1,
-            &device.secret().public(),
-            0,
             None,
         )
         .unwrap();
@@ -890,12 +904,14 @@ mod tests {
         );
         let outcome = store::accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t_demo"],
+            &store::AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t_demo"],
+                pubkey: &device.secret().public(),
+                now_ms: 0,
+            },
             &bytes(3).1,
-            &device.secret().public(),
-            0,
             None,
         )
         .unwrap();
@@ -935,12 +951,14 @@ mod tests {
             let tx = b.transaction().unwrap();
             store::accept_row_entry(
                 &tx,
-                account(),
-                stream(),
-                &["t_demo"],
+                &store::AcceptCtx {
+                    account_id: account(),
+                    expected_stream: stream(),
+                    expected_tables: &["t_demo"],
+                    pubkey: &device.secret().public(),
+                    now_ms: 0,
+                },
                 &signed_bytes,
-                &device.secret().public(),
-                0,
                 None,
             )
             .unwrap();
@@ -963,12 +981,14 @@ mod tests {
         let tx = b.transaction().unwrap();
         let outcome = store::accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t_demo"],
+            &store::AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t_demo"],
+                pubkey: &device.secret().public(),
+                now_ms: 0,
+            },
             &floor_bytes,
-            &device.secret().public(),
-            0,
             Some(store::AdvertisedFloor {
                 lamport: 4,
                 entry_hash: <[u8; 32]>::try_from(floor_hash.as_slice()).unwrap(),
@@ -1008,12 +1028,14 @@ mod tests {
         let tx = c.transaction().unwrap();
         let outcome = store::accept_row_entry(
             &tx,
-            account(),
-            stream(),
-            &["t_demo"],
+            &store::AcceptCtx {
+                account_id: account(),
+                expected_stream: stream(),
+                expected_tables: &["t_demo"],
+                pubkey: &device.secret().public(),
+                now_ms: 0,
+            },
             &dropped,
-            &device.secret().public(),
-            0,
             None,
         )
         .unwrap();
