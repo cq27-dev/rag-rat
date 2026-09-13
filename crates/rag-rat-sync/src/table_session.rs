@@ -232,7 +232,8 @@ where
             (entries_sent, entries_received, entries_newly_stored, local_pending || peer_pending)
         },
     };
-    complete(&mut send, &mut recv, role, idle_timeout).await?;
+    role.acknowledge_in_order(send_ack(&mut send, idle_timeout), read_ack(&mut recv, idle_timeout))
+        .await?;
     Ok(TableSessionReport {
         streams,
         entries_sent,
@@ -565,24 +566,6 @@ fn validate_chain_page(chains: &[ChainHead]) -> anyhow::Result<()> {
         "local table-sync chain page is not canonical"
     );
     Ok(())
-}
-
-async fn complete<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
-    send: &mut W,
-    recv: &mut R,
-    role: AuthRole,
-    idle_timeout: Duration,
-) -> Result<(), TableSessionError> {
-    match role {
-        AuthRole::Dialer => {
-            send_ack(send, idle_timeout).await?;
-            read_ack(recv, idle_timeout).await
-        },
-        AuthRole::Acceptor => {
-            read_ack(recv, idle_timeout).await?;
-            send_ack(send, idle_timeout).await
-        },
-    }
 }
 
 async fn send_ack<W: AsyncWrite + Unpin>(

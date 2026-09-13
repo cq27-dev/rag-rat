@@ -347,39 +347,17 @@ where
     // flow control mid-stream, and the session would hang instead of failing.
     let ((mut send, entries_sent), (mut recv, entries_received, entries_newly_stored)) =
         tokio::try_join!(sender, receiver)?;
-    complete_session(&mut send, &mut recv, role, idle_timeout).await?;
+    role.acknowledge_in_order(
+        send_ack_and_finish(&mut send, idle_timeout),
+        read_ack_before(&mut recv, idle_timeout),
+    )
+    .await?;
     Ok(SessionReport {
         entries_sent,
         entries_received,
         entries_newly_stored,
         peer_capability: capabilities.peer,
     })
-}
-
-/// Prove both data streams were consumed before the dialer may close the connection. The ordering
-/// is deliberate: the dialer acknowledges first, the acceptor reads that proof before replying,
-/// and the dialer waits for the reply. The acceptor endpoint then keeps the connection alive until
-/// the dialer closes, so its final acknowledgement cannot be truncated in flight.
-async fn complete_session<R, W>(
-    send: &mut W,
-    recv: &mut R,
-    role: AuthRole,
-    idle_timeout: Duration,
-) -> Result<(), SessionError>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    match role {
-        AuthRole::Dialer => {
-            send_ack_and_finish(send, idle_timeout).await?;
-            read_ack_before(recv, idle_timeout).await
-        },
-        AuthRole::Acceptor => {
-            read_ack_before(recv, idle_timeout).await?;
-            send_ack_and_finish(send, idle_timeout).await
-        },
-    }
 }
 
 async fn send_ack_and_finish<W: AsyncWrite + Unpin>(

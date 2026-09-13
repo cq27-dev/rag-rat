@@ -78,6 +78,31 @@ pub enum AuthRole {
     Acceptor,
 }
 
+impl AuthRole {
+    /// Run a session's completion acknowledgement in role order, proving both data streams were
+    /// consumed before the dialer may close the connection: the dialer acknowledges first, the
+    /// acceptor reads that proof before replying, and the dialer waits for the reply. The acceptor
+    /// endpoint then keeps the connection alive until the dialer closes, so its final
+    /// acknowledgement cannot be truncated in flight. Both session lanes complete through this one
+    /// ordering; each supplies its own frame-level send and read.
+    pub(crate) async fn acknowledge_in_order<E>(
+        self,
+        send_ack: impl Future<Output = Result<(), E>>,
+        read_ack: impl Future<Output = Result<(), E>>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Dialer => {
+                send_ack.await?;
+                read_ack.await
+            },
+            Self::Acceptor => {
+                read_ack.await?;
+                send_ack.await
+            },
+        }
+    }
+}
+
 /// Whether the authenticated peer may transmit entries in the data phase. This is a transport
 /// capability, not proof that the peer authored those entries: under [`AuthPolicy::Open`], a dialer
 /// permits its explicitly selected server to send the snapshot needed to restore roster state.
