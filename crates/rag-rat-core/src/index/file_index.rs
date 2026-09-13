@@ -435,7 +435,7 @@ impl IndexDatabase {
             )?
             .execute(params![
                 file_id,
-                chunk.kind,
+                chunk.kind.as_db_str(),
                 chunk.symbol_path,
                 symbol_id,
                 i64::try_from(chunk.start_byte)?,

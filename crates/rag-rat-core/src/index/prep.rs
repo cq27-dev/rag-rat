@@ -67,7 +67,7 @@ pub(crate) fn prepare_chunks(
                 path,
                 language,
                 file_kind,
-                chunk.kind,
+                chunk.kind.as_db_str(),
                 chunk.symbol_path.as_deref(),
                 &chunk.text,
                 ai::DEFAULT_MAX_EMBEDDING_CHARS,

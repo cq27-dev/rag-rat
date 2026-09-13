@@ -14,9 +14,24 @@ const SYMBOL_SPLIT_LINES: usize = 120;
 /// Line cap per chunk for the uncovered (between-symbol) context spans.
 const UNCOVERED_SPAN_SPLIT_LINES: usize = 80;
 
+/// The persisted `chunks.chunk_kind` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
+pub enum ChunkKind {
+    Code,
+    Markdown,
+    Generated,
+}
+
+impl ChunkKind {
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Chunk {
-    pub kind: &'static str,
+    pub kind: ChunkKind,
     pub symbol_path: Option<String>,
     /// Index of the parsed symbol this chunk was cut from, into the same `&[ParsedSymbol]` slice
     /// `code_chunks_for_symbols` received — `insert_chunks` remaps it to the symbol's DB rowid and
@@ -34,7 +49,7 @@ pub struct Chunk {
 
 pub fn chunks_for_file(path: &Path, language: Language, text: &str) -> Vec<Chunk> {
     if text.len() > MAX_STRUCTURAL_PARSE_BYTES && language != Language::Markdown {
-        return split_text_chunks(path, "code", text, TEXT_SPLIT_LINES);
+        return split_text_chunks(path, ChunkKind::Code, text, TEXT_SPLIT_LINES);
     }
     match language {
         Language::Markdown => markdown_chunks(text),
@@ -43,7 +58,7 @@ pub fn chunks_for_file(path: &Path, language: Language, text: &str) -> Vec<Chunk
 }
 
 pub fn generated_chunks_for_file(path: &Path, text: &str) -> Vec<Chunk> {
-    split_text_chunks(path, "generated", text, TEXT_SPLIT_LINES)
+    split_text_chunks(path, ChunkKind::Generated, text, TEXT_SPLIT_LINES)
 }
 
 fn markdown_chunks(text: &str) -> Vec<Chunk> {
@@ -58,7 +73,7 @@ fn markdown_chunks(text: &str) -> Vec<Chunk> {
         let line = raw.trim_end_matches('\n').trim_end_matches('\r');
         if line.starts_with('#') && !buffer.trim().is_empty() {
             chunks.push(make_chunk(
-                "markdown",
+                ChunkKind::Markdown,
                 Some(current_heading.join(" > ")),
                 start_byte,
                 byte,
@@ -79,7 +94,7 @@ fn markdown_chunks(text: &str) -> Vec<Chunk> {
 
     if !buffer.trim().is_empty() {
         chunks.push(make_chunk(
-            "markdown",
+            ChunkKind::Markdown,
             Some(current_heading.join(" > ")),
             start_byte,
             text.len(),
@@ -121,7 +136,7 @@ pub fn code_chunks_for_symbols(
                 .enumerate()
         {
             let mut chunk = make_chunk(
-                "code",
+                ChunkKind::Code,
                 Some(if part_idx == 0 {
                     symbol.qualified_name.clone()
                 } else {
@@ -210,7 +225,7 @@ fn push_uncovered_chunk(
             .enumerate()
     {
         chunks.push(make_chunk(
-            "code",
+            ChunkKind::Code,
             Some(format!(
                 "{}::#context-{}{}",
                 rag_rat_base::paths::path_string(path),
@@ -275,7 +290,7 @@ impl LineOffsets {
 
 fn whole_file_chunk(path: &Path, text: &str) -> Vec<Chunk> {
     vec![make_chunk(
-        "code",
+        ChunkKind::Code,
         path.file_name().map(|name| name.to_string_lossy().to_string()),
         0,
         text.len(),
@@ -285,7 +300,7 @@ fn whole_file_chunk(path: &Path, text: &str) -> Vec<Chunk> {
     )]
 }
 
-fn split_text_chunks(path: &Path, kind: &'static str, text: &str, max_lines: usize) -> Vec<Chunk> {
+fn split_text_chunks(path: &Path, kind: ChunkKind, text: &str, max_lines: usize) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let mut start_line = 1;
     let mut start_byte = 0;
@@ -326,7 +341,7 @@ fn split_text_chunks(path: &Path, kind: &'static str, text: &str, max_lines: usi
 }
 
 fn make_chunk(
-    kind: &'static str,
+    kind: ChunkKind,
     symbol_path: Option<String>,
     start_byte: usize,
     end_byte: usize,
@@ -406,4 +421,18 @@ fn split_symbol(
         });
     }
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChunkKind;
+
+    /// The tokens are persisted into `chunks.chunk_kind` and string-compared by the embedding
+    /// policy, so they are schema.
+    #[test]
+    fn chunk_kind_tokens_are_the_persisted_values() {
+        assert_eq!(ChunkKind::Code.as_db_str(), "code");
+        assert_eq!(ChunkKind::Markdown.as_db_str(), "markdown");
+        assert_eq!(ChunkKind::Generated.as_db_str(), "generated");
+    }
 }
