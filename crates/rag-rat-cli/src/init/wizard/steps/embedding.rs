@@ -20,7 +20,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use super::super::catalog::CookbookEntry;
 use super::super::draft::{
@@ -258,43 +258,15 @@ pub(super) fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
     ])
     .split(cols[1]);
 
-    let current_mode = remote_mode(state);
-    let mode_items: Vec<ListItem> = RemoteModeChoice::ALL
-        .iter()
-        .enumerate()
-        .map(|(i, mode)| {
-            let selected = if *mode == current_mode { "*" } else { " " };
-            let cursor = if i == *mode_cursor { ">" } else { " " };
-            let style = if i == *mode_cursor { theme::selected() } else { theme::base() };
-            ListItem::new(format!("{cursor} [{selected}] {}", mode.label())).style(style)
-        })
-        .collect();
-    let focused = *focus == EmbedFocus::Mode;
-    f.render_widget(
-        List::new(mode_items)
-            .style(theme::base())
-            .block(theme::focused_block("Remote mode", focused)),
-        right[0],
-    );
-
     let rmode = remote_mode(state);
-    let remote = state.draft.remote.as_ref();
-    let ep = match remote.map(|r| &r.mode) {
-        Some(RemoteMode::Connect(u)) => u.as_str(),
-        _ => "",
-    };
-    let m = remote.map_or("", |r| r.model.as_str());
-    let g = remote.and_then(|r| r.gpu.as_deref()).unwrap_or("");
-    let bs = remote.map_or(256, |r| r.batch_size).to_string();
-    let concurrency = remote
-        .map_or_else(|| RemoteEmbeddingConfig::default().concurrency, |r| r.concurrency)
-        .to_string();
-    let max_batch_chars = remote
-        .map_or_else(|| RemoteEmbeddingConfig::default().max_batch_chars, |r| r.max_batch_chars)
-        .to_string();
-    let auth = remote.and_then(|r| r.auth_env.as_deref()).unwrap_or("");
-
-    let dim = |f: EmbedFocus| if *focus == f { theme::focused_border() } else { theme::border() };
+    super::widgets::cursor_list(
+        f,
+        right[0],
+        theme::focused_block("Remote mode", *focus == EmbedFocus::Mode),
+        RemoteModeChoice::ALL.iter().map(|mode| (mode.label(), *mode == rmode)),
+        0,
+        *mode_cursor,
+    );
 
     if model_none {
         f.render_widget(
@@ -306,88 +278,113 @@ pub(super) fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
         return;
     }
 
+    render_remote_pane(f, right[1], state, rmode, *focus, *cookbook_cursor, *gpu_cursor);
+    render_server_pane(
+        f,
+        right[2],
+        state,
+        *focus,
+        *backend_cursor,
+        *server_model_cursor,
+        *server_model_scroll,
+    );
+    render_runtime_fields(f, right[3], state, rmode, *focus);
+}
+
+/// A field's border: highlighted while it holds the step's focus.
+fn field_border(focus: EmbedFocus, field: EmbedFocus) -> Style {
+    if focus == field { theme::focused_border() } else { theme::border() }
+}
+
+/// The remote pane for the chosen mode: the connect endpoint, the ephemeral cookbook + gpu
+/// pickers, or the remote-disabled note.
+fn render_remote_pane(
+    f: &mut Frame,
+    area: Rect,
+    state: &WizardState,
+    rmode: RemoteModeChoice,
+    focus: EmbedFocus,
+    cookbook_cursor: usize,
+    gpu_cursor: usize,
+) {
+    let remote = state.draft.remote.as_ref();
     if rmode == RemoteModeChoice::Connect {
+        let ep = match remote.map(|r| &r.mode) {
+            Some(RemoteMode::Connect(u)) => u.as_str(),
+            _ => "",
+        };
         let endpoint =
             Layout::vertical([Constraint::Length(ONE_LINE_FIELD_OUTER_HEIGHT), Constraint::Min(0)])
-                .split(right[1]);
-        f.render_widget(one_line_field(ep, "endpoint", dim(EmbedFocus::Endpoint)), endpoint[0]);
+                .split(area);
+        f.render_widget(
+            one_line_field(ep, "endpoint", field_border(focus, EmbedFocus::Endpoint)),
+            endpoint[0],
+        );
     } else if rmode == RemoteModeChoice::Ephemeral {
+        let g = remote.and_then(|r| r.gpu.as_deref()).unwrap_or("");
         let fields =
-            Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(right[1]);
+            Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(area);
         let cookbook_entries = cookbook_choices(state);
         let selected_cookbook = selected_cookbook_idx(state);
         let cookbook_visible = usize::from(fields[0].height.saturating_sub(2)).max(1);
         let (cookbook_scroll, cookbook_end) =
-            visible_list_bounds(cookbook_entries.len(), *cookbook_cursor, 0, cookbook_visible);
-        let cookbook_items: Vec<ListItem> = cookbook_entries[cookbook_scroll..cookbook_end]
-            .iter()
-            .enumerate()
-            .map(|(offset, entry)| {
-                let i = cookbook_scroll + offset;
-                let cursor = if i == *cookbook_cursor { ">" } else { " " };
-                let selected = if Some(i) == selected_cookbook { "*" } else { " " };
-                let style = if i == *cookbook_cursor { theme::selected() } else { theme::base() };
-                ListItem::new(format!("{cursor} [{selected}] {}", entry.label)).style(style)
-            })
-            .collect();
-        f.render_widget(
-            List::new(cookbook_items)
-                .style(theme::base())
-                .block(theme::block("cookbook").border_style(dim(EmbedFocus::Cookbook))),
+            visible_list_bounds(cookbook_entries.len(), cookbook_cursor, 0, cookbook_visible);
+        super::widgets::cursor_list(
+            f,
             fields[0],
+            theme::block("cookbook").border_style(field_border(focus, EmbedFocus::Cookbook)),
+            cookbook_entries[cookbook_scroll..cookbook_end].iter().enumerate().map(
+                |(offset, entry)| {
+                    (&entry.label, Some(cookbook_scroll + offset) == selected_cookbook)
+                },
+            ),
+            cookbook_scroll,
+            cookbook_cursor,
         );
         let gpu_opts = current_gpu_options(state);
         let gpu_visible = usize::from(fields[1].height.saturating_sub(2)).max(1);
-        let (gpu_scroll, gpu_end) =
-            visible_list_bounds(gpu_opts.len(), *gpu_cursor, 0, gpu_visible);
-        let gpu_items: Vec<ListItem> = gpu_opts[gpu_scroll..gpu_end]
-            .iter()
-            .enumerate()
-            .map(|(offset, gpu)| {
-                let i = gpu_scroll + offset;
-                let cursor = if i == *gpu_cursor { ">" } else { " " };
-                let selected = if gpu == g { "*" } else { " " };
-                let style = if i == *gpu_cursor { theme::selected() } else { theme::base() };
-                ListItem::new(format!("{cursor} [{selected}] {gpu}")).style(style)
-            })
-            .collect();
-        f.render_widget(
-            List::new(gpu_items)
-                .style(theme::base())
-                .block(theme::block("gpu").border_style(dim(EmbedFocus::Gpu))),
+        let (gpu_scroll, gpu_end) = visible_list_bounds(gpu_opts.len(), gpu_cursor, 0, gpu_visible);
+        super::widgets::cursor_list(
+            f,
             fields[1],
+            theme::block("gpu").border_style(field_border(focus, EmbedFocus::Gpu)),
+            gpu_opts[gpu_scroll..gpu_end].iter().map(|gpu| (gpu, gpu == g)),
+            gpu_scroll,
+            gpu_cursor,
         );
     } else {
         f.render_widget(
             Paragraph::new("Remote disabled. Select connect or ephemeral to configure Ollama.")
                 .style(theme::base())
                 .block(theme::block("Remote")),
-            right[1],
+            area,
         );
     }
+}
 
-    // Backend + server-model row: the backend picker (efficiency-ordered) drives what a server
-    // model name means, so it sits immediately left of the server-model list. Shown in BOTH
-    // connect and ephemeral modes — the backend selects the embeddings route in either.
+/// Backend + server-model row: the backend picker (efficiency-ordered) drives what a server
+/// model name means, so it sits immediately left of the server-model list. Shown in BOTH
+/// connect and ephemeral modes — the backend selects the embeddings route in either.
+fn render_server_pane(
+    f: &mut Frame,
+    area: Rect,
+    state: &WizardState,
+    focus: EmbedFocus,
+    backend_cursor: usize,
+    server_model_cursor: usize,
+    server_model_scroll: usize,
+) {
     let backend = draft_backend(state);
     // Backend names are short (`infinity`/`vllm`/`ollama`), so a fixed narrow column leaves the
     // server-model list its full width (its HF ids / ollama names are the long strings).
-    let picker = Layout::horizontal([Constraint::Length(16), Constraint::Min(0)]).split(right[2]);
-    let backend_items: Vec<ListItem> = BACKENDS_BY_EFFICIENCY
-        .iter()
-        .enumerate()
-        .map(|(i, b)| {
-            let cursor = if i == *backend_cursor { ">" } else { " " };
-            let selected = if *b == backend { "*" } else { " " };
-            let style = if i == *backend_cursor { theme::selected() } else { theme::base() };
-            ListItem::new(format!("{cursor} [{selected}] {}", b.as_db_str())).style(style)
-        })
-        .collect();
-    f.render_widget(
-        List::new(backend_items)
-            .style(theme::base())
-            .block(theme::block("backend").border_style(dim(EmbedFocus::Backend))),
+    let picker = Layout::horizontal([Constraint::Length(16), Constraint::Min(0)]).split(area);
+    super::widgets::cursor_list(
+        f,
         picker[0],
+        theme::block("backend").border_style(field_border(focus, EmbedFocus::Backend)),
+        BACKENDS_BY_EFFICIENCY.iter().map(|b| (b.as_db_str(), *b == backend)),
+        0,
+        backend_cursor,
     );
 
     // vLLM needs a GPU and rejects any chunk over the model's context. The relevant knob is the
@@ -410,15 +407,36 @@ pub(super) fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
     };
 
     let server_models = compatible_server_models(&state.draft.model, backend);
+    let selected_model = state.draft.remote.as_ref().map_or("", |r| r.model.as_str());
     render_server_model_list(
         f,
         server_area,
         &server_models,
-        m,
-        *server_model_cursor,
-        *server_model_scroll,
-        *focus == EmbedFocus::ServerModel,
+        selected_model,
+        server_model_cursor,
+        server_model_scroll,
+        focus == EmbedFocus::ServerModel,
     );
+}
+
+/// The bottom row of runtime knobs; ephemeral mode adds the provision-confirm field.
+fn render_runtime_fields(
+    f: &mut Frame,
+    area: Rect,
+    state: &WizardState,
+    rmode: RemoteModeChoice,
+    focus: EmbedFocus,
+) {
+    let remote = state.draft.remote.as_ref();
+    let bs = remote.map_or(256, |r| r.batch_size).to_string();
+    let concurrency = remote
+        .map_or_else(|| RemoteEmbeddingConfig::default().concurrency, |r| r.concurrency)
+        .to_string();
+    let max_batch_chars = remote
+        .map_or_else(|| RemoteEmbeddingConfig::default().max_batch_chars, |r| r.max_batch_chars)
+        .to_string();
+    let auth = remote.and_then(|r| r.auth_env.as_deref()).unwrap_or("");
+    let dim = |field| field_border(focus, field);
 
     if rmode == RemoteModeChoice::Ephemeral {
         let bottom = Layout::horizontal([
@@ -428,7 +446,7 @@ pub(super) fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
             Constraint::Ratio(1, 5),
             Constraint::Ratio(1, 5),
         ])
-        .split(right[3]);
+        .split(area);
         f.render_widget(one_line_field(&bs, "batch", dim(EmbedFocus::BatchSize)), bottom[0]);
         f.render_widget(
             one_line_field(&concurrency, "parallel", dim(EmbedFocus::Concurrency)),
@@ -460,7 +478,7 @@ pub(super) fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
             Constraint::Ratio(1, 4),
             Constraint::Ratio(1, 4),
         ])
-        .split(right[3]);
+        .split(area);
         f.render_widget(one_line_field(&bs, "batch", dim(EmbedFocus::BatchSize)), bottom[0]);
         f.render_widget(
             one_line_field(&concurrency, "parallel", dim(EmbedFocus::Concurrency)),
@@ -508,20 +526,13 @@ fn render_model_list(
 ) {
     let visible = usize::from(area.height.saturating_sub(2)).max(1);
     let (scroll, end) = visible_list_bounds(rows.len(), cursor, scroll, visible);
-    let items: Vec<ListItem> = rows[scroll..end]
-        .iter()
-        .enumerate()
-        .map(|(offset, (id, label))| {
-            let idx = scroll + offset;
-            let cursor_marker = if idx == cursor { ">" } else { " " };
-            let selected = if id == &state.draft.model { "*" } else { " " };
-            let style = if idx == cursor { theme::selected() } else { theme::base() };
-            ListItem::new(format!("{cursor_marker} [{selected}] {label}")).style(style)
-        })
-        .collect();
-    f.render_widget(
-        List::new(items).style(theme::base()).block(theme::focused_block("Model", focused)),
+    super::widgets::cursor_list(
+        f,
         area,
+        theme::focused_block("Model", focused),
+        rows[scroll..end].iter().map(|(id, label)| (label, id == &state.draft.model)),
+        scroll,
+        cursor,
     );
 }
 
@@ -605,20 +616,13 @@ fn render_server_model_list(
 ) {
     let visible = usize::from(area.height.saturating_sub(2)).max(1);
     let (scroll, end) = visible_list_bounds(models.len(), cursor, scroll, visible);
-    let items: Vec<ListItem> = models[scroll..end]
-        .iter()
-        .enumerate()
-        .map(|(offset, model)| {
-            let idx = scroll + offset;
-            let cursor_marker = if idx == cursor { ">" } else { " " };
-            let selected = if *model == selected_model { "*" } else { " " };
-            let style = if idx == cursor { theme::selected() } else { theme::base() };
-            ListItem::new(format!("{cursor_marker} [{selected}] {model}")).style(style)
-        })
-        .collect();
-    f.render_widget(
-        List::new(items).style(theme::base()).block(theme::focused_block("server model", focused)),
+    super::widgets::cursor_list(
+        f,
         area,
+        theme::focused_block("server model", focused),
+        models[scroll..end].iter().map(|model| (model, *model == selected_model)),
+        scroll,
+        cursor,
     );
 }
 

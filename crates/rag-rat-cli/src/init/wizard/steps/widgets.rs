@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
 
 use super::super::theme;
 
@@ -36,6 +36,32 @@ pub(super) fn option_list(
         })
         .collect();
     f.render_widget(List::new(items).block(theme::focused_block(title, focused)), area);
+}
+
+/// A picker list whose cursor and selection are separate rows: `>` marks the cursor row (also the
+/// highlighted row) and `[*]` the selected value — the Embedding step's picker shape, where moving
+/// the cursor does not change the selection. `rows` is the visible window as `(label, selected)`,
+/// starting at list index `first_index`. [`option_list`] is the single-select shape instead.
+pub(super) fn cursor_list<L: std::fmt::Display>(
+    f: &mut Frame,
+    area: Rect,
+    block: Block<'_>,
+    rows: impl IntoIterator<Item = (L, bool)>,
+    first_index: usize,
+    cursor: usize,
+) {
+    let items: Vec<ListItem> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(offset, (label, selected))| {
+            let row = first_index + offset;
+            let cursor_marker = if row == cursor { ">" } else { " " };
+            let selected_marker = if selected { "*" } else { " " };
+            let style = if row == cursor { theme::selected() } else { theme::base() };
+            ListItem::new(format!("{cursor_marker} [{selected_marker}] {label}")).style(style)
+        })
+        .collect();
+    f.render_widget(List::new(items).style(theme::base()).block(block), area);
 }
 
 /// A wrapped help/info paragraph inside a titled block.
