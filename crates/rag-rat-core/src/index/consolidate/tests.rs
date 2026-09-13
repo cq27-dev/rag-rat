@@ -1402,8 +1402,7 @@ fn unknown_source_access_mode_aborts_import_before_any_authoring() {
     let target = fresh_target();
 
     let err = import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
-        .err()
-        .expect("an unknown access mode must fail closed");
+        .expect_err("an unknown access mode must fail closed");
     assert!(err.to_string().contains("unknown memory stream access mode"), "got: {err}");
 }
 
@@ -1420,8 +1419,7 @@ fn unknown_source_seal_policy_aborts_import_before_any_authoring() {
     let target = fresh_target();
 
     let err = import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
-        .err()
-        .expect("an unknown policy must fail closed");
+        .expect_err("an unknown policy must fail closed");
     assert!(err.to_string().contains("unknown memory stream seal policy"));
     assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories"), 0);
     assert_eq!(count(&target, "SELECT COUNT(*) FROM content_entries"), 0);
@@ -1458,8 +1456,7 @@ fn sealed_target_wins_retries_and_rejects_a_conflicting_unsafe_source() {
         )
         .unwrap();
     let err = import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
-        .err()
-        .expect("plaintext must not override a sealed target");
+        .expect_err("plaintext must not override a sealed target");
     assert!(err.to_string().contains("unknown memory stream seal policy"));
     assert_eq!(policy(), "sealed", "the conflicting import cannot downgrade the target");
     assert_eq!(count(&target, "SELECT COUNT(*) FROM content_entries"), 0);
@@ -1538,8 +1535,7 @@ fn a_conflicting_target_pin_refuses_the_import() {
         .unwrap();
 
     let err = import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
-        .err()
-        .expect("two trust roots for one repository must not be reconciled silently");
+        .expect_err("two trust roots for one repository must not be reconciled silently");
     assert!(err.to_string().contains("consolidation refused"), "got: {err}");
     assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-a"));
     assert_eq!(count(&target, "SELECT COUNT(*) FROM repo_memories"), 0, "nothing imported");
@@ -1570,8 +1566,7 @@ fn a_second_source_cannot_replace_the_pin_another_source_imported() {
     assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-a"));
 
     let err = import_from_source(&second, &target, "global-repo", ImportMode::ConsolidateLegacy)
-        .err()
-        .expect("another source's conflicting pin is not a retry of the first");
+        .expect_err("another source's conflicting pin is not a retry of the first");
     assert!(err.to_string().contains("consolidation refused"), "got: {err}");
     assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-a"));
 }
@@ -1631,8 +1626,7 @@ fn a_pin_re_decided_in_the_target_after_an_import_is_not_overwritten() {
         .unwrap();
 
     let err = import_from_source(&source, &target, "global-repo", ImportMode::ConsolidateLegacy)
-        .err()
-        .expect("a pin the target re-decided is not this consolidation's to replace");
+        .expect_err("a pin the target re-decided is not this consolidation's to replace");
     assert!(err.to_string().contains("consolidation refused"), "got: {err}");
     assert_eq!(target_meta(&target, "memory_stream_pin").as_deref(), Some("owner-c"));
 }

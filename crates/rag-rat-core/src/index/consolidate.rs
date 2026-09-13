@@ -37,6 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -158,14 +159,7 @@ pub struct ImportSummary {
     /// is refused before any import, so a summary only exists for a completed import + rename).
     pub renamed_to: PathBuf,
     pub target: PathBuf,
-    pub memories: u64,
-    pub bindings: u64,
-    pub tags: u64,
-    pub call_paths: u64,
-    pub call_path_edges: u64,
-    pub edges: u64,
-    pub embedding_cache_rows: u64,
-    pub meta_keys: u64,
+    pub counts: ImportCounts,
 }
 
 /// Consolidate the repo of `config` into the global database. The pinned-key refusal keys off
@@ -192,52 +186,11 @@ fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<Cons
         "cannot resolve the global database path: no data directory is available (set \
          RAG_RAT_DATA_DIR, XDG_DATA_HOME, or HOME)",
     )?;
-    let mut source = config.database.clone();
-
-    // Already on the global store (an explicit `database = <global>` or a keyless config whose
-    // legacy file was already imported) — usually nothing to import, with ONE refinement: a
-    // config explicitly PINNED AT the global path can coexist with a lingering, never-imported
-    // legacy file (the pin was added by hand, so no consolidate run ever renamed the old
-    // per-repo DB) — reporting `already_global` there strands the authored memories in the old
-    // file while claiming success. Probe the default legacy path: present without its
-    // `.imported` marker ⇒ import FROM it. This is the one pinned shape where proceeding is
-    // strictly correct — the pin already names the target, so the rename cannot strand the
-    // config (post-import it still resolves global), which is why the pinned refusal below is
-    // skipped for it.
-    let mut pinned_at_target = false;
-    if source == target {
-        let legacy = config::default_legacy_database_path(&config.root);
-        if legacy != target && legacy.exists() && !imported_marker(&legacy).exists() {
-            source = legacy;
-            pinned_at_target = true;
-        } else {
-            return Ok(ConsolidateOutcome::AlreadyGlobal { database: target });
-        }
-    }
-
-    // A pinned `[index] database` key is REFUSED before ANY side effect — and BEFORE the
-    // missing-source exits below: a pin at a missing/renamed path would otherwise report a happy
-    // `no_legacy_index` / `already_consolidated` while the repo stays stranded on the pin (the
-    // next `rag-rat index` recreates an empty per-repo DB there). Only a pin at the global target
-    // itself is genuinely fine — that returned `AlreadyGlobal` above. Rationale for refusing at
-    // all: renaming the legacy file would strand the still-pinned config on a fresh empty DB, and
-    // importing WITHOUT renaming would open a divergence window (memories edited in the
-    // still-live legacy DB before a later finishing run are silently dropped by the idempotent
-    // `INSERT OR IGNORE`s); a pinned config never reads the global store, so an early import buys
-    // nothing.
-    if config.database_key_pinned && !pinned_at_target {
-        let default_legacy = config::default_legacy_database_path(&config.root);
-        anyhow::bail!("{}", pinned_refusal_message(&source, &default_legacy));
-    }
-
+    let source = match resolve_consolidation_source(config, &target)? {
+        ControlFlow::Continue(source) => source,
+        ControlFlow::Break(outcome) => return Ok(outcome),
+    };
     let imported = imported_marker(&source);
-    if !source.exists() {
-        return Ok(if imported.exists() {
-            ConsolidateOutcome::AlreadyImported { imported }
-        } else {
-            ConsolidateOutcome::NoLegacyIndex { source }
-        });
-    }
 
     // Resolve the repo identity FIRST: the per-repo write locks are keyed by the id this run
     // registers and writes under (the A6 lock-matches-written-id rule).
@@ -248,38 +201,8 @@ fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<Cons
             .with_context(|| format!("creating the global data directory {}", parent.display()))?;
     }
 
-    // Hold the repo's per-repo write locks for the WHOLE registration → import → rename sequence:
-    // the GLOBAL-side lock covers every row written under `identity.repo_id` in the global DB, and
-    // the LEGACY-side locks exclude a watcher / MCP writer still keyed beside the legacy file, so
-    // nothing can append to it between the snapshot read and the rename. Both bounded; the global
-    // locks taken inside (schema in the migration, registry in `register_repo`) follow the
-    // per-repo → global ordering rule (see `locks::registry_lock_path`).
-    //
-    // The LEGACY side drains EVERY id the source DB itself records, not just the CURRENT identity:
-    // the legacy file predates the identity transition, so a writer started PRE-deepen still keys
-    // its flock by the OLD `local:` id — a current-identity lock alone would not conflict with it,
-    // and the snapshot + rename could race its writes into the renamed artifact (the same loss the
-    // same-id lock exists to prevent; the outgoing-drain rule the upgrade path follows). The ids
-    // come from a read-only PRE-lock peek at the source's own `repos` registry; canonical order,
-    // bounded. A source so old it predates the registry tables peeks empty — only pre-A6 binaries
-    // (whose lock files predate per-repo keying entirely) ever wrote such a file, so no
-    // current-scheme lock could coordinate with them regardless.
-    let _target_lock = acquire_consolidate_lock(&target, &identity.repo_id, "global")?;
-    let mut source_side_ids = source_registered_repo_ids(&source);
-    if !source_side_ids.iter().any(|id| id == &identity.repo_id) {
-        source_side_ids.push(identity.repo_id.clone());
-    }
-    source_side_ids.sort_by(|a, b| {
-        if rag_rat_base::locks::canonical_lock_order(a, b).0 == a.as_str() {
-            std::cmp::Ordering::Less
-        } else {
-            std::cmp::Ordering::Greater
-        }
-    });
-    let mut _source_locks = Vec::with_capacity(source_side_ids.len());
-    for id in &source_side_ids {
-        _source_locks.push(acquire_consolidate_lock(&source, id, "legacy")?);
-    }
+    let (_target_lock, _source_locks) =
+        acquire_all_consolidate_locks(&target, &source, &identity.repo_id)?;
 
     // #767 review: `rm` holds this same source-side repo lock while deleting the governing config.
     // If consolidate loaded Config first and then waited here, it would otherwise resume from that
@@ -406,41 +329,141 @@ fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<Cons
         rag_rat_base::time::now_ms(),
     )?;
 
-    // Rename the legacy file so a keyless config now resolves to the global store (via the
-    // `.imported` latch), and a re-run is a no-op. AFTER the import commits, so a failure leaves
-    // the legacy file in place to retry. The WAL sidecars travel WITH the archive: a bare
-    // main-file rename would orphan `-wal`/`-shm` as permanent litter, and any un-checkpointed
-    // frames in the WAL belong to the archive (SQLite opens the renamed pair as a unit) — the
-    // same discipline the custom-pin remedy tells users to follow.
-    fs::rename(&source, &imported)
-        .with_context(|| format!("renaming {} to {}", source.display(), imported.display()))?;
-    rename_wal_sidecars(&source, &imported);
-    // The legacy index is archived, so no retry of THIS consolidation can follow: the pin it wrote
-    // stops being a replaceable copy and becomes the global store's own trust decision. A failure
-    // here is left as a warning — the source identity in the marker already keeps any other source
-    // from claiming it, and failing an import that has completed would help nothing.
-    if let Err(error) = retire_pin_import(target_conn, &repo_id) {
-        tracing::warn!(
-            repo_id = %repo_id,
-            %error,
-            "consolidation completed but could not retire its stream pin import marker"
-        );
-    }
+    finish_consolidation(target_conn, &source, &imported, &repo_id)?;
 
     Ok(ConsolidateOutcome::Imported(ImportSummary {
         repo_id,
         source,
         renamed_to: imported,
         target,
-        memories: counts.memories,
-        bindings: counts.bindings,
-        tags: counts.tags,
-        call_paths: counts.call_paths,
-        call_path_edges: counts.call_path_edges,
-        edges: counts.edges,
-        embedding_cache_rows: counts.embedding_cache_rows,
-        meta_keys: counts.meta_keys,
+        counts,
     }))
+}
+
+/// Where this run imports FROM, or the outcome that ends it before any side effect: already on the
+/// global store, a refused `[index] database` pin, no legacy file, or one already imported.
+fn resolve_consolidation_source(
+    config: &Config,
+    target: &Path,
+) -> anyhow::Result<ControlFlow<ConsolidateOutcome, PathBuf>> {
+    let mut source = config.database.clone();
+
+    // Already on the global store (an explicit `database = <global>` or a keyless config whose
+    // legacy file was already imported) — usually nothing to import, with ONE refinement: a
+    // config explicitly PINNED AT the global path can coexist with a lingering, never-imported
+    // legacy file (the pin was added by hand, so no consolidate run ever renamed the old
+    // per-repo DB) — reporting `already_global` there strands the authored memories in the old
+    // file while claiming success. Probe the default legacy path: present without its
+    // `.imported` marker ⇒ import FROM it. This is the one pinned shape where proceeding is
+    // strictly correct — the pin already names the target, so the rename cannot strand the
+    // config (post-import it still resolves global), which is why the pinned refusal below is
+    // skipped for it.
+    let mut pinned_at_target = false;
+    if source == target {
+        let legacy = config::default_legacy_database_path(&config.root);
+        if legacy != target && legacy.exists() && !imported_marker(&legacy).exists() {
+            source = legacy;
+            pinned_at_target = true;
+        } else {
+            return Ok(ControlFlow::Break(ConsolidateOutcome::AlreadyGlobal {
+                database: target.to_path_buf(),
+            }));
+        }
+    }
+
+    // A pinned `[index] database` key is REFUSED before ANY side effect — and BEFORE the
+    // missing-source exits below: a pin at a missing/renamed path would otherwise report a happy
+    // `no_legacy_index` / `already_consolidated` while the repo stays stranded on the pin (the
+    // next `rag-rat index` recreates an empty per-repo DB there). Only a pin at the global target
+    // itself is genuinely fine — that returned `AlreadyGlobal` above. Rationale for refusing at
+    // all: renaming the legacy file would strand the still-pinned config on a fresh empty DB, and
+    // importing WITHOUT renaming would open a divergence window (memories edited in the
+    // still-live legacy DB before a later finishing run are silently dropped by the idempotent
+    // `INSERT OR IGNORE`s); a pinned config never reads the global store, so an early import buys
+    // nothing.
+    if config.database_key_pinned && !pinned_at_target {
+        let default_legacy = config::default_legacy_database_path(&config.root);
+        anyhow::bail!("{}", pinned_refusal_message(&source, &default_legacy));
+    }
+
+    let imported = imported_marker(&source);
+    if !source.exists() {
+        return Ok(ControlFlow::Break(if imported.exists() {
+            ConsolidateOutcome::AlreadyImported { imported }
+        } else {
+            ConsolidateOutcome::NoLegacyIndex { source }
+        }));
+    }
+    Ok(ControlFlow::Continue(source))
+}
+
+/// Hold the repo's per-repo write locks for the WHOLE registration → import → rename sequence:
+/// the GLOBAL-side lock covers every row written under `identity.repo_id` in the global DB, and
+/// the LEGACY-side locks exclude a watcher / MCP writer still keyed beside the legacy file, so
+/// nothing can append to it between the snapshot read and the rename. Both bounded; the global
+/// locks taken inside (schema in the migration, registry in `register_repo`) follow the
+/// per-repo → global ordering rule (see `locks::registry_lock_path`).
+///
+/// The LEGACY side drains EVERY id the source DB itself records, not just the CURRENT identity:
+/// the legacy file predates the identity transition, so a writer started PRE-deepen still keys
+/// its flock by the OLD `local:` id — a current-identity lock alone would not conflict with it,
+/// and the snapshot + rename could race its writes into the renamed artifact (the same loss the
+/// same-id lock exists to prevent; the outgoing-drain rule the upgrade path follows). The ids
+/// come from a read-only PRE-lock peek at the source's own `repos` registry; canonical order,
+/// bounded. A source so old it predates the registry tables peeks empty — only pre-A6 binaries
+/// (whose lock files predate per-repo keying entirely) ever wrote such a file, so no
+/// current-scheme lock could coordinate with them regardless.
+fn acquire_all_consolidate_locks(
+    target: &Path,
+    source: &Path,
+    repo_id: &str,
+) -> anyhow::Result<(locks::WriteLock, Vec<locks::WriteLock>)> {
+    let target_lock = acquire_consolidate_lock(target, repo_id, "global")?;
+    let mut source_side_ids = source_registered_repo_ids(source);
+    if !source_side_ids.iter().any(|id| id == repo_id) {
+        source_side_ids.push(repo_id.to_string());
+    }
+    source_side_ids.sort_by(|a, b| {
+        if rag_rat_base::locks::canonical_lock_order(a, b).0 == a.as_str() {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    });
+    let mut source_locks = Vec::with_capacity(source_side_ids.len());
+    for id in &source_side_ids {
+        source_locks.push(acquire_consolidate_lock(source, id, "legacy")?);
+    }
+    Ok((target_lock, source_locks))
+}
+
+/// Rename the legacy file so a keyless config now resolves to the global store (via the
+/// `.imported` latch), and a re-run is a no-op. AFTER the import commits, so a failure leaves
+/// the legacy file in place to retry. The WAL sidecars travel WITH the archive: a bare
+/// main-file rename would orphan `-wal`/`-shm` as permanent litter, and any un-checkpointed
+/// frames in the WAL belong to the archive (SQLite opens the renamed pair as a unit) — the
+/// same discipline the custom-pin remedy tells users to follow.
+fn finish_consolidation(
+    target_conn: &Connection,
+    source: &Path,
+    imported: &Path,
+    repo_id: &str,
+) -> anyhow::Result<()> {
+    fs::rename(source, imported)
+        .with_context(|| format!("renaming {} to {}", source.display(), imported.display()))?;
+    rename_wal_sidecars(source, imported);
+    // The legacy index is archived, so no retry of THIS consolidation can follow: the pin it wrote
+    // stops being a replaceable copy and becomes the global store's own trust decision. A failure
+    // here is left as a warning — the source identity in the marker already keeps any other source
+    // from claiming it, and failing an import that has completed would help nothing.
+    if let Err(error) = retire_pin_import(target_conn, repo_id) {
+        tracing::warn!(
+            repo_id = %repo_id,
+            %error,
+            "consolidation completed but could not retire its stream pin import marker"
+        );
+    }
+    Ok(())
 }
 
 /// The real (non-placeholder) repo ids the SOURCE legacy DB's own `repos` registry records — the
@@ -593,15 +616,16 @@ fn checkpoint_source_wal(source: &Path) {
 }
 
 /// Import counts, threaded back to the [`ImportSummary`].
-struct ImportCounts {
-    memories: u64,
-    bindings: u64,
-    tags: u64,
-    call_paths: u64,
-    call_path_edges: u64,
-    edges: u64,
-    embedding_cache_rows: u64,
-    meta_keys: u64,
+#[derive(Debug)]
+pub struct ImportCounts {
+    pub memories: u64,
+    pub bindings: u64,
+    pub tags: u64,
+    pub call_paths: u64,
+    pub call_path_edges: u64,
+    pub edges: u64,
+    pub embedding_cache_rows: u64,
+    pub meta_keys: u64,
 }
 
 /// Which caller is driving [`import_from_source`], and thus what the source is and what to carry.
