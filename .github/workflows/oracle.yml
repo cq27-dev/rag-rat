@@ -141,7 +141,9 @@ jobs:
     needs: matrix
     if: needs.matrix.outputs.tier == 'small'
     # 24.04: the pinned scip-clang prebuilt links against a recent GLIBC (see bench.Containerfile).
-    runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
+    # Six legs fan out onto six ephemeral VMs at once. Each is a cold build, but the corpora are
+    # small and the alternative — the box's warm slots — queues them behind the CI jobs.
+    runs-on: ubicloud-standard-4
     strategy:
       fail-fast: false
       matrix:
