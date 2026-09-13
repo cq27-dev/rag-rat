@@ -373,28 +373,25 @@ pub(crate) fn graph_tool(
     memory_surface: MemorySurface,
 ) -> anyhow::Result<Value> {
     let limit = args.limit;
-    let include_references = included(&args.include, GraphInclude::References, false);
-    let include_unresolved = included(&args.include, GraphInclude::Unresolved, false);
-    let include_macros = included(&args.include, GraphInclude::Macros, false);
-    let include_common_methods = included(&args.include, GraphInclude::CommonMethods, false);
     let include_coverage = included(&args.include, GraphInclude::Coverage, false);
     let include_memories = included(&args.include, GraphInclude::Memories, true);
-    let edge_kinds = graph_edge_kinds(args.edge_kinds.as_deref());
     let allow_ambiguous = args.allow_ambiguous;
+    // One traversal spec for both answers; only the resolved branch pins it to a symbol id.
+    let mut options = GraphTraversalOptions {
+        include_references: included(&args.include, GraphInclude::References, false),
+        include_unresolved: included(&args.include, GraphInclude::Unresolved, false),
+        include_macros: included(&args.include, GraphInclude::Macros, false),
+        include_common_methods: included(&args.include, GraphInclude::CommonMethods, false),
+        edge_kinds: graph_edge_kinds(args.edge_kinds.as_deref()),
+        resolution_mode,
+        symbol_id: None,
+        logical_symbol_id: args.logical_symbol_id,
+    };
     let selector = selector_from!(ref args, language: None);
     let selected = db.select_symbol(&selector)?;
     match selected {
         Ok(Some(symbol)) => {
-            let options = GraphTraversalOptions {
-                include_references,
-                include_unresolved,
-                include_macros,
-                include_common_methods,
-                edge_kinds,
-                resolution_mode,
-                symbol_id: Some(symbol.symbol_id),
-                logical_symbol_id: args.logical_symbol_id,
-            };
+            options.symbol_id = Some(symbol.symbol_id);
             let mut value = json!(db.graph_traversal_report(
                 if reverse { "find_callers" } else { "trace_callees" },
                 &symbol,
@@ -427,16 +424,6 @@ pub(crate) fn graph_tool(
         Ok(None) if allow_ambiguous => {
             let Some(symbol) = args.symbol.as_deref() else {
                 return Ok(Value::Null);
-            };
-            let options = GraphTraversalOptions {
-                include_references,
-                include_unresolved,
-                include_macros,
-                include_common_methods,
-                edge_kinds,
-                resolution_mode,
-                symbol_id: None,
-                logical_symbol_id: args.logical_symbol_id,
             };
             let hops = if reverse {
                 db.find_callers_with_options(symbol, limit, &options)?
