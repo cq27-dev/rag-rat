@@ -542,345 +542,38 @@ pub fn live_oracle_pass(
     report.files_with_candidates = by_path.len() as u64;
 
     let tx = conn.unchecked_transaction()?;
-    let mut refinements_stale = false;
-    // Version transition: a respawn probing a NEW `rust-analyzer --version` must not strand the
-    // prior version's still-current verdicts — the first partial pass's run row would become the
-    // latest for the whole checkout and gate every prior-version verdict out of currency,
-    // collapsing live coverage to the handful of files this pass revisits. Migrate the rows
-    // (content-addressed, so `file_sha` still gates drift; SCOPED to this checkout so a sibling
-    // worktree's rows and currency stay untouched) and invalidate the scip refinements whose
-    // evidence just changed hands. The transition run is recorded whenever the version moved —
-    // even with zero rows moved — because the session's binary IS the new version and the
-    // currency gate must start selecting it (a sibling's migration may already have moved the
-    // shared rows). Migration COPIES rather than relabels: identical-content siblings share the
-    // old row and still need it under their old-version currency.
-    let mut version_migrated = false;
-    if let Some(old_version) =
-        store::latest_run_tool_version(conn, tool, input.commit_sha, input.worktree_id)?
-        && old_version != session.tool_version()
-    {
-        let migration = store::migrate_live_verdicts_to_version(
-            conn,
-            tool,
-            &old_version,
-            session.tool_version(),
-            input.commit_sha,
-            input.worktree_id,
-        )?;
-        match migration {
-            store::LiveVersionMigration::Copied(moved) => {
-                version_migrated = true;
-                if moved > 0 {
-                    refinements_stale = true;
-                }
-            },
-            store::LiveVersionMigration::BlockedByContentCollision => {
+    let (version_migrated, refinements_stale) =
+        match migrate_version_if_moved(conn, session, input, tool)? {
+            VersionTransition::Unchanged => (false, false),
+            VersionTransition::Migrated { moved_rows } => (true, moved_rows),
+            VersionTransition::BlockedByContentCollision => {
                 // The content-key PK cannot hold both checkouts' different bytes under the new
-                // version. Do NOT process/write with that version or record its currency: preserve
-                // the active checkout's old-version coverage and retry after the collision clears.
+                // version. Do NOT process/write with that version or record its currency:
+                // preserve the active checkout's old-version coverage and retry after the
+                // collision clears.
                 report.unfinished_paths = input.worklist.to_vec();
                 report.status = "VersionMigrationBlocked".to_string();
                 tx.commit()?;
                 return Ok(report);
             },
-        }
-    }
-    let mut stop: Option<PassStop> = None;
-    // Per-pass caches: definition-file disk bytes / indexed sha / symbol spans, keyed by
-    // repo-relative path (the LSP returns a bounded set of def paths, so these stay small — the
-    // whole-checkout sha map is deliberately NOT loaded).
-    let mut def_bytes: HashMap<String, Option<Vec<u8>>> = HashMap::new();
-    let mut def_indexed_sha: HashMap<String, Option<String>> = HashMap::new();
-    let mut def_spans: HashMap<String, Vec<store::SymbolSpan>> = HashMap::new();
-    let logical_cache: std::cell::RefCell<HashMap<i64, Option<i64>>> =
-        std::cell::RefCell::new(HashMap::new());
-    let mut moniker_cache: HashMap<i64, Option<String>> = HashMap::new();
+        };
 
-    'files: for (position, path) in input.worklist.iter().enumerate() {
+    let ctx = PassCtx { conn, input, tool, moniker_source };
+    let mut progress = PassProgress { report, caches: PassCaches::default(), refinements_stale };
+    let mut stop: Option<PassStop> = None;
+    for (position, path) in input.worklist.iter().enumerate() {
         let Some(callees) = by_path.get(path.as_str()) else {
             continue;
         };
-        // The session may be unable to CONFIGURE this file even though its language qualifies:
-        // with several compilation databases in a checkout, clangd is pointed at none, and a file
-        // whose database it cannot find on its own gets heuristic flags. Measured, that resolves a
-        // cross-translation-unit call to the callee's HEADER DECLARATION — a wrong verdict, not a
-        // missing one, and the covered-skip budget would never revisit it. Skip rather than
-        // resolve, and do NOT defer: retrying cannot help until the checkout's layout changes.
-        // RETAINED for the caller instead, so the layout change that makes the file resolvable can
-        // bring it back — without a backlog entry that would schedule passes able only to re-skip.
-        if !session.can_resolve_path(input.scope, path) {
-            report.skipped_unconfigured += callees.len() as u64;
-            report.skipped_unconfigured_paths.push(path.clone());
-            continue;
-        }
-        // Budget gate: nothing left → every candidate-bearing path from here rides the backlog.
-        let remaining = input.max_requests.saturating_sub(report.requests_used) as usize;
-        if remaining == 0 {
-            defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
-            break 'files;
-        }
-
-        // Readiness is dynamic: Cargo metadata or workspace changes can put rust-analyzer back
-        // into loading after the pass-entry gate. Never begin another definition batch while it is
-        // non-quiescent, or temporary nulls would become permanently completed unresolved work.
-        let readiness_checkpoint = match checkpoint_or_stop(session, None) {
-            Ok(checkpoint) => checkpoint,
-            Err(pass_stop) => {
-                stop = Some(pass_stop);
-                defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
-                break 'files;
-            },
-        };
-
-        // Callsite drift gate: the server resolves the DIRTY disk bytes, so those bytes must
-        // still hash to the indexed `file_sha` the candidates were built from — a mid-pass edit
-        // makes the indexed callee ranges point at the wrong content. Skip, never mis-resolve.
-        let Some(text) = read_undrifted(input.scope.root(), path, &callees[0].file_sha) else {
-            defer_drifted(&mut report, path, callees.len());
-            continue;
-        };
-
-        // Covered-skip continuation: an edge with a CURRENT live verdict (same tool_version +
-        // file_sha, FULL content key — two edges may share a callee token, and a start-byte key
-        // would let one written row starve the other) is NEVER re-resolved for the same
-        // content — the budget only ever spends on unverdicted edges. A file a prior pass
-        // truncated therefore resumes exactly where it stopped, and a fully-covered file costs
-        // nothing (the first-file exemption this replaces let a huge generated file blow the
-        // budget). Re-resolution happens naturally on content change (a new `file_sha`
-        // un-covers the edge) — e.g. upgrading a sentinel to a batch moniker — or on a version
-        // migration, so a stale sentinel costs only cosmetics: the batch row carries the real
-        // evidence for any span both tools cover.
-        let covered = store::live_covered_edges_for_path(
-            conn,
-            tool,
-            session.tool_version(),
-            path,
-            &callees[0].file_sha,
-            input.commit_sha,
-            input.worktree_id,
-        )?;
-        let is_covered = |c: &store::EdgeJoinCandidate| {
-            covered.contains(&(
-                c.source_start_byte,
-                c.source_end_byte,
-                c.callee_start_byte,
-                c.callee_end_byte,
-                c.edge_kind.clone(),
-            ))
-        };
-        let unverdicted: Vec<&store::EdgeJoinCandidate> =
-            callees.iter().copied().filter(|c| !is_covered(c)).collect();
-        if unverdicted.is_empty() {
-            continue;
-        }
-        let (to_resolve, deferred) = unverdicted.split_at(remaining.min(unverdicted.len()));
-        let deferred_count = deferred.len();
-
-        // Platform-aware file URL conversion handles drive/UNC/verbatim prefixes and percent
-        // encoding; hand-joining the root and DB path repeatedly produced malformed URIs.
-        let uri: String = Url::from_file_path(input.scope.root().join(path))
-            .map_err(|()| anyhow::anyhow!("cannot convert live-oracle document path to file URL"))?
-            .into();
-        let starts: Vec<usize> =
-            to_resolve.iter().filter_map(|c| usize::try_from(c.callee_start_byte).ok()).collect();
-        report.requests_used += starts.len() as u64;
-        let language_id = session.backend.language_id_for(path);
-        let resolved = match session.client.resolve_definitions(&uri, language_id, &text, &starts) {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                // A dead/wedged server: keep what earlier files produced, REQUEUE this file and
-                // every candidate-bearing path after it (the watcher rides them into the next
-                // pass and replaces the session), and never fail the maintenance pass over it.
-                stop = Some(PassStop::Aborted(err.to_string()));
-                defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
-                break 'files;
-            },
-        };
-        // A reload may begin while the synchronous batch is in flight. Discard the whole batch
-        // before interpreting any null definitions, and retry this file once the server is ready.
-        if let Err(pass_stop) = checkpoint_or_stop(session, Some(readiness_checkpoint)) {
-            stop = Some(pass_stop);
-            defer_candidate_paths_from(&mut report, input.worklist, position, &by_path);
-            break 'files;
-        }
-        // The caller may change while synchronous requests are in flight. Re-read AFTER the batch:
-        // the server resolved the didOpen snapshot, and writing it against an already-changed disk
-        // file would look current until the queued reindex catches up (or forever if its event was
-        // missed).
-        if std::fs::read(input.scope.root().join(path))
-            .ok()
-            .is_none_or(|current| hex_sha256(&current) != callees[0].file_sha)
+        if let FileOutcome::Stop(pass_stop) =
+            resolve_one_file(&ctx, session, &mut progress, path, callees)?
         {
-            defer_drifted(&mut report, path, to_resolve.len());
-            continue;
-        }
-        let mut retry_file = deferred_count > 0;
-        // Definition bytes are cached ONLY within this file's batch: a def file edited between
-        // two source files' LSP requests would otherwise be hashed + position-converted from a
-        // stale snapshot, defeating the definition-side drift gate. (The indexed sha + symbol
-        // spans stay cached: the write lock pins the index for the whole pass.)
-        def_bytes.clear();
-
-        for (candidate, definition) in to_resolve.iter().zip(resolved.iter()) {
-            let Some((target_uri, target_range)) = definition else {
-                report.unresolved += 1;
-                continue;
-            };
-            // The definition must land inside this checkout: an external target (a dependency
-            // source outside the root) has no indexed symbol and no batch-interchangeable
-            // moniker, so live writes nothing for it.
-            let Some(def_path) = path_from_uri(&session.root_uri, target_uri) else {
-                report.skipped_external += 1;
-                continue;
-            };
-            // Definition-side drift gate: the LSP range converts against the def file's CURRENT
-            // disk bytes, so those must still be the indexed bytes the symbol spans came from.
-            let def_disk = def_bytes
-                .entry(def_path.clone())
-                .or_insert_with(|| std::fs::read(input.scope.root().join(&def_path)).ok())
-                .clone();
-            let Some(def_disk) = def_disk else {
-                report.skipped_drifted += 1;
-                retry_file = true;
-                continue;
-            };
-            let indexed_sha = match def_indexed_sha.entry(def_path.clone()) {
-                Entry::Occupied(entry) => entry.get().clone(),
-                Entry::Vacant(entry) => entry
-                    .insert(store::indexed_file_sha_for_path(
-                        conn,
-                        &def_path,
-                        input.commit_sha,
-                        input.worktree_id,
-                    )?)
-                    .clone(),
-            };
-            match indexed_sha {
-                // Not indexed in this checkout — nothing live can map to it.
-                None => {
-                    report.skipped_external += 1;
-                    continue;
-                },
-                Some(sha) if sha == hex_sha256(&def_disk) => {},
-                Some(_) => {
-                    report.skipped_drifted += 1;
-                    retry_file = true;
-                    continue;
-                },
-            }
-            let index = LineIndex::new(&def_disk, session.client.encoding());
-            let (Some(def_start), Some(def_end)) = (
-                index.byte_at_position(target_range.start),
-                index.byte_at_position(target_range.end),
-            ) else {
-                report.skipped_drifted += 1;
-                retry_file = true;
-                continue;
-            };
-            let spans = match def_spans.entry(def_path.clone()) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => entry.insert(store::symbol_spans_for_path(
-                    conn,
-                    &def_path,
-                    input.commit_sha,
-                    input.worktree_id,
-                )?),
-            };
-            let Some(symbol_id) = join::map_definition_to_symbol(spans, def_start, def_end) else {
-                // The def is in an indexed file but under no indexed symbol (macro-generated
-                // code, a symbol kind without a row): nothing trustworthy to write.
-                report.skipped_external += 1;
-                continue;
-            };
-
-            // Resolve the logical ids of the heuristic + compiler targets up front, propagating
-            // a DB failure instead of swallowing it to `None` — a swallowed error would degrade
-            // a real Confirm (same logical symbol) into a Contradict and corrupt precision while
-            // later writes still succeed (#534 review). The closure then reads the warmed cache.
-            let warm_logical = |id: i64| -> anyhow::Result<()> {
-                if !logical_cache.borrow().contains_key(&id) {
-                    let logical = store::logical_symbol_id_for_member(conn, id)?;
-                    logical_cache.borrow_mut().insert(id, logical);
-                }
-                Ok(())
-            };
-            warm_logical(symbol_id)?;
-            if let Some(heuristic_id) = candidate.to_symbol_id {
-                warm_logical(heuristic_id)?;
-            }
-            let logical_symbol_of =
-                |id: i64| -> Option<i64> { logical_cache.borrow().get(&id).copied().flatten() };
-            let kind = join::classify_in_corpus(
-                candidate.confidence,
-                candidate.to_symbol_id,
-                symbol_id,
-                &logical_symbol_of,
-            );
-
-            // Moniker: the target's batch moniker verbatim, else the content-stable local
-            // sentinel (module docs — NEVER the LSP moniker string). A DB failure propagates.
-            if let std::collections::hash_map::Entry::Vacant(slot) = moniker_cache.entry(symbol_id)
-            {
-                slot.insert(store::batch_moniker_for_symbol(conn, symbol_id, moniker_source)?);
-            }
-            let scip_symbol = moniker_cache
-                .get(&symbol_id)
-                .and_then(Clone::clone)
-                .unwrap_or_else(|| live_local_sentinel(tool, &candidate.source_path, candidate));
-
-            let row = EdgeOracleRow {
-                source_path: &candidate.source_path,
-                source_start_byte: candidate.source_start_byte,
-                source_end_byte: candidate.source_end_byte,
-                callee_start_byte: candidate.callee_start_byte,
-                callee_end_byte: candidate.callee_end_byte,
-                edge_kind: &candidate.edge_kind,
-                file_sha: &candidate.file_sha,
-                resolved_symbol_id: Some(symbol_id),
-                scip_symbol: &scip_symbol,
-                kind,
-            };
-            let existing =
-                store::existing_verdict_scip_symbol(conn, tool, session.tool_version(), &row)?;
-            // The content-key PK excludes file_sha. Preserve a different-SHA row while any sibling
-            // checkout still joins to it; overwriting would make that sibling lose live evidence.
-            if let Some((old_sha, _)) = &existing
-                && old_sha != &candidate.file_sha
-                && store::verdict_content_is_current_anywhere(conn, &row, old_sha)?
-            {
-                report.skipped_content_collisions += 1;
-                continue;
-            }
-            // Refine-cache interplay: CHANGED evidence under the same bytes, OR newly inserted
-            // NON-LOCAL moniker evidence, moves data absent from the refinement key. Local
-            // sentinels are filtered by the consumer and are refine-neutral.
-            if existing.as_ref().is_some_and(|(old_sha, old_symbol)| {
-                old_sha == &candidate.file_sha && old_symbol != &scip_symbol
-            }) || (existing.is_none() && !super::scip::is_local_symbol(&scip_symbol))
-            {
-                refinements_stale = true;
-            }
-            store::write_edge_oracle(conn, tool, session.tool_version(), &row)?;
-            report.rows_written += 1;
-            match kind {
-                OracleResolutionKind::Upgrade => report.upgraded += 1,
-                OracleResolutionKind::Confirm => report.confirmed += 1,
-                OracleResolutionKind::Contradict => report.contradicted += 1,
-                // Live never emits ResolvedExternal (out-of-corpus defs are skipped above).
-                OracleResolutionKind::ResolvedExternal => {},
-            }
-        }
-        // Fully resolved only when nothing was budget- or drift-deferred. A definition that changed
-        // during this caller's batch requeues the CALLER because the definition's own watcher event
-        // does not enumerate every caller that resolved into it.
-        if retry_file {
-            if !report.unfinished_paths.contains(path) {
-                report.unfinished_paths.push(path.clone());
-            }
-        } else {
-            report.files_resolved += 1;
+            stop = pass_stop;
+            defer_candidate_paths_from(&mut progress.report, input.worklist, position, &by_path);
+            break;
         }
     }
+    let PassProgress { mut report, refinements_stale, .. } = progress;
 
     // Every early exit reachable from here is the server's — a dead transport or a readiness
     // error. A layout change returns above, before any file is touched.
@@ -891,15 +584,9 @@ pub fn live_oracle_pass(
     // migration is what makes the new `tool_version` current for the currency gate, and without
     // a backing run row the migrated rows stay invisible (the gate keys on the LATEST run).
     report.version_migrated = version_migrated;
-    if report.rows_written > 0 || version_migrated {
-        report.run_recorded = true;
-        report.status = match &stop {
-            Some(PassStop::Aborted(err)) => format!("Aborted: {err}"),
-            Some(PassStop::Warming) => "Warming".to_string(),
-            None if report.rows_written == 0 => "VersionMigrated".to_string(),
-            None if report.unfinished_paths.is_empty() => "Completed".to_string(),
-            None => "BudgetExhausted".to_string(),
-        };
+    report.run_recorded = report.rows_written > 0 || version_migrated;
+    report.status = pass_status(stop.as_ref(), &report);
+    if report.run_recorded {
         if refinements_stale {
             rag_rat_clones::refine::cache::invalidate_scip_refinements(conn)?;
             report.refinements_invalidated = true;
@@ -916,16 +603,399 @@ pub fn live_oracle_pass(
             &report.status,
             &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
         )?;
-    } else {
-        report.status = match &stop {
-            Some(PassStop::Aborted(err)) => format!("Aborted: {err}"),
-            Some(PassStop::Warming) => "Warming".to_string(),
-            None if report.unfinished_paths.is_empty() => "NoVerdicts".to_string(),
-            None => "BudgetExhausted".to_string(),
-        };
     }
     tx.commit()?;
     Ok(report)
+}
+
+/// What the pass-entry version check decided.
+enum VersionTransition {
+    /// No prior run, or the latest run is already at the session's `tool_version`.
+    Unchanged,
+    /// Prior-version verdicts were copied to the session's version; `moved_rows` says whether
+    /// any evidence changed hands, which stales the scip refinements.
+    Migrated { moved_rows: bool },
+    /// The content-key PK cannot hold both checkouts' different bytes under the new version.
+    BlockedByContentCollision,
+}
+
+/// Version transition: a respawn probing a NEW `rust-analyzer --version` must not strand the
+/// prior version's still-current verdicts — the first partial pass's run row would become the
+/// latest for the whole checkout and gate every prior-version verdict out of currency,
+/// collapsing live coverage to the handful of files this pass revisits. Migrate the rows
+/// (content-addressed, so `file_sha` still gates drift; SCOPED to this checkout so a sibling
+/// worktree's rows and currency stay untouched) and invalidate the scip refinements whose
+/// evidence just changed hands. The transition run is recorded whenever the version moved —
+/// even with zero rows moved — because the session's binary IS the new version and the
+/// currency gate must start selecting it (a sibling's migration may already have moved the
+/// shared rows). Migration COPIES rather than relabels: identical-content siblings share the
+/// old row and still need it under their old-version currency.
+fn migrate_version_if_moved(
+    conn: &Connection,
+    session: &LiveOracleSession,
+    input: &LivePassInput<'_>,
+    tool: crate::OracleTool,
+) -> anyhow::Result<VersionTransition> {
+    let Some(old_version) =
+        store::latest_run_tool_version(conn, tool, input.commit_sha, input.worktree_id)?
+    else {
+        return Ok(VersionTransition::Unchanged);
+    };
+    if old_version == session.tool_version() {
+        return Ok(VersionTransition::Unchanged);
+    }
+    Ok(
+        match store::migrate_live_verdicts_to_version(
+            conn,
+            tool,
+            &old_version,
+            session.tool_version(),
+            input.commit_sha,
+            input.worktree_id,
+        )? {
+            store::LiveVersionMigration::Copied(moved) =>
+                VersionTransition::Migrated { moved_rows: moved > 0 },
+            store::LiveVersionMigration::BlockedByContentCollision =>
+                VersionTransition::BlockedByContentCollision,
+        },
+    )
+}
+
+/// What stays fixed across one live pass: the connection, the pass input, and the live tool
+/// with the batch tool whose monikers it copies.
+struct PassCtx<'a> {
+    conn: &'a Connection,
+    input: &'a LivePassInput<'a>,
+    tool: crate::OracleTool,
+    moniker_source: crate::OracleTool,
+}
+
+/// What a live pass accumulates while it walks the worklist.
+struct PassProgress {
+    report: LivePassReport,
+    caches: PassCaches,
+    /// Whether written evidence moved data absent from the scip refinement key.
+    refinements_stale: bool,
+}
+
+/// Per-pass caches: definition-file disk bytes / indexed sha / symbol spans keyed by
+/// repo-relative path, and logical ids / batch monikers keyed by symbol id. The LSP returns a
+/// bounded set of def paths, so these stay small — the whole-checkout sha map is deliberately
+/// NOT loaded.
+#[derive(Default)]
+struct PassCaches {
+    def_bytes: HashMap<String, Option<Vec<u8>>>,
+    def_indexed_sha: HashMap<String, Option<String>>,
+    def_spans: HashMap<String, Vec<store::SymbolSpan>>,
+    logical_cache: std::cell::RefCell<HashMap<i64, Option<i64>>>,
+    moniker_cache: HashMap<i64, Option<String>>,
+}
+
+/// How one worklist file left the pass.
+enum FileOutcome {
+    /// Move on to the next worklist path (resolved, covered, skipped, or requeued).
+    Next,
+    /// Stop here: this path and every candidate-bearing one after it ride the backlog. `None` is
+    /// the request budget running out; `Some` is the server's.
+    Stop(Option<PassStop>),
+}
+
+/// Resolve one worklist file's unverdicted callees through the live client and write their
+/// verdicts, or say why the pass must stop at this file.
+fn resolve_one_file(
+    ctx: &PassCtx<'_>,
+    session: &mut LiveOracleSession,
+    progress: &mut PassProgress,
+    path: &str,
+    callees: &[&store::EdgeJoinCandidate],
+) -> anyhow::Result<FileOutcome> {
+    let PassCtx { conn, input, tool, moniker_source } = *ctx;
+    let PassProgress { report, caches, refinements_stale } = progress;
+    let PassCaches { def_bytes, def_indexed_sha, def_spans, logical_cache, moniker_cache } = caches;
+    // The session may be unable to CONFIGURE this file even though its language qualifies:
+    // with several compilation databases in a checkout, clangd is pointed at none, and a file
+    // whose database it cannot find on its own gets heuristic flags. Measured, that resolves a
+    // cross-translation-unit call to the callee's HEADER DECLARATION — a wrong verdict, not a
+    // missing one, and the covered-skip budget would never revisit it. Skip rather than
+    // resolve, and do NOT defer: retrying cannot help until the checkout's layout changes.
+    // RETAINED for the caller instead, so the layout change that makes the file resolvable can
+    // bring it back — without a backlog entry that would schedule passes able only to re-skip.
+    if !session.can_resolve_path(input.scope, path) {
+        report.skipped_unconfigured += callees.len() as u64;
+        report.skipped_unconfigured_paths.push(path.to_string());
+        return Ok(FileOutcome::Next);
+    }
+    // Budget gate: nothing left → every candidate-bearing path from here rides the backlog.
+    let remaining = input.max_requests.saturating_sub(report.requests_used) as usize;
+    if remaining == 0 {
+        return Ok(FileOutcome::Stop(None));
+    }
+
+    // Readiness is dynamic: Cargo metadata or workspace changes can put rust-analyzer back
+    // into loading after the pass-entry gate. Never begin another definition batch while it is
+    // non-quiescent, or temporary nulls would become permanently completed unresolved work.
+    let readiness_checkpoint = match checkpoint_or_stop(session, None) {
+        Ok(checkpoint) => checkpoint,
+        Err(pass_stop) => return Ok(FileOutcome::Stop(Some(pass_stop))),
+    };
+
+    // Callsite drift gate: the server resolves the DIRTY disk bytes, so those bytes must
+    // still hash to the indexed `file_sha` the candidates were built from — a mid-pass edit
+    // makes the indexed callee ranges point at the wrong content. Skip, never mis-resolve.
+    let Some(text) = read_undrifted(input.scope.root(), path, &callees[0].file_sha) else {
+        defer_drifted(report, path, callees.len());
+        return Ok(FileOutcome::Next);
+    };
+
+    // Covered-skip continuation: an edge with a CURRENT live verdict (same tool_version +
+    // file_sha, FULL content key — two edges may share a callee token, and a start-byte key
+    // would let one written row starve the other) is NEVER re-resolved for the same
+    // content — the budget only ever spends on unverdicted edges. A file a prior pass
+    // truncated therefore resumes exactly where it stopped, and a fully-covered file costs
+    // nothing (the first-file exemption this replaces let a huge generated file blow the
+    // budget). Re-resolution happens naturally on content change (a new `file_sha`
+    // un-covers the edge) — e.g. upgrading a sentinel to a batch moniker — or on a version
+    // migration, so a stale sentinel costs only cosmetics: the batch row carries the real
+    // evidence for any span both tools cover.
+    let covered = store::live_covered_edges_for_path(
+        conn,
+        tool,
+        session.tool_version(),
+        path,
+        &callees[0].file_sha,
+        input.commit_sha,
+        input.worktree_id,
+    )?;
+    let is_covered = |c: &store::EdgeJoinCandidate| {
+        covered.contains(&(
+            c.source_start_byte,
+            c.source_end_byte,
+            c.callee_start_byte,
+            c.callee_end_byte,
+            c.edge_kind.clone(),
+        ))
+    };
+    let unverdicted: Vec<&store::EdgeJoinCandidate> =
+        callees.iter().copied().filter(|c| !is_covered(c)).collect();
+    if unverdicted.is_empty() {
+        return Ok(FileOutcome::Next);
+    }
+    let (to_resolve, deferred) = unverdicted.split_at(remaining.min(unverdicted.len()));
+    let deferred_count = deferred.len();
+
+    // Platform-aware file URL conversion handles drive/UNC/verbatim prefixes and percent
+    // encoding; hand-joining the root and DB path repeatedly produced malformed URIs.
+    let uri: String = Url::from_file_path(input.scope.root().join(path))
+        .map_err(|()| anyhow::anyhow!("cannot convert live-oracle document path to file URL"))?
+        .into();
+    let starts: Vec<usize> =
+        to_resolve.iter().filter_map(|c| usize::try_from(c.callee_start_byte).ok()).collect();
+    report.requests_used += starts.len() as u64;
+    let language_id = session.backend.language_id_for(path);
+    let resolved = match session.client.resolve_definitions(&uri, language_id, &text, &starts) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            // A dead/wedged server: keep what earlier files produced, REQUEUE this file and
+            // every candidate-bearing path after it (the watcher rides them into the next
+            // pass and replaces the session), and never fail the maintenance pass over it.
+            return Ok(FileOutcome::Stop(Some(PassStop::Aborted(err.to_string()))));
+        },
+    };
+    // A reload may begin while the synchronous batch is in flight. Discard the whole batch
+    // before interpreting any null definitions, and retry this file once the server is ready.
+    if let Err(pass_stop) = checkpoint_or_stop(session, Some(readiness_checkpoint)) {
+        return Ok(FileOutcome::Stop(Some(pass_stop)));
+    }
+    // The caller may change while synchronous requests are in flight. Re-read AFTER the batch:
+    // the server resolved the didOpen snapshot, and writing it against an already-changed disk
+    // file would look current until the queued reindex catches up (or forever if its event was
+    // missed).
+    if std::fs::read(input.scope.root().join(path))
+        .ok()
+        .is_none_or(|current| hex_sha256(&current) != callees[0].file_sha)
+    {
+        defer_drifted(report, path, to_resolve.len());
+        return Ok(FileOutcome::Next);
+    }
+    let mut retry_file = deferred_count > 0;
+    // Definition bytes are cached ONLY within this file's batch: a def file edited between
+    // two source files' LSP requests would otherwise be hashed + position-converted from a
+    // stale snapshot, defeating the definition-side drift gate. (The indexed sha + symbol
+    // spans stay cached: the write lock pins the index for the whole pass.)
+    def_bytes.clear();
+
+    for (candidate, definition) in to_resolve.iter().zip(resolved.iter()) {
+        let Some((target_uri, target_range)) = definition else {
+            report.unresolved += 1;
+            continue;
+        };
+        // The definition must land inside this checkout: an external target (a dependency
+        // source outside the root) has no indexed symbol and no batch-interchangeable
+        // moniker, so live writes nothing for it.
+        let Some(def_path) = path_from_uri(&session.root_uri, target_uri) else {
+            report.skipped_external += 1;
+            continue;
+        };
+        // Definition-side drift gate: the LSP range converts against the def file's CURRENT
+        // disk bytes, so those must still be the indexed bytes the symbol spans came from.
+        let def_disk = def_bytes
+            .entry(def_path.clone())
+            .or_insert_with(|| std::fs::read(input.scope.root().join(&def_path)).ok())
+            .clone();
+        let Some(def_disk) = def_disk else {
+            report.skipped_drifted += 1;
+            retry_file = true;
+            continue;
+        };
+        let indexed_sha = match def_indexed_sha.entry(def_path.clone()) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => entry
+                .insert(store::indexed_file_sha_for_path(
+                    conn,
+                    &def_path,
+                    input.commit_sha,
+                    input.worktree_id,
+                )?)
+                .clone(),
+        };
+        match indexed_sha {
+            // Not indexed in this checkout — nothing live can map to it.
+            None => {
+                report.skipped_external += 1;
+                continue;
+            },
+            Some(sha) if sha == hex_sha256(&def_disk) => {},
+            Some(_) => {
+                report.skipped_drifted += 1;
+                retry_file = true;
+                continue;
+            },
+        }
+        let index = LineIndex::new(&def_disk, session.client.encoding());
+        let (Some(def_start), Some(def_end)) =
+            (index.byte_at_position(target_range.start), index.byte_at_position(target_range.end))
+        else {
+            report.skipped_drifted += 1;
+            retry_file = true;
+            continue;
+        };
+        let spans = match def_spans.entry(def_path.clone()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(store::symbol_spans_for_path(
+                conn,
+                &def_path,
+                input.commit_sha,
+                input.worktree_id,
+            )?),
+        };
+        let Some(symbol_id) = join::map_definition_to_symbol(spans, def_start, def_end) else {
+            // The def is in an indexed file but under no indexed symbol (macro-generated
+            // code, a symbol kind without a row): nothing trustworthy to write.
+            report.skipped_external += 1;
+            continue;
+        };
+
+        // Resolve the logical ids of the heuristic + compiler targets up front, propagating
+        // a DB failure instead of swallowing it to `None` — a swallowed error would degrade
+        // a real Confirm (same logical symbol) into a Contradict and corrupt precision while
+        // later writes still succeed (#534 review). The closure then reads the warmed cache.
+        let warm_logical = |id: i64| -> anyhow::Result<()> {
+            if !logical_cache.borrow().contains_key(&id) {
+                let logical = store::logical_symbol_id_for_member(conn, id)?;
+                logical_cache.borrow_mut().insert(id, logical);
+            }
+            Ok(())
+        };
+        warm_logical(symbol_id)?;
+        if let Some(heuristic_id) = candidate.to_symbol_id {
+            warm_logical(heuristic_id)?;
+        }
+        let logical_symbol_of =
+            |id: i64| -> Option<i64> { logical_cache.borrow().get(&id).copied().flatten() };
+        let kind = join::classify_in_corpus(
+            candidate.confidence,
+            candidate.to_symbol_id,
+            symbol_id,
+            &logical_symbol_of,
+        );
+
+        // Moniker: the target's batch moniker verbatim, else the content-stable local
+        // sentinel (module docs — NEVER the LSP moniker string). A DB failure propagates.
+        if let std::collections::hash_map::Entry::Vacant(slot) = moniker_cache.entry(symbol_id) {
+            slot.insert(store::batch_moniker_for_symbol(conn, symbol_id, moniker_source)?);
+        }
+        let scip_symbol = moniker_cache
+            .get(&symbol_id)
+            .and_then(Clone::clone)
+            .unwrap_or_else(|| live_local_sentinel(tool, &candidate.source_path, candidate));
+
+        let row = EdgeOracleRow {
+            source_path: &candidate.source_path,
+            source_start_byte: candidate.source_start_byte,
+            source_end_byte: candidate.source_end_byte,
+            callee_start_byte: candidate.callee_start_byte,
+            callee_end_byte: candidate.callee_end_byte,
+            edge_kind: &candidate.edge_kind,
+            file_sha: &candidate.file_sha,
+            resolved_symbol_id: Some(symbol_id),
+            scip_symbol: &scip_symbol,
+            kind,
+        };
+        let existing =
+            store::existing_verdict_scip_symbol(conn, tool, session.tool_version(), &row)?;
+        // The content-key PK excludes file_sha. Preserve a different-SHA row while any sibling
+        // checkout still joins to it; overwriting would make that sibling lose live evidence.
+        if let Some((old_sha, _)) = &existing
+            && old_sha != &candidate.file_sha
+            && store::verdict_content_is_current_anywhere(conn, &row, old_sha)?
+        {
+            report.skipped_content_collisions += 1;
+            continue;
+        }
+        // Refine-cache interplay: CHANGED evidence under the same bytes, OR newly inserted
+        // NON-LOCAL moniker evidence, moves data absent from the refinement key. Local
+        // sentinels are filtered by the consumer and are refine-neutral.
+        if existing.as_ref().is_some_and(|(old_sha, old_symbol)| {
+            old_sha == &candidate.file_sha && old_symbol != &scip_symbol
+        }) || (existing.is_none() && !super::scip::is_local_symbol(&scip_symbol))
+        {
+            *refinements_stale = true;
+        }
+        store::write_edge_oracle(conn, tool, session.tool_version(), &row)?;
+        report.rows_written += 1;
+        match kind {
+            OracleResolutionKind::Upgrade => report.upgraded += 1,
+            OracleResolutionKind::Confirm => report.confirmed += 1,
+            OracleResolutionKind::Contradict => report.contradicted += 1,
+            // Live never emits ResolvedExternal (out-of-corpus defs are skipped above).
+            OracleResolutionKind::ResolvedExternal => {},
+        }
+    }
+    // Fully resolved only when nothing was budget- or drift-deferred. A definition that changed
+    // during this caller's batch requeues the CALLER because the definition's own watcher event
+    // does not enumerate every caller that resolved into it.
+    if retry_file {
+        if !report.unfinished_paths.iter().any(|queued| queued == path) {
+            report.unfinished_paths.push(path.to_string());
+        }
+    } else {
+        report.files_resolved += 1;
+    }
+    Ok(FileOutcome::Next)
+}
+
+/// The operator-facing status for a pass that ended with `stop`. A recorded run tells a
+/// version-only transition and a completed pass apart from the unrecorded no-verdict pass.
+fn pass_status(stop: Option<&PassStop>, report: &LivePassReport) -> String {
+    match stop {
+        Some(PassStop::Aborted(err)) => format!("Aborted: {err}"),
+        Some(PassStop::Warming) => "Warming".to_string(),
+        None if report.run_recorded && report.rows_written == 0 => "VersionMigrated".to_string(),
+        None if report.unfinished_paths.is_empty() && report.run_recorded =>
+            "Completed".to_string(),
+        None if report.unfinished_paths.is_empty() => "NoVerdicts".to_string(),
+        None => "BudgetExhausted".to_string(),
+    }
 }
 
 fn defer_candidate_paths_from(
