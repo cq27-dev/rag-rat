@@ -14,10 +14,7 @@ use minicbor::Encoder;
 use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
 
-use crate::cbor;
-
-/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::super`.
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
+use crate::cbor::{self, VecEncoderExt};
 
 /// A cut (§11): `Empty` (CBOR `null`) means nothing on the chain is valid; `At { seq, hash }` pins
 /// the valid prefix to slots `≤ seq` on the branch ending at `hash`.
@@ -33,12 +30,12 @@ impl Cut {
     pub(super) fn encode_into(&self, enc: &mut Encoder<&mut Vec<u8>>) {
         match self {
             Cut::Empty => {
-                enc.null().expect(INFALLIBLE);
+                enc.put_null();
             },
             Cut::At { seq, hash } => {
-                enc.array(2).expect(INFALLIBLE);
-                enc.u64(*seq).expect(INFALLIBLE);
-                enc.bytes(hash).expect(INFALLIBLE);
+                enc.put_array(2);
+                enc.put_u64(*seq);
+                enc.put_bytes(hash);
             },
         }
     }

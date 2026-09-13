@@ -9,10 +9,7 @@
 use minicbor::Encoder;
 
 use super::limits::ACCOUNT_ID_DOMAIN;
-use crate::cbor;
-
-/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::super`.
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
+use crate::cbor::{self, VecEncoderExt};
 
 /// An account's immutable, content-derived identity: `sha256` of the domain-tagged genesis
 /// commitment. The store-global key for a principal's roster, grants, and folds.
@@ -68,9 +65,9 @@ pub(super) fn account_id_from_genesis_payload(genesis_payload_bytes: &[u8]) -> A
     let mut buf = Vec::with_capacity(64);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(2).expect(INFALLIBLE);
-        enc.str(ACCOUNT_ID_DOMAIN).expect(INFALLIBLE);
-        enc.bytes(genesis_payload_bytes).expect(INFALLIBLE);
+        enc.put_array(2);
+        enc.put_str(ACCOUNT_ID_DOMAIN);
+        enc.put_bytes(genesis_payload_bytes);
     }
     AccountId(cbor::sha256(&buf))
 }

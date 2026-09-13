@@ -24,9 +24,10 @@ use minicbor::{Decoder, Encoder};
 use super::ops::DeviceRole;
 use super::storage;
 use crate::account::AccountId;
+use crate::cbor::{self, VecEncoderExt};
 use crate::device::DevicePublic;
+use crate::identity;
 use crate::op::DeviceFingerprint;
-use crate::{cbor, identity};
 
 /// The signature domain for a node binding. Distinct from `FRAME_DOMAIN`, the account/content entry
 /// domains, and every other signed preimage in the system — a binding signature and an op signature
@@ -41,8 +42,6 @@ pub const MAX_BINDING_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 /// A binding whose `issued_at_ms` is more than this far in the FUTURE is rejected — tolerates
 /// modest clock skew between peers without opening a meaningful pre-dating window.
 pub const MAX_BINDING_FUTURE_SKEW_MS: i64 = 60 * 60 * 1000;
-
-const INFALLIBLE: &str = "encoding into an owned Vec cannot fail";
 
 /// Why a node binding failed authorization. Typed for the caller's logging and future retry logic
 /// (a `NotRosterDevice` can be retried after more of the account log syncs; a `BadSignature` never
@@ -77,12 +76,12 @@ fn signing_bytes(
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(160);
     let mut enc = Encoder::new(&mut buf);
-    enc.array(5).expect(INFALLIBLE);
-    enc.str(NODE_BINDING_DOMAIN).expect(INFALLIBLE);
-    enc.bytes(&account_id.to_bytes()).expect(INFALLIBLE);
-    enc.bytes(node_pubkey).expect(INFALLIBLE);
-    enc.bytes(device_pubkey).expect(INFALLIBLE);
-    enc.i64(issued_at_ms).expect(INFALLIBLE);
+    enc.put_array(5);
+    enc.put_str(NODE_BINDING_DOMAIN);
+    enc.put_bytes(&account_id.to_bytes());
+    enc.put_bytes(node_pubkey);
+    enc.put_bytes(device_pubkey);
+    enc.put_i64(issued_at_ms);
     buf
 }
 
@@ -105,13 +104,13 @@ pub fn sign_local_node_binding(
 
     let mut buf = Vec::with_capacity(224);
     let mut enc = Encoder::new(&mut buf);
-    enc.array(6).expect(INFALLIBLE);
-    enc.str(NODE_BINDING_DOMAIN).expect(INFALLIBLE);
-    enc.bytes(&account_id.to_bytes()).expect(INFALLIBLE);
-    enc.bytes(node_pubkey).expect(INFALLIBLE);
-    enc.bytes(&device_pubkey).expect(INFALLIBLE);
-    enc.i64(now_ms).expect(INFALLIBLE);
-    enc.bytes(&signature).expect(INFALLIBLE);
+    enc.put_array(6);
+    enc.put_str(NODE_BINDING_DOMAIN);
+    enc.put_bytes(&account_id.to_bytes());
+    enc.put_bytes(node_pubkey);
+    enc.put_bytes(&device_pubkey);
+    enc.put_i64(now_ms);
+    enc.put_bytes(&signature);
     Ok(Ok(buf))
 }
 

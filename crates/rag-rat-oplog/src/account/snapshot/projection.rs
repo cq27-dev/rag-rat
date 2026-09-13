@@ -43,10 +43,7 @@ use minicbor::Encoder;
 
 use super::super::fold::{AccountAuthHistory, AccountClassification, AuthorityBoundary};
 use super::super::ops::DeviceCut;
-use crate::cbor;
-
-/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible).
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
+use crate::cbor::{self, VecEncoderExt};
 
 /// Domain tag for the canonical projection. Changing what this encoding covers is a
 /// `SNAPSHOT_STATE_FORMAT_V1` bump, and this tag is what makes a hash from one encoding
@@ -67,59 +64,59 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
     // decoder treat the tail as trailing values outside the frame, even though every byte is still
     // hashed. Keep this in step with the writes below — domain, classification, successor,
     // effective_count, then the seven collections.
-    enc.array(11).expect(INFALLIBLE);
-    enc.str(PROJECTION_DOMAIN).expect(INFALLIBLE);
+    enc.put_array(11);
+    enc.put_str(PROJECTION_DOMAIN);
 
     // 1. Classification. `Contested` carries the depth its pre-contest state was frozen at, which
     //    is part of the state a peer must agree on, not a local detail.
     match history.classification() {
         AccountClassification::Live => {
-            enc.array(1).expect(INFALLIBLE);
-            enc.u8(0).expect(INFALLIBLE);
+            enc.put_array(1);
+            enc.put_u8(0);
         },
         AccountClassification::Contested { state_before_depth } => {
-            enc.array(2).expect(INFALLIBLE);
-            enc.u8(1).expect(INFALLIBLE);
-            enc.u64(state_before_depth as u64).expect(INFALLIBLE);
+            enc.put_array(2);
+            enc.put_u8(1);
+            enc.put_u64(state_before_depth as u64);
         },
     }
 
     // 2. The deterministic recovery successor (§12), when contested.
     match history.contested_successor() {
-        Some(account) => enc.bytes(&account.to_bytes()).expect(INFALLIBLE),
-        None => enc.null().expect(INFALLIBLE),
+        Some(account) => enc.put_bytes(&account.to_bytes()),
+        None => enc.put_null(),
     };
 
-    enc.u64(history.effective_count()).expect(INFALLIBLE);
+    enc.put_u64(history.effective_count());
 
     // 3. The effective set, sorted by entry hash.
     let mut effective: Vec<([u8; 32], u64)> = history.effective_entries().collect();
     effective.sort_unstable();
-    enc.array(effective.len() as u64).expect(INFALLIBLE);
+    enc.put_array(effective.len() as u64);
     for (hash, auth_epoch) in effective {
-        enc.array(2).expect(INFALLIBLE);
-        enc.bytes(&hash).expect(INFALLIBLE);
-        enc.u64(auth_epoch).expect(INFALLIBLE);
+        enc.put_array(2);
+        enc.put_bytes(&hash);
+        enc.put_u64(auth_epoch);
     }
 
     // 4. Roster facts, sorted by the entry hash that minted them.
     let mut roster: Vec<_> = history.roster_facts().collect();
     roster.sort_unstable_by_key(|(hash, _)| **hash);
-    enc.array(roster.len() as u64).expect(INFALLIBLE);
+    enc.put_array(roster.len() as u64);
     for (hash, fact) in roster {
-        enc.array(7).expect(INFALLIBLE);
-        enc.bytes(hash).expect(INFALLIBLE);
-        enc.bytes(&fact.authority.device_fingerprint.to_bytes()).expect(INFALLIBLE);
-        enc.u8(fact.authority.current_role.as_u8()).expect(INFALLIBLE);
+        enc.put_array(7);
+        enc.put_bytes(hash);
+        enc.put_bytes(&fact.authority.device_fingerprint.to_bytes());
+        enc.put_u8(fact.authority.current_role.as_u8());
         write_window(&mut enc, fact.effective_at, fact.closed_at);
         write_boundary(&mut enc, fact.control_boundary);
         write_boundary(&mut enc, fact.secrets_boundary);
         let mut content: Vec<_> = fact.content_boundaries.iter().collect();
         content.sort_unstable_by_key(|(stream, _)| stream.to_bytes());
-        enc.array(content.len() as u64).expect(INFALLIBLE);
+        enc.put_array(content.len() as u64);
         for (stream, boundary) in content {
-            enc.array(2).expect(INFALLIBLE);
-            enc.bytes(&stream.to_bytes()).expect(INFALLIBLE);
+            enc.put_array(2);
+            enc.put_bytes(&stream.to_bytes());
             write_boundary(&mut enc, *boundary);
         }
     }
@@ -127,11 +124,11 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
     // 5. Owner incarnations, sorted by mint hash.
     let mut incarnations: Vec<_> = history.owner_incarnation_facts().collect();
     incarnations.sort_unstable_by_key(|(hash, _)| **hash);
-    enc.array(incarnations.len() as u64).expect(INFALLIBLE);
+    enc.put_array(incarnations.len() as u64);
     for (hash, fact) in incarnations {
-        enc.array(5).expect(INFALLIBLE);
-        enc.bytes(hash).expect(INFALLIBLE);
-        enc.bytes(&fact.authority.device_fingerprint.to_bytes()).expect(INFALLIBLE);
+        enc.put_array(5);
+        enc.put_bytes(hash);
+        enc.put_bytes(&fact.authority.device_fingerprint.to_bytes());
         write_window(&mut enc, fact.effective_at, fact.closed_at);
         write_boundary(&mut enc, fact.control_boundary);
         write_boundary(&mut enc, fact.secrets_boundary);
@@ -140,45 +137,45 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
     // 6. Stream ownership, sorted by stream.
     let mut ownership: Vec<_> = history.stream_ownership_facts().collect();
     ownership.sort_unstable_by_key(|(stream, _)| stream.to_bytes());
-    enc.array(ownership.len() as u64).expect(INFALLIBLE);
+    enc.put_array(ownership.len() as u64);
     for (stream, fact) in ownership {
-        enc.array(3).expect(INFALLIBLE);
-        enc.bytes(&stream.to_bytes()).expect(INFALLIBLE);
-        enc.bytes(&fact.own_id).expect(INFALLIBLE);
-        enc.u64(fact.effective_at).expect(INFALLIBLE);
+        enc.put_array(3);
+        enc.put_bytes(&stream.to_bytes());
+        enc.put_bytes(&fact.own_id);
+        enc.put_u64(fact.effective_at);
     }
 
     // 7. Grants, sorted by grant id.
     let mut grants: Vec<_> = history.grant_facts().collect();
     grants.sort_unstable_by_key(|(id, _)| **id);
-    enc.array(grants.len() as u64).expect(INFALLIBLE);
+    enc.put_array(grants.len() as u64);
     for (grant_id, fact) in grants {
         // FIVE items: grant_id, stream, grantee, role, window — `write_window` emits ONE array, not
         // two values. A miscounted nested arity makes the decoder consume following top-level items
         // to fill this one, which is how a malformed frame hides behind a stable hash.
-        enc.array(5).expect(INFALLIBLE);
-        enc.bytes(grant_id).expect(INFALLIBLE);
-        enc.bytes(&fact.authority.stream_id.to_bytes()).expect(INFALLIBLE);
-        enc.bytes(&fact.authority.grantee_account_id.to_bytes()).expect(INFALLIBLE);
-        enc.u8(fact.authority.role.as_u8()).expect(INFALLIBLE);
+        enc.put_array(5);
+        enc.put_bytes(grant_id);
+        enc.put_bytes(&fact.authority.stream_id.to_bytes());
+        enc.put_bytes(&fact.authority.grantee_account_id.to_bytes());
+        enc.put_u8(fact.authority.role.as_u8());
         write_window(&mut enc, fact.effective_at, fact.closed_at);
     }
 
     // 8. Grant cuts, sorted by grant id then by the device each cut names.
     let mut grant_cuts: Vec<_> = history.grant_cuts().collect();
     grant_cuts.sort_unstable_by_key(|(id, _)| **id);
-    enc.array(grant_cuts.len() as u64).expect(INFALLIBLE);
+    enc.put_array(grant_cuts.len() as u64);
     for (grant_id, cuts) in grant_cuts {
-        enc.array(2).expect(INFALLIBLE);
-        enc.bytes(grant_id).expect(INFALLIBLE);
+        enc.put_array(2);
+        enc.put_bytes(grant_id);
         let mut sorted: Vec<&DeviceCut> = cuts.iter().collect();
         sorted.sort_unstable_by_key(|cut| (cut.device_fingerprint.to_bytes(), cut.seq, cut.hash));
-        enc.array(sorted.len() as u64).expect(INFALLIBLE);
+        enc.put_array(sorted.len() as u64);
         for cut in sorted {
-            enc.array(3).expect(INFALLIBLE);
-            enc.bytes(&cut.device_fingerprint.to_bytes()).expect(INFALLIBLE);
-            enc.u64(cut.seq).expect(INFALLIBLE);
-            enc.bytes(&cut.hash).expect(INFALLIBLE);
+            enc.put_array(3);
+            enc.put_bytes(&cut.device_fingerprint.to_bytes());
+            enc.put_u64(cut.seq);
+            enc.put_bytes(&cut.hash);
         }
     }
 
@@ -186,9 +183,9 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
     let mut tombstoned: Vec<[u8; 32]> =
         history.tombstoned().map(|fingerprint| fingerprint.to_bytes()).collect();
     tombstoned.sort_unstable();
-    enc.array(tombstoned.len() as u64).expect(INFALLIBLE);
+    enc.put_array(tombstoned.len() as u64);
     for fingerprint in tombstoned {
-        enc.bytes(&fingerprint).expect(INFALLIBLE);
+        enc.put_bytes(&fingerprint);
     }
 
     buf
@@ -197,11 +194,11 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
 /// An `(effective_at, closed_at)` validity window. Written as a pair so a closed fact can never
 /// encode identically to an open one at the same epoch.
 fn write_window(enc: &mut Encoder<&mut Vec<u8>>, effective_at: u64, closed_at: Option<u64>) {
-    enc.array(2).expect(INFALLIBLE);
-    enc.u64(effective_at).expect(INFALLIBLE);
+    enc.put_array(2);
+    enc.put_u64(effective_at);
     match closed_at {
-        Some(at) => enc.u64(at).expect(INFALLIBLE),
-        None => enc.null().expect(INFALLIBLE),
+        Some(at) => enc.put_u64(at),
+        None => enc.put_null(),
     };
 }
 
@@ -210,18 +207,18 @@ fn write_window(enc: &mut Encoder<&mut Vec<u8>>, effective_at: u64, closed_at: O
 fn write_boundary(enc: &mut Encoder<&mut Vec<u8>>, boundary: AuthorityBoundary) {
     match boundary {
         AuthorityBoundary::Open => {
-            enc.array(1).expect(INFALLIBLE);
-            enc.u8(0).expect(INFALLIBLE);
+            enc.put_array(1);
+            enc.put_u8(0);
         },
         AuthorityBoundary::Cut { seq, hash } => {
-            enc.array(3).expect(INFALLIBLE);
-            enc.u8(1).expect(INFALLIBLE);
-            enc.u64(seq).expect(INFALLIBLE);
-            enc.bytes(&hash).expect(INFALLIBLE);
+            enc.put_array(3);
+            enc.put_u8(1);
+            enc.put_u64(seq);
+            enc.put_bytes(&hash);
         },
         AuthorityBoundary::Closed => {
-            enc.array(1).expect(INFALLIBLE);
-            enc.u8(2).expect(INFALLIBLE);
+            enc.put_array(1);
+            enc.put_u8(2);
         },
     }
 }

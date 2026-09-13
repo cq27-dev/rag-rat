@@ -40,10 +40,8 @@ use minicbor::decode::{Decoder, Error as CborError};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::cbor;
+use crate::cbor::{self, VecEncoderExt};
 use crate::device::{DeviceX25519Public, DeviceX25519Secret};
-
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// Domain tag for the canonical-CBOR wire form of a [`SealedKeyWrap`].
 const KEY_WRAP_DOMAIN: &str = "rag-rat/key-wrap/1";
@@ -163,10 +161,10 @@ impl SealedKeyWrap {
     pub fn to_cbor(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(96);
         let mut encoder = Encoder::new(&mut bytes);
-        encoder.array(3).expect(INFALLIBLE);
-        encoder.str(KEY_WRAP_DOMAIN).expect(INFALLIBLE);
-        encoder.bytes(&self.ephemeral_pubkey).expect(INFALLIBLE);
-        encoder.bytes(&self.ciphertext).expect(INFALLIBLE);
+        encoder.put_array(3);
+        encoder.put_str(KEY_WRAP_DOMAIN);
+        encoder.put_bytes(&self.ephemeral_pubkey);
+        encoder.put_bytes(&self.ciphertext);
         bytes
     }
 

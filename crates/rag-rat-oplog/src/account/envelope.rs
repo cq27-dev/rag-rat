@@ -31,12 +31,9 @@ use minicbor::decode::{Decoder, Error as CborError};
 
 use super::AccountId;
 use super::limits::{ACCOUNT_ENTRY_DOMAIN, ACCOUNT_ENVELOPE_MAX_BYTES, ACCOUNT_SIGNED_DOMAIN};
-use crate::cbor;
+use crate::cbor::{self, VecEncoderExt};
 use crate::device::{DevicePublic, DeviceSecret};
 use crate::op::DeviceFingerprint;
-
-/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::super`.
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// The 13-part account-entry header (§6), fixed field order. `domain` (part 0) is a constant and is
 /// not stored — it is written at encode and asserted at decode. `entry_type` and `authority_ref`
@@ -187,18 +184,18 @@ fn encode_header(h: &AccountEntryHeader) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(13).expect(INFALLIBLE);
-        enc.str(ACCOUNT_ENTRY_DOMAIN).expect(INFALLIBLE);
-        enc.bytes(&h.account_id.to_bytes()).expect(INFALLIBLE);
-        enc.u8(h.log_id).expect(INFALLIBLE);
-        enc.bytes(&h.device_fingerprint.to_bytes()).expect(INFALLIBLE);
-        enc.u64(h.seq).expect(INFALLIBLE);
+        enc.put_array(13);
+        enc.put_str(ACCOUNT_ENTRY_DOMAIN);
+        enc.put_bytes(&h.account_id.to_bytes());
+        enc.put_u8(h.log_id);
+        enc.put_bytes(&h.device_fingerprint.to_bytes());
+        enc.put_u64(h.seq);
         encode_opt_hash(&mut enc, h.prev_hash);
         encode_opt_hash(&mut enc, h.parent_ref);
-        enc.u32(h.entry_type).expect(INFALLIBLE);
-        enc.u32(h.op_version).expect(INFALLIBLE);
-        enc.u8(h.crypto_suite).expect(INFALLIBLE);
-        enc.u64(h.auth_len).expect(INFALLIBLE);
+        enc.put_u32(h.entry_type);
+        enc.put_u32(h.op_version);
+        enc.put_u8(h.crypto_suite);
+        enc.put_u64(h.auth_len);
         encode_opt_hash(&mut enc, h.key_id);
         encode_opt_hash(&mut enc, h.authority_ref);
     }
@@ -211,9 +208,9 @@ fn encode_body(header_bytes: &[u8], payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(header_bytes.len() + payload.len() + 16);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(2).expect(INFALLIBLE);
-        enc.bytes(header_bytes).expect(INFALLIBLE);
-        enc.bytes(payload).expect(INFALLIBLE);
+        enc.put_array(2);
+        enc.put_bytes(header_bytes);
+        enc.put_bytes(payload);
     }
     buf
 }
@@ -224,10 +221,10 @@ fn encode_signed(body_bytes: &[u8], signature: &[u8; 64]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(body_bytes.len() + 96);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(3).expect(INFALLIBLE);
-        enc.str(ACCOUNT_SIGNED_DOMAIN).expect(INFALLIBLE);
-        enc.bytes(body_bytes).expect(INFALLIBLE);
-        enc.bytes(signature).expect(INFALLIBLE);
+        enc.put_array(3);
+        enc.put_str(ACCOUNT_SIGNED_DOMAIN);
+        enc.put_bytes(body_bytes);
+        enc.put_bytes(signature);
     }
     buf
 }
@@ -237,10 +234,10 @@ fn encode_signed(body_bytes: &[u8], signature: &[u8; 64]) -> Vec<u8> {
 fn encode_opt_hash(enc: &mut Encoder<&mut Vec<u8>>, hash: Option<[u8; 32]>) {
     match hash {
         Some(hash) => {
-            enc.bytes(&hash).expect(INFALLIBLE);
+            enc.put_bytes(&hash);
         },
         None => {
-            enc.null().expect(INFALLIBLE);
+            enc.put_null();
         },
     }
 }

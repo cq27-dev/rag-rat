@@ -205,12 +205,9 @@ mod format_v1 {
     use super::super::super::limits::{SNAPSHOT_COVERED_MAX, SNAPSHOT_TARGETS_MAX};
     use super::super::super::ops::{decode_opt_b32, encode_opt_b32};
     use super::{CoveredWatermark, SNAPSHOT_STATE_FORMAT_V1, SnapshotOp, SnapshotTarget};
-    use crate::cbor;
+    use crate::cbor::{self, VecEncoderExt};
     use crate::op::DeviceFingerprint;
     use crate::stream::StreamId;
-
-    /// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible).
-    const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
     /// The three coordinate shapes a format-1 target may name. The set is CLOSED: an undefined log
     /// has no folded projection, so a coverage claim about it could never be verified or refuted. A
@@ -338,25 +335,25 @@ mod format_v1 {
             let mut enc = Encoder::new(&mut buf);
             match op {
                 SnapshotOp::Snapshot { state_format_version, moderation_epoch, targets } => {
-                    enc.array(3).expect(INFALLIBLE);
-                    enc.u32(*state_format_version).expect(INFALLIBLE);
-                    enc.u64(*moderation_epoch).expect(INFALLIBLE);
-                    enc.array(targets.len() as u64).expect(INFALLIBLE);
+                    enc.put_array(3);
+                    enc.put_u32(*state_format_version);
+                    enc.put_u64(*moderation_epoch);
+                    enc.put_array(targets.len() as u64);
                     for target in targets {
-                        enc.array(5).expect(INFALLIBLE);
-                        enc.u8(target.log_id).expect(INFALLIBLE);
+                        enc.put_array(5);
+                        enc.put_u8(target.log_id);
                         encode_opt_b32(&mut enc, target.stream_id.map(StreamId::to_bytes));
                         encode_opt_b32(
                             &mut enc,
                             target.subject_account_id.map(AccountId::to_bytes),
                         );
-                        enc.bytes(&target.folded_state_hash).expect(INFALLIBLE);
-                        enc.array(target.covered.len() as u64).expect(INFALLIBLE);
+                        enc.put_bytes(&target.folded_state_hash);
+                        enc.put_array(target.covered.len() as u64);
                         for w in &target.covered {
-                            enc.array(3).expect(INFALLIBLE);
-                            enc.bytes(&w.device_fingerprint.to_bytes()).expect(INFALLIBLE);
-                            enc.u64(w.seq).expect(INFALLIBLE);
-                            enc.bytes(&w.entry_hash).expect(INFALLIBLE);
+                            enc.put_array(3);
+                            enc.put_bytes(&w.device_fingerprint.to_bytes());
+                            enc.put_u64(w.seq);
+                            enc.put_bytes(&w.entry_hash);
                         }
                     }
                 },

@@ -16,12 +16,10 @@ use super::super::keywrap::ContentKey;
 use super::super::limits::{
     CONTENT_ENTRY_DOMAIN, CONTENT_ENVELOPE_MAX_BYTES, CONTENT_SIGNED_DOMAIN,
 };
-use crate::cbor;
+use crate::cbor::{self, VecEncoderExt};
 use crate::device::{DevicePublic, DeviceSecret};
 use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
-
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// The suite-1 (XChaCha20-Poly1305 sealed) crypto-suite id a sealed `/3` header carries. The
 /// suite-0 sibling [`sign_content_entry`] never authors this; [`sign_sealed_content_entry`] is the
@@ -285,19 +283,19 @@ pub fn verify_content_signed(
 fn encode_header(header: &ContentEntryHeader) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(320);
     let mut encoder = Encoder::new(&mut bytes);
-    encoder.array(13).expect(INFALLIBLE);
-    encoder.str(CONTENT_ENTRY_DOMAIN).expect(INFALLIBLE);
-    encoder.bytes(&header.stream_id.to_bytes()).expect(INFALLIBLE);
-    encoder.bytes(&header.author_account_id.to_bytes()).expect(INFALLIBLE);
-    encoder.bytes(&header.device_fingerprint.to_bytes()).expect(INFALLIBLE);
-    encoder.u64(header.seq).expect(INFALLIBLE);
-    encoder.u64(header.lamport).expect(INFALLIBLE);
+    encoder.put_array(13);
+    encoder.put_str(CONTENT_ENTRY_DOMAIN);
+    encoder.put_bytes(&header.stream_id.to_bytes());
+    encoder.put_bytes(&header.author_account_id.to_bytes());
+    encoder.put_bytes(&header.device_fingerprint.to_bytes());
+    encoder.put_u64(header.seq);
+    encoder.put_u64(header.lamport);
     encode_opt_hash(&mut encoder, header.prev_hash);
     encode_opt_hash(&mut encoder, header.grant_id);
-    encoder.bytes(&header.roster_ref).expect(INFALLIBLE);
-    encoder.u64(header.owner_auth_len).expect(INFALLIBLE);
-    encoder.u64(header.author_auth_len).expect(INFALLIBLE);
-    encoder.u64(header.crypto_suite).expect(INFALLIBLE);
+    encoder.put_bytes(&header.roster_ref);
+    encoder.put_u64(header.owner_auth_len);
+    encoder.put_u64(header.author_auth_len);
+    encoder.put_u64(header.crypto_suite);
     encode_opt_hash(&mut encoder, header.key_id);
     bytes
 }
@@ -305,19 +303,19 @@ fn encode_header(header: &ContentEntryHeader) -> Vec<u8> {
 fn encode_body(header_bytes: &[u8], payload: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(header_bytes.len() + payload.len() + 16);
     let mut encoder = Encoder::new(&mut bytes);
-    encoder.array(2).expect(INFALLIBLE);
-    encoder.bytes(header_bytes).expect(INFALLIBLE);
-    encoder.bytes(payload).expect(INFALLIBLE);
+    encoder.put_array(2);
+    encoder.put_bytes(header_bytes);
+    encoder.put_bytes(payload);
     bytes
 }
 
 fn encode_signed(body_bytes: &[u8], signature: &[u8; 64]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(body_bytes.len() + 96);
     let mut encoder = Encoder::new(&mut bytes);
-    encoder.array(3).expect(INFALLIBLE);
-    encoder.str(CONTENT_SIGNED_DOMAIN).expect(INFALLIBLE);
-    encoder.bytes(body_bytes).expect(INFALLIBLE);
-    encoder.bytes(signature).expect(INFALLIBLE);
+    encoder.put_array(3);
+    encoder.put_str(CONTENT_SIGNED_DOMAIN);
+    encoder.put_bytes(body_bytes);
+    encoder.put_bytes(signature);
     bytes
 }
 
@@ -362,8 +360,8 @@ pub fn open_sealed_payload(
 
 fn encode_opt_hash(encoder: &mut Encoder<&mut Vec<u8>>, hash: Option<[u8; 32]>) {
     match hash {
-        Some(hash) => encoder.bytes(&hash).expect(INFALLIBLE),
-        None => encoder.null().expect(INFALLIBLE),
+        Some(hash) => encoder.put_bytes(&hash),
+        None => encoder.put_null(),
     };
 }
 

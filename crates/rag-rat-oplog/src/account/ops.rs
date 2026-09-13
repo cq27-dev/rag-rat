@@ -20,13 +20,10 @@ use minicbor::decode::{Decoder, Error as CborError};
 use super::AccountId;
 use super::cut::Cut;
 use super::limits::{CONTENT_CUTS_MAX, DEVICE_CUTS_MAX};
-use crate::cbor;
+use crate::cbor::{self, VecEncoderExt};
 use crate::device::{DevicePublic, DeviceX25519Public};
 use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
-
-/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::super`.
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// The frozen `entry_type` tag set (header part 7). A tag is a wire constant — a renumber is a wire
 /// bump. Deferred control ops land ADDITIVELY at 10+ (`StandoffResolve` §12, `PublicStreamConfig`,
@@ -364,11 +361,11 @@ fn encode_canonical(op: &AccountOp) -> Vec<u8> {
                 created_at_ms,
                 label,
             } => {
-                enc.array(5).expect(INFALLIBLE);
-                enc.bytes(ed25519_pubkey).expect(INFALLIBLE);
-                enc.bytes(x25519_pubkey).expect(INFALLIBLE);
-                enc.bytes(nonce16).expect(INFALLIBLE);
-                enc.u64(*created_at_ms).expect(INFALLIBLE);
+                enc.put_array(5);
+                enc.put_bytes(ed25519_pubkey);
+                enc.put_bytes(x25519_pubkey);
+                enc.put_bytes(nonce16);
+                enc.put_u64(*created_at_ms);
                 encode_opt_str(&mut enc, label.as_deref());
             },
             AccountOp::DeviceAdd {
@@ -378,11 +375,11 @@ fn encode_canonical(op: &AccountOp) -> Vec<u8> {
                 role,
                 label,
             } => {
-                enc.array(5).expect(INFALLIBLE);
-                enc.bytes(&device_fingerprint.to_bytes()).expect(INFALLIBLE);
-                enc.bytes(ed25519_pubkey).expect(INFALLIBLE);
-                enc.bytes(x25519_pubkey).expect(INFALLIBLE);
-                enc.u8(role.as_u8()).expect(INFALLIBLE);
+                enc.put_array(5);
+                enc.put_bytes(&device_fingerprint.to_bytes());
+                enc.put_bytes(ed25519_pubkey);
+                enc.put_bytes(x25519_pubkey);
+                enc.put_u8(role.as_u8());
                 encode_opt_str(&mut enc, label.as_deref());
             },
             AccountOp::DeviceRemove {
@@ -392,16 +389,16 @@ fn encode_canonical(op: &AccountOp) -> Vec<u8> {
                 content_cuts,
                 reason,
             } => {
-                enc.array(5).expect(INFALLIBLE);
-                enc.bytes(&device_fingerprint.to_bytes()).expect(INFALLIBLE);
+                enc.put_array(5);
+                enc.put_bytes(&device_fingerprint.to_bytes());
                 control_cut.encode_into(&mut enc);
                 secrets_cut.encode_into(&mut enc);
                 write_content_cuts(&mut enc, content_cuts);
-                enc.str(reason).expect(INFALLIBLE);
+                enc.put_str(reason);
             },
             AccountOp::OwnerPromote { device_fingerprint } => {
-                enc.array(1).expect(INFALLIBLE);
-                enc.bytes(&device_fingerprint.to_bytes()).expect(INFALLIBLE);
+                enc.put_array(1);
+                enc.put_bytes(&device_fingerprint.to_bytes());
             },
             AccountOp::OwnerDemote {
                 device_fingerprint,
@@ -410,12 +407,12 @@ fn encode_canonical(op: &AccountOp) -> Vec<u8> {
                 secrets_cut,
                 reason,
             } => {
-                enc.array(5).expect(INFALLIBLE);
-                enc.bytes(&device_fingerprint.to_bytes()).expect(INFALLIBLE);
-                enc.bytes(owner_id).expect(INFALLIBLE);
+                enc.put_array(5);
+                enc.put_bytes(&device_fingerprint.to_bytes());
+                enc.put_bytes(owner_id);
                 control_cut.encode_into(&mut enc);
                 secrets_cut.encode_into(&mut enc);
-                enc.str(reason).expect(INFALLIBLE);
+                enc.put_str(reason);
             },
             AccountOp::CutExtend {
                 chain_kind,
@@ -426,25 +423,25 @@ fn encode_canonical(op: &AccountOp) -> Vec<u8> {
                 new_seq,
                 new_entry_hash,
             } => {
-                enc.array(7).expect(INFALLIBLE);
-                enc.u8(chain_kind.as_u8()).expect(INFALLIBLE);
+                enc.put_array(7);
+                enc.put_u8(chain_kind.as_u8());
                 encode_opt_b32(&mut enc, stream_id.map(StreamId::to_bytes));
                 encode_opt_b32(&mut enc, *incarnation_id);
-                enc.bytes(&subject_account_id.to_bytes()).expect(INFALLIBLE);
-                enc.bytes(&device_fingerprint.to_bytes()).expect(INFALLIBLE);
-                enc.u64(*new_seq).expect(INFALLIBLE);
-                enc.bytes(new_entry_hash).expect(INFALLIBLE);
+                enc.put_bytes(&subject_account_id.to_bytes());
+                enc.put_bytes(&device_fingerprint.to_bytes());
+                enc.put_u64(*new_seq);
+                enc.put_bytes(new_entry_hash);
             },
             AccountOp::StreamOwn { stream_id, stream_spec_bytes } => {
-                enc.array(2).expect(INFALLIBLE);
-                enc.bytes(&stream_id.to_bytes()).expect(INFALLIBLE);
-                enc.bytes(stream_spec_bytes).expect(INFALLIBLE);
+                enc.put_array(2);
+                enc.put_bytes(&stream_id.to_bytes());
+                enc.put_bytes(stream_spec_bytes);
             },
             AccountOp::StreamGrant { stream_id, grantee_account_id, grant_role } => {
-                enc.array(3).expect(INFALLIBLE);
-                enc.bytes(&stream_id.to_bytes()).expect(INFALLIBLE);
-                enc.bytes(&grantee_account_id.to_bytes()).expect(INFALLIBLE);
-                enc.u8(grant_role.as_u8()).expect(INFALLIBLE);
+                enc.put_array(3);
+                enc.put_bytes(&stream_id.to_bytes());
+                enc.put_bytes(&grantee_account_id.to_bytes());
+                enc.put_u8(grant_role.as_u8());
             },
             AccountOp::StreamRevoke {
                 stream_id,
@@ -453,16 +450,16 @@ fn encode_canonical(op: &AccountOp) -> Vec<u8> {
                 device_cuts,
                 reason,
             } => {
-                enc.array(5).expect(INFALLIBLE);
-                enc.bytes(&stream_id.to_bytes()).expect(INFALLIBLE);
-                enc.bytes(&grantee_account_id.to_bytes()).expect(INFALLIBLE);
-                enc.bytes(grant_id).expect(INFALLIBLE);
+                enc.put_array(5);
+                enc.put_bytes(&stream_id.to_bytes());
+                enc.put_bytes(&grantee_account_id.to_bytes());
+                enc.put_bytes(grant_id);
                 write_device_cuts(&mut enc, device_cuts);
-                enc.str(reason).expect(INFALLIBLE);
+                enc.put_str(reason);
             },
             AccountOp::AccountReRoot { successor_account_id, note } => {
-                enc.array(2).expect(INFALLIBLE);
-                enc.bytes(&successor_account_id.to_bytes()).expect(INFALLIBLE);
+                enc.put_array(2);
+                enc.put_bytes(&successor_account_id.to_bytes());
                 encode_opt_str(&mut enc, note.as_deref());
             },
         }
@@ -669,12 +666,12 @@ fn canonical_content_cuts(cuts: &[ContentCut]) -> Result<Vec<ContentCut>, CborEr
 
 /// Emit an ALREADY-canonical content-cut array (see [`canonical_content_cuts`]).
 fn write_content_cuts(enc: &mut Encoder<&mut Vec<u8>>, cuts: &[ContentCut]) {
-    enc.array(cuts.len() as u64).expect(INFALLIBLE);
+    enc.put_array(cuts.len() as u64);
     for cut in cuts {
-        enc.array(3).expect(INFALLIBLE);
-        enc.bytes(&cut.stream_id.to_bytes()).expect(INFALLIBLE);
-        enc.u64(cut.seq).expect(INFALLIBLE);
-        enc.bytes(&cut.hash).expect(INFALLIBLE);
+        enc.put_array(3);
+        enc.put_bytes(&cut.stream_id.to_bytes());
+        enc.put_u64(cut.seq);
+        enc.put_bytes(&cut.hash);
     }
 }
 
@@ -717,12 +714,12 @@ fn canonical_device_cuts(cuts: &[DeviceCut]) -> Result<Vec<DeviceCut>, CborError
 
 /// Emit an ALREADY-canonical device-cut array (see [`canonical_device_cuts`]).
 fn write_device_cuts(enc: &mut Encoder<&mut Vec<u8>>, cuts: &[DeviceCut]) {
-    enc.array(cuts.len() as u64).expect(INFALLIBLE);
+    enc.put_array(cuts.len() as u64);
     for cut in cuts {
-        enc.array(3).expect(INFALLIBLE);
-        enc.bytes(&cut.device_fingerprint.to_bytes()).expect(INFALLIBLE);
-        enc.u64(cut.seq).expect(INFALLIBLE);
-        enc.bytes(&cut.hash).expect(INFALLIBLE);
+        enc.put_array(3);
+        enc.put_bytes(&cut.device_fingerprint.to_bytes());
+        enc.put_u64(cut.seq);
+        enc.put_bytes(&cut.hash);
     }
 }
 
@@ -755,10 +752,10 @@ fn decode_device_cuts(d: &mut Decoder<'_>) -> Result<Vec<DeviceCut>, CborError> 
 fn encode_opt_str(enc: &mut Encoder<&mut Vec<u8>>, text: Option<&str>) {
     match text {
         Some(text) => {
-            enc.str(text).expect(INFALLIBLE);
+            enc.put_str(text);
         },
         None => {
-            enc.null().expect(INFALLIBLE);
+            enc.put_null();
         },
     }
 }
@@ -776,10 +773,10 @@ fn decode_opt_str(d: &mut Decoder<'_>) -> Result<Option<String>, CborError> {
 pub(in crate::account) fn encode_opt_b32(enc: &mut Encoder<&mut Vec<u8>>, value: Option<[u8; 32]>) {
     match value {
         Some(value) => {
-            enc.bytes(&value).expect(INFALLIBLE);
+            enc.put_bytes(&value);
         },
         None => {
-            enc.null().expect(INFALLIBLE);
+            enc.put_null();
         },
     }
 }

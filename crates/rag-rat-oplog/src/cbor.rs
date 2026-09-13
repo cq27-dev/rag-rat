@@ -31,6 +31,54 @@ pub(super) const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 /// helper shares.
 pub(super) type VecEncoder<'a> = Encoder<&'a mut Vec<u8>>;
 
+/// Infallible writes onto a [`VecEncoder`]: each `put_*` is the matching `minicbor` write with the
+/// impossible error absorbed once here (see [`INFALLIBLE`]), so an encoder reads as its field list.
+/// The emitted bytes are exactly those of the underlying `minicbor` call.
+pub(super) trait VecEncoderExt {
+    fn put_array(&mut self, len: u64) -> &mut Self;
+    fn put_bytes(&mut self, bytes: &[u8]) -> &mut Self;
+    fn put_str(&mut self, text: &str) -> &mut Self;
+    fn put_u8(&mut self, value: u8) -> &mut Self;
+    fn put_u32(&mut self, value: u32) -> &mut Self;
+    fn put_u64(&mut self, value: u64) -> &mut Self;
+    fn put_i64(&mut self, value: i64) -> &mut Self;
+    fn put_null(&mut self) -> &mut Self;
+}
+
+impl VecEncoderExt for VecEncoder<'_> {
+    fn put_array(&mut self, len: u64) -> &mut Self {
+        self.array(len).expect(INFALLIBLE)
+    }
+
+    fn put_bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        self.bytes(bytes).expect(INFALLIBLE)
+    }
+
+    fn put_str(&mut self, text: &str) -> &mut Self {
+        self.str(text).expect(INFALLIBLE)
+    }
+
+    fn put_u8(&mut self, value: u8) -> &mut Self {
+        self.u8(value).expect(INFALLIBLE)
+    }
+
+    fn put_u32(&mut self, value: u32) -> &mut Self {
+        self.u32(value).expect(INFALLIBLE)
+    }
+
+    fn put_u64(&mut self, value: u64) -> &mut Self {
+        self.u64(value).expect(INFALLIBLE)
+    }
+
+    fn put_i64(&mut self, value: i64) -> &mut Self {
+        self.i64(value).expect(INFALLIBLE)
+    }
+
+    fn put_null(&mut self) -> &mut Self {
+        self.null().expect(INFALLIBLE)
+    }
+}
+
 /// Validate that `bytes` is EXACTLY one canonical CBOR item (RFC 8949 §4.2 core-deterministic) with
 /// no trailing bytes: MINIMAL-length argument headers, DEFINITE lengths only, sorted + unique map
 /// keys, and no floats (this wire format is integer-only). This is the encoding-level canonicity a

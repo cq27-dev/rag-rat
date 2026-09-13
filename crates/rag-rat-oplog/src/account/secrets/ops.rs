@@ -17,12 +17,9 @@ use minicbor::decode::{Decoder, Error as CborError};
 
 use super::super::keywrap::SealedKeyWrap;
 use super::super::limits::WRAP_RECIPIENTS_MAX;
-use crate::cbor;
+use crate::cbor::{self, VecEncoderExt};
 use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
-
-/// Writing CBOR into a `Vec` cannot fail (its `Write` impl is infallible) — mirrors `super::super`.
-const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
 
 /// The frozen secrets-log `entry_type` tag set (header part 7), a per-log namespace with fresh
 /// numbering. A tag is a wire constant — a renumber is a wire bump. Decode of these tags is gated
@@ -110,11 +107,11 @@ pub fn encode_repo_incarnation(op: &RepoIncarnation) -> Result<Vec<u8>, CborErro
     }
     let mut buf = Vec::with_capacity(80);
     let mut enc = Encoder::new(&mut buf);
-    enc.array(2).expect(INFALLIBLE);
-    enc.str(&op.repo_id).expect(INFALLIBLE);
+    enc.put_array(2);
+    enc.put_str(&op.repo_id);
     match op.predecessor_ref {
-        Some(predecessor) => enc.bytes(&predecessor).expect(INFALLIBLE),
-        None => enc.null().expect(INFALLIBLE),
+        Some(predecessor) => enc.put_bytes(&predecessor),
+        None => enc.put_null(),
     };
     Ok(buf)
 }
@@ -133,10 +130,10 @@ fn encode_canonical(op: &StreamKeyWrap) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(4).expect(INFALLIBLE);
-        enc.bytes(&op.stream_id.to_bytes()).expect(INFALLIBLE);
-        enc.bytes(&op.key_id).expect(INFALLIBLE);
-        enc.u64(op.key_epoch).expect(INFALLIBLE);
+        enc.put_array(4);
+        enc.put_bytes(&op.stream_id.to_bytes());
+        enc.put_bytes(&op.key_id);
+        enc.put_u64(op.key_epoch);
         write_wraps(&mut enc, &op.wraps);
     }
     buf
@@ -234,11 +231,11 @@ fn canonical_wraps(wraps: &[WrapEntry]) -> Result<Vec<WrapEntry>, CborError> {
 /// Emit an ALREADY-canonical wrap array (see [`canonical_wraps`]). Each `wrapped_key` is the opaque
 /// canonical [`SealedKeyWrap::to_cbor`] bstr — NOT an inline array (§15 S-c).
 fn write_wraps(enc: &mut Encoder<&mut Vec<u8>>, wraps: &[WrapEntry]) {
-    enc.array(wraps.len() as u64).expect(INFALLIBLE);
+    enc.put_array(wraps.len() as u64);
     for wrap in wraps {
-        enc.array(2).expect(INFALLIBLE);
-        enc.bytes(&wrap.recipient_fp.to_bytes()).expect(INFALLIBLE);
-        enc.bytes(&wrap.sealed.to_cbor()).expect(INFALLIBLE);
+        enc.put_array(2);
+        enc.put_bytes(&wrap.recipient_fp.to_bytes());
+        enc.put_bytes(&wrap.sealed.to_cbor());
     }
 }
 
