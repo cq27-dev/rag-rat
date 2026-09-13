@@ -3,9 +3,8 @@ use crate::index::edges::*;
 
 pub(in crate::index::languages) fn kotlin_edges(
     EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
-    emit: &mut EdgeEmitter<'_>,
+    out: &mut EdgeEmitter<'_>,
 ) {
-    let out = emit;
     match node.kind() {
         "import" | "import_header" | "import_directive" => {
             for name in identifiers_under(node, text) {

@@ -26,9 +26,8 @@ use crate::index::edges::*;
 
 pub(in crate::index::languages) fn go_edges(
     EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
-    emit: &mut EdgeEmitter<'_>,
+    out: &mut EdgeEmitter<'_>,
 ) {
-    let out = emit;
     match node.kind() {
         "import_spec" => go_import_edges(text, node, path, out),
         "call_expression" => go_call_edges(text, node, locator, out),

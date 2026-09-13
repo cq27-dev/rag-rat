@@ -9,12 +9,27 @@ pub(crate) mod scope_grammar;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-pub(crate) use extract::*;
-pub(crate) use helpers::*;
+pub(crate) use extract::{
+    EdgeEmitter, EdgeVisit, edge_candidates_from_root, enclosing_use_scope, file_edge,
+    file_edge_scoped, index_file_edges, inline_mod_scope, qn_tail, symbol_edge,
+    symbol_edge_with_context,
+};
+#[cfg(test)]
+pub(crate) use extract::{edge_candidates, syntactic_edges};
+pub(crate) use helpers::{
+    EdgeStringInterner, IdentifierPath, SymbolLocator, all_symbols, call_target_name,
+    call_target_node, child_name_text, edge_evidence, final_segment_node, first_identifier_node,
+    first_identifier_text, identifiers_under, insert_candidates, intern_edge_string,
+    is_rust_path_keyword, last_identifier_node, last_identifier_text, looks_like_type_name,
+    named_children, node_text, scoped_receiver_name, short_name, span_for_node, symbols_for_file,
+    target_qualified_name, unwrap_generic_function, use_declaration_evidence,
+};
 pub(crate) use imports::scan_packages;
 use intern::{OptSym, StrArena, Sym};
 use rag_rat_base::language::Language;
-pub(crate) use resolve::*;
+pub(crate) use resolve::{
+    resolve_all_edges, resolve_and_insert_edges, resolve_changed_edges, resolve_overlay_edges,
+};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use tree_sitter::Node;

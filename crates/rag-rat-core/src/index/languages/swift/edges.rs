@@ -1,5 +1,7 @@
 //! Swift graph-edge extraction for the shared structural edge walk.
 
+use std::path::Path;
+
 use tree_sitter::Node;
 
 use super::syntax;
@@ -7,27 +9,14 @@ use crate::index::edges::*;
 
 pub(in crate::index::languages) fn swift_edges(
     EdgeVisit { text, node, symbols, path, locator }: EdgeVisit<'_, '_, '_>,
-    emit: &mut EdgeEmitter<'_>,
+    out: &mut EdgeEmitter<'_>,
 ) {
-    let out = emit;
     match node.kind() {
         "source_file"
             if text.contains(',')
                 && (text.contains("higherThan:") || text.contains("lowerThan:")) =>
             swift_precedence_group_relation_list_edges(text, node, symbols, out),
-        "import_declaration" => {
-            let identifiers = swift_import_identifiers(node, text);
-            if !identifiers.is_empty() {
-                out.push(file_edge(
-                    path,
-                    node,
-                    text,
-                    identifiers.join("::"),
-                    EdgeKind::Imports,
-                    EdgeConfidence::NameOnly,
-                ));
-            }
-        },
+        "import_declaration" => swift_import_edges(text, node, path, out),
         "call_expression" => swift_call_edges(text, node, locator, out),
         "constructor_expression" => swift_constructor_edges(text, node, locator, out),
         "macro_invocation" => swift_macro_edges(text, node, locator, out),
@@ -48,62 +37,13 @@ pub(in crate::index::languages) fn swift_edges(
         "navigation_expression" => swift_qualified_case_edges(text, node, locator, out),
         "attribute" if !swift_node_is_import_modifier(node) =>
             swift_attribute_macro_edges(text, node, locator, out),
-        "inheritance_specifier" => {
-            let Some(type_path) = swift_inherited_type_name(node) else {
-                return;
-            };
-            let identifier_nodes = syntax::identifier_nodes(type_path);
-            let identifiers = identifier_nodes
-                .iter()
-                .map(|&identifier| node_text(identifier, text))
-                .collect::<Vec<_>>();
-            let Some(name) = identifiers.last().cloned() else {
-                return;
-            };
-            let edge_kind = if swift_inheritance_is_enum_raw_type(node, text) {
-                EdgeKind::ReferencesType
-            } else {
-                EdgeKind::Implements
-            };
-            out.push(symbol_edge_with_context(
-                locator,
-                node,
-                text,
-                name,
-                edge_kind,
-                EdgeConfidence::NameOnly,
-                swift_edge_context(&identifiers),
-                identifier_nodes.last().copied().map(CalleeRange::of_node),
-            ));
-        },
+        "inheritance_specifier" => swift_inheritance_edges(text, node, locator, out),
         "user_type"
             if !swift_node_is_declaration_name(node)
                 && !swift_node_is_import_modifier(node)
                 && !swift_has_ancestor_kind(node, "attribute")
                 && !swift_node_is_type_parameter_reference(node, text) =>
-        {
-            let identifier_nodes = syntax::identifier_nodes(node);
-            let Some(type_node) = identifier_nodes.last().copied() else {
-                return;
-            };
-            let identifiers = identifier_nodes
-                .iter()
-                .map(|&identifier| node_text(identifier, text))
-                .collect::<Vec<_>>();
-            let Some(name) = identifiers.last().cloned() else {
-                return;
-            };
-            out.push(symbol_edge_with_context(
-                locator,
-                node,
-                text,
-                name,
-                EdgeKind::ReferencesType,
-                EdgeConfidence::NameOnly,
-                swift_edge_context(&identifiers),
-                Some(CalleeRange::of_node(type_node)),
-            ));
-        },
+            swift_user_type_edges(text, node, locator, out),
         "type_identifier"
             if node.parent().is_none_or(|parent| parent.kind() != "user_type")
                 && !swift_node_is_declaration_name(node)
@@ -111,19 +51,99 @@ pub(in crate::index::languages) fn swift_edges(
                 && !swift_node_is_type_parameter_reference(node, text)
                 && !swift_has_ancestor_kind(node, "attribute")
                 && !swift_node_is_import_modifier(node) =>
-        {
-            let name = node_text(node, text);
-            out.push(symbol_edge(
-                locator,
-                node,
-                name,
-                EdgeKind::ReferencesType,
-                EdgeConfidence::NameOnly,
-                Some(CalleeRange::of_node(node)),
-            ));
-        },
+            swift_type_identifier_edges(text, node, locator, out),
         _ => {},
     }
+}
+
+fn swift_import_edges(text: &str, node: Node<'_>, path: &Path, out: &mut EdgeEmitter<'_>) {
+    let identifiers = swift_import_identifiers(node, text);
+    if !identifiers.is_empty() {
+        out.push(file_edge(
+            path,
+            node,
+            text,
+            identifiers.join("::"),
+            EdgeKind::Imports,
+            EdgeConfidence::NameOnly,
+        ));
+    }
+}
+
+fn swift_inheritance_edges(
+    text: &str,
+    node: Node<'_>,
+    locator: &SymbolLocator<'_>,
+    out: &mut EdgeEmitter<'_>,
+) {
+    let Some(type_path) = swift_inherited_type_name(node) else {
+        return;
+    };
+    let identifier_nodes = syntax::identifier_nodes(type_path);
+    let identifiers =
+        identifier_nodes.iter().map(|&identifier| node_text(identifier, text)).collect::<Vec<_>>();
+    let Some(name) = identifiers.last().cloned() else {
+        return;
+    };
+    let edge_kind = if swift_inheritance_is_enum_raw_type(node, text) {
+        EdgeKind::ReferencesType
+    } else {
+        EdgeKind::Implements
+    };
+    out.push(symbol_edge_with_context(
+        locator,
+        node,
+        text,
+        name,
+        edge_kind,
+        EdgeConfidence::NameOnly,
+        swift_edge_context(&identifiers),
+        identifier_nodes.last().copied().map(CalleeRange::of_node),
+    ));
+}
+
+fn swift_user_type_edges(
+    text: &str,
+    node: Node<'_>,
+    locator: &SymbolLocator<'_>,
+    out: &mut EdgeEmitter<'_>,
+) {
+    let identifier_nodes = syntax::identifier_nodes(node);
+    let Some(type_node) = identifier_nodes.last().copied() else {
+        return;
+    };
+    let identifiers =
+        identifier_nodes.iter().map(|&identifier| node_text(identifier, text)).collect::<Vec<_>>();
+    let Some(name) = identifiers.last().cloned() else {
+        return;
+    };
+    out.push(symbol_edge_with_context(
+        locator,
+        node,
+        text,
+        name,
+        EdgeKind::ReferencesType,
+        EdgeConfidence::NameOnly,
+        swift_edge_context(&identifiers),
+        Some(CalleeRange::of_node(type_node)),
+    ));
+}
+
+fn swift_type_identifier_edges(
+    text: &str,
+    node: Node<'_>,
+    locator: &SymbolLocator<'_>,
+    out: &mut EdgeEmitter<'_>,
+) {
+    let name = node_text(node, text);
+    out.push(symbol_edge(
+        locator,
+        node,
+        name,
+        EdgeKind::ReferencesType,
+        EdgeConfidence::NameOnly,
+        Some(CalleeRange::of_node(node)),
+    ));
 }
 
 fn swift_operator_or_shorthand_case_edges(

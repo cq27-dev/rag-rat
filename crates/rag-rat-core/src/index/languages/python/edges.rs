@@ -9,152 +9,13 @@ use crate::index::edges::*;
 
 pub(in crate::index::languages) fn python_edges(
     EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
-    emit: &mut EdgeEmitter<'_>,
+    out: &mut EdgeEmitter<'_>,
 ) {
-    let out = emit;
     match node.kind() {
-        // `from <module> import <name|name as alias>, ...` — emit Imports edges to the MODULE and
-        // to each imported NAME, never the local alias. A relative import (`.sessions`)
-        // normalizes to its dotted tail (the leading dots aren't identifiers), so the
-        // module name is recorded separately from any `as` alias.
-        "import_from_statement" => {
-            let module = node.child_by_field_name("module_name");
-            if let Some(module) = module
-                && let Some(name) = last_identifier_text(module, text)
-            {
-                out.push(file_edge(
-                    path,
-                    module,
-                    text,
-                    name,
-                    EdgeKind::Imports,
-                    EdgeConfidence::NameOnly,
-                ));
-            }
-            // Record an alias for the rebind ONLY when the from-import is BOTH module-bound AND
-            // RELATIVE (`from .compat import X as Y`). Two gates:
-            //  - module-bound: a `def`/`class`-nested import binds the alias only in that local
-            //    scope, so a whole-file alias scope would rebind unrelated same-name references; it
-            //    binds file-wide at top level and inside transparent `if`/`try`/`with`/`for`
-            //    blocks.
-            //  - relative: a relative import provably names an IN-CORPUS sibling module, so
-            //    rebinding its alias to the in-corpus target is safe. An ABSOLUTE import (`from
-            //    urllib3.util import Timeout as TimeoutSauce`) is usually EXTERNAL — rebinding
-            //    `TimeoutSauce` → bare `Timeout` would mis-bind to a same-named LOCAL class
-            //    (`requests.exceptions .Timeout`), a real precision regression measured on
-            //    psf/requests (#174 review). Distinguishing absolute-in-corpus from
-            //    absolute-external needs a Python package model we don't have; relative is the
-            //    correct-by-construction in-corpus subset.
-            // A non-recorded alias still emits its plain target Imports edge (dependency captured).
-            let record_alias =
-                is_python_module_bound(node) && python_from_import_is_relative(node, text);
-            let import_start = node.start_byte();
-            // The module root is needed to bound the alias's scope at the next module-scope
-            // rebinding of the alias name (#174 review) — see `python_import_target`.
-            let module_root = record_alias.then(|| python_module_root(node)).flatten();
-            let module_id = module.map(|m| m.id());
-            for child in named_children(node) {
-                if Some(child.id()) == module_id {
-                    continue;
-                }
-                python_import_target(
-                    child,
-                    text,
-                    path,
-                    record_alias,
-                    import_start,
-                    module_root,
-                    out,
-                );
-            }
-        },
-        // `import <module>` / `import <module> as alias` — Imports edge to the module, not the
-        // alias.
-        "import_statement" =>
-            for child in named_children(node) {
-                python_import_target(child, text, path, false, node.start_byte(), None, out);
-            },
-        // Function / method / constructor call. Mirror the C handler: the callee is the LAST
-        // identifier under the `function` child (`f()` → `f`, `obj.method()` → `method`), the
-        // receiver is the first (recorded only as a NameOnly hint — never claimed as exact;
-        // resolving it is the oracle's job, not the heuristic's).
-        "call" => {
-            let function = node.child_by_field_name("function").unwrap_or(node);
-            let identifiers = IdentifierPath::under(function, text);
-            // `handlers[key]()` — the callee is the subscript RESULT, not the index variable
-            // `last()` would pick. There's no clean callee identifier, so emit nothing (a wrong
-            // `calls_name key` is worse than a missing edge).
-            if function.kind() == "subscript" {
-                // fall through to recursion without emitting a call edge
-            } else if let Some(name) = identifiers.last_text().map(ToOwned::to_owned) {
-                out.push(symbol_edge_with_context(
-                    locator,
-                    node,
-                    text,
-                    name,
-                    EdgeKind::CallsName,
-                    EdgeConfidence::NameOnly,
-                    EdgeContext {
-                        target_qualified_name: identifiers.qualified_name(),
-                        receiver_hint: identifiers
-                            .first_text()
-                            .filter(|_| identifiers.len() > 1)
-                            .map(ToOwned::to_owned),
-                        ..Default::default()
-                    },
-                    identifiers.last_node().map(CalleeRange::of_node),
-                ));
-            }
-        },
-        // `class Foo(Base, Generic[T], metaclass=Meta)` — each POSITIONAL base is an Implements +
-        // ReferencesType edge. Keyword (`metaclass=`) and splat (`*bases`/`**kw`) arguments are not
-        // superclasses, and a parameterized base resolves to its head (`Generic`, not `T`).
-        "class_definition" =>
-            if let Some(supers) = node.child_by_field_name("superclasses") {
-                for base in named_children(supers) {
-                    if matches!(base.kind(), "keyword_argument" | "list_splat" | "dictionary_splat")
-                    {
-                        continue;
-                    }
-                    // Emit Implements ONLY for a STATIC head — a plain identifier, or an attribute
-                    // whose receiver chain is all identifiers and not `self`/`cls` (`pkg.Base`),
-                    // after unwrapping generic/subscript/paren wrappers (#172 review). A DYNAMIC
-                    // base has no compile-time class — `factory()`,
-                    // `factory().Base`, `self.Base`, `Base if flag else Other`,
-                    // a lambda, … — so claiming an Implements edge would
-                    // let the Python class preference mis-bind it to a same-named local class. An
-                    // allowlist (vs blocklisting each dynamic form) is robust to new expression
-                    // kinds.
-                    //
-                    // Implements targets the base HEAD's LEAF name (`Base` for
-                    // `pkg.Base`/`Generic[T]` → `Generic`); ReferencesType
-                    // (below) covers the head and every type argument. The edge
-                    // is bare-name (no qualified context): a module-qualified base `pkg.Base`
-                    // is resolved by the leaf `Base` exactly like a bare base, because a top-level
-                    // Python class's `scope_path` is the bare name, not `pkg::Base`. The cost is
-                    // that an EXTERNAL `pkg.Base`/bare imported base can still
-                    // bind a same-named local class — the general "Python has
-                    // no external-import suppression" gap (#172/#174
-                    // review), which needs an in-corpus Python module model to close, not a
-                    // per-base special case.
-                    if let Some(head) = python_static_base_head(base, text)
-                        && let Some(name) = last_identifier_text(head, text)
-                    {
-                        let callee = last_identifier_node(head)
-                            .map(final_segment_node)
-                            .map(CalleeRange::of_node);
-                        out.push(symbol_edge(
-                            locator,
-                            base,
-                            name,
-                            EdgeKind::Implements,
-                            EdgeConfidence::NameOnly,
-                            callee,
-                        ));
-                    }
-                    emit_python_type_refs(base, locator, text, out);
-                }
-            },
+        "import_from_statement" => python_from_import_edges(text, node, path, out),
+        "import_statement" => python_import_statement_edges(text, node, path, out),
+        "call" => python_call_edges(text, node, locator, out),
+        "class_definition" => python_class_edges(text, node, locator, out),
         // Type annotations (`x: T`, `-> T`) wrap their type in a `type` node.
         // `emit_python_type_refs` walks the whole type expression — generics (`Box[Item]`),
         // qualified generics (`typing.Optional[Api]`), unions (`A | B`), nested
@@ -164,42 +25,193 @@ pub(in crate::index::languages) fn python_edges(
         "type" if !python_is_type_alias_name(node) => {
             emit_python_type_refs(node, locator, text, out);
         },
-        // A bare decorator (`@requires_auth`, `@pytest.fixture`) is an identifier/attribute, not a
-        // `call` — applying it is a call-like dependency, so emit a NameOnly call edge. A
-        // parenthesized decorator (`@foo(...)`) is a `call` child, already handled by the call arm
-        // via recursion.
-        "decorator" => {
-            if let Some(inner) = node.named_child(0)
-                && matches!(inner.kind(), "identifier" | "attribute")
-            {
-                let identifiers = IdentifierPath::under(inner, text);
-                let Some(name) = identifiers.last_text().map(ToOwned::to_owned) else {
-                    return;
-                };
-                // Preserve the qualifier so a qualified decorator (`@pytest.fixture`) carries its
-                // `pytest` receiver + dotted path — same context the call arm records — so the
-                // resolver doesn't fall back to a bare local `fixture` of the same name.
-                out.push(symbol_edge_with_context(
-                    locator,
-                    node,
-                    text,
-                    name,
-                    EdgeKind::CallsName,
-                    EdgeConfidence::NameOnly,
-                    EdgeContext {
-                        target_qualified_name: identifiers.qualified_name(),
-                        receiver_hint: identifiers
-                            .first_text()
-                            .filter(|_| identifiers.len() > 1)
-                            .map(ToOwned::to_owned),
-                        ..Default::default()
-                    },
-                    identifiers.last_node().map(final_segment_node).map(CalleeRange::of_node),
-                ));
-            }
-        },
+        "decorator" => python_decorator_edges(text, node, locator, out),
         _ => {},
     }
+}
+
+/// `from <module> import <name|name as alias>, ...` — emit Imports edges to the MODULE and to each
+/// imported NAME, never the local alias. A relative import (`.sessions`) normalizes to its dotted
+/// tail (the leading dots aren't identifiers), so the module name is recorded separately from any
+/// `as` alias.
+fn python_from_import_edges(text: &str, node: Node<'_>, path: &Path, out: &mut EdgeEmitter<'_>) {
+    let module = node.child_by_field_name("module_name");
+    if let Some(module) = module
+        && let Some(name) = last_identifier_text(module, text)
+    {
+        out.push(file_edge(path, module, text, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+    }
+    // Record an alias for the rebind ONLY when the from-import is BOTH module-bound AND
+    // RELATIVE (`from .compat import X as Y`). Two gates:
+    //  - module-bound: a `def`/`class`-nested import binds the alias only in that local scope, so a
+    //    whole-file alias scope would rebind unrelated same-name references; it binds file-wide at
+    //    top level and inside transparent `if`/`try`/`with`/`for` blocks.
+    //  - relative: a relative import provably names an IN-CORPUS sibling module, so rebinding its
+    //    alias to the in-corpus target is safe. An ABSOLUTE import (`from urllib3.util import
+    //    Timeout as TimeoutSauce`) is usually EXTERNAL — rebinding `TimeoutSauce` → bare `Timeout`
+    //    would mis-bind to a same-named LOCAL class (`requests.exceptions .Timeout`), a real
+    //    precision regression measured on psf/requests (#174 review). Distinguishing
+    //    absolute-in-corpus from absolute-external needs a Python package model we don't have;
+    //    relative is the correct-by-construction in-corpus subset.
+    // A non-recorded alias still emits its plain target Imports edge (dependency captured).
+    let record_alias = is_python_module_bound(node) && python_from_import_is_relative(node, text);
+    let import_start = node.start_byte();
+    // The module root is needed to bound the alias's scope at the next module-scope
+    // rebinding of the alias name (#174 review) — see `python_import_target`.
+    let module_root = record_alias.then(|| python_module_root(node)).flatten();
+    let module_id = module.map(|m| m.id());
+    for child in named_children(node) {
+        if Some(child.id()) == module_id {
+            continue;
+        }
+        python_import_target(child, text, path, record_alias, import_start, module_root, out);
+    }
+}
+
+/// `import <module>` / `import <module> as alias` — Imports edge to the module, not the alias.
+fn python_import_statement_edges(
+    text: &str,
+    node: Node<'_>,
+    path: &Path,
+    out: &mut EdgeEmitter<'_>,
+) {
+    for child in named_children(node) {
+        python_import_target(child, text, path, false, node.start_byte(), None, out);
+    }
+}
+
+/// Function / method / constructor call. Mirror the C handler: the callee is the LAST identifier
+/// under the `function` child (`f()` → `f`, `obj.method()` → `method`), the receiver is the first
+/// (recorded only as a NameOnly hint — never claimed as exact; resolving it is the oracle's job,
+/// not the heuristic's).
+fn python_call_edges(
+    text: &str,
+    node: Node<'_>,
+    locator: &SymbolLocator<'_>,
+    out: &mut EdgeEmitter<'_>,
+) {
+    let function = node.child_by_field_name("function").unwrap_or(node);
+    let identifiers = IdentifierPath::under(function, text);
+    // `handlers[key]()` — the callee is the subscript RESULT, not the index variable
+    // `last()` would pick. There's no clean callee identifier, so emit nothing (a wrong
+    // `calls_name key` is worse than a missing edge).
+    if function.kind() == "subscript" {
+        // fall through to recursion without emitting a call edge
+    } else if let Some(name) = identifiers.last_text().map(ToOwned::to_owned) {
+        out.push(symbol_edge_with_context(
+            locator,
+            node,
+            text,
+            name,
+            EdgeKind::CallsName,
+            EdgeConfidence::NameOnly,
+            EdgeContext {
+                target_qualified_name: identifiers.qualified_name(),
+                receiver_hint: identifiers
+                    .first_text()
+                    .filter(|_| identifiers.len() > 1)
+                    .map(ToOwned::to_owned),
+                ..Default::default()
+            },
+            identifiers.last_node().map(CalleeRange::of_node),
+        ));
+    }
+}
+
+/// `class Foo(Base, Generic[T], metaclass=Meta)` — each POSITIONAL base is an Implements +
+/// ReferencesType edge. Keyword (`metaclass=`) and splat (`*bases`/`**kw`) arguments are not
+/// superclasses, and a parameterized base resolves to its head (`Generic`, not `T`).
+fn python_class_edges(
+    text: &str,
+    node: Node<'_>,
+    locator: &SymbolLocator<'_>,
+    out: &mut EdgeEmitter<'_>,
+) {
+    let Some(supers) = node.child_by_field_name("superclasses") else {
+        return;
+    };
+    for base in named_children(supers) {
+        if matches!(base.kind(), "keyword_argument" | "list_splat" | "dictionary_splat") {
+            continue;
+        }
+        // Emit Implements ONLY for a STATIC head — a plain identifier, or an attribute
+        // whose receiver chain is all identifiers and not `self`/`cls` (`pkg.Base`),
+        // after unwrapping generic/subscript/paren wrappers (#172 review). A DYNAMIC
+        // base has no compile-time class — `factory()`,
+        // `factory().Base`, `self.Base`, `Base if flag else Other`,
+        // a lambda, … — so claiming an Implements edge would
+        // let the Python class preference mis-bind it to a same-named local class. An
+        // allowlist (vs blocklisting each dynamic form) is robust to new expression
+        // kinds.
+        //
+        // Implements targets the base HEAD's LEAF name (`Base` for
+        // `pkg.Base`/`Generic[T]` → `Generic`); ReferencesType
+        // (below) covers the head and every type argument. The edge
+        // is bare-name (no qualified context): a module-qualified base `pkg.Base`
+        // is resolved by the leaf `Base` exactly like a bare base, because a top-level
+        // Python class's `scope_path` is the bare name, not `pkg::Base`. The cost is
+        // that an EXTERNAL `pkg.Base`/bare imported base can still
+        // bind a same-named local class — the general "Python has
+        // no external-import suppression" gap (#172/#174
+        // review), which needs an in-corpus Python module model to close, not a
+        // per-base special case.
+        if let Some(head) = python_static_base_head(base, text)
+            && let Some(name) = last_identifier_text(head, text)
+        {
+            let callee =
+                last_identifier_node(head).map(final_segment_node).map(CalleeRange::of_node);
+            out.push(symbol_edge(
+                locator,
+                base,
+                name,
+                EdgeKind::Implements,
+                EdgeConfidence::NameOnly,
+                callee,
+            ));
+        }
+        emit_python_type_refs(base, locator, text, out);
+    }
+}
+
+/// A bare decorator (`@requires_auth`, `@pytest.fixture`) is an identifier/attribute, not a `call`
+/// — applying it is a call-like dependency, so emit a NameOnly call edge. A parenthesized
+/// decorator (`@foo(...)`) is a `call` child, already handled by the call arm via recursion.
+fn python_decorator_edges(
+    text: &str,
+    node: Node<'_>,
+    locator: &SymbolLocator<'_>,
+    out: &mut EdgeEmitter<'_>,
+) {
+    let Some(inner) = node.named_child(0) else {
+        return;
+    };
+    if !matches!(inner.kind(), "identifier" | "attribute") {
+        return;
+    }
+    let identifiers = IdentifierPath::under(inner, text);
+    let Some(name) = identifiers.last_text().map(ToOwned::to_owned) else {
+        return;
+    };
+    // Preserve the qualifier so a qualified decorator (`@pytest.fixture`) carries its
+    // `pytest` receiver + dotted path — same context the call arm records — so the
+    // resolver doesn't fall back to a bare local `fixture` of the same name.
+    out.push(symbol_edge_with_context(
+        locator,
+        node,
+        text,
+        name,
+        EdgeKind::CallsName,
+        EdgeConfidence::NameOnly,
+        EdgeContext {
+            target_qualified_name: identifiers.qualified_name(),
+            receiver_hint: identifiers
+                .first_text()
+                .filter(|_| identifiers.len() > 1)
+                .map(ToOwned::to_owned),
+            ..Default::default()
+        },
+        identifiers.last_node().map(final_segment_node).map(CalleeRange::of_node),
+    ));
 }
 
 /// Emit `ReferencesType` edges for a subscript-form generic's type arguments, RECURSIVELY so nested

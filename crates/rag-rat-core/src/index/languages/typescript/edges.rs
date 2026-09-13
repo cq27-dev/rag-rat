@@ -3,9 +3,8 @@ use crate::index::edges::*;
 
 pub(in crate::index::languages) fn typescript_edges(
     EdgeVisit { text, node, symbols: _, path, locator }: EdgeVisit<'_, '_, '_>,
-    emit: &mut EdgeEmitter<'_>,
+    out: &mut EdgeEmitter<'_>,
 ) {
-    let out = emit;
     match node.kind() {
         "import_statement" =>
             for name in identifiers_under(node, text) {
