@@ -67,44 +67,40 @@ impl IndexDatabase {
         // unset → rm's purge waits for this commit and sweeps the re-inserted rows itself. The
         // heal deliberately stays LOCKLESS at the flock level — it must run alongside a
         // mid-flight rebuild (`a_lockless_heal_mid_rebuild_does_not_remove_the_staged_row`).
-        let conn = self.storage.connection();
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-        let active_repo_id = rag_rat_db::schema::active_repo_id(&tx)?;
-        super::remove::assert_repo_not_removed(&tx, &active_repo_id)?;
+        self.in_immediate_txn(|| {
+            let conn = self.storage.connection();
+            let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+            super::remove::assert_repo_not_removed(conn, &active_repo_id)?;
 
-        let Some(text) = text else {
-            // File deleted on disk since indexing — drop it from the index rather than
-            // hard-erroring the whole search. The caller (search_with_heal) re-runs
-            // search without it. Mirrors read_chunk_current's deletion handling.
-            self.mark_file_deleted(path)?;
-            tx.commit()?;
-            return Ok(());
-        };
+            let Some(text) = text else {
+                // File deleted on disk since indexing — drop it from the index rather than
+                // hard-erroring the whole search. The caller (search_with_heal) re-runs
+                // search without it. Mirrors read_chunk_current's deletion handling.
+                return self.mark_file_deleted(path);
+            };
 
-        let is_dirty = changes.changed.contains(path);
-        let has_base_commit = !self.active_commit_sha.is_empty();
-        let scope = if !has_base_commit || is_dirty {
-            FileScope::worktree(self.active_worktree_id.clone())
-        } else {
-            FileScope::commit(self.active_commit_sha.clone())
-        };
-        self.remove_file_in_scope(path, &scope.commit_sha, &scope.worktree_id)?;
+            let is_dirty = changes.changed.contains(path);
+            let has_base_commit = !self.active_commit_sha.is_empty();
+            let scope = if !has_base_commit || is_dirty {
+                FileScope::worktree(self.active_worktree_id.clone())
+            } else {
+                FileScope::commit(self.active_commit_sha.clone())
+            };
+            self.remove_file_in_scope(path, &scope.commit_sha, &scope.worktree_id)?;
 
-        self.index_file(
-            path,
-            row.language,
-            row.kind,
-            file_metadata_ms(&full_path)?,
-            &text,
-            &scope,
-        )?;
-        // Defer: a single-file heal must not stamp the logical-key version — every other file's
-        // drift is still in the future (#493).
-        self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
-        self.resolve_edges()?;
-        tx.commit()?;
-        Ok(())
+            self.index_file(
+                path,
+                row.language,
+                row.kind,
+                file_metadata_ms(&full_path)?,
+                &text,
+                &scope,
+            )?;
+            // Defer: a single-file heal must not stamp the logical-key version — every other
+            // file's drift is still in the future (#493).
+            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+            self.resolve_edges()
+        })
     }
 
     /// The deletion half of a heal, gated exactly like [`Self::heal_file`] (#767 review): the
@@ -113,14 +109,12 @@ impl IndexDatabase {
     /// in an IMMEDIATE transaction with the removal tombstone re-checked inside (the transaction
     /// serializes with rm's purge on the SQLite write lock — see `heal_file`).
     pub(crate) fn mark_file_deleted_if_not_removed(&self, path: &Path) -> anyhow::Result<()> {
-        let conn = self.storage.connection();
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-        let active_repo_id = rag_rat_db::schema::active_repo_id(&tx)?;
-        super::remove::assert_repo_not_removed(&tx, &active_repo_id)?;
-        self.mark_file_deleted(path)?;
-        tx.commit()?;
-        Ok(())
+        self.in_immediate_txn(|| {
+            let conn = self.storage.connection();
+            let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+            super::remove::assert_repo_not_removed(conn, &active_repo_id)?;
+            self.mark_file_deleted(path)
+        })
     }
 
     fn index_file(

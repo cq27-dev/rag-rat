@@ -75,6 +75,29 @@ impl IndexDatabase {
         self.storage.fold_wal();
     }
 
+    /// Run `f` inside one `BEGIN IMMEDIATE` transaction on this connection, with
+    /// `rusqlite::Transaction` semantics: COMMIT when `f` returns `Ok`; the guard rolls back
+    /// (best-effort — the original error is what surfaces) when `f` errors, when the COMMIT fails,
+    /// or when `f` panics and the unwind drops it. IMMEDIATE takes the write lock up front, so a
+    /// racing writer waits out busy_timeout instead of failing a deferred read→write upgrade with
+    /// SQLITE_BUSY. Used by the heal paths, whose contract this is. Sites with a different failure
+    /// policy keep their own BEGIN/COMMIT: the standalone finalize and the generated-flags heal
+    /// leave a failed COMMIT's transaction open, and the rebuild's wave loop and phase-2/terminal
+    /// transactions leave the rollback to the rebuild's outer handler, which joins the
+    /// git-history worker first.
+    pub(super) fn in_immediate_txn<T>(
+        &self,
+        f: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            self.storage.connection(),
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let value = f()?;
+        tx.commit()?;
+        Ok(value)
+    }
+
     /// Open the DB at `path` and bring its schema current, migrating FORWARD under the index write
     /// lock when it lags this binary. Shared by every open path; resolves NO repo scope (the caller
     /// does — a bare open via [`sole_repo_id`](schema::sole_repo_id), a config-bearing open via
@@ -961,6 +984,63 @@ fn write_repo_generation_view(
         ",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod immediate_txn_tests {
+    use std::panic::{self, AssertUnwindSafe};
+    use std::path::Path;
+
+    use rag_rat_base::repo_identity::{RepoIdentity, RepoIdentityClass};
+    use rag_rat_base::test_scratch::ScratchDir;
+    use rag_rat_db::schema::{self, register_repo};
+    use rag_rat_db::storage::IndexConnection;
+
+    use crate::index::IndexDatabase;
+
+    /// A panic inside the body must not strand the IMMEDIATE transaction on a connection the caller
+    /// keeps — the `rusqlite::Transaction` contract the heal paths relied on: the unwind rolls the
+    /// body's writes back and returns the connection to autocommit.
+    #[test]
+    fn a_panicking_body_rolls_the_transaction_back() {
+        let scratch = ScratchDir::new("immediate-txn-panic");
+        let path = scratch.path().join("rag-rat.sqlite");
+        {
+            let conn = IndexConnection::open(&path).unwrap();
+            schema::apply(conn.connection(), &crate::index::migration_hooks()).unwrap();
+            register_repo(
+                conn.connection(),
+                &RepoIdentity {
+                    repo_id: "repo-txn".to_string(),
+                    display_name: "txn".to_string(),
+                    class: RepoIdentityClass::Portable,
+                    shallow_boundary: Vec::new(),
+                },
+                Path::new("/src/txn"),
+                1,
+                &crate::index::migration_hooks(),
+            )
+            .unwrap();
+        }
+        let db = IndexDatabase::open(&path).unwrap();
+
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            db.in_immediate_txn(|| -> anyhow::Result<()> {
+                db.connection().execute_batch("CREATE TABLE txn_probe(x)")?;
+                panic!("body panics mid-transaction");
+            })
+        }));
+
+        assert!(outcome.is_err(), "the panic propagates");
+        assert!(db.connection().is_autocommit(), "the unwind closed the transaction");
+        let probe_tables: i64 = db
+            .connection()
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'txn_probe'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(probe_tables, 0, "the body's write rolled back");
+    }
 }
 
 #[cfg(test)]
