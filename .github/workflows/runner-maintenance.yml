@@ -28,12 +28,32 @@ jobs:
           command -v cargo-sweep >/dev/null || cargo install --locked cargo-sweep
           # cargo-sweep reads the target dir through `cargo metadata` of a checkout; this one serves
           # for every dir, since they were all built from this workspace.
-          for dir in "$HOME"/actions-runner*/cargo-target "$HOME"/cargo-target-coverage; do
+          # cargo-sweep removes files without taking Cargo's build-directory lock, and a sibling
+          # runner may be mid-build in the dir being swept. Hold every profile's `.cargo-lock` for the
+          # sweep (the lock Cargo blocks on), so a build in progress finishes first and one starting
+          # waits; the coverage dir's cycle-wide lock is held the same way.
+          sweep() {
+            local dir=$1; shift
+            local locks=()
+            for lock in "$dir"/*/.cargo-lock "$dir"/*/*/.cargo-lock; do
+              [ -e "$lock" ] && locks+=("$lock")
+            done
+            if [ ${#locks[@]} -eq 0 ]; then CARGO_TARGET_DIR="$dir" cargo sweep --maxsize 30GB; return; fi
+            local cmd=(env "CARGO_TARGET_DIR=$dir" cargo sweep --maxsize 30GB)
+            for lock in "${locks[@]}"; do cmd=(flock "$lock" "${cmd[@]}"); done
+            "${cmd[@]}"
+          }
+          for dir in "$HOME"/actions-runner*/cargo-target; do
             [ -d "$dir" ] || continue
             echo "== $dir: $(du -sh "$dir" | cut -f1) before"
-            CARGO_TARGET_DIR="$dir" cargo sweep --maxsize 30GB
+            sweep "$dir"
             echo "== $dir: $(du -sh "$dir" | cut -f1) after"
           done
+          if [ -d "$HOME/cargo-target-coverage" ]; then
+            echo "== coverage: $(du -sh "$HOME/cargo-target-coverage" | cut -f1) before"
+            flock "$HOME/cargo-target-coverage.lock" env CARGO_TARGET_DIR="$HOME/cargo-target-coverage" cargo sweep --maxsize 30GB
+            echo "== coverage: $(du -sh "$HOME/cargo-target-coverage" | cut -f1) after"
+          fi
       - name: Prune dangling Docker layers
         run: docker image prune -f
       - name: Report
