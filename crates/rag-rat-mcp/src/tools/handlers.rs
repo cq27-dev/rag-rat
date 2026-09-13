@@ -1,5 +1,34 @@
 use super::*;
 
+/// The one spelling of a symbol tool's [`SymbolSelector`]: every symbol arg struct carries the same
+/// selector fields, and `symbol_id` is never caller-supplied. `language` is spelled at each call
+/// site because only `symbol_lookup` and the `*_for_symbol` ref tools let the caller pin one. The
+/// `ref` form clones the two names for a handler that still reads them after resolving.
+macro_rules! selector_from {
+    ($args:expr, language: $language:expr) => {
+        SymbolSelector {
+            logical_symbol_id: $args.logical_symbol_id,
+            symbol_id: None,
+            symbol_path: $args.symbol_path,
+            symbol: $args.symbol,
+            language: $language,
+            allow_ambiguous: $args.allow_ambiguous,
+            limit: $args.limit,
+        }
+    };
+    (ref $args:expr, language: $language:expr) => {
+        SymbolSelector {
+            logical_symbol_id: $args.logical_symbol_id,
+            symbol_id: None,
+            symbol_path: $args.symbol_path.clone(),
+            symbol: $args.symbol.clone(),
+            language: $language,
+            allow_ambiguous: $args.allow_ambiguous,
+            limit: $args.limit,
+        }
+    };
+}
+
 pub(crate) fn call_tool_with_db(
     db: &IndexDatabase,
     name: &str,
@@ -352,7 +381,7 @@ pub(crate) fn graph_tool(
     let include_memories = included(&args.include, GraphInclude::Memories, true);
     let edge_kinds = graph_edge_kinds(args.edge_kinds.as_deref());
     let allow_ambiguous = args.allow_ambiguous;
-    let selector = graph_symbol_selector(&args)?;
+    let selector = selector_from!(ref args, language: None);
     let selected = db.select_symbol(&selector)?;
     match selected {
         Ok(Some(symbol)) => {
@@ -425,7 +454,7 @@ pub(crate) fn docs_for_symbol_tool(
     db: &IndexDatabase,
     args: SymbolGraphArgs,
 ) -> anyhow::Result<Value> {
-    let selector = graph_symbol_selector(&args)?;
+    let selector = selector_from!(ref args, language: None);
     match db.select_symbol(&selector)? {
         Ok(Some(symbol)) => Ok(json!(db.docs_for_selected_symbol(&symbol, args.limit)?)),
         Ok(None) if args.allow_ambiguous => {
@@ -444,15 +473,7 @@ pub(crate) fn compare_graph_to_text_tool(
     args: CompareGraphTextArgs,
     resolution_mode: GraphResolutionMode,
 ) -> anyhow::Result<Value> {
-    let selector = SymbolSelector {
-        logical_symbol_id: args.logical_symbol_id,
-        symbol_id: None,
-        symbol_path: args.symbol_path,
-        symbol: args.symbol,
-        language: None,
-        allow_ambiguous: args.allow_ambiguous,
-        limit: args.limit,
-    };
+    let selector = selector_from!(args, language: None);
     match db.select_symbol(&selector)? {
         Ok(Some(symbol)) => {
             let options = GraphTraversalOptions {
@@ -627,15 +648,7 @@ pub(crate) fn impact_tool(
         surface: memory_surface,
     };
     if args.logical_symbol_id.is_some() || args.symbol_path.is_some() || args.symbol.is_some() {
-        let selector = SymbolSelector {
-            logical_symbol_id: args.logical_symbol_id,
-            symbol_id: None,
-            symbol_path: args.symbol_path,
-            symbol: args.symbol,
-            language: None,
-            allow_ambiguous: args.allow_ambiguous,
-            limit: args.limit,
-        };
+        let selector = selector_from!(args, language: None);
         return match db.select_symbol(&selector)? {
             // The distilled-records drive-by lane (#705) is now part of the report itself — built,
             // capped, and truncation-signalled in `impact_surface_report_for_selected_symbol`.
@@ -663,15 +676,7 @@ pub(crate) fn memory_for_symbol_tool(
     args: MemoryForSymbolArgs,
     memory_surface: MemorySurface,
 ) -> anyhow::Result<Value> {
-    let selector = SymbolSelector {
-        logical_symbol_id: args.logical_symbol_id,
-        symbol_id: None,
-        symbol_path: args.symbol_path,
-        symbol: args.symbol,
-        language: None,
-        allow_ambiguous: args.allow_ambiguous,
-        limit: args.limit,
-    };
+    let selector = selector_from!(args, language: None);
     match db.select_symbol(&selector)? {
         Ok(Some(symbol)) => Ok(json!(db.memory_for_symbol(&symbol, args.limit, memory_surface)?)),
         Ok(None) => Ok(Value::Null),
@@ -706,27 +711,11 @@ fn important_symbols_tool(
 }
 
 pub(crate) fn symbol_selector(args: SymbolArgs) -> anyhow::Result<SymbolSelector> {
-    Ok(SymbolSelector {
-        logical_symbol_id: args.logical_symbol_id,
-        symbol_id: None,
-        symbol_path: args.symbol_path,
-        symbol: args.symbol,
-        language: optional_language(args.language)?,
-        allow_ambiguous: args.allow_ambiguous,
-        limit: args.limit,
-    })
+    Ok(selector_from!(args, language: optional_language(args.language)?))
 }
 
 pub(crate) fn symbol_ref_selector(args: SymbolRefArgs) -> anyhow::Result<SymbolSelector> {
-    Ok(SymbolSelector {
-        logical_symbol_id: args.logical_symbol_id,
-        symbol_id: None,
-        symbol_path: args.symbol_path,
-        symbol: args.symbol,
-        language: optional_language(args.language)?,
-        allow_ambiguous: args.allow_ambiguous,
-        limit: args.limit,
-    })
+    Ok(selector_from!(args, language: optional_language(args.language)?))
 }
 
 pub(crate) fn resolution_mode(value: Option<McpGraphResolutionMode>) -> GraphResolutionMode {
@@ -736,18 +725,6 @@ pub(crate) fn resolution_mode(value: Option<McpGraphResolutionMode>) -> GraphRes
 pub(crate) fn graph_edge_kinds(edge_kinds: Option<&[McpGraphEdgeKind]>) -> Option<Vec<String>> {
     edge_kinds.map(|edge_kinds| {
         edge_kinds.iter().map(|edge_kind| edge_kind.as_str().to_string()).collect()
-    })
-}
-
-pub(crate) fn graph_symbol_selector(args: &SymbolGraphArgs) -> anyhow::Result<SymbolSelector> {
-    Ok(SymbolSelector {
-        logical_symbol_id: args.logical_symbol_id,
-        symbol_id: None,
-        symbol_path: args.symbol_path.clone(),
-        symbol: args.symbol.clone(),
-        language: None,
-        allow_ambiguous: args.allow_ambiguous,
-        limit: args.limit,
     })
 }
 
