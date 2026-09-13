@@ -134,26 +134,27 @@ pub(super) fn coverage_gap(conn: &Connection, limit: usize) -> anyhow::Result<Ve
     if limit == 0 {
         return Ok(Vec::new());
     }
-    // `{binding_clause}`/`{b_clause}` are ` AND <table>.repo_id = '<id>'` under scope, empty
-    // pre-A5.
+    // `{b_clause}` is ` AND b.repo_id = '<id>'` under scope, empty pre-A5.
     let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
-    let binding_clause =
-        rag_rat_db::schema::periphery_repo_scope_clause(&scope, "repo_memory_bindings");
     let b_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "b");
 
     // Covered symbol ids: a direct `symbol_id` binding OR any member of a bound logical symbol.
+    // Each joins the memory: a binding whose synced memory the drain has removed is kept for
+    // `anchors/1` to carry, and covers nothing.
     let mut covered_symbols: HashSet<i64> = conn
         .prepare(&format!(
-            "SELECT symbol_id FROM repo_memory_bindings WHERE symbol_id IS NOT \
-             NULL{binding_clause}"
+            "SELECT b.symbol_id FROM repo_memory_bindings b
+             JOIN repo_memories m ON m.id = b.memory_id AND m.repo_id = b.repo_id
+             WHERE b.symbol_id IS NOT NULL{b_clause}"
         ))?
         .query_map([], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<_>>()?;
     let logical_members = conn
         .prepare(&format!(
             "SELECT lsm.symbol_id FROM logical_symbol_members lsm JOIN repo_memory_bindings b ON \
-             b.logical_symbol_id = lsm.logical_symbol_id WHERE b.logical_symbol_id IS NOT \
-             NULL{b_clause}"
+             b.logical_symbol_id = lsm.logical_symbol_id
+             JOIN repo_memories m ON m.id = b.memory_id AND m.repo_id = b.repo_id
+             WHERE b.logical_symbol_id IS NOT NULL{b_clause}"
         ))?
         .query_map([], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<Vec<i64>>>()?;
@@ -161,7 +162,9 @@ pub(super) fn coverage_gap(conn: &Connection, limit: usize) -> anyhow::Result<Ve
 
     let covered_paths: HashSet<String> = conn
         .prepare(&format!(
-            "SELECT path FROM repo_memory_bindings WHERE path IS NOT NULL{binding_clause}"
+            "SELECT b.path FROM repo_memory_bindings b
+             JOIN repo_memories m ON m.id = b.memory_id AND m.repo_id = b.repo_id
+             WHERE b.path IS NOT NULL{b_clause}"
         ))?
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -1009,6 +1012,35 @@ mod tests {
             hub_finding.evidence.contains("PageRank"),
             "evidence cites the importance signal: {}",
             hub_finding.evidence
+        );
+    }
+
+    /// A binding whose memory row is gone — the drain keeps a removed synced memory's bindings for
+    /// `anchors/1` to carry — covers nothing: the symbol it names is still a coverage gap.
+    #[test]
+    fn a_binding_without_its_memory_covers_nothing() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let src = add_file(&c, "src/lib.rs", 0);
+        let hub = add_symbol(&c, src, "hub");
+        let a = add_symbol(&c, src, "a");
+        let b = add_symbol(&c, src, "b");
+        for (caller, cname) in [(a, "a"), (b, "b")] {
+            add_call(&c, src, (caller, cname), (hub, "hub"));
+        }
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, symbol_id, \
+             path, anchor_status, created_at_ms, repo_id) VALUES ('gone', 'symbol', 'bnd', ?1, \
+             'src/lib.rs', 'current', 0, 'r')",
+            [hub],
+        )
+        .unwrap();
+
+        let findings = coverage_gap(&c, 10).unwrap();
+        let subjects: Vec<&str> = findings.iter().map(|f| f.subject.as_str()).collect();
+        assert!(
+            subjects.contains(&"src/lib.rs::hub"),
+            "an orphan binding covers nothing: {subjects:?}"
         );
     }
 

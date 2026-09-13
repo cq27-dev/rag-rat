@@ -911,6 +911,168 @@ fn a_refresh_collision_deletes_the_stale_duplicate_binding() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// The same collision on a binding whose memory row is gone — the drain keeps a removed synced
+/// memory's bindings for `anchors/1` to carry (#1298) — deletes nothing: the delete would publish
+/// a `Remove` for a memory this device cannot show, and which rows collapse here need not be
+/// which collapse on a device where the memory is live. The loser's checkout-local handle is
+/// cleared instead, so that when the memory returns validation re-enters it into the relocation
+/// ladder — here it relocates by the source hash, the rename collides, and the duplicate is taken
+/// — rather than trusting the live handle and leaving the stale name in place for good.
+#[test]
+fn a_refresh_collision_on_a_binding_without_its_memory_deletes_nothing() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn gone_anchor(x: u8) -> u8 { x }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let real_id: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM logical_symbols WHERE logical_name = 'gone_anchor'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let live_qual: String = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT value FROM name_strings
+              WHERE id = (SELECT qualified_name_id FROM logical_symbols WHERE id = ?1)",
+            params![real_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let created = db
+        .memory_create(rag_rat_query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Bound to gone_anchor under two derivations, then removed".to_string(),
+            body: "A collision on a binding without its memory must not delete.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: rag_rat_query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: Some(real_id),
+                symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                tracker: None,
+                project: None,
+                item_key: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+                edge_path: None,
+                dir: None,
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id;
+    drop(db);
+
+    let fake_id: i64 = 424249;
+    {
+        let conn = rusqlite::Connection::open(&config.database).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute("UPDATE logical_symbols SET id = ?1 WHERE id = ?2", params![fake_id, real_id])
+            .unwrap();
+        conn.execute(
+            "UPDATE logical_symbol_members SET logical_symbol_id = ?1 WHERE logical_symbol_id = ?2",
+            params![fake_id, real_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE repo_memory_bindings
+                SET binding_id = 'legacy::gone_anchor', logical_symbol_id = ?1
+              WHERE memory_id = ?2 AND binding_kind = 'logical_symbol'",
+            params![fake_id, memory_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id,
+                        logical_symbol_id, anchor_status, created_at_ms)
+             VALUES (?1, 'logical_symbol', ?2, ?3, 'current', 0)",
+            params![memory_id, live_qual, fake_id],
+        )
+        .unwrap();
+        // The memory row goes; its bindings stay, as after a condemn. Keep the row's values to
+        // bring it back below, as a returning projection would.
+        conn.execute("DELETE FROM repo_memory_fts WHERE memory_id = ?1", params![memory_id])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE parked_memory_row AS SELECT * FROM repo_memories WHERE id = ?1",
+            params![memory_id],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM repo_memories WHERE id = ?1", params![memory_id]).unwrap();
+        conn.execute("DELETE FROM repo_meta WHERE key = 'logical_key_version'", []).unwrap();
+    }
+
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn gone_anchor(x: u8) -> u8 { x }\n\npub fn gone_appendix() {}\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let fresh_id: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT id FROM logical_symbols WHERE logical_name = 'gone_anchor'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let bindings_of = |db: &IndexDatabase| -> Vec<(String, Option<i64>, String)> {
+        let conn = db.storage.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT binding_id, logical_symbol_id, anchor_status FROM repo_memory_bindings
+                  WHERE memory_id = ?1 AND binding_kind = 'logical_symbol'
+                  ORDER BY binding_id",
+            )
+            .unwrap();
+        stmt.query_map(params![memory_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let mut expected = vec![
+        ("legacy::gone_anchor".to_string(), None, "unverified".to_string()),
+        (live_qual.clone(), Some(fresh_id), "current".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(
+        bindings_of(&db),
+        expected,
+        "the winner is realigned; the loser is kept with its handle cleared, not deleted"
+    );
+
+    // The memory returns; validation re-derives the handle-less row, renames it onto the live
+    // qualified name, and takes the duplicate on that collision.
+    db.storage
+        .connection()
+        .execute_batch(
+            "INSERT INTO repo_memories SELECT * FROM parked_memory_row;
+             DROP TABLE parked_memory_row;",
+        )
+        .unwrap();
+    db.memory_validate().unwrap();
+    assert_eq!(
+        bindings_of(&db),
+        vec![(live_qual, Some(fresh_id), "current".to_string())],
+        "one binding at the live qualified name once the memory is back"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// #493 review: vacating must run BEFORE the remap — an occupied id with no winner can itself be
 /// another drifted reference's legitimate target, and a post-remap vacate would wipe the freshly
 /// realigned references along with the stale ones.

@@ -1839,7 +1839,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 121, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 122, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
@@ -1981,6 +1981,50 @@ fn migration_120_memory_applied_anchor_snapshot() {
     let recorded: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM schema_version WHERE id = '120_memory_applied_anchor_snapshot'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
+}
+
+/// V122 (#1298) adds the table the drain parks a removed synced memory's applied-anchor baseline
+/// in; keyed by repo so a repo purge sweeps it, and a replay over a current store is a no-op.
+#[test]
+fn migration_122_memory_parked_anchor_baselines() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let strict: i64 = conn
+        .query_row(
+            "SELECT strict FROM pragma_table_list
+             WHERE schema = 'main' AND name = 'repo_memory_parked_baselines'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(strict, 1, "the parked-baseline table is STRICT");
+    let pk: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM pragma_table_info('repo_memory_parked_baselines') WHERE pk > 0 \
+             ORDER BY pk",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(pk, ["repo_id", "memory_id"]);
+    assert!(
+        schema::repo_scoped_table_names(&conn)
+            .unwrap()
+            .iter()
+            .any(|table| table == "repo_memory_parked_baselines"),
+        "a repo purge sweeps the parked baselines",
+    );
+    schema::migrations::apply_memory_parked_anchor_baselines(&conn).unwrap();
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '122_memory_parked_anchor_baselines'",
             [],
             |row| row.get(0),
         )
