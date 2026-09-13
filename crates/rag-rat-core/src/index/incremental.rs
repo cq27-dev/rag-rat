@@ -94,6 +94,30 @@ pub(crate) struct IncrementalPassReport {
     pub(crate) clone_delta_hint: Option<BTreeSet<String>>,
 }
 
+/// What the incremental write transaction changed — the counts and the package-map verdict the
+/// pass's re-derive gates branch on.
+struct PassEffects {
+    indexed: usize,
+    healed: usize,
+    carried: usize,
+    roots_changed: bool,
+}
+
+impl PassEffects {
+    /// Whether any file row was written, healed or carried — each moves symbols, so each needs the
+    /// logical re-derive + edge re-resolve tail.
+    fn any_rows_written(&self) -> bool {
+        self.indexed > 0 || self.healed > 0 || self.carried > 0
+    }
+
+    /// Whether the pass's only changes were per-file base-row replacements: no overlay heal, carry
+    /// or package-map change, any of which can shift grouping or resolution OUTSIDE the changed
+    /// files.
+    fn base_files_only(&self) -> bool {
+        self.healed == 0 && self.carried == 0 && !self.roots_changed
+    }
+}
+
 impl IndexDatabase {
     pub fn index_changed(config: &Config) -> anyhow::Result<Self> {
         Self::index_changed_with_progress(config, |_| {})
@@ -378,7 +402,7 @@ impl IndexDatabase {
         // here is publication authority and stays in this one transaction; the expensive reads are
         // already hoisted above, so the writer lock now covers only DB mutation.
         let write_started = std::time::Instant::now();
-        let result = (|| -> anyhow::Result<(bool, usize, usize, usize)> {
+        let result = (|| -> anyhow::Result<PassEffects> {
             // BEGIN IMMEDIATE: take the write lock up front so a racing writer waits out
             // busy_timeout instead of failing a deferred read→write upgrade with SQLITE_BUSY.
             db.storage.execute_batch("BEGIN IMMEDIATE")?;
@@ -438,9 +462,8 @@ impl IndexDatabase {
             // walk-free when there are no overlay candidates (#63).
             let healed =
                 db.heal_stale_overlay_rows(&config.root, &prepared.reindexed_base_paths())?;
-            let mut mutated = indexed > 0
-                || healed > 0
-                || carried > 0
+            let mut effects = PassEffects { indexed, healed, carried, roots_changed: false };
+            let mut mutated = effects.any_rows_written()
                 || source_root_changed
                 || git_meta_changed
                 || embedding_model_seeded
@@ -458,13 +481,12 @@ impl IndexDatabase {
             // still refreshes; `carried > 0` also refreshes (#502) since the package
             // map is keyed by `(commit_sha, worktree_id)`. `refresh_packages` returns
             // whether the map changed, forcing a re-resolve.
-            let roots_changed =
-                if indexed > 0 || healed > 0 || carried > 0 || manifest_in_change_set {
-                    db.refresh_packages(&config.root)?
-                } else {
-                    false
-                };
-            if roots_changed {
+            effects.roots_changed = if effects.any_rows_written() || manifest_in_change_set {
+                db.refresh_packages(&config.root)?
+            } else {
+                false
+            };
+            if effects.roots_changed {
                 mutated = true;
             }
             // Healing can delete overlay symbols (NULLing in-edges via `remove_file_in_scope`), so
@@ -472,7 +494,7 @@ impl IndexDatabase {
             // change re-resolves so `use new_crate::X` binds (#95); a carried scope
             // re-resolves so a carried caller's edge re-points at re-derived rowids
             // (#502).
-            if indexed > 0 || healed > 0 || carried > 0 || roots_changed {
+            if effects.any_rows_written() || effects.roots_changed {
                 // #820: a batch whose EVERY change was a key-stable file replacement keeps the
                 // grouped table correct by re-linking members inside this same transaction —
                 // the wholesale rebuild is owed only when a key set changed, or when the pass
@@ -482,7 +504,7 @@ impl IndexDatabase {
                 // untouched either way — the pass's tail settle below still consumes it.
                 let key_stable_relinks = match logical {
                     graph_index::LogicalGroupingUpkeep::RelinkMembers(relinks)
-                        if healed == 0 && carried == 0 && !roots_changed =>
+                        if effects.base_files_only() =>
                         Some(relinks),
                     _ => None,
                 };
@@ -519,7 +541,7 @@ impl IndexDatabase {
                 // the full active-scope pass. The narrowed set re-points every
                 // existing edge (no `find_callers` loss); only a purely NEW binding
                 // from an unchanged source is deferred to the next full pass.
-                let scoped_resolve = indexed > 0 && healed == 0 && carried == 0 && !roots_changed;
+                let scoped_resolve = indexed > 0 && effects.base_files_only();
                 if scoped_resolve {
                     db.resolve_changed_edges()?;
                 } else {
@@ -546,15 +568,16 @@ impl IndexDatabase {
                 db.storage.execute_batch("ROLLBACK")?;
             }
             progress(IndexProgress::Finished { files: indexed });
-            // Report whether index *content* changed (files added / edited / removed, or stale
-            // overlays healed — symbols move scope), so the watch loop can skip the reconcile /
-            // memory-validate tail on an idle sweep.
-            Ok((indexed > 0 || healed > 0, indexed, carried, healed))
+            Ok(effects)
         })();
         if result.is_err() {
             let _ = db.storage.execute_batch("ROLLBACK");
         }
-        let (content_changed, indexed, carried, healed) = result?;
+        let PassEffects { indexed, healed, carried, .. } = result?;
+        // Report whether index *content* changed (files added / edited / removed, or stale
+        // overlays healed — symbols move scope), so the watch loop can skip the reconcile /
+        // memory-validate tail on an idle sweep.
+        let content_changed = indexed > 0 || healed > 0;
         // #560 measurement: prepare (reads/parse) vs write (BEGIN IMMEDIATE..COMMIT) durations +
         // row counts, so the write-lock hold time is observable independently of the hoisted reads.
         tracing::debug!(
