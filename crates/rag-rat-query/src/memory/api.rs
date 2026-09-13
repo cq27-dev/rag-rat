@@ -957,8 +957,8 @@ pub fn validate_memories(
         // A scoped miss is not enough, however: the same valid id may belong to a linked-worktree
         // edge hidden from this checkout. Preserve that id so one checkout cannot erase another's
         // recall mapping before hysteresis has a chance to reconcile their observations.
-        let globally_live_hidden_edge = if status == "gone"
-            && binding.binding_kind == "edge"
+        let globally_live_hidden_edge = if status == AnchorStatus::Gone
+            && binding.binding_kind == BindingKind::Edge.as_db_str()
             && stored_edge_id.is_some()
             && binding.edge_id.is_none()
         {
@@ -976,9 +976,9 @@ pub fn validate_memories(
         };
         if globally_live_hidden_edge {
             binding.edge_id = stored_edge_id;
-            status = "pending".to_string();
-        } else if status == "gone"
-            && binding.binding_kind == "edge"
+            status = AnchorStatus::Pending;
+        } else if status == AnchorStatus::Gone
+            && binding.binding_kind == BindingKind::Edge.as_db_str()
             && stored_edge_id.is_some()
             && binding.edge_id.is_none()
         {
@@ -1005,7 +1005,7 @@ pub fn validate_memories(
         // window freezes the status rule entirely (see `staged_window` above). The REPORT keeps
         // counting the computed observation: what this pass saw is honest; only what doctor reads
         // is hysteresis-guarded.
-        if status == "gone" && stored_status != "gone" {
+        if status == AnchorStatus::Gone && stored_status != AnchorStatus::Gone.as_db_str() {
             if staged_window {
                 // Untrustworthy observation: leave status and its marker exactly as they were.
             } else if downgrade_pending_at_ms.is_none() {
@@ -1022,18 +1022,18 @@ pub fn validate_memories(
                     ],
                 )?;
             } else {
-                stamp_validated_binding(conn, scope.as_deref(), &binding, &status)?;
+                stamp_validated_binding(conn, scope.as_deref(), &binding, status)?;
             }
         } else {
-            stamp_validated_binding(conn, scope.as_deref(), &binding, &status)?;
+            stamp_validated_binding(conn, scope.as_deref(), &binding, status)?;
         }
-        match status.as_str() {
-            "current" => report.current += 1,
-            "relocated" => report.relocated += 1,
-            "stale" => report.stale += 1,
-            "gone" => report.gone += 1,
-            "pending" => report.pending += 1,
-            _ => report.unverified += 1,
+        match status {
+            AnchorStatus::Current => report.current += 1,
+            AnchorStatus::Relocated => report.relocated += 1,
+            AnchorStatus::Stale => report.stale += 1,
+            AnchorStatus::Gone => report.gone += 1,
+            AnchorStatus::Pending => report.pending += 1,
+            AnchorStatus::Unverified => report.unverified += 1,
         }
     }
     if report.checked > 0
@@ -1066,7 +1066,7 @@ fn stamp_validated_binding(
     conn: &Connection,
     repo_id: Option<&str>,
     binding: &RepoMemoryBinding,
-    status: &str,
+    status: AnchorStatus,
 ) -> anyhow::Result<()> {
     conn.execute(
         "
@@ -1082,7 +1082,7 @@ fn stamp_validated_binding(
         params![
             binding.memory_id,
             binding.binding_kind,
-            status,
+            status.as_db_str(),
             binding.logical_symbol_id,
             binding.symbol_id,
             binding.chunk_id,

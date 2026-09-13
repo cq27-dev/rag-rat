@@ -42,7 +42,7 @@ pub fn duplicate_memory_id(
             params![
                 title.trim(),
                 body.trim(),
-                binding.binding_kind,
+                binding.binding_kind.as_db_str(),
                 binding.binding_id,
                 payload_json,
                 kind
@@ -561,13 +561,18 @@ pub fn split_active_stale(memories: Vec<RepoMemory>) -> (Vec<RepoMemory>, Vec<Re
             // divergence cannot distinguish a peer running ahead from a local edit after a pull.
             || memory.synced_anchor_drifted
             || memory.bindings.iter().any(|binding| {
-                binding.binding_kind != SCIP_MONIKER_BINDING_KIND
+                binding.binding_kind != BindingKind::ScipMoniker.as_db_str()
                     && matches!(
-                        binding.anchor_status.as_str(),
+                        AnchorStatus::from_db_str(&binding.anchor_status).ok(),
                         // `pending` (#492) joins the demoted bucket: the anchored code is not in
                         // THIS context, so drive-by evidence must not present as confidently
                         // current — but unlike `gone` it draws no remediation.
-                        "stale" | "gone" | "unverified" | "pending"
+                        Some(
+                            AnchorStatus::Stale
+                                | AnchorStatus::Gone
+                                | AnchorStatus::Unverified
+                                | AnchorStatus::Pending
+                        )
                     )
             })
         {

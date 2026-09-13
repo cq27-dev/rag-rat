@@ -32,8 +32,7 @@ pub(crate) use hydrate::{
     attach_memory_children, binding_row, drive_by_memory, ids_to_memories, memory_row,
 };
 pub(crate) use moniker::{
-    MONIKER_MATCH_REASON, SCIP_MONIKER_BINDING_KIND, relocate_binding_by_moniker,
-    validate_moniker_binding,
+    MONIKER_MATCH_REASON, relocate_binding_by_moniker, validate_moniker_binding,
 };
 pub use moniker::{MonikerResolution, insert_auto_moniker_binding, resolve_moniker};
 use rag_rat_base::hash::hex_sha256;
@@ -203,6 +202,8 @@ pub struct RepoMemoryBinding {
     /// anchor never relocated or relocated via the default qualified-name/content paths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relocation_reason: Option<String>,
+    /// The stored [`AnchorStatus`] token. Like `binding_kind`, it stays a string: this struct is
+    /// the row as read and as serialized.
     pub anchor_status: String,
     pub created_at_ms: i64,
 }
@@ -233,6 +234,64 @@ impl RepoMemoryBinding {
     /// resolution rather than restating it, so "resolved" always means "moved".
     pub(crate) fn set_resolved_binding_id(&mut self, id: String) {
         self.resolved_binding_id = (id != self.binding_id).then_some(id);
+    }
+}
+
+/// The closed set of `repo_memory_bindings.binding_kind` tokens this build resolves and validates.
+///
+/// [`RepoMemoryBinding::binding_kind`] stays a string because a binding row replicates with its
+/// memory: a peer on a newer build can deliver a kind this one does not know, and that row must
+/// still load. It validates as `unverified` (see `validate_binding`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum BindingKind {
+    LogicalSymbol,
+    Symbol,
+    Chunk,
+    Edge,
+    CallPath,
+    ScipMoniker,
+    Path,
+    Dir,
+    Commit,
+    Tracker,
+}
+
+impl BindingKind {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown binding kind `{value}`"))
+    }
+}
+
+/// The closed set of `repo_memory_bindings.anchor_status` tokens: what the last validation of a
+/// binding concluded in this checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum AnchorStatus {
+    Current,
+    Relocated,
+    Stale,
+    Gone,
+    /// Absent in this checkout but alive in another indexed scope (#492).
+    Pending,
+    Unverified,
+}
+
+impl AnchorStatus {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown anchor status `{value}`"))
     }
 }
 
@@ -597,7 +656,7 @@ impl From<&RepoMemory> for CompactRepoMemory {
         let primary = memory
             .bindings
             .iter()
-            .find(|binding| binding.binding_kind != SCIP_MONIKER_BINDING_KIND)
+            .find(|binding| binding.binding_kind != BindingKind::ScipMoniker.as_db_str())
             .or_else(|| memory.bindings.first());
         Self {
             memory_id: memory.memory_id.clone(),
@@ -624,7 +683,7 @@ impl From<&RepoMemory> for CompactRepoMemory {
 
 #[derive(Debug)]
 pub struct ResolvedBinding {
-    pub binding_kind: String,
+    pub binding_kind: BindingKind,
     pub binding_id: String,
     pub path: Option<String>,
     pub start_line: Option<i64>,
@@ -641,7 +700,7 @@ pub struct ResolvedBinding {
     pub signature_hash: Option<String>,
     pub call_path: Option<ResolvedCallPath>,
     pub source_text_hash: Option<String>,
-    pub anchor_status: String,
+    pub anchor_status: AnchorStatus,
 }
 
 #[derive(Debug)]
@@ -783,13 +842,47 @@ mod tests {
     }
 
     #[test]
+    fn binding_kind_and_anchor_status_tokens_are_exact_and_round_trip() {
+        let kinds = [
+            (BindingKind::LogicalSymbol, "logical_symbol"),
+            (BindingKind::Symbol, "symbol"),
+            (BindingKind::Chunk, "chunk"),
+            (BindingKind::Edge, "edge"),
+            (BindingKind::CallPath, "call_path"),
+            (BindingKind::ScipMoniker, "scip_moniker"),
+            (BindingKind::Path, "path"),
+            (BindingKind::Dir, "dir"),
+            (BindingKind::Commit, "commit"),
+            (BindingKind::Tracker, "tracker"),
+        ];
+        for (kind, token) in kinds {
+            assert_eq!(kind.as_db_str(), token);
+            assert_eq!(BindingKind::from_db_str(token).unwrap(), kind);
+        }
+        let statuses = [
+            (AnchorStatus::Current, "current"),
+            (AnchorStatus::Relocated, "relocated"),
+            (AnchorStatus::Stale, "stale"),
+            (AnchorStatus::Gone, "gone"),
+            (AnchorStatus::Pending, "pending"),
+            (AnchorStatus::Unverified, "unverified"),
+        ];
+        for (status, token) in statuses {
+            assert_eq!(status.as_db_str(), token);
+            assert_eq!(AnchorStatus::from_db_str(token).unwrap(), status);
+        }
+        assert!(BindingKind::from_db_str("repo").is_err());
+        assert!(AnchorStatus::from_db_str("Current").is_err());
+    }
+
+    #[test]
     fn compact_header_skips_a_lagging_moniker_binding_for_the_real_anchor() {
         // `attach_memory_children` orders bindings by `binding_kind`, so a `scip_moniker` companion
         // (which can be `unverified`/`gone` between oracle runs, and which `split_active_stale`
         // deliberately ignores) sorts BEFORE the real `symbol` anchor. The compact header must skip
         // it, or an ACTIVE memory reads as stale (Codex on #194).
         let compact = CompactRepoMemory::from(&memory(vec![
-            binding(SCIP_MONIKER_BINDING_KIND, "unverified", None),
+            binding("scip_moniker", "unverified", None),
             binding("symbol", "current", Some("src/lib.rs")),
         ]));
         assert_eq!(compact.binding_kind.as_deref(), Some("symbol"));
@@ -802,12 +895,9 @@ mod tests {
     fn compact_header_falls_back_to_a_moniker_only_binding_set() {
         // A memory anchored ONLY by a moniker still gets a header (no non-moniker binding to
         // prefer).
-        let compact = CompactRepoMemory::from(&memory(vec![binding(
-            SCIP_MONIKER_BINDING_KIND,
-            "current",
-            None,
-        )]));
-        assert_eq!(compact.binding_kind.as_deref(), Some(SCIP_MONIKER_BINDING_KIND));
+        let compact =
+            CompactRepoMemory::from(&memory(vec![binding("scip_moniker", "current", None)]));
+        assert_eq!(compact.binding_kind.as_deref(), Some("scip_moniker"));
     }
 
     // ── dream-summary surfacing (`[memory] surface = "summary"`) ─────────────────

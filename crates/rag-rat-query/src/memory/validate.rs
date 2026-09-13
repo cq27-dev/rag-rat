@@ -6,18 +6,22 @@ pub(crate) fn validate_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
     fs_root: Option<&Path>,
-) -> anyhow::Result<String> {
-    match binding.binding_kind.as_str() {
-        "logical_symbol" => validate_logical_symbol_binding(conn, binding),
-        "symbol" => validate_symbol_binding(conn, binding),
-        "chunk" => validate_chunk_binding(conn, binding),
-        "edge" => validate_edge_binding(conn, binding),
-        "call_path" => validate_call_path_binding(conn, binding),
-        "scip_moniker" => validate_moniker_binding(conn, binding),
-        "path" => validate_path_binding(conn, binding, fs_root),
-        "dir" => validate_dir_binding(conn, binding, fs_root),
-        "commit" | "tracker" => Ok("unverified".to_string()),
-        _ => Ok("unverified".to_string()),
+) -> anyhow::Result<AnchorStatus> {
+    // A kind outside this build's set — a binding a peer on a newer build replicated here — has no
+    // validator, so it is reported, never guessed at.
+    let Ok(kind) = BindingKind::from_db_str(&binding.binding_kind) else {
+        return Ok(AnchorStatus::Unverified);
+    };
+    match kind {
+        BindingKind::LogicalSymbol => validate_logical_symbol_binding(conn, binding),
+        BindingKind::Symbol => validate_symbol_binding(conn, binding),
+        BindingKind::Chunk => validate_chunk_binding(conn, binding),
+        BindingKind::Edge => validate_edge_binding(conn, binding),
+        BindingKind::CallPath => validate_call_path_binding(conn, binding),
+        BindingKind::ScipMoniker => validate_moniker_binding(conn, binding),
+        BindingKind::Path => validate_path_binding(conn, binding, fs_root),
+        BindingKind::Dir => validate_dir_binding(conn, binding, fs_root),
+        BindingKind::Commit | BindingKind::Tracker => Ok(AnchorStatus::Unverified),
     }
 }
 /// Validate a `dir` binding: current while at least one indexed file lives at or under the
@@ -33,12 +37,12 @@ pub(crate) fn validate_dir_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
     fs_root: Option<&Path>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     let dir = binding.path.clone().unwrap_or_else(|| binding.current_binding_id().to_string());
     if dir_has_files(conn, &dir)? {
-        return Ok("current".to_string());
+        return Ok(AnchorStatus::Current);
     }
-    Ok(if dir_exists_on_disk(fs_root, &dir) { "current" } else { "gone" }.to_string())
+    Ok(if dir_exists_on_disk(fs_root, &dir) { AnchorStatus::Current } else { AnchorStatus::Gone })
 }
 /// Validate a binding against the live logical symbol `id` it resolves to.
 fn validate_live_logical_symbol(
@@ -46,7 +50,7 @@ fn validate_live_logical_symbol(
     binding: &mut RepoMemoryBinding,
     id: i64,
     qualified_name: String,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     // The handle proves WHICH group this is; record the name it carries as this store's
     // resolution, so a row whose resolution was reset — or whose authored name a stranger now
     // reuses — answers to the name of the target it actually points at (#1297).
@@ -58,8 +62,8 @@ fn validate_live_logical_symbol(
         binding.start_line = Some(chunk.start_line);
         binding.end_line = Some(chunk.end_line);
         return Ok(match source_hash_for_memory(conn, &binding.memory_id)? {
-            Some(expected) if expected != chunk.text_hash => "stale".to_string(),
-            _ => "current".to_string(),
+            Some(expected) if expected != chunk.text_hash => AnchorStatus::Stale,
+            _ => AnchorStatus::Current,
         });
     }
     validate_bound_chunk(conn, binding)
@@ -68,7 +72,7 @@ fn validate_live_logical_symbol(
 pub(crate) fn validate_logical_symbol_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     // A live handle is trusted — unless its writer marked the row retargeted and the handle's
     // target contradicts the recorded kind or signature (see `RETARGETED_REASON`); then it is held
     // back and the twins below are searched with the author's evidence first.
@@ -101,39 +105,40 @@ pub(crate) fn validate_logical_symbol_binding(
     // Land on the twin among those answering to `name` that the binding's discriminators pick
     // (#491: one qualified name can hold several live twins — a struct and its impl block,
     // overloads with distinct signatures — so a bare `LIMIT 1` is a plan-order coin flip).
-    let land = |binding: &mut RepoMemoryBinding, name: &str| -> anyhow::Result<Option<String>> {
-        let candidates = logical_twins_named(conn, name, &active_repo_id)?;
-        let picked =
-            pick_relocation_twin(candidates, binding, retargeted, published_scope.as_deref());
-        let Some(RelocationTwin { id, path, kind, signature, scope, .. }) = picked else {
-            return Ok(None);
+    let land =
+        |binding: &mut RepoMemoryBinding, name: &str| -> anyhow::Result<Option<AnchorStatus>> {
+            let candidates = logical_twins_named(conn, name, &active_repo_id)?;
+            let picked =
+                pick_relocation_twin(candidates, binding, retargeted, published_scope.as_deref());
+            let Some(RelocationTwin { id, path, kind, signature, scope, .. }) = picked else {
+                return Ok(None);
+            };
+            // Back at the row the retarget check held back: nothing that matches the author's
+            // evidence answers to the name. Validate it live rather than relocate onto
+            // itself; the mark stays for a checkout that holds the author's target.
+            if Some(id) == held_back {
+                return validate_live_logical_symbol(conn, binding, id, name.to_string()).map(Some);
+            }
+            if target_agrees(
+                binding,
+                &kind,
+                signature.as_deref(),
+                scope.as_deref(),
+                published_scope.as_deref(),
+            ) {
+                answer_retarget_mark(binding);
+            }
+            binding.set_resolved_binding_id(name.to_string());
+            binding.logical_symbol_id = Some(id);
+            binding.path = Some(path);
+            if let Some(chunk) = chunk_for_logical_symbol(conn, id)? {
+                binding.symbol_id = chunk.symbol_id;
+                binding.chunk_id = Some(chunk.chunk_id);
+                binding.start_line = Some(chunk.start_line);
+                binding.end_line = Some(chunk.end_line);
+            }
+            Ok(Some(AnchorStatus::Relocated))
         };
-        // Back at the row the retarget check held back: nothing that matches the author's evidence
-        // answers to the name. Validate it live rather than relocate onto itself; the mark stays
-        // for a checkout that holds the author's target.
-        if Some(id) == held_back {
-            return validate_live_logical_symbol(conn, binding, id, name.to_string()).map(Some);
-        }
-        if target_agrees(
-            binding,
-            &kind,
-            signature.as_deref(),
-            scope.as_deref(),
-            published_scope.as_deref(),
-        ) {
-            answer_retarget_mark(binding);
-        }
-        binding.set_resolved_binding_id(name.to_string());
-        binding.logical_symbol_id = Some(id);
-        binding.path = Some(path);
-        if let Some(chunk) = chunk_for_logical_symbol(conn, id)? {
-            binding.symbol_id = chunk.symbol_id;
-            binding.chunk_id = Some(chunk.chunk_id);
-            binding.start_line = Some(chunk.start_line);
-            binding.end_line = Some(chunk.end_line);
-        }
-        Ok(Some("relocated".to_string()))
-    };
     // The name this store last found the target under.
     let current = binding.current_binding_id().to_string();
     if let Some(status) = land(binding, &current)? {
@@ -157,16 +162,16 @@ pub(crate) fn validate_logical_symbol_binding(
             binding.symbol_kind = m.symbol_kind;
             binding.signature_hash = m.signature_hash;
             answer_retarget_mark(binding);
-            return Ok("relocated".to_string());
+            return Ok(AnchorStatus::Relocated);
         }
     }
     if relocate_by_moniker(conn, binding)? {
-        return Ok("relocated".to_string());
+        return Ok(AnchorStatus::Relocated);
     }
     // The authored name is identity, not evidence: once this store has resolved the row elsewhere
     // it is never searched again, since a stranger can reuse it while the target sits somewhere
     // the hash and the moniker could not place (#1297).
-    Ok("gone".to_string())
+    Ok(AnchorStatus::Gone)
 }
 
 /// The live logical symbols of the active repo answering to `name`, each with its group's member
@@ -463,7 +468,7 @@ fn validate_live_symbol(
     binding: &mut RepoMemoryBinding,
     id: i64,
     qualified_name: String,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     // The row id proves WHICH symbol this is; the name is only what every later relocation
     // searches by. A rename in place — an index upgrade re-deriving an impl's identity moves the
     // row's name from the trait to the type — leaves the two disagreeing, and nothing notices
@@ -483,7 +488,7 @@ fn validate_live_symbol(
 pub(crate) fn validate_symbol_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     let retargeted = is_retargeted(binding);
     let published_scope = if retargeted { published_scope_for(conn, binding)? } else { None };
     let mut held_back = None;
@@ -510,7 +515,9 @@ pub(crate) fn validate_symbol_binding(
     // pick — the same rule, and the same helper, the logical-symbol path uses. Each candidate
     // carries its logical group, keyed on its own row id so the correlated read adds no scope
     // surface, because the group is what separates two impls of different traits for one type.
-    let land = |binding: &mut RepoMemoryBinding, name: &str| -> anyhow::Result<Option<String>> {
+    let land = |binding: &mut RepoMemoryBinding,
+                name: &str|
+     -> anyhow::Result<Option<AnchorStatus>> {
         let candidates = symbol_twins_named(conn, name)?;
         let picked =
             pick_relocation_twin(candidates, binding, retargeted, published_scope.as_deref());
@@ -550,7 +557,7 @@ pub(crate) fn validate_symbol_binding(
             binding.symbol_kind = kind;
             binding.signature_hash = sig;
         }
-        Ok(Some("relocated".to_string()))
+        Ok(Some(AnchorStatus::Relocated))
     };
     // The name this store last found the target under.
     let current = binding.current_binding_id().to_string();
@@ -571,16 +578,16 @@ pub(crate) fn validate_symbol_binding(
             binding.symbol_kind = m.symbol_kind;
             binding.signature_hash = m.signature_hash;
             answer_retarget_mark(binding);
-            return Ok("relocated".to_string());
+            return Ok(AnchorStatus::Relocated);
         }
     }
     if relocate_by_moniker(conn, binding)? {
-        return Ok("relocated".to_string());
+        return Ok(AnchorStatus::Relocated);
     }
     // The authored name is identity, not evidence: once this store has resolved the row elsewhere
     // it is never searched again, since a stranger can reuse it while the target sits somewhere
     // the hash and the moniker could not place (#1297).
-    Ok("gone".to_string())
+    Ok(AnchorStatus::Gone)
 }
 
 /// The live symbol rows answering to `name`, each with its logical group, kind, signature and
@@ -636,28 +643,28 @@ fn relocate_by_moniker(conn: &Connection, binding: &mut RepoMemoryBinding) -> an
 pub(crate) fn validate_chunk_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     let status = validate_bound_chunk(conn, binding)?;
-    if status != "gone" {
+    if status != AnchorStatus::Gone {
         return Ok(status);
     }
     let Some(hash) = source_hash_for_memory(conn, &binding.memory_id)? else {
-        return Ok("gone".to_string());
+        return Ok(AnchorStatus::Gone);
     };
     let Some(chunk) = relocate_chunk_by_hash(conn, &hash)? else {
-        return Ok("gone".to_string());
+        return Ok(AnchorStatus::Gone);
     };
     binding.set_resolved_binding_id(chunk.chunk_id.to_string());
     binding.chunk_id = Some(chunk.chunk_id);
     binding.path = Some(chunk.path);
     binding.start_line = Some(chunk.start_line);
     binding.end_line = Some(chunk.end_line);
-    Ok("relocated".to_string())
+    Ok(AnchorStatus::Relocated)
 }
 pub(crate) fn validate_edge_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     // The row id alone is not identity. A graph-version rebuild DELETEs and re-INSERTs every
     // edge, and SQLite reuses freed rowids, so a stored `edge_id` can come back pointing at a
     // DIFFERENT call site — and this fast path would then report the binding `current` on the
@@ -689,7 +696,7 @@ pub(crate) fn validate_edge_binding(
         // stable fingerprint no longer exists, retaining that id would surface this memory on the
         // replacement edge through edge-id lookups.
         binding.edge_id = None;
-        return Ok("gone".to_string());
+        return Ok(AnchorStatus::Gone);
     };
     // Compatibility matches return the live current fingerprint. Converge the resolution so the
     // next validation takes the current fast path instead of reporting `relocated` forever.
@@ -700,12 +707,12 @@ pub(crate) fn validate_edge_binding(
     binding.end_line = Some(edge.end_line);
     binding.symbol_id = None;
     binding.logical_symbol_id = None;
-    Ok("relocated".to_string())
+    Ok(AnchorStatus::Relocated)
 }
 pub(crate) fn validate_call_path_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     // The row's resolution as the table holds it NOW, not as this pass hydrated it: converging a
     // sibling binding of the same memory re-points every binding resolving to the old hash and
     // moves the local rows with them, and a binding hydrated before that would otherwise look the
@@ -758,7 +765,7 @@ pub(crate) fn validate_call_path_binding(
             params![binding.memory_id, binding.current_binding_id()],
             |row| row.get::<_, i64>(0),
         )?;
-        return Ok(if exists > 0 { "unverified" } else { "gone" }.to_string());
+        return Ok(if exists > 0 { AnchorStatus::Unverified } else { AnchorStatus::Gone });
     }
 
     let total = edges.len();
@@ -811,15 +818,14 @@ pub(crate) fn validate_call_path_binding(
     }
 
     Ok(if gone == total {
-        "gone"
+        AnchorStatus::Gone
     } else if gone > 0 {
-        "stale"
+        AnchorStatus::Stale
     } else if relocated > 0 {
-        "relocated"
+        AnchorStatus::Relocated
     } else {
-        "current"
-    }
-    .to_string())
+        AnchorStatus::Current
+    })
 }
 
 /// Migrate one pre-versioned call-path binding onto the current edge identity, in full.
@@ -963,43 +969,43 @@ pub(crate) fn validate_bound_edge_source_hash(
     conn: &Connection,
     binding: &RepoMemoryBinding,
     current_source_hash: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     match source_hash_for_memory(conn, &binding.memory_id)? {
-        Some(expected) if expected != current_source_hash => Ok("stale".to_string()),
-        _ => Ok("current".to_string()),
+        Some(expected) if expected != current_source_hash => Ok(AnchorStatus::Stale),
+        _ => Ok(AnchorStatus::Current),
     }
 }
 pub(crate) fn validate_bound_chunk(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     let Some(chunk_id) = binding.chunk_id else {
-        return Ok("unverified".to_string());
+        return Ok(AnchorStatus::Unverified);
     };
     let Some(chunk) = chunk_by_id(conn, chunk_id)? else {
-        return Ok("gone".to_string());
+        return Ok(AnchorStatus::Gone);
     };
     // A chunk binding's name IS its chunk id: record the live one as this store's resolution, so
     // a row whose resolution was reset answers to the chunk it points at, not to the authored id
     // (#1297). A symbol binding validated through its chunk keeps its qualified name.
-    if binding.binding_kind == "chunk" {
+    if binding.binding_kind == BindingKind::Chunk.as_db_str() {
         binding.set_resolved_binding_id(chunk_id.to_string());
     }
     binding.path = Some(chunk.path);
     binding.start_line = Some(chunk.start_line);
     binding.end_line = Some(chunk.end_line);
     match source_hash_for_memory(conn, &binding.memory_id)? {
-        Some(expected) if expected != chunk.text_hash => Ok("stale".to_string()),
-        _ => Ok("current".to_string()),
+        Some(expected) if expected != chunk.text_hash => Ok(AnchorStatus::Stale),
+        _ => Ok(AnchorStatus::Current),
     }
 }
 pub(crate) fn validate_path_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
     fs_root: Option<&Path>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     let Some(path) = binding.path.as_deref() else {
-        return Ok("unverified".to_string());
+        return Ok(AnchorStatus::Unverified);
     };
     // `kind != 'deleted'` (#492): a deleted-at-HEAD file leaves a marker row (kind='deleted',
     // sha256='') that would otherwise be the newest row for the path and shadow the absence —
@@ -1025,9 +1031,9 @@ pub(crate) fn validate_path_binding(
         // genuinely `gone`.
         let status = if path_is_file_on_disk(fs_root, path) {
             if binding.start_line.is_none() && binding.end_line.is_none() {
-                "current"
+                AnchorStatus::Current
             } else {
-                "unverified"
+                AnchorStatus::Unverified
             }
         } else if path_is_live_in_another_scope(conn, path)? {
             // Neither indexed here nor on disk — but ALIVE in another indexed scope (a
@@ -1035,11 +1041,11 @@ pub(crate) fn validate_path_binding(
             // not gone. Verified live: forward anchors to branch-only files ping-ponged
             // current/gone between checkout contexts, and doctor advised mark-obsolete for
             // valid in-flight work. Only when NO scope holds the path is it genuinely gone.
-            "pending"
+            AnchorStatus::Pending
         } else {
-            "gone"
+            AnchorStatus::Gone
         };
-        return Ok(status.to_string());
+        return Ok(status);
     };
     // A BARE path binding (no line span) is an AREA anchor, like a `dir` binding: the claim is
     // "this note is about this file", not "this file's bytes are X" — so it is current while the
@@ -1048,11 +1054,11 @@ pub(crate) fn validate_path_binding(
     // buried the real staleness signals under noise. Only a SPANNED `path:start-end` binding
     // claims specific content and keeps the content-hash check.
     if binding.start_line.is_none() && binding.end_line.is_none() {
-        return Ok("current".to_string());
+        return Ok(AnchorStatus::Current);
     }
     match source_hash_for_memory(conn, &binding.memory_id)? {
-        Some(expected) if expected != current_hash => Ok("stale".to_string()),
-        _ => Ok("current".to_string()),
+        Some(expected) if expected != current_hash => Ok(AnchorStatus::Stale),
+        _ => Ok(AnchorStatus::Current),
     }
 }
 /// The persisted `source_root` (the on-disk repo root recorded in `repo_meta` at
@@ -1793,7 +1799,7 @@ mod call_path_receiver_type_hint_tests {
         };
         binding.memory_id = "m1".to_string();
 
-        assert_eq!(validate_edge_binding(&c, &mut binding).unwrap(), "relocated");
+        assert_eq!(validate_edge_binding(&c, &mut binding).unwrap(), AnchorStatus::Relocated);
     }
 
     #[test]
@@ -1836,7 +1842,7 @@ mod call_path_receiver_type_hint_tests {
         };
         binding.memory_id = "m1".to_string();
 
-        assert_eq!(validate_edge_binding(&c, &mut binding).unwrap(), "relocated");
+        assert_eq!(validate_edge_binding(&c, &mut binding).unwrap(), AnchorStatus::Relocated);
         assert!(binding.edge_id.is_some(), "the relocated binding adopts the live edge row");
         assert_ne!(
             binding.current_binding_id(),
@@ -1845,7 +1851,7 @@ mod call_path_receiver_type_hint_tests {
         );
         assert_eq!(
             validate_edge_binding(&c, &mut binding).unwrap(),
-            "current",
+            AnchorStatus::Current,
             "a compatibility relocation converges instead of repeating forever"
         );
 
@@ -1855,7 +1861,7 @@ mod call_path_receiver_type_hint_tests {
             resolved_binding_id: None,
             ..call_path_binding("m1", "unused")
         };
-        assert_eq!(validate_edge_binding(&c, &mut missing).unwrap(), "gone");
+        assert_eq!(validate_edge_binding(&c, &mut missing).unwrap(), AnchorStatus::Gone);
 
         c.execute(
             "INSERT INTO repo_memory_call_paths(memory_id, edge_sequence_hash, path_summary, \
@@ -1873,7 +1879,7 @@ mod call_path_receiver_type_hint_tests {
         let mut call_path = call_path_binding("m1", "legacy-path");
         assert_eq!(
             validate_call_path_binding(&c, &mut call_path).unwrap(),
-            "relocated",
+            AnchorStatus::Relocated,
             "legacy identity proves the site survived but cannot prove its receiver owner"
         );
         // Convergence moves the WHOLE binding, not just its member fingerprints: the key is the
@@ -1915,7 +1921,7 @@ mod call_path_receiver_type_hint_tests {
         assert_eq!(reachable, 1, "the call-path row is re-keyed too, so nothing is orphaned");
         assert_eq!(
             validate_call_path_binding(&c, &mut call_path).unwrap(),
-            "current",
+            AnchorStatus::Current,
             "the converged v3 identity is no longer permanently hint-blind"
         );
     }
@@ -1967,12 +1973,12 @@ mod call_path_receiver_type_hint_tests {
         c.execute("UPDATE edges_data SET to_symbol_id = ?1 WHERE id = ?2", [beta, edge_id])
             .unwrap();
 
-        assert_eq!(validate_edge_binding(&c, &mut edge_binding).unwrap(), "gone");
+        assert_eq!(validate_edge_binding(&c, &mut edge_binding).unwrap(), AnchorStatus::Gone);
         assert_eq!(edge_binding.edge_id, None, "a retargeted row id must not remain attached");
         let mut call_path = call_path_binding("m1", &path_hash);
         assert_eq!(
             validate_call_path_binding(&c, &mut call_path).unwrap(),
-            "gone",
+            AnchorStatus::Gone,
             "loose relocation must reject a different stable callee"
         );
     }
@@ -2216,7 +2222,7 @@ mod call_path_receiver_type_hint_tests {
         .unwrap();
 
         let mut binding = call_path_binding("m1", "legacy-path");
-        assert_eq!(validate_call_path_binding(&c, &mut binding).unwrap(), "stale");
+        assert_eq!(validate_call_path_binding(&c, &mut binding).unwrap(), AnchorStatus::Stale);
         assert_eq!(binding.binding_id, "legacy-path", "a partial path keeps its stored identity");
         let stored: String = c
             .query_row(
@@ -2360,7 +2366,7 @@ mod call_path_receiver_type_hint_tests {
         let mut binding = call_path_binding("m1", "hash1");
         assert_eq!(
             validate_call_path_binding(&c, &mut binding).unwrap(),
-            "current",
+            AnchorStatus::Current,
             "unchanged edge validates current"
         );
 
@@ -2368,7 +2374,7 @@ mod call_path_receiver_type_hint_tests {
 
         assert_ne!(
             validate_call_path_binding(&c, &mut binding).unwrap(),
-            "current",
+            AnchorStatus::Current,
             "a receiver-type-driven re-resolution must not keep validating current against the \
              stale method target"
         );

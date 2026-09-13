@@ -28,9 +28,6 @@ pub(crate) const MONIKER_MATCH_REASON: &str = "moniker-match";
 /// keyed off our own content-derived logical id, not fuzzy matching.
 pub(crate) const MONIKER_REFRESH_REASON: &str = "moniker-refresh";
 
-/// The binding kind for a moniker anchor row.
-pub(crate) const SCIP_MONIKER_BINDING_KIND: &str = "scip_moniker";
-
 /// One `logical_symbol_monikers` row, as read for auto-binding.
 #[derive(Debug, Clone)]
 pub(crate) struct MonikerRow {
@@ -253,7 +250,7 @@ pub(crate) fn moniker_binding_for_memory(
           AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
         LIMIT 1
         ",
-        params![memory_id, SCIP_MONIKER_BINDING_KIND],
+        params![memory_id, BindingKind::ScipMoniker.as_db_str()],
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -316,7 +313,7 @@ pub fn insert_auto_moniker_binding(
     primary: &ResolvedBinding,
     now: i64,
 ) -> anyhow::Result<()> {
-    if !matches!(primary.binding_kind.as_str(), "symbol" | "logical_symbol") {
+    if !matches!(primary.binding_kind, BindingKind::Symbol | BindingKind::LogicalSymbol) {
         return Ok(());
     }
     let Some(logical_symbol_id) = primary.logical_symbol_id else {
@@ -338,7 +335,7 @@ pub fn insert_auto_moniker_binding(
         ",
         params![
             memory_id,
-            SCIP_MONIKER_BINDING_KIND,
+            BindingKind::ScipMoniker.as_db_str(),
             row.moniker,
             primary.path,
             primary.start_line,
@@ -383,9 +380,9 @@ pub fn insert_auto_moniker_binding(
 pub(crate) fn validate_moniker_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AnchorStatus> {
     let Some(tool) = binding.moniker_tool.clone() else {
-        return Ok("unverified".to_string());
+        return Ok(AnchorStatus::Unverified);
     };
     // (1) The stored stable logical id is live and has a current moniker row → anchor there.
     if let Some(stored_id) = binding.logical_symbol_id
@@ -393,7 +390,7 @@ pub(crate) fn validate_moniker_binding(
         && let Some(row) = moniker_for_logical_symbol_tool(conn, stored_id, &tool)?
     {
         let Some(matched) = relocate_match_for_logical_symbol(conn, stored_id)? else {
-            return Ok("stale".to_string());
+            return Ok(AnchorStatus::Stale);
         };
         let drifted = binding.current_binding_id() != row.moniker;
         apply_relocate_match(binding, &matched);
@@ -401,26 +398,26 @@ pub(crate) fn validate_moniker_binding(
             binding.set_resolved_binding_id(row.moniker);
             binding.moniker_tool_version = Some(row.tool_version);
             binding.relocation_reason = Some(MONIKER_REFRESH_REASON.to_string());
-            return Ok("relocated".to_string());
+            return Ok(AnchorStatus::Relocated);
         }
-        return Ok("current".to_string());
+        return Ok(AnchorStatus::Current);
     }
     // (2) The stored id is dead (file move) or has no current row: resolve the recorded string.
     match resolve_moniker(conn, binding.current_binding_id(), &tool)? {
-        MonikerResolution::NoData => Ok("unverified".to_string()),
-        MonikerResolution::Gone => Ok("gone".to_string()),
-        MonikerResolution::Dangling | MonikerResolution::Ambiguous => Ok("stale".to_string()),
+        MonikerResolution::NoData => Ok(AnchorStatus::Unverified),
+        MonikerResolution::Gone => Ok(AnchorStatus::Gone),
+        MonikerResolution::Dangling | MonikerResolution::Ambiguous => Ok(AnchorStatus::Stale),
         MonikerResolution::Unique { logical_symbol_id, tool_version: _ } => {
             let moved = binding.logical_symbol_id != Some(logical_symbol_id);
             let Some(matched) = relocate_match_for_logical_symbol(conn, logical_symbol_id)? else {
-                return Ok("stale".to_string());
+                return Ok(AnchorStatus::Stale);
             };
             apply_relocate_match(binding, &matched);
             if moved {
                 binding.relocation_reason = Some(MONIKER_MATCH_REASON.to_string());
-                Ok("relocated".to_string())
+                Ok(AnchorStatus::Relocated)
             } else {
-                Ok("current".to_string())
+                Ok(AnchorStatus::Current)
             }
         },
     }
