@@ -200,6 +200,99 @@ fn import_alias_rebind(
     })
 }
 
+/// One edge reference's resolution inputs, borrowed from either driver's storage — DB rows on the
+/// incremental path, the frozen arena on the full rebuild. Both drivers build the resolver request
+/// through [`resolve_reference`], so they cannot feed it different inputs (#61 both-driver parity).
+struct ReferenceInputs<'a> {
+    file_id: i64,
+    source_language: Option<&'a str>,
+    edge_kind: EdgeKind,
+    to_name: &'a str,
+    target_qualified_name: Option<&'a str>,
+    evidence: Option<&'a str>,
+    receiver_hint: Option<&'a str>,
+    receiver_type_hint: Option<&'a str>,
+    /// The reference's byte position; drives the module-aware covering test (#61).
+    ref_byte: usize,
+}
+
+fn resolve_reference<'s>(
+    reference: ReferenceInputs<'_>,
+    import_scope: &ImportScope,
+    index: &SymbolIndex<'s>,
+) -> Option<Resolved<'s>> {
+    let ReferenceInputs {
+        file_id,
+        source_language,
+        edge_kind,
+        to_name,
+        target_qualified_name,
+        evidence,
+        receiver_hint,
+        receiver_type_hint,
+        ref_byte,
+    } = reference;
+    // A language-owned import-alias policy may rewrite a reference to its imported target.
+    // Imports edges retain their own target name.
+    let rebind = if edge_kind == EdgeKind::Imports {
+        Default::default()
+    } else {
+        import_alias_rebind(import_scope, index, ImportAliasResolveRequest {
+            file_id,
+            source_language,
+            to_name,
+            target_qualified_name,
+            receiver_hint,
+            ref_byte,
+        })
+    };
+    let aliased_receiver_type =
+        alias_resolved_receiver_hint(import_scope, file_id, receiver_type_hint, ref_byte);
+    let receiver_alias_bound = receiver_type_hint.is_some_and(|hint| {
+        let root = hint.trim().split_once("::").map_or(hint.trim(), |(root, _)| root);
+        import_scope.has_import_alias(file_id, root, ref_byte)
+    });
+    resolve_symbol(
+        ResolveSymbolRequest {
+            name: rebind.name.as_deref().unwrap_or(to_name),
+            target_qualified_name: rebind
+                .target_qualified_name
+                .as_deref()
+                .or(target_qualified_name),
+            edge_kind,
+            evidence,
+            receiver_hint: rebind.receiver_hint.as_deref().or(receiver_hint),
+            receiver_type: receiver_type_identity(
+                import_scope,
+                index,
+                file_id,
+                source_language,
+                ref_byte,
+                receiver_type_hint,
+                if receiver_alias_bound {
+                    ReceiverTypeHintResolution::Alias(aliased_receiver_type.as_deref())
+                } else {
+                    ReceiverTypeHintResolution::Original(receiver_type_hint)
+                },
+            ),
+            source_file_id: file_id,
+            source_language,
+            imported_external: import_scope.is_external_import(
+                file_id,
+                short_name(to_name),
+                ref_byte,
+            ) || import_scope.is_external_qualified_root(
+                file_id,
+                target_qualified_name,
+                ref_byte,
+            ),
+            receiver_package: receiver_package(import_scope, file_id, receiver_type_hint, ref_byte),
+            file_package: import_scope.file_packages(),
+        },
+        index,
+    )
+}
+
 /// Load the per-package local-crate sets and COMPUTE each active file's owning package into `scope`
 /// (#61 per-package locality). `packages.local_roots_json` is a JSON string array of crate roots.
 ///
@@ -546,75 +639,19 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             ])?;
             continue;
         }
-        // The reference's byte position drives the module-aware covering test (#61).
-        let ref_byte = usize::try_from(source_start_byte).unwrap_or(0);
-        // A language-owned import-alias policy may rewrite a reference to its imported target.
-        // Imports edges retain their own target name.
-        let rebind = if edge_kind == EdgeKind::Imports {
-            Default::default()
-        } else {
-            import_alias_rebind(&import_scope, &index, ImportAliasResolveRequest {
+        let resolution = resolve_reference(
+            ReferenceInputs {
                 file_id: source_file_id,
                 source_language: Some(source_language.as_str()),
+                edge_kind,
                 to_name: &to_name,
                 target_qualified_name: target_qualified_name.as_deref(),
-                receiver_hint: receiver_hint.as_deref(),
-                ref_byte,
-            })
-        };
-        let resolve_name = rebind.name.as_deref().unwrap_or(to_name.as_str());
-        let resolve_qualified =
-            rebind.target_qualified_name.as_deref().or(target_qualified_name.as_deref());
-        let resolve_receiver = rebind.receiver_hint.as_deref().or(receiver_hint.as_deref());
-        let aliased_receiver_type = alias_resolved_receiver_hint(
-            &import_scope,
-            source_file_id,
-            receiver_type_hint.as_deref(),
-            ref_byte,
-        );
-        let receiver_alias_bound = receiver_type_hint.as_deref().is_some_and(|hint| {
-            let root = hint.trim().split_once("::").map_or(hint.trim(), |(root, _)| root);
-            import_scope.has_import_alias(source_file_id, root, ref_byte)
-        });
-        let resolution = resolve_symbol(
-            ResolveSymbolRequest {
-                name: resolve_name,
-                target_qualified_name: resolve_qualified,
-                edge_kind,
                 evidence: evidence.as_deref(),
-                receiver_hint: resolve_receiver,
-                receiver_type: receiver_type_identity(
-                    &import_scope,
-                    &index,
-                    source_file_id,
-                    Some(source_language.as_str()),
-                    ref_byte,
-                    receiver_type_hint.as_deref(),
-                    if receiver_alias_bound {
-                        ReceiverTypeHintResolution::Alias(aliased_receiver_type.as_deref())
-                    } else {
-                        ReceiverTypeHintResolution::Original(receiver_type_hint.as_deref())
-                    },
-                ),
-                source_file_id,
-                source_language: Some(source_language.as_str()),
-                imported_external: import_scope.is_external_import(
-                    source_file_id,
-                    short_name(&to_name),
-                    ref_byte,
-                ) || import_scope.is_external_qualified_root(
-                    source_file_id,
-                    target_qualified_name.as_deref(),
-                    ref_byte,
-                ),
-                receiver_package: receiver_package(
-                    &import_scope,
-                    source_file_id,
-                    receiver_type_hint.as_deref(),
-                    ref_byte,
-                ),
-                file_package: import_scope.file_packages(),
+                receiver_hint: receiver_hint.as_deref(),
+                receiver_type_hint: receiver_type_hint.as_deref(),
+                ref_byte: usize::try_from(source_start_byte).unwrap_or(0),
             },
+            &import_scope,
             &index,
         );
         let Some((to_symbol_id, confidence, reason)) = resolution else {
@@ -804,32 +841,6 @@ pub(crate) fn resolve_and_insert_edges(
         let evidence = arena.get_opt(candidate.evidence);
         let receiver_hint = arena.get_opt(candidate.receiver_hint);
         let receiver_type_hint = arena.get_opt(candidate.receiver_type_hint);
-        // The reference's byte position drives the module-aware covering test (#61) — same input
-        // the DB driver reads from `source_start_byte`.
-        let ref_byte = candidate.source_span.start_byte as usize;
-        // Mirror the DB driver: a language-owned alias policy may rewrite a reference to its
-        // imported target. Imports edges keep their own target name.
-        let rebind = if candidate.edge_kind == EdgeKind::Imports {
-            Default::default()
-        } else {
-            import_alias_rebind(&import_scope, &index, ImportAliasResolveRequest {
-                file_id: *file_id,
-                source_language: file_language.get(file_id).map(String::as_str),
-                to_name,
-                target_qualified_name,
-                receiver_hint,
-                ref_byte,
-            })
-        };
-        let resolve_name = rebind.name.as_deref().unwrap_or(to_name);
-        let resolve_qualified = rebind.target_qualified_name.as_deref().or(target_qualified_name);
-        let resolve_receiver = rebind.receiver_hint.as_deref().or(receiver_hint);
-        let aliased_receiver_type =
-            alias_resolved_receiver_hint(&import_scope, *file_id, receiver_type_hint, ref_byte);
-        let receiver_alias_bound = receiver_type_hint.is_some_and(|hint| {
-            let root = hint.trim().split_once("::").map_or(hint.trim(), |(root, _)| root);
-            import_scope.has_import_alias(*file_id, root, ref_byte)
-        });
         // #200: a `dispatch_construct` fact's `to_name` is a synthetic `Enum::Variant` key, not a
         // real target — never resolve it (synthesis reads only its `from_symbol_id`). Mirrors the
         // incremental driver's skip; `dispatch_handle` DOES resolve (synthesis needs its handler
@@ -837,45 +848,20 @@ pub(crate) fn resolve_and_insert_edges(
         let resolution = if candidate.edge_kind == EdgeKind::DispatchConstruct {
             None
         } else {
-            resolve_symbol(
-                ResolveSymbolRequest {
-                    name: resolve_name,
-                    target_qualified_name: resolve_qualified,
-                    edge_kind: candidate.edge_kind,
-                    evidence,
-                    receiver_hint: resolve_receiver,
-                    receiver_type: receiver_type_identity(
-                        &import_scope,
-                        &index,
-                        *file_id,
-                        file_language.get(file_id).map(String::as_str),
-                        ref_byte,
-                        receiver_type_hint,
-                        if receiver_alias_bound {
-                            ReceiverTypeHintResolution::Alias(aliased_receiver_type.as_deref())
-                        } else {
-                            ReceiverTypeHintResolution::Original(receiver_type_hint)
-                        },
-                    ),
-                    source_file_id: *file_id,
+            resolve_reference(
+                ReferenceInputs {
+                    file_id: *file_id,
                     source_language: file_language.get(file_id).map(String::as_str),
-                    imported_external: import_scope.is_external_import(
-                        *file_id,
-                        short_name(to_name),
-                        ref_byte,
-                    ) || import_scope.is_external_qualified_root(
-                        *file_id,
-                        target_qualified_name,
-                        ref_byte,
-                    ),
-                    receiver_package: receiver_package(
-                        &import_scope,
-                        *file_id,
-                        receiver_type_hint,
-                        ref_byte,
-                    ),
-                    file_package: import_scope.file_packages(),
+                    edge_kind: candidate.edge_kind,
+                    to_name,
+                    target_qualified_name,
+                    evidence,
+                    receiver_hint,
+                    receiver_type_hint,
+                    // The same position the DB driver reads from `source_start_byte`.
+                    ref_byte: candidate.source_span.start_byte as usize,
                 },
+                &import_scope,
                 &index,
             )
         };
