@@ -34,7 +34,7 @@ use tokio::time::timeout;
 
 use crate::auth::{
     AuthConfig, AuthPolicy, AuthRole, DEFAULT_PRE_AUTH_TIMEOUT, NodeAuth, PeerAdmission, Selected,
-    run_auth_phase, run_auth_phase_selected,
+    SessionCapabilities, run_auth_phase, run_auth_phase_selected,
 };
 use crate::enrollment::{
     ENROLL_ALPN, EnrollmentAcceptorOutcome, EnrollmentReceipt, EnrollmentRequest, InviteError,
@@ -958,6 +958,107 @@ fn serve_scope_for(policy: AuthPolicy, admission: PeerAdmission) -> ServeScope {
     }
 }
 
+/// The streams an acceptor routes, named by the ALPN the connection negotiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncAlpn {
+    Account,
+    Content,
+    Table,
+    Enroll,
+}
+
+impl SyncAlpn {
+    fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Account => SYNC_ALPN,
+            Self::Content => CONTENT_SYNC_ALPN,
+            Self::Table => TABLE_SYNC_ALPN,
+            Self::Enroll => ENROLL_ALPN,
+        }
+    }
+}
+
+impl TryFrom<&[u8]> for SyncAlpn {
+    type Error = ();
+
+    fn try_from(alpn: &[u8]) -> Result<Self, ()> {
+        [Self::Account, Self::Content, Self::Table, Self::Enroll]
+            .into_iter()
+            .find(|stream| stream.as_bytes() == alpn)
+            .ok_or(())
+    }
+}
+
+/// A connection that passed node authorization, ready for the session its ALPN names.
+struct AuthorizedStream<'c> {
+    conn: &'c IrohConnection,
+    stream: SyncAlpn,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+    capabilities: SessionCapabilities,
+    admission: PeerAdmission,
+    /// The admission policy this stream ran under (tables pinned `Closed`).
+    policy: AuthPolicy,
+}
+
+/// The shared tail of both dispatchers: narrow the serve scope, run the session the negotiated
+/// stream names against its store, then hold the connection until the dialer closes.
+async fn run_dispatched<C: SyncStore>(
+    authorized: AuthorizedStream<'_>,
+    account_store: &mut OplogSyncStore<'_>,
+    content_store: &mut C,
+    now_ms: impl Fn() -> i64 + Copy,
+    egress: Option<std::sync::Arc<std::sync::Mutex<GlobalEgressLimiter>>>,
+) -> Result<SessionReport, SyncFailure> {
+    let AuthorizedStream { conn, stream, send, recv, capabilities, admission, policy } = authorized;
+    // Narrow the serve to public-only for an anonymous (fallback-admitted) reader of a `PublicRead`
+    // account (#407); a verified member — or any Open/Closed session — serves the full account. Set
+    // on both stores; only the ALPN's store actually serves, and the store re-checks fully-public.
+    let scope = serve_scope_for(policy, admission);
+    account_store.set_serve_scope(scope);
+    content_store.set_serve_scope(scope);
+    // The account log and `/3` content are the anonymous-servable paths, so their egress is metered
+    // against the shared budget. Table sync is pinned `Closed` (unreachable by an anonymous peer),
+    // so it carries no anonymous egress and is left unmetered here.
+    let limits = SessionLimits { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress, now_ms };
+    let report = match stream {
+        SyncAlpn::Account =>
+            run_session_limited(account_store, send, recv, AuthRole::Acceptor, capabilities, limits)
+                .await
+                .map_err(SyncFailure::Session)?,
+        SyncAlpn::Content =>
+            run_session_limited(content_store, send, recv, AuthRole::Acceptor, capabilities, limits)
+                .await
+                .map_err(SyncFailure::Session)?,
+        SyncAlpn::Table => {
+            let mut table_store = crate::store::OplogTableSyncStore::new(
+                account_store.connection(),
+                AccountId::from_bytes(account_store.account_id()),
+                now_ms,
+            );
+            let table =
+                run_table_session(&mut table_store, send, recv, AuthRole::Acceptor, capabilities)
+                    .await
+                    .map_err(SyncFailure::TableSession)?;
+            SessionReport {
+                entries_sent: table.entries_sent,
+                entries_received: table.entries_received,
+                entries_newly_stored: table.entries_newly_stored,
+                peer_capability: capabilities.peer,
+            }
+        },
+        // Enrollment is its own exchange, routed (or refused) before authorization.
+        SyncAlpn::Enroll =>
+            return Err(SyncFailure::Endpoint(EndpointError::Connect(
+                "enrollment has no sync session".into(),
+            ))),
+    };
+    // Keep the acceptor alive until the dialer reads its final acknowledgement and closes.
+    let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
+    conn.close(0u32.into(), b"done");
+    Ok(report)
+}
+
 /// Run the ALPN-selected sync session for an already-accepted connection.
 pub async fn dispatch_connection<C>(
     conn: IrohConnection,
@@ -987,21 +1088,17 @@ where
     // refuses any ALPN `build_endpoint` didn't bind, and it binds exactly the routed ones), but
     // keeping the check ahead of auth means adding another bound ALPN without a route here
     // fails cleanly here instead of after the peer has completed authorization.
-    if alpn.as_slice() != SYNC_ALPN
-        && alpn.as_slice() != CONTENT_SYNC_ALPN
-        && alpn.as_slice() != TABLE_SYNC_ALPN
-        && alpn.as_slice() != ENROLL_ALPN
-    {
+    let Ok(stream) = SyncAlpn::try_from(alpn.as_slice()) else {
         conn.close(0u32.into(), b"unknown-alpn");
         return Err(SyncFailure::Endpoint(EndpointError::Connect(format!(
             "peer negotiated an unknown ALPN {alpn:?}"
         ))));
-    }
+    };
     let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.accept_bi())
         .await
         .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("peer opened no stream".into())))?
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
-    if alpn.as_slice() == ENROLL_ALPN {
+    if stream == SyncAlpn::Enroll {
         let enrollment_database = account_store.connection();
         // The acceptor consumes one of the enrollment database's OWN invites and authors the
         // DeviceAdd into ITS account, so unless that database's local account is exactly the one
@@ -1035,7 +1132,7 @@ where
     let auth_now_ms = now_ms();
     // Table streams are private account data. Open/bootstrap/public admission is only for the
     // account + content paths; a table manifest is never revealed to an unverified peer.
-    let alpn_policy = if alpn.as_slice() == TABLE_SYNC_ALPN { AuthPolicy::Closed } else { policy };
+    let alpn_policy = if stream == SyncAlpn::Table { AuthPolicy::Closed } else { policy };
     // The auth phase is store-agnostic (the binding is account-level), so authorize with the
     // account store BEFORE any inventory — no stream leaves this peer until it passes the policy.
     let (capabilities, admission) =
@@ -1050,59 +1147,16 @@ where
         })
         .await
         .map_err(SyncFailure::Auth)?;
-    // Narrow the serve to public-only for an anonymous (fallback-admitted) reader of a `PublicRead`
-    // account (#407); a verified member — or any Open/Closed session — serves the full account. Set
-    // on both stores; only the ALPN's store actually serves, and the store re-checks fully-public.
-    let scope = serve_scope_for(alpn_policy, admission);
-    account_store.set_serve_scope(scope);
-    content_store.set_serve_scope(scope);
-    // Route the session to the store the negotiated ALPN names (validated above, so the final
-    // `else` is the table stream, not an unknown-ALPN fallthrough).
-    // The account log and `/3` content are the anonymous-servable paths, so their egress is metered
-    // against the shared budget. Table sync is pinned `Closed` (unreachable by an anonymous peer),
-    // so it carries no anonymous egress and is left unmetered here.
-    let report = if alpn.as_slice() == SYNC_ALPN {
-        run_session_limited(
-            account_store,
-            send,
-            recv,
-            AuthRole::Acceptor,
-            capabilities,
-            SessionLimits { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress, now_ms },
-        )
-        .await
-        .map_err(SyncFailure::Session)?
-    } else if alpn.as_slice() == CONTENT_SYNC_ALPN {
-        run_session_limited(
-            content_store,
-            send,
-            recv,
-            AuthRole::Acceptor,
-            capabilities,
-            SessionLimits { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress, now_ms },
-        )
-        .await
-        .map_err(SyncFailure::Session)?
-    } else {
-        let mut table_store = crate::store::OplogTableSyncStore::new(
-            account_store.connection(),
-            AccountId::from_bytes(account_store.account_id()),
-            now_ms,
-        );
-        let table =
-            run_table_session(&mut table_store, send, recv, AuthRole::Acceptor, capabilities)
-                .await
-                .map_err(SyncFailure::TableSession)?;
-        SessionReport {
-            entries_sent: table.entries_sent,
-            entries_received: table.entries_received,
-            entries_newly_stored: table.entries_newly_stored,
-            peer_capability: capabilities.peer,
-        }
+    let authorized = AuthorizedStream {
+        conn: &conn,
+        stream,
+        send,
+        recv,
+        capabilities,
+        admission,
+        policy: alpn_policy,
     };
-    // Keep the acceptor alive until the dialer reads its final acknowledgement and closes.
-    let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
-    conn.close(0u32.into(), b"done");
+    let report = run_dispatched(authorized, account_store, content_store, now_ms, egress).await?;
     Ok((alpn, report))
 }
 
@@ -1167,22 +1221,22 @@ pub async fn dispatch_connection_multi(
     let alpn = conn.alpn().to_vec();
     // The multi host serves the account-log, content, and table streams. ENROLL_ALPN (and any
     // unbound ALPN) is refused BEFORE a stream opens — no route, no handshake.
-    if alpn.as_slice() != SYNC_ALPN
-        && alpn.as_slice() != CONTENT_SYNC_ALPN
-        && alpn.as_slice() != TABLE_SYNC_ALPN
-    {
-        conn.close(0u32.into(), b"unknown-alpn");
-        return Err(SyncFailure::Endpoint(EndpointError::Connect(format!(
-            "multi-account host does not serve ALPN {alpn:?}"
-        ))));
-    }
+    let stream = match SyncAlpn::try_from(alpn.as_slice()) {
+        Ok(stream @ (SyncAlpn::Account | SyncAlpn::Content | SyncAlpn::Table)) => stream,
+        Ok(SyncAlpn::Enroll) | Err(()) => {
+            conn.close(0u32.into(), b"unknown-alpn");
+            return Err(SyncFailure::Endpoint(EndpointError::Connect(format!(
+                "multi-account host does not serve ALPN {alpn:?}"
+            ))));
+        },
+    };
     let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.accept_bi())
         .await
         .map_err(|_| SyncFailure::Endpoint(EndpointError::Connect("peer opened no stream".into())))?
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
     // Read the clock only now that a peer has connected (see `accept_and_sync`).
     let auth_now_ms = now_ms();
-    let table_alpn = alpn.as_slice() == TABLE_SYNC_ALPN;
+    let table_alpn = stream == SyncAlpn::Table;
     // Authorize FIRST, selecting the account from the dialer's frame — no inventory (not even which
     // account is served) leaves the host until selection + the binding check pass. `account_id` and
     // `policy` in the config are placeholders the selection overrides.
@@ -1217,56 +1271,20 @@ pub async fn dispatch_connection_multi(
         .iter_mut()
         .find(|account| account.sync.account_id() == selected_account)
         .expect("run_auth_phase_selected returns only an account the selector accepted");
-    // Narrow the serve to public-only for an anonymous reader of a `PublicRead` account (the
-    // selected account's policy under this ALPN — tables pinned `Closed`), same as the
-    // single-account dispatcher; the store re-checks fully-public before serving.
+    // The serve scope comes from the selected account's policy under this ALPN — tables pinned
+    // `Closed` — same as the single-account dispatcher.
     let alpn_policy = if table_alpn { AuthPolicy::Closed } else { account.policy };
-    let scope = serve_scope_for(alpn_policy, admission);
-    account.sync.set_serve_scope(scope);
-    account.content.set_serve_scope(scope);
-    // As in `dispatch_connection`: the anonymous-servable account + content paths are
-    // egress-metered; table sync is pinned `Closed` (no anonymous egress) and left unmetered.
-    let report = if alpn.as_slice() == SYNC_ALPN {
-        run_session_limited(
-            &mut account.sync,
-            send,
-            recv,
-            AuthRole::Acceptor,
-            capabilities,
-            SessionLimits { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress, now_ms },
-        )
-        .await
-        .map_err(SyncFailure::Session)?
-    } else if alpn.as_slice() == CONTENT_SYNC_ALPN {
-        run_session_limited(
-            &mut account.content,
-            send,
-            recv,
-            AuthRole::Acceptor,
-            capabilities,
-            SessionLimits { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress, now_ms },
-        )
-        .await
-        .map_err(SyncFailure::Session)?
-    } else {
-        let mut table_store = crate::store::OplogTableSyncStore::new(
-            account.sync.connection(),
-            AccountId::from_bytes(account.sync.account_id()),
-            now_ms,
-        );
-        let table =
-            run_table_session(&mut table_store, send, recv, AuthRole::Acceptor, capabilities)
-                .await
-                .map_err(SyncFailure::TableSession)?;
-        SessionReport {
-            entries_sent: table.entries_sent,
-            entries_received: table.entries_received,
-            entries_newly_stored: table.entries_newly_stored,
-            peer_capability: capabilities.peer,
-        }
+    let authorized = AuthorizedStream {
+        conn: &conn,
+        stream,
+        send,
+        recv,
+        capabilities,
+        admission,
+        policy: alpn_policy,
     };
-    let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
-    conn.close(0u32.into(), b"done");
+    let report =
+        run_dispatched(authorized, &mut account.sync, &mut account.content, now_ms, egress).await?;
     Ok((alpn, report))
 }
 
