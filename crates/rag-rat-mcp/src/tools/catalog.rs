@@ -280,7 +280,7 @@ const WORKTREE_PARAM_DESCRIPTION: &str =
      this repo is silently ignored: results then come from the indexed checkout, with no error.";
 
 pub fn schema(name: &str) -> Value {
-    let mut schema = arg_schema(name);
+    let mut schema = arg_schema(name).unwrap_or_else(|| json!({"type": "object"}));
     // Only advertise the parameter on the tools that actually honor it: a write tool and
     // `compare_graph_to_text` stay base-scoped by contract, so declaring it there would promise a
     // scoping the dispatcher deliberately ignores.
@@ -306,8 +306,10 @@ fn declare_worktree_property(schema: &mut Value) {
     }
 }
 
-fn arg_schema(name: &str) -> Value {
-    match name {
+/// The generated arg schema for a listed tool; `None` for a name the catalog does not list, so the
+/// coverage test can tell a missing arm from an `EmptyArgs` tool (both render `{"type":"object"}`).
+fn arg_schema(name: &str) -> Option<Value> {
+    Some(match name {
         "semantic_search"
         | "commit_search"
         | "commits_touching_query"
@@ -352,8 +354,8 @@ fn arg_schema(name: &str) -> Value {
         "memory_edges" => schema_for::<MemoryEdgesArgs>(),
         "dream" => schema_for::<DreamArgs>(),
         "dream_review" => schema_for::<DreamReviewArgs>(),
-        _ => json!({"type": "object"}),
-    }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -381,6 +383,18 @@ mod schema_tests {
 
     fn worktree_property(name: &str) -> Option<Value> {
         schema(name).get("properties")?.get("worktree").cloned()
+    }
+
+    /// `description` and `schema` fall back silently for a name they do not list, so a tool added
+    /// to `TOOL_NAMES` without both arms would ship "Unknown tool." and a property-less schema
+    /// (indistinguishable from `EmptyArgs`) to every client.
+    #[test]
+    fn every_listed_tool_has_its_own_description_and_arg_schema() {
+        let unknown_description = description("");
+        for name in TOOL_NAMES {
+            assert_ne!(description(name), unknown_description, "{name}: no description arm");
+            assert!(arg_schema(name).is_some(), "{name}: no arg_schema arm");
+        }
     }
 
     #[test]
