@@ -411,98 +411,92 @@ async fn file_clones(
     .map(Json)
 }
 
-async fn file_symbols(
-    State(state): State<HttpState>,
-    Query(query): Query<FileQuery>,
-) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileSymbols>>, ApiError> {
+/// The shared body of the plain `/api/file/*` lenses: require a valid relative `path`, resolve it
+/// to the indexed spelling, and wrap `read` in the file-answer freshness envelope. A new
+/// validation rule lands here once for every file lens.
+async fn file_lens<T: Send + 'static>(
+    state: HttpState,
+    query: FileQuery,
+    read: impl FnOnce(&IndexDatabase, &str) -> anyhow::Result<T> + Send + 'static,
+) -> Result<Json<LensFileAnswer<T>>, ApiError> {
     let path = required_path(query.path)?;
     let case_insensitive = state.options.case_insensitive_paths;
     run_db(state, move |db, _, _| {
         let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_answer(&path, || db.lens_file_symbols(&path))?)
+        Ok(db.lens_file_answer(&path, || read(db, &path))?)
     })
     .await
     .map(Json)
+}
+
+async fn file_symbols(
+    State(state): State<HttpState>,
+    Query(query): Query<FileQuery>,
+) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileSymbols>>, ApiError> {
+    file_lens(state, query, |db, path| db.lens_file_symbols(path)).await
 }
 
 async fn file_graph(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileGraph>>, ApiError> {
-    let path = required_path(query.path)?;
-    let case_insensitive = state.options.case_insensitive_paths;
-    run_db(state, move |db, _, _| {
-        let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_answer(&path, || db.lens_file_graph(&path))?)
-    })
-    .await
-    .map(Json)
+    file_lens(state, query, |db, path| db.lens_file_graph(path)).await
 }
 
 async fn file_coupling(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileCoupling>>, ApiError> {
-    let path = required_path(query.path)?;
-    let case_insensitive = state.options.case_insensitive_paths;
-    run_db(state, move |db, _, _| {
-        let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_answer(&path, || db.lens_file_coupling(&path))?)
-    })
-    .await
-    .map(Json)
+    file_lens(state, query, |db, path| db.lens_file_coupling(path)).await
 }
 
 async fn file_memories(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileMemories>>, ApiError> {
-    let path = required_path(query.path)?;
-    let case_insensitive = state.options.case_insensitive_paths;
-    run_db(state, move |db, _, _| {
-        let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_answer(&path, || db.lens_file_memories(&path))?)
-    })
-    .await
-    .map(Json)
+    file_lens(state, query, |db, path| db.lens_file_memories(path)).await
 }
 
 async fn file_papertrail(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFilePapertrail>>, ApiError> {
-    let path = required_path(query.path)?;
-    let case_insensitive = state.options.case_insensitive_paths;
-    run_db(state, move |db, _, _| {
-        let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_answer(&path, || db.lens_file_papertrail(&path))?)
-    })
-    .await
-    .map(Json)
+    file_lens(state, query, |db, path| db.lens_file_papertrail(path)).await
+}
+
+/// The shared body of the symbol hop lenses: resolve the hop selector and limit, run `hop`, and
+/// answer 404 for a handle that names no current symbol.
+async fn hop_lens<T: Send + 'static>(
+    state: HttpState,
+    query: SymbolHopQuery,
+    hop: impl FnOnce(
+        &IndexDatabase,
+        &rag_rat_core::index::LensHopSelector,
+        u32,
+    ) -> anyhow::Result<Option<T>>
+    + Send
+    + 'static,
+) -> Result<Json<T>, ApiError> {
+    let selector = hop_selector(&query)?;
+    let limit = hop_limit(query.limit.as_deref());
+    run_db(state, move |db, _, _| Ok(hop(db, &selector, limit)?))
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(UNKNOWN_SYMBOL_HANDLE.into()))
 }
 
 async fn symbol_callers(
     State(state): State<HttpState>,
     Query(query): Query<SymbolHopQuery>,
 ) -> Result<Json<rag_rat_core::index::LensCallers>, ApiError> {
-    let selector = hop_selector(&query)?;
-    let limit = hop_limit(query.limit.as_deref());
-    run_db(state, move |db, _, _| Ok(db.lens_symbol_callers(&selector, limit)?))
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::NotFound(UNKNOWN_SYMBOL_HANDLE.into()))
+    hop_lens(state, query, |db, selector, limit| db.lens_symbol_callers(selector, limit)).await
 }
 
 async fn symbol_callees(
     State(state): State<HttpState>,
     Query(query): Query<SymbolHopQuery>,
 ) -> Result<Json<rag_rat_core::index::LensCallees>, ApiError> {
-    let selector = hop_selector(&query)?;
-    let limit = hop_limit(query.limit.as_deref());
-    run_db(state, move |db, _, _| Ok(db.lens_symbol_callees(&selector, limit)?))
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiError::NotFound(UNKNOWN_SYMBOL_HANDLE.into()))
+    hop_lens(state, query, |db, selector, limit| db.lens_symbol_callees(selector, limit)).await
 }
 
 async fn chunk_text(
