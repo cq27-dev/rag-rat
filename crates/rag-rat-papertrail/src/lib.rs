@@ -238,7 +238,10 @@ pub struct PapertrailRef {
     pub project: String,
     pub item_key: String,
     pub item_kind: Option<ItemKind>,
+    /// A [`RefKind`] token when this crate wrote the row; kept a string so a stored row carrying
+    /// any other token (the column is unconstrained TEXT) still reads.
     pub ref_kind: String,
+    /// A [`RefSourceKind`] token when this crate wrote the row; a string for the same reason.
     pub source_kind: String,
     pub source_path: Option<String>,
     pub source_commit: Option<String>,
@@ -252,7 +255,8 @@ pub struct PapertrailEvidence {
     /// Kind of the ITEM this row belongs to: `issue` | `change_request`.
     pub item_kind: String,
     pub item_key: String,
-    /// Which mirror row matched: the item's own text (`item`) or one of its comments (`comment`).
+    /// Which mirror row matched: the item's own text (`item`) or one of its comments (`comment`),
+    /// as [`DocKind`] tokens; kept a string so a stored row with any other token still reads.
     pub doc_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment_id: Option<String>,
@@ -330,6 +334,124 @@ impl ItemKind {
     /// Parse a persisted token, rejecting anything outside the closed set.
     pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
         value.parse().map_err(|_| anyhow::anyhow!("unknown item kind token `{value}`"))
+    }
+}
+
+/// How a discovered reference claims its item (`papertrail_refs.ref_kind`), classified from the
+/// word before it. Claim strength for duplicate collapse is `ref_kind_rank`: `closing` beats
+/// `reverts` beats `reference` beats everything else.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::VariantArray,
+)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum RefKind {
+    Closing,
+    Reverts,
+    Reference,
+    Unknown,
+    /// The manual single-item lane (`sync_issue`) has no preceding word to classify and records
+    /// the matched token's syntax shape instead — a full URL, `owner/repo#N`, a bare `#N`, or
+    /// `GH-N` — so these tokens exist in stored refs. They rank with `unknown`.
+    Url,
+    CrossRepo,
+    LocalNumber,
+    GhDash,
+}
+
+impl RefKind {
+    /// The exact persisted token (`papertrail_refs.ref_kind`).
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown ref kind token `{value}`"))
+    }
+}
+
+/// Where a reference was discovered (`papertrail_refs.source_kind`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::VariantArray,
+)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum RefSourceKind {
+    Branch,
+    Commit,
+    File,
+    Manual,
+    /// Mined from a mirrored item's own text.
+    Item,
+    /// Mined from a mirrored comment.
+    Comment,
+}
+
+impl RefSourceKind {
+    /// The exact persisted token (`papertrail_refs.source_kind`).
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown ref source kind token `{value}`"))
+    }
+}
+
+/// Which mirror row a `papertrail_fts` document is (`papertrail_fts.doc_kind`): an item's own
+/// title/body or one of its comments.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::VariantArray,
+)]
+#[strum(serialize_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum DocKind {
+    Item,
+    Comment,
+}
+
+impl DocKind {
+    /// The exact persisted token (`papertrail_fts.doc_kind`).
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown doc kind token `{value}`"))
     }
 }
 
@@ -804,7 +926,7 @@ pub(crate) struct FtsRow<'a> {
     item_kind: &'a str,
     item_key: &'a str,
     /// `item` for the item's own title/body row, `comment` for a comment row.
-    doc_kind: &'a str,
+    doc_kind: DocKind,
     /// The provider comment id for a `comment` row; empty string on `item` rows.
     comment_id: &'a str,
     url: &'a str,
@@ -822,7 +944,7 @@ pub(crate) struct FtsRow<'a> {
 pub(crate) struct ParsedRef {
     project: String,
     number: i64,
-    kind: String,
+    kind: RefKind,
 }
 
 impl ParsedRef {
@@ -830,7 +952,7 @@ impl ParsedRef {
     /// provenance. The grammar is GitHub-only today, so the tracker is fixed here.
     pub(crate) fn into_ref(
         self,
-        source_kind: &str,
+        source_kind: RefSourceKind,
         source_path: Option<String>,
         source_commit: Option<String>,
         source_text: String,
@@ -840,8 +962,8 @@ impl ParsedRef {
             project: self.project,
             item_key: self.number.to_string(),
             item_kind: None,
-            ref_kind: self.kind,
-            source_kind: source_kind.to_string(),
+            ref_kind: self.kind.as_db_str().to_string(),
+            source_kind: source_kind.as_db_str().to_string(),
             source_path,
             source_commit,
             source_text,
@@ -880,6 +1002,46 @@ mod token_tests {
         assert_eq!(ItemKind::from_db_str("change_request").unwrap(), ItemKind::ChangeRequest);
         for rejected in ["Issue", "pull", "change-request", " issue", ""] {
             assert!(ItemKind::from_db_str(rejected).is_err(), "must reject `{rejected}`");
+        }
+    }
+
+    #[test]
+    fn ref_and_doc_kind_tokens_are_exact_and_closed() {
+        use strum::VariantArray;
+
+        let ref_kinds = RefKind::VARIANTS.iter().map(|kind| kind.as_db_str()).collect::<Vec<_>>();
+        assert_eq!(ref_kinds, [
+            "closing",
+            "reverts",
+            "reference",
+            "unknown",
+            "url",
+            "cross_repo",
+            "local_number",
+            "gh_dash"
+        ]);
+        let source_kinds =
+            RefSourceKind::VARIANTS.iter().map(|kind| kind.as_db_str()).collect::<Vec<_>>();
+        assert_eq!(source_kinds, ["branch", "commit", "file", "manual", "item", "comment"]);
+        let doc_kinds = DocKind::VARIANTS.iter().map(|kind| kind.as_db_str()).collect::<Vec<_>>();
+        assert_eq!(doc_kinds, ["item", "comment"]);
+        for kind in RefKind::VARIANTS {
+            assert_eq!(RefKind::from_db_str(kind.as_db_str()).unwrap(), *kind);
+        }
+        for kind in RefSourceKind::VARIANTS {
+            assert_eq!(RefSourceKind::from_db_str(kind.as_db_str()).unwrap(), *kind);
+        }
+        for kind in DocKind::VARIANTS {
+            assert_eq!(DocKind::from_db_str(kind.as_db_str()).unwrap(), *kind);
+        }
+        for rejected in ["Closing", " closing", "fixes", ""] {
+            assert!(RefKind::from_db_str(rejected).is_err(), "must reject `{rejected}`");
+        }
+        for rejected in ["Commit", "commit ", "pr", ""] {
+            assert!(RefSourceKind::from_db_str(rejected).is_err(), "must reject `{rejected}`");
+        }
+        for rejected in ["Item", "comments", ""] {
+            assert!(DocKind::from_db_str(rejected).is_err(), "must reject `{rejected}`");
         }
     }
 

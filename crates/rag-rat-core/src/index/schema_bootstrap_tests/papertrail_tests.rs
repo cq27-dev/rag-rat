@@ -26,12 +26,14 @@ fn configless_discovery_keeps_self_contained_github_refs_from_files_and_commits(
     assert_eq!(report.discovered_refs, 2);
 
     let refs = papertrail::refs(db.storage.connection()).unwrap();
-    for (source_kind, key) in [("file", "7"), ("commit", "8")] {
+    for (source_kind, key) in
+        [(papertrail::RefSourceKind::File, "7"), (papertrail::RefSourceKind::Commit, "8")]
+    {
         assert!(refs.iter().any(|reference| {
             reference.tracker == papertrail::Tracker::Github
                 && reference.project == "cq27-dev/rag-rat"
                 && reference.item_key == key
-                && reference.source_kind == source_kind
+                && reference.source_kind == source_kind.as_db_str()
         }));
     }
 
@@ -73,8 +75,8 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
         project: "group/repo".to_string(),
         item_kind: Some(papertrail::ItemKind::Issue),
         item_key: "42".to_string(),
-        ref_kind: "reference".to_string(),
-        source_kind: "manual".to_string(),
+        ref_kind: papertrail::RefKind::Reference.as_db_str().to_string(),
+        source_kind: papertrail::RefSourceKind::Manual.as_db_str().to_string(),
         source_path: None,
         source_commit: None,
         source_text: "group/repo#42".to_string(),
@@ -152,8 +154,8 @@ fn rationale_lookup_keeps_self_contained_github_refs_without_a_binding() {
         project: "cq27-dev/rag-rat".to_string(),
         item_kind: None,
         item_key: "42".to_string(),
-        ref_kind: "reference".to_string(),
-        source_kind: "manual".to_string(),
+        ref_kind: papertrail::RefKind::Reference.as_db_str().to_string(),
+        source_kind: papertrail::RefSourceKind::Manual.as_db_str().to_string(),
         source_path: None,
         source_commit: None,
         source_text: "cq27-dev/rag-rat#42".to_string(),
@@ -304,7 +306,8 @@ fn papertrail_for_symbol_dedupes_duplicate_file_refs() {
         papertrail
             .evidence
             .iter()
-            .filter(|item| item.item_key == "42" && item.doc_kind == "item")
+            .filter(|item| item.item_key == "42"
+                && item.doc_kind == papertrail::DocKind::Item.as_db_str())
             .count(),
         1,
         "duplicate #42 refs in one file should collapse to one item evidence row: {papertrail:?}"
@@ -1333,8 +1336,8 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
         tracker: papertrail::Tracker::Github,
         project: "o/r".to_string(),
         item_key: item_key.to_string(),
-        ref_kind: "unknown".to_string(),
-        source_kind: "file".to_string(),
+        ref_kind: papertrail::RefKind::Unknown.as_db_str().to_string(),
+        source_kind: papertrail::RefSourceKind::File.as_db_str().to_string(),
         source_path: None,
         source_commit: None,
         source_text: String::new(),

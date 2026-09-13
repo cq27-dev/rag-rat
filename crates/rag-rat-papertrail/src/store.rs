@@ -153,7 +153,7 @@ pub fn store_item(
         project: &item.project,
         item_kind: item.item_kind.as_db_str(),
         item_key: &item.item_key,
-        doc_kind: "item",
+        doc_kind: DocKind::Item,
         comment_id: "",
         url: &item.url,
         title: &item.title,
@@ -217,7 +217,7 @@ pub fn store_comment(
         project: &comment.project,
         item_kind: comment.item_kind.as_db_str(),
         item_key: &comment.item_key,
-        doc_kind: "comment",
+        doc_kind: DocKind::Comment,
         comment_id: &comment.comment_id,
         url: comment.url.as_deref().unwrap_or_default(),
         // A file-anchored comment surfaces its path in the title slot (the affordance the old
@@ -362,7 +362,7 @@ fn rebuild_fts_inner(conn: &Connection) -> rusqlite::Result<()> {
                 project: &row.get::<_, String>(1)?,
                 item_kind: &row.get::<_, String>(2)?,
                 item_key: &row.get::<_, String>(3)?,
-                doc_kind: "item",
+                doc_kind: DocKind::Item,
                 comment_id: "",
                 url: &row.get::<_, String>(4)?,
                 title: &row.get::<_, String>(5)?,
@@ -383,7 +383,7 @@ fn rebuild_fts_inner(conn: &Connection) -> rusqlite::Result<()> {
             project: &row.get::<_, String>(1)?,
             item_kind: &row.get::<_, String>(2)?,
             item_key: &row.get::<_, String>(3)?,
-            doc_kind: "comment",
+            doc_kind: DocKind::Comment,
             comment_id: &row.get::<_, String>(4)?,
             url: &row.get::<_, String>(5)?,
             title: &row.get::<_, String>(6)?,
@@ -404,7 +404,7 @@ pub(crate) fn insert_fts(conn: &Connection, row: FtsRow<'_>) -> rusqlite::Result
             row.project,
             row.item_kind,
             row.item_key,
-            row.doc_kind,
+            row.doc_kind.as_db_str(),
             row.comment_id,
             row.url,
             row.title,
@@ -773,33 +773,61 @@ mod fts_mirror_tests {
     fn store_ref_promotes_to_the_strongest_claim_and_never_demotes() {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn, &crate::test_hooks()).unwrap();
-        let make = |kind: &str| crate::PapertrailRef {
+        let make = |kind: crate::RefKind| crate::PapertrailRef {
             tracker: Tracker::Github,
             project: "o/r".into(),
             item_key: "5".into(),
             item_kind: None,
-            ref_kind: kind.into(),
-            source_kind: "commit".into(),
+            ref_kind: kind.as_db_str().to_string(),
+            source_kind: crate::RefSourceKind::Commit.as_db_str().to_string(),
             source_path: None,
             source_commit: Some("abc".into()),
             source_text: "fixes #5".into(),
         };
         // An old row classified before a keyword existed…
-        store_ref(&conn, &make("unknown")).unwrap();
+        store_ref(&conn, &make(crate::RefKind::Unknown)).unwrap();
         // …is PROMOTED by re-discovery under the stronger classification (no migration needed:
         // commit discovery re-parses every sync)…
-        store_ref(&conn, &make("closing")).unwrap();
+        store_ref(&conn, &make(crate::RefKind::Closing)).unwrap();
         let kind: String =
             conn.query_row("SELECT ref_kind FROM papertrail_refs", [], |r| r.get(0)).unwrap();
         assert_eq!(kind, "closing");
         // …and a later weaker sighting never demotes it.
-        store_ref(&conn, &make("reference")).unwrap();
+        store_ref(&conn, &make(crate::RefKind::Reference)).unwrap();
         let kind: String =
             conn.query_row("SELECT ref_kind FROM papertrail_refs", [], |r| r.get(0)).unwrap();
         assert_eq!(kind, "closing");
         let rows: i64 =
             conn.query_row("SELECT COUNT(*) FROM papertrail_refs", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 1, "one row per identity throughout");
+    }
+    #[test]
+    fn rows_with_unrecognized_kind_tokens_still_read() {
+        // `papertrail_refs.ref_kind`/`source_kind` and `papertrail_fts.doc_kind` are unconstrained
+        // TEXT: a token this build does not know round-trips verbatim instead of failing the read.
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
+        store_ref(&conn, &crate::PapertrailRef {
+            tracker: Tracker::Github,
+            project: "o/r".into(),
+            item_key: "5".into(),
+            item_kind: None,
+            ref_kind: "custom".into(),
+            source_kind: "elsewhere".into(),
+            source_path: None,
+            source_commit: None,
+            source_text: "o/r#5".into(),
+        })
+        .unwrap();
+        let refs = crate::refs(&conn).unwrap();
+        assert_eq!(
+            (refs[0].ref_kind.as_str(), refs[0].source_kind.as_str()),
+            ("custom", "elsewhere")
+        );
+        store_item(&conn, Tracker::Github, &item(ItemKind::Issue, "5", "alpha", "beta")).unwrap();
+        conn.execute("UPDATE papertrail_fts SET doc_kind = 'custom'", []).unwrap();
+        let hits = crate::search_fts(&conn, "alpha", None, 10).unwrap();
+        assert_eq!(hits[0].doc_kind, "custom");
     }
     #[test]
     fn storing_a_reopened_item_voids_its_closing_edges() {

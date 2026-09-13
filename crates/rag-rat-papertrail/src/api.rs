@@ -499,7 +499,7 @@ pub async fn sync_issue<C: PapertrailClient>(
         .ok_or_else(|| anyhow::anyhow!("invalid tracker item reference `{issue_ref}`"))?;
     let project = parsed.project.clone();
     let item_key = parsed.number.to_string();
-    store_ref(conn, &parsed.into_ref("manual", None, None, issue_ref.to_string()))?;
+    store_ref(conn, &parsed.into_ref(RefSourceKind::Manual, None, None, issue_ref.to_string()))?;
     let refs = refs(conn)?;
     let sync = if offline {
         SyncRefsReport::default()
@@ -655,7 +655,7 @@ pub fn issue_search(
     // not shrink the result below `limit` when lower-ranked unique matches exist; truncate after.
     // Bounded 2× covers the common single-PR pair; a thread with many coalesced PRs may still
     // under-fill (rare, and the corpus may genuinely have fewer distinct threads).
-    let mut evidence = search_fts(conn, query, Some("item"), coalesce_overfetch(limit))?;
+    let mut evidence = search_fts(conn, query, Some(DocKind::Item), coalesce_overfetch(limit))?;
     attach_records(conn, &mut evidence)?;
     coalesce_pairs(&mut evidence);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));

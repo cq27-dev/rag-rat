@@ -131,7 +131,7 @@ pub(crate) fn evidence_for_commit_refs(
 pub(crate) fn search_fts(
     conn: &Connection,
     query: &str,
-    doc_kind: Option<&str>,
+    doc_kind: Option<DocKind>,
     limit: u32,
 ) -> anyhow::Result<Vec<PapertrailEvidence>> {
     let fts_query = fts_query(query);
@@ -158,7 +158,10 @@ pub(crate) fn search_fts(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(doc_kind) = doc_kind {
-        stmt.query_map(params![fts_query, i64::from(limit), doc_kind, repo_id], evidence_row)?
+        stmt.query_map(
+            params![fts_query, i64::from(limit), doc_kind.as_db_str(), repo_id],
+            evidence_row,
+        )?
     } else {
         stmt.query_map(params![fts_query, i64::from(limit), repo_id], evidence_row)?
     };

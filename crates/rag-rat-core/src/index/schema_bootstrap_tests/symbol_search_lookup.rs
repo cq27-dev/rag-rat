@@ -2052,7 +2052,7 @@ fn papertrail_sync_caches_rationale_without_query_time_crawling() {
 
     let refs = db.papertrail_refs_for_path("docs/search.md", 10).unwrap();
     assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].source_kind, "file");
+    assert_eq!(refs[0].source_kind, rag_rat_papertrail::RefSourceKind::File.as_db_str());
 
     let rationale = db.rationale_search("risk", 10).unwrap();
     assert!(rationale.iter().any(|item| item.snippet.contains("live crawling")));

@@ -38,7 +38,7 @@ pub(crate) fn parse_issue_ref(token: &str, default_repo: Option<&str>) -> Option
     Some(ParsedRef {
         project: parsed.project,
         number: parsed.number,
-        kind: parsed.shape.to_string(),
+        kind: parsed.shape.ref_kind(),
     })
 }
 struct GithubTokenRef {
@@ -48,7 +48,27 @@ struct GithubTokenRef {
     /// refs stay `None`: GitHub serves pull requests through issue URLs too, so the provider must
     /// resolve their kind.
     item_kind: Option<ItemKind>,
-    shape: &'static str,
+    shape: TokenShape,
+}
+/// Which GitHub token syntax matched.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenShape {
+    Url,
+    CrossRepo,
+    GhDash,
+    LocalNumber,
+}
+impl TokenShape {
+    /// The ref kind a shape records when no preceding word classifies it (the manual single-item
+    /// lane — see [`RefKind::Url`]).
+    fn ref_kind(self) -> RefKind {
+        match self {
+            Self::Url => RefKind::Url,
+            Self::CrossRepo => RefKind::CrossRepo,
+            Self::GhDash => RefKind::GhDash,
+            Self::LocalNumber => RefKind::LocalNumber,
+        }
+    }
 }
 /// The GitHub token grammar — `<base>/owner/repo/{issues|pull}/N` URLs, `owner/repo#N`, `GH-N`,
 /// bare `#N` — shared by the legacy lane and the provider-keyed grammar so the two can never
@@ -67,7 +87,7 @@ fn github_token_ref(
                 project: format!("{}/{}", parts[0], parts[1]),
                 number: ref_number(parts[3])?,
                 item_kind: (parts[2] == "pull").then_some(ItemKind::ChangeRequest),
-                shape: "url",
+                shape: TokenShape::Url,
             });
         }
     }
@@ -78,7 +98,7 @@ fn github_token_ref(
                 project: repo_ref.to_string(),
                 number: ref_number(number)?,
                 item_kind: None,
-                shape: "cross_repo",
+                shape: TokenShape::CrossRepo,
             });
         }
     }
@@ -89,7 +109,7 @@ fn github_token_ref(
             project: default_project?.to_string(),
             number: ref_number(number)?,
             item_kind: None,
-            shape: "gh_dash",
+            shape: TokenShape::GhDash,
         });
     }
     if local_number && let Some(number) = token.strip_prefix('#') {
@@ -97,7 +117,7 @@ fn github_token_ref(
             project: default_project?.to_string(),
             number: ref_number(number)?,
             item_kind: None,
-            shape: "local_number",
+            shape: TokenShape::LocalNumber,
         });
     }
     None
@@ -113,14 +133,15 @@ pub struct TrackerParsedRef {
     /// Provider item key, stringly — numeric for the code hosts, `PROJ-123` for Jira.
     pub item_key: String,
     pub item_kind: Option<ItemKind>,
-    /// `closing` / `reference` / `unknown` from the preceding word, exactly as [`parse_refs`].
-    pub ref_kind: String,
+    /// `closing` / `reverts` / `reference` / `unknown` from the preceding word, exactly as
+    /// [`parse_refs`].
+    pub ref_kind: RefKind,
 }
 
 impl TrackerParsedRef {
     pub(crate) fn into_ref(
         self,
-        source_kind: &str,
+        source_kind: RefSourceKind,
         source_path: Option<String>,
         source_commit: Option<String>,
         source_text: String,
@@ -130,8 +151,8 @@ impl TrackerParsedRef {
             project: self.project,
             item_key: self.item_key,
             item_kind: self.item_kind,
-            ref_kind: self.ref_kind,
-            source_kind: source_kind.to_string(),
+            ref_kind: self.ref_kind.as_db_str().to_string(),
+            source_kind: source_kind.as_db_str().to_string(),
             source_path,
             source_commit,
             source_text,
@@ -255,7 +276,7 @@ fn tracker_token_ref(
             let base = url_base(tracker, "https://github.com");
             let parsed =
                 github_token_ref(token, Some(&tracker.project), base, is_code_host && allow_bare)?;
-            if bare_only && !matches!(parsed.shape, "local_number" | "gh_dash") {
+            if bare_only && !matches!(parsed.shape, TokenShape::LocalNumber | TokenShape::GhDash) {
                 return None;
             }
             Some(tracker_ref(tracker, parsed.project, parsed.number.to_string(), parsed.item_kind))
@@ -291,13 +312,13 @@ fn tracker_ref(
     item_key: String,
     item_kind: Option<ItemKind>,
 ) -> TrackerParsedRef {
-    // `ref_kind` comes from the surrounding text; the caller stamps it.
+    // `ref_kind` comes from the surrounding text; the caller stamps it over this placeholder.
     TrackerParsedRef {
         provider: tracker.provider,
         project,
         item_key,
         item_kind,
-        ref_kind: String::new(),
+        ref_kind: RefKind::Unknown,
     }
 }
 /// The URL prefix a binding's URL grammar matches. A self-hosted binding matches ONLY its own
@@ -456,9 +477,9 @@ pub(crate) fn ref_number(digits: &str) -> Option<i64> {
 /// GitHub's (the gerunds and the Implement family close issues on default-branch merges/commits),
 /// so a ref CLAIMED by a GitLab binding classifies under GitLab's set; every other provider uses
 /// the GitHub set (the shared floor).
-pub(crate) fn ref_kind_for(provider: Tracker, previous: &str) -> String {
+pub(crate) fn ref_kind_for(provider: Tracker, previous: &str) -> RefKind {
     let base = ref_kind(previous);
-    if provider == Tracker::Gitlab && base == "unknown" {
+    if provider == Tracker::Gitlab && base == RefKind::Unknown {
         let previous = previous.to_ascii_lowercase();
         if [
             "closing",
@@ -471,7 +492,7 @@ pub(crate) fn ref_kind_for(provider: Tracker, previous: &str) -> String {
         ]
         .contains(&previous.as_str())
         {
-            return "closing".to_string();
+            return RefKind::Closing;
         }
     }
     base
@@ -487,18 +508,18 @@ pub(crate) fn ref_kind_for(provider: Tracker, previous: &str) -> String {
 pub const CLOSING_KEYWORDS: &[&str] =
     &["fix", "fixes", "fixed", "close", "closes", "closed", "resolve", "resolves", "resolved"];
 
-pub(crate) fn ref_kind(previous: &str) -> String {
+pub(crate) fn ref_kind(previous: &str) -> RefKind {
     let previous = previous.to_ascii_lowercase();
     if CLOSING_KEYWORDS.contains(&previous.as_str()) {
-        "closing".to_string()
+        RefKind::Closing
     } else if ["reverts", "reverted"].contains(&previous.as_str()) {
         // "Reverts owner/repo#N" — the body GitHub writes into every revert PR: a free PR↔PR
         // revert edge for the distill layer's outcome chains (issue #702).
-        "reverts".to_string()
+        RefKind::Reverts
     } else if ["refs", "ref", "see", "related"].contains(&previous.as_str()) {
-        "reference".to_string()
+        RefKind::Reference
     } else {
-        "unknown".to_string()
+        RefKind::Unknown
     }
 }
 pub(crate) fn classify_text(text: &str) -> String {
@@ -731,7 +752,7 @@ mod grammar_tests {
         assert_eq!(table("#notanumber a/b/c#4 https://github.com/a/b", &gh), Vec::new());
         // The ref-kind words still classify the surrounding text.
         let refs = parse_tracker_refs("fixes #1 and see #2, #3", &gh);
-        assert_eq!(refs.iter().map(|r| r.ref_kind.as_str()).collect::<Vec<_>>(), [
+        assert_eq!(refs.iter().map(|r| r.ref_kind.as_db_str()).collect::<Vec<_>>(), [
             "closing",
             "reference",
             "unknown"
@@ -875,7 +896,7 @@ mod grammar_tests {
             let refs = parse_tracker_refs(text, &github);
             assert_eq!(refs.len(), 1, "`{text}` parses");
             assert_eq!(refs[0].item_key, "5", "`{text}`");
-            assert_eq!(refs[0].ref_kind, "closing", "`{text}` keeps the closing claim");
+            assert_eq!(refs[0].ref_kind, RefKind::Closing, "`{text}` keeps the closing claim");
         }
         // A LEADING `!` stays ref syntax (GitLab MR shorthand), only trailing is trimmed.
         let gitlab = [tracker(Tracker::Gitlab, "g/r")];
@@ -935,12 +956,12 @@ mod grammar_tests {
         let gitlab = [tracker(Tracker::Gitlab, "g/r")];
         for text in ["Closing #5", "Fixing #5", "Implements #5", "resolving #5"] {
             let refs = parse_tracker_refs(text, &gitlab);
-            assert_eq!(refs[0].ref_kind, "closing", "`{text}` closes on GitLab");
+            assert_eq!(refs[0].ref_kind, RefKind::Closing, "`{text}` closes on GitLab");
         }
         let github = [tracker(Tracker::Github, "o/r")];
         for text in ["Closing #5", "Implements #5"] {
             let refs = parse_tracker_refs(text, &github);
-            assert_eq!(refs[0].ref_kind, "unknown", "`{text}` does NOT close on GitHub");
+            assert_eq!(refs[0].ref_kind, RefKind::Unknown, "`{text}` does NOT close on GitHub");
         }
     }
 
@@ -1178,9 +1199,13 @@ mod mapper_tests {
     #[test]
     fn singular_closing_keywords_classify_as_closing() {
         for word in ["fix", "close", "resolve", "Fixes", "resolved"] {
-            assert_eq!(ref_kind(word), "closing", "`{word}` is a documented closing keyword");
+            assert_eq!(
+                ref_kind(word),
+                RefKind::Closing,
+                "`{word}` is a documented closing keyword"
+            );
         }
-        assert_eq!(ref_kind("prefix"), "unknown", "substrings of keywords do not match");
+        assert_eq!(ref_kind("prefix"), RefKind::Unknown, "substrings of keywords do not match");
     }
 
     #[test]
@@ -1195,7 +1220,7 @@ mod mapper_tests {
         };
         let refs = parse_tracker_refs("Reverts o/r#41", &[binding]);
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].ref_kind, "reverts");
+        assert_eq!(refs[0].ref_kind, RefKind::Reverts);
         assert_eq!(refs[0].item_key, "41");
     }
 }

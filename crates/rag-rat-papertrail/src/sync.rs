@@ -14,11 +14,11 @@ pub(crate) fn discover_and_store_refs(
         .map(|name| name.shorten().to_string())
         .unwrap_or_default();
     for parsed in parse_tracker_refs(&branch, &ctx.trackers) {
-        refs.push(parsed.into_ref("branch", None, None, branch.clone()));
+        refs.push(parsed.into_ref(RefSourceKind::Branch, None, None, branch.clone()));
     }
     if ctx.trackers.is_empty() {
         for parsed in parse_refs(&branch, None) {
-            refs.push(parsed.into_ref("branch", None, None, branch.clone()));
+            refs.push(parsed.into_ref(RefSourceKind::Branch, None, None, branch.clone()));
         }
     }
     let mut unique = BTreeSet::new();
@@ -199,11 +199,21 @@ pub(crate) fn discover_commit_refs(
         let (hash, subject, body) = row?;
         for text in [subject, body] {
             for parsed in parse_tracker_refs(&text, trackers) {
-                out.push(parsed.into_ref("commit", None, Some(hash.clone()), text.clone()));
+                out.push(parsed.into_ref(
+                    RefSourceKind::Commit,
+                    None,
+                    Some(hash.clone()),
+                    text.clone(),
+                ));
             }
             if trackers.is_empty() {
                 for parsed in parse_refs(&text, None) {
-                    out.push(parsed.into_ref("commit", None, Some(hash.clone()), text.clone()));
+                    out.push(parsed.into_ref(
+                        RefSourceKind::Commit,
+                        None,
+                        Some(hash.clone()),
+                        text.clone(),
+                    ));
                 }
             }
         }
@@ -226,7 +236,7 @@ pub(crate) fn discover_file_refs(
         for line in text.lines() {
             for parsed in parse_tracker_refs(line, trackers) {
                 out.push(parsed.into_ref(
-                    "file",
+                    RefSourceKind::File,
                     Some(path.clone()),
                     None,
                     line.trim().to_string(),
@@ -235,7 +245,7 @@ pub(crate) fn discover_file_refs(
             if trackers.is_empty() {
                 for parsed in parse_refs(line, None) {
                     out.push(parsed.into_ref(
-                        "file",
+                        RefSourceKind::File,
                         Some(path.clone()),
                         None,
                         line.trim().to_string(),
@@ -422,7 +432,7 @@ pub(crate) fn mine_item_refs(
             {
                 continue;
             }
-            let reference = parsed.into_ref("item", None, None, identity.clone());
+            let reference = parsed.into_ref(RefSourceKind::Item, None, None, identity.clone());
             store_ref(conn, &reference)?;
         }
     }
@@ -455,7 +465,7 @@ pub(crate) fn mine_comment_refs(
         {
             continue;
         }
-        let reference = parsed.into_ref("comment", None, None, identity.clone());
+        let reference = parsed.into_ref(RefSourceKind::Comment, None, None, identity.clone());
         store_ref(conn, &reference)?;
     }
     Ok(())
@@ -573,7 +583,7 @@ pub(crate) fn current_commit_closing_refs(conn: &Connection) -> anyhow::Result<V
             item_key,
             item_kind,
             ref_kind,
-            source_kind: "commit".to_string(),
+            source_kind: RefSourceKind::Commit.as_db_str().to_string(),
             source_path: None,
             source_commit,
             source_text,
@@ -688,12 +698,13 @@ fn default_branch_checkout_projects(
 /// indexed commit is default-reachable. On a feature/release checkout — or when `origin/HEAD`
 /// is unset — the refs stay annotations and the provider tier attests closures.
 /// Claim strength for the in-memory duplicate collapse — closing beats reverts beats plain
-/// reference beats unknown.
+/// reference beats every other token (unknown, the manual lane's syntax shapes, or a token this
+/// build does not know).
 fn ref_kind_rank(kind: &str) -> u8 {
-    match kind {
-        "closing" => 0,
-        "reverts" => 1,
-        "reference" => 2,
+    match kind.parse::<RefKind>() {
+        Ok(RefKind::Closing) => 0,
+        Ok(RefKind::Reverts) => 1,
+        Ok(RefKind::Reference) => 2,
         _ => 3,
     }
 }
@@ -714,7 +725,9 @@ pub(crate) fn store_text_closing_edges_from_commit_refs(
         if !default_branch_projects.contains(&(reference.tracker, reference.project.clone())) {
             continue;
         }
-        if reference.ref_kind != "closing" || reference.source_kind != "commit" {
+        if reference.ref_kind != RefKind::Closing.as_db_str()
+            || reference.source_kind != RefSourceKind::Commit.as_db_str()
+        {
             continue;
         }
         // Issue targets only: an explicit change-request target is an annotation, not a closer
@@ -860,8 +873,8 @@ mod mining_tests {
             project: "o/r".into(),
             item_key: "5".into(),
             item_kind: None,
-            ref_kind: "closing".into(),
-            source_kind: "commit".into(),
+            ref_kind: RefKind::Closing.as_db_str().to_string(),
+            source_kind: RefSourceKind::Commit.as_db_str().to_string(),
             source_path: None,
             source_commit: Some("deadbeef".into()),
             source_text: "fixes #5".into(),
@@ -977,8 +990,8 @@ mod mining_tests {
             project: "o/r".into(),
             item_key: "5".into(),
             item_kind: None,
-            ref_kind: "closing".into(),
-            source_kind: "commit".into(),
+            ref_kind: RefKind::Closing.as_db_str().to_string(),
+            source_kind: RefSourceKind::Commit.as_db_str().to_string(),
             source_path: None,
             source_commit: Some(sha.into()),
             source_text: "fixes #5".into(),
@@ -1012,9 +1025,11 @@ mod mining_tests {
 
     #[test]
     fn duplicate_collapse_keeps_the_closing_claim() {
-        assert!(ref_kind_rank("closing") < ref_kind_rank("reference"));
-        assert!(ref_kind_rank("reverts") < ref_kind_rank("reference"));
-        assert!(ref_kind_rank("reference") < ref_kind_rank("unknown"));
+        let rank = |kind: RefKind| ref_kind_rank(kind.as_db_str());
+        assert!(rank(RefKind::Closing) < rank(RefKind::Reference));
+        assert!(rank(RefKind::Reverts) < rank(RefKind::Reference));
+        assert!(rank(RefKind::Reference) < rank(RefKind::Unknown));
+        assert_eq!(ref_kind_rank("custom"), rank(RefKind::Unknown), "unknown tokens rank last");
     }
 
     #[test]
@@ -1089,8 +1104,8 @@ mod mining_tests {
             project: "PROJ".into(),
             item_key: "PROJ-123".into(),
             item_kind: Some(ItemKind::Issue),
-            ref_kind: "closing".into(),
-            source_kind: "commit".into(),
+            ref_kind: RefKind::Closing.as_db_str().to_string(),
+            source_kind: RefSourceKind::Commit.as_db_str().to_string(),
             source_path: None,
             source_commit: Some("deadbeef".into()),
             source_text: "fixes PROJ-123".into(),
@@ -1232,8 +1247,8 @@ mod mining_tests {
             project: "o/r".into(),
             item_key: "5".into(),
             item_kind: Some(ItemKind::Issue),
-            ref_kind: "closing".into(),
-            source_kind: "commit".into(),
+            ref_kind: RefKind::Closing.as_db_str().to_string(),
+            source_kind: RefSourceKind::Commit.as_db_str().to_string(),
             source_path: None,
             source_commit: Some("abc".into()),
             source_text: "fixes #5".into(),
@@ -1290,8 +1305,8 @@ mod mining_tests {
             project: "o/r".into(),
             item_key: "5".into(),
             item_kind: Some(ItemKind::Issue),
-            ref_kind: "closing".into(),
-            source_kind: "commit".into(),
+            ref_kind: RefKind::Closing.as_db_str().to_string(),
+            source_kind: RefSourceKind::Commit.as_db_str().to_string(),
             source_path: None,
             source_commit: Some("abc".into()),
             source_text: "fixes #5".into(),
@@ -1338,8 +1353,8 @@ mod mining_tests {
             project: "o/r".into(),
             item_key: "5".into(),
             item_kind: Some(ItemKind::Issue),
-            ref_kind: "closing".into(),
-            source_kind: "commit".into(),
+            ref_kind: RefKind::Closing.as_db_str().to_string(),
+            source_kind: RefSourceKind::Commit.as_db_str().to_string(),
             source_path: None,
             source_commit: Some("abc".into()),
             source_text: "fixes #5".into(),
