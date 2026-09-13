@@ -43,8 +43,20 @@ jobs:
             for lock in "${locks[@]}"; do cmd=(flock "$lock" "${cmd[@]}"); done
             "${cmd[@]}"
           }
+          # Cargo's lock covers compilation only: nextest and the benches run their binaries after
+          # it is released, and an eviction then can take a binary a sibling's test phase still
+          # needs. So sibling dirs are swept only while this job is the sole runner worker on the
+          # box — a job starting afterwards compiles first, behind the locks above, before it runs
+          # anything. This runner's own dir is idle by construction and is always swept.
+          own="${CARGO_TARGET_DIR:-}"
+          siblings_idle() { [ "$(pgrep -c -f 'Runner.Worker')" -le 1 ]; }
+          for _ in $(seq 1 60); do siblings_idle && break; sleep 30; done
           for dir in "$HOME"/actions-runner*/cargo-target; do
             [ -d "$dir" ] || continue
+            if [ "$dir" != "$own" ] && ! siblings_idle; then
+              echo "== $dir: skipped, a sibling runner is busy"
+              continue
+            fi
             echo "== $dir: $(du -sh "$dir" | cut -f1) before"
             sweep "$dir"
             echo "== $dir: $(du -sh "$dir" | cut -f1) after"
