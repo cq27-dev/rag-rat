@@ -1253,7 +1253,7 @@ impl IndexDatabase {
                 )? == Some((
                     content.sha256.clone(),
                     prepared_file.file.language.as_str().to_string(),
-                    prepared_file.file.kind.as_str().to_string(),
+                    prepared_file.file.kind.as_db_str().to_string(),
                 ))
             {
                 continue;

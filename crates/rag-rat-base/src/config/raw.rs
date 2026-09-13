@@ -268,11 +268,11 @@ impl TryFrom<RawLog> for LogConfig {
     fn try_from(raw: RawLog) -> Result<Self, Self::Error> {
         let d = LogConfig::default();
         let level = match raw.level {
-            Some(s) => LogLevel::parse(&s).ok_or(ConfigError::UnknownLogLevel(s))?,
+            Some(s) => LogLevel::parse_config(&s).ok_or(ConfigError::UnknownLogLevel(s))?,
             None => d.level,
         };
         let format = match raw.format {
-            Some(s) => LogFormat::parse(&s).ok_or(ConfigError::UnknownLogFormat(s))?,
+            Some(s) => LogFormat::parse_config(&s).ok_or(ConfigError::UnknownLogFormat(s))?,
             None => d.format,
         };
         Ok(Self {
@@ -424,7 +424,8 @@ impl TryFrom<RawMemory> for MemoryConfig {
 
     fn try_from(raw: RawMemory) -> Result<Self, Self::Error> {
         let surface = match raw.surface {
-            Some(s) => MemorySurface::parse(&s).ok_or(ConfigError::UnknownMemorySurface(s))?,
+            Some(s) =>
+                MemorySurface::parse_config(&s).ok_or(ConfigError::UnknownMemorySurface(s))?,
             None => MemorySurface::default(),
         };
         Ok(Self { surface })

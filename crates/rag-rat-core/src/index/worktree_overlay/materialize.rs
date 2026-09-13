@@ -445,7 +445,7 @@ impl IndexDatabase {
                 == Some(&(
                     hex_sha256(&bytes),
                     language.as_str().to_string(),
-                    kind.as_str().to_string(),
+                    kind.as_db_str().to_string(),
                 ))
             {
                 continue; // unchanged since the last overlay index (content AND target identity)

@@ -287,7 +287,7 @@ pub(crate) fn doctor(config: &Config, args: &DoctorArgs) -> anyhow::Result<()> {
             "name": target.name,
             "language": target.language.as_str(),
             "directories": target.directories,
-            "kind": target.kind.as_str(),
+            "kind": target.kind.as_db_str(),
         })).collect::<Vec<_>>(),
         "index": index,
         "mcp": {

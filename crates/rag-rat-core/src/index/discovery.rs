@@ -89,7 +89,7 @@ pub(crate) fn discovery_plan(
                 && let Some(matching) = rows.iter().rev().find(|row| {
                     row.sha256 == current_hash
                         && row.language == file.language.as_str()
-                        && row.kind == file.kind.as_str()
+                        && row.kind == file.kind.as_db_str()
                 })
             {
                 carried.push(matching.file_id);
@@ -104,7 +104,7 @@ pub(crate) fn discovery_plan(
         // `cpp` target. The stored row would otherwise keep its old parse forever (sha unchanged),
         // so the `.h`→C++ upgrade would never take effect on an existing index without `--full`.
         let target_drift =
-            indexed.language != file.language.as_str() || indexed.kind != file.kind.as_str();
+            indexed.language != file.language.as_str() || indexed.kind != file.kind.as_db_str();
         if current_hash != indexed.sha256 || target_drift {
             changed.push(file.relative_path.clone());
             files.push(file);

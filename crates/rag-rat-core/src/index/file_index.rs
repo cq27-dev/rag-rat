@@ -213,7 +213,7 @@ impl IndexDatabase {
                 params![
                     path,
                     file.language.as_str(),
-                    file.kind.as_str(),
+                    file.kind.as_db_str(),
                     prepared.sha256,
                     prepared.modified_at_ms,
                     rag_rat_base::path_class::file_is_generated(file.kind, &path),

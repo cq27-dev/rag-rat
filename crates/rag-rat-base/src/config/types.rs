@@ -94,13 +94,7 @@ impl Tracker {
         value.parse().map_err(|_| anyhow::anyhow!("unknown tracker token `{value}`"))
     }
     pub(crate) fn parse_config(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "github" => Some(Self::Github),
-            "gitlab" => Some(Self::Gitlab),
-            "bitbucket" => Some(Self::Bitbucket),
-            "jira" => Some(Self::Jira),
-            _ => None,
-        }
+        s.trim().to_ascii_lowercase().parse().ok()
     }
     pub fn is_code_host(self) -> bool {
         !matches!(self, Self::Jira)
@@ -159,9 +153,10 @@ pub struct MemoryConfig {
 /// bodies. With no summary row the body's own size decides: a note already inside the summary
 /// envelope (≤150 words and ≤1200 characters) is one compaction skips and will never have a row, so
 /// it surfaces WHOLE rather than as a bare title, while a longer uncompacted body is deferred
-/// behind a one-line marker naming the expand call. Persisted only in config, so a closed enum with
-/// a stable `as_str` round-trip is enough (no DB column).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// behind a one-line marker naming the expand call. Persisted only in config (no DB column):
+/// `as_db_str` is its stable config token.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub enum MemorySurface {
     /// Title + compacted summary + verdict marker. The default — a body over the summary envelope
     /// is deferred to `memory show`, one already inside it is shown whole.
@@ -174,21 +169,14 @@ pub enum MemorySurface {
 
 impl MemorySurface {
     /// The stable config string (matches the toml `surface = "..."` value).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Summary => "summary",
-        }
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
     }
 
     /// Parse a `surface = "..."` value (case-insensitive). `None` for an unrecognized value — the
     /// config layer turns that into `ConfigError::UnknownMemorySurface`.
-    pub(crate) fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "full" => Some(Self::Full),
-            "summary" => Some(Self::Summary),
-            _ => None,
-        }
+    pub(crate) fn parse_config(s: &str) -> Option<Self> {
+        s.trim().to_ascii_lowercase().parse().ok()
     }
 }
 
@@ -427,7 +415,8 @@ impl Default for WatchConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub enum LogLevel {
     Off,
     Error,
@@ -438,44 +427,26 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    pub(crate) fn parse(s: &str) -> Option<Self> {
-        Some(match s.trim().to_ascii_lowercase().as_str() {
-            "off" => Self::Off,
-            "error" => Self::Error,
-            "warn" => Self::Warn,
-            "info" => Self::Info,
-            "debug" => Self::Debug,
-            "trace" => Self::Trace,
-            _ => return None,
-        })
+    pub(crate) fn parse_config(s: &str) -> Option<Self> {
+        s.trim().to_ascii_lowercase().parse().ok()
     }
 
     /// The EnvFilter directive string for this level.
-    pub fn as_filter_str(&self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Error => "error",
-            Self::Warn => "warn",
-            Self::Info => "info",
-            Self::Debug => "debug",
-            Self::Trace => "trace",
-        }
+    pub fn as_filter_str(self) -> &'static str {
+        self.into()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString)]
+#[strum(serialize_all = "lowercase")]
 pub enum LogFormat {
     Text,
     Json,
 }
 
 impl LogFormat {
-    pub(crate) fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "text" => Some(Self::Text),
-            "json" => Some(Self::Json),
-            _ => None,
-        }
+    pub(crate) fn parse_config(s: &str) -> Option<Self> {
+        s.trim().to_ascii_lowercase().parse().ok()
     }
 }
 
@@ -1117,7 +1088,8 @@ impl ResolvedTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub enum TargetKind {
     Source,
     Generated,
@@ -1126,13 +1098,9 @@ pub enum TargetKind {
 }
 
 impl TargetKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Source => "source",
-            Self::Generated => "generated",
-            Self::Docs => "docs",
-            Self::Tests => "tests",
-        }
+    /// The token stored in `files.kind` (and the toml `kind = "..."` spelling).
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
     }
 }
 

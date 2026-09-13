@@ -15,7 +15,7 @@ pub(crate) fn dump_config(config: &Config) -> anyhow::Result<()> {
                 "directories": target.directories,
                 "include": target.include,
                 "exclude": target.exclude,
-                "kind": target.kind.as_str(),
+                "kind": target.kind.as_db_str(),
             })
         })
         .collect::<Vec<_>>();

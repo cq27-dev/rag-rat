@@ -558,7 +558,7 @@ pub(crate) fn prepare_index_content_from_text(
     let chunks = prepare_chunks(
         relative_path,
         language.as_str(),
-        kind.as_str(),
+        kind.as_db_str(),
         chunks,
         text,
         parsed.as_ref().map(|p| p.root()),

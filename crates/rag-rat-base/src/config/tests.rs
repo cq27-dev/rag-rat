@@ -2784,10 +2784,10 @@ fn memory_surface_defaults_summary_and_parses_full_and_rejects_unknown() {
     assert_eq!(memory.surface, MemorySurface::Full, "surface = \"full\" opts back to whole bodies");
 
     // Case-insensitive, and a round-trip through `as_str`.
-    assert_eq!(MemorySurface::parse("SUMMARY"), Some(MemorySurface::Summary));
-    assert_eq!(MemorySurface::parse("FULL"), Some(MemorySurface::Full));
-    assert_eq!(MemorySurface::Summary.as_str(), "summary");
-    assert_eq!(MemorySurface::Full.as_str(), "full");
+    assert_eq!(MemorySurface::parse_config("SUMMARY"), Some(MemorySurface::Summary));
+    assert_eq!(MemorySurface::parse_config("FULL"), Some(MemorySurface::Full));
+    assert_eq!(MemorySurface::Summary.as_db_str(), "summary");
+    assert_eq!(MemorySurface::Full.as_db_str(), "full");
 
     let bad: RawConfig =
         toml::from_str("[index]\nroot = \".\"\n\n[memory]\nsurface = \"digest\"\n").unwrap();
