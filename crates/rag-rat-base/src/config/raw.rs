@@ -120,12 +120,11 @@ struct RawTrackerAuth {
 impl TryFrom<RawTracker> for TrackerConfig {
     type Error = ConfigError;
     fn try_from(raw: RawTracker) -> Result<Self, Self::Error> {
-        let trimmed = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        let provider = match trimmed(raw.provider) {
+        let provider = match trimmed_nonempty(raw.provider) {
             None => return Err(ConfigError::TrackerProviderMissing),
             Some(p) => Tracker::parse_config(&p).ok_or(ConfigError::UnknownTrackerProvider(p))?,
         };
-        let project = trimmed(raw.project);
+        let project = trimmed_nonempty(raw.project);
         if provider == Tracker::Jira && project.is_none() {
             return Err(ConfigError::JiraTrackerRequiresProject);
         }
@@ -137,7 +136,7 @@ impl TryFrom<RawTracker> for TrackerConfig {
                 project: project.to_string(),
             });
         }
-        let base_url = match trimmed(raw.base_url) {
+        let base_url = match trimmed_nonempty(raw.base_url) {
             None => None,
             Some(url) => {
                 if !valid_tracker_base_url_scheme_authority(&url) {
@@ -160,7 +159,7 @@ impl TryFrom<RawTracker> for TrackerConfig {
         Ok(Self {
             provider,
             project,
-            remote: trimmed(raw.remote).unwrap_or_else(|| "origin".to_string()),
+            remote: trimmed_nonempty(raw.remote).unwrap_or_else(|| "origin".to_string()),
             base_url,
             auth,
             tags,
@@ -217,8 +216,7 @@ pub fn valid_tracker_base_url(url: &str) -> bool {
 impl TryFrom<RawTrackerAuth> for TrackerAuth {
     type Error = ConfigError;
     fn try_from(raw: RawTrackerAuth) -> Result<Self, Self::Error> {
-        let trimmed = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        match (trimmed(raw.env), trimmed(raw.token_command)) {
+        match (trimmed_nonempty(raw.env), trimmed_nonempty(raw.token_command)) {
             (Some(v), None) => Ok(Self::Env(v)),
             (None, Some(v)) => Ok(Self::TokenCommand(v)),
             _ => Err(ConfigError::TrackerAuthExactlyOne),
@@ -514,6 +512,82 @@ pub(crate) struct RawRemoteDream {
     provision_timeout_s: Option<u64>,
 }
 
+/// The embedding remote block's name in error messages.
+const EMBEDDING_REMOTE_SECTION: &str = "[llm.embedding.remote]";
+
+/// A present, non-blank key, trimmed; `None` for an absent or whitespace-only one.
+fn trimmed_nonempty(value: Option<String>) -> Option<String> {
+    value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+// The remote-serving checks the chat (`[llm.*.remote]`) and embedding (`[llm.embedding.remote]`)
+// blocks share. Each block supplies its own error variants, so messages stay block-specific, and
+// calls them in its own order, so a config with several mistakes reports the same one first.
+
+/// The SERVER-side model name — required, non-empty. For ollama the ollama model name; for
+/// infinity/vLLM the HF id the server was launched with.
+fn required_remote_model(
+    model: Option<String>,
+    missing: ConfigError,
+) -> Result<String, ConfigError> {
+    let model = model.unwrap_or_default();
+    let model = model.trim();
+    if model.is_empty() {
+        return Err(missing);
+    }
+    Ok(model.to_string())
+}
+
+/// Which OpenAI-compatible server serves the block. Omitted → `ollama` (back-compat).
+fn parse_remote_backend(
+    backend: Option<String>,
+    section: &'static str,
+) -> Result<RemoteBackend, ConfigError> {
+    match trimmed_nonempty(backend) {
+        None => Ok(RemoteBackend::default()),
+        Some(got) => RemoteBackend::from_db_str(&got)
+            .ok_or(ConfigError::RemoteBackendUnknown { section, got }),
+    }
+}
+
+/// The MODE is INFERRED from which URL field is set (#318): EXACTLY ONE of `endpoint` (connect) /
+/// `cookbook` (ephemeral). Both → ambiguous; neither → no server to reach. Returns the trimmed
+/// `(endpoint, cookbook)`.
+fn resolve_remote_mode(
+    endpoint: Option<String>,
+    cookbook: Option<String>,
+    ambiguous: ConfigError,
+) -> Result<(Option<String>, Option<String>), ConfigError> {
+    let endpoint = trimmed_nonempty(endpoint);
+    let cookbook = trimmed_nonempty(cookbook);
+    if endpoint.is_some() == cookbook.is_some() {
+        return Err(ambiguous);
+    }
+    Ok((endpoint, cookbook))
+}
+
+/// EPHEMERAL-only: the GPU to provision. A PRESENT-but-empty/whitespace value is a config error
+/// (clearer than silently dropping a meant-to-be-set key). Set together with a connect `endpoint`
+/// it is meaningless — reject it rather than ignore it. The VALUE is provider-specific (Modal GPU
+/// class / RunPod gpuTypeId); it is NOT validated against an allow-list — the provider does so at
+/// provision time.
+fn resolve_remote_gpu(
+    gpu: Option<String>,
+    section: &'static str,
+    connect_endpoint: Option<&str>,
+    requires_cookbook: ConfigError,
+) -> Result<Option<String>, ConfigError> {
+    let Some(gpu) = gpu else { return Ok(None) };
+    let gpu = gpu.trim();
+    if gpu.is_empty() {
+        return Err(ConfigError::RemoteGpuEmpty { section });
+    }
+    if connect_endpoint.is_some() {
+        return Err(requires_cookbook);
+    }
+    Ok(Some(gpu.to_string()))
+}
+
 /// Resolve a `[llm.*.remote]` chat-serving block. `section` names the block for error messages so a
 /// bad `[llm.distill.remote]` never surfaces a `[llm.dream.remote]`-worded error.
 fn resolve_remote_dream(
@@ -521,20 +595,8 @@ fn resolve_remote_dream(
     section: &'static str,
 ) -> Result<RemoteDreamConfig, ConfigError> {
     let default = RemoteDreamConfig::default();
-    let trimmed = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-    // The SERVER-side chat model name — required, non-empty. For ollama the ollama model name;
-    // for vLLM the HF id the server was launched with.
-    let model = raw.model.unwrap_or_default();
-    let model = model.trim();
-    if model.is_empty() {
-        return Err(ConfigError::DreamRemoteMissingModel { section });
-    }
-    // Which OpenAI-compatible server serves this block. Omitted → `ollama`.
-    let backend = match trimmed(raw.backend) {
-        None => RemoteBackend::default(),
-        Some(raw_backend) => RemoteBackend::from_db_str(&raw_backend)
-            .ok_or(ConfigError::RemoteBackendUnknown { section, got: raw_backend })?,
-    };
+    let model = required_remote_model(raw.model, ConfigError::DreamRemoteMissingModel { section })?;
+    let backend = parse_remote_backend(raw.backend, section)?;
     // A chat pass requests the CHAT capability; `infinity` is embed-only. Reject it at parse
     // time so a misrouted backend never reaches the chat client.
     if !backend.supports_chat() {
@@ -543,16 +605,10 @@ fn resolve_remote_dream(
             backend: backend.as_db_str().to_string(),
         });
     }
-    // The MODE is INFERRED from which URL field is set (mirrors embeddings): EXACTLY ONE of
-    // `endpoint` (connect) / `cookbook` (ephemeral). Both → ambiguous; neither → no server.
-    let endpoint = trimmed(raw.endpoint);
-    let cookbook = trimmed(raw.cookbook);
-    match (endpoint.is_some(), cookbook.is_some()) {
-        (true, true) | (false, false) => {
-            return Err(ConfigError::DreamRemoteModeAmbiguous { section });
-        },
-        _ => {},
-    }
+    let (endpoint, cookbook) =
+        resolve_remote_mode(raw.endpoint, raw.cookbook, ConfigError::DreamRemoteModeAmbiguous {
+            section,
+        })?;
     // SECRET HYGIENE: reject a `user:pass@host` endpoint and direct the user to `auth_env`
     // instead. Checked against the URL authority only, so an `@` in a path/query is fine.
     // `cookbook` is a recipe spec, not a URL, so it is not checked.
@@ -561,25 +617,14 @@ fn resolve_remote_dream(
     {
         return Err(ConfigError::DreamRemoteEndpointHasCredentials { section });
     }
-    // EPHEMERAL-only: the GPU to provision. A PRESENT-but-empty value is a config error
-    // (clearer than silently dropping a meant-to-be-set key). Set with a connect
-    // `endpoint` it is meaningless → rejected. The VALUE is provider-specific and
-    // validated at provision time.
-    let gpu = match raw.gpu {
-        Some(g) => {
-            let g = g.trim();
-            if g.is_empty() {
-                return Err(ConfigError::RemoteGpuEmpty { section });
-            }
-            if endpoint.is_some() {
-                return Err(ConfigError::DreamRemoteGpuRequiresCookbook { section });
-            }
-            Some(g.to_string())
-        },
-        None => None,
-    };
+    let gpu = resolve_remote_gpu(
+        raw.gpu,
+        section,
+        endpoint.as_deref(),
+        ConfigError::DreamRemoteGpuRequiresCookbook { section },
+    )?;
     // Optional — local Ollama needs no auth; trim if present.
-    let auth_env = trimmed(raw.auth_env);
+    let auth_env = trimmed_nonempty(raw.auth_env);
     // EPHEMERAL-only boot-budget override: it may only LENGTHEN past the backend's provisioning
     // floor (the distill 30B case). A value below the floor would starve the recipe — its budget
     // (this value minus the teardown margin) collapses toward zero and provisioning gives up
@@ -602,7 +647,7 @@ fn resolve_remote_dream(
         backend,
         endpoint,
         cookbook,
-        model: model.to_string(),
+        model,
         gpu,
         auth_env,
         request_timeout_s: raw.request_timeout_s.unwrap_or(default.request_timeout_s),
@@ -722,34 +767,13 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
 
     fn try_from(raw: RawRemoteEmbedding) -> Result<Self, Self::Error> {
         let default = RemoteEmbeddingConfig::default();
-        let trimmed = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        // The SERVER-side model name — required, non-empty. For ollama the ollama model name; for
-        // infinity/vLLM the HF id the server was launched with.
-        let model = raw.model.unwrap_or_default();
-        let model = model.trim();
-        if model.is_empty() {
-            return Err(ConfigError::RemoteEmbeddingMissingModel);
-        }
-        // Which OpenAI-compatible server serves this block. Omitted → `ollama` (back-compat).
-        let backend = match trimmed(raw.backend) {
-            None => RemoteBackend::default(),
-            Some(raw_backend) => RemoteBackend::from_db_str(&raw_backend).ok_or(
-                ConfigError::RemoteBackendUnknown {
-                    section: "[llm.embedding.remote]",
-                    got: raw_backend,
-                },
-            )?,
-        };
-        // The MODE is INFERRED from which URL field is set (#318): EXACTLY ONE of `endpoint`
-        // (connect) / `cookbook` (ephemeral). Both → ambiguous; neither → no server to reach.
-        let endpoint = trimmed(raw.endpoint);
-        let cookbook = trimmed(raw.cookbook);
-        match (endpoint.is_some(), cookbook.is_some()) {
-            (true, true) | (false, false) => {
-                return Err(ConfigError::RemoteEmbeddingModeAmbiguous);
-            },
-            _ => {},
-        }
+        let model = required_remote_model(raw.model, ConfigError::RemoteEmbeddingMissingModel)?;
+        let backend = parse_remote_backend(raw.backend, EMBEDDING_REMOTE_SECTION)?;
+        let (endpoint, cookbook) = resolve_remote_mode(
+            raw.endpoint,
+            raw.cookbook,
+            ConfigError::RemoteEmbeddingModeAmbiguous,
+        )?;
         // SECRET HYGIENE: `endpoint`/`query_endpoint` are persisted WHOLE into the (secret-free)
         // index meta. A URL with userinfo (`https://user:token@host`) would copy that credential
         // into the SQLite index — reject it and direct the user to `auth_env`. Checked against the
@@ -765,7 +789,7 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
         // fallback. So require an explicit `query_endpoint` there. Ignored for connect
         // (queries hit the connect endpoint).
         let query_endpoint = if cookbook.is_some() {
-            match trimmed(raw.query_endpoint) {
+            match trimmed_nonempty(raw.query_endpoint) {
                 Some(qe) => Some(qe),
                 None if backend == RemoteBackend::Ollama =>
                     Some(DEFAULT_QUERY_ENDPOINT.to_string()),
@@ -784,25 +808,13 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
             }
         }
         // Optional — local Ollama needs no auth; trim if present.
-        let auth_env = trimmed(raw.auth_env);
-        // EPHEMERAL-only: the GPU to provision. A PRESENT-but-empty/whitespace value is a config
-        // error (clearer than silently dropping a meant-to-be-set key). Set together with a connect
-        // `endpoint` it is meaningless — reject it rather than ignore it. The VALUE is
-        // provider-specific (Modal GPU class / RunPod gpuTypeId); we do NOT validate it against an
-        // allow-list — the provider does so at provision time.
-        let gpu = match raw.gpu {
-            Some(g) => {
-                let g = g.trim();
-                if g.is_empty() {
-                    return Err(ConfigError::RemoteGpuEmpty { section: "[llm.embedding.remote]" });
-                }
-                if endpoint.is_some() {
-                    return Err(ConfigError::RemoteGpuRequiresCookbook);
-                }
-                Some(g.to_string())
-            },
-            None => None,
-        };
+        let auth_env = trimmed_nonempty(raw.auth_env);
+        let gpu = resolve_remote_gpu(
+            raw.gpu,
+            EMBEDDING_REMOTE_SECTION,
+            endpoint.as_deref(),
+            ConfigError::RemoteGpuRequiresCookbook,
+        )?;
         if matches!(raw.num_ctx, Some(0)) {
             return Err(ConfigError::RemoteEmbeddingInvalidNumCtx);
         }
@@ -818,7 +830,7 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
             });
         }
         Ok(Self {
-            model: model.to_string(),
+            model,
             backend,
             endpoint,
             cookbook,
