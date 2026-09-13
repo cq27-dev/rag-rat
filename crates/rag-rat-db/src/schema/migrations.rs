@@ -1418,14 +1418,9 @@ pub(crate) fn add_column_if_missing(
     column: &str,
     definition: &str,
 ) -> rusqlite::Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column {
-            return Ok(());
-        }
+    if column_exists(conn, table, column)? {
+        return Ok(());
     }
-
     conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))
 }
 
@@ -3170,9 +3165,7 @@ pub fn apply_papertrail_provider_neutral_schema(
 }
 
 pub(crate) fn apply_papertrail_ref_item_kind(conn: &Connection) -> rusqlite::Result<()> {
-    if !column_exists(conn, "papertrail_refs", "item_kind")? {
-        conn.execute_batch("ALTER TABLE papertrail_refs ADD COLUMN item_kind TEXT;")?;
-    }
+    add_column_if_missing(conn, "papertrail_refs", "item_kind", "TEXT")?;
     conn.execute_batch(
         "DROP INDEX IF EXISTS idx_papertrail_refs_item;
          DROP INDEX IF EXISTS idx_papertrail_refs_unique;
@@ -5633,15 +5626,14 @@ pub fn apply_distill_enriched_context(conn: &Connection) -> rusqlite::Result<()>
 /// it (the derived-data doctrine of V079/V080). The source ITEM identity is deliberately NOT added:
 /// distilled evidence is primary-only (the drain rejects partner units), so the source item is
 /// always the record's own `(item_kind, item_key)` already stored on the row. Guarded by
-/// `column_exists` so a torn replay (column added, migration row not yet recorded) is a no-op
-/// rather than a duplicate-column error.
+/// `add_column_if_missing` so a torn replay (column added, migration row not yet recorded) is a
+/// no-op rather than a duplicate-column error.
 pub fn apply_distill_evidence_source_part(conn: &Connection) -> rusqlite::Result<()> {
-    if column_exists(conn, "papertrail_distill_evidence", "source_part")? {
-        return Ok(());
-    }
-    conn.execute_batch(
-        "ALTER TABLE papertrail_distill_evidence
-             ADD COLUMN source_part TEXT CHECK(source_part IN ('title', 'body', 'comment'));",
+    add_column_if_missing(
+        conn,
+        "papertrail_distill_evidence",
+        "source_part",
+        "TEXT CHECK(source_part IN ('title', 'body', 'comment'))",
     )
 }
 
@@ -8468,9 +8460,7 @@ pub(crate) fn apply_content_entries_lamport_column(
     conn: &Connection,
     hooks: &crate::hooks::MigrationHooks,
 ) -> rusqlite::Result<()> {
-    if !column_exists(conn, "content_entries", "lamport")? {
-        conn.execute_batch("ALTER TABLE content_entries ADD COLUMN lamport INTEGER;")?;
-    }
+    add_column_if_missing(conn, "content_entries", "lamport", "INTEGER")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_content_entries_stream_accepted_lamport
              ON content_entries(stream_id, lamport) WHERE accepted = 1;
