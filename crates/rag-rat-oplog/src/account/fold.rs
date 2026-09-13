@@ -1632,6 +1632,7 @@ fn fold_account_pass(
             .min_by_key(|account_id| account_id.to_bytes());
     }
     let effective_count = normalize_auth_epochs(&mut outcomes);
+    let vouches = vouch_table(&candidates, &credits, &outcomes);
     // Effective candidates use `effective_count - 1` inside the closure above. Also inspect
     // condemned, contested, and actual register contributors against the fully-folded count: a
     // mint can provisionally authorize the descendant cut that later condemns it; mutually-
@@ -1639,19 +1640,22 @@ fn fold_account_pass(
     // phase E rejects it as ineffective (for example, removing a never-enrolled device).
     // Structurally rejected and ordinarily parked candidates retain their stronger verdict when
     // they contributed neither state nor a register. A cut keeps its revocation credit here too, so
-    // a redundant concurrent cut of the same device does not park behind the ops both removed.
+    // a redundant concurrent cut of the same device does not park behind the ops both removed —
+    // and the vouch of the other effective cuts, as in the closure.
     for candidate in &candidates {
         let credit = credits.get(&candidate.hash()).copied().unwrap_or(0);
         if !readiness_exclusions.contains_key(&candidate.hash())
             && register_contributors.contains(&candidate.hash())
-            && candidate.header().auth_len > effective_count.saturating_add(credit)
+            && cited_ahead(&vouches, candidate, effective_count, credit)
         {
             discovered.insert(candidate.hash(), Outcome::Parked(ParkReason::AuthLenAhead));
         }
     }
     // A cut found ahead in this pass is held out of the next one, so what it condemned or contested
     // is judged there. Measured now, an honest victim reads as ahead of a count that lost it to a
-    // cut that did not hold, and is held out for the whole fold (#1294).
+    // cut that did not hold, and is held out for the whole fold (#1294). The vouch applies here as
+    // everywhere: a contested pair authored against the pre-cut view must stay contested, not be
+    // held out as ahead and let the account fold `Live` around a genuine standoff.
     let cut_found_ahead = register_contributors.iter().any(|hash| discovered.contains_key(hash));
     if !cut_found_ahead {
         for candidate in &candidates {
@@ -1661,7 +1665,7 @@ fn fold_account_pass(
                     outcomes.get(&candidate.hash()),
                     Some(Outcome::Condemned(_) | Outcome::Parked(ParkReason::ContestedSubject))
                 )
-                && candidate.header().auth_len > effective_count
+                && cited_ahead(&vouches, candidate, effective_count, 0)
             {
                 discovered.insert(candidate.hash(), Outcome::Parked(ParkReason::AuthLenAhead));
             }
@@ -1798,10 +1802,122 @@ fn revocation_credit(
     credit
 }
 
+/// What the effective cuts vouch for the other ops' freshness, and the effective ops each author
+/// can count on its own chain — the two owner-signed inputs of [`concurrent_vouch`]. One snapshot
+/// per check, taken before any verdict moves.
+struct VouchTable {
+    /// Each effective cut that installs a register: its hash, revocation credit and cited length.
+    /// A cut extend installs no register and vouches for nothing.
+    cuts: Vec<([u8; 32], u64, u64)>,
+    /// Every effective op by author device: chain seq and cited length.
+    chains: HashMap<DeviceFingerprint, Vec<(u64, u64)>>,
+}
+
+fn vouch_table(
+    candidates: &[Candidate],
+    credits: &HashMap<[u8; 32], u64>,
+    outcomes: &HashMap<[u8; 32], Outcome>,
+) -> VouchTable {
+    let effective: Vec<&Candidate> = candidates
+        .iter()
+        .filter(|c| outcomes.get(&c.hash()).is_some_and(Outcome::is_effective))
+        .collect();
+    VouchTable {
+        cuts: effective
+            .iter()
+            .filter(|c| !cut_op_registers(c).is_empty())
+            .filter_map(|c| {
+                credits.get(&c.hash()).map(|credit| (c.hash(), *credit, c.header().auth_len))
+            })
+            .collect(),
+        chains: effective.iter().fold(HashMap::new(), |mut chains, c| {
+            let h = c.header();
+            chains.entry(h.device_fingerprint).or_insert_with(Vec::new).push((h.seq, h.auth_len));
+            chains
+        }),
+    }
+}
+
+/// Whether `op` cites past `base + credit` even with what the effective cuts vouch for it. The
+/// vouch is computed only for an op that is ahead without it: the chain scan behind it is
+/// per-device, and an ahead op is the exception, so a refold stays linear in the ordinary case.
+fn cited_ahead(table: &VouchTable, op: &Candidate, base: u64, credit: u64) -> bool {
+    let measure = base.saturating_add(credit);
+    op.header().auth_len > measure
+        && op.header().auth_len > measure.saturating_add(concurrent_vouch(table, op, base))
+}
+
+/// What the effective cuts vouch for an op's freshness (#1301): an op authored concurrently with a
+/// revoking cut counted the ops the cut condemned, and its citation exceeds the post-cut count by
+/// that many. The cut's own credit ([`revocation_credit`]) covers only the cut. Every other op is
+/// credited
+///
+/// ```text
+/// min( Σ credit of the other effective cuts,  max(0, ceiling − base) )
+/// ceiling = max over those cuts c of
+///           N_c + the op's own effective chain predecessors cited at or past N_c
+/// ```
+///
+/// where `N_c` is the cut's cited length and `base` the count the op is measured against. A cut's
+/// citation is owner-signed and the fold accepted it, so `N_c − base` is the fewest condemned ops
+/// its author must have folded; an honest op concurrent with the cuts cites at most what one of
+/// their authors could have counted, plus one for each op of its own it had landed since that view.
+/// Those predecessors are as owner-signed as the cuts — effective, on the op's own chain, below it
+/// — and a revoked key cannot add one. Without them only the first op an owner authors after the
+/// shared view clears; each later one would park until the account gained an op it did not author.
+/// The maximum is taken per cut so the ceiling never falls when a cut joins the table: a cut that
+/// is provisionally effective can only raise it, and the pass-level check, which sees every
+/// register contributor, never parks what the closure would clear. The credit term bounds the whole
+/// by what is actually condemned. A revoked key can inflate the credits (its entries past the cut
+/// are all condemned), but it signs no accepted citation and adds nothing effective, so it cannot
+/// raise the ceiling. One vouch per op, not one per cut: summing per-cut vouches double-counts a
+/// victim two cut authors both folded, and a revoked key's junk then moves the sum.
+///
+/// What remains, all inside the trusted-owner model. The credit is what makes a cut effective, and
+/// a revoked key can inflate it enough to clear a cut whose citation is ahead of its honest view
+/// (that alone only brings the revocation forward). Such a cut then vouches for ops up to that
+/// citation before the ops justifying it are held — bounded by an owner-signed citation, which a
+/// live owner could reach with filler adds anyway, and undone when the missing ops arrive and the
+/// fold recomputes. The credit term is the victims' to inflate too, so an owner citing high on a
+/// cut of a device it padded with entries vouches for that much; two such cuts clear each other.
+/// Nothing in the log separates a cut's folded victims from later junk on the same chain; a signed
+/// victim-chain watermark on the cut ops would (#1311).
+fn concurrent_vouch(table: &VouchTable, op: &Candidate, base: u64) -> u64 {
+    let condemned: u64 = table
+        .cuts
+        .iter()
+        .filter(|(hash, _, _)| *hash != op.hash())
+        .fold(0u64, |sum, (_, credit, _)| sum.saturating_add(*credit));
+    if condemned == 0 {
+        return 0;
+    }
+    let h = op.header();
+    let chain = table.chains.get(&h.device_fingerprint).map_or(&[][..], Vec::as_slice);
+    let ceiling = table
+        .cuts
+        .iter()
+        .filter(|(hash, _, _)| *hash != op.hash())
+        .map(|&(_, _, cited)| {
+            let own_since =
+                chain.iter().filter(|&&(seq, auth_len)| seq < h.seq && auth_len >= cited).count();
+            cited.saturating_add(own_since as u64)
+        })
+        .max()
+        .unwrap_or(0);
+    condemned.min(ceiling.saturating_sub(base))
+}
+
 /// Final fail-closed dependency closure after fixed-register phase-E replay. No authority fact may
 /// survive without its final-effective roster / ownership / grant prerequisite. Freshness is also
 /// decided against the fully folded count here — never against transient hash iteration order, and
 /// never as an authority input.
+///
+/// Each round first removes every op whose prerequisite is not effective until nothing more falls
+/// (removal only, so the fixed point does not depend on candidate order), then measures freshness
+/// against that settled set and applies the parks together. Measuring earlier would let an op that
+/// is about to fall — a cut whose authority is parked, say — vouch for another op or move its
+/// ceiling for one round, and since an ahead park is permanent, which round it fell in would decide
+/// the other op's verdict.
 fn close_final_authority_dependencies(
     candidates: &[Candidate],
     credits: &HashMap<[u8; 32], u64>,
@@ -1809,7 +1925,47 @@ fn close_final_authority_dependencies(
 ) -> HashMap<[u8; 32], Outcome> {
     let mut discovered = HashMap::new();
     loop {
+        let measured: Vec<&Candidate> = candidates
+            .iter()
+            .filter(|candidate| outcomes.get(&candidate.hash()).is_some_and(Outcome::is_effective))
+            .collect();
+        settle_authority_dependencies(candidates, outcomes);
         let effective_count = normalize_auth_epochs(outcomes);
+        let vouches = vouch_table(candidates, credits, outcomes);
+        // Every op effective at the start of the round is measured against the settled fold
+        // without it, the ones that just fell included: a citation ahead of that count is the
+        // stronger, permanent verdict.
+        let ahead: Vec<[u8; 32]> = measured
+            .into_iter()
+            .filter(|candidate| {
+                let credit = credits.get(&candidate.hash()).copied().unwrap_or(0);
+                let still_effective =
+                    outcomes.get(&candidate.hash()).is_some_and(Outcome::is_effective);
+                let base = effective_count.saturating_sub(u64::from(still_effective));
+                cited_ahead(&vouches, candidate, base, credit)
+            })
+            .map(Candidate::hash)
+            .collect();
+        if ahead.is_empty() {
+            return discovered;
+        }
+        for hash in ahead {
+            outcomes.insert(hash, Outcome::Parked(ParkReason::AuthLenAhead));
+            discovered.insert(hash, Outcome::Parked(ParkReason::AuthLenAhead));
+        }
+    }
+}
+
+/// Remove every effective op whose prerequisite is not effective — its `authority_ref`, the roster
+/// row an `OwnerPromote` needs, the public ownership a `StreamGrant` needs, the grant a
+/// `StreamRevoke` names — until nothing more falls. Only freshness is monotone across readiness
+/// passes: a stale citation or failed state precondition can recover after an ahead competing
+/// effect is excluded, so these verdicts are recomputed rather than permanently held out.
+fn settle_authority_dependencies(
+    candidates: &[Candidate],
+    outcomes: &mut HashMap<[u8; 32], Outcome>,
+) {
+    loop {
         let effective_roster: HashSet<DeviceFingerprint> = candidates
             .iter()
             .filter(|candidate| outcomes.get(&candidate.hash()).is_some_and(Outcome::is_effective))
@@ -1847,13 +2003,7 @@ fn close_final_authority_dependencies(
             if !outcomes.get(&candidate.hash()).is_some_and(Outcome::is_effective) {
                 continue;
             }
-            // Measured against the fold without this op; a cut also gets back what it removed.
-            let credit = credits.get(&candidate.hash()).copied().unwrap_or(0);
-            let replacement = if candidate.header().auth_len
-                > effective_count.saturating_sub(1).saturating_add(credit)
-            {
-                Some(Outcome::Parked(ParkReason::AuthLenAhead))
-            } else if let Some(authority_ref) = candidate.header().authority_ref
+            let replacement = if let Some(authority_ref) = candidate.header().authority_ref
                 && !outcomes.get(&authority_ref).is_some_and(Outcome::is_effective)
             {
                 Some(match outcomes.get(&authority_ref) {
@@ -1877,20 +2027,13 @@ fn close_final_authority_dependencies(
             };
             if let Some(replacement) = replacement {
                 outcomes.insert(candidate.hash(), replacement);
-                // Only freshness is monotone across readiness passes. A stale citation or failed
-                // state precondition can recover after an ahead competing effect is excluded, so
-                // those verdicts must be recomputed rather than permanently held out.
-                if replacement == Outcome::Parked(ParkReason::AuthLenAhead) {
-                    discovered.insert(candidate.hash(), replacement);
-                }
                 changed = true;
             }
         }
         if !changed {
-            break;
+            return;
         }
     }
-    discovered
 }
 
 #[derive(Default)]
@@ -2450,6 +2593,7 @@ mod tests {
     /// Authors a real signed account (genesis + arbitrary ops) so the fold runs over verified
     /// entries. Tests control each op's (author, authority_ref, payload) to build exact traces; the
     /// harness threads the per-device seq/prev chains.
+    #[derive(Clone)]
     struct Fixture {
         account_id: AccountId,
         genesis_hash: [u8; 32],
@@ -3354,37 +3498,359 @@ mod tests {
         assert_eq!(h.outcome(&add_member), Some(Outcome::Rejected(RejectReason::StaleAuthority)));
     }
 
-    /// The credit belongs to the cut alone. A revoked device can pile up entries past the cut, all
-    /// condemned, but none may carry another op — a plain add, or a cut of a different device —
-    /// past a count its author never saw.
+    /// A revoked device can pile up entries past the cut, all condemned, but they carry no other
+    /// op past the largest citation an effective cut made. Here the pre-cut view is 5 (genesis, the
+    /// adds of O and Q, O's two adds): an op cited at 5 is concurrent with the cut and takes
+    /// effect, one cited at 6 — a plain add, or a cut of a different device — parks whatever O
+    /// appends.
     #[test]
-    fn a_revoked_devices_condemned_entries_credit_no_other_op() {
+    fn a_revoked_devices_condemned_entries_credit_no_op_past_the_cuts_citation() {
         for remove_q in [false, true] {
             let (mut f, founder, o, add_o, _) = owner_with_history(2);
             let g = f.genesis_hash;
-            let q = Dev::new(20);
+            let (q, b) = (Dev::new(20), Dev::new(22));
             f.author_at_auth_len(&founder, Some(g), &device_add(&q, DeviceRole::Member), 4);
-            let cut = f.author_at_auth_len(&founder, Some(g), &device_remove(&o, Cut::Empty), 5);
+            let add_b =
+                f.author_at_auth_len(&founder, Some(g), &device_add(&b, DeviceRole::Owner), 5);
+            let cut = f.author_at_auth_len(&founder, Some(g), &device_remove(&o, Cut::Empty), 6);
             for i in 0..10 {
                 let junk = device_add(&Dev::new(30 + i), DeviceRole::Member);
-                f.author_at_auth_len(&o, Some(add_o), &junk, 5);
+                f.author_at_auth_len(&o, Some(add_o), &junk, 6);
             }
-            let other = if remove_q {
-                device_remove(&q, Cut::Empty)
-            } else {
-                device_add(&Dev::new(21), DeviceRole::Member)
+            let other = |n: u8| {
+                if remove_q {
+                    device_remove(&q, Cut::Empty)
+                } else {
+                    device_add(&Dev::new(40 + n), DeviceRole::Member)
+                }
             };
-            // One past the honest count of 4: genesis, the adds of O and Q, and the cut.
-            let ahead = f.author_at_auth_len(&founder, Some(g), &other, 5);
+            // B folded the pre-cut view (6, B's own add included) and never saw the cut. The op one
+            // past it lives in its own fixture, so a second removal of Q is not merely redundant.
+            let mut g2 = f.clone();
+            let ahead = g2.author_at_auth_len(&b, Some(add_b), &other(1), 7);
+            let concurrent = f.author_at_auth_len(&b, Some(add_b), &other(0), 6);
 
             let h = f.fold();
             assert!(h.is_effective(&cut), "remove_q={remove_q}");
+            assert!(h.is_effective(&concurrent), "remove_q={remove_q}: concurrent with the cut");
+            let h2 = g2.fold();
             assert_eq!(
-                h.outcome(&ahead),
+                h2.outcome(&ahead),
                 Some(Outcome::Parked(ParkReason::AuthLenAhead)),
-                "remove_q={remove_q}: O's condemned entries credited an op other than O's cut",
+                "remove_q={remove_q}: O's condemned entries carried an op past the cut's citation",
             );
         }
+    }
+
+    /// #1301: B and the founder both folded 5 ops. The founder cuts O citing 5; B concurrently adds
+    /// a device citing 5. After the cut the count is 5 with B's add, so B's add is one past the
+    /// fold without it — and one is exactly what the cut's citation vouches for.
+    /// Order-independent.
+    #[test]
+    fn an_op_concurrent_with_a_revoking_cut_takes_effect() {
+        let (founder, b, o) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&founder);
+        let g = f.genesis_hash;
+        let add_b = f.author(&founder, Some(g), &device_add(&b, DeviceRole::Owner));
+        let add_o = f.author_at_auth_len(&founder, Some(g), &device_add(&o, DeviceRole::Owner), 2);
+        for i in 0..2 {
+            let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
+            f.author_at_auth_len(&o, Some(add_o), &member, 3 + u64::from(i));
+        }
+        let cut = f.author_at_auth_len(&founder, Some(g), &device_remove(&o, Cut::Empty), 5);
+        let concurrent = f.author_at_auth_len(
+            &b,
+            Some(add_b),
+            &device_add(&Dev::new(20), DeviceRole::Member),
+            5,
+        );
+        // B keeps authoring before it sees the cut: each op counts the one before it. The cuts'
+        // citations alone cap at 5; B's own landed ops raise what B could honestly cite.
+        let second = f.author_at_auth_len(
+            &b,
+            Some(add_b),
+            &device_add(&Dev::new(21), DeviceRole::Member),
+            6,
+        );
+        let third = f.author_at_auth_len(
+            &b,
+            Some(add_b),
+            &device_add(&Dev::new(22), DeviceRole::Member),
+            7,
+        );
+
+        for rot in 0..f.entries.len() {
+            let h = f.fold_rotated(rot);
+            assert!(h.is_effective(&cut), "rotation {rot}");
+            for (name, op) in [("first", &concurrent), ("second", &second), ("third", &third)] {
+                assert!(h.is_effective(op), "rotation {rot}: B's {name} op parked behind the cut");
+            }
+            assert_eq!(h.effective_count(), 7, "rotation {rot}");
+        }
+    }
+
+    /// The same with an `OwnerDemote` as the vouching cut.
+    #[test]
+    fn an_op_concurrent_with_a_demoting_cut_takes_effect() {
+        let (founder, b, o) = (Dev::new(1), Dev::new(2), Dev::new(3));
+        let mut f = Fixture::genesis(&founder);
+        let g = f.genesis_hash;
+        let add_b = f.author(&founder, Some(g), &device_add(&b, DeviceRole::Owner));
+        let add_o = f.author_at_auth_len(&founder, Some(g), &device_add(&o, DeviceRole::Owner), 2);
+        for i in 0..2 {
+            let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
+            f.author_at_auth_len(&o, Some(add_o), &member, 3 + u64::from(i));
+        }
+        let demote =
+            f.author_at_auth_len(&founder, Some(g), &owner_demote(&o, add_o, Cut::Empty), 5);
+        let concurrent = f.author_at_auth_len(
+            &b,
+            Some(add_b),
+            &device_add(&Dev::new(20), DeviceRole::Member),
+            5,
+        );
+
+        let h = f.fold();
+        assert!(h.is_effective(&demote));
+        assert!(h.is_effective(&concurrent));
+    }
+
+    /// Two owners removing each other, both citing the view a concurrent revocation of O has since
+    /// cut down, are a genuine standoff. Measured without the vouch they read as ahead, are held
+    /// out, and the account folds `Live` around them; with it they stay contested.
+    #[test]
+    fn a_mutual_removal_concurrent_with_a_revocation_stays_contested() {
+        let (founder, b, d, o) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
+        let mut f = Fixture::genesis(&founder);
+        let g = f.genesis_hash;
+        let add_b = f.author(&founder, Some(g), &device_add(&b, DeviceRole::Owner));
+        let add_d = f.author_at_auth_len(&founder, Some(g), &device_add(&d, DeviceRole::Owner), 2);
+        let add_o = f.author_at_auth_len(&founder, Some(g), &device_add(&o, DeviceRole::Owner), 3);
+        for i in 0..2 {
+            let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
+            f.author_at_auth_len(&o, Some(add_o), &member, 4 + u64::from(i));
+        }
+        let cut = f.author_at_auth_len(&founder, Some(g), &device_remove(&o, Cut::Empty), 6);
+        let remove_d = f.author_at_auth_len(&b, Some(add_b), &device_remove(&d, Cut::Empty), 6);
+        let remove_b = f.author_at_auth_len(&d, Some(add_d), &device_remove(&b, Cut::Empty), 6);
+
+        for rot in 0..f.entries.len() {
+            let h = f.fold_rotated(rot);
+            assert!(h.is_effective(&cut), "rotation {rot}");
+            assert!(
+                matches!(h.classification(), AccountClassification::Contested { .. }),
+                "rotation {rot}: the standoff was held out as ahead instead of contesting",
+            );
+            for op in [&remove_d, &remove_b] {
+                assert_eq!(
+                    h.outcome(op),
+                    Some(Outcome::Parked(ParkReason::ContestedSubject)),
+                    "rotation {rot}"
+                );
+            }
+        }
+    }
+
+    /// A cut whose authority is parked falls in the closure; which round it falls in must not
+    /// decide anything else. Here B's cut of O1 cites high on an enrolment cited at `u64::MAX`,
+    /// and the founder's add counts its own ops since the founder's low-citing cut of O2. With the
+    /// doomed cut in the table the add's ceiling is measured from the high citation and it reads
+    /// ahead; without it, from the low one, and it clears. Every rotation must agree.
+    #[test]
+    fn a_cut_that_falls_for_its_authority_never_moves_another_ops_verdict() {
+        let (founder, b, o1, o2) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
+        let mut f = Fixture::genesis(&founder);
+        let g = f.genesis_hash;
+        let add_b =
+            f.author_at_auth_len(&founder, Some(g), &device_add(&b, DeviceRole::Owner), u64::MAX);
+        f.author_at_auth_len(&founder, Some(g), &device_add(&o1, DeviceRole::Owner), 1);
+        let add_o2 =
+            f.author_at_auth_len(&founder, Some(g), &device_add(&o2, DeviceRole::Owner), 2);
+        for i in 0..2 {
+            let member = device_add(&Dev::new(30 + i), DeviceRole::Member);
+            f.author_at_auth_len(&o2, Some(add_o2), &member, 3 + u64::from(i));
+        }
+        for i in 0..8 {
+            let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
+            f.author_at_auth_len(&founder, Some(g), &member, 6);
+        }
+        let low = f.author_at_auth_len(&founder, Some(g), &device_remove(&o2, Cut::Empty), 6);
+        let high = f.author_at_auth_len(&b, Some(add_b), &device_remove(&o1, Cut::Empty), 13);
+        let mut g2 = f.clone();
+        let x = f.author_at_auth_len(
+            &founder,
+            Some(g),
+            &device_add(&Dev::new(50), DeviceRole::Member),
+            14,
+        );
+        let beyond = g2.author_at_auth_len(
+            &founder,
+            Some(g),
+            &device_add(&Dev::new(51), DeviceRole::Member),
+            15,
+        );
+
+        for rot in 0..f.entries.len() {
+            let h = f.fold_rotated(rot);
+            assert!(!h.is_effective(&high), "rotation {rot}: its enrolment is parked");
+            assert!(h.is_effective(&low), "rotation {rot}");
+            assert!(h.is_effective(&x), "rotation {rot}: parked by a cut that fell");
+            assert_eq!(h.effective_count(), 13, "rotation {rot}");
+        }
+        for rot in 0..g2.entries.len() {
+            let h = g2.fold_rotated(rot);
+            assert_eq!(
+                h.outcome(&beyond),
+                Some(Outcome::Parked(ParkReason::AuthLenAhead)),
+                "rotation {rot}"
+            );
+        }
+    }
+
+    /// The bound: two cuts of two devices, each citing the pre-cut view plus BOTH victim counts,
+    /// clear each other (the credit term is the victims' to fill) and vouch for that much.
+    /// Owner-signed on both sides; recorded, not defended.
+    #[test]
+    fn two_cuts_citing_past_the_view_clear_each_other_up_to_the_condemned_count() {
+        let (founder, b, c, o1, o2) =
+            (Dev::new(1), Dev::new(2), Dev::new(5), Dev::new(3), Dev::new(4));
+        let mut f = Fixture::genesis(&founder);
+        let g = f.genesis_hash;
+        let add_b = f.author(&founder, Some(g), &device_add(&b, DeviceRole::Owner));
+        let add_c = f.author_at_auth_len(&founder, Some(g), &device_add(&c, DeviceRole::Owner), 2);
+        let add_o1 =
+            f.author_at_auth_len(&founder, Some(g), &device_add(&o1, DeviceRole::Owner), 3);
+        let add_o2 =
+            f.author_at_auth_len(&founder, Some(g), &device_add(&o2, DeviceRole::Owner), 4);
+        for i in 0..2 {
+            let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
+            f.author_at_auth_len(&o1, Some(add_o1), &member, 5 + u64::from(i));
+        }
+        for i in 0..2 {
+            let member = device_add(&Dev::new(12 + i), DeviceRole::Member);
+            f.author_at_auth_len(&o2, Some(add_o2), &member, 7 + u64::from(i));
+        }
+        // The pre-cut view is 9; the fold with both cuts is 7. Each cut cites 6 + 2 + 2: the
+        // fold without it plus its own credit plus the other's. C, with nothing landed since the
+        // view, is vouched for up to that citation and no further.
+        let cut1 = f.author_at_auth_len(&founder, Some(g), &device_remove(&o1, Cut::Empty), 10);
+        let cut2 = f.author_at_auth_len(&b, Some(add_b), &device_remove(&o2, Cut::Empty), 10);
+        let mut g2 = f.clone();
+        let past = f.author_at_auth_len(
+            &c,
+            Some(add_c),
+            &device_add(&Dev::new(20), DeviceRole::Member),
+            10,
+        );
+        let beyond = g2.author_at_auth_len(
+            &c,
+            Some(add_c),
+            &device_add(&Dev::new(21), DeviceRole::Member),
+            11,
+        );
+
+        let h = f.fold();
+        assert!(h.is_effective(&cut1) && h.is_effective(&cut2));
+        assert!(h.is_effective(&past), "vouched up to the condemned count");
+        assert_eq!(g2.fold().outcome(&beyond), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+    }
+
+    /// Two owners revoke two DIFFERENT devices over one history of 8 ops, each citing 8. Each cut's
+    /// author counted the other's victims, which its own credit does not cover; the other cut
+    /// vouches for them. Both take effect, every victim is condemned, and an op cited one past the
+    /// shared view still parks — whatever a revoked device appends.
+    #[test]
+    fn concurrent_cuts_of_two_devices_both_take_effect() {
+        for junk in [0u8, 3] {
+            let (founder, b, o1, o2) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
+            let mut f = Fixture::genesis(&founder);
+            let g = f.genesis_hash;
+            let add_b = f.author(&founder, Some(g), &device_add(&b, DeviceRole::Owner));
+            let add_o1 =
+                f.author_at_auth_len(&founder, Some(g), &device_add(&o1, DeviceRole::Owner), 2);
+            let add_o2 =
+                f.author_at_auth_len(&founder, Some(g), &device_add(&o2, DeviceRole::Owner), 3);
+            let mut victims = Vec::new();
+            for i in 0..2 {
+                let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
+                victims.push(f.author_at_auth_len(&o1, Some(add_o1), &member, 4 + u64::from(i)));
+            }
+            for i in 0..2 {
+                let member = device_add(&Dev::new(12 + i), DeviceRole::Member);
+                victims.push(f.author_at_auth_len(&o2, Some(add_o2), &member, 6 + u64::from(i)));
+            }
+            let cut1 = f.author_at_auth_len(&founder, Some(g), &device_remove(&o1, Cut::Empty), 8);
+            let cut2 = f.author_at_auth_len(&b, Some(add_b), &device_remove(&o2, Cut::Empty), 8);
+            for i in 0..junk {
+                let entry = device_add(&Dev::new(30 + i), DeviceRole::Member);
+                f.author_at_auth_len(&o1, Some(add_o1), &entry, 8);
+            }
+            let concurrent = f.author_at_auth_len(
+                &b,
+                Some(add_b),
+                &device_add(&Dev::new(20), DeviceRole::Member),
+                8,
+            );
+            // B's own cut and add landed since the view, so B may cite two past it, not three.
+            let mut g2 = f.clone();
+            let next = g2.author_at_auth_len(
+                &b,
+                Some(add_b),
+                &device_add(&Dev::new(21), DeviceRole::Member),
+                10,
+            );
+            let ahead = g2.author_at_auth_len(
+                &b,
+                Some(add_b),
+                &device_add(&Dev::new(22), DeviceRole::Member),
+                12,
+            );
+
+            for rot in 0..f.entries.len() {
+                let h = f.fold_rotated(rot);
+                assert!(
+                    h.is_effective(&cut1) && h.is_effective(&cut2),
+                    "junk={junk} rotation {rot}"
+                );
+                assert!(h.is_effective(&concurrent), "junk={junk} rotation {rot}");
+                for victim in &victims {
+                    assert_eq!(
+                        h.outcome(victim),
+                        Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
+                        "junk={junk} rotation {rot}"
+                    );
+                }
+            }
+            let h2 = g2.fold();
+            assert!(h2.is_effective(&next), "junk={junk}: B's own landed ops raise its ceiling");
+            assert_eq!(
+                h2.outcome(&ahead),
+                Some(Outcome::Parked(ParkReason::AuthLenAhead)),
+                "junk={junk}: admitted past the largest citation any effective cut made",
+            );
+        }
+    }
+
+    /// A cut that parks as ahead vouches for nothing: an op concurrent with it parks too.
+    #[test]
+    fn a_parked_cut_vouches_for_nothing() {
+        let (mut f, founder, o, _, _) = owner_with_history(2);
+        let g = f.genesis_hash;
+        let b = Dev::new(22);
+        let add_b = f.author_at_auth_len(&founder, Some(g), &device_add(&b, DeviceRole::Owner), 4);
+        // Past the honest count of 5 (genesis, the adds of O and B, O's two adds) AND past the two
+        // condemned ops the cut's own credit covers: 7 parks it.
+        let cut = f.author_at_auth_len(&founder, Some(g), &device_remove(&o, Cut::Empty), 7);
+        let concurrent = f.author_at_auth_len(
+            &b,
+            Some(add_b),
+            &device_add(&Dev::new(20), DeviceRole::Member),
+            7,
+        );
+
+        let h = f.fold();
+        assert_eq!(h.outcome(&cut), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert_eq!(h.outcome(&concurrent), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
     }
 
     /// An unenrolled device signing entries that cite O's incarnation folds `WrongDevice`; they are
