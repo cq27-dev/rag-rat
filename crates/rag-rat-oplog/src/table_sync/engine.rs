@@ -367,8 +367,9 @@ fn row_repair_op(
     row_pk: &str,
     winner_hex: &str,
 ) -> anyhow::Result<RowRepair> {
-    let clock = apply::row_clock_winner_on_stream(tx, stream, repo_id, spec.name, row_pk)?;
-    let tombstone = apply::tombstone_winner_on_stream(tx, stream, repo_id, spec.name, row_pk)?;
+    let key = apply::RowKey { stream, repo_id, table: spec.name, row_pk };
+    let clock = apply::row_clock_winner_on_stream(tx, &key)?;
+    let tombstone = apply::tombstone_winner_on_stream(tx, &key)?;
     // A live clock and a tombstone can only coexist with the clock newer: a remove raises the
     // tombstone at its own lamport, and a remove that BEATS the clock clears the clock. So a live
     // clock always owns the row, and a tombstone owns the deletion only without one.

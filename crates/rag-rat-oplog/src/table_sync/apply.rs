@@ -196,7 +196,8 @@ fn apply_remove(
 ) -> anyhow::Result<ApplyOutcome> {
     let row_pk = &row_op::row_pk_string(pk_vals);
     let device_hex = &meta.device.to_string();
-    let survives = match current_row_clock_on_stream(tx, stream, repo_id, spec.name, row_pk)? {
+    let key = RowKey { stream, repo_id, table: spec.name, row_pk };
+    let survives = match current_row_clock_on_stream(tx, &key)? {
         // A write strictly newer than the delete keeps the row alive.
         Some((clock_lamport, clock_device)) =>
             beats(clock_lamport, &clock_device, meta.lamport, device_hex),
@@ -223,7 +224,7 @@ fn apply_remove(
     }
     // Raise the tombstone only once the remove has actually applied (the row was deleted, or a
     // newer write kept it): the tombstone guards against an older upsert resurrecting the row.
-    raise_tombstone(tx, stream, repo_id, spec.name, row_pk, meta.lamport, device_hex)?;
+    raise_tombstone(tx, &key, meta.lamport, device_hex)?;
     // The tombstone is raised either way, but a delete a newer write outranks did not delete
     // anything — and, crucially, left the published record in place. Say so.
     Ok(if survives { ApplyOutcome::Superseded } else { ApplyOutcome::Applied })
@@ -329,11 +330,12 @@ fn apply_upsert(
 ) -> anyhow::Result<ApplyOutcome> {
     let row_pk = &row_op::row_pk_string(pk_vals);
     let device_hex = &meta.device.to_string();
+    let key = RowKey { stream, repo_id, table: spec.name, row_pk };
 
     // A row deleted at a clock this op cannot beat stays deleted: the delete is newer than this
     // edit, so the edit must not resurrect the row. (Suppressed, but the entry is still stored, so
     // redelivery stays idempotent.)
-    if let Some((t_lamport, t_device)) = current_tombstone(tx, stream, repo_id, spec.name, row_pk)?
+    if let Some((t_lamport, t_device)) = current_tombstone(tx, &key)?
         && !beats(meta.lamport, device_hex, t_lamport, &t_device)
     {
         return Ok(ApplyOutcome::Superseded);
@@ -342,7 +344,7 @@ fn apply_upsert(
     // Whole-row LWW: the op wins the ENTIRE row iff it beats the row's write clock (or the row is
     // new). A losing op is a no-op — it never partially overwrites, and it must not touch the
     // published hash (that would mark an unsent local edit as sent and make the producer drop it).
-    let wins = match current_row_clock_on_stream(tx, stream, repo_id, spec.name, row_pk)? {
+    let wins = match current_row_clock_on_stream(tx, &key)? {
         Some((c_lamport, c_device)) => beats(meta.lamport, device_hex, c_lamport, &c_device),
         None => true, // no prior write — this op establishes the row.
     };
@@ -381,7 +383,7 @@ fn apply_upsert(
         }
         return Err(err);
     }
-    raise_row_clock(tx, stream, repo_id, spec.name, row_pk, meta.lamport, device_hex)?;
+    raise_row_clock(tx, &key, meta.lamport, device_hex)?;
 
     // Anti-echo: the winning op now owns the whole current row state, so record its synced hash.
     // (A losing op returned above without touching the published hash.)
@@ -399,25 +401,97 @@ fn beats(lamport: u64, device_hex: &str, other_lamport: u64, other_device: &str)
     lamport > other_lamport || (lamport == other_lamport && device_hex < other_device)
 }
 
+/// One synced row's coordinates on a stream — the key both LWW clock tables are addressed by.
+#[derive(Clone, Copy)]
+pub(crate) struct RowKey<'a> {
+    pub(crate) stream: StreamId,
+    pub(crate) repo_id: &'a str,
+    pub(crate) table: &'a str,
+    pub(crate) row_pk: &'a str,
+}
+
+/// The two whole-row LWW clock tables. They share a shape — `(lamport, device_fingerprint)` per
+/// row key, raised only by a clock that [`beats`] the stored one — and differ only in what they
+/// record: the latest write, or the latest delete.
+#[derive(Clone, Copy)]
+enum ClockTable {
+    Rows,
+    Tombstones,
+}
+
+impl ClockTable {
+    fn sql_table(self) -> &'static str {
+        match self {
+            Self::Rows => "sync_row_clocks",
+            Self::Tombstones => "sync_row_tombstones",
+        }
+    }
+}
+
+/// The stored clock for `key` in `table` as `(lamport, device hex)`, or `None` if absent.
+fn stored_clock(
+    tx: &Transaction<'_>,
+    table: ClockTable,
+    key: &RowKey<'_>,
+) -> anyhow::Result<Option<(u64, String)>> {
+    let row = tx
+        .query_row(
+            &format!(
+                "SELECT lamport, device_fingerprint FROM {}
+                 WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4",
+                table.sql_table()
+            ),
+            rusqlite::params![key.stream.to_bytes().as_slice(), key.repo_id, key.table, key.row_pk],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    row.map(|(lamport, device)| Ok((u64::try_from(lamport)?, device))).transpose()
+}
+
+/// Raise `key`'s clock in `table` to `(lamport, device_hex)` under LWW — a clock that does not
+/// [`beats`] the stored one never lowers it.
+fn raise_clock(
+    tx: &Transaction<'_>,
+    table: ClockTable,
+    key: &RowKey<'_>,
+    lamport: u64,
+    device_hex: &str,
+) -> anyhow::Result<()> {
+    if let Some((old_lamport, old_device)) = stored_clock(tx, table, key)?
+        && !beats(lamport, device_hex, old_lamport, &old_device)
+    {
+        return Ok(());
+    }
+    tx.execute(
+        &format!(
+            "INSERT INTO {}(
+                 stream_id, repo_id, table_name, row_pk, lamport, device_fingerprint
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(stream_id, table_name, row_pk)
+             DO UPDATE SET lamport = excluded.lamport, device_fingerprint = \
+             excluded.device_fingerprint",
+            table.sql_table()
+        ),
+        rusqlite::params![
+            key.stream.to_bytes().as_slice(),
+            key.repo_id,
+            key.table,
+            key.row_pk,
+            i64::try_from(lamport)?,
+            device_hex,
+        ],
+    )?;
+    Ok(())
+}
+
 /// The row's latest-write clock, or `None` if it has never been written on this device. Recorded on
 /// every write (including an insert-only row, which has no per-column clock), it is what a delete
 /// and the anti-echo gate compare against.
 fn current_row_clock_on_stream(
     tx: &Transaction<'_>,
-    stream: StreamId,
-    repo_id: &str,
-    table: &str,
-    row_pk: &str,
+    key: &RowKey<'_>,
 ) -> anyhow::Result<Option<(u64, String)>> {
-    let row = tx
-        .query_row(
-            "SELECT lamport, device_fingerprint FROM sync_row_clocks
-             WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4",
-            rusqlite::params![stream.to_bytes().as_slice(), repo_id, table, row_pk],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    row.map(|(lamport, device)| Ok((u64::try_from(lamport)?, device))).transpose()
+    stored_clock(tx, ClockTable::Rows, key)
 }
 
 #[cfg(test)]
@@ -427,7 +501,12 @@ fn current_row_clock(
     table: &str,
     row_pk: &str,
 ) -> anyhow::Result<Option<(u64, String)>> {
-    current_row_clock_on_stream(tx, StreamId::from_bytes([0; 32]), repo_id, table, row_pk)
+    current_row_clock_on_stream(tx, &RowKey {
+        stream: StreamId::from_bytes([0; 32]),
+        repo_id,
+        table,
+        row_pk,
+    })
 }
 
 /// The row's live whole-row-LWW winner on `stream` as `(lamport, device hex)` — the merge-table
@@ -435,110 +514,46 @@ fn current_row_clock(
 /// applier wrote (`OpMeta::device.to_string()`); callers compare the hex strings directly.
 pub(crate) fn row_clock_winner_on_stream(
     tx: &Transaction<'_>,
-    stream: StreamId,
-    repo_id: &str,
-    table: &str,
-    row_pk: &str,
+    key: &RowKey<'_>,
 ) -> anyhow::Result<Option<(u64, String)>> {
-    current_row_clock_on_stream(tx, stream, repo_id, table, row_pk)
+    current_row_clock_on_stream(tx, key)
 }
 
 /// Raise the row's write clock to `(lamport, device_hex)` under LWW — a later-arriving but older
 /// write never lowers it.
 fn raise_row_clock(
     tx: &Transaction<'_>,
-    stream: StreamId,
-    repo_id: &str,
-    table: &str,
-    row_pk: &str,
+    key: &RowKey<'_>,
     lamport: u64,
     device_hex: &str,
 ) -> anyhow::Result<()> {
-    if let Some((old_lamport, old_device)) =
-        current_row_clock_on_stream(tx, stream, repo_id, table, row_pk)?
-        && !beats(lamport, device_hex, old_lamport, &old_device)
-    {
-        return Ok(());
-    }
-    tx.execute(
-        "INSERT INTO sync_row_clocks(
-             stream_id, repo_id, table_name, row_pk, lamport, device_fingerprint
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(stream_id, table_name, row_pk)
-         DO UPDATE SET lamport = excluded.lamport, device_fingerprint = excluded.device_fingerprint",
-        rusqlite::params![
-            stream.to_bytes().as_slice(),
-            repo_id,
-            table,
-            row_pk,
-            i64::try_from(lamport)?,
-            device_hex,
-        ],
-    )?;
-    Ok(())
+    raise_clock(tx, ClockTable::Rows, key, lamport, device_hex)
 }
 
 fn current_tombstone(
     tx: &Transaction<'_>,
-    stream: StreamId,
-    repo_id: &str,
-    table: &str,
-    row_pk: &str,
+    key: &RowKey<'_>,
 ) -> anyhow::Result<Option<(u64, String)>> {
-    let row = tx
-        .query_row(
-            "SELECT lamport, device_fingerprint FROM sync_row_tombstones
-             WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4",
-            rusqlite::params![stream.to_bytes().as_slice(), repo_id, table, row_pk],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    row.map(|(lamport, device)| Ok((u64::try_from(lamport)?, device))).transpose()
+    stored_clock(tx, ClockTable::Tombstones, key)
 }
 
 /// The row's current tombstone winner on `stream` as `(lamport, device hex)` — the deletion half
 /// of the re-adoption verdict (#997).
 pub(crate) fn tombstone_winner_on_stream(
     tx: &Transaction<'_>,
-    stream: StreamId,
-    repo_id: &str,
-    table: &str,
-    row_pk: &str,
+    key: &RowKey<'_>,
 ) -> anyhow::Result<Option<(u64, String)>> {
-    current_tombstone(tx, stream, repo_id, table, row_pk)
+    current_tombstone(tx, key)
 }
 
 /// Raise the row's tombstone to `(lamport, device_hex)` under LWW — a lower clock never lowers it.
 fn raise_tombstone(
     tx: &Transaction<'_>,
-    stream: StreamId,
-    repo_id: &str,
-    table: &str,
-    row_pk: &str,
+    key: &RowKey<'_>,
     lamport: u64,
     device_hex: &str,
 ) -> anyhow::Result<()> {
-    if let Some((old_lamport, old_device)) = current_tombstone(tx, stream, repo_id, table, row_pk)?
-        && !beats(lamport, device_hex, old_lamport, &old_device)
-    {
-        return Ok(());
-    }
-    tx.execute(
-        "INSERT INTO sync_row_tombstones(
-             stream_id, repo_id, table_name, row_pk, lamport, device_fingerprint
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(stream_id, table_name, row_pk)
-         DO UPDATE SET lamport = excluded.lamport, device_fingerprint = excluded.device_fingerprint",
-        rusqlite::params![
-            stream.to_bytes().as_slice(),
-            repo_id,
-            table,
-            row_pk,
-            i64::try_from(lamport)?,
-            device_hex,
-        ],
-    )?;
-    Ok(())
+    raise_clock(tx, ClockTable::Tombstones, key, lamport, device_hex)
 }
 
 /// The row's current synced-column hash (the anti-echo identity), or `None` if the row is absent.
@@ -832,8 +847,12 @@ pub(crate) fn stale_row_disposition(
     current: &[Cell],
 ) -> anyhow::Result<StaleRow> {
     let row_pk = row_op::row_pk_string(pk_vals);
-    let Some((lamport, device_hex)) =
-        current_row_clock_on_stream(tx, stream, repo_id, spec.name, &row_pk)?
+    let Some((lamport, device_hex)) = current_row_clock_on_stream(tx, &RowKey {
+        stream,
+        repo_id,
+        table: spec.name,
+        row_pk: &row_pk,
+    })?
     else {
         return Ok(StaleRow::Unknown);
     };
