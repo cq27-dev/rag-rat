@@ -16,7 +16,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::align::{class_lcs_ratio, class_lcs_ratio_global};
+use super::align;
 use super::antiunify::{align_to_anchor, anti_unify, anti_unify_global, resolve_anchor_idx};
 use super::score::{Confidence, confidence_v2, metavar_profile, refactorability_v2};
 use super::signature::propose_signature;
@@ -84,15 +84,15 @@ pub struct CachedRefinement {
     pub anti_unify_coverage: f64,
     /// `true` when the LCS fidelity for this refinement engaged EITHER cost-cap dimension — the
     /// member-count sample ([`LCS_MEMBER_SAMPLE`]) OR the per-pair length proxy
-    /// ([`LCS_MAX_SEQ_TOKENS`]); see `class_lcs_ratio`, which ORs both into the returned bit.
-    /// PERSISTED in `clone_refinements` (Fix 3, #215 Plan 4a round-2): a cache HIT reads the
-    /// stored bit back, so the long-sequence sampling dimension survives a warm hit instead of
-    /// degrading to `false`. The caller (`apply_refinement`) folds it into the class's
-    /// `metrics_sampled` flag — and ALSO independently re-derives the member-count dimension
-    /// there from `class.member_count > LCS_MEMBER_SAMPLE`, as a cache-agnostic guard that
-    /// flags the member-count sample even for a row predating this persisted bit (stored
-    /// default 0). The length-proxy dimension has no such independent re-derivation; it is
-    /// carried only by this persisted bit.
+    /// ([`LCS_MAX_SEQ_TOKENS`]); see `align::class_fidelity`, which ORs both into its `sampled`
+    /// bit. PERSISTED in `clone_refinements` (Fix 3, #215 Plan 4a round-2): a cache HIT reads
+    /// the stored bit back, so the long-sequence sampling dimension survives a warm hit
+    /// instead of degrading to `false`. The caller (`apply_refinement`) folds it into the
+    /// class's `metrics_sampled` flag — and ALSO independently re-derives the member-count
+    /// dimension there from `class.member_count > LCS_MEMBER_SAMPLE`, as a cache-agnostic
+    /// guard that flags the member-count sample even for a row predating this persisted bit
+    /// (stored default 0). The length-proxy dimension has no such independent re-derivation;
+    /// it is carried only by this persisted bit.
     pub lcs_sampled: bool,
 }
 
@@ -295,10 +295,11 @@ pub fn refine_compute_and_store_budgeted(
     );
     // `lcs_ratio` stays the NiCad class fidelity (min pairwise 2·LCS/(|a|+|b|)) + its sampling bit.
     let seqs: Vec<Vec<String>> = members.iter().map(|m| m.seq.clone()).collect();
-    let (lcs_ratio, lcs_sampled) = match global_remaining.as_deref_mut() {
-        Some(remaining) => class_lcs_ratio_global(&seqs, remaining),
-        None => class_lcs_ratio(&seqs),
+    let fidelity = match global_remaining.as_deref_mut() {
+        Some(remaining) => align::class_fidelity_global(&seqs, remaining),
+        None => align::class_fidelity(&seqs, align::LCS_AGGREGATE_CELLS_BUDGET),
     };
+    let (lcs_ratio, lcs_sampled) = (fidelity.min_ratio, fidelity.sampled);
 
     // ── Anti-unification (Plan 4b §1.1-§1.10): medoid-anchored star LCS → template + VPs
     // ──────────

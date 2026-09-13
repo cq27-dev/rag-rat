@@ -3,7 +3,7 @@
 /// matched-statement re-descent ([`emit_matched_statement_redescent`]).
 ///
 /// This is the template lane's sibling of [`align::LCS_AGGREGATE_CELLS_BUDGET`] (the FIDELITY
-/// lane's budget in `class_lcs_ratio`). The two lanes are SEPARATE: `class_lcs_ratio` runs an
+/// lane's budget in `class_fidelity`). The two lanes are SEPARATE: `class_fidelity` runs an
 /// all-pairs (N²/2) DP, while [`align_to_anchor`] runs a medoid-anchored STAR align (N−1 DPs) plus,
 /// since the Fix-2 re-descent, a fresh star align per matched statement — so the fidelity budget
 /// never bounded this lane. Until this constant landed, [`align_to_anchor`] had ONLY the per-member
@@ -48,7 +48,7 @@ impl CellBudget {
 
     /// Charge `cells` against the budget BEFORE running the exact DP, then return whether the
     /// budget is now exhausted. A pair already charged still runs exactly (the bound is "budget
-    /// + one pair"), mirroring [`align::class_lcs_ratio`]'s check-after-charge discipline.
+    /// + one pair"), mirroring [`align::class_fidelity`]'s check-after-charge discipline.
     pub(super) fn charge(&mut self, cells: u64) -> bool {
         self.spent = self.spent.saturating_add(cells);
         if self.spent > self.budget {

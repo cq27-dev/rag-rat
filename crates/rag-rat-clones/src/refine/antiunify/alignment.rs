@@ -20,7 +20,7 @@ pub(crate) fn resolve_anchor_idx(members: &[RefineMember], medoid_symbol_id: Opt
 ///
 /// `N−1` LCS aligns (not `N²`). Cost guards bound the work so a cold refine of a very large clone
 /// can never allocate the `(n+1)·(m+1)` LCS DP table unbounded — mirroring
-/// [`align::class_lcs_ratio`]'s caps (the anti-unify path used to call exact `lcs_align` on EVERY
+/// [`align::class_fidelity`]'s caps (the anti-unify path used to call exact `lcs_align` on EVERY
 /// member with no guard, the OOM bug):
 /// - **Degraded anchor** — when the ANCHOR seq exceeds [`align::LCS_MAX_SEQ_TOKENS`], the template
 ///   can't be computed bounded at all, so EVERY non-anchor member is skipped (all-gap map). The

@@ -11,7 +11,7 @@
 //! # NiCad-style `lcs_ratio`
 //!
 //! `2 * LCS(a, b) / (|a| + |b|)` — a Dice coefficient over token sequences, identical to the
-//! similarity measure NiCad uses as `1 - dissimilarity`. `class_lcs_ratio` aggregates per-class as
+//! similarity measure NiCad uses as `1 - dissimilarity`. `class_fidelity` aggregates per-class as
 //! the **minimum** over all unordered pairs: a single loose member drags the class ratio down,
 //! mirroring Plan-2's min-not-average discipline.
 
@@ -92,7 +92,7 @@ pub(crate) fn lcs_align(a: &[String], b: &[String]) -> Alignment {
 /// `lcs_sampled = true` when this cap engages.
 ///
 /// NOTE — NOT the binding cap. `load_refine_members` truncates the refine population to
-/// `MEMBER_VALUE_CAP = MAX_MEMBERS = 50` BEFORE it reaches `class_lcs_ratio`, and
+/// `MEMBER_VALUE_CAP = MAX_MEMBERS = 50` BEFORE it reaches `class_fidelity`, and
 /// `MEMBER_VALUE_CAP < LCS_MEMBER_SAMPLE` is a load-bearing invariant (asserted in
 /// `query_api/clones.rs`; the value cap must stay below the align cap so the 51..=64 member range
 /// the loader already sampled is flagged via `member_count > MEMBER_VALUE_CAP`). So in production
@@ -102,7 +102,7 @@ pub(crate) fn lcs_align(a: &[String], b: &[String]) -> Alignment {
 /// the AGGREGATE exact-DP cost regardless of member count is [`LCS_AGGREGATE_CELLS_BUDGET`].
 pub const LCS_MEMBER_SAMPLE: usize = 64;
 
-/// AGGREGATE cap on the total number of exact-DP cells `class_lcs_ratio` will compute across ALL
+/// AGGREGATE cap on the total number of exact-DP cells `class_fidelity` will compute across ALL
 /// member pairs in one class. The per-pair length cap ([`LCS_MAX_SEQ_TOKENS`]) only fires when ONE
 /// sequence EXCEEDS 2000 tokens — so a class of many members all JUST UNDER 2000 tokens slips past
 /// it and runs an exact O(n·m) DP for EVERY pair (a 50-member ~1999-token class = 1225 exact DPs ≈
@@ -110,7 +110,7 @@ pub const LCS_MEMBER_SAMPLE: usize = 64;
 /// and member-count caps bound a single pair and the member count, but NOT the `pairs × per-pair`
 /// product; this budget closes that gap.
 ///
-/// `class_lcs_ratio` tracks the running sum of `|a|·|b|` over the exact-DP pairs it has actually
+/// `class_fidelity` tracks the running sum of `|a|·|b|` over the exact-DP pairs it has actually
 /// computed; once that sum EXCEEDS this budget, ALL remaining pairs fall back to the cheap
 /// order-blind [`multiset_dice`] proxy (clamped to [`DICE_PROXY_CEILING`]) and `lcs_sampled` is
 /// set, so a budget-truncated class can never be reported as exact.
@@ -178,26 +178,32 @@ fn multiset_dice(a: &[String], b: &[String]) -> f64 {
     2.0 * intersection as f64 / denom
 }
 
-/// NiCad-style class fidelity: the **minimum** over all unordered member pairs of
-/// `2 * LCS(a, b) / (|a| + |b|)`.
-///
-/// Returns `(1.0, false)` for a slice with fewer than 2 members (degenerate case) and for any pair
-/// of identical sequences. Returns `0.0` when one sequence is empty and the other is not (edge
-/// case: `2*0 / (0 + m) == 0`). Guards `|a| + |b| == 0` (both empty) → `1.0`.
-///
-/// The returned `bool` is `lcs_sampled` — `true` when ANY cost cap engaged: the member-count cap
-/// ([`LCS_MEMBER_SAMPLE`], only the first N members entered the all-pairs loop), the per-pair
-/// length cap ([`LCS_MAX_SEQ_TOKENS`], a pair fell back to the [`multiset_dice`] proxy instead of
-/// the exact O(n·m) DP), or the AGGREGATE cell budget ([`LCS_AGGREGATE_CELLS_BUDGET`], the running
-/// sum of exact-DP cells across pairs exceeded the budget and the remaining pairs fell back to the
-/// proxy). The caller folds this into the class's `metrics_sampled` flag so a cost-bounded fidelity
-/// is distinguishable from an exact one.
-pub(crate) fn class_lcs_ratio(seqs: &[Vec<String>]) -> (f64, bool) {
-    let (ratio, sampled, _exact_dp_pairs) = class_lcs_ratio_counted(seqs);
-    (ratio, sampled)
+/// NiCad-style class fidelity — the **minimum** over all unordered member pairs of
+/// `2 * LCS(a, b) / (|a| + |b|)` — plus what measuring it cost.
+pub(crate) struct ClassFidelity {
+    /// The minimum pairwise ratio: `1.0` for a slice with fewer than 2 members (degenerate case)
+    /// and for any pair of identical sequences, `0.0` when one sequence is empty and the other is
+    /// not (`2*0 / (0 + m) == 0`); `|a| + |b| == 0` (both empty) is guarded to `1.0`.
+    pub(crate) min_ratio: f64,
+    /// `lcs_sampled` — `true` when ANY cost cap engaged: the member-count cap
+    /// ([`LCS_MEMBER_SAMPLE`], only the first N members entered the all-pairs loop), the per-pair
+    /// length cap ([`LCS_MAX_SEQ_TOKENS`], a pair fell back to the [`multiset_dice`] proxy instead
+    /// of the exact O(n·m) DP), or the AGGREGATE cell budget (the running sum of exact-DP cells
+    /// across pairs exceeded the budget and the remaining pairs fell back to the proxy). The
+    /// caller folds this into the class's `metrics_sampled` flag so a cost-bounded fidelity is
+    /// distinguishable from an exact one.
+    pub(crate) sampled: bool,
+    /// How many pairs ran the exact O(n·m) DP (the rest took the [`multiset_dice`] proxy) — the
+    /// count the aggregate-budget tests assert is BOUNDED.
+    #[allow(dead_code)] // read only by the aggregate-budget tests
+    pub(crate) exact_dp_pairs: u64,
+    /// The exact-DP cells charged (`Σ |a|·|b|` over the exact pairs). [`class_fidelity_global`]
+    /// decrements its shared allowance by this so the WHOLE refine pass — not just each class — is
+    /// cell-bounded.
+    pub(crate) exact_dp_cells: u64,
 }
 
-/// Like [`class_lcs_ratio`] but draws its exact-DP allowance from a SHARED CROSS-CLASS budget
+/// Like [`class_fidelity`] but draws its exact-DP allowance from a SHARED CROSS-CLASS budget
 /// (`*remaining_cells`) instead of a fresh per-class [`LCS_AGGREGATE_CELLS_BUDGET`]. The per-class
 /// cap is `min(LCS_AGGREGATE_CELLS_BUDGET, *remaining_cells)` — so the fidelity lane stays bounded
 /// per class AND the WHOLE `find_clones` refine pass is bounded by the global allowance the driver
@@ -209,48 +215,32 @@ pub(crate) fn class_lcs_ratio(seqs: &[Vec<String>]) -> (f64, bool) {
 /// DETERMINISM: the per-class budget is a pure function of `*remaining_cells` at entry, and the
 /// classes are refined in a fixed provisional-ROI order, so the same input always truncates at the
 /// same class and the same pair — byte-identical output. With a generous (or default
-/// `LCS_AGGREGATE_CELLS_BUDGET`-sized) allowance this is byte-identical to [`class_lcs_ratio`].
-pub(crate) fn class_lcs_ratio_global(
+/// `LCS_AGGREGATE_CELLS_BUDGET`-sized) allowance this is byte-identical to [`class_fidelity`] at
+/// the full lane budget.
+pub(crate) fn class_fidelity_global(
     seqs: &[Vec<String>],
     remaining_cells: &mut u64,
-) -> (f64, bool) {
+) -> ClassFidelity {
     let per_class = LCS_AGGREGATE_CELLS_BUDGET.min(*remaining_cells);
-    let (ratio, sampled, cells_spent) = class_lcs_ratio_counted_with_cells(seqs, per_class);
-    *remaining_cells = remaining_cells.saturating_sub(cells_spent);
-    (ratio, sampled)
+    let fidelity = class_fidelity(seqs, per_class);
+    *remaining_cells = remaining_cells.saturating_sub(fidelity.exact_dp_cells);
+    fidelity
 }
 
-/// The body of [`class_lcs_ratio`], additionally returning how many pairs actually ran the exact
-/// O(n·m) DP (the rest took the [`multiset_dice`] proxy). The count is what the aggregate-budget
-/// test asserts is BOUNDED — it is otherwise an implementation detail, so the public wrapper drops
-/// it. Uses the production aggregate budget ([`LCS_AGGREGATE_CELLS_BUDGET`]).
-fn class_lcs_ratio_counted(seqs: &[Vec<String>]) -> (f64, bool, u64) {
-    class_lcs_ratio_counted_with_budget(seqs, LCS_AGGREGATE_CELLS_BUDGET)
-}
-
-/// [`class_lcs_ratio_counted`] with an INJECTABLE aggregate cell budget. Production always uses the
-/// [`LCS_AGGREGATE_CELLS_BUDGET`] default (via the wrapper above); the budget is a parameter only
-/// so the aggregate-budget test can trip the cutover with a TINY budget on SMALL sequences in
-/// milliseconds, instead of running ~26 real 1900² DPs to exhaust the 100M production budget (~11
-/// s). The cutover logic is byte-identical regardless of the budget value, so the fast test
-/// exercises the same code path as production.
-fn class_lcs_ratio_counted_with_budget(seqs: &[Vec<String>], budget: u64) -> (f64, bool, u64) {
-    let (ratio, sampled, pairs, _cells) = class_lcs_ratio_full(seqs, budget);
-    (ratio, sampled, pairs)
-}
-
-/// [`class_lcs_ratio_counted_with_budget`] but additionally returning the exact-DP CELLS charged
-/// (not just the pair count). The cross-class global driver ([`class_lcs_ratio_global`]) decrements
-/// its shared allowance by this so the WHOLE refine pass — not just each class — is cell-bounded.
-fn class_lcs_ratio_counted_with_cells(seqs: &[Vec<String>], budget: u64) -> (f64, bool, u64) {
-    let (ratio, sampled, _pairs, cells) = class_lcs_ratio_full(seqs, budget);
-    (ratio, sampled, cells)
-}
-
-/// Shared body: returns `(min_ratio, lcs_sampled, exact_dp_pairs, exact_dp_cells)`.
-fn class_lcs_ratio_full(seqs: &[Vec<String>], budget: u64) -> (f64, bool, u64, u64) {
+/// Measure the class's [`ClassFidelity`] against an aggregate exact-DP cell `budget`. Production
+/// passes [`LCS_AGGREGATE_CELLS_BUDGET`] (or, through [`class_fidelity_global`], the smaller shared
+/// allowance); the budget is a parameter so the aggregate-budget test can trip the cutover with a
+/// TINY budget on SMALL sequences in milliseconds, instead of running ~26 real 1900² DPs to exhaust
+/// the 100M production budget (~11 s). The cutover logic is byte-identical regardless of the budget
+/// value, so the fast test exercises the same code path as production.
+pub(crate) fn class_fidelity(seqs: &[Vec<String>], budget: u64) -> ClassFidelity {
     if seqs.len() < 2 {
-        return (1.0, false, 0, 0);
+        return ClassFidelity {
+            min_ratio: 1.0,
+            sampled: false,
+            exact_dp_pairs: 0,
+            exact_dp_cells: 0,
+        };
     }
 
     // Member-count cap: use at most LCS_MEMBER_SAMPLE members. The slice is already in canonical
@@ -304,12 +294,16 @@ fn class_lcs_ratio_full(seqs: &[Vec<String>], budget: u64) -> (f64, bool, u64, u
         }
     }
 
-    let lcs_sampled = sampled_members || sampled_seq;
     // SAFETY: the `seqs.len() < 2` early return guarantees `effective.len() >= 2`, so the inner
     // loop body (i=0, j=1) executes at least once and `min_ratio` is updated from `f64::INFINITY`.
     // The `f64::INFINITY` fallback is therefore unreachable — assert it in debug, return min_ratio.
     debug_assert!(min_ratio.is_finite(), "min_ratio must be set: effective.len() >= 2");
-    (min_ratio, lcs_sampled, exact_dp_pairs, exact_dp_cells)
+    ClassFidelity {
+        min_ratio,
+        sampled: sampled_members || sampled_seq,
+        exact_dp_pairs,
+        exact_dp_cells,
+    }
 }
 
 #[cfg(test)]
@@ -320,7 +314,12 @@ mod tests {
         tokens.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Two identical sequences → all Match ops, lcs_len == len, class_lcs_ratio == 1.0.
+    /// Fidelity at the production aggregate budget.
+    fn fidelity(seqs: &[Vec<String>]) -> ClassFidelity {
+        class_fidelity(seqs, LCS_AGGREGATE_CELLS_BUDGET)
+    }
+
+    /// Two identical sequences → all Match ops, lcs_len == len, class_fidelity == 1.0.
     #[test]
     fn lcs_align_identical_is_all_match() {
         let a = strs(&["fn", "foo", "(", ")", "{", "x", "}"]);
@@ -333,7 +332,7 @@ mod tests {
             assert_eq!(*op, AlignOp::Match(k, k), "op at position {k} was not Match");
         }
 
-        let (ratio, sampled) = class_lcs_ratio(&[a, b]);
+        let ClassFidelity { min_ratio: ratio, sampled, .. } = fidelity(&[a, b]);
         assert!((ratio - 1.0).abs() < 1e-12, "expected ratio 1.0 for identical seqs, got {ratio}");
         assert!(!sampled, "small identical seqs must not engage any cost cap");
     }
@@ -387,7 +386,7 @@ mod tests {
 
         // Exact ratio check.
         let expected = 2.0 * n as f64 / (n + n + k) as f64;
-        let (ratio, _sampled) = class_lcs_ratio(&[base, b]);
+        let ratio = fidelity(&[base, b]).min_ratio;
         assert!((ratio - expected).abs() < 1e-12, "ratio: expected {expected}, got {ratio}");
     }
 
@@ -410,7 +409,7 @@ mod tests {
         assert_eq!(del_count, 1, "expected 1 DelA, got {del_count}");
         assert_eq!(ins_count, 1, "expected 1 InsB, got {ins_count}");
 
-        let (ratio, _sampled) = class_lcs_ratio(&[a, b]);
+        let ratio = fidelity(&[a, b]).min_ratio;
         assert!(ratio < 1.0, "ratio should be < 1.0 for a renamed token, got {ratio}");
         // exact: 2*(n-1)/(n+n) = (n-1)/n
         let expected = (n - 1) as f64 / n as f64;
@@ -418,9 +417,9 @@ mod tests {
     }
 
     /// 3 seqs: two identical (pair ratio 1.0) + one distant (ratio ~0.5).
-    /// class_lcs_ratio must return the MIN (~0.5), not the average.
+    /// class_fidelity must return the MIN (~0.5), not the average.
     #[test]
-    fn class_lcs_ratio_is_minimum_not_average() {
+    fn class_fidelity_is_minimum_not_average() {
         // a and b are identical (ratio 1.0 between them).
         let a = strs(&["fn", "foo", "(", ")", "{"]);
         let b = a.clone();
@@ -434,16 +433,16 @@ mod tests {
         // ratio_ac should be < 0.5; ensure it's noticeably less than the average of (1.0 + 1.0 +
         // ratio_ac)/3.
 
-        let (class_ratio, _sampled) = class_lcs_ratio(&[a, b, c]);
+        let class_ratio = fidelity(&[a, b, c]).min_ratio;
         assert!(
             (class_ratio - ratio_ac).abs() < 1e-12,
-            "class_lcs_ratio ({class_ratio}) should equal the minimum pairwise ratio ({ratio_ac})"
+            "class_fidelity ({class_ratio}) should equal the minimum pairwise ratio ({ratio_ac})"
         );
         // Confirm it is indeed the minimum, not the average.
         let average = (1.0 + ratio_ac + ratio_ac) / 3.0;
         assert!(
             class_ratio < average,
-            "class_lcs_ratio ({class_ratio}) should be less than average ({average})"
+            "class_fidelity ({class_ratio}) should be less than average ({average})"
         );
     }
 
@@ -484,11 +483,11 @@ mod tests {
         let nonempty = strs(&["fn", "foo"]);
 
         // Both empty → 1.0.
-        let (ratio_both, _) = class_lcs_ratio(&[empty.clone(), empty.clone()]);
+        let ratio_both = fidelity(&[empty.clone(), empty.clone()]).min_ratio;
         assert!((ratio_both - 1.0).abs() < 1e-12, "both empty: expected 1.0, got {ratio_both}");
 
         // One empty → 0.0.
-        let (ratio_one, _) = class_lcs_ratio(&[empty.clone(), nonempty.clone()]);
+        let ratio_one = fidelity(&[empty.clone(), nonempty.clone()]).min_ratio;
         assert!(ratio_one.abs() < 1e-12, "one empty: expected 0.0, got {ratio_one}");
 
         // Verify lcs_align itself doesn't panic.
@@ -507,12 +506,12 @@ mod tests {
     /// `lcs_sampled = true`. The ratio is still computed over the (identical) sample, so it stays
     /// `1.0`.
     #[test]
-    fn class_lcs_ratio_caps_member_count_and_sets_sampled() {
+    fn class_fidelity_caps_member_count_and_sets_sampled() {
         // Build LCS_MEMBER_SAMPLE + 1 identical sequences → member-count cap kicks in.
         let seq: Vec<String> = (0..10).map(|i| format!("tok{i}")).collect();
         let seqs: Vec<Vec<String>> = (0..=LCS_MEMBER_SAMPLE).map(|_| seq.clone()).collect();
         assert!(seqs.len() > LCS_MEMBER_SAMPLE);
-        let (ratio, sampled) = class_lcs_ratio(&seqs);
+        let ClassFidelity { min_ratio: ratio, sampled, .. } = fidelity(&seqs);
         assert!((ratio - 1.0).abs() < 1e-12, "identical seqs → ratio 1.0, got {ratio}");
         assert!(sampled, "member-count cap must set lcs_sampled=true");
     }
@@ -523,11 +522,11 @@ mod tests {
     /// is clamped to [`DICE_PROXY_CEILING`] — the proxy is order-blind, so it can never certify a
     /// full ratio.
     #[test]
-    fn class_lcs_ratio_caps_long_seq_and_uses_dice_proxy() {
+    fn class_fidelity_caps_long_seq_and_uses_dice_proxy() {
         // Two sequences each LCS_MAX_SEQ_TOKENS + 1 tokens long → per-pair length cap kicks in.
         let long_seq: Vec<String> = (0..=LCS_MAX_SEQ_TOKENS).map(|i| format!("t{i}")).collect();
         let seqs = vec![long_seq.clone(), long_seq.clone()];
-        let (ratio, sampled) = class_lcs_ratio(&seqs);
+        let ClassFidelity { min_ratio: ratio, sampled, .. } = fidelity(&seqs);
         // Identical long sequences → raw Dice proxy = 1.0, but clamped to the sub-perfect ceiling.
         assert!(
             (ratio - DICE_PROXY_CEILING).abs() < 1e-12,
@@ -538,11 +537,11 @@ mod tests {
 
     /// Fix 1 round-2 (#215 Plan 4a): the order-blind Dice proxy must NOT certify a perfect ratio.
     /// Two long sequences with the SAME token multiset but REVERSED order have a true LCS ratio far
-    /// below 1.0, yet token-bag Dice scores them ~1.0. `class_lcs_ratio` clamps the proxied pair to
+    /// below 1.0, yet token-bag Dice scores them ~1.0. `class_fidelity` clamps the proxied pair to
     /// [`DICE_PROXY_CEILING`], reports `lcs_sampled = true`, and the resulting ratio bands at most
     /// Medium confidence — never High.
     #[test]
-    fn class_lcs_ratio_clamps_reversed_order_long_seqs_below_high() {
+    fn class_fidelity_clamps_reversed_order_long_seqs_below_high() {
         // Build seqs > LCS_MAX_SEQ_TOKENS by repeating a small alphabet, so the multiset is
         // identical but the order is reversed.
         let alphabet = ["a", "b", "c", "d", "e"];
@@ -559,7 +558,7 @@ mod tests {
             assert_eq!(fa, rb, "reversed seq must have the SAME token multiset");
         }
 
-        let (ratio, sampled) = class_lcs_ratio(&[forward, reversed]);
+        let ClassFidelity { min_ratio: ratio, sampled, .. } = fidelity(&[forward, reversed]);
         assert!(sampled, "per-pair length cap must set lcs_sampled=true");
         assert!(
             ratio <= DICE_PROXY_CEILING,
@@ -580,7 +579,7 @@ mod tests {
     /// `lcs_sampled` is set. Without the budget this class would run all `50·49/2 = 1225` exact DPs
     /// (the measured ~minutes cliff); with it, only a bounded handful run.
     #[test]
-    fn class_lcs_ratio_aggregate_budget_caps_exact_dp() {
+    fn class_fidelity_aggregate_budget_caps_exact_dp() {
         // Same invariant the production budget enforces, exercised with a TINY INJECTED budget on
         // SMALL sequences so it runs in milliseconds. (The production budget is 100M cells;
         // tripping it for real needs ~26 exact 1900² DPs ≈ 11 s — that cost is in the
@@ -606,8 +605,7 @@ mod tests {
         );
         let total_pairs = (member_count * (member_count - 1) / 2) as u64; // 190
 
-        let (_ratio, sampled, exact_dp_pairs) =
-            class_lcs_ratio_counted_with_budget(&seqs, tiny_budget);
+        let ClassFidelity { sampled, exact_dp_pairs, .. } = class_fidelity(&seqs, tiny_budget);
 
         // The budget tripped → sampled flag set (a budget-truncated class is never reported exact).
         assert!(sampled, "aggregate-budget truncation must set lcs_sampled=true");
@@ -632,13 +630,14 @@ mod tests {
     /// C-B companion: a SMALL class within the aggregate budget runs ALL pairs exactly and is NOT
     /// reported sampled — the budget must not perturb the ratio value for normal-size classes.
     #[test]
-    fn class_lcs_ratio_small_class_within_budget_is_exact() {
+    fn class_fidelity_small_class_within_budget_is_exact() {
         // Three modest members (well under the aggregate budget): all 3 pairs run exact DP, no
         // sampling, and the ratio matches the pre-budget minimum-pairwise behavior.
         let a = strs(&["fn", "foo", "(", ")", "{", "x", "}"]);
         let b = strs(&["fn", "bar", "(", ")", "{", "x", "}"]); // one token differs
         let c = a.clone();
-        let (ratio, sampled, exact_dp_pairs) = class_lcs_ratio_counted(&[a.clone(), b.clone(), c]);
+        let ClassFidelity { min_ratio: ratio, sampled, exact_dp_pairs, .. } =
+            fidelity(&[a.clone(), b.clone(), c]);
         assert!(!sampled, "a small class within budget must not be sampled");
         assert_eq!(exact_dp_pairs, 3, "all 3 pairs of a 3-member class run exact DP within budget");
         // Min pairwise: a↔b differ by one token (DelA+InsB), a↔c & b↔c... a==c (1.0). The min is
@@ -655,9 +654,9 @@ mod tests {
     /// shared counter is drained, later classes get a `0` per-class budget → every pair takes the
     /// proxy and `lcs_sampled` latches, so the global truncation is honest. This is the
     /// fidelity-lane mechanism the driver (`find_clones`) threads through
-    /// `class_lcs_ratio_global`.
+    /// `class_fidelity_global`.
     #[test]
-    fn class_lcs_ratio_global_budget_caps_aggregate_across_classes() {
+    fn class_fidelity_global_budget_caps_aggregate_across_classes() {
         // Each "class" is 4 members × 10 tokens → 6 pairs × 100 cells = 600 cells of exact DP if
         // fully run. With a 250-cell GLOBAL allowance shared across THREE classes, only the first
         // class can run any exact DP at all; by the time class 2 starts the counter is drained, so
@@ -670,7 +669,7 @@ mod tests {
         let mut remaining: u64 = 250;
         let mut sampled_flags = Vec::new();
         for seqs in &classes {
-            let (_ratio, sampled) = class_lcs_ratio_global(seqs, &mut remaining);
+            let sampled = class_fidelity_global(seqs, &mut remaining).sampled;
             sampled_flags.push(sampled);
         }
 
@@ -684,22 +683,23 @@ mod tests {
     }
 
     /// #272 UNDER-budget determinism: a GLOBAL run with a generous allowance is BYTE-IDENTICAL to
-    /// the per-class `class_lcs_ratio` path (same ratio, same not-sampled flag) — the global
+    /// the per-class `class_fidelity` path (same ratio, same not-sampled flag) — the global
     /// counter only changes behavior PAST the allowance. This is the "under-budget runs stay
     /// byte-identical" guarantee the #272 fix must preserve.
     #[test]
-    fn class_lcs_ratio_global_under_budget_is_byte_identical() {
+    fn class_fidelity_global_under_budget_is_byte_identical() {
         let a = strs(&["fn", "foo", "(", ")", "{", "x", "}"]);
         let b = strs(&["fn", "bar", "(", ")", "{", "x", "}"]);
         let c = a.clone();
         let seqs = [a, b, c];
 
-        let (ratio_ref, sampled_ref) = class_lcs_ratio(&seqs);
+        let ClassFidelity { min_ratio: ratio_ref, sampled: sampled_ref, .. } = fidelity(&seqs);
 
         // A generous global allowance → the per-class budget is the full lane const → identical.
         let mut remaining: u64 = LCS_AGGREGATE_CELLS_BUDGET * 8;
         let before = remaining;
-        let (ratio_global, sampled_global) = class_lcs_ratio_global(&seqs, &mut remaining);
+        let ClassFidelity { min_ratio: ratio_global, sampled: sampled_global, .. } =
+            class_fidelity_global(&seqs, &mut remaining);
 
         assert_eq!(ratio_ref, ratio_global, "under-budget ratio must be byte-identical");
         assert_eq!(sampled_ref, sampled_global, "under-budget sampled flag must match");

@@ -156,7 +156,7 @@ struct MemberStmtAlign {
 ///
 /// WHY THIS IS NON-BLOCKING (display fidelity only; never a scoring over-claim):
 /// 1. `lcs_ratio` (the NiCad class fidelity) is computed INDEPENDENTLY from the raw `m.seq` token
-///    sequences in `cache.rs` (`class_lcs_ratio`), NOT from this template/coverage — so a dropped
+///    sequences in `cache.rs` (`class_fidelity`), NOT from this template/coverage — so a dropped
 ///    statement still depresses the pairwise LCS.
 /// 2. A gapped VP is still emitted, and `confidence_v2`/`refactorability_v2` ALWAYS downgrade on
 ///    `gapped > 0`. So a false coverage 1.0 can never escalate confidence to High or
