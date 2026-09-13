@@ -104,834 +104,998 @@ const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
 const MIGRATION_001_DESCRIPTION: &str =
     "SQLite storage baseline with FTS, tree-sitter graph edges, git/GitHub, and local AI metadata";
-const MIGRATION_002_ID: &str = "002_embedding_vector_metadata";
-const MIGRATION_002_CHECKSUM: &str = "sha256:rag-rat-embedding-vector-metadata-v2";
-const MIGRATION_002_DESCRIPTION: &str =
-    "Add embedding model dimension metadata and per-vector dimensions for hybrid vector search";
-const MIGRATION_003_ID: &str = "003_derived_artifact_reconcile_metadata";
-const MIGRATION_003_CHECKSUM: &str = "sha256:rag-rat-derived-artifact-reconcile-metadata-v3";
-const MIGRATION_003_DESCRIPTION: &str = "Add model version, retry metadata, summaries, and \
-                                         reconcile meta for diff-based derived artifact \
-                                         reconciliation";
-const MIGRATION_004_ID: &str = "004_edge_source_target_spans";
-const MIGRATION_004_CHECKSUM: &str = "sha256:rag-rat-edge-source-target-spans-v4";
-const MIGRATION_004_DESCRIPTION: &str =
-    "Add exact source call-site spans and resolved target line spans to graph edges";
-const MIGRATION_005_ID: &str = "005_edge_evidence_and_resolution";
-const MIGRATION_005_CHECKSUM: &str = "sha256:rag-rat-edge-evidence-resolution-v5";
-const MIGRATION_005_DESCRIPTION: &str =
-    "Add raw graph edge evidence, receiver hints, qualified targets, and resolution reasons";
-const MIGRATION_006_ID: &str = "006_embedding_policy_and_input_hash";
-const MIGRATION_006_CHECKSUM: &str = "sha256:rag-rat-embedding-policy-input-hash-v6";
-const MIGRATION_006_DESCRIPTION: &str = "Add embedding eligibility policy, priority, bounded \
-                                         input hash, and reconcile throughput metadata";
-const MIGRATION_007_ID: &str = "007_logical_symbol_groups";
-const MIGRATION_007_CHECKSUM: &str = "sha256:rag-rat-logical-symbol-groups-v7";
-const MIGRATION_007_DESCRIPTION: &str =
-    "Add logical symbol groups for cfg variants and duplicate definitions";
-const MIGRATION_008_ID: &str = "008_commit_addressable_worktrees";
-const MIGRATION_008_CHECKSUM: &str = "sha256:rag-rat-commit-addressable-worktrees-v8";
-const MIGRATION_008_DESCRIPTION: &str =
-    "Add commit_sha and worktree_id to files table for multi-worktree / multi-branch support";
-const MIGRATION_009_ID: &str = "009_github_ref_sync_state";
-const MIGRATION_009_CHECKSUM: &str = "sha256:rag-rat-github-ref-sync-state-v9";
-const MIGRATION_009_DESCRIPTION: &str =
-    "Add per-GitHub-ref sync state for resumable papertrail cache updates";
-const MIGRATION_010_ID: &str = "010_symbol_facts";
-const MIGRATION_010_CHECKSUM: &str = "sha256:rag-rat-symbol-facts-v10";
-const MIGRATION_010_DESCRIPTION: &str =
-    "Add normalized symbol facts for parsed language metadata such as Rust attributes";
-const MIGRATION_011_ID: &str = "011_repo_memories";
-const MIGRATION_011_CHECKSUM: &str = "sha256:rag-rat-repo-memories-v11";
-const MIGRATION_011_DESCRIPTION: &str =
-    "Add source-anchored repo memories bound to symbols, chunks, paths, and papertrail refs";
-const MIGRATION_012_ID: &str = "012_repo_memory_call_paths";
-const MIGRATION_012_CHECKSUM: &str = "sha256:rag-rat-repo-memory-call-paths-v12";
-const MIGRATION_012_DESCRIPTION: &str =
-    "Add edge and call-path memory bindings for graph traversal surfacing";
-const MIGRATION_013_ID: &str = "013_graph_file_lookup_indexes";
-const MIGRATION_013_CHECKSUM: &str = "sha256:rag-rat-graph-file-lookup-indexes-v13";
-const MIGRATION_013_DESCRIPTION: &str =
-    "Add graph file lookup indexes for ownership clustering and file-level graph summaries";
-const MIGRATION_014_ID: &str = "014_repo_memory_binding_signals";
-const MIGRATION_014_CHECKSUM: &str = "sha256:rag-rat-repo-memory-binding-signals-v14";
-const MIGRATION_014_DESCRIPTION: &str =
-    "Add symbol_kind + signature_hash to repo_memory_bindings for durable cross-file relocation";
-const MIGRATION_015_ID: &str = "015_repo_memory_call_path_edges";
-const MIGRATION_015_CHECKSUM: &str = "sha256:rag-rat-repo-memory-call-path-edges-v15";
-const MIGRATION_015_DESCRIPTION: &str =
-    "Add ordered edge fingerprints behind server-derived call-path hashes for validation";
-const MIGRATION_016_ID: &str = "016_symbol_line_spans";
-const MIGRATION_016_CHECKSUM: &str = "sha256:rag-rat-symbol-line-spans-v16";
-const MIGRATION_016_DESCRIPTION: &str = "Store start_line/end_line on symbols so readers skip the \
-                                         per-symbol chunk-containment subqueries";
-const MIGRATION_017_ID: &str = "017_edge_callee_byte_range";
-const MIGRATION_017_CHECKSUM: &str = "sha256:rag-rat-edge-callee-byte-range-v17";
-const MIGRATION_017_DESCRIPTION: &str =
-    "Add callee identifier byte range to edges for the SCIP occurrence join (#61 prerequisite)";
-const MIGRATION_018_ID: &str = "018_scip_oracle_tables";
-const MIGRATION_018_CHECKSUM: &str = "sha256:rag-rat-scip-oracle-tables-v18";
-const MIGRATION_018_DESCRIPTION: &str =
-    "Add oracle_runs + edge_oracle side tables for SCIP compiler-grade edge resolution (#68)";
-const MIGRATION_019_ID: &str = "019_scip_moniker_anchors";
-const MIGRATION_019_CHECKSUM: &str = "sha256:rag-rat-scip-moniker-anchors-v19";
-const MIGRATION_019_DESCRIPTION: &str = "Add logical_symbol_monikers + moniker provenance and \
-                                         relocation reason on repo memory bindings (#70)";
-const MIGRATION_020_ID: &str = "020_edge_string_interning";
-const MIGRATION_020_CHECKSUM: &str = "sha256:rag-rat-edge-string-interning-v20";
-const MIGRATION_020_DESCRIPTION: &str = "Normalize repeated edge strings into the name_strings \
-                                         dictionary behind the edges compatibility view (#79)";
-const MIGRATION_021_ID: &str = "021_symbol_scope_path";
-const MIGRATION_021_CHECKSUM: &str = "sha256:rag-rat-symbol-scope-path-v21";
-const MIGRATION_021_DESCRIPTION: &str =
-    "Add symbols.scope_path (semantic enclosing-scope path) for scope-aware edge resolution (#61)";
-const MIGRATION_022_ID: &str = "022_per_package_import_scope";
-const MIGRATION_022_CHECKSUM: &str = "sha256:rag-rat-per-package-import-scope-v22";
-const MIGRATION_022_DESCRIPTION: &str = "Add packages table + dedicated edge import-scope columns \
-                                         for per-package, module-aware import resolution (#61)";
-const MIGRATION_023_ID: &str = "023_dispatch_edge_facts_view_exclusion";
-const MIGRATION_023_CHECKSUM: &str = "sha256:rag-rat-dispatch-edge-facts-view-exclusion-v23";
-const MIGRATION_023_DESCRIPTION: &str = "Recreate the edges compatibility view to exclude \
-                                         internal dispatch FACT rows from query-layer reads (#200)";
-const MIGRATION_024_ID: &str = "024_files_has_test_code";
-const MIGRATION_024_CHECKSUM: &str = "sha256:rag-rat-files-has-test-code-v24";
-const MIGRATION_024_DESCRIPTION: &str = "Add files.has_test_code flag (precomputed test-marker \
-                                         detection) so impact_surface avoids a chunks.text scan \
-                                         (#77)";
-const MIGRATION_025_ID: &str = "025_chunk_text_compression_tables";
-const MIGRATION_025_CHECKSUM: &str = "sha256:rag-rat-chunk-text-compression-tables-v25";
-const MIGRATION_025_DESCRIPTION: &str = "Add chunk_text (zstd blob) + chunk_text_dict (shared \
-                                         dictionary) tables for compressed chunk text (#77)";
-const MIGRATION_026_ID: &str = "026_contentless_chunk_fts";
-const MIGRATION_026_CHECKSUM: &str = "sha256:rag-rat-contentless-chunk-fts-v26";
-const MIGRATION_026_DESCRIPTION: &str = "Recreate chunk_fts as a contentless FTS5 index and \
-                                         repopulate it, so chunks.text can be dropped (#77 Phase \
-                                         2)";
-const MIGRATION_027_ID: &str = "027_drop_chunks_text";
-const MIGRATION_027_CHECKSUM: &str = "sha256:rag-rat-drop-chunks-text-v27";
-const MIGRATION_027_DESCRIPTION: &str = "Build the compressed chunk_text store from chunks.text, \
-                                         then drop the chunks.text column (#77 Phase 2)";
-const MIGRATION_028_ID: &str = "028_intern_symbol_qualified_names";
-const MIGRATION_028_CHECKSUM: &str = "sha256:rag-rat-intern-symbol-qualified-names-v28";
-const MIGRATION_028_DESCRIPTION: &str = "Intern symbols/logical_symbols qualified_name into the \
-                                         shared name_strings pool, then drop the columns (#224)";
-const MIGRATION_029_ID: &str = "029_clone_fingerprint_tables";
-const MIGRATION_029_CHECKSUM: &str = "sha256:rag-rat-clone-fingerprint-tables-v29";
-const MIGRATION_029_DESCRIPTION: &str = "Add symbol_fingerprints + symbol_token_postings + \
-                                         clone_token_df + clone_refinements for clone detection \
-                                         (#215)";
-const MIGRATION_030_ID: &str = "030_clone_refinements_lcs_sampled";
-const MIGRATION_030_CHECKSUM: &str = "sha256:rag-rat-clone-refinements-lcs-sampled-v30";
-const MIGRATION_030_DESCRIPTION: &str =
-    "Add clone_refinements.lcs_sampled (additive; heals indexes already at V029)";
-const MIGRATION_031_ID: &str = "031_edge_oracle_content_anchor";
-const MIGRATION_031_CHECKSUM: &str = "sha256:rag-rat-edge-oracle-content-anchor-v31";
-const MIGRATION_031_DESCRIPTION: &str = "Rebuild edge_oracle content-anchored (drop edges_data FK \
-                                         + edge_id PK) so verdicts survive reindex (#248)";
-const MIGRATION_032_ID: &str = "032_clone_token_bag_blob";
-const MIGRATION_032_CHECKSUM: &str = "sha256:rag-rat-clone-token-bag-blob-v32";
-const MIGRATION_032_DESCRIPTION: &str = "Add symbol_fingerprints.token_bag BLOB + drop \
-                                         symbol_token_postings (BLOB-pack the clone token bag) \
-                                         (#231)";
-const MIGRATION_033_ID: &str = "033_dream_findings";
-const MIGRATION_033_CHECKSUM: &str = "sha256:rag-rat-dream-findings-v33";
-const MIGRATION_033_DESCRIPTION: &str = "Add dream_findings (dream-mode worklist: findings ABOUT \
-                                         memories, identity-keyed supersede/decay, never mutate \
-                                         memories) (#122)";
-const MIGRATION_034_ID: &str = "034_clone_graph_precompute";
-const MIGRATION_034_CHECKSUM: &str = "sha256:rag-rat-clone-graph-precompute-v34";
-const MIGRATION_034_DESCRIPTION: &str =
-    "Add clone_graph_generations + clone_edges (content-anchored precomputed clone-edge graph so \
-     find_clones reads a persisted graph instead of recomputing candidate pairs every query)";
-const MIGRATION_035_ID: &str = "035_symbols_is_test";
-const MIGRATION_035_CHECKSUM: &str = "sha256:rag-rat-symbols-is-test-v35";
-const MIGRATION_035_DESCRIPTION: &str = "Add symbols.is_test (cross-language test-code marker: \
-                                         test-file path, Rust #[test]/#[cfg(test)], Kotlin @Test, \
-                                         Python test_*/TestCase) so clone detection can exclude \
-                                         tests from the corpus";
-const MIGRATION_036_ID: &str = "036_embedding_content_cache";
-const MIGRATION_036_CHECKSUM: &str = "sha256:rag-rat-embedding-content-cache-v36";
-const MIGRATION_036_DESCRIPTION: &str =
-    "Add embedding_cache (content-addressed vectors keyed by input_hash) so embeddings survive \
-     reindex / branch-switch and reconcile reuses unchanged content across contexts instead of \
-     re-embedding; seeded from current chunk_embeddings (#357)";
-const MIGRATION_037_ID: &str = "037_clone_subblock_postings";
-const MIGRATION_037_CHECKSUM: &str = "sha256:rag-rat-clone-subblock-postings-v37";
-const MIGRATION_037_DESCRIPTION: &str =
-    "Add clone_subblock_postings (persisted content-anchored sub-block postings, \
-     generation-staged like clone_edges) + clone_graph_generations.postings_written so the \
-     write-time clone check does a bounded indexed lookup instead of rebuilding the RAM index and \
-     scales past the 40k guard (#296)";
-const MIGRATION_038_ID: &str = "038_repos_registry";
-const MIGRATION_038_CHECKSUM: &str = "sha256:rag-rat-repos-registry-v38";
-const MIGRATION_038_DESCRIPTION: &str =
-    "Add repos registry + repo_roots + repo_meta (per-machine repo identity registry and per-repo \
-     key/value store) with the __unassigned__ adoption placeholder — the substrate for the global \
-     consolidated database and repo_id scoping (memory-sync phase A)";
-const MIGRATION_039_ID: &str = "039_per_repo_meta";
-const MIGRATION_039_CHECKSUM: &str = "sha256:rag-rat-per-repo-meta-v39";
-const MIGRATION_039_DESCRIPTION: &str = "Relocate the per-repo singleton meta keys from the \
-                                         global index_meta / reconcile_meta into repo_meta under \
-                                         the __unassigned__ placeholder (memory-sync phase A2)";
-const MIGRATION_040_ID: &str = "040_repo_id_core_scoping";
-const MIGRATION_040_CHECKSUM: &str = "sha256:rag-rat-repo-id-core-scoping-v40";
-const MIGRATION_040_DESCRIPTION: &str =
-    "Add repo_id scoping to the core tables (files, packages, logical_symbols, docs, \
-     parser_failures, git_commits + git_file_changes) with rebuilt UNIQUE / PK keys and the \
-     re-pointed commit_fts external content, plus the two active-embedding-model provenance meta \
-     keys moved to repo_meta (memory-sync phase A3)";
-const MIGRATION_041_ID: &str = "041_github_repo_id_scoping";
-const MIGRATION_041_CHECKSUM: &str = "sha256:rag-rat-github-repo-id-scoping-v41";
-const MIGRATION_041_DESCRIPTION: &str =
-    "Repo-scope the GitHub papertrail cache: add repo_id to the seven github_* tables (refs, \
-     issues, comments, pull_requests, reviews, review_comments, ref_sync) and rebuild github_fts \
-     with a repo_id UNINDEXED column, so lexical and papertrail queries in a consolidated \
-     database never surface a sibling repo's refs or issues (memory-sync phase A4)";
-const MIGRATION_042_ID: &str = "042_repo_id_periphery_scoping";
-const MIGRATION_042_CHECKSUM: &str = "sha256:rag-rat-repo-id-periphery-scoping-v42";
-const MIGRATION_042_DESCRIPTION: &str =
-    "Repo-scope the clone / oracle / reconcile / memory periphery: add repo_id to \
-     clone_graph_generations, oracle_runs, reconcile_attempts, repo_memories, \
-     repo_memory_bindings (additive) and rebuild clone_token_df, clone_refinements, edge_oracle, \
-     logical_symbol_monikers, dream_findings with repo_id in their PK / UNIQUE plus \
-     repo_memory_fts with a repo_id UNINDEXED column, so clone stats, oracle runs, and memory \
-     search in a consolidated database never pool or surface a sibling repo's rows (memory-sync \
-     phase A5)";
-const MIGRATION_043_ID: &str = "043_files_generation";
-const MIGRATION_043_CHECKSUM: &str = "sha256:rag-rat-files-generation-v43";
-const MIGRATION_043_DESCRIPTION: &str =
-    "Add files.generation and widen the UNIQUE key to (repo_id, path, commit_sha, worktree_id, \
-     generation), so a full rebuild can stage a fresh generation of every file row alongside the \
-     live one and flip readers over atomically instead of clearing-then-reinserting inside one \
-     long write-locked transaction (memory-sync phase A6)";
-const MIGRATION_044_ID: &str = "044_github_natural_key_widening";
-const MIGRATION_044_CHECKSUM: &str = "sha256:rag-rat-github-natural-key-widening-v44";
-const MIGRATION_044_DESCRIPTION: &str =
-    "Fold repo_id into the (owner, repo, number)-style GitHub natural keys — widen github_issues \
-     / github_pull_requests UNIQUE and github_ref_sync PRIMARY KEY to (repo_id, owner, repo, \
-     number) and re-create idx_github_refs_unique with a leading repo_id — so two repos in a \
-     consolidated database can each cache the same external issue/PR/ref without one repo's sync \
-     overwriting the other's row (memory-sync phase A7)";
-const MIGRATION_045_ID: &str = "045_github_child_key_widening";
-const MIGRATION_045_CHECKSUM: &str = "sha256:rag-rat-github-child-key-widening-v45";
-const MIGRATION_045_DESCRIPTION: &str =
-    "Fold repo_id into the id-keyed GitHub child caches — rebuild github_comments / \
-     github_reviews / github_review_comments with (repo_id, id) uniqueness, backfilling one copy \
-     per owning-parent repo — so two repos sharing an external issue/PR each keep that item's \
-     comments and reviews in their scoped papertrail instead of last-syncer-owns restamping \
-     (memory-sync phase A7)";
-const MIGRATION_046_ID: &str = "046_memory_verification_reality_summaries";
-const MIGRATION_046_CHECKSUM: &str = "sha256:rag-rat-memory-verification-reality-summaries-v46";
-const MIGRATION_046_DESCRIPTION: &str =
-    "Add the dream verification sibling tables memory_reality (one derived verdict/check row per \
-     memory, keyed (repo_id, memory_id)) and memory_summaries (one per (repo_id, memory_id, \
-     content_hash) so a body edit self-invalidates), both STRICT and repo_id-scoped. They hold \
-     derived, regenerable data so dream verifies memories without ever mutating a repo_memories \
-     row (dream v2 pass 0)";
-const MIGRATION_047_ID: &str = "047_memory_model_failures";
-const MIGRATION_047_CHECKSUM: &str = "sha256:rag-rat-memory-model-failures-v47";
-const MIGRATION_047_DESCRIPTION: &str =
-    "Add memory_model_failures, a repo_id-scoped dream sibling table that records deterministic \
-     verdict/compaction model failures with stable enum tokens and input/model freshness stamps, \
-     so rejected current attempts do not rerun every dream pass";
-const MIGRATION_048_ID: &str = "048_memory_payload_json";
-const MIGRATION_048_CHECKSUM: &str = "sha256:rag-rat-memory-payload-json-v48";
-const MIGRATION_048_DESCRIPTION: &str =
-    "Add repo_memories.payload_json, a nullable opaque canonical-JSON payload for polymorphic \
-     memory nodes (the Task / Concept kinds), folded into the content_hash so a payload edit \
-     self-invalidates the derived dream summary/verdict rows exactly as a title/body edit does";
-const MIGRATION_049_ID: &str = "049_repo_node_edges";
-const MIGRATION_049_CHECKSUM: &str = "sha256:rag-rat-repo-node-edges-v49";
-const MIGRATION_049_DESCRIPTION: &str =
-    "Add repo_node_edges, the typed content-addressed cross-repo edge set (#464): relation-typed \
-     edges from a memory node to another node or a code/github target, with explicit owner + \
-     target repo ids and a stable edge_key, no FK to volatile graph rows (only the durable source \
-     memory)";
-const MIGRATION_050_ID: &str = "050_clone_delta_maintenance";
-const MIGRATION_050_CHECKSUM: &str = "sha256:rag-rat-clone-delta-maintenance-v50";
-const MIGRATION_050_DESCRIPTION: &str =
-    "Add the clone_subblock_postings (build_generation, path) index and the \
-     clone_graph_generations.delta_files_applied counter, so the incremental clone-graph delta \
-     pass can delete a changed file's postings without a table scan and track df drift toward the \
-     next full rebuild";
-const MIGRATION_051_ID: &str = "051_clone_df_epoch";
-const MIGRATION_051_CHECKSUM: &str = "sha256:rag-rat-clone-df-epoch-v51";
-const MIGRATION_051_DESCRIPTION: &str =
-    "Add clone_df_epoch, the per-generation snapshot of clone_token_df taken at each fresh \
-     clone-graph build (#479), so the persisted postings and the delta pass read their own \
-     build's frozen token order while the live candidate paths read a clone_token_df that moves \
-     again on incremental passes; backfilled from the current (freeze-pinned) df for existing \
-     generations";
-const MIGRATION_052_ID: &str = "052_oplog_storage";
-const MIGRATION_052_CHECKSUM: &str = "sha256:rag-rat-oplog-storage-v52";
-const MIGRATION_052_DESCRIPTION: &str =
-    "Add the memory op-log storage tables (#503, phase B C4): oplog_entries — the layer-1 opaque \
-     signed entry log, content-addressed on entry_hash, no FK; and the layer-2 shadow projection \
-     (oplog_projected_nodes / oplog_projected_edges) plus oplog_meta, wholly rebuilt by the \
-     full-replay fold. Fresh tables (no backfill); nothing is wired to the live write path yet";
-const MIGRATION_053_ID: &str = "053_oplog_stream_scoping";
-const MIGRATION_053_CHECKSUM: &str = "sha256:rag-rat-oplog-stream-scoping-v53";
-const MIGRATION_053_DESCRIPTION: &str =
-    "Scope the op-log by immutable stream identity (#509): rebuild the still-unwired (and \
-     therefore empty) V052 op-log tables with a stream_id dimension — one signed chain per \
-     (stream_id, device), UNIQUE(stream_id, device_fingerprint, lamport), projection keyed per \
-     stream — and add oplog_fork_evidence, the quarantine that durably preserves BOTH heads of a \
-     detected equivocation. Nothing is wired to the live write path yet";
-const MIGRATION_054_ID: &str = "054_oplog_device_identity";
-const MIGRATION_054_CHECKSUM: &str = "sha256:rag-rat-oplog-device-identity-v54";
-const MIGRATION_054_DESCRIPTION: &str =
-    "Add oplog_device_identity (#513, phase B): the ONE persisted ed25519 keypair per store that \
-     the op-log write path signs every entry with — a single-row (id = 0) STRICT table holding \
-     the 32-byte seed, its derived public_key, and the sha256(public_key) fingerprint. \
-     Store-global, not repo-scoped (a device is a machine identity). Purely additive; nothing is \
-     wired to the live write path yet";
-const MIGRATION_055_ID: &str = "055_binding_downgrade_marker";
-const MIGRATION_055_CHECKSUM: &str = "sha256:rag-rat-binding-downgrade-marker-v55";
-const MIGRATION_055_DESCRIPTION: &str =
-    "Add repo_memory_bindings.downgrade_pending_at_ms (#492), the anchor-status downgrade \
-     hysteresis marker: a validate pass that observes a non-gone binding as gone arms the marker \
-     instead of stamping, and only a SECOND consecutive gone observation persists the downgrade — \
-     so a single torn observation (a validate racing a rebuild window, or a sweep from a narrower \
-     checkout) cannot flip a healthy anchor to gone and hand doctor destructive advice";
-const MIGRATION_056_ID: &str = "056_git_change_couplings";
-const MIGRATION_056_CHECKSUM: &str = "sha256:rag-rat-git-change-couplings-v56";
-const MIGRATION_056_DESCRIPTION: &str =
-    "Add git_change_couplings (#566), the windowed file-pair change-coupling table derived from \
-     git_file_changes: one STRICT symmetric row per unordered pair (path_a < path_b) holding raw \
-     co-change + endpoint counts over a bounded recency window of eligible commits, keyed \
-     (repo_id, path_a, path_b) with a secondary (repo_id, path_b) index. A DerivedIndex table \
-     (repo_id-scoped, no FK to the volatile history rows): wholesale-recomputed lazily on the \
-     impact_surface read path against a repo_meta 'git_coupling_stamp', never patched \
-     incrementally. Fresh + empty on create; the first git-inclusive impact read fills it";
-const MIGRATION_057_ID: &str = "057_external_symbols";
-const MIGRATION_057_CHECKSUM: &str = "sha256:rag-rat-external-symbols-v57";
-const MIGRATION_057_DESCRIPTION: &str =
-    "Add external_symbols (#114), the per-moniker dependency contract oracle run parses out of \
-     the .scip index.external_symbols (kind, display_name, signature_documentation text, \
-     documentation, a derived deprecated flag) — data from_index previously discarded. \
-     Oracle-persisted, content/moniker-keyed with NO reindex-cascading FK, checkout-scoped \
-     (repo_id, tool, commit_sha, worktree_id) from birth; moniker is the RAW SCIP symbol string \
-     so it exact-joins edge_oracle.scip_symbol. Backs the check_library_usage tool that surfaces \
-     the current signature/docs at external call sites and flags deprecated usage";
-const MIGRATION_058_ID: &str = "058_oplog_device_x25519";
-const MIGRATION_058_CHECKSUM: &str = "sha256:rag-rat-oplog-device-x25519-v58";
-const MIGRATION_058_DESCRIPTION: &str =
-    "Add x25519_secret + x25519_public (nullable BLOB) to oplog_device_identity (sync phase C, \
-     §5): the device's X25519 ENCRYPTION keypair beside its ed25519 signing key. Additive on the \
-     STRICT table; an existing ed25519-only row is backfilled at the next local_device open via a \
-     CAS UPDATE that mirrors the ed25519 mint-if-absent race, so concurrent opens converge on one \
-     encryption identity. C1 only mints/persists/validates the key; ECDH + HKDF is C4";
-const MIGRATION_059_ID: &str = "059_account_candidate_dag";
-const MIGRATION_059_CHECKSUM: &str = "sha256:rag-rat-account-candidate-dag-v59-signed-envelope-key";
-const MIGRATION_059_DESCRIPTION: &str =
-    "The account-log CANDIDATE DAG (sync phase C, §16.1): account_entries (all branches, \
-     grow-only, no seq-uniqueness — equivocation heads are first-class; the derived `accepted` \
-     flag + the account_accepted_slot partial unique index pin accepted-set uniqueness per slot, \
-     I10a), account_entry_status (the projected §16.3 taxonomy), and account_pre_verify (entries \
-     whose signing device isn't yet resolvable, retried on a later DeviceAdd/AccountGenesis \
-     arrival). All CREATE ... IF NOT EXISTS + STRICT tables";
-const MIGRATION_060_ID: &str = "060_papertrail_provider_neutral_schema";
-const MIGRATION_060_CHECKSUM: &str = "sha256:rag-rat-papertrail-provider-neutral-schema-v60";
-const MIGRATION_060_DESCRIPTION: &str =
-    "Normalize the GitHub papertrail cache into the provider-neutral papertrail_* tables (#588): \
-     papertrail_items (tracker + item_kind in the natural key, issue-shadow deduped), unified \
-     papertrail_comments (reviews fold in behind review_state / anchor_path), papertrail_refs \
-     (annotation layer only), papertrail_sync_cursor (one row per repo/tracker/project — the \
-     per-ref github_ref_sync state machine is deleted), papertrail_item_tags, and the \
-     incrementally-maintained papertrail_fts mirror; backfills mechanically from the seven \
-     github_* tables then DROPS them (hard rename, no aliases); renames the memory binding kind \
-     github -> tracker (tracker/project/item_key columns backfilled, github_* columns dropped) \
-     and the github_last_sync_ms repo_meta key to papertrail_last_sync_ms";
-const MIGRATION_061_ID: &str = "061_papertrail_ref_item_kind";
-const MIGRATION_061_CHECKSUM: &str = "sha256:rag-rat-papertrail-ref-item-kind-v61";
-const MIGRATION_061_DESCRIPTION: &str = "Preserve the nullable item_kind on papertrail_refs so \
-                                         providers with separate issue/change-request namespaces \
-                                         cannot collapse #N and !N annotations";
-const MIGRATION_062_ID: &str = "062_papertrail_comment_cursor";
-const MIGRATION_062_CHECKSUM: &str = "sha256:rag-rat-papertrail-comment-cursor-v62";
-const MIGRATION_062_DESCRIPTION: &str = "Split repo-wide comment progress from the item watermark \
-                                         and persist comment pagination only after each stored \
-                                         page";
-const MIGRATION_063_ID: &str = "063_papertrail_mirror_resume_state";
-const MIGRATION_063_CHECKSUM: &str = "sha256:rag-rat-papertrail-mirror-resume-state-v63e";
-const MIGRATION_063_DESCRIPTION: &str =
-    "Persist item-page, item-thread, Search-tie, per-stream comment-scan, immutable item-delta \
-     windows, and full-rewalk state so every stored unit resumes without replay or lost pruning";
-const MIGRATION_064_ID: &str = "064_account_authority_projection";
-const MIGRATION_064_CHECKSUM: &str = "sha256:rag-rat-account-authority-projection-v64b";
-const MIGRATION_064_DESCRIPTION: &str =
-    "Persist the fully folded account classification, roster and owner incarnations, immutable \
-     stream ownership, exact grant incarnations, and revoke device cuts. refold_account rewrites \
-     these shadow tables in the same IMMEDIATE transaction as accepted/status, so /3 authority \
-     checks never rescan the bounded candidate DAG";
-const MIGRATION_065_ID: &str = "065_account_authority_boundaries";
-const MIGRATION_065_CHECKSUM: &str = "sha256:rag-rat-account-authority-boundaries-v65a";
-const MIGRATION_065_DESCRIPTION: &str =
-    "Persist closed roster and owner chain boundaries for bounded historical citations";
-const MIGRATION_066_ID: &str = "066_content_candidate_dag";
-const MIGRATION_066_CHECKSUM: &str = "sha256:rag-rat-content-candidate-dag-v66a";
-const MIGRATION_066_DESCRIPTION: &str =
-    "Persist every structurally valid /3 content candidate, bounded pre-verification work, and \
-     derived status while reserving accepted-slot uniqueness for C3 authority acceptance";
-const MIGRATION_067_ID: &str = "067_papertrail_binding_health";
-const MIGRATION_067_CHECKSUM: &str = "sha256:rag-rat-papertrail-binding-health-v67e";
-const MIGRATION_067_DESCRIPTION: &str = "Persist per-binding attempt, successful probe/mirror, \
-                                         and closed failure state for automatic scheduling and \
-                                         status";
-const MIGRATION_068_ID: &str = "068_suppressed_edge_candidates";
-const MIGRATION_068_CHECKSUM: &str = "sha256:rag-rat-suppressed-edge-candidates-v68";
-const MIGRATION_068_DESCRIPTION: &str = "Hide suppressed unresolved edge candidates from the \
-                                         compatibility view while retaining them for later \
-                                         incremental re-resolution";
-const MIGRATION_069_ID: &str = "069_oplog_local_account";
-const MIGRATION_069_CHECKSUM: &str = "sha256:rag-rat-oplog-local-account-v69";
-const MIGRATION_069_DESCRIPTION: &str =
-    "Add oplog_local_account (sync phase C3.4a): the single-row (id = 0) STRICT pointer naming \
-     the genesis_entry_hash of this store's one local account, minted once by local_account and \
-     reused so later C3.4 slices author owner-bound /3 content under a stable identity. \
-     Store-global, not repo-scoped; purely additive, nothing pre-existing to backfill";
-const MIGRATION_070_ID: &str = "070_content_projected_tables";
-const MIGRATION_070_CHECKSUM: &str = "sha256:rag-rat-content-projected-tables-v70";
-const MIGRATION_070_DESCRIPTION: &str =
-    "Add content_projected_nodes/content_projected_edges (sync phase C3.4b-i): the stream-keyed \
-     memory projection of the accepted /3 content DAG, mirroring the /1 oplog_projected_* shadow \
-     tables but updated only when acceptance changes (the content refold), never by the /1 \
-     projector sweep — kept separate so a projector-version bump cannot wipe the /3 projection. \
-     Purely additive, nothing pre-existing to backfill";
-const MIGRATION_071_ID: &str = "071_edge_target_qname_index";
-const MIGRATION_071_CHECKSUM: &str = "sha256:rag-rat-edge-target-qname-index-v71";
-const MIGRATION_071_DESCRIPTION: &str =
-    "Add idx_edges_target_qname on edges_data(target_qualified_name_id) so \
-     find_callers/trace_callees seed the graph traversal on an indexed id column (MULTI-INDEX OR) \
-     instead of full-scanning the edge table when matching unresolved edges by \
-     target_qualified_name. Purely additive; CREATE INDEX IF NOT EXISTS, nothing pre-existing to \
-     backfill";
-const MIGRATION_072_ID: &str = "072_content_streams_pending_refold";
-const MIGRATION_072_CHECKSUM: &str = "sha256:rag-rat-content-streams-pending-refold-v72";
-const MIGRATION_072_DESCRIPTION: &str =
-    "Add content_streams_pending_refold (issue #652): the deferred-refold work queue for the /3 \
-     content-ingest path. content_ingest no longer folds acceptance per entry (O(n^2) under the \
-     writer lock as a stream is built one candidate at a time); it enqueues the stream here and \
-     settle_pending_content_refolds folds each dirty stream once. Purely additive; CREATE ... IF \
-     NOT EXISTS, nothing pre-existing to backfill";
 
-const MIGRATION_073_ID: &str = "073_papertrail_distill_substrate";
-const MIGRATION_073_CHECKSUM: &str = "sha256:rag-rat-papertrail-distill-substrate-v73";
-const MIGRATION_073_DESCRIPTION: &str =
-    "Add papertrail_closing_edges (issue #702): first-class provider-attested issue<->closer \
-     edges for the distillation substrate, plus papertrail_items closed_at / resolution / \
-     merge_commit_sha (merged-only) / state_normalized (backfilled) / author facets and \
-     papertrail_comments author facets. Additive; CREATE IF NOT EXISTS + add_column_if_missing + \
-     an idempotent state_normalized backfill";
-const MIGRATION_074_ID: &str = "074_edges_view_scalar_suppression";
-const MIGRATION_074_CHECKSUM: &str = "sha256:rag-rat-edges-view-scalar-suppression-v74";
-const MIGRATION_074_DESCRIPTION: &str =
-    "Re-install the edges compatibility view so the V068 suppressed-edge exclusion is a scalar \
-     compare instead of a per-row NOT IN membership probe (the query_warm regression: the probe \
-     taxed every per-hit graph-evidence query). Pure view DDL refresh via ensure_edges_view; no \
-     data change";
-const MIGRATION_075_ID: &str = "075_edges_hidden_flag";
-const MIGRATION_075_CHECKSUM: &str = "sha256:rag-rat-edges-hidden-flag-v75";
-const MIGRATION_075_DESCRIPTION: &str =
-    "Materialize edge visibility as edges_data.hidden and filter the edges view on it (issue \
-     #734): visibility is decided once at write time instead of re-deriving the dispatch-fact + \
-     suppressed-candidate predicates on every view row. Adds the column, backfills it from the \
-     predicate the view WHERE used to evaluate, and refreshes the view via ensure_edges_view";
-const MIGRATION_076_ID: &str = "076_sync_security_events";
-const MIGRATION_076_CHECKSUM: &str = "sha256:rag-rat-sync-security-events-v76";
-const MIGRATION_076_DESCRIPTION: &str =
-    "Add sync_security_events (sync phase C4.3b, #607): the local-only audit log the sealing-key \
-     adoption cross-check writes when an accepted StreamKeyWrap naming this device fails to \
-     unwrap (AEAD tag failure) or unwraps to a key whose key_id disagrees with the op's signed \
-     key_id. Never on the wire, never a fold input. Additive; CREATE ... IF NOT EXISTS + a dedup \
-     unique index, nothing pre-existing to backfill";
-const MIGRATION_077_ID: &str = "077_distill_record_store";
-const MIGRATION_077_CHECKSUM: &str = "sha256:rag-rat-distill-record-store-v77";
-const MIGRATION_077_DESCRIPTION: &str =
-    "Add the distillation record store (issue #703): papertrail_distill (derived, regenerable \
-     decision records with provenance-facet confidence, not a fused label), plus junction \
-     children (evidence with materialized quotes + snapshotted provenance, sym_<hex> anchors, \
-     alternatives, mechanical fixing-commits), thread-keyed edges (survive record regeneration), \
-     the distill work queue, and per-run stats. Additive; CREATE IF NOT EXISTS, nothing \
-     pre-existing to backfill";
-const MIGRATION_078_ID: &str = "078_distill_anchor_selection";
-const MIGRATION_078_CHECKSUM: &str = "sha256:rag-rat-distill-anchor-selection-v78";
-const MIGRATION_078_DESCRIPTION: &str =
-    "Distinguish mined anchor candidates from model selections (issue #704): add a stable, \
-     zero-based candidate ordinal and selected state to papertrail_distill_anchors; \
-     deterministically backfill V077 rows in insertion order per thread; enforce ordinal \
-     uniqueness and boolean selected values; index selected anchors. Additive; existing anchor \
-     identity/path columns are unchanged";
-const MIGRATION_079_ID: &str = "079_distill_safe_input_snapshot";
-const MIGRATION_079_CHECKSUM: &str = "sha256:rag-rat-distill-safe-input-snapshot-v79";
-const MIGRATION_079_DESCRIPTION: &str =
-    "Add extraction-owned safe-input snapshots for distillation (issue #704): exact ordered \
-     title/body/comment sources with full thread and partner identity, provenance, timestamps, \
-     and every deterministic block-unit byte span; add prompt_version/model_input_hash \
-     model-output stamps. Additive and intentionally does not backfill snapshots from the mutable \
-     mirror";
-const MIGRATION_080_ID: &str = "080_distill_enriched_context";
-const MIGRATION_080_CHECKSUM: &str = "sha256:rag-rat-distill-enriched-context-v80";
-const MIGRATION_080_DESCRIPTION: &str =
-    "Add extraction-owned enriched-context snapshots for distillation (issue #800): \
-     per-fix-commit unified diffs restricted to files with symbol anchor candidates, and \
-     cross-referenced item titles + opening paragraphs mined from the thread's outbound \
-     papertrail refs. Additive and intentionally does not backfill from mutable git/mirror state";
-const MIGRATION_081_ID: &str = "081_distill_evidence_source_part";
-const MIGRATION_081_CHECKSUM: &str = "sha256:rag-rat-distill-evidence-source-part-v81";
-const MIGRATION_081_DESCRIPTION: &str =
-    "Persist source-part identity (title|body|comment) on distilled evidence rows (issue #801) so \
-     a citation from an item's title is distinguishable from one in its body (both share the item \
-     key as source_id). Nullable and additive: existing rows keep NULL, the drain populates new \
-     rows from its snapshot, and no SQL backfill is performed (a re-drain rewrites evidence)";
+/// Declares every ADDITIVE migration in one ordered block: each entry emits its
+/// `MIGRATION_NNN_{ID,CHECKSUM,DESCRIPTION}` consts and its [`ADDITIVE_MIGRATIONS`] row, so a
+/// migration's strings and its ladder position cannot drift apart. Entries MUST stay in ascending
+/// id order — the array order is the order the ladder applies them.
+macro_rules! additive_migrations {
+    ($($id:ident, $checksum:ident, $description:ident = (
+        $id_str:expr, $checksum_str:expr, $description_str:expr $(,)?
+    ) => $apply:expr;)*) => {
+        $(
+            const $id: &str = $id_str;
+            const $checksum: &str = $checksum_str;
+            const $description: &str = $description_str;
+        )*
+        const ADDITIVE_MIGRATIONS: &[Migration] = &[
+            $(Migration { id: $id, checksum: $checksum, description: $description, apply: $apply },)*
+        ];
+    };
+}
 
-const MIGRATION_083_ID: &str = "083_logical_group_reason_by_evidence";
-const MIGRATION_083_CHECKSUM: &str = "sha256:rag-rat-logical-group-reason-by-evidence-v83";
-const MIGRATION_083_DESCRIPTION: &str = "Recompute logical_symbols.group_reason from member \
-                                         evidence — the old value asserted cfg_variant for every \
-                                         multi-member group (#855)";
-const MIGRATION_082_ID: &str = "082_content_refold_queue_and_stats";
-const MIGRATION_082_CHECKSUM: &str = "sha256:rag-rat-content-refold-queue-and-stats-v82";
-const MIGRATION_082_DESCRIPTION: &str =
-    "Extend content_streams_pending_refold with reason bits and deterministic enqueue timestamps, \
-     add ordered pending selection, and materialize per-stream candidate count/work bytes from \
-     content_entries. SQLite triggers keep the stats exact for inserts, deletes, and mutable \
-     stream_id/signed_bytes updates; existing queue rows backfill as content-candidate work with \
-     min/max candidate receive times";
-const MIGRATION_084_ID: &str = "084_chunk_symbol_id";
-const MIGRATION_084_CHECKSUM: &str = "sha256:rag-rat-chunk-symbol-id-v84";
-const MIGRATION_084_DESCRIPTION: &str =
-    "Add chunks.symbol_id: the direct rowid of the symbol a code chunk was cut from, written at \
-     index time from the same parse that assigned the symbol its rowid. Replaces position-based \
-     chunk→symbol resolution, which could not disambiguate same-name symbols that nest or share a \
-     physical line. Nullable; backfills on the next reindex of each file (derived data, no SQL \
-     backfill)";
-
-const MIGRATION_085_ID: &str = "085_sync_origin_and_edge_tombstone";
-const MIGRATION_085_CHECKSUM: &str = "sha256:rag-rat-sync-origin-and-edge-tombstone-v85";
-const MIGRATION_085_DESCRIPTION: &str =
-    "Add repo_memories.origin and repo_node_edges.origin ('local'|'synced') and \
-     content_projected_edges.present. The origin column gates the memory reconcile so a synced \
-     row is never re-authored as local /3 content (forging local authorship / re-legitimizing \
-     revoked content); the present column retains edge tombstones so a foreign EdgeRemove is \
-     honored instead of resurrected in an op-log growth loop. Additive; existing rows default to \
-     local/present";
-const MIGRATION_086_ID: &str = "086_content_digest_state";
-const MIGRATION_086_CHECKSUM: &str = "sha256:rag-rat-content-digest-state-v86";
-const MIGRATION_086_DESCRIPTION: &str =
-    "Incrementally maintain content_revision (#828): add the one-row content_digest_state table \
-     and the three files_content_digest_* triggers that fold a 256-bit additive multiset hash of \
-     {(path, sha256) : main.files, kind != 'deleted'} via the registered rr_content_digest_fold \
-     scalar, seed the state from a from-scratch Rust fold, and re-stamp every freshness stamp \
-     (index_meta fts_source_revision/content_revision, clone_graph_generations.source_revision, \
-     the clone-graph quiet candidate) that equals the frozen legacy digest so no one-time \
-     FTS/clone rebuild fires. Replaces the O(N) main.files scan with an O(1) state read";
-const MIGRATION_087_ID: &str = "087_table_sync_bookkeeping";
-const MIGRATION_087_CHECKSUM: &str = "sha256:rag-rat-table-sync-bookkeeping-v87";
-const MIGRATION_087_DESCRIPTION: &str =
-    "Add the table→log sync engine's bookkeeping tables: sync_published_rows (post-apply \
-     synced-column hash that stops a remotely-applied row being re-signed and rebroadcast — the \
-     anti-echo record), sync_row_clocks (the per-row whole-row last-writer-wins clock an upsert \
-     or delete must beat to win the row), sync_row_tombstones (a per-row deletion clock so an \
-     out-of-order stale delete cannot win and an even older insert cannot resurrect), and \
-     table_sync_entries (the engine's own signed hash-chained entry log, separate from \
-     oplog_entries so the memory-content re-fold never sees a table op). All STRICT; no authored \
-     content — pure sync bookkeeping the fold and producer read";
-const MIGRATION_088_ID: &str = "088_clone_postings_row_count";
-const MIGRATION_088_CHECKSUM: &str = "sha256:rag-rat-clone-postings-row-count-v88";
-const MIGRATION_088_DESCRIPTION: &str =
-    "Cache each clone generation's posting-row count on the generation row (#830): add \
-     clone_graph_generations.postings_row_count and backfill it from COUNT(*) of \
-     clone_subblock_postings per generation. The #598 delta work budget sizes off this count; \
-     reading a maintained column replaces a full COUNT(*) scan of the postings table on every \
-     delta pass. Additive; existing rows backfill from the current postings, and the count is \
-     then maintained transactionally at build (complete_generation) and in each delta write-back";
-const MIGRATION_089_ID: &str = "089_sync_invites";
-const MIGRATION_089_CHECKSUM: &str = "sha256:rag-rat-sync-invites-bootstrap-replay-v89";
-const MIGRATION_089_DESCRIPTION: &str =
-    "Add the durable one-time enrollment invite store: a random nonce binds one account, granted \
-     device role, optional label, and expiry; successful redemption stores the exact request \
-     identity, signed DeviceAdd, and exact account-log bootstrap receipt in the same transaction \
-     as invite consumption and key catch-up, so delivery failures can replay the acknowledged \
-     enrollment idempotently and a fresh joiner can authorize its first closed sync";
-const MIGRATION_090_ID: &str = "090_account_candidate_reservations";
-const MIGRATION_090_CHECKSUM: &str = "sha256:rag-rat-account-candidate-reservations-v90";
-const MIGRATION_090_DESCRIPTION: &str =
-    "Add durable candidate-capacity reservations for outstanding enrollment invites (#949): a \
-     minted invite reserves the exact entries/bytes its mandatory DeviceAdd plus stream-key wraps \
-     will consume, and candidate admission charges active reservations against the same grow-only \
-     counters, so ordinary ingest or a second mint cannot strand an already-minted ticket. \
-     Redemption releases its reservation under the writer lock; expiry frees it";
-const MIGRATION_091_ID: &str = "091_account_candidate_reservation_targets";
-const MIGRATION_091_CHECKSUM: &str = "sha256:rag-rat-account-candidate-reservation-targets-v91";
-const MIGRATION_091_DESCRIPTION: &str =
-    "Track the live key-target count each outstanding invite reservation covers \
-     (account_candidate_reservations.reserved_targets, #949): any fold that grows the target set \
-     — local key mints or remotely synced StreamOwn/wrap entries — tops reservations up to the \
-     current mandatory redemption cost, so a minted ticket cannot be stranded by later growth. \
-     Backfilled from reserved_entries - 1, exact for every V090-era row";
-const MIGRATION_092_ID: &str = "092_sync_invites_normalized_receipts";
-const MIGRATION_092_CHECKSUM: &str = "sha256:rag-rat-sync-invites-normalized-receipts-v92";
-const MIGRATION_092_DESCRIPTION: &str =
-    "Drop sync_invites.receipt_bytes (#949): consumed invites keep only the joiner-specific \
-     DeviceAdd envelope; the account bootstrap is already durable in the grow-only candidate DAG, \
-     and receipt replay reconstructs the snapshot from it instead of storing one full copy per \
-     invite (quadratic growth across a fleet). Table rebuild preserving every row";
-const MIGRATION_093_ID: &str = "093_table_sync_projection_state";
-const MIGRATION_093_CHECKSUM: &str = "sha256:rag-rat-table-sync-projection-state-v93";
-const MIGRATION_093_DESCRIPTION: &str =
-    "Table-sync forward-compat projection substrate (#1001): mark entries this binary cannot \
-     fully project (pending_reason / pending_projector_version) so a later binary replays them \
-     instead of losing their payload; a table_sync_streams directory recovering the (repo_id, \
-     account_id, scope_id) apply context that the one-way stream id hashes away, without which a \
-     stored entry cannot be replayed at all; and sync_published_rows.projector_version, since the \
-     anti-echo hash covers the hashing binary's column set and is meaningless without that set's \
-     identity";
-const MIGRATION_094_ID: &str = "094_lens_enrichment_revision";
-const MIGRATION_094_CHECKSUM: &str =
-    "sha256:rag-rat-lens-enrichment-revision-v94-transactional-history-and-oracle";
-const MIGRATION_094_DESCRIPTION: &str =
-    "Add SQLite triggers that increment a per-repo repo_meta revision when Lens-visible memories, \
-     dream state, papertrail records, clone refinements, Oracle runs, or the live clone graph \
-     change. Bulk writers whose transaction touches one row per indexed edge or commit — \
-     git-history imports and Oracle verdict passes — increment the same clock once at their \
-     transaction boundary instead of once per row. The Lens SSE freshness probe reads only O(1) \
-     indexed rows instead of rescanning enrichment and files tables every polling interval";
-
-const MIGRATION_095_ID: &str = "095_table_sync_spec_version";
-const MIGRATION_095_CHECKSUM: &str = "sha256:rag-rat-table-sync-spec-version-v95";
-const MIGRATION_095_DESCRIPTION: &str =
-    "Per-table spec versioning for table-sync (#1002): sync_published_rows records the TABLE's \
-     spec_version rather than the store-global projector version, so an unrelated projector bump \
-     no longer marks every table's rows incomparable. The table is necessarily empty (no table is \
-     registered), so it is rebuilt into its final shape rather than carrying a dead column";
-
-const MIGRATION_096_ID: &str = "096_table_sync_gapped_entries";
-const MIGRATION_096_CHECKSUM: &str = "sha256:rag-rat-table-sync-gapped-entries-v96";
-const MIGRATION_096_DESCRIPTION: &str =
-    "Retention for table-sync entries whose chain predecessor has not arrived (#1058): \
-     table_sync_gapped_entries holds a verified entry that links to an unheld predecessor until \
-     that predecessor is accepted, at which point it is promoted through the ordinary accept and \
-     apply path. Previously such an entry was dropped, so a chain delivered out of causal order \
-     could only converge through redelivery in exact order. Deliberately its own table rather \
-     than a status column: six queries read table_sync_entries as the accepted chain — the \
-     authoring Lamport clock, the lamport-advance bound, the chain tail, entry existence, the LWW \
-     winner lookup, and the refold's pending set — and every one of them must keep excluding an \
-     entry that is not on a chain";
-
-const MIGRATION_097_ID: &str = "097_windows_verbatim_path_rekey";
-const MIGRATION_097_CHECKSUM: &str = "sha256:rag-rat-windows-verbatim-path-rekey-v97";
-const MIGRATION_097_DESCRIPTION: &str =
-    "Rekey the persisted Windows path spellings an older binary wrote in the \\\\?\\ verbatim \
-     form (#1048): every worktree_id scope key, repo_roots.root, the path-valued meta keys \
-     (source_root and the git_history_indexed_root reload cursor), and the worktree_overlay_basis \
-     keys whose suffix is a worktree_id. Production now canonicalizes to the plain spelling, and \
-     these values are compared textually against it — left stale, the overlay and dirty rows fall \
-     out of the active scope and GC prunes them as a dead checkout, and the git-history gate \
-     forces a full revwalk plus a blame-cache wipe. Rewriting uses the same rule canonicalization \
-     does, so a verbatim path that is still load-bearing (UNC, >MAX_PATH, reserved DOS names) is \
-     kept. Runs on every host: which spellings a store carries is a property of the store, not of \
-     the binary that opens it";
-
-const MIGRATION_098_ID: &str = "098_reindex_after_unix_backslash_rendering";
-const MIGRATION_098_CHECKSUM: &str = "sha256:rag-rat-reindex-after-unix-backslash-rendering-v98";
-const MIGRATION_098_DESCRIPTION: &str =
-    "Force the next ordinary index pass to re-walk the tree and reload git history, so a store an \
-     older binary wrote before the Unix backslash-rendering fix (#1032) re-derives its path-keyed \
-     rows off the corrected spelling. That binary collapsed a literal backslash in a Unix \
-     filename to a separator, so files.path and the symbol identities keyed on it could not be \
-     told apart from a genuinely nested sibling; the old rendering was lossy, so the stored \
-     spelling cannot be repaired in place — only a re-walk recovers the truth. This deletes the \
-     freshness markers that gate that work: the base-scope discovery marker (files re-walk, which \
-     cascades chunks, symbols, and edges), the git-history root cursor (a full revwalk, which \
-     re-derives the commit and file-change rows and the change couplings folded off its freshness \
-     key), and the worktree_overlay_basis keys (per-checkout overlay re-derive); it also clears \
-     parser_failures, the one path-keyed derived table a file re-walk does not cascade. Runs on \
-     every host: which spellings a store carries is a property of the store, not of the binary \
-     that opens it";
-
-const MIGRATION_099_ID: &str = "099_table_sync_repo_incarnations";
-const MIGRATION_099_CHECKSUM: &str = "sha256:rag-rat-table-sync-repo-incarnations-v99";
-const MIGRATION_099_DESCRIPTION: &str =
-    "Add the owner-authorized repository-incarnation projection and /5 table-sync substrate: \
-     incarnation-bound stream contexts, stream-isolated row clocks/publication/tombstones, and \
-     retained per-device chain-tip witnesses that survive local repository purge. Pre-transport \
-     /4 table-sync state is cleared because it has no account-authorized incarnation identity";
-
-const MIGRATION_100_ID: &str = "100_receiver_type_hint_interning";
-const MIGRATION_100_CHECKSUM: &str =
-    "sha256:rag-rat-receiver-type-hint-and-callee-aware-edge-identity-v100";
-const MIGRATION_100_DESCRIPTION: &str = "Add edges_data.receiver_type_hint_id for conservative \
-                                         Rust receiver-type resolution and persist stable callee \
-                                         identity for call-path validation";
-const MIGRATION_101_ID: &str = "101_file_graph_version_provenance";
-const MIGRATION_101_CHECKSUM: &str = "sha256:rag-rat-file-graph-version-provenance-v101";
-const MIGRATION_101_DESCRIPTION: &str = "Add per-file graph and scope derivation provenance so an \
-                                         active checkout can refresh only rows whose bytes it can \
-                                         verify, while linked worktrees retain and later complete \
-                                         their own upgrade";
-const MIGRATION_102_ID: &str = "102_lens_lane_revisions";
-const MIGRATION_102_CHECKSUM: &str = "sha256:rag-rat-lens-lane-revisions-v102";
-const MIGRATION_102_DESCRIPTION: &str = "Add independent O(1), per-repo Lens revision clocks for \
-                                         symbols, clones, memories, coupling, and papertrail so \
-                                         editor clients refetch only lanes whose backing data \
-                                         changed while the aggregate legacy clock remains intact";
-const MIGRATION_103_ID: &str = "103_syncable_memory_bindings";
-const MIGRATION_103_CHECKSUM: &str = "sha256:rag-rat-syncable-memory-bindings-v103";
-const MIGRATION_103_DESCRIPTION: &str = "Rebuild memory bindings as a strict, repository-keyed, \
-                                         dependency-free table suitable for deterministic \
-                                         anchors/1 whole-row replication";
-const MIGRATION_104_ID: &str = "104_table_sync_readoption";
-const MIGRATION_104_CHECKSUM: &str = "sha256:rag-rat-table-sync-readoption-v104";
-const MIGRATION_104_DESCRIPTION: &str =
-    "Add the durable table-sync re-adoption worklist and audit log (#997): an effective \
-     DeviceRemove enqueues one item per affected stream, which a current writer drains by \
-     re-authoring the removed writer's surviving LWW state under its own chain";
-const MIGRATION_105_ID: &str = "105_table_sync_retained_floors";
-const MIGRATION_105_CHECKSUM: &str = "sha256:rag-rat-table-sync-retained-floors-v105";
-const MIGRATION_105_DESCRIPTION: &str = "Add table_sync_retained_floors (#1127): the per-(stream, \
-                                         device) chain prefix floor an accepted-entry compaction \
-                                         has reclaimed below, so peers and the accept path can \
-                                         tell an intentionally pruned prefix from a chain gap";
-const MIGRATION_106_ID: &str = "106_readoption_audit_nullable_winner";
-const MIGRATION_106_CHECKSUM: &str = "sha256:rag-rat-readoption-audit-nullable-winner-v106";
-const MIGRATION_106_DESCRIPTION: &str = "Make table_sync_readoption_audit.original_entry_hash \
-                                         nullable (#1127): a winner reclaimed by accepted-entry \
-                                         compaction before re-adoption ran has no hash to record; \
-                                         the slot stays named by (stream, device, lamport)";
-const MIGRATION_107_ID: &str = "107_syncable_overlay_tables";
-const MIGRATION_107_CHECKSUM: &str = "sha256:rag-rat-syncable-overlay-tables-v107";
-const MIGRATION_107_DESCRIPTION: &str =
-    "Drop the Lens revision triggers on memory_reality and memory_summaries (#1133): the \
-     overlay/1 table-sync scope applies these rows under whole-row LWW, and a trigger firing on a \
-     wire-applied row is a device-local side effect; the dream write and the sync apply advance \
-     the Lens lanes explicitly instead";
-const MIGRATION_108_ID: &str = "108_syncable_distill_records";
-const MIGRATION_108_CHECKSUM: &str = "sha256:rag-rat-syncable-distill-records-v108";
-const MIGRATION_108_DESCRIPTION: &str =
-    "Rebuild papertrail_distill onto the thread natural key (repo_id first), dropping the \
-     device-local AUTOINCREMENT id, so the distill/1 table-sync scope can replicate distilled \
-     records under whole-row LWW (#1135); also drops its Lens revision triggers (the sync apply \
-     advances the papertrail lane explicitly)";
-const MIGRATION_109_ID: &str = "109_syncable_distill_edges_and_alternatives";
-const MIGRATION_109_CHECKSUM: &str = "sha256:rag-rat-syncable-distill-edges-and-alternatives-v109";
-const MIGRATION_109_DESCRIPTION: &str =
-    "Rebuild papertrail_distill_edges and papertrail_distill_alternatives onto their thread \
-     natural keys (repo_id first), dropping the device-local AUTOINCREMENT id, so these distill \
-     enrichment children replicate on the distill/1 table-sync scope under whole-row LWW (#1137)";
-const MIGRATION_110_ID: &str = "110_syncable_distill_record_commits";
-const MIGRATION_110_CHECKSUM: &str = "sha256:rag-rat-syncable-distill-record-commits-v110";
-const MIGRATION_110_DESCRIPTION: &str =
-    "Rebuild papertrail_distill_record_commits onto its natural key (repo_id first), dropping the \
-     device-local AUTOINCREMENT id and adding a created_at_ms non-key column so the key-only \
-     table can replicate on the distill/1 table-sync scope under whole-row LWW (#1139)";
-const MIGRATION_111_ID: &str = "111_syncable_distill_evidence";
-const MIGRATION_111_CHECKSUM: &str = "sha256:rag-rat-syncable-distill-evidence-v111";
-const MIGRATION_111_DESCRIPTION: &str =
-    "Rebuild papertrail_distill_evidence onto its natural key (repo_id first) with a per-thread \
-     ordinal, dropping the device-local AUTOINCREMENT id, so the distill evidence child \
-     replicates on the distill/1 table-sync scope under whole-row LWW (#1139)";
-const MIGRATION_112_ID: &str = "112_syncable_distill_anchors";
-const MIGRATION_112_CHECKSUM: &str = "sha256:rag-rat-syncable-distill-anchors-v112";
-const MIGRATION_112_DESCRIPTION: &str =
-    "Rebuild papertrail_distill_anchors onto its natural key (repo_id first), dropping the \
-     device-local AUTOINCREMENT id and its Lens revision triggers, so the distill anchors child \
-     replicates on the distill/1 table-sync scope under whole-row LWW; logical_symbol_id and \
-     resolved stay checkout-local and never replicate (#1139)";
-const MIGRATION_113_ID: &str = "113_refold_content_streams_for_lamport_clamp";
-const MIGRATION_113_CHECKSUM: &str = "sha256:rag-rat-refold-content-streams-for-lamport-clamp-v113";
-const MIGRATION_113_DESCRIPTION: &str =
-    "Queue every /3 content stream for an acceptance refold so entries accepted before the \
-     lamport clamp existed are re-judged under it; a stale accepted near-ceiling lamport would \
-     otherwise keep dominating LWW and blocking authoring on an upgraded store while a fresh \
-     replica parks the same entry and diverges (#1176)";
-const MIGRATION_114_ID: &str = "114_content_entries_lamport_column";
-const MIGRATION_115_ID: &str = "115_refold_account_authority_projections";
-const MIGRATION_116_ID: &str = "116_writer_invites";
-const MIGRATION_117_ID: &str = "117_content_author_stream_index";
-const MIGRATION_118_ID: &str = "118_content_projected_node_anchors";
-const MIGRATION_119_ID: &str = "119_content_projected_node_source_hash";
-const MIGRATION_119_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-source-hash-v119";
-const MIGRATION_119_DESCRIPTION: &str =
-    "Add the nullable source_text_hash column to content_projected_nodes so the /3 fold can carry \
-     the text a memory's author anchored to (#1213). A receiver compares it against its own \
-     checkout to demote a drifted anchor; NULL means no node_source_hash op has been folded, \
-     which surfaces unmarked rather than as evidence of drift";
-const MIGRATION_120_ID: &str = "120_memory_applied_anchor_snapshot";
-const MIGRATION_120_CHECKSUM: &str = "sha256:rag-rat-memory-applied-anchor-snapshot-v120";
-const MIGRATION_120_DESCRIPTION: &str =
-    "Record what the memory drain last applied to a synced memory (#1243): \
-     repo_memories.anchors_applied_digest and source_hash_applied, so an author's later rebind \
-     replaces them without undoing local relocation, and anchors_applied_targets, the kind and \
-     signature that set named for each symbol anchor, to tell a retarget from a republish. Add \
-     content_projected_nodes.anchors_author, the account that authored each node's winning anchor \
-     set, so the drain leaves a set its own account's anchors/1 carries to that carrier";
-const MIGRATION_121_ID: &str = "121_refold_for_held_control_log_freshness";
-const MIGRATION_121_CHECKSUM: &str = "sha256:rag-rat-refold-for-held-control-log-freshness-v121";
-const MIGRATION_121_DESCRIPTION: &str =
-    "Queue every /3 content stream for an acceptance refold and refold every account, so content \
-     and secrets-log wraps parked auth_len_ahead after a cut lowered the cited account's \
-     effective count are re-judged against the held control log (#1282)";
-const MIGRATION_122_ID: &str = "122_memory_parked_anchor_baselines";
-const MIGRATION_122_CHECKSUM: &str = "sha256:rag-rat-memory-parked-anchor-baselines-v122";
-const MIGRATION_122_DESCRIPTION: &str =
-    "Add repo_memory_parked_baselines, where the memory drain parks a condemned or quarantined \
-     synced memory's applied-anchor baseline while its row is gone (#1298). Its bindings stay, \
-     since they replicate on anchors/1 and deleting them would remove them from every device the \
-     memory is still live on; the parked baseline lets a returning memory converge on a rebind \
-     published while it was away";
-const MIGRATION_123_ID: &str = "123_memory_binding_resolution";
-const MIGRATION_123_CHECKSUM: &str = "sha256:rag-rat-memory-binding-resolution-v123";
-const MIGRATION_123_DESCRIPTION: &str =
-    "Add this store's resolution of each memory binding beside the authored anchor \
-     (resolved_binding_id, resolved_path, resolved_start_line, resolved_end_line, \
-     resolved_symbol_kind, resolved_signature_hash, resolved_moniker_tool_version on \
-     repo_memory_bindings), so relocation writes local columns and no longer republishes the row \
-     on anchors/1 (#1297)";
-const MIGRATION_124_ID: &str = "124_content_projected_superseded_anchors";
-const MIGRATION_124_CHECKSUM: &str = "sha256:rag-rat-content-projected-superseded-anchors-v124";
-const MIGRATION_124_DESCRIPTION: &str =
-    "Add superseded_anchors_json to content_projected_nodes: the anchor sets a node's register \
-     held before the winning one, so the memory drain can tell binding rows that are the image of \
-     a publication it has superseded from rows of one still in flight (#1304)";
-const MIGRATION_125_ID: &str = "125_refold_for_concurrent_cut_vouch";
-const MIGRATION_125_CHECKSUM: &str = "sha256:rag-rat-refold-for-concurrent-cut-vouch-v125";
-const MIGRATION_125_DESCRIPTION: &str =
-    "Refold every account and queue every /3 content stream for an acceptance refold, so control \
-     ops authored concurrently with a revoking cut and parked auth_len_ahead behind the ops it \
-     condemned are re-judged with the cut vouching for them (#1301)";
-const MIGRATION_118_CHECKSUM: &str = "sha256:rag-rat-content-projected-node-anchors-v118";
-const MIGRATION_118_DESCRIPTION: &str =
-    "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
-     node's portable anchor set (#1209). NULL means no node_anchors op has been folded for that \
-     node, which is distinct from an author publishing an empty set; existing rows stay NULL \
-     until the accompanying content-projector bump re-folds their stream from the accepted \
-     entries it already retains";
-const MIGRATION_117_CHECKSUM: &str = "sha256:rag-rat-content-author-stream-index-v117";
-const MIGRATION_117_DESCRIPTION: &str =
-    "Index /3 content entries by (author_account_id, stream_id) over accepted rows, so the \
-     pre-authentication servability probe can enumerate the streams an account has actually \
-     authored onto as an indexed scan instead of a per-dial table walk (#1185)";
-const MIGRATION_116_CHECKSUM: &str = "sha256:rag-rat-writer-invites-v116";
-const MIGRATION_116_DESCRIPTION: &str =
-    "Rebuild sync_invites so an invite can be a cross-account WRITER invite (#1179): the role \
-     gains the writer marker, a writer row carries the target stream_id (the grant is authored at \
-     redemption, when the contributor account is first known), and the used-columns check \
-     branches by role — a writer redemption records the dialing node and the authored grant id, \
-     never device enrollment keys";
-const MIGRATION_115_CHECKSUM: &str = "sha256:rag-rat-refold-account-authority-projections-v115";
-const MIGRATION_115_DESCRIPTION: &str =
-    "Rebuild every account's persisted authority projection from its candidate DAG, so a grant a \
-     pre-gate binary folded effective on a private stream is re-judged under the fold's \
-     grants-require-PublicRead rule at upgrade time — the projected account_stream_grants row \
-     would otherwise keep answering Effective until some unrelated ingest happened to refold that \
-     account (#1178)";
-const MIGRATION_114_CHECKSUM: &str = "sha256:rag-rat-content-entries-lamport-column-v114";
-const MIGRATION_114_DESCRIPTION: &str =
-    "Denormalize the /3 header lamport into a content_entries column (backfilled from the signed \
-     envelopes) with a partial (stream_id, lamport) accepted-rows index, so the accepted stream \
-     clock is an indexed MAX instead of a per-read decode of every accepted envelope — the \
-     ingest-time bounded-advance gate and the authoring mint both read it (#1176)";
+additive_migrations! {
+    MIGRATION_002_ID, MIGRATION_002_CHECKSUM, MIGRATION_002_DESCRIPTION = (
+        "002_embedding_vector_metadata",
+        "sha256:rag-rat-embedding-vector-metadata-v2",
+        "Add embedding model dimension metadata and per-vector dimensions for hybrid vector search",
+    ) => MigrationFn::Plain(migrations::apply_embedding_vector_metadata);
+    MIGRATION_003_ID, MIGRATION_003_CHECKSUM, MIGRATION_003_DESCRIPTION = (
+        "003_derived_artifact_reconcile_metadata",
+        "sha256:rag-rat-derived-artifact-reconcile-metadata-v3",
+        "Add model version, retry metadata, summaries, and \
+         reconcile meta for diff-based derived artifact \
+         reconciliation",
+    ) => MigrationFn::Plain(migrations::apply_derived_artifact_reconcile_metadata);
+    MIGRATION_004_ID, MIGRATION_004_CHECKSUM, MIGRATION_004_DESCRIPTION = (
+        "004_edge_source_target_spans",
+        "sha256:rag-rat-edge-source-target-spans-v4",
+        "Add exact source call-site spans and resolved target line spans to graph edges",
+    ) => MigrationFn::Plain(migrations::apply_edge_source_target_spans);
+    MIGRATION_005_ID, MIGRATION_005_CHECKSUM, MIGRATION_005_DESCRIPTION = (
+        "005_edge_evidence_and_resolution",
+        "sha256:rag-rat-edge-evidence-resolution-v5",
+        "Add raw graph edge evidence, receiver hints, qualified targets, and resolution reasons",
+    ) => MigrationFn::Plain(migrations::apply_edge_evidence_and_resolution);
+    MIGRATION_006_ID, MIGRATION_006_CHECKSUM, MIGRATION_006_DESCRIPTION = (
+        "006_embedding_policy_and_input_hash",
+        "sha256:rag-rat-embedding-policy-input-hash-v6",
+        "Add embedding eligibility policy, priority, bounded \
+         input hash, and reconcile throughput metadata",
+    ) => MigrationFn::Plain(migrations::apply_embedding_policy_and_input_hash);
+    MIGRATION_007_ID, MIGRATION_007_CHECKSUM, MIGRATION_007_DESCRIPTION = (
+        "007_logical_symbol_groups",
+        "sha256:rag-rat-logical-symbol-groups-v7",
+        "Add logical symbol groups for cfg variants and duplicate definitions",
+    ) => MigrationFn::Plain(migrations::apply_logical_symbol_groups);
+    MIGRATION_008_ID, MIGRATION_008_CHECKSUM, MIGRATION_008_DESCRIPTION = (
+        "008_commit_addressable_worktrees",
+        "sha256:rag-rat-commit-addressable-worktrees-v8",
+        "Add commit_sha and worktree_id to files table for multi-worktree / multi-branch support",
+    ) => MigrationFn::Plain(migrations::apply_commit_addressable_worktrees);
+    MIGRATION_009_ID, MIGRATION_009_CHECKSUM, MIGRATION_009_DESCRIPTION = (
+        "009_github_ref_sync_state",
+        "sha256:rag-rat-github-ref-sync-state-v9",
+        "Add per-GitHub-ref sync state for resumable papertrail cache updates",
+    ) => MigrationFn::Plain(migrations::apply_github_ref_sync);
+    MIGRATION_010_ID, MIGRATION_010_CHECKSUM, MIGRATION_010_DESCRIPTION = (
+        "010_symbol_facts",
+        "sha256:rag-rat-symbol-facts-v10",
+        "Add normalized symbol facts for parsed language metadata such as Rust attributes",
+    ) => MigrationFn::Plain(migrations::apply_symbol_facts);
+    MIGRATION_011_ID, MIGRATION_011_CHECKSUM, MIGRATION_011_DESCRIPTION = (
+        "011_repo_memories",
+        "sha256:rag-rat-repo-memories-v11",
+        "Add source-anchored repo memories bound to symbols, chunks, paths, and papertrail refs",
+    ) => MigrationFn::Plain(migrations::apply_repo_memories);
+    MIGRATION_012_ID, MIGRATION_012_CHECKSUM, MIGRATION_012_DESCRIPTION = (
+        "012_repo_memory_call_paths",
+        "sha256:rag-rat-repo-memory-call-paths-v12",
+        "Add edge and call-path memory bindings for graph traversal surfacing",
+    ) => MigrationFn::Plain(migrations::apply_repo_memory_call_paths);
+    MIGRATION_013_ID, MIGRATION_013_CHECKSUM, MIGRATION_013_DESCRIPTION = (
+        "013_graph_file_lookup_indexes",
+        "sha256:rag-rat-graph-file-lookup-indexes-v13",
+        "Add graph file lookup indexes for ownership clustering and file-level graph summaries",
+    ) => MigrationFn::Plain(migrations::apply_graph_file_lookup_indexes);
+    MIGRATION_014_ID, MIGRATION_014_CHECKSUM, MIGRATION_014_DESCRIPTION = (
+        "014_repo_memory_binding_signals",
+        "sha256:rag-rat-repo-memory-binding-signals-v14",
+        "Add symbol_kind + signature_hash to repo_memory_bindings for durable cross-file relocation",
+    ) => MigrationFn::Plain(migrations::apply_memory_binding_signals);
+    MIGRATION_015_ID, MIGRATION_015_CHECKSUM, MIGRATION_015_DESCRIPTION = (
+        "015_repo_memory_call_path_edges",
+        "sha256:rag-rat-repo-memory-call-path-edges-v15",
+        "Add ordered edge fingerprints behind server-derived call-path hashes for validation",
+    ) => MigrationFn::Plain(migrations::apply_repo_memory_call_path_edges);
+    MIGRATION_016_ID, MIGRATION_016_CHECKSUM, MIGRATION_016_DESCRIPTION = (
+        "016_symbol_line_spans",
+        "sha256:rag-rat-symbol-line-spans-v16",
+        "Store start_line/end_line on symbols so readers skip the \
+         per-symbol chunk-containment subqueries",
+    ) => MigrationFn::Plain(migrations::apply_symbol_line_spans);
+    MIGRATION_017_ID, MIGRATION_017_CHECKSUM, MIGRATION_017_DESCRIPTION = (
+        "017_edge_callee_byte_range",
+        "sha256:rag-rat-edge-callee-byte-range-v17",
+        "Add callee identifier byte range to edges for the SCIP occurrence join (#61 prerequisite)",
+    ) => MigrationFn::Plain(migrations::apply_edge_callee_byte_range);
+    MIGRATION_018_ID, MIGRATION_018_CHECKSUM, MIGRATION_018_DESCRIPTION = (
+        "018_scip_oracle_tables",
+        "sha256:rag-rat-scip-oracle-tables-v18",
+        "Add oracle_runs + edge_oracle side tables for SCIP compiler-grade edge resolution (#68)",
+    ) => MigrationFn::Plain(migrations::apply_oracle_tables);
+    MIGRATION_019_ID, MIGRATION_019_CHECKSUM, MIGRATION_019_DESCRIPTION = (
+        "019_scip_moniker_anchors",
+        "sha256:rag-rat-scip-moniker-anchors-v19",
+        "Add logical_symbol_monikers + moniker provenance and \
+         relocation reason on repo memory bindings (#70)",
+    ) => MigrationFn::Plain(migrations::apply_scip_moniker_anchors);
+    MIGRATION_020_ID, MIGRATION_020_CHECKSUM, MIGRATION_020_DESCRIPTION = (
+        "020_edge_string_interning",
+        "sha256:rag-rat-edge-string-interning-v20",
+        "Normalize repeated edge strings into the name_strings \
+         dictionary behind the edges compatibility view (#79)",
+    ) => MigrationFn::Plain(migrations::apply_edge_string_interning);
+    MIGRATION_021_ID, MIGRATION_021_CHECKSUM, MIGRATION_021_DESCRIPTION = (
+        "021_symbol_scope_path",
+        "sha256:rag-rat-symbol-scope-path-v21",
+        "Add symbols.scope_path (semantic enclosing-scope path) for scope-aware edge resolution (#61)",
+    ) => MigrationFn::Plain(migrations::apply_symbol_scope_path);
+    MIGRATION_022_ID, MIGRATION_022_CHECKSUM, MIGRATION_022_DESCRIPTION = (
+        "022_per_package_import_scope",
+        "sha256:rag-rat-per-package-import-scope-v22",
+        "Add packages table + dedicated edge import-scope columns \
+         for per-package, module-aware import resolution (#61)",
+    ) => MigrationFn::Plain(migrations::apply_per_package_import_scope);
+    MIGRATION_023_ID, MIGRATION_023_CHECKSUM, MIGRATION_023_DESCRIPTION = (
+        "023_dispatch_edge_facts_view_exclusion",
+        "sha256:rag-rat-dispatch-edge-facts-view-exclusion-v23",
+        "Recreate the edges compatibility view to exclude \
+         internal dispatch FACT rows from query-layer reads (#200)",
+    ) => MigrationFn::Plain(migrations::apply_edges_view_refresh);
+    MIGRATION_024_ID, MIGRATION_024_CHECKSUM, MIGRATION_024_DESCRIPTION = (
+        "024_files_has_test_code",
+        "sha256:rag-rat-files-has-test-code-v24",
+        "Add files.has_test_code flag (precomputed test-marker \
+         detection) so impact_surface avoids a chunks.text scan \
+         (#77)",
+    ) => MigrationFn::Plain(migrations::apply_files_has_test_code);
+    MIGRATION_025_ID, MIGRATION_025_CHECKSUM, MIGRATION_025_DESCRIPTION = (
+        "025_chunk_text_compression_tables",
+        "sha256:rag-rat-chunk-text-compression-tables-v25",
+        "Add chunk_text (zstd blob) + chunk_text_dict (shared \
+         dictionary) tables for compressed chunk text (#77)",
+    ) => MigrationFn::Plain(migrations::apply_chunk_text_compression_tables);
+    MIGRATION_026_ID, MIGRATION_026_CHECKSUM, MIGRATION_026_DESCRIPTION = (
+        "026_contentless_chunk_fts",
+        "sha256:rag-rat-contentless-chunk-fts-v26",
+        "Recreate chunk_fts as a contentless FTS5 index and \
+         repopulate it, so chunks.text can be dropped (#77 Phase \
+         2)",
+    ) => MigrationFn::Plain(migrations::apply_contentless_chunk_fts);
+    MIGRATION_027_ID, MIGRATION_027_CHECKSUM, MIGRATION_027_DESCRIPTION = (
+        "027_drop_chunks_text",
+        "sha256:rag-rat-drop-chunks-text-v27",
+        "Build the compressed chunk_text store from chunks.text, \
+         then drop the chunks.text column (#77 Phase 2)",
+    ) => MigrationFn::Plain(migrations::apply_drop_chunks_text);
+    MIGRATION_028_ID, MIGRATION_028_CHECKSUM, MIGRATION_028_DESCRIPTION = (
+        "028_intern_symbol_qualified_names",
+        "sha256:rag-rat-intern-symbol-qualified-names-v28",
+        "Intern symbols/logical_symbols qualified_name into the \
+         shared name_strings pool, then drop the columns (#224)",
+    ) => MigrationFn::Plain(migrations::apply_intern_symbol_qualified_names);
+    MIGRATION_029_ID, MIGRATION_029_CHECKSUM, MIGRATION_029_DESCRIPTION = (
+        "029_clone_fingerprint_tables",
+        "sha256:rag-rat-clone-fingerprint-tables-v29",
+        "Add symbol_fingerprints + symbol_token_postings + \
+         clone_token_df + clone_refinements for clone detection \
+         (#215)",
+    ) => MigrationFn::Plain(migrations::apply_clone_fingerprint_tables);
+    MIGRATION_030_ID, MIGRATION_030_CHECKSUM, MIGRATION_030_DESCRIPTION = (
+        "030_clone_refinements_lcs_sampled",
+        "sha256:rag-rat-clone-refinements-lcs-sampled-v30",
+        "Add clone_refinements.lcs_sampled (additive; heals indexes already at V029)",
+    ) => MigrationFn::Plain(migrations::apply_clone_refinements_lcs_sampled);
+    MIGRATION_031_ID, MIGRATION_031_CHECKSUM, MIGRATION_031_DESCRIPTION = (
+        "031_edge_oracle_content_anchor",
+        "sha256:rag-rat-edge-oracle-content-anchor-v31",
+        "Rebuild edge_oracle content-anchored (drop edges_data FK \
+         + edge_id PK) so verdicts survive reindex (#248)",
+    ) => MigrationFn::Plain(migrations::apply_edge_oracle_content_anchor);
+    MIGRATION_032_ID, MIGRATION_032_CHECKSUM, MIGRATION_032_DESCRIPTION = (
+        "032_clone_token_bag_blob",
+        "sha256:rag-rat-clone-token-bag-blob-v32",
+        "Add symbol_fingerprints.token_bag BLOB + drop \
+         symbol_token_postings (BLOB-pack the clone token bag) \
+         (#231)",
+    ) => MigrationFn::Plain(migrations::apply_token_bag_blob);
+    MIGRATION_033_ID, MIGRATION_033_CHECKSUM, MIGRATION_033_DESCRIPTION = (
+        "033_dream_findings",
+        "sha256:rag-rat-dream-findings-v33",
+        "Add dream_findings (dream-mode worklist: findings ABOUT \
+         memories, identity-keyed supersede/decay, never mutate \
+         memories) (#122)",
+    ) => MigrationFn::Plain(migrations::apply_dream_findings);
+    MIGRATION_034_ID, MIGRATION_034_CHECKSUM, MIGRATION_034_DESCRIPTION = (
+        "034_clone_graph_precompute",
+        "sha256:rag-rat-clone-graph-precompute-v34",
+        "Add clone_graph_generations + clone_edges (content-anchored precomputed clone-edge graph so \
+         find_clones reads a persisted graph instead of recomputing candidate pairs every query)",
+    ) => MigrationFn::Plain(migrations::apply_clone_graph_tables);
+    MIGRATION_035_ID, MIGRATION_035_CHECKSUM, MIGRATION_035_DESCRIPTION = (
+        "035_symbols_is_test",
+        "sha256:rag-rat-symbols-is-test-v35",
+        "Add symbols.is_test (cross-language test-code marker: \
+         test-file path, Rust #[test]/#[cfg(test)], Kotlin @Test, \
+         Python test_*/TestCase) so clone detection can exclude \
+         tests from the corpus",
+    ) => MigrationFn::Plain(migrations::apply_symbols_is_test);
+    MIGRATION_036_ID, MIGRATION_036_CHECKSUM, MIGRATION_036_DESCRIPTION = (
+        "036_embedding_content_cache",
+        "sha256:rag-rat-embedding-content-cache-v36",
+        "Add embedding_cache (content-addressed vectors keyed by input_hash) so embeddings survive \
+         reindex / branch-switch and reconcile reuses unchanged content across contexts instead of \
+         re-embedding; seeded from current chunk_embeddings (#357)",
+    ) => MigrationFn::Plain(migrations::apply_embedding_content_cache);
+    MIGRATION_037_ID, MIGRATION_037_CHECKSUM, MIGRATION_037_DESCRIPTION = (
+        "037_clone_subblock_postings",
+        "sha256:rag-rat-clone-subblock-postings-v37",
+        "Add clone_subblock_postings (persisted content-anchored sub-block postings, \
+         generation-staged like clone_edges) + clone_graph_generations.postings_written so the \
+         write-time clone check does a bounded indexed lookup instead of rebuilding the RAM index and \
+         scales past the 40k guard (#296)",
+    ) => MigrationFn::Plain(migrations::apply_clone_subblock_postings_tables);
+    MIGRATION_038_ID, MIGRATION_038_CHECKSUM, MIGRATION_038_DESCRIPTION = (
+        "038_repos_registry",
+        "sha256:rag-rat-repos-registry-v38",
+        "Add repos registry + repo_roots + repo_meta (per-machine repo identity registry and per-repo \
+         key/value store) with the __unassigned__ adoption placeholder — the substrate for the global \
+         consolidated database and repo_id scoping (memory-sync phase A)",
+    ) => MigrationFn::Plain(migrations::apply_repos_registry);
+    MIGRATION_039_ID, MIGRATION_039_CHECKSUM, MIGRATION_039_DESCRIPTION = (
+        "039_per_repo_meta",
+        "sha256:rag-rat-per-repo-meta-v39",
+        "Relocate the per-repo singleton meta keys from the \
+         global index_meta / reconcile_meta into repo_meta under \
+         the __unassigned__ placeholder (memory-sync phase A2)",
+    ) => MigrationFn::Plain(migrations::apply_move_per_repo_meta);
+    MIGRATION_040_ID, MIGRATION_040_CHECKSUM, MIGRATION_040_DESCRIPTION = (
+        "040_repo_id_core_scoping",
+        "sha256:rag-rat-repo-id-core-scoping-v40",
+        "Add repo_id scoping to the core tables (files, packages, logical_symbols, docs, \
+         parser_failures, git_commits + git_file_changes) with rebuilt UNIQUE / PK keys and the \
+         re-pointed commit_fts external content, plus the two active-embedding-model provenance meta \
+         keys moved to repo_meta (memory-sync phase A3)",
+    ) => MigrationFn::WithHooks(migrations::apply_repo_id_core_scoping);
+    MIGRATION_041_ID, MIGRATION_041_CHECKSUM, MIGRATION_041_DESCRIPTION = (
+        "041_github_repo_id_scoping",
+        "sha256:rag-rat-github-repo-id-scoping-v41",
+        "Repo-scope the GitHub papertrail cache: add repo_id to the seven github_* tables (refs, \
+         issues, comments, pull_requests, reviews, review_comments, ref_sync) and rebuild github_fts \
+         with a repo_id UNINDEXED column, so lexical and papertrail queries in a consolidated \
+         database never surface a sibling repo's refs or issues (memory-sync phase A4)",
+    ) => MigrationFn::Plain(migrations::apply_github_repo_id_scoping);
+    MIGRATION_042_ID, MIGRATION_042_CHECKSUM, MIGRATION_042_DESCRIPTION = (
+        "042_repo_id_periphery_scoping",
+        "sha256:rag-rat-repo-id-periphery-scoping-v42",
+        "Repo-scope the clone / oracle / reconcile / memory periphery: add repo_id to \
+         clone_graph_generations, oracle_runs, reconcile_attempts, repo_memories, \
+         repo_memory_bindings (additive) and rebuild clone_token_df, clone_refinements, edge_oracle, \
+         logical_symbol_monikers, dream_findings with repo_id in their PK / UNIQUE plus \
+         repo_memory_fts with a repo_id UNINDEXED column, so clone stats, oracle runs, and memory \
+         search in a consolidated database never pool or surface a sibling repo's rows (memory-sync \
+         phase A5)",
+    ) => MigrationFn::WithHooks(migrations::apply_repo_id_periphery_scoping);
+    MIGRATION_043_ID, MIGRATION_043_CHECKSUM, MIGRATION_043_DESCRIPTION = (
+        "043_files_generation",
+        "sha256:rag-rat-files-generation-v43",
+        "Add files.generation and widen the UNIQUE key to (repo_id, path, commit_sha, worktree_id, \
+         generation), so a full rebuild can stage a fresh generation of every file row alongside the \
+         live one and flip readers over atomically instead of clearing-then-reinserting inside one \
+         long write-locked transaction (memory-sync phase A6)",
+    ) => MigrationFn::Plain(migrations::apply_files_generation);
+    MIGRATION_044_ID, MIGRATION_044_CHECKSUM, MIGRATION_044_DESCRIPTION = (
+        "044_github_natural_key_widening",
+        "sha256:rag-rat-github-natural-key-widening-v44",
+        "Fold repo_id into the (owner, repo, number)-style GitHub natural keys — widen github_issues \
+         / github_pull_requests UNIQUE and github_ref_sync PRIMARY KEY to (repo_id, owner, repo, \
+         number) and re-create idx_github_refs_unique with a leading repo_id — so two repos in a \
+         consolidated database can each cache the same external issue/PR/ref without one repo's sync \
+         overwriting the other's row (memory-sync phase A7)",
+    ) => MigrationFn::Plain(migrations::apply_github_natural_key_widening);
+    MIGRATION_045_ID, MIGRATION_045_CHECKSUM, MIGRATION_045_DESCRIPTION = (
+        "045_github_child_key_widening",
+        "sha256:rag-rat-github-child-key-widening-v45",
+        "Fold repo_id into the id-keyed GitHub child caches — rebuild github_comments / \
+         github_reviews / github_review_comments with (repo_id, id) uniqueness, backfilling one copy \
+         per owning-parent repo — so two repos sharing an external issue/PR each keep that item's \
+         comments and reviews in their scoped papertrail instead of last-syncer-owns restamping \
+         (memory-sync phase A7)",
+    ) => MigrationFn::Plain(migrations::apply_github_child_key_widening);
+    MIGRATION_046_ID, MIGRATION_046_CHECKSUM, MIGRATION_046_DESCRIPTION = (
+        "046_memory_verification_reality_summaries",
+        "sha256:rag-rat-memory-verification-reality-summaries-v46",
+        "Add the dream verification sibling tables memory_reality (one derived verdict/check row per \
+         memory, keyed (repo_id, memory_id)) and memory_summaries (one per (repo_id, memory_id, \
+         content_hash) so a body edit self-invalidates), both STRICT and repo_id-scoped. They hold \
+         derived, regenerable data so dream verifies memories without ever mutating a repo_memories \
+         row (dream v2 pass 0)",
+    ) => MigrationFn::Plain(migrations::apply_memory_verification_tables);
+    MIGRATION_047_ID, MIGRATION_047_CHECKSUM, MIGRATION_047_DESCRIPTION = (
+        "047_memory_model_failures",
+        "sha256:rag-rat-memory-model-failures-v47",
+        "Add memory_model_failures, a repo_id-scoped dream sibling table that records deterministic \
+         verdict/compaction model failures with stable enum tokens and input/model freshness stamps, \
+         so rejected current attempts do not rerun every dream pass",
+    ) => MigrationFn::Plain(migrations::apply_memory_model_failures_table);
+    MIGRATION_048_ID, MIGRATION_048_CHECKSUM, MIGRATION_048_DESCRIPTION = (
+        "048_memory_payload_json",
+        "sha256:rag-rat-memory-payload-json-v48",
+        "Add repo_memories.payload_json, a nullable opaque canonical-JSON payload for polymorphic \
+         memory nodes (the Task / Concept kinds), folded into the content_hash so a payload edit \
+         self-invalidates the derived dream summary/verdict rows exactly as a title/body edit does",
+    ) => MigrationFn::Plain(migrations::apply_memory_payload_json);
+    MIGRATION_049_ID, MIGRATION_049_CHECKSUM, MIGRATION_049_DESCRIPTION = (
+        "049_repo_node_edges",
+        "sha256:rag-rat-repo-node-edges-v49",
+        "Add repo_node_edges, the typed content-addressed cross-repo edge set (#464): relation-typed \
+         edges from a memory node to another node or a code/github target, with explicit owner + \
+         target repo ids and a stable edge_key, no FK to volatile graph rows (only the durable source \
+         memory)",
+    ) => MigrationFn::Plain(migrations::apply_repo_node_edges);
+    MIGRATION_050_ID, MIGRATION_050_CHECKSUM, MIGRATION_050_DESCRIPTION = (
+        "050_clone_delta_maintenance",
+        "sha256:rag-rat-clone-delta-maintenance-v50",
+        "Add the clone_subblock_postings (build_generation, path) index and the \
+         clone_graph_generations.delta_files_applied counter, so the incremental clone-graph delta \
+         pass can delete a changed file's postings without a table scan and track df drift toward the \
+         next full rebuild",
+    ) => MigrationFn::Plain(migrations::apply_clone_delta_maintenance);
+    MIGRATION_051_ID, MIGRATION_051_CHECKSUM, MIGRATION_051_DESCRIPTION = (
+        "051_clone_df_epoch",
+        "sha256:rag-rat-clone-df-epoch-v51",
+        "Add clone_df_epoch, the per-generation snapshot of clone_token_df taken at each fresh \
+         clone-graph build (#479), so the persisted postings and the delta pass read their own \
+         build's frozen token order while the live candidate paths read a clone_token_df that moves \
+         again on incremental passes; backfilled from the current (freeze-pinned) df for existing \
+         generations",
+    ) => MigrationFn::Plain(migrations::apply_clone_df_epoch);
+    MIGRATION_052_ID, MIGRATION_052_CHECKSUM, MIGRATION_052_DESCRIPTION = (
+        "052_oplog_storage",
+        "sha256:rag-rat-oplog-storage-v52",
+        "Add the memory op-log storage tables (#503, phase B C4): oplog_entries — the layer-1 opaque \
+         signed entry log, content-addressed on entry_hash, no FK; and the layer-2 shadow projection \
+         (oplog_projected_nodes / oplog_projected_edges) plus oplog_meta, wholly rebuilt by the \
+         full-replay fold. Fresh tables (no backfill); nothing is wired to the live write path yet",
+    ) => MigrationFn::Plain(migrations::apply_oplog_storage);
+    MIGRATION_053_ID, MIGRATION_053_CHECKSUM, MIGRATION_053_DESCRIPTION = (
+        "053_oplog_stream_scoping",
+        "sha256:rag-rat-oplog-stream-scoping-v53",
+        "Scope the op-log by immutable stream identity (#509): rebuild the still-unwired (and \
+         therefore empty) V052 op-log tables with a stream_id dimension — one signed chain per \
+         (stream_id, device), UNIQUE(stream_id, device_fingerprint, lamport), projection keyed per \
+         stream — and add oplog_fork_evidence, the quarantine that durably preserves BOTH heads of a \
+         detected equivocation. Nothing is wired to the live write path yet",
+    ) => MigrationFn::Plain(migrations::apply_oplog_stream_scoping);
+    MIGRATION_054_ID, MIGRATION_054_CHECKSUM, MIGRATION_054_DESCRIPTION = (
+        "054_oplog_device_identity",
+        "sha256:rag-rat-oplog-device-identity-v54",
+        "Add oplog_device_identity (#513, phase B): the ONE persisted ed25519 keypair per store that \
+         the op-log write path signs every entry with — a single-row (id = 0) STRICT table holding \
+         the 32-byte seed, its derived public_key, and the sha256(public_key) fingerprint. \
+         Store-global, not repo-scoped (a device is a machine identity). Purely additive; nothing is \
+         wired to the live write path yet",
+    ) => MigrationFn::Plain(migrations::apply_oplog_device_identity);
+    MIGRATION_055_ID, MIGRATION_055_CHECKSUM, MIGRATION_055_DESCRIPTION = (
+        "055_binding_downgrade_marker",
+        "sha256:rag-rat-binding-downgrade-marker-v55",
+        "Add repo_memory_bindings.downgrade_pending_at_ms (#492), the anchor-status downgrade \
+         hysteresis marker: a validate pass that observes a non-gone binding as gone arms the marker \
+         instead of stamping, and only a SECOND consecutive gone observation persists the downgrade — \
+         so a single torn observation (a validate racing a rebuild window, or a sweep from a narrower \
+         checkout) cannot flip a healthy anchor to gone and hand doctor destructive advice",
+    ) => MigrationFn::Plain(migrations::apply_binding_downgrade_marker);
+    MIGRATION_056_ID, MIGRATION_056_CHECKSUM, MIGRATION_056_DESCRIPTION = (
+        "056_git_change_couplings",
+        "sha256:rag-rat-git-change-couplings-v56",
+        "Add git_change_couplings (#566), the windowed file-pair change-coupling table derived from \
+         git_file_changes: one STRICT symmetric row per unordered pair (path_a < path_b) holding raw \
+         co-change + endpoint counts over a bounded recency window of eligible commits, keyed \
+         (repo_id, path_a, path_b) with a secondary (repo_id, path_b) index. A DerivedIndex table \
+         (repo_id-scoped, no FK to the volatile history rows): wholesale-recomputed lazily on the \
+         impact_surface read path against a repo_meta 'git_coupling_stamp', never patched \
+         incrementally. Fresh + empty on create; the first git-inclusive impact read fills it",
+    ) => MigrationFn::Plain(migrations::apply_git_change_couplings);
+    MIGRATION_057_ID, MIGRATION_057_CHECKSUM, MIGRATION_057_DESCRIPTION = (
+        "057_external_symbols",
+        "sha256:rag-rat-external-symbols-v57",
+        "Add external_symbols (#114), the per-moniker dependency contract oracle run parses out of \
+         the .scip index.external_symbols (kind, display_name, signature_documentation text, \
+         documentation, a derived deprecated flag) — data from_index previously discarded. \
+         Oracle-persisted, content/moniker-keyed with NO reindex-cascading FK, checkout-scoped \
+         (repo_id, tool, commit_sha, worktree_id) from birth; moniker is the RAW SCIP symbol string \
+         so it exact-joins edge_oracle.scip_symbol. Backs the check_library_usage tool that surfaces \
+         the current signature/docs at external call sites and flags deprecated usage",
+    ) => MigrationFn::Plain(migrations::apply_external_symbols);
+    MIGRATION_058_ID, MIGRATION_058_CHECKSUM, MIGRATION_058_DESCRIPTION = (
+        "058_oplog_device_x25519",
+        "sha256:rag-rat-oplog-device-x25519-v58",
+        "Add x25519_secret + x25519_public (nullable BLOB) to oplog_device_identity (sync phase C, \
+         §5): the device's X25519 ENCRYPTION keypair beside its ed25519 signing key. Additive on the \
+         STRICT table; an existing ed25519-only row is backfilled at the next local_device open via a \
+         CAS UPDATE that mirrors the ed25519 mint-if-absent race, so concurrent opens converge on one \
+         encryption identity. C1 only mints/persists/validates the key; ECDH + HKDF is C4",
+    ) => MigrationFn::Plain(migrations::apply_oplog_device_x25519);
+    MIGRATION_059_ID, MIGRATION_059_CHECKSUM, MIGRATION_059_DESCRIPTION = (
+        "059_account_candidate_dag",
+        "sha256:rag-rat-account-candidate-dag-v59-signed-envelope-key",
+        "The account-log CANDIDATE DAG (sync phase C, §16.1): account_entries (all branches, \
+         grow-only, no seq-uniqueness — equivocation heads are first-class; the derived `accepted` \
+         flag + the account_accepted_slot partial unique index pin accepted-set uniqueness per slot, \
+         I10a), account_entry_status (the projected §16.3 taxonomy), and account_pre_verify (entries \
+         whose signing device isn't yet resolvable, retried on a later DeviceAdd/AccountGenesis \
+         arrival). All CREATE ... IF NOT EXISTS + STRICT tables",
+    ) => MigrationFn::Plain(migrations::apply_account_candidate_dag);
+    MIGRATION_060_ID, MIGRATION_060_CHECKSUM, MIGRATION_060_DESCRIPTION = (
+        "060_papertrail_provider_neutral_schema",
+        "sha256:rag-rat-papertrail-provider-neutral-schema-v60",
+        "Normalize the GitHub papertrail cache into the provider-neutral papertrail_* tables (#588): \
+         papertrail_items (tracker + item_kind in the natural key, issue-shadow deduped), unified \
+         papertrail_comments (reviews fold in behind review_state / anchor_path), papertrail_refs \
+         (annotation layer only), papertrail_sync_cursor (one row per repo/tracker/project — the \
+         per-ref github_ref_sync state machine is deleted), papertrail_item_tags, and the \
+         incrementally-maintained papertrail_fts mirror; backfills mechanically from the seven \
+         github_* tables then DROPS them (hard rename, no aliases); renames the memory binding kind \
+         github -> tracker (tracker/project/item_key columns backfilled, github_* columns dropped) \
+         and the github_last_sync_ms repo_meta key to papertrail_last_sync_ms",
+    ) => MigrationFn::WithHooks(migrations::apply_papertrail_provider_neutral_schema);
+    MIGRATION_061_ID, MIGRATION_061_CHECKSUM, MIGRATION_061_DESCRIPTION = (
+        "061_papertrail_ref_item_kind",
+        "sha256:rag-rat-papertrail-ref-item-kind-v61",
+        "Preserve the nullable item_kind on papertrail_refs so \
+         providers with separate issue/change-request namespaces \
+         cannot collapse #N and !N annotations",
+    ) => MigrationFn::Plain(migrations::apply_papertrail_ref_item_kind);
+    MIGRATION_062_ID, MIGRATION_062_CHECKSUM, MIGRATION_062_DESCRIPTION = (
+        "062_papertrail_comment_cursor",
+        "sha256:rag-rat-papertrail-comment-cursor-v62",
+        "Split repo-wide comment progress from the item watermark \
+         and persist comment pagination only after each stored \
+         page",
+    ) => MigrationFn::Plain(migrations::apply_papertrail_comment_cursor);
+    MIGRATION_063_ID, MIGRATION_063_CHECKSUM, MIGRATION_063_DESCRIPTION = (
+        "063_papertrail_mirror_resume_state",
+        "sha256:rag-rat-papertrail-mirror-resume-state-v63e",
+        "Persist item-page, item-thread, Search-tie, per-stream comment-scan, immutable item-delta \
+         windows, and full-rewalk state so every stored unit resumes without replay or lost pruning",
+    ) => MigrationFn::Plain(migrations::apply_papertrail_mirror_resume_state);
+    MIGRATION_064_ID, MIGRATION_064_CHECKSUM, MIGRATION_064_DESCRIPTION = (
+        "064_account_authority_projection",
+        "sha256:rag-rat-account-authority-projection-v64b",
+        "Persist the fully folded account classification, roster and owner incarnations, immutable \
+         stream ownership, exact grant incarnations, and revoke device cuts. refold_account rewrites \
+         these shadow tables in the same IMMEDIATE transaction as accepted/status, so /3 authority \
+         checks never rescan the bounded candidate DAG",
+    ) => MigrationFn::Plain(migrations::apply_account_authority_projection);
+    MIGRATION_065_ID, MIGRATION_065_CHECKSUM, MIGRATION_065_DESCRIPTION = (
+        "065_account_authority_boundaries",
+        "sha256:rag-rat-account-authority-boundaries-v65a",
+        "Persist closed roster and owner chain boundaries for bounded historical citations",
+    ) => MigrationFn::Plain(migrations::apply_account_authority_boundaries);
+    MIGRATION_066_ID, MIGRATION_066_CHECKSUM, MIGRATION_066_DESCRIPTION = (
+        "066_content_candidate_dag",
+        "sha256:rag-rat-content-candidate-dag-v66a",
+        "Persist every structurally valid /3 content candidate, bounded pre-verification work, and \
+         derived status while reserving accepted-slot uniqueness for C3 authority acceptance",
+    ) => MigrationFn::Plain(migrations::apply_content_candidate_dag);
+    MIGRATION_067_ID, MIGRATION_067_CHECKSUM, MIGRATION_067_DESCRIPTION = (
+        "067_papertrail_binding_health",
+        "sha256:rag-rat-papertrail-binding-health-v67e",
+        "Persist per-binding attempt, successful probe/mirror, \
+         and closed failure state for automatic scheduling and \
+         status",
+    ) => MigrationFn::Plain(migrations::apply_papertrail_binding_health);
+    MIGRATION_068_ID, MIGRATION_068_CHECKSUM, MIGRATION_068_DESCRIPTION = (
+        "068_suppressed_edge_candidates",
+        "sha256:rag-rat-suppressed-edge-candidates-v68",
+        "Hide suppressed unresolved edge candidates from the \
+         compatibility view while retaining them for later \
+         incremental re-resolution",
+    ) => MigrationFn::Plain(migrations::apply_edges_view_refresh);
+    MIGRATION_069_ID, MIGRATION_069_CHECKSUM, MIGRATION_069_DESCRIPTION = (
+        "069_oplog_local_account",
+        "sha256:rag-rat-oplog-local-account-v69",
+        "Add oplog_local_account (sync phase C3.4a): the single-row (id = 0) STRICT pointer naming \
+         the genesis_entry_hash of this store's one local account, minted once by local_account and \
+         reused so later C3.4 slices author owner-bound /3 content under a stable identity. \
+         Store-global, not repo-scoped; purely additive, nothing pre-existing to backfill",
+    ) => MigrationFn::Plain(migrations::apply_oplog_local_account);
+    MIGRATION_070_ID, MIGRATION_070_CHECKSUM, MIGRATION_070_DESCRIPTION = (
+        "070_content_projected_tables",
+        "sha256:rag-rat-content-projected-tables-v70",
+        "Add content_projected_nodes/content_projected_edges (sync phase C3.4b-i): the stream-keyed \
+         memory projection of the accepted /3 content DAG, mirroring the /1 oplog_projected_* shadow \
+         tables but updated only when acceptance changes (the content refold), never by the /1 \
+         projector sweep — kept separate so a projector-version bump cannot wipe the /3 projection. \
+         Purely additive, nothing pre-existing to backfill",
+    ) => MigrationFn::Plain(migrations::apply_content_projected_tables);
+    MIGRATION_071_ID, MIGRATION_071_CHECKSUM, MIGRATION_071_DESCRIPTION = (
+        "071_edge_target_qname_index",
+        "sha256:rag-rat-edge-target-qname-index-v71",
+        "Add idx_edges_target_qname on edges_data(target_qualified_name_id) so \
+         find_callers/trace_callees seed the graph traversal on an indexed id column (MULTI-INDEX OR) \
+         instead of full-scanning the edge table when matching unresolved edges by \
+         target_qualified_name. Purely additive; CREATE INDEX IF NOT EXISTS, nothing pre-existing to \
+         backfill",
+    ) => MigrationFn::Plain(migrations::apply_edge_target_qname_index);
+    MIGRATION_072_ID, MIGRATION_072_CHECKSUM, MIGRATION_072_DESCRIPTION = (
+        "072_content_streams_pending_refold",
+        "sha256:rag-rat-content-streams-pending-refold-v72",
+        "Add content_streams_pending_refold (issue #652): the deferred-refold work queue for the /3 \
+         content-ingest path. content_ingest no longer folds acceptance per entry (O(n^2) under the \
+         writer lock as a stream is built one candidate at a time); it enqueues the stream here and \
+         settle_pending_content_refolds folds each dirty stream once. Purely additive; CREATE ... IF \
+         NOT EXISTS, nothing pre-existing to backfill",
+    ) => MigrationFn::Plain(migrations::apply_content_streams_pending_refold);
+    MIGRATION_073_ID, MIGRATION_073_CHECKSUM, MIGRATION_073_DESCRIPTION = (
+        "073_papertrail_distill_substrate",
+        "sha256:rag-rat-papertrail-distill-substrate-v73",
+        "Add papertrail_closing_edges (issue #702): first-class provider-attested issue<->closer \
+         edges for the distillation substrate, plus papertrail_items closed_at / resolution / \
+         merge_commit_sha (merged-only) / state_normalized (backfilled) / author facets and \
+         papertrail_comments author facets. Additive; CREATE IF NOT EXISTS + add_column_if_missing + \
+         an idempotent state_normalized backfill",
+    ) => MigrationFn::Plain(migrations::apply_papertrail_distill_substrate);
+    MIGRATION_074_ID, MIGRATION_074_CHECKSUM, MIGRATION_074_DESCRIPTION = (
+        "074_edges_view_scalar_suppression",
+        "sha256:rag-rat-edges-view-scalar-suppression-v74",
+        "Re-install the edges compatibility view so the V068 suppressed-edge exclusion is a scalar \
+         compare instead of a per-row NOT IN membership probe (the query_warm regression: the probe \
+         taxed every per-hit graph-evidence query). Pure view DDL refresh via ensure_edges_view; no \
+         data change",
+    ) => MigrationFn::Plain(migrations::apply_edges_view_scalar_suppression);
+    MIGRATION_075_ID, MIGRATION_075_CHECKSUM, MIGRATION_075_DESCRIPTION = (
+        "075_edges_hidden_flag",
+        "sha256:rag-rat-edges-hidden-flag-v75",
+        "Materialize edge visibility as edges_data.hidden and filter the edges view on it (issue \
+         #734): visibility is decided once at write time instead of re-deriving the dispatch-fact + \
+         suppressed-candidate predicates on every view row. Adds the column, backfills it from the \
+         predicate the view WHERE used to evaluate, and refreshes the view via ensure_edges_view",
+    ) => MigrationFn::Plain(migrations::apply_edges_hidden_flag);
+    MIGRATION_076_ID, MIGRATION_076_CHECKSUM, MIGRATION_076_DESCRIPTION = (
+        "076_sync_security_events",
+        "sha256:rag-rat-sync-security-events-v76",
+        "Add sync_security_events (sync phase C4.3b, #607): the local-only audit log the sealing-key \
+         adoption cross-check writes when an accepted StreamKeyWrap naming this device fails to \
+         unwrap (AEAD tag failure) or unwraps to a key whose key_id disagrees with the op's signed \
+         key_id. Never on the wire, never a fold input. Additive; CREATE ... IF NOT EXISTS + a dedup \
+         unique index, nothing pre-existing to backfill",
+    ) => MigrationFn::Plain(migrations::apply_sync_security_events);
+    MIGRATION_077_ID, MIGRATION_077_CHECKSUM, MIGRATION_077_DESCRIPTION = (
+        "077_distill_record_store",
+        "sha256:rag-rat-distill-record-store-v77",
+        "Add the distillation record store (issue #703): papertrail_distill (derived, regenerable \
+         decision records with provenance-facet confidence, not a fused label), plus junction \
+         children (evidence with materialized quotes + snapshotted provenance, sym_<hex> anchors, \
+         alternatives, mechanical fixing-commits), thread-keyed edges (survive record regeneration), \
+         the distill work queue, and per-run stats. Additive; CREATE IF NOT EXISTS, nothing \
+         pre-existing to backfill",
+    ) => MigrationFn::Plain(migrations::apply_distill_record_store);
+    MIGRATION_078_ID, MIGRATION_078_CHECKSUM, MIGRATION_078_DESCRIPTION = (
+        "078_distill_anchor_selection",
+        "sha256:rag-rat-distill-anchor-selection-v78",
+        "Distinguish mined anchor candidates from model selections (issue #704): add a stable, \
+         zero-based candidate ordinal and selected state to papertrail_distill_anchors; \
+         deterministically backfill V077 rows in insertion order per thread; enforce ordinal \
+         uniqueness and boolean selected values; index selected anchors. Additive; existing anchor \
+         identity/path columns are unchanged",
+    ) => MigrationFn::Plain(migrations::apply_distill_anchor_selection);
+    MIGRATION_079_ID, MIGRATION_079_CHECKSUM, MIGRATION_079_DESCRIPTION = (
+        "079_distill_safe_input_snapshot",
+        "sha256:rag-rat-distill-safe-input-snapshot-v79",
+        "Add extraction-owned safe-input snapshots for distillation (issue #704): exact ordered \
+         title/body/comment sources with full thread and partner identity, provenance, timestamps, \
+         and every deterministic block-unit byte span; add prompt_version/model_input_hash \
+         model-output stamps. Additive and intentionally does not backfill snapshots from the mutable \
+         mirror",
+    ) => MigrationFn::Plain(migrations::apply_distill_safe_input_snapshot);
+    MIGRATION_080_ID, MIGRATION_080_CHECKSUM, MIGRATION_080_DESCRIPTION = (
+        "080_distill_enriched_context",
+        "sha256:rag-rat-distill-enriched-context-v80",
+        "Add extraction-owned enriched-context snapshots for distillation (issue #800): \
+         per-fix-commit unified diffs restricted to files with symbol anchor candidates, and \
+         cross-referenced item titles + opening paragraphs mined from the thread's outbound \
+         papertrail refs. Additive and intentionally does not backfill from mutable git/mirror state",
+    ) => MigrationFn::Plain(migrations::apply_distill_enriched_context);
+    MIGRATION_081_ID, MIGRATION_081_CHECKSUM, MIGRATION_081_DESCRIPTION = (
+        "081_distill_evidence_source_part",
+        "sha256:rag-rat-distill-evidence-source-part-v81",
+        "Persist source-part identity (title|body|comment) on distilled evidence rows (issue #801) so \
+         a citation from an item's title is distinguishable from one in its body (both share the item \
+         key as source_id). Nullable and additive: existing rows keep NULL, the drain populates new \
+         rows from its snapshot, and no SQL backfill is performed (a re-drain rewrites evidence)",
+    ) => MigrationFn::Plain(migrations::apply_distill_evidence_source_part);
+    MIGRATION_082_ID, MIGRATION_082_CHECKSUM, MIGRATION_082_DESCRIPTION = (
+        "082_content_refold_queue_and_stats",
+        "sha256:rag-rat-content-refold-queue-and-stats-v82",
+        "Extend content_streams_pending_refold with reason bits and deterministic enqueue timestamps, \
+         add ordered pending selection, and materialize per-stream candidate count/work bytes from \
+         content_entries. SQLite triggers keep the stats exact for inserts, deletes, and mutable \
+         stream_id/signed_bytes updates; existing queue rows backfill as content-candidate work with \
+         min/max candidate receive times",
+    ) => MigrationFn::Plain(migrations::apply_content_refold_queue_and_stats);
+    MIGRATION_083_ID, MIGRATION_083_CHECKSUM, MIGRATION_083_DESCRIPTION = (
+        "083_logical_group_reason_by_evidence",
+        "sha256:rag-rat-logical-group-reason-by-evidence-v83",
+        "Recompute logical_symbols.group_reason from member \
+         evidence — the old value asserted cfg_variant for every \
+         multi-member group (#855)",
+    ) => MigrationFn::Plain(migrations::apply_logical_group_reason_by_evidence);
+    MIGRATION_084_ID, MIGRATION_084_CHECKSUM, MIGRATION_084_DESCRIPTION = (
+        "084_chunk_symbol_id",
+        "sha256:rag-rat-chunk-symbol-id-v84",
+        "Add chunks.symbol_id: the direct rowid of the symbol a code chunk was cut from, written at \
+         index time from the same parse that assigned the symbol its rowid. Replaces position-based \
+         chunk→symbol resolution, which could not disambiguate same-name symbols that nest or share a \
+         physical line. Nullable; backfills on the next reindex of each file (derived data, no SQL \
+         backfill)",
+    ) => MigrationFn::Plain(migrations::apply_chunk_symbol_id);
+    MIGRATION_085_ID, MIGRATION_085_CHECKSUM, MIGRATION_085_DESCRIPTION = (
+        "085_sync_origin_and_edge_tombstone",
+        "sha256:rag-rat-sync-origin-and-edge-tombstone-v85",
+        "Add repo_memories.origin and repo_node_edges.origin ('local'|'synced') and \
+         content_projected_edges.present. The origin column gates the memory reconcile so a synced \
+         row is never re-authored as local /3 content (forging local authorship / re-legitimizing \
+         revoked content); the present column retains edge tombstones so a foreign EdgeRemove is \
+         honored instead of resurrected in an op-log growth loop. Additive; existing rows default to \
+         local/present",
+    ) => MigrationFn::Plain(migrations::apply_sync_origin_and_edge_tombstone);
+    MIGRATION_086_ID, MIGRATION_086_CHECKSUM, MIGRATION_086_DESCRIPTION = (
+        "086_content_digest_state",
+        "sha256:rag-rat-content-digest-state-v86",
+        "Incrementally maintain content_revision (#828): add the one-row content_digest_state table \
+         and the three files_content_digest_* triggers that fold a 256-bit additive multiset hash of \
+         {(path, sha256) : main.files, kind != 'deleted'} via the registered rr_content_digest_fold \
+         scalar, seed the state from a from-scratch Rust fold, and re-stamp every freshness stamp \
+         (index_meta fts_source_revision/content_revision, clone_graph_generations.source_revision, \
+         the clone-graph quiet candidate) that equals the frozen legacy digest so no one-time \
+         FTS/clone rebuild fires. Replaces the O(N) main.files scan with an O(1) state read",
+    ) => MigrationFn::Plain(migrations::apply_content_digest_state);
+    MIGRATION_087_ID, MIGRATION_087_CHECKSUM, MIGRATION_087_DESCRIPTION = (
+        "087_table_sync_bookkeeping",
+        "sha256:rag-rat-table-sync-bookkeeping-v87",
+        "Add the table→log sync engine's bookkeeping tables: sync_published_rows (post-apply \
+         synced-column hash that stops a remotely-applied row being re-signed and rebroadcast — the \
+         anti-echo record), sync_row_clocks (the per-row whole-row last-writer-wins clock an upsert \
+         or delete must beat to win the row), sync_row_tombstones (a per-row deletion clock so an \
+         out-of-order stale delete cannot win and an even older insert cannot resurrect), and \
+         table_sync_entries (the engine's own signed hash-chained entry log, separate from \
+         oplog_entries so the memory-content re-fold never sees a table op). All STRICT; no authored \
+         content — pure sync bookkeeping the fold and producer read",
+    ) => MigrationFn::Plain(migrations::apply_table_sync_tables);
+    MIGRATION_088_ID, MIGRATION_088_CHECKSUM, MIGRATION_088_DESCRIPTION = (
+        "088_clone_postings_row_count",
+        "sha256:rag-rat-clone-postings-row-count-v88",
+        "Cache each clone generation's posting-row count on the generation row (#830): add \
+         clone_graph_generations.postings_row_count and backfill it from COUNT(*) of \
+         clone_subblock_postings per generation. The #598 delta work budget sizes off this count; \
+         reading a maintained column replaces a full COUNT(*) scan of the postings table on every \
+         delta pass. Additive; existing rows backfill from the current postings, and the count is \
+         then maintained transactionally at build (complete_generation) and in each delta write-back",
+    ) => MigrationFn::Plain(migrations::apply_clone_postings_row_count);
+    MIGRATION_089_ID, MIGRATION_089_CHECKSUM, MIGRATION_089_DESCRIPTION = (
+        "089_sync_invites",
+        "sha256:rag-rat-sync-invites-bootstrap-replay-v89",
+        "Add the durable one-time enrollment invite store: a random nonce binds one account, granted \
+         device role, optional label, and expiry; successful redemption stores the exact request \
+         identity, signed DeviceAdd, and exact account-log bootstrap receipt in the same transaction \
+         as invite consumption and key catch-up, so delivery failures can replay the acknowledged \
+         enrollment idempotently and a fresh joiner can authorize its first closed sync",
+    ) => MigrationFn::Plain(migrations::apply_sync_invites);
+    MIGRATION_090_ID, MIGRATION_090_CHECKSUM, MIGRATION_090_DESCRIPTION = (
+        "090_account_candidate_reservations",
+        "sha256:rag-rat-account-candidate-reservations-v90",
+        "Add durable candidate-capacity reservations for outstanding enrollment invites (#949): a \
+         minted invite reserves the exact entries/bytes its mandatory DeviceAdd plus stream-key wraps \
+         will consume, and candidate admission charges active reservations against the same grow-only \
+         counters, so ordinary ingest or a second mint cannot strand an already-minted ticket. \
+         Redemption releases its reservation under the writer lock; expiry frees it",
+    ) => MigrationFn::Plain(migrations::apply_account_candidate_reservations);
+    MIGRATION_091_ID, MIGRATION_091_CHECKSUM, MIGRATION_091_DESCRIPTION = (
+        "091_account_candidate_reservation_targets",
+        "sha256:rag-rat-account-candidate-reservation-targets-v91",
+        "Track the live key-target count each outstanding invite reservation covers \
+         (account_candidate_reservations.reserved_targets, #949): any fold that grows the target set \
+         — local key mints or remotely synced StreamOwn/wrap entries — tops reservations up to the \
+         current mandatory redemption cost, so a minted ticket cannot be stranded by later growth. \
+         Backfilled from reserved_entries - 1, exact for every V090-era row",
+    ) => MigrationFn::Plain(migrations::apply_account_candidate_reservation_targets);
+    MIGRATION_092_ID, MIGRATION_092_CHECKSUM, MIGRATION_092_DESCRIPTION = (
+        "092_sync_invites_normalized_receipts",
+        "sha256:rag-rat-sync-invites-normalized-receipts-v92",
+        "Drop sync_invites.receipt_bytes (#949): consumed invites keep only the joiner-specific \
+         DeviceAdd envelope; the account bootstrap is already durable in the grow-only candidate DAG, \
+         and receipt replay reconstructs the snapshot from it instead of storing one full copy per \
+         invite (quadratic growth across a fleet). Table rebuild preserving every row",
+    ) => MigrationFn::Plain(migrations::apply_sync_invites_normalized_receipts);
+    MIGRATION_093_ID, MIGRATION_093_CHECKSUM, MIGRATION_093_DESCRIPTION = (
+        "093_table_sync_projection_state",
+        "sha256:rag-rat-table-sync-projection-state-v93",
+        "Table-sync forward-compat projection substrate (#1001): mark entries this binary cannot \
+         fully project (pending_reason / pending_projector_version) so a later binary replays them \
+         instead of losing their payload; a table_sync_streams directory recovering the (repo_id, \
+         account_id, scope_id) apply context that the one-way stream id hashes away, without which a \
+         stored entry cannot be replayed at all; and sync_published_rows.projector_version, since the \
+         anti-echo hash covers the hashing binary's column set and is meaningless without that set's \
+         identity",
+    ) => MigrationFn::Plain(migrations::apply_table_sync_projection_state);
+    MIGRATION_094_ID, MIGRATION_094_CHECKSUM, MIGRATION_094_DESCRIPTION = (
+        "094_lens_enrichment_revision",
+        "sha256:rag-rat-lens-enrichment-revision-v94-transactional-history-and-oracle",
+        "Add SQLite triggers that increment a per-repo repo_meta revision when Lens-visible memories, \
+         dream state, papertrail records, clone refinements, Oracle runs, or the live clone graph \
+         change. Bulk writers whose transaction touches one row per indexed edge or commit — \
+         git-history imports and Oracle verdict passes — increment the same clock once at their \
+         transaction boundary instead of once per row. The Lens SSE freshness probe reads only O(1) \
+         indexed rows instead of rescanning enrichment and files tables every polling interval",
+    ) => MigrationFn::Plain(migrations::apply_lens_enrichment_revision);
+    MIGRATION_095_ID, MIGRATION_095_CHECKSUM, MIGRATION_095_DESCRIPTION = (
+        "095_table_sync_spec_version",
+        "sha256:rag-rat-table-sync-spec-version-v95",
+        "Per-table spec versioning for table-sync (#1002): sync_published_rows records the TABLE's \
+         spec_version rather than the store-global projector version, so an unrelated projector bump \
+         no longer marks every table's rows incomparable. The table is necessarily empty (no table is \
+         registered), so it is rebuilt into its final shape rather than carrying a dead column",
+    ) => MigrationFn::Plain(migrations::apply_table_sync_spec_version);
+    MIGRATION_096_ID, MIGRATION_096_CHECKSUM, MIGRATION_096_DESCRIPTION = (
+        "096_table_sync_gapped_entries",
+        "sha256:rag-rat-table-sync-gapped-entries-v96",
+        "Retention for table-sync entries whose chain predecessor has not arrived (#1058): \
+         table_sync_gapped_entries holds a verified entry that links to an unheld predecessor until \
+         that predecessor is accepted, at which point it is promoted through the ordinary accept and \
+         apply path. Previously such an entry was dropped, so a chain delivered out of causal order \
+         could only converge through redelivery in exact order. Deliberately its own table rather \
+         than a status column: six queries read table_sync_entries as the accepted chain — the \
+         authoring Lamport clock, the lamport-advance bound, the chain tail, entry existence, the LWW \
+         winner lookup, and the refold's pending set — and every one of them must keep excluding an \
+         entry that is not on a chain",
+    ) => MigrationFn::Plain(migrations::apply_table_sync_gapped_entries);
+    MIGRATION_097_ID, MIGRATION_097_CHECKSUM, MIGRATION_097_DESCRIPTION = (
+        "097_windows_verbatim_path_rekey",
+        "sha256:rag-rat-windows-verbatim-path-rekey-v97",
+        "Rekey the persisted Windows path spellings an older binary wrote in the \\\\?\\ verbatim \
+         form (#1048): every worktree_id scope key, repo_roots.root, the path-valued meta keys \
+         (source_root and the git_history_indexed_root reload cursor), and the worktree_overlay_basis \
+         keys whose suffix is a worktree_id. Production now canonicalizes to the plain spelling, and \
+         these values are compared textually against it — left stale, the overlay and dirty rows fall \
+         out of the active scope and GC prunes them as a dead checkout, and the git-history gate \
+         forces a full revwalk plus a blame-cache wipe. Rewriting uses the same rule canonicalization \
+         does, so a verbatim path that is still load-bearing (UNC, >MAX_PATH, reserved DOS names) is \
+         kept. Runs on every host: which spellings a store carries is a property of the store, not of \
+         the binary that opens it",
+    ) => MigrationFn::Plain(migrations::apply_windows_verbatim_path_rekey);
+    MIGRATION_098_ID, MIGRATION_098_CHECKSUM, MIGRATION_098_DESCRIPTION = (
+        "098_reindex_after_unix_backslash_rendering",
+        "sha256:rag-rat-reindex-after-unix-backslash-rendering-v98",
+        "Force the next ordinary index pass to re-walk the tree and reload git history, so a store an \
+         older binary wrote before the Unix backslash-rendering fix (#1032) re-derives its path-keyed \
+         rows off the corrected spelling. That binary collapsed a literal backslash in a Unix \
+         filename to a separator, so files.path and the symbol identities keyed on it could not be \
+         told apart from a genuinely nested sibling; the old rendering was lossy, so the stored \
+         spelling cannot be repaired in place — only a re-walk recovers the truth. This deletes the \
+         freshness markers that gate that work: the base-scope discovery marker (files re-walk, which \
+         cascades chunks, symbols, and edges), the git-history root cursor (a full revwalk, which \
+         re-derives the commit and file-change rows and the change couplings folded off its freshness \
+         key), and the worktree_overlay_basis keys (per-checkout overlay re-derive); it also clears \
+         parser_failures, the one path-keyed derived table a file re-walk does not cascade. Runs on \
+         every host: which spellings a store carries is a property of the store, not of the binary \
+         that opens it",
+    ) => MigrationFn::Plain(migrations::apply_reindex_after_unix_backslash_rendering);
+    MIGRATION_099_ID, MIGRATION_099_CHECKSUM, MIGRATION_099_DESCRIPTION = (
+        "099_table_sync_repo_incarnations",
+        "sha256:rag-rat-table-sync-repo-incarnations-v99",
+        "Add the owner-authorized repository-incarnation projection and /5 table-sync substrate: \
+         incarnation-bound stream contexts, stream-isolated row clocks/publication/tombstones, and \
+         retained per-device chain-tip witnesses that survive local repository purge. Pre-transport \
+         /4 table-sync state is cleared because it has no account-authorized incarnation identity",
+    ) => MigrationFn::Plain(migrations::apply_table_sync_repo_incarnations);
+    MIGRATION_100_ID, MIGRATION_100_CHECKSUM, MIGRATION_100_DESCRIPTION = (
+        "100_receiver_type_hint_interning",
+        "sha256:rag-rat-receiver-type-hint-and-callee-aware-edge-identity-v100",
+        "Add edges_data.receiver_type_hint_id for conservative \
+         Rust receiver-type resolution and persist stable callee \
+         identity for call-path validation",
+    ) => MigrationFn::Plain(migrations::apply_receiver_type_hint_interning);
+    MIGRATION_101_ID, MIGRATION_101_CHECKSUM, MIGRATION_101_DESCRIPTION = (
+        "101_file_graph_version_provenance",
+        "sha256:rag-rat-file-graph-version-provenance-v101",
+        "Add per-file graph and scope derivation provenance so an \
+         active checkout can refresh only rows whose bytes it can \
+         verify, while linked worktrees retain and later complete \
+         their own upgrade",
+    ) => MigrationFn::Plain(migrations::apply_file_graph_version_provenance);
+    MIGRATION_102_ID, MIGRATION_102_CHECKSUM, MIGRATION_102_DESCRIPTION = (
+        "102_lens_lane_revisions",
+        "sha256:rag-rat-lens-lane-revisions-v102",
+        "Add independent O(1), per-repo Lens revision clocks for \
+         symbols, clones, memories, coupling, and papertrail so \
+         editor clients refetch only lanes whose backing data \
+         changed while the aggregate legacy clock remains intact",
+    ) => MigrationFn::Plain(migrations::apply_lens_lane_revisions);
+    MIGRATION_103_ID, MIGRATION_103_CHECKSUM, MIGRATION_103_DESCRIPTION = (
+        "103_syncable_memory_bindings",
+        "sha256:rag-rat-syncable-memory-bindings-v103",
+        "Rebuild memory bindings as a strict, repository-keyed, \
+         dependency-free table suitable for deterministic \
+         anchors/1 whole-row replication",
+    ) => MigrationFn::Plain(migrations::apply_syncable_memory_bindings);
+    MIGRATION_104_ID, MIGRATION_104_CHECKSUM, MIGRATION_104_DESCRIPTION = (
+        "104_table_sync_readoption",
+        "sha256:rag-rat-table-sync-readoption-v104",
+        "Add the durable table-sync re-adoption worklist and audit log (#997): an effective \
+         DeviceRemove enqueues one item per affected stream, which a current writer drains by \
+         re-authoring the removed writer's surviving LWW state under its own chain",
+    ) => MigrationFn::Plain(migrations::apply_table_sync_readoption);
+    MIGRATION_105_ID, MIGRATION_105_CHECKSUM, MIGRATION_105_DESCRIPTION = (
+        "105_table_sync_retained_floors",
+        "sha256:rag-rat-table-sync-retained-floors-v105",
+        "Add table_sync_retained_floors (#1127): the per-(stream, \
+         device) chain prefix floor an accepted-entry compaction \
+         has reclaimed below, so peers and the accept path can \
+         tell an intentionally pruned prefix from a chain gap",
+    ) => MigrationFn::Plain(migrations::apply_table_sync_retained_floors);
+    MIGRATION_106_ID, MIGRATION_106_CHECKSUM, MIGRATION_106_DESCRIPTION = (
+        "106_readoption_audit_nullable_winner",
+        "sha256:rag-rat-readoption-audit-nullable-winner-v106",
+        "Make table_sync_readoption_audit.original_entry_hash \
+         nullable (#1127): a winner reclaimed by accepted-entry \
+         compaction before re-adoption ran has no hash to record; \
+         the slot stays named by (stream, device, lamport)",
+    ) => MigrationFn::Plain(migrations::apply_readoption_audit_nullable_winner);
+    MIGRATION_107_ID, MIGRATION_107_CHECKSUM, MIGRATION_107_DESCRIPTION = (
+        "107_syncable_overlay_tables",
+        "sha256:rag-rat-syncable-overlay-tables-v107",
+        "Drop the Lens revision triggers on memory_reality and memory_summaries (#1133): the \
+         overlay/1 table-sync scope applies these rows under whole-row LWW, and a trigger firing on a \
+         wire-applied row is a device-local side effect; the dream write and the sync apply advance \
+         the Lens lanes explicitly instead",
+    ) => MigrationFn::Plain(migrations::apply_syncable_overlay_tables);
+    MIGRATION_108_ID, MIGRATION_108_CHECKSUM, MIGRATION_108_DESCRIPTION = (
+        "108_syncable_distill_records",
+        "sha256:rag-rat-syncable-distill-records-v108",
+        "Rebuild papertrail_distill onto the thread natural key (repo_id first), dropping the \
+         device-local AUTOINCREMENT id, so the distill/1 table-sync scope can replicate distilled \
+         records under whole-row LWW (#1135); also drops its Lens revision triggers (the sync apply \
+         advances the papertrail lane explicitly)",
+    ) => MigrationFn::Plain(migrations::apply_syncable_distill_records);
+    MIGRATION_109_ID, MIGRATION_109_CHECKSUM, MIGRATION_109_DESCRIPTION = (
+        "109_syncable_distill_edges_and_alternatives",
+        "sha256:rag-rat-syncable-distill-edges-and-alternatives-v109",
+        "Rebuild papertrail_distill_edges and papertrail_distill_alternatives onto their thread \
+         natural keys (repo_id first), dropping the device-local AUTOINCREMENT id, so these distill \
+         enrichment children replicate on the distill/1 table-sync scope under whole-row LWW (#1137)",
+    ) => MigrationFn::Plain(migrations::apply_syncable_distill_edges_and_alternatives);
+    MIGRATION_110_ID, MIGRATION_110_CHECKSUM, MIGRATION_110_DESCRIPTION = (
+        "110_syncable_distill_record_commits",
+        "sha256:rag-rat-syncable-distill-record-commits-v110",
+        "Rebuild papertrail_distill_record_commits onto its natural key (repo_id first), dropping the \
+         device-local AUTOINCREMENT id and adding a created_at_ms non-key column so the key-only \
+         table can replicate on the distill/1 table-sync scope under whole-row LWW (#1139)",
+    ) => MigrationFn::Plain(migrations::apply_syncable_distill_record_commits);
+    MIGRATION_111_ID, MIGRATION_111_CHECKSUM, MIGRATION_111_DESCRIPTION = (
+        "111_syncable_distill_evidence",
+        "sha256:rag-rat-syncable-distill-evidence-v111",
+        "Rebuild papertrail_distill_evidence onto its natural key (repo_id first) with a per-thread \
+         ordinal, dropping the device-local AUTOINCREMENT id, so the distill evidence child \
+         replicates on the distill/1 table-sync scope under whole-row LWW (#1139)",
+    ) => MigrationFn::Plain(migrations::apply_syncable_distill_evidence);
+    MIGRATION_112_ID, MIGRATION_112_CHECKSUM, MIGRATION_112_DESCRIPTION = (
+        "112_syncable_distill_anchors",
+        "sha256:rag-rat-syncable-distill-anchors-v112",
+        "Rebuild papertrail_distill_anchors onto its natural key (repo_id first), dropping the \
+         device-local AUTOINCREMENT id and its Lens revision triggers, so the distill anchors child \
+         replicates on the distill/1 table-sync scope under whole-row LWW; logical_symbol_id and \
+         resolved stay checkout-local and never replicate (#1139)",
+    ) => MigrationFn::Plain(migrations::apply_syncable_distill_anchors);
+    MIGRATION_113_ID, MIGRATION_113_CHECKSUM, MIGRATION_113_DESCRIPTION = (
+        "113_refold_content_streams_for_lamport_clamp",
+        "sha256:rag-rat-refold-content-streams-for-lamport-clamp-v113",
+        "Queue every /3 content stream for an acceptance refold so entries accepted before the \
+         lamport clamp existed are re-judged under it; a stale accepted near-ceiling lamport would \
+         otherwise keep dominating LWW and blocking authoring on an upgraded store while a fresh \
+         replica parks the same entry and diverges (#1176)",
+    ) => MigrationFn::WithHooks(migrations::apply_refold_content_streams_for_lamport_clamp);
+    MIGRATION_114_ID, MIGRATION_114_CHECKSUM, MIGRATION_114_DESCRIPTION = (
+        "114_content_entries_lamport_column",
+        "sha256:rag-rat-content-entries-lamport-column-v114",
+        "Denormalize the /3 header lamport into a content_entries column (backfilled from the signed \
+         envelopes) with a partial (stream_id, lamport) accepted-rows index, so the accepted stream \
+         clock is an indexed MAX instead of a per-read decode of every accepted envelope — the \
+         ingest-time bounded-advance gate and the authoring mint both read it (#1176)",
+    ) => MigrationFn::WithHooks(migrations::apply_content_entries_lamport_column);
+    MIGRATION_115_ID, MIGRATION_115_CHECKSUM, MIGRATION_115_DESCRIPTION = (
+        "115_refold_account_authority_projections",
+        "sha256:rag-rat-refold-account-authority-projections-v115",
+        "Rebuild every account's persisted authority projection from its candidate DAG, so a grant a \
+         pre-gate binary folded effective on a private stream is re-judged under the fold's \
+         grants-require-PublicRead rule at upgrade time — the projected account_stream_grants row \
+         would otherwise keep answering Effective until some unrelated ingest happened to refold that \
+         account (#1178)",
+    ) => MigrationFn::Plain(migrations::apply_refold_account_authority_projections);
+    MIGRATION_116_ID, MIGRATION_116_CHECKSUM, MIGRATION_116_DESCRIPTION = (
+        "116_writer_invites",
+        "sha256:rag-rat-writer-invites-v116",
+        "Rebuild sync_invites so an invite can be a cross-account WRITER invite (#1179): the role \
+         gains the writer marker, a writer row carries the target stream_id (the grant is authored at \
+         redemption, when the contributor account is first known), and the used-columns check \
+         branches by role — a writer redemption records the dialing node and the authored grant id, \
+         never device enrollment keys",
+    ) => MigrationFn::Plain(migrations::apply_writer_invites);
+    MIGRATION_117_ID, MIGRATION_117_CHECKSUM, MIGRATION_117_DESCRIPTION = (
+        "117_content_author_stream_index",
+        "sha256:rag-rat-content-author-stream-index-v117",
+        "Index /3 content entries by (author_account_id, stream_id) over accepted rows, so the \
+         pre-authentication servability probe can enumerate the streams an account has actually \
+         authored onto as an indexed scan instead of a per-dial table walk (#1185)",
+    ) => MigrationFn::Plain(migrations::apply_content_author_stream_index);
+    MIGRATION_118_ID, MIGRATION_118_CHECKSUM, MIGRATION_118_DESCRIPTION = (
+        "118_content_projected_node_anchors",
+        "sha256:rag-rat-content-projected-node-anchors-v118",
+        "Add the nullable anchors_json column to content_projected_nodes so the /3 fold can carry a \
+         node's portable anchor set (#1209). NULL means no node_anchors op has been folded for that \
+         node, which is distinct from an author publishing an empty set; existing rows stay NULL \
+         until the accompanying content-projector bump re-folds their stream from the accepted \
+         entries it already retains",
+    ) => MigrationFn::Plain(migrations::apply_content_projected_node_anchors);
+    MIGRATION_119_ID, MIGRATION_119_CHECKSUM, MIGRATION_119_DESCRIPTION = (
+        "119_content_projected_node_source_hash",
+        "sha256:rag-rat-content-projected-node-source-hash-v119",
+        "Add the nullable source_text_hash column to content_projected_nodes so the /3 fold can carry \
+         the text a memory's author anchored to (#1213). A receiver compares it against its own \
+         checkout to demote a drifted anchor; NULL means no node_source_hash op has been folded, \
+         which surfaces unmarked rather than as evidence of drift",
+    ) => MigrationFn::Plain(migrations::apply_content_projected_node_source_hash);
+    MIGRATION_120_ID, MIGRATION_120_CHECKSUM, MIGRATION_120_DESCRIPTION = (
+        "120_memory_applied_anchor_snapshot",
+        "sha256:rag-rat-memory-applied-anchor-snapshot-v120",
+        "Record what the memory drain last applied to a synced memory (#1243): \
+         repo_memories.anchors_applied_digest and source_hash_applied, so an author's later rebind \
+         replaces them without undoing local relocation, and anchors_applied_targets, the kind and \
+         signature that set named for each symbol anchor, to tell a retarget from a republish. Add \
+         content_projected_nodes.anchors_author, the account that authored each node's winning anchor \
+         set, so the drain leaves a set its own account's anchors/1 carries to that carrier",
+    ) => MigrationFn::Plain(migrations::apply_memory_applied_anchor_snapshot);
+    MIGRATION_121_ID, MIGRATION_121_CHECKSUM, MIGRATION_121_DESCRIPTION = (
+        "121_refold_for_held_control_log_freshness",
+        "sha256:rag-rat-refold-for-held-control-log-freshness-v121",
+        "Queue every /3 content stream for an acceptance refold and refold every account, so content \
+         and secrets-log wraps parked auth_len_ahead after a cut lowered the cited account's \
+         effective count are re-judged against the held control log (#1282)",
+    ) => MigrationFn::Plain(migrations::apply_refold_for_held_control_log_freshness);
+    MIGRATION_122_ID, MIGRATION_122_CHECKSUM, MIGRATION_122_DESCRIPTION = (
+        "122_memory_parked_anchor_baselines",
+        "sha256:rag-rat-memory-parked-anchor-baselines-v122",
+        "Add repo_memory_parked_baselines, where the memory drain parks a condemned or quarantined \
+         synced memory's applied-anchor baseline while its row is gone (#1298). Its bindings stay, \
+         since they replicate on anchors/1 and deleting them would remove them from every device the \
+         memory is still live on; the parked baseline lets a returning memory converge on a rebind \
+         published while it was away",
+    ) => MigrationFn::Plain(migrations::apply_memory_parked_anchor_baselines);
+    MIGRATION_123_ID, MIGRATION_123_CHECKSUM, MIGRATION_123_DESCRIPTION = (
+        "123_memory_binding_resolution",
+        "sha256:rag-rat-memory-binding-resolution-v123",
+        "Add this store's resolution of each memory binding beside the authored anchor \
+         (resolved_binding_id, resolved_path, resolved_start_line, resolved_end_line, \
+         resolved_symbol_kind, resolved_signature_hash, resolved_moniker_tool_version on \
+         repo_memory_bindings), so relocation writes local columns and no longer republishes the row \
+         on anchors/1 (#1297)",
+    ) => MigrationFn::Plain(migrations::apply_memory_binding_resolution);
+    MIGRATION_124_ID, MIGRATION_124_CHECKSUM, MIGRATION_124_DESCRIPTION = (
+        "124_content_projected_superseded_anchors",
+        "sha256:rag-rat-content-projected-superseded-anchors-v124",
+        "Add superseded_anchors_json to content_projected_nodes: the anchor sets a node's register \
+         held before the winning one, so the memory drain can tell binding rows that are the image of \
+         a publication it has superseded from rows of one still in flight (#1304)",
+    ) => MigrationFn::Plain(migrations::apply_content_projected_superseded_anchors);
+    MIGRATION_125_ID, MIGRATION_125_CHECKSUM, MIGRATION_125_DESCRIPTION = (
+        "125_refold_for_concurrent_cut_vouch",
+        "sha256:rag-rat-refold-for-concurrent-cut-vouch-v125",
+        "Refold every account and queue every /3 content stream for an acceptance refold, so control \
+         ops authored concurrently with a revoking cut and parked auth_len_ahead behind the ops it \
+         condemned are re-judged with the cut vouching for them (#1301)",
+    ) => MigrationFn::Plain(migrations::apply_refold_for_concurrent_cut_vouch);
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1211,753 +1375,6 @@ fn apply_and_record_migration(
     migrations::record_migration(&tx, step.id, step.checksum, step.description)?;
     tx.commit()
 }
-
-const ADDITIVE_MIGRATIONS: &[Migration] = &[
-    Migration {
-        id: MIGRATION_002_ID,
-        checksum: MIGRATION_002_CHECKSUM,
-        description: MIGRATION_002_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_embedding_vector_metadata),
-    },
-    Migration {
-        id: MIGRATION_003_ID,
-        checksum: MIGRATION_003_CHECKSUM,
-        description: MIGRATION_003_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_derived_artifact_reconcile_metadata),
-    },
-    Migration {
-        id: MIGRATION_004_ID,
-        checksum: MIGRATION_004_CHECKSUM,
-        description: MIGRATION_004_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_edge_source_target_spans),
-    },
-    Migration {
-        id: MIGRATION_005_ID,
-        checksum: MIGRATION_005_CHECKSUM,
-        description: MIGRATION_005_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_edge_evidence_and_resolution),
-    },
-    Migration {
-        id: MIGRATION_006_ID,
-        checksum: MIGRATION_006_CHECKSUM,
-        description: MIGRATION_006_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_embedding_policy_and_input_hash),
-    },
-    Migration {
-        id: MIGRATION_007_ID,
-        checksum: MIGRATION_007_CHECKSUM,
-        description: MIGRATION_007_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_logical_symbol_groups),
-    },
-    Migration {
-        id: MIGRATION_008_ID,
-        checksum: MIGRATION_008_CHECKSUM,
-        description: MIGRATION_008_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_commit_addressable_worktrees),
-    },
-    Migration {
-        id: MIGRATION_009_ID,
-        checksum: MIGRATION_009_CHECKSUM,
-        description: MIGRATION_009_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_github_ref_sync),
-    },
-    Migration {
-        id: MIGRATION_010_ID,
-        checksum: MIGRATION_010_CHECKSUM,
-        description: MIGRATION_010_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_symbol_facts),
-    },
-    Migration {
-        id: MIGRATION_011_ID,
-        checksum: MIGRATION_011_CHECKSUM,
-        description: MIGRATION_011_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_repo_memories),
-    },
-    Migration {
-        id: MIGRATION_012_ID,
-        checksum: MIGRATION_012_CHECKSUM,
-        description: MIGRATION_012_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_repo_memory_call_paths),
-    },
-    Migration {
-        id: MIGRATION_013_ID,
-        checksum: MIGRATION_013_CHECKSUM,
-        description: MIGRATION_013_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_graph_file_lookup_indexes),
-    },
-    Migration {
-        id: MIGRATION_014_ID,
-        checksum: MIGRATION_014_CHECKSUM,
-        description: MIGRATION_014_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_memory_binding_signals),
-    },
-    Migration {
-        id: MIGRATION_015_ID,
-        checksum: MIGRATION_015_CHECKSUM,
-        description: MIGRATION_015_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_repo_memory_call_path_edges),
-    },
-    Migration {
-        id: MIGRATION_016_ID,
-        checksum: MIGRATION_016_CHECKSUM,
-        description: MIGRATION_016_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_symbol_line_spans),
-    },
-    Migration {
-        id: MIGRATION_017_ID,
-        checksum: MIGRATION_017_CHECKSUM,
-        description: MIGRATION_017_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_edge_callee_byte_range),
-    },
-    Migration {
-        id: MIGRATION_018_ID,
-        checksum: MIGRATION_018_CHECKSUM,
-        description: MIGRATION_018_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_oracle_tables),
-    },
-    Migration {
-        id: MIGRATION_019_ID,
-        checksum: MIGRATION_019_CHECKSUM,
-        description: MIGRATION_019_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_scip_moniker_anchors),
-    },
-    Migration {
-        id: MIGRATION_020_ID,
-        checksum: MIGRATION_020_CHECKSUM,
-        description: MIGRATION_020_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_edge_string_interning),
-    },
-    Migration {
-        id: MIGRATION_021_ID,
-        checksum: MIGRATION_021_CHECKSUM,
-        description: MIGRATION_021_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_symbol_scope_path),
-    },
-    Migration {
-        id: MIGRATION_022_ID,
-        checksum: MIGRATION_022_CHECKSUM,
-        description: MIGRATION_022_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_per_package_import_scope),
-    },
-    Migration {
-        id: MIGRATION_023_ID,
-        checksum: MIGRATION_023_CHECKSUM,
-        description: MIGRATION_023_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_edges_view_refresh),
-    },
-    Migration {
-        id: MIGRATION_024_ID,
-        checksum: MIGRATION_024_CHECKSUM,
-        description: MIGRATION_024_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_files_has_test_code),
-    },
-    Migration {
-        id: MIGRATION_025_ID,
-        checksum: MIGRATION_025_CHECKSUM,
-        description: MIGRATION_025_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_chunk_text_compression_tables),
-    },
-    Migration {
-        id: MIGRATION_026_ID,
-        checksum: MIGRATION_026_CHECKSUM,
-        description: MIGRATION_026_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_contentless_chunk_fts),
-    },
-    Migration {
-        id: MIGRATION_027_ID,
-        checksum: MIGRATION_027_CHECKSUM,
-        description: MIGRATION_027_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_drop_chunks_text),
-    },
-    Migration {
-        id: MIGRATION_028_ID,
-        checksum: MIGRATION_028_CHECKSUM,
-        description: MIGRATION_028_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_intern_symbol_qualified_names),
-    },
-    Migration {
-        id: MIGRATION_029_ID,
-        checksum: MIGRATION_029_CHECKSUM,
-        description: MIGRATION_029_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_clone_fingerprint_tables),
-    },
-    Migration {
-        id: MIGRATION_030_ID,
-        checksum: MIGRATION_030_CHECKSUM,
-        description: MIGRATION_030_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_clone_refinements_lcs_sampled),
-    },
-    Migration {
-        id: MIGRATION_031_ID,
-        checksum: MIGRATION_031_CHECKSUM,
-        description: MIGRATION_031_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_edge_oracle_content_anchor),
-    },
-    Migration {
-        id: MIGRATION_032_ID,
-        checksum: MIGRATION_032_CHECKSUM,
-        description: MIGRATION_032_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_token_bag_blob),
-    },
-    Migration {
-        id: MIGRATION_033_ID,
-        checksum: MIGRATION_033_CHECKSUM,
-        description: MIGRATION_033_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_dream_findings),
-    },
-    Migration {
-        id: MIGRATION_034_ID,
-        checksum: MIGRATION_034_CHECKSUM,
-        description: MIGRATION_034_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_clone_graph_tables),
-    },
-    Migration {
-        id: MIGRATION_035_ID,
-        checksum: MIGRATION_035_CHECKSUM,
-        description: MIGRATION_035_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_symbols_is_test),
-    },
-    Migration {
-        id: MIGRATION_036_ID,
-        checksum: MIGRATION_036_CHECKSUM,
-        description: MIGRATION_036_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_embedding_content_cache),
-    },
-    Migration {
-        id: MIGRATION_037_ID,
-        checksum: MIGRATION_037_CHECKSUM,
-        description: MIGRATION_037_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_clone_subblock_postings_tables),
-    },
-    Migration {
-        id: MIGRATION_038_ID,
-        checksum: MIGRATION_038_CHECKSUM,
-        description: MIGRATION_038_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_repos_registry),
-    },
-    Migration {
-        id: MIGRATION_039_ID,
-        checksum: MIGRATION_039_CHECKSUM,
-        description: MIGRATION_039_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_move_per_repo_meta),
-    },
-    Migration {
-        id: MIGRATION_040_ID,
-        checksum: MIGRATION_040_CHECKSUM,
-        description: MIGRATION_040_DESCRIPTION,
-        apply: MigrationFn::WithHooks(migrations::apply_repo_id_core_scoping),
-    },
-    Migration {
-        id: MIGRATION_041_ID,
-        checksum: MIGRATION_041_CHECKSUM,
-        description: MIGRATION_041_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_github_repo_id_scoping),
-    },
-    Migration {
-        id: MIGRATION_042_ID,
-        checksum: MIGRATION_042_CHECKSUM,
-        description: MIGRATION_042_DESCRIPTION,
-        apply: MigrationFn::WithHooks(migrations::apply_repo_id_periphery_scoping),
-    },
-    Migration {
-        id: MIGRATION_043_ID,
-        checksum: MIGRATION_043_CHECKSUM,
-        description: MIGRATION_043_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_files_generation),
-    },
-    Migration {
-        id: MIGRATION_044_ID,
-        checksum: MIGRATION_044_CHECKSUM,
-        description: MIGRATION_044_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_github_natural_key_widening),
-    },
-    Migration {
-        id: MIGRATION_045_ID,
-        checksum: MIGRATION_045_CHECKSUM,
-        description: MIGRATION_045_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_github_child_key_widening),
-    },
-    Migration {
-        id: MIGRATION_046_ID,
-        checksum: MIGRATION_046_CHECKSUM,
-        description: MIGRATION_046_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_memory_verification_tables),
-    },
-    Migration {
-        id: MIGRATION_047_ID,
-        checksum: MIGRATION_047_CHECKSUM,
-        description: MIGRATION_047_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_memory_model_failures_table),
-    },
-    Migration {
-        id: MIGRATION_048_ID,
-        checksum: MIGRATION_048_CHECKSUM,
-        description: MIGRATION_048_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_memory_payload_json),
-    },
-    Migration {
-        id: MIGRATION_049_ID,
-        checksum: MIGRATION_049_CHECKSUM,
-        description: MIGRATION_049_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_repo_node_edges),
-    },
-    Migration {
-        id: MIGRATION_050_ID,
-        checksum: MIGRATION_050_CHECKSUM,
-        description: MIGRATION_050_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_clone_delta_maintenance),
-    },
-    Migration {
-        id: MIGRATION_051_ID,
-        checksum: MIGRATION_051_CHECKSUM,
-        description: MIGRATION_051_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_clone_df_epoch),
-    },
-    Migration {
-        id: MIGRATION_052_ID,
-        checksum: MIGRATION_052_CHECKSUM,
-        description: MIGRATION_052_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_oplog_storage),
-    },
-    Migration {
-        id: MIGRATION_053_ID,
-        checksum: MIGRATION_053_CHECKSUM,
-        description: MIGRATION_053_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_oplog_stream_scoping),
-    },
-    Migration {
-        id: MIGRATION_054_ID,
-        checksum: MIGRATION_054_CHECKSUM,
-        description: MIGRATION_054_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_oplog_device_identity),
-    },
-    Migration {
-        id: MIGRATION_055_ID,
-        checksum: MIGRATION_055_CHECKSUM,
-        description: MIGRATION_055_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_binding_downgrade_marker),
-    },
-    Migration {
-        id: MIGRATION_056_ID,
-        checksum: MIGRATION_056_CHECKSUM,
-        description: MIGRATION_056_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_git_change_couplings),
-    },
-    Migration {
-        id: MIGRATION_057_ID,
-        checksum: MIGRATION_057_CHECKSUM,
-        description: MIGRATION_057_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_external_symbols),
-    },
-    Migration {
-        id: MIGRATION_058_ID,
-        checksum: MIGRATION_058_CHECKSUM,
-        description: MIGRATION_058_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_oplog_device_x25519),
-    },
-    Migration {
-        id: MIGRATION_059_ID,
-        checksum: MIGRATION_059_CHECKSUM,
-        description: MIGRATION_059_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_account_candidate_dag),
-    },
-    Migration {
-        id: MIGRATION_060_ID,
-        checksum: MIGRATION_060_CHECKSUM,
-        description: MIGRATION_060_DESCRIPTION,
-        apply: MigrationFn::WithHooks(migrations::apply_papertrail_provider_neutral_schema),
-    },
-    Migration {
-        id: MIGRATION_061_ID,
-        checksum: MIGRATION_061_CHECKSUM,
-        description: MIGRATION_061_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_papertrail_ref_item_kind),
-    },
-    Migration {
-        id: MIGRATION_062_ID,
-        checksum: MIGRATION_062_CHECKSUM,
-        description: MIGRATION_062_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_papertrail_comment_cursor),
-    },
-    Migration {
-        id: MIGRATION_063_ID,
-        checksum: MIGRATION_063_CHECKSUM,
-        description: MIGRATION_063_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_papertrail_mirror_resume_state),
-    },
-    Migration {
-        id: MIGRATION_064_ID,
-        checksum: MIGRATION_064_CHECKSUM,
-        description: MIGRATION_064_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_account_authority_projection),
-    },
-    Migration {
-        id: MIGRATION_065_ID,
-        checksum: MIGRATION_065_CHECKSUM,
-        description: MIGRATION_065_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_account_authority_boundaries),
-    },
-    Migration {
-        id: MIGRATION_066_ID,
-        checksum: MIGRATION_066_CHECKSUM,
-        description: MIGRATION_066_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_content_candidate_dag),
-    },
-    Migration {
-        id: MIGRATION_067_ID,
-        checksum: MIGRATION_067_CHECKSUM,
-        description: MIGRATION_067_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_papertrail_binding_health),
-    },
-    Migration {
-        id: MIGRATION_068_ID,
-        checksum: MIGRATION_068_CHECKSUM,
-        description: MIGRATION_068_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_edges_view_refresh),
-    },
-    Migration {
-        id: MIGRATION_069_ID,
-        checksum: MIGRATION_069_CHECKSUM,
-        description: MIGRATION_069_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_oplog_local_account),
-    },
-    Migration {
-        id: MIGRATION_070_ID,
-        checksum: MIGRATION_070_CHECKSUM,
-        description: MIGRATION_070_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_content_projected_tables),
-    },
-    Migration {
-        id: MIGRATION_071_ID,
-        checksum: MIGRATION_071_CHECKSUM,
-        description: MIGRATION_071_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_edge_target_qname_index),
-    },
-    Migration {
-        id: MIGRATION_072_ID,
-        checksum: MIGRATION_072_CHECKSUM,
-        description: MIGRATION_072_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_content_streams_pending_refold),
-    },
-    Migration {
-        id: MIGRATION_073_ID,
-        checksum: MIGRATION_073_CHECKSUM,
-        description: MIGRATION_073_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_papertrail_distill_substrate),
-    },
-    Migration {
-        id: MIGRATION_074_ID,
-        checksum: MIGRATION_074_CHECKSUM,
-        description: MIGRATION_074_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_edges_view_scalar_suppression),
-    },
-    Migration {
-        id: MIGRATION_075_ID,
-        checksum: MIGRATION_075_CHECKSUM,
-        description: MIGRATION_075_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_edges_hidden_flag),
-    },
-    Migration {
-        id: MIGRATION_076_ID,
-        checksum: MIGRATION_076_CHECKSUM,
-        description: MIGRATION_076_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_sync_security_events),
-    },
-    Migration {
-        id: MIGRATION_077_ID,
-        checksum: MIGRATION_077_CHECKSUM,
-        description: MIGRATION_077_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_distill_record_store),
-    },
-    Migration {
-        id: MIGRATION_078_ID,
-        checksum: MIGRATION_078_CHECKSUM,
-        description: MIGRATION_078_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_distill_anchor_selection),
-    },
-    Migration {
-        id: MIGRATION_079_ID,
-        checksum: MIGRATION_079_CHECKSUM,
-        description: MIGRATION_079_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_distill_safe_input_snapshot),
-    },
-    Migration {
-        id: MIGRATION_080_ID,
-        checksum: MIGRATION_080_CHECKSUM,
-        description: MIGRATION_080_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_distill_enriched_context),
-    },
-    Migration {
-        id: MIGRATION_081_ID,
-        checksum: MIGRATION_081_CHECKSUM,
-        description: MIGRATION_081_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_distill_evidence_source_part),
-    },
-    Migration {
-        id: MIGRATION_082_ID,
-        checksum: MIGRATION_082_CHECKSUM,
-        description: MIGRATION_082_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_content_refold_queue_and_stats),
-    },
-    Migration {
-        id: MIGRATION_083_ID,
-        checksum: MIGRATION_083_CHECKSUM,
-        description: MIGRATION_083_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_logical_group_reason_by_evidence),
-    },
-    Migration {
-        id: MIGRATION_084_ID,
-        checksum: MIGRATION_084_CHECKSUM,
-        description: MIGRATION_084_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_chunk_symbol_id),
-    },
-    Migration {
-        id: MIGRATION_085_ID,
-        checksum: MIGRATION_085_CHECKSUM,
-        description: MIGRATION_085_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_sync_origin_and_edge_tombstone),
-    },
-    Migration {
-        id: MIGRATION_086_ID,
-        checksum: MIGRATION_086_CHECKSUM,
-        description: MIGRATION_086_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_content_digest_state),
-    },
-    Migration {
-        id: MIGRATION_087_ID,
-        checksum: MIGRATION_087_CHECKSUM,
-        description: MIGRATION_087_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_table_sync_tables),
-    },
-    Migration {
-        id: MIGRATION_088_ID,
-        checksum: MIGRATION_088_CHECKSUM,
-        description: MIGRATION_088_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_clone_postings_row_count),
-    },
-    Migration {
-        id: MIGRATION_089_ID,
-        checksum: MIGRATION_089_CHECKSUM,
-        description: MIGRATION_089_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_sync_invites),
-    },
-    Migration {
-        id: MIGRATION_090_ID,
-        checksum: MIGRATION_090_CHECKSUM,
-        description: MIGRATION_090_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_account_candidate_reservations),
-    },
-    Migration {
-        id: MIGRATION_091_ID,
-        checksum: MIGRATION_091_CHECKSUM,
-        description: MIGRATION_091_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_account_candidate_reservation_targets),
-    },
-    Migration {
-        id: MIGRATION_092_ID,
-        checksum: MIGRATION_092_CHECKSUM,
-        description: MIGRATION_092_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_sync_invites_normalized_receipts),
-    },
-    Migration {
-        id: MIGRATION_093_ID,
-        checksum: MIGRATION_093_CHECKSUM,
-        description: MIGRATION_093_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_table_sync_projection_state),
-    },
-    Migration {
-        id: MIGRATION_094_ID,
-        checksum: MIGRATION_094_CHECKSUM,
-        description: MIGRATION_094_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_lens_enrichment_revision),
-    },
-    Migration {
-        id: MIGRATION_095_ID,
-        checksum: MIGRATION_095_CHECKSUM,
-        description: MIGRATION_095_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_table_sync_spec_version),
-    },
-    Migration {
-        id: MIGRATION_096_ID,
-        checksum: MIGRATION_096_CHECKSUM,
-        description: MIGRATION_096_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_table_sync_gapped_entries),
-    },
-    Migration {
-        id: MIGRATION_097_ID,
-        checksum: MIGRATION_097_CHECKSUM,
-        description: MIGRATION_097_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_windows_verbatim_path_rekey),
-    },
-    Migration {
-        id: MIGRATION_098_ID,
-        checksum: MIGRATION_098_CHECKSUM,
-        description: MIGRATION_098_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_reindex_after_unix_backslash_rendering),
-    },
-    Migration {
-        id: MIGRATION_099_ID,
-        checksum: MIGRATION_099_CHECKSUM,
-        description: MIGRATION_099_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_table_sync_repo_incarnations),
-    },
-    Migration {
-        id: MIGRATION_100_ID,
-        checksum: MIGRATION_100_CHECKSUM,
-        description: MIGRATION_100_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_receiver_type_hint_interning),
-    },
-    Migration {
-        id: MIGRATION_101_ID,
-        checksum: MIGRATION_101_CHECKSUM,
-        description: MIGRATION_101_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_file_graph_version_provenance),
-    },
-    Migration {
-        id: MIGRATION_102_ID,
-        checksum: MIGRATION_102_CHECKSUM,
-        description: MIGRATION_102_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_lens_lane_revisions),
-    },
-    Migration {
-        id: MIGRATION_103_ID,
-        checksum: MIGRATION_103_CHECKSUM,
-        description: MIGRATION_103_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_syncable_memory_bindings),
-    },
-    Migration {
-        id: MIGRATION_104_ID,
-        checksum: MIGRATION_104_CHECKSUM,
-        description: MIGRATION_104_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_table_sync_readoption),
-    },
-    Migration {
-        id: MIGRATION_105_ID,
-        checksum: MIGRATION_105_CHECKSUM,
-        description: MIGRATION_105_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_table_sync_retained_floors),
-    },
-    Migration {
-        id: MIGRATION_106_ID,
-        checksum: MIGRATION_106_CHECKSUM,
-        description: MIGRATION_106_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_readoption_audit_nullable_winner),
-    },
-    Migration {
-        id: MIGRATION_107_ID,
-        checksum: MIGRATION_107_CHECKSUM,
-        description: MIGRATION_107_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_syncable_overlay_tables),
-    },
-    Migration {
-        id: MIGRATION_108_ID,
-        checksum: MIGRATION_108_CHECKSUM,
-        description: MIGRATION_108_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_syncable_distill_records),
-    },
-    Migration {
-        id: MIGRATION_109_ID,
-        checksum: MIGRATION_109_CHECKSUM,
-        description: MIGRATION_109_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_syncable_distill_edges_and_alternatives),
-    },
-    Migration {
-        id: MIGRATION_110_ID,
-        checksum: MIGRATION_110_CHECKSUM,
-        description: MIGRATION_110_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_syncable_distill_record_commits),
-    },
-    Migration {
-        id: MIGRATION_111_ID,
-        checksum: MIGRATION_111_CHECKSUM,
-        description: MIGRATION_111_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_syncable_distill_evidence),
-    },
-    Migration {
-        id: MIGRATION_112_ID,
-        checksum: MIGRATION_112_CHECKSUM,
-        description: MIGRATION_112_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_syncable_distill_anchors),
-    },
-    Migration {
-        id: MIGRATION_113_ID,
-        checksum: MIGRATION_113_CHECKSUM,
-        description: MIGRATION_113_DESCRIPTION,
-        apply: MigrationFn::WithHooks(migrations::apply_refold_content_streams_for_lamport_clamp),
-    },
-    Migration {
-        id: MIGRATION_114_ID,
-        checksum: MIGRATION_114_CHECKSUM,
-        description: MIGRATION_114_DESCRIPTION,
-        apply: MigrationFn::WithHooks(migrations::apply_content_entries_lamport_column),
-    },
-    Migration {
-        id: MIGRATION_115_ID,
-        checksum: MIGRATION_115_CHECKSUM,
-        description: MIGRATION_115_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_refold_account_authority_projections),
-    },
-    Migration {
-        id: MIGRATION_116_ID,
-        checksum: MIGRATION_116_CHECKSUM,
-        description: MIGRATION_116_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_writer_invites),
-    },
-    Migration {
-        id: MIGRATION_117_ID,
-        checksum: MIGRATION_117_CHECKSUM,
-        description: MIGRATION_117_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_content_author_stream_index),
-    },
-    Migration {
-        id: MIGRATION_118_ID,
-        checksum: MIGRATION_118_CHECKSUM,
-        description: MIGRATION_118_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_content_projected_node_anchors),
-    },
-    Migration {
-        id: MIGRATION_119_ID,
-        checksum: MIGRATION_119_CHECKSUM,
-        description: MIGRATION_119_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_content_projected_node_source_hash),
-    },
-    Migration {
-        id: MIGRATION_120_ID,
-        checksum: MIGRATION_120_CHECKSUM,
-        description: MIGRATION_120_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_memory_applied_anchor_snapshot),
-    },
-    Migration {
-        id: MIGRATION_121_ID,
-        checksum: MIGRATION_121_CHECKSUM,
-        description: MIGRATION_121_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_refold_for_held_control_log_freshness),
-    },
-    Migration {
-        id: MIGRATION_122_ID,
-        checksum: MIGRATION_122_CHECKSUM,
-        description: MIGRATION_122_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_memory_parked_anchor_baselines),
-    },
-    Migration {
-        id: MIGRATION_123_ID,
-        checksum: MIGRATION_123_CHECKSUM,
-        description: MIGRATION_123_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_memory_binding_resolution),
-    },
-    Migration {
-        id: MIGRATION_124_ID,
-        checksum: MIGRATION_124_CHECKSUM,
-        description: MIGRATION_124_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_content_projected_superseded_anchors),
-    },
-    Migration {
-        id: MIGRATION_125_ID,
-        checksum: MIGRATION_125_CHECKSUM,
-        description: MIGRATION_125_DESCRIPTION,
-        apply: MigrationFn::Plain(migrations::apply_refold_for_concurrent_cut_vouch),
-    },
-];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
 /// existing index that lags this binary. It first provisions the baseline idempotently (so a
@@ -2420,11 +1837,11 @@ mod ledger_atomicity {
     }
 }
 
-/// Registering a migration takes six coordinated edits — the `MIGRATION_0NN_{ID,CHECKSUM,
-/// DESCRIPTION}` consts, the [`ADDITIVE_MIGRATIONS`] entry, [`LATEST_SCHEMA_VERSION`], and three
-/// separate recognizers in `migrations.rs` ([`migrations::known_version`],
-/// [`migrations::known_migration`], [`migrations::migration_checksum_mismatch`]) — and only the
-/// first two fail to compile when forgotten.
+/// Registering a migration takes five coordinated edits — its `additive_migrations!` entry (one
+/// block that emits both the `MIGRATION_0NN_{ID,CHECKSUM,DESCRIPTION}` consts and the
+/// [`ADDITIVE_MIGRATIONS`] row, so the two cannot be declared apart), [`LATEST_SCHEMA_VERSION`],
+/// and three separate recognizers in `migrations.rs` ([`migrations::known_version`],
+/// [`migrations::known_migration`], [`migrations::migration_checksum_mismatch`]).
 ///
 /// These tests make the remaining four mechanical by ranging over the shipped ladder itself, so a
 /// new migration is checked automatically. The `known_migration` arm is the one that is otherwise
