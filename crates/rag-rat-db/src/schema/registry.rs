@@ -185,7 +185,7 @@ pub fn register_repo(
     now_ms: i64,
     hooks: &MigrationHooks,
 ) -> rusqlite::Result<String> {
-    register_repo_inner(conn, identity, root, now_ms, true, hooks)
+    register_repo_inner(conn, identity, root, now_ms, RootRecording::Record, hooks)
 }
 
 /// The `index_meta` key that TOMBSTONES a repo removed via `rag-rat rm` (#767). GLOBAL scope on
@@ -263,18 +263,28 @@ pub fn register_repo_read_only(
     now_ms: i64,
     hooks: &MigrationHooks,
 ) -> rusqlite::Result<String> {
-    register_repo_inner(conn, identity, root, now_ms, false, hooks)
+    register_repo_inner(conn, identity, root, now_ms, RootRecording::Skip, hooks)
 }
 
-/// The registration impl shared by [`register_repo`] (records the root) and
-/// [`register_repo_read_only`] (does not). `record_root` gates ONLY the `repo_roots` INSERT; every
-/// identity decision below is identical.
+/// Whether a registration records the working-tree root in `repo_roots` — the "this checkout was
+/// INDEXED here" signal. It gates ONLY that INSERT; every identity decision is identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootRecording {
+    /// An indexing open ([`register_repo`]).
+    Record,
+    /// A read-only open ([`register_repo_read_only`]): a mere read must not mark the checkout
+    /// indexed.
+    Skip,
+}
+
+/// The registration impl shared by [`register_repo`] and [`register_repo_read_only`]; `recording`
+/// is the only difference between them.
 fn register_repo_inner(
     conn: &Connection,
     identity: &RepoIdentity,
     root: &Path,
     now_ms: i64,
-    record_root: bool,
+    recording: RootRecording,
     hooks: &MigrationHooks,
 ) -> rusqlite::Result<String> {
     // Defense in depth: the resolver already refuses a pinned placeholder and never derives it, but
@@ -293,10 +303,10 @@ fn register_repo_inner(
     }
 
     // #767: refuse to (re-)register a repo tombstoned by `rag-rat rm`, on BOTH the indexing
-    // (`record_root`) AND the read-only adoption paths. A writer that queued behind the removal
-    // lock resumes with a stale in-memory config and would otherwise repopulate the just-purged
-    // repo — and a read-only open is NOT harmless when it is write-capable: a manual
-    // `papertrail sync` registers read-only, then commits `papertrail_*` rows. A
+    // (`RootRecording::Record`) AND the read-only adoption paths. A writer that queued behind the
+    // removal lock resumes with a stale in-memory config and would otherwise repopulate the
+    // just-purged repo — and a read-only open is NOT harmless when it is write-capable: a
+    // manual `papertrail sync` registers read-only, then commits `papertrail_*` rows. A
     // genuinely-removed repo has no surviving config to reach here (rm deletes it); `rag-rat
     // init` / `consolidate` clear the tombstone for a deliberate re-add. This is the cheap
     // PRE-FILTER; the AUTHORITATIVE check re-runs inside the adoption transaction below (this
@@ -321,28 +331,7 @@ fn register_repo_inner(
     // UPGRADE path takes while holding this are BOUNDED, so no cross-type cycle can hang — see
     // `locks::registry_lock_path`). Bounded and reentrant; a timeout is a retryable refusal. A
     // pathless (in-memory) connection skips it — no cross-process writer can exist for it.
-    let _registry_lock = match conn.path().filter(|p| !p.is_empty()) {
-        Some(db_path) => Some(
-            rag_rat_base::locks::WriteLock::acquire_registry_timeout(
-                Path::new(db_path),
-                REGISTRY_LOCK_TIMEOUT,
-            )
-            .map_err(|err| {
-                registry_refusal(format!(
-                    "cannot register repo {}: failed acquiring the repo-registry lock: {err}",
-                    identity.repo_id
-                ))
-            })?
-            .ok_or_else(|| {
-                registry_refusal(format!(
-                    "cannot register repo {}: timed out waiting for a concurrent registration to \
-                     finish; re-run the command",
-                    identity.repo_id
-                ))
-            })?,
-        ),
-        None => None,
-    };
+    let _registry_lock = acquire_registry_lock(conn, identity)?;
     // Read the registered set INSIDE the registry lock, so the decision below cannot race a
     // concurrent registration's write (a same-id racer that lost the lock re-reads a set already
     // containing the id and collapses into the idempotent path).
@@ -366,12 +355,7 @@ fn register_repo_inner(
         if let Some(owner) = real_root_owner(conn, &root_str, &identity.repo_id)? {
             if late_upgrade_is_proven(conn, &owner, identity, root)? {
                 merge_local_incumbent_into_registered(
-                    conn,
-                    identity,
-                    &owner,
-                    &root_str,
-                    now_ms,
-                    record_root,
+                    conn, identity, &owner, &root_str, now_ms, recording,
                 )?;
                 persist_shallow_boundary(conn, identity)?;
                 return Ok(identity.repo_id.clone());
@@ -382,7 +366,7 @@ fn register_repo_inner(
                 &root_str,
             )));
         }
-        if record_root {
+        if recording == RootRecording::Record {
             record_repo_root(conn, &identity.repo_id, &root_str, now_ms)?;
         }
         persist_shallow_boundary(conn, identity)?;
@@ -448,6 +432,82 @@ fn register_repo_inner(
         _ => None,
     };
 
+    adopt_in_transaction(conn, Adoption {
+        identity,
+        root_str: &root_str,
+        now_ms,
+        recording,
+        hooks,
+        upgrade_from: upgrade_from.as_deref(),
+        no_real_repos: real_ids.is_empty(),
+    })?;
+    // State what happened on a shallow-clone upgrade (a `local:` id re-pointed to a portable one)
+    // so the transition is legible in the log — it re-writes every scoped row and every logical
+    // id.
+    if let Some(local_id) = upgrade_from {
+        tracing::warn!(
+            old_repo_id = %local_id,
+            new_repo_id = %identity.repo_id,
+            "shallow-clone identity upgraded: the index was registered under a machine-local id \
+             (`local:`) and is now re-pointed to a portable id. All scoped rows, repo_meta, \
+             repo_roots, and logical-symbol ids were migrated in place."
+        );
+    }
+    Ok(identity.repo_id.clone())
+}
+
+/// Take the DB-global repo-registry lock for one registration (see the REGISTRY LOCK note in
+/// [`register_repo_inner`]). Bounded and reentrant; a timeout or acquisition failure is a
+/// retryable refusal. A pathless (in-memory) connection gets `None` — no cross-process writer can
+/// exist for it.
+fn acquire_registry_lock(
+    conn: &Connection,
+    identity: &RepoIdentity,
+) -> rusqlite::Result<Option<rag_rat_base::locks::WriteLock>> {
+    let Some(db_path) = conn.path().filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    rag_rat_base::locks::WriteLock::acquire_registry_timeout(
+        Path::new(db_path),
+        REGISTRY_LOCK_TIMEOUT,
+    )
+    .map_err(|err| {
+        registry_refusal(format!(
+            "cannot register repo {}: failed acquiring the repo-registry lock: {err}",
+            identity.repo_id
+        ))
+    })?
+    .ok_or_else(|| {
+        registry_refusal(format!(
+            "cannot register repo {}: timed out waiting for a concurrent registration to finish; \
+             re-run the command",
+            identity.repo_id
+        ))
+    })
+    .map(Some)
+}
+
+/// What the adoption transaction writes under: the registration itself plus the two facts the
+/// decision spine established before opening it.
+struct Adoption<'a> {
+    identity: &'a RepoIdentity,
+    root_str: &'a str,
+    now_ms: i64,
+    recording: RootRecording,
+    hooks: &'a MigrationHooks,
+    /// The `local:` incumbent being upgraded in place to the portable id, if any.
+    upgrade_from: Option<&'a str>,
+    /// Whether the DB held no real repo before this registration — only then is a legacy
+    /// placeholder adopted.
+    no_real_repos: bool,
+}
+
+/// Insert the `repos` row and, on an upgrade or a fresh legacy adoption, re-point the source id's
+/// rows onto it — all in ONE immediate transaction (see the comments inside).
+fn adopt_in_transaction(conn: &Connection, adoption: Adoption<'_>) -> rusqlite::Result<()> {
+    let Adoption { identity, root_str, now_ms, recording, hooks, upgrade_from, no_real_repos } =
+        adoption;
+    let trimmed_id = identity.repo_id.trim();
     // No real repo yet (or a `local:`-id upgrade): adopt in ONE transaction. Insert the real
     // `repos` row FIRST, re-point the source id's children, then drop the source row. Since
     // V039 (phase A2) `repo_meta` carries rows under the placeholder, and its FK to `repos` is
@@ -503,9 +563,9 @@ fn register_repo_inner(
     // holds real repos (A7), a new repo registers FRESH and must NOT claim any vestigial
     // placeholder rows as its own — so `repoint_from` is `None` there and the block below is
     // skipped entirely.
-    let repoint_from = match upgrade_from.as_deref() {
+    let repoint_from = match upgrade_from {
         Some(local_id) => Some(local_id),
-        None if real_ids.is_empty() && placeholder_present => Some(LEGACY_REPO_ID),
+        None if no_real_repos && placeholder_present => Some(LEGACY_REPO_ID),
         None => None,
     };
     if let Some(source_id) = repoint_from {
@@ -614,8 +674,8 @@ fn register_repo_inner(
         (hooks.realign_logical_symbol_ids)(&tx)?;
         tx.execute("DELETE FROM repos WHERE repo_id = ?1", [source_id])?;
     }
-    if record_root {
-        record_repo_root(&tx, &identity.repo_id, &root_str, now_ms)?;
+    if recording == RootRecording::Record {
+        record_repo_root(&tx, &identity.repo_id, root_str, now_ms)?;
     }
     // Record a fresh LocalOnly adoption's shallow boundary INSIDE the transaction (atomic with the
     // `repos` row it references), so a future deepened clone can prove the upgrade against it. A
@@ -623,19 +683,7 @@ fn register_repo_inner(
     // incoming).
     persist_shallow_boundary(&tx, identity)?;
     tx.commit()?;
-    // State what happened on a shallow-clone upgrade (a `local:` id re-pointed to a portable one)
-    // so the transition is legible in the log — it re-writes every scoped row and every logical
-    // id.
-    if let Some(local_id) = upgrade_from {
-        tracing::warn!(
-            old_repo_id = %local_id,
-            new_repo_id = %identity.repo_id,
-            "shallow-clone identity upgraded: the index was registered under a machine-local id \
-             (`local:`) and is now re-pointed to a portable id. All scoped rows, repo_meta, \
-             repo_roots, and logical-symbol ids were migrated in place."
-        );
-    }
-    Ok(identity.repo_id.clone())
+    Ok(())
 }
 
 /// Acquire BOTH repo ids' per-repo write locks in the CANONICAL LEXICOGRAPHIC ORDER
@@ -778,7 +826,7 @@ fn merge_local_incumbent_into_registered(
     owner: &str,
     root_str: &str,
     now_ms: i64,
-    record_root: bool,
+    recording: RootRecording,
 ) -> rusqlite::Result<()> {
     let _merge_locks = match conn.path().filter(|p| !p.is_empty()) {
         Some(db_path) =>
@@ -858,7 +906,7 @@ fn merge_local_incumbent_into_registered(
         owner
     ])?;
     tx.execute("DELETE FROM repos WHERE repo_id = ?1", [owner])?;
-    if record_root {
+    if recording == RootRecording::Record {
         record_repo_root(&tx, &identity.repo_id, root_str, now_ms)?;
     }
     tx.commit()?;
