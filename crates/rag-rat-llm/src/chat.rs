@@ -11,12 +11,10 @@
 //! selector constrains output on every backend; a server that cannot honor it degrades to an
 //! unguided completion (the caller's output ladder retries unguided) rather than failing.
 
-use std::time::Duration;
-
 use rag_rat_base::config::RemoteDreamConfig;
 use serde::{Deserialize, Serialize};
 
-use crate::openai::{endpoint_is_loopback, resolve_auth_header};
+use crate::openai::resolve_auth_header;
 
 /// A single-turn chat model: given a fully-rendered prompt, return the model's raw completion text.
 /// Object-safe so a pass takes a `&dyn ChatModel` and a test can swap in a mock.
@@ -105,21 +103,10 @@ struct ChatChoiceMessage {
     content: String,
 }
 
-/// Error body most OpenAI-compatible servers return on non-2xx (`{ "error": { "message" } }`).
-#[derive(Deserialize)]
-struct ErrorResponse {
-    error: ErrorDetail,
-}
-
-#[derive(Deserialize)]
-struct ErrorDetail {
-    message: String,
-}
-
 /// The HTTP chat model: a blocking `ureq` client against an OpenAI-compatible
-/// `/v1/chat/completions` route (ollama/vLLM/any compatible server). Mirrors the embedder client's
-/// transport posture ([`crate::openai`]) — one place to audit, loopback proxy bypass,
-/// `http_status_as_error(false)` so the server's JSON error body survives.
+/// `/v1/chat/completions` route (ollama/vLLM/any compatible server). Shares the embedder client's
+/// transport ([`crate::http`]) — loopback proxy bypass, `http_status_as_error(false)` so the
+/// server's JSON error body survives.
 #[derive(Debug)]
 pub struct HttpChatModel {
     agent: ureq::Agent,
@@ -184,14 +171,11 @@ impl HttpChatModel {
         request_timeout_s: u64,
     ) -> Self {
         let chat_url = format!("{endpoint}/v1/chat/completions");
-        let mut builder = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(request_timeout_s)))
-            .http_status_as_error(false)
-            .user_agent(concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (chat)"));
-        if endpoint_is_loopback(endpoint) {
-            builder = builder.proxy(None);
-        }
-        let agent: ureq::Agent = builder.build().into();
+        let agent = crate::http::build_agent(
+            endpoint,
+            request_timeout_s,
+            concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (chat)"),
+        );
         Self { agent, chat_url, model: model.to_string(), auth_header }
     }
 
@@ -225,36 +209,13 @@ impl ChatModel for HttpChatModel {
             stream: false,
             response_format: Self::guided_response_format(guided),
         };
-        // The `json` ureq feature is not enabled (workspace ureq is rustls-only), so serialize the
-        // body ourselves and send it with an explicit content-type — same as the embedder client.
-        let body = serde_json::to_vec(&payload)
-            .map_err(|e| anyhow::anyhow!("failed to serialize chat request: {e}"))?;
-
-        let mut request = self.agent.post(&self.chat_url).content_type("application/json");
-        if let Some(header) = &self.auth_header {
-            request = request.header("authorization", header.as_str());
-        }
-        let mut response = request
-            .send(body)
-            .map_err(|e| anyhow::anyhow!("chat request to `{}` failed: {e}", self.chat_url))?;
-        let status = response.status();
-        let raw = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| anyhow::anyhow!("reading chat response failed: {e}"))?;
-        if !status.is_success() {
-            // OpenAI-compatible servers usually return `{"error":{"message":...}}`; surface that
-            // clean message when present, else a bounded raw excerpt.
-            let detail = serde_json::from_str::<ErrorResponse>(&raw)
-                .map(|e| e.error.message)
-                .unwrap_or_else(|_| response_excerpt(&raw));
-            anyhow::bail!(
-                "chat request to `{}` failed: http status {}: {}",
-                self.chat_url,
-                status.as_u16(),
-                detail
-            );
-        }
+        let raw = crate::http::post_json(
+            &self.agent,
+            &self.chat_url,
+            self.auth_header.as_deref(),
+            &payload,
+            "chat",
+        )?;
         let parsed: ChatResponse = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("malformed chat completion response: {e}"))?;
         parsed
@@ -320,15 +281,6 @@ fn chat_cookbook_input(remote: &RemoteDreamConfig) -> crate::CookbookInput {
         num_ctx: None,
         server_concurrency: 1,
     }
-}
-
-fn response_excerpt(body: &str) -> String {
-    let trimmed = body.trim();
-    let mut excerpt = trimmed.chars().take(500).collect::<String>();
-    if trimmed.chars().count() > 500 {
-        excerpt.push_str("...");
-    }
-    excerpt
 }
 
 #[cfg(test)]

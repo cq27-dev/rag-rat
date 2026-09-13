@@ -11,6 +11,7 @@ mod cookbook;
 #[cfg(feature = "fastembed")]
 mod fastembed;
 mod hash;
+mod http;
 mod model2vec;
 mod openai;
 

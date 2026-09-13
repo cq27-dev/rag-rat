@@ -1,17 +1,17 @@
-//! The OpenAI-compatible HTTP embedding backend: the ONLY code that connects to a remote embedding
-//! server. All HTTP to `/v1/embeddings` lives in [`OpenAiEmbedder::embed_batch`]; everything else
-//! (install-time reachability probes, the dispatch in `providers/mod.rs`) reaches the server by
-//! constructing and calling one of these. ONE client for every OpenAI-speaking backend — ollama
-//! (its `/v1/embeddings` compatibility route), michaelfeil/infinity, and vLLM — so there is one
-//! place to audit/secure/retry. The `[remote] backend` selector routes provisioning + the
-//! freshness/tune markers, NOT the wire call (identical across backends).
+//! The OpenAI-compatible HTTP embedding client. Every `/v1/embeddings` request is built in
+//! `request_embeddings` — reached from [`OpenAiEmbedder::embed_batch`] and the eval-only
+//! `probe_dim` — and sent through [`crate::http::post_json`]; everything else (install-time
+//! reachability probes, the dispatch in `providers/mod.rs`) reaches the server by constructing and
+//! calling one of these. ONE client for every OpenAI-speaking backend — ollama
+//! (its `/v1/embeddings` compatibility route), michaelfeil/infinity, and vLLM. The wire transport
+//! (agent posture, auth, error-body handling) is shared with the chat client in [`crate::http`].
+//! The `[remote] backend` selector routes provisioning + the freshness/tune markers, NOT the wire
+//! call (identical across backends).
 //!
 //! Native, blocking HTTP via `ureq` (v3, rustls) — already a non-optional workspace dep (the
 //! crates.io version check uses it), so this backend ships unconditionally: no cargo feature, no
 //! missing-feature message. The cloneable `ureq::Agent` is held bare (no `Mutex`) and cloned into
 //! bounded blocking worker threads for remote request fan-out.
-
-use std::time::Duration;
 
 use rag_rat_base::config::RemoteEmbeddingConfig;
 use serde::{Deserialize, Serialize};
@@ -43,18 +43,6 @@ struct EmbedData {
 #[derive(Deserialize)]
 struct EmbedResponse {
     data: Vec<EmbedData>,
-}
-
-/// Error body most OpenAI-compatible servers return on 4xx/5xx (`{ "error": { "message" } }`),
-/// parsed on non-2xx for a clearer message than the raw excerpt.
-#[derive(Deserialize)]
-struct ErrorResponse {
-    error: ErrorDetail,
-}
-
-#[derive(Deserialize)]
-struct ErrorDetail {
-    message: String,
 }
 
 /// A native HTTP embedder that offloads embedding work to an OpenAI-compatible `/v1/embeddings`
@@ -210,18 +198,11 @@ impl OpenAiEmbedder {
             max_batch_chars,
         } = params;
         let embed_url = format!("{}{}", endpoint.trim_end_matches('/'), embed_path);
-        let mut builder = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(request_timeout_s)))
-            .http_status_as_error(false)
-            .user_agent(concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (openai-embed)"));
-        // ureq's default config inherits `HTTP_PROXY`/`HTTPS_PROXY` from the env. A local Ollama
-        // (`http://127.0.0.1:11434`) routed through a corporate proxy 403s, so disable the proxy for
-        // loopback endpoints only — a non-loopback (truly remote) endpoint may legitimately need
-        // it.
-        if endpoint_is_loopback(endpoint) {
-            builder = builder.proxy(None);
-        }
-        let agent: ureq::Agent = builder.build().into();
+        let agent = crate::http::build_agent(
+            endpoint,
+            request_timeout_s,
+            concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (openai-embed)"),
+        );
         Self {
             agent,
             embed_url,
@@ -267,41 +248,7 @@ impl OpenAiEmbedder {
         texts: &[String],
     ) -> anyhow::Result<Vec<Vec<f32>>> {
         let payload = EmbedRequest { model: server_model, input: texts, encoding_format: "float" };
-        // The `json` ureq feature is not enabled (workspace ureq is rustls-only), so serialize the
-        // body ourselves and send it with an explicit content-type.
-        let body = serde_json::to_vec(&payload)
-            .map_err(|e| anyhow::anyhow!("failed to serialize embed request: {e}"))?;
-
-        let mut request = agent.post(embed_url).content_type("application/json");
-        if let Some(header) = auth_header {
-            request = request.header("Authorization", header);
-        }
-
-        // `http_status_as_error(false)` lets us read the server's JSON error body on 4xx/5xx
-        // instead of losing the actionable reason behind ureq's bare `http status: N`
-        // error.
-        let mut response = request
-            .send(body)
-            .map_err(|e| anyhow::anyhow!("embed request to `{embed_url}` failed: {e}"))?;
-        let status = response.status();
-        let raw = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| anyhow::anyhow!("reading embed response failed: {e}"))?;
-        if !status.is_success() {
-            // OpenAI-compatible servers usually return `{"error":{"message":...}}`; surface that
-            // clean message when present, else a bounded raw excerpt.
-            let detail = serde_json::from_str::<ErrorResponse>(&raw)
-                .map(|e| e.error.message)
-                .unwrap_or_else(|_| response_excerpt(&raw));
-            anyhow::bail!(
-                "embed request to `{}` failed: http status {}: {}",
-                embed_url,
-                status.as_u16(),
-                detail
-            );
-        }
-
+        let raw = crate::http::post_json(&agent, embed_url, auth_header, &payload, "embed")?;
         let parsed: EmbedResponse = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("malformed embed response: {e}"))?;
 
@@ -409,42 +356,11 @@ impl OpenAiEmbedder {
         texts: &[String],
     ) -> anyhow::Result<Vec<Vec<f32>>> {
         let payload = EmbedRequest { model: server_model, input: texts, encoding_format: "float" };
-        let body = serde_json::to_vec(&payload)
-            .map_err(|e| anyhow::anyhow!("failed to serialize embed request: {e}"))?;
-        let mut request = agent.post(embed_url).content_type("application/json");
-        if let Some(header) = auth_header {
-            request = request.header("Authorization", header);
-        }
-        let mut response = request
-            .send(body)
-            .map_err(|e| anyhow::anyhow!("dim probe request to `{embed_url}` failed: {e}"))?;
-        let status = response.status();
-        let raw = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| anyhow::anyhow!("reading dim probe response failed: {e}"))?;
-        if !status.is_success() {
-            let detail = serde_json::from_str::<ErrorResponse>(&raw)
-                .map(|e| e.error.message)
-                .unwrap_or_else(|_| response_excerpt(&raw));
-            anyhow::bail!(
-                "dim probe request to `{embed_url}` failed: http status {}: {detail}",
-                status.as_u16(),
-            );
-        }
+        let raw = crate::http::post_json(&agent, embed_url, auth_header, &payload, "dim probe")?;
         let parsed: EmbedResponse = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("malformed dim probe response: {e}"))?;
         Ok(parsed.data.into_iter().map(|item| item.embedding).collect())
     }
-}
-
-fn response_excerpt(body: &str) -> String {
-    let trimmed = body.trim();
-    let mut excerpt = trimmed.chars().take(500).collect::<String>();
-    if trimmed.chars().count() > 500 {
-        excerpt.push_str("...");
-    }
-    excerpt
 }
 
 /// Resolve the `Authorization` header from the configured `auth_env` name, looking the value up
@@ -466,31 +382,6 @@ pub fn resolve_auth_header(
             )
         })?;
     Ok(Some(format!("Bearer {token}")))
-}
-
-/// Whether the endpoint's host is loopback (`127.0.0.1`, `localhost`, `::1`). Loopback endpoints
-/// bypass the ambient HTTP proxy; everything else inherits it. Parses the host out of the URL by
-/// stripping the scheme then the path/port, tolerating a bracketed IPv6 literal. Shared with the
-/// chat client (`chat.rs`) so both HTTP paths classify loopback identically.
-pub(crate) fn endpoint_is_loopback(endpoint: &str) -> bool {
-    let host_port = url_authority(endpoint);
-    let host = match host_port.strip_prefix('[') {
-        // Bracketed IPv6 literal: `[::1]:11434` → `::1`.
-        Some(rest) => rest.split(']').next().unwrap_or(rest),
-        // Bare host or IPv4: take everything before the first `:` (the port).
-        None => host_port.split(':').next().unwrap_or(host_port),
-    };
-    matches!(host.trim().to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
-        || host.starts_with("127.")
-}
-
-/// The `host[:port]` of an endpoint URL: the scheme, path/query/fragment, and any `user:pass@`
-/// userinfo stripped. The one authority parse behind both loopback classification and
-/// credential-free endpoint logging (`sanitize_endpoint`), so the two can't disagree on the host.
-pub(crate) fn url_authority(url: &str) -> &str {
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
-    authority.rsplit_once('@').map_or(authority, |(_, host_port)| host_port)
 }
 
 impl Embedder for OpenAiEmbedder {
@@ -1481,28 +1372,6 @@ mod tests {
         let header =
             resolve_auth_header(Some("OLLAMA_TOKEN"), |_| Some("sekret".to_string())).unwrap();
         assert_eq!(header.as_deref(), Some("Bearer sekret"));
-    }
-
-    #[test]
-    fn endpoint_is_loopback_classifies_hosts() {
-        for ep in [
-            "http://127.0.0.1:11434",
-            "http://localhost:11434",
-            "http://LOCALHOST",
-            "http://127.0.0.5:11434",
-            "http://[::1]:11434",
-            "http://127.0.0.1",
-        ] {
-            assert!(endpoint_is_loopback(ep), "should be loopback: {ep}");
-        }
-        for ep in [
-            "https://ollama.example.com:11434",
-            "http://10.0.0.5:11434",
-            "https://user:pass@remote.host/path",
-            "http://192.168.1.10",
-        ] {
-            assert!(!endpoint_is_loopback(ep), "should NOT be loopback: {ep}");
-        }
     }
 
     #[test]

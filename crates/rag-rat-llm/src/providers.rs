@@ -50,7 +50,7 @@ pub const LIGHT_REQUEST_TIMEOUT_S: u64 = 30;
 /// `user:pass@` userinfo (the connect/query endpoints support it — see `endpoint_is_loopback`), so
 /// the raw URL must never land in a log line.
 pub fn sanitize_endpoint(url: &str) -> String {
-    let host_port = crate::openai::url_authority(url);
+    let host_port = crate::http::url_authority(url);
     match url.split_once("://") {
         Some((scheme, _)) => format!("{scheme}://{host_port}"),
         None => host_port.to_string(),
