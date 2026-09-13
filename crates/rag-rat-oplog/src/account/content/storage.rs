@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::super::ops::{self, AccountOp, DecodedAccountOp};
+use super::super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
 use super::super::{envelope as account_envelope, storage as account_storage};
 use super::acceptance::{
     self, CitedFreshness, CitedGrantAuthority, CitedOwnership, CitedRosterAuthority,
@@ -34,6 +35,8 @@ const PENDING_REFOLD_ACCOUNT_CHANGE: i64 = 2;
 
 const PRE_VERIFY_PER_AUTHOR_MAX: i64 = 64;
 const PRE_VERIFY_GLOBAL_MAX: i64 = 256;
+const PRE_VERIFY: PreVerifyQueue =
+    PreVerifyQueue { table: "content_pre_verify", owner_column: "claimed_author_account_id" };
 const CANDIDATES_PER_AUTHOR_MAX: i64 = 4_096;
 const CANDIDATES_GLOBAL_MAX: i64 = 16_384;
 const CANDIDATE_BYTES_PER_AUTHOR_MAX: i64 = 16 * 1024 * 1024;
@@ -272,15 +275,7 @@ fn park_pre_verify(
     now_ms: i64,
 ) -> rusqlite::Result<ContentIngestOutcome> {
     let signed_hash = cbor::sha256(raw);
-    if tx
-        .query_row(
-            "SELECT 1 FROM content_pre_verify WHERE signed_hash = ?1",
-            [signed_hash.as_slice()],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some()
-    {
+    if PRE_VERIFY.contains(tx, &signed_hash)? {
         return Ok(ContentIngestOutcome::PreVerify);
     }
     let author = signed.header.author_account_id.to_bytes();
@@ -308,61 +303,25 @@ fn enforce_pre_verify_budget(
     author: super::super::AccountId,
     inserted_hash: &EntryHash,
 ) -> rusqlite::Result<ContentIngestOutcome> {
-    let mut scopes = Vec::new();
-    if evict_oldest_pre_verify(tx, Some(author), PRE_VERIFY_PER_AUTHOR_MAX)? > 0 {
-        scopes.push(ContentCapacityScope::PreVerifyAuthor);
-    }
-    if !pre_verify_contains(tx, inserted_hash)? {
-        return Ok(ContentIngestOutcome::CapacityReached {
+    let outcome = PRE_VERIFY.enforce_budget(
+        tx,
+        author,
+        inserted_hash,
+        QueueBudget {
+            max: PRE_VERIFY_PER_AUTHOR_MAX as usize,
             scope: ContentCapacityScope::PreVerifyAuthor,
-        });
-    }
-    if evict_oldest_pre_verify(tx, None, PRE_VERIFY_GLOBAL_MAX)? > 0 {
-        scopes.push(ContentCapacityScope::PreVerifyGlobal);
-    }
-    if !pre_verify_contains(tx, inserted_hash)? {
-        return Ok(ContentIngestOutcome::CapacityReached {
+        },
+        QueueBudget {
+            max: PRE_VERIFY_GLOBAL_MAX as usize,
             scope: ContentCapacityScope::PreVerifyGlobal,
-        });
-    }
-    if scopes.is_empty() {
-        Ok(ContentIngestOutcome::PreVerify)
-    } else {
-        Ok(ContentIngestOutcome::PreVerifyWithEviction { scopes })
-    }
-}
-
-fn pre_verify_contains(conn: &Connection, signed_hash: &EntryHash) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM content_pre_verify WHERE signed_hash = ?1)",
-        [signed_hash.as_slice()],
-        |row| row.get(0),
-    )
-}
-
-fn evict_oldest_pre_verify(
-    conn: &Connection,
-    author: Option<super::super::AccountId>,
-    limit: i64,
-) -> rusqlite::Result<usize> {
-    let author = author.map(super::super::AccountId::to_bytes);
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM content_pre_verify
-         WHERE (?1 IS NULL OR claimed_author_account_id = ?1)",
-        params![author.as_ref().map(<[u8; 32]>::as_slice)],
-        |row| row.get(0),
+        },
     )?;
-    if count <= limit {
-        return Ok(0);
-    }
-    conn.execute(
-        "DELETE FROM content_pre_verify WHERE signed_hash IN (
-             SELECT signed_hash FROM content_pre_verify
-             WHERE (?1 IS NULL OR claimed_author_account_id = ?1)
-             ORDER BY received_at_ms, signed_hash LIMIT ?2
-         )",
-        params![author.as_ref().map(<[u8; 32]>::as_slice), count - limit],
-    )
+    Ok(match outcome {
+        BudgetOutcome::Parked { evicted } if evicted.is_empty() => ContentIngestOutcome::PreVerify,
+        BudgetOutcome::Parked { evicted } =>
+            ContentIngestOutcome::PreVerifyWithEviction { scopes: evicted },
+        BudgetOutcome::AtCapacity(scope) => ContentIngestOutcome::CapacityReached { scope },
+    })
 }
 
 // Test-only: how many times the parked-content promotion sweep actually ran. The gate that keeps
@@ -413,7 +372,7 @@ pub(in crate::account) fn promote_pre_verify_for_account(
             let signed = match envelope::decode_content_signed(&raw) {
                 Ok(signed) => signed,
                 Err(_) => {
-                    delete_pre_verify(tx, &signed_hash)?;
+                    PRE_VERIFY.delete(tx, &signed_hash)?;
                     progressed = true;
                     continue;
                 },
@@ -425,7 +384,7 @@ pub(in crate::account) fn promote_pre_verify_for_account(
             // the drop-before-storage contract; a legitimately re-offered envelope re-parks and
             // gets re-judged with a fresher clock.
             if signed.header.lamport >= crate::entry::MAX_ENTRY_LAMPORT {
-                delete_pre_verify(tx, &signed_hash)?;
+                PRE_VERIFY.delete(tx, &signed_hash)?;
                 progressed = true;
                 continue;
             }
@@ -433,7 +392,7 @@ pub(in crate::account) fn promote_pre_verify_for_account(
                 Ok(Some(public)) => public,
                 Ok(None) => continue,
                 Err(_) => {
-                    delete_pre_verify(tx, &signed_hash)?;
+                    PRE_VERIFY.delete(tx, &signed_hash)?;
                     progressed = true;
                     continue;
                 },
@@ -441,7 +400,7 @@ pub(in crate::account) fn promote_pre_verify_for_account(
             let verified = match envelope::verify_content_signed(&raw, &public) {
                 Ok(verified) => verified,
                 Err(_) => {
-                    delete_pre_verify(tx, &signed_hash)?;
+                    PRE_VERIFY.delete(tx, &signed_hash)?;
                     progressed = true;
                     continue;
                 },
@@ -457,14 +416,14 @@ pub(in crate::account) fn promote_pre_verify_for_account(
                 if verified.header.lamport
                     > stream_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE)
                 {
-                    delete_pre_verify(tx, &signed_hash)?;
+                    PRE_VERIFY.delete(tx, &signed_hash)?;
                     progressed = true;
                     continue;
                 }
             }
             match stored_candidate_bytes(tx, &verified.entry_hash)? {
                 Some(stored) if stored != raw => {
-                    delete_pre_verify(tx, &signed_hash)?;
+                    PRE_VERIFY.delete(tx, &signed_hash)?;
                     progressed = true;
                     continue;
                 },
@@ -472,7 +431,7 @@ pub(in crate::account) fn promote_pre_verify_for_account(
                 None if let Some(scope) = candidate_capacity(tx, &verified, raw.len())? => {
                     outcome.scope.get_or_insert(scope);
                     outcome.entry_hashes.push(verified.entry_hash);
-                    delete_pre_verify(tx, &signed_hash)?;
+                    PRE_VERIFY.delete(tx, &signed_hash)?;
                     progressed = true;
                     continue;
                 },
@@ -486,18 +445,13 @@ pub(in crate::account) fn promote_pre_verify_for_account(
                 PENDING_REFOLD_CONTENT_CANDIDATE,
                 now_ms,
             )?;
-            delete_pre_verify(tx, &signed_hash)?;
+            PRE_VERIFY.delete(tx, &signed_hash)?;
             progressed = true;
         }
         if !progressed {
             return Ok(outcome);
         }
     }
-}
-
-fn delete_pre_verify(tx: &Transaction<'_>, signed_hash: &[u8]) -> rusqlite::Result<()> {
-    tx.execute("DELETE FROM content_pre_verify WHERE signed_hash = ?1", [signed_hash])?;
-    Ok(())
 }
 
 fn candidate_capacity(
@@ -3714,8 +3668,8 @@ mod tests {
                 .unwrap(),
             PRE_VERIFY_PER_AUTHOR_MAX
         );
-        assert!(!pre_verify_contains(&conn, &first_hash.unwrap()).unwrap());
-        assert!(pre_verify_contains(&conn, &newest_hash.unwrap()).unwrap());
+        assert!(!PRE_VERIFY.contains(&conn, &first_hash.unwrap()).unwrap());
+        assert!(PRE_VERIFY.contains(&conn, &newest_hash.unwrap()).unwrap());
     }
 
     #[test]
@@ -3764,7 +3718,7 @@ mod tests {
 
         // Author B's older row survives — author A's per-author eviction must not reach across it.
         assert!(
-            pre_verify_contains(&conn, &b_hash).unwrap(),
+            PRE_VERIFY.contains(&conn, &b_hash).unwrap(),
             "author A's flood must NOT evict author B's parked row",
         );
         // Author A is held to EXACTLY the per-author cap.
@@ -4059,7 +4013,7 @@ mod tests {
                 scopes: vec![ContentCapacityScope::PreVerifyGlobal]
             }
         );
-        assert!(!pre_verify_contains(&conn, &oldest).unwrap());
+        assert!(!PRE_VERIFY.contains(&conn, &oldest).unwrap());
 
         let replay = db();
         let (account, roster_ref) = roster(&replay, &secret);

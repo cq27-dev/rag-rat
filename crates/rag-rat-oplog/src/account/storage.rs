@@ -16,6 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
+use super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
 use super::{AccountId, content, fold, secrets, snapshot};
 use crate::cbor;
 use crate::device::{DevicePublic, DeviceX25519Public};
@@ -34,6 +35,8 @@ type BranchChildren = HashMap<BranchKey, Vec<BranchChild>>;
 // evicts: deleting grow-only history would break replica convergence.
 pub(super) const PRE_VERIFY_PER_ACCOUNT_MAX: usize = 64;
 const PRE_VERIFY_GLOBAL_MAX: usize = 256;
+const PRE_VERIFY: PreVerifyQueue =
+    PreVerifyQueue { table: "account_pre_verify", owner_column: "claimed_account_id" };
 pub(super) const CANDIDATES_PER_ACCOUNT_MAX: usize = 4_096;
 const CANDIDATES_GLOBAL_MAX: usize = 16_384;
 const CANDIDATE_BYTES_PER_ACCOUNT_MAX: usize = 16 * 1024 * 1024;
@@ -2925,62 +2928,23 @@ fn insert_pre_verify(
     enforce_pre_verify_budget(conn, account_id, &signed_hash)
 }
 
-fn pre_verify_contains(conn: &Connection, signed_hash: &EntryHash) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM account_pre_verify WHERE signed_hash = ?1)",
-        params![signed_hash.as_slice()],
-        |row| row.get(0),
-    )
-}
-
-/// Keep the unauthenticated queue within deterministic oldest-first account and global budgets.
-/// Ties use `signed_hash`, so replicas with the same rows and timestamps retain the same set.
+/// Keep the unauthenticated queue within its per-account and global budgets.
 fn enforce_pre_verify_budget(
     conn: &Connection,
     account_id: AccountId,
     inserted_signed_hash: &EntryHash,
 ) -> rusqlite::Result<PreVerifyInsert> {
-    let mut evicted = Vec::new();
-    if evict_oldest_pre_verify(conn, Some(account_id), PRE_VERIFY_PER_ACCOUNT_MAX)? > 0 {
-        evicted.push(CapacityScope::PreVerifyAccount);
-    }
-    if !pre_verify_contains(conn, inserted_signed_hash)? {
-        return Ok(PreVerifyInsert::AtCapacity(CapacityScope::PreVerifyAccount));
-    }
-    if evict_oldest_pre_verify(conn, None, PRE_VERIFY_GLOBAL_MAX)? > 0 {
-        evicted.push(CapacityScope::PreVerifyGlobal);
-    }
-    if !pre_verify_contains(conn, inserted_signed_hash)? {
-        return Ok(PreVerifyInsert::AtCapacity(CapacityScope::PreVerifyGlobal));
-    }
-    Ok(PreVerifyInsert::Parked { evicted })
-}
-
-fn evict_oldest_pre_verify(
-    conn: &Connection,
-    account_id: Option<AccountId>,
-    limit: usize,
-) -> rusqlite::Result<usize> {
-    let account_bytes = account_id.map(AccountId::to_bytes);
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM account_pre_verify
-         WHERE (?1 IS NULL OR claimed_account_id = ?1)",
-        params![account_bytes.as_ref().map(<[u8; 32]>::as_slice)],
-        |row| row.get(0),
+    let outcome = PRE_VERIFY.enforce_budget(
+        conn,
+        account_id,
+        inserted_signed_hash,
+        QueueBudget { max: PRE_VERIFY_PER_ACCOUNT_MAX, scope: CapacityScope::PreVerifyAccount },
+        QueueBudget { max: PRE_VERIFY_GLOBAL_MAX, scope: CapacityScope::PreVerifyGlobal },
     )?;
-    if count <= limit as i64 {
-        return Ok(0);
-    }
-    let excess = count - limit as i64;
-    conn.execute(
-        "DELETE FROM account_pre_verify WHERE signed_hash IN (
-             SELECT signed_hash FROM account_pre_verify
-             WHERE (?1 IS NULL OR claimed_account_id = ?1)
-             ORDER BY received_at_ms, signed_hash
-             LIMIT ?2
-         )",
-        params![account_bytes.as_ref().map(<[u8; 32]>::as_slice), excess,],
-    )
+    Ok(match outcome {
+        BudgetOutcome::Parked { evicted } => PreVerifyInsert::Parked { evicted },
+        BudgetOutcome::AtCapacity(scope) => PreVerifyInsert::AtCapacity(scope),
+    })
 }
 
 /// Retry every pre-verify row for the account against the now-larger device set: a row whose signer
@@ -3028,7 +2992,7 @@ fn promote_pre_verify(
                 });
             let Some(verified) = promoted else {
                 // The signer resolved but the signature or authenticated payload was invalid.
-                delete_pre_verify(tx, &signed_hash)?;
+                PRE_VERIFY.delete(tx, &signed_hash)?;
                 continue;
             };
             match insert_candidate(tx, &verified, &raw_bytes, now_ms)? {
@@ -3040,14 +3004,14 @@ fn promote_pre_verify(
                     // a later park-budget eviction silently discarded it.
                     outcome.scope.get_or_insert(scope);
                     outcome.entry_hashes.push(verified.entry_hash);
-                    delete_pre_verify(tx, &signed_hash)?;
+                    PRE_VERIFY.delete(tx, &signed_hash)?;
                 },
                 CandidateInsert::Inserted | CandidateInsert::AlreadyPresent => {
                     // A promoted genesis/DeviceAdd certifies a device key — feed it back so the
                     // next round can resolve entries that were waiting on it.
                     add_self_pubkey(&mut pubkeys, &verified.header, &verified.payload);
                     promoted_any = true;
-                    delete_pre_verify(tx, &signed_hash)?;
+                    PRE_VERIFY.delete(tx, &signed_hash)?;
                 },
             }
         }
@@ -3058,11 +3022,6 @@ fn promote_pre_verify(
         }
     }
     Ok(outcome)
-}
-
-fn delete_pre_verify(conn: &Connection, signed_hash: &[u8]) -> rusqlite::Result<()> {
-    conn.execute("DELETE FROM account_pre_verify WHERE signed_hash = ?1", params![signed_hash])?;
-    Ok(())
 }
 
 /// A genesis op — gated on `log_id == CONTROL_LOG` (S3) so a secrets-log tag reusing the 0 number
@@ -6897,8 +6856,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, PRE_VERIFY_PER_ACCOUNT_MAX as i64);
-        assert!(pre_verify_contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
-        assert!(!pre_verify_contains(&conn, &oldest_signed_hash.unwrap()).unwrap());
+        assert!(PRE_VERIFY.contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
+        assert!(!PRE_VERIFY.contains(&conn, &oldest_signed_hash.unwrap()).unwrap());
     }
 
     #[test]
@@ -7083,7 +7042,7 @@ mod tests {
             scope: CapacityScope::CandidateGlobal,
             entry_hashes: vec![pending_hash],
         },);
-        assert!(!pre_verify_contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
+        assert!(!PRE_VERIFY.contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
         assert_eq!(status(&conn, &trigger_hash), Some("forked".into()));
         assert_eq!(status(&conn, &pending_hash), None, "the rejected row was not half-promoted");
     }
@@ -7158,7 +7117,7 @@ mod tests {
             entry_hashes: vec![pending_hash],
         },);
         tx.commit().unwrap();
-        assert!(!pre_verify_contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
+        assert!(!PRE_VERIFY.contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
         assert_eq!(status(&conn, &pending_hash), None, "the blocked row was not half-promoted");
     }
 

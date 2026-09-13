@@ -32,6 +32,7 @@ mod keywrap;
 mod limits;
 mod node_binding;
 mod ops;
+mod pre_verify;
 mod registers;
 // C4.2b: the account secrets log (`log_id = 1`) — the `StreamKeyWrap` op + owner-gated acceptance
 // evaluator, consuming the control fold's authority projection (#607).
