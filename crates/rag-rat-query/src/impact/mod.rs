@@ -204,13 +204,47 @@ fn oracle_ranked_neighbors(
     Ok(hops)
 }
 
-pub fn impact_surface_report_for_symbol(
+/// The report's capped list lanes, gathered before the caveats and memory evidence are derived
+/// from them.
+struct ImpactSections {
+    direct_semantic_callers: Vec<GraphHop>,
+    direct_semantic_callees: Vec<GraphHop>,
+    import_export_dependents: Vec<ImpactItem>,
+    tests_touching_symbol_path: Vec<ImpactItem>,
+    docs_mentioning_symbol_path: Vec<ImpactItem>,
+    text_fallback_hits: Vec<ImpactItem>,
+    recent_commits_touching_symbol_path: Vec<ImpactItem>,
+    files_co_changed_with_symbol_path: Vec<ImpactItem>,
+    papertrail_rationale_items: Vec<ImpactItem>,
+}
+
+impl ImpactSections {
+    /// Every lane by its `ImpactSurfaceReport` field name, with its length. The one place those
+    /// names are spelled: `truncated_sections` reports them, and
+    /// `impact_lane_names_match_the_report_fields` pins them to the serialized report.
+    fn lane_lengths(&self) -> [(&'static str, usize); 9] {
+        [
+            ("direct_semantic_callers", self.direct_semantic_callers.len()),
+            ("direct_semantic_callees", self.direct_semantic_callees.len()),
+            ("import_export_dependents", self.import_export_dependents.len()),
+            ("tests_touching_symbol_path", self.tests_touching_symbol_path.len()),
+            ("docs_mentioning_symbol_path", self.docs_mentioning_symbol_path.len()),
+            ("text_fallback_hits", self.text_fallback_hits.len()),
+            ("recent_commits_touching_symbol_path", self.recent_commits_touching_symbol_path.len()),
+            ("files_co_changed_with_symbol_path", self.files_co_changed_with_symbol_path.len()),
+            ("papertrail_rationale_items", self.papertrail_rationale_items.len()),
+        ]
+    }
+}
+
+/// Fetch every list lane the options enable for `symbol`, each capped at `limit`.
+fn gather_sections(
     conn: &Connection,
     symbol: &SymbolHit,
     limit: u32,
     options: &ImpactSurfaceOptions,
-    enrich: impl Fn(&mut Vec<GraphHop>) -> anyhow::Result<bool>,
-) -> anyhow::Result<ImpactSurfaceReport> {
+    enrich: &impl Fn(&mut Vec<GraphHop>) -> anyhow::Result<bool>,
+) -> anyhow::Result<ImpactSections> {
     let graph_options = GraphTraversalOptions {
         resolution_mode: options.resolution_mode,
         symbol_id: Some(symbol.symbol_id),
@@ -223,21 +257,15 @@ pub fn impact_surface_report_for_symbol(
     // completeness counts) sees the SAME truncated, re-ranked window the report returns.
     // `enrich` is a no-op for callers without an oracle pass (e.g. tests), so the lists
     // collapse back to the plain heuristic top-`limit`.
-    let direct_semantic_callers = oracle_ranked_neighbors(
-        conn,
-        &symbol.qualified_name,
-        true,
-        limit,
-        &graph_options,
-        &enrich,
-    )?;
+    let direct_semantic_callers =
+        oracle_ranked_neighbors(conn, &symbol.qualified_name, true, limit, &graph_options, enrich)?;
     let direct_semantic_callees = oracle_ranked_neighbors(
         conn,
         &symbol.qualified_name,
         false,
         limit,
         &graph_options,
-        &enrich,
+        enrich,
     )?;
     let names = vec![symbol.name.clone(), symbol.qualified_name.clone()];
     let import_export_dependents =
@@ -275,11 +303,53 @@ pub fn impact_surface_report_for_symbol(
     } else {
         Vec::new()
     };
+    Ok(ImpactSections {
+        direct_semantic_callers,
+        direct_semantic_callees,
+        import_export_dependents,
+        tests_touching_symbol_path,
+        docs_mentioning_symbol_path,
+        text_fallback_hits,
+        recent_commits_touching_symbol_path,
+        files_co_changed_with_symbol_path,
+        papertrail_rationale_items,
+    })
+}
+
+/// No silent caps (#49): a section that returns exactly `limit` rows was capped and may hide more.
+/// Name every capped section so the agent can raise `limit` or narrow the query instead of trusting
+/// a truncated list as complete.
+fn truncated_sections(
+    sections: &ImpactSections,
+    memories_truncated: bool,
+    limit: u32,
+) -> Vec<String> {
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    sections
+        .lane_lengths()
+        .into_iter()
+        .filter(|&(_, len)| limit_usize != 0 && len >= limit_usize)
+        .map(|(name, _)| name.to_string())
+        // `repo_memories` is capped per lane inside memory_evidence; its `memories_truncated` flag
+        // accounts for rows split off to `stale` (which the active-lane lengths would miss), #146
+        // review.
+        .chain(memories_truncated.then(|| "repo_memories".to_string()))
+        .collect()
+}
+
+pub fn impact_surface_report_for_symbol(
+    conn: &Connection,
+    symbol: &SymbolHit,
+    limit: u32,
+    options: &ImpactSurfaceOptions,
+    enrich: impl Fn(&mut Vec<GraphHop>) -> anyhow::Result<bool>,
+) -> anyhow::Result<ImpactSurfaceReport> {
+    let sections = gather_sections(conn, symbol, limit, options, &enrich)?;
     let (repo_memories, memories_truncated) = if options.include_memories {
         let caller_edge_ids =
-            direct_semantic_callers.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
+            sections.direct_semantic_callers.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
         let callee_edge_ids =
-            direct_semantic_callees.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
+            sections.direct_semantic_callees.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
         memory::memory_evidence_for_symbol_and_edges(
             conn,
             symbol,
@@ -292,37 +362,16 @@ pub fn impact_surface_report_for_symbol(
     };
     let mut caveats = vec![GRAPH_SYNTACTIC_CAVEAT.to_string()];
     if options.resolution_mode == GraphResolutionMode::Exact
-        && direct_semantic_callers.is_empty()
-        && !text_fallback_hits.is_empty()
+        && sections.direct_semantic_callers.is_empty()
+        && !sections.text_fallback_hits.is_empty()
     {
         caveats.push(format!(
             "No exact graph callers found. Text search found {} symbol/path hits. This likely \
              indicates graph extraction or resolution gaps.",
-            text_fallback_hits.len()
+            sections.text_fallback_hits.len()
         ));
     }
-    // No silent caps (#49): a section that returns exactly `limit` rows was capped and may hide
-    // more. Name every capped section so the agent can raise `limit` or narrow the query instead of
-    // trusting a truncated list as complete.
-    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
-    let truncated_sections: Vec<String> = [
-        ("direct_semantic_callers", direct_semantic_callers.len()),
-        ("direct_semantic_callees", direct_semantic_callees.len()),
-        ("import_export_dependents", import_export_dependents.len()),
-        ("tests_touching_symbol_path", tests_touching_symbol_path.len()),
-        ("docs_mentioning_symbol_path", docs_mentioning_symbol_path.len()),
-        ("text_fallback_hits", text_fallback_hits.len()),
-        ("recent_commits_touching_symbol_path", recent_commits_touching_symbol_path.len()),
-        ("files_co_changed_with_symbol_path", files_co_changed_with_symbol_path.len()),
-        ("papertrail_rationale_items", papertrail_rationale_items.len()),
-    ]
-    .into_iter()
-    .filter(|&(_, len)| limit_usize != 0 && len >= limit_usize)
-    .map(|(name, _)| name.to_string())
-    // `repo_memories` is capped per lane inside memory_evidence; its `memories_truncated` flag
-    // accounts for rows split off to `stale` (which the active-lane lengths would miss), #146 review.
-    .chain(memories_truncated.then(|| "repo_memories".to_string()))
-    .collect();
+    let truncated_sections = truncated_sections(&sections, memories_truncated, limit);
     if !truncated_sections.is_empty() {
         caveats.push(format!(
             "Sections truncated at limit={limit}: {}. More results may exist — raise `limit` or \
@@ -353,6 +402,17 @@ pub fn impact_surface_report_for_symbol(
     } else {
         RepoMemoryEvidenceView::Full(repo_memories)
     };
+    let ImpactSections {
+        direct_semantic_callers,
+        direct_semantic_callees,
+        import_export_dependents,
+        tests_touching_symbol_path,
+        docs_mentioning_symbol_path,
+        text_fallback_hits,
+        recent_commits_touching_symbol_path,
+        files_co_changed_with_symbol_path,
+        papertrail_rationale_items,
+    } = sections;
     Ok(ImpactSurfaceReport {
         query: ImpactSurfaceQuery {
             symbol_id: Some(symbol.symbol_id),
@@ -714,5 +774,61 @@ impl ImpactSurface {
         });
         items.truncate(limit);
         items
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn impact_lane_names_match_the_report_fields() {
+        let sections = ImpactSections {
+            direct_semantic_callers: Vec::new(),
+            direct_semantic_callees: Vec::new(),
+            import_export_dependents: Vec::new(),
+            tests_touching_symbol_path: Vec::new(),
+            docs_mentioning_symbol_path: Vec::new(),
+            text_fallback_hits: Vec::new(),
+            recent_commits_touching_symbol_path: Vec::new(),
+            files_co_changed_with_symbol_path: Vec::new(),
+            papertrail_rationale_items: Vec::new(),
+        };
+        let names = sections.lane_lengths().map(|(name, _)| name);
+        let ImpactSections {
+            direct_semantic_callers,
+            direct_semantic_callees,
+            import_export_dependents,
+            tests_touching_symbol_path,
+            docs_mentioning_symbol_path,
+            text_fallback_hits,
+            recent_commits_touching_symbol_path,
+            files_co_changed_with_symbol_path,
+            papertrail_rationale_items,
+        } = sections;
+        let report = ImpactSurfaceReport {
+            query: ImpactSurfaceQuery {
+                symbol_id: None,
+                symbol_path: None,
+                query: None,
+                resolution: String::new(),
+            },
+            direct_semantic_callers,
+            direct_semantic_callees,
+            import_export_dependents,
+            tests_touching_symbol_path,
+            docs_mentioning_symbol_path,
+            text_fallback_hits,
+            recent_commits_touching_symbol_path,
+            files_co_changed_with_symbol_path,
+            papertrail_rationale_items,
+            repo_memories: RepoMemoryEvidenceView::Full(RepoMemoryEvidence::default()),
+            distilled_records: Vec::new(),
+            completeness_and_caveats: ImpactCompleteness::default(),
+        };
+        let serialized = serde_json::to_value(&report).unwrap();
+        for name in names {
+            assert!(serialized.get(name).is_some(), "`{name}` is not an ImpactSurfaceReport field");
+        }
     }
 }
