@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 
 use super::super::RefineMember;
@@ -141,101 +141,17 @@ pub(super) fn anti_unify_with_budget(
     // `EmittedSpan::Statement`.
     let mut zero_width_cols: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     for span in &spans {
-        // Two Raw-span widenings, both turning a leaf hole that would render an INVALID
-        // substitution into a whole-subtree hole:
-        // - Fix 3 (Codex round-5): a `string_content` LEAF covers only the text INSIDE the quotes
-        //   (`hello`), so the surrounding `"` quotes would render as FIXED text around the hole →
-        //   `"⟨m0⟩"` with `arg0: &str` (a `&str` value carries its own quotes). Widen to the
-        //   enclosing `string_literal` so the hole is the WHOLE `"hello"`.
-        // - Fix 4 (Codex round-7): a `generic_type` HEAD leaf (`Vec` of `Vec<i32>` vs
-        //   `Option<i32>`) reopens only the head, so the type args render as FIXED text around the
-        //   hole → `⟨m0⟩<i32>` / `-> T0<i32>` (invalid Rust, and hard-codes the anchor's type
-        //   args). Widen to the enclosing `generic_type` so the WHOLE `Vec<i32>` is one type_param
-        //   → `⟨m0⟩` / generic `T0` with values `[Vec<i32>, Option<i32>]`. An INNER-arg-only diff
-        //   (`Vec<i32>`/`Vec<u8>`) reopens the inner leaf (not the head), so it is NOT widened — it
-        //   stays the existing inner case.
-        // Statement / Classified spans are never bare type/string leaves, so widening only applies
-        // to Raw.
-        let (lo, hi) = match span {
-            EmittedSpan::Raw(rlo, rhi) => {
-                let (wlo, whi) = widen_string_content_run(anchor, *rlo, *rhi);
-                widen_generic_type_head_run(anchor, wlo, whi)
-            },
-            EmittedSpan::Statement { lo, hi, .. } | EmittedSpan::Classified { lo, hi, .. } =>
-                (*lo, *hi),
-        };
-        let snapped_kind = anchor.node_spans[lo].kind;
-        // A statement-snapped indel carries pre-computed, statement-balanced per_member_values
-        // (recovered from clean statement-level structural alignment, NOT the tangled token
-        // col_map) and is always Gapped. A Classified span (Fix 2 matched-statement re-descent)
-        // carries a pre-classified VP from a clean sub-anti_unify — consumed verbatim, NOT
-        // re-recovered from the parent's tangled col_map. A raw run recovers from the col_map and
-        // is classified.
-        let (per_member_values, run_class, is_zero_width) = match span {
-            EmittedSpan::Statement { per_member_values, zero_width, .. } => (
-                per_member_values.clone(),
-                RunClass {
-                    kind: MetavarKind::Gapped,
-                    type_hint: None,
-                    confidence: Confidence::Low,
-                    differing_callee: false,
-                },
-                *zero_width,
-            ),
-            EmittedSpan::Classified {
-                per_member_values,
-                kind,
-                type_hint,
-                confidence,
-                differing_callee,
-                zero_width,
-                ..
-            } => (
-                per_member_values.clone(),
-                RunClass {
-                    kind: *kind,
-                    type_hint: type_hint.clone(),
-                    confidence: *confidence,
-                    differing_callee: *differing_callee,
-                },
-                *zero_width,
-            ),
-            EmittedSpan::Raw(..) => {
-                let pmv = recover_values(members, alignment, lo, hi);
-                let rc = classify_run(members, alignment, anchor, lo, hi, &pmv);
-                (pmv, rc, false)
-            },
-        };
-        let RunClass { kind, type_hint, confidence, differing_callee } = run_class;
-        // C1 guard: drop a non-gapped, all-identical-value candidate (a fixed region mis-keyed by a
-        // stray insert). Compare only ALIGNED members' values (`aligned_values`): a cost-skipped
-        // member's `""` sentinel is "value unknown", NOT a distinct value, so it must not defeat
-        // the all-equal test and resurrect a spurious metavar over a genuinely-fixed region
-        // (the 8th skipped-member residual — see the INVARIANT note on `recover_values`).
-        // There is always ≥1 aligned member (the anchor), so the comparison is never empty.
-        if kind != MetavarKind::Gapped && aligned_values_all_equal(&per_member_values, alignment) {
+        let Some(SpanCandidate { metavar, hi, zero_width }) =
+            candidate_for_span(span, anchor, members, alignment)
+        else {
             continue;
-        }
-        if is_zero_width {
-            zero_width_cols.insert(lo);
+        };
+        if zero_width {
+            zero_width_cols.insert(metavar.lo);
         } else {
-            surviving_spans.push((lo, hi));
+            surviving_spans.push((metavar.lo, hi));
         }
-        candidates.push(RunMetavar {
-            lo,
-            snapped_kind,
-            per_member_values,
-            kind,
-            type_hint,
-            confidence,
-            differing_callee,
-            // The syntactic type context at this occurrence — the recovered `: T` annotation text
-            // (Fix 3, Codex round-7). Part of the collapse key so two occurrences with the SAME
-            // value tuple but DIFFERENT annotations (`let a: i32 = 1` / `let b: u8 = 1`) stay
-            // SEPARATE metavars; collapsing them would make `propose_signature` reuse one param
-            // across two distinct typed slots (an invalid `i32`+`u8` signature).
-            type_context: annotation_type_context(anchor, lo),
-        });
+        candidates.push(metavar);
     }
 
     // ── Recurrence collapse (§1.7): dedupe spans with identical (values, kind)
@@ -252,23 +168,13 @@ pub(super) fn anti_unify_with_budget(
          {variation_points:?}"
     );
 
-    // ── Coverage (§1.10): fixed_spine_columns / total_spine_columns ──────────────────────────────
-    // Every column a SURVIVING metavar span covers counts as non-fixed (a subtree-snapped metavar
-    // marks its whole span). Dropped (all-identical) spans are fixed, so coverage is recomputed
-    // over the surviving spans only — the dropped columns rejoin the fixed mask and coverage rises.
-    // Zero-width member-only inserts occupy no anchor column → excluded from the mask.
-    let mut snapped_fixed = is_fixed.clone();
-    for &(lo, hi) in &surviving_spans {
-        snapped_fixed[lo..=hi].fill(false);
-    }
-    let anti_unify_coverage = coverage_from_mask(&snapped_fixed);
-
-    // ── Template text (§1.9) ─────────────────────────────────────────────────────────────────────
-    // occurrences store only the lo column after collapse; map lo → hi so render recovers each
-    // span.
-    let lo_to_hi: BTreeMap<usize, usize> =
-        surviving_spans.iter().map(|&(lo, hi)| (lo, hi)).collect();
-    let text = render_template(anchor, &variation_points, &lo_to_hi, &zero_width_cols);
+    let (anti_unify_coverage, text) = coverage_and_render(
+        anchor,
+        &is_fixed,
+        &variation_points,
+        &surviving_spans,
+        &zero_width_cols,
+    );
 
     // Carry each occurrence's REAL snapped span + zero-width flag (Fix 2): a consuming hole keeps
     // its `(lo, hi)` from `surviving_spans`; a zero-width member-only insert is `(lo, lo)` with
@@ -290,6 +196,149 @@ pub(super) fn anti_unify_with_budget(
         sampled: redescent_sampled,
         occurrence_spans,
     }
+}
+
+/// One emitted span turned into a variation-point candidate, plus where it sits in the anchor.
+struct SpanCandidate {
+    metavar: RunMetavar,
+    /// The last anchor column the (possibly widened) span covers.
+    hi: usize,
+    /// A zero-width member-only insert: it occupies no anchor column, so it stays out of the
+    /// coverage mask and renders as an insertion point.
+    zero_width: bool,
+}
+
+/// Widen, value, and classify one emitted span into a variation-point candidate, or `None` when
+/// the C1 guard drops it as a genuinely fixed region.
+fn candidate_for_span(
+    span: &EmittedSpan,
+    anchor: &RefineMember,
+    members: &[RefineMember],
+    alignment: &ClassAlignment,
+) -> Option<SpanCandidate> {
+    // Two Raw-span widenings, both turning a leaf hole that would render an INVALID
+    // substitution into a whole-subtree hole:
+    // - Fix 3 (Codex round-5): a `string_content` LEAF covers only the text INSIDE the quotes
+    //   (`hello`), so the surrounding `"` quotes would render as FIXED text around the hole →
+    //   `"⟨m0⟩"` with `arg0: &str` (a `&str` value carries its own quotes). Widen to the enclosing
+    //   `string_literal` so the hole is the WHOLE `"hello"`.
+    // - Fix 4 (Codex round-7): a `generic_type` HEAD leaf (`Vec` of `Vec<i32>` vs `Option<i32>`)
+    //   reopens only the head, so the type args render as FIXED text around the hole → `⟨m0⟩<i32>`
+    //   / `-> T0<i32>` (invalid Rust, and hard-codes the anchor's type args). Widen to the
+    //   enclosing `generic_type` so the WHOLE `Vec<i32>` is one type_param → `⟨m0⟩` / generic `T0`
+    //   with values `[Vec<i32>, Option<i32>]`. An INNER-arg-only diff (`Vec<i32>`/`Vec<u8>`)
+    //   reopens the inner leaf (not the head), so it is NOT widened — it stays the existing inner
+    //   case.
+    // Statement / Classified spans are never bare type/string leaves, so widening only applies
+    // to Raw.
+    let (lo, hi) = match span {
+        EmittedSpan::Raw(rlo, rhi) => {
+            let (wlo, whi) = widen_string_content_run(anchor, *rlo, *rhi);
+            widen_generic_type_head_run(anchor, wlo, whi)
+        },
+        EmittedSpan::Statement { lo, hi, .. } | EmittedSpan::Classified { lo, hi, .. } =>
+            (*lo, *hi),
+    };
+    let snapped_kind = anchor.node_spans[lo].kind;
+    // A statement-snapped indel carries pre-computed, statement-balanced per_member_values
+    // (recovered from clean statement-level structural alignment, NOT the tangled token
+    // col_map) and is always Gapped. A Classified span (Fix 2 matched-statement re-descent)
+    // carries a pre-classified VP from a clean sub-anti_unify — consumed verbatim, NOT
+    // re-recovered from the parent's tangled col_map. A raw run recovers from the col_map and
+    // is classified.
+    let (per_member_values, run_class, is_zero_width) = match span {
+        EmittedSpan::Statement { per_member_values, zero_width, .. } => (
+            per_member_values.clone(),
+            RunClass {
+                kind: MetavarKind::Gapped,
+                type_hint: None,
+                confidence: Confidence::Low,
+                differing_callee: false,
+            },
+            *zero_width,
+        ),
+        EmittedSpan::Classified {
+            per_member_values,
+            kind,
+            type_hint,
+            confidence,
+            differing_callee,
+            zero_width,
+            ..
+        } => (
+            per_member_values.clone(),
+            RunClass {
+                kind: *kind,
+                type_hint: type_hint.clone(),
+                confidence: *confidence,
+                differing_callee: *differing_callee,
+            },
+            *zero_width,
+        ),
+        EmittedSpan::Raw(..) => {
+            let pmv = recover_values(members, alignment, lo, hi);
+            let rc = classify_run(members, alignment, anchor, lo, hi, &pmv);
+            (pmv, rc, false)
+        },
+    };
+    let RunClass { kind, type_hint, confidence, differing_callee } = run_class;
+    // C1 guard: drop a non-gapped, all-identical-value candidate (a fixed region mis-keyed by a
+    // stray insert). Compare only ALIGNED members' values (`aligned_values`): a cost-skipped
+    // member's `""` sentinel is "value unknown", NOT a distinct value, so it must not defeat
+    // the all-equal test and resurrect a spurious metavar over a genuinely-fixed region
+    // (the 8th skipped-member residual — see the INVARIANT note on `recover_values`).
+    // There is always ≥1 aligned member (the anchor), so the comparison is never empty.
+    if kind != MetavarKind::Gapped && aligned_values_all_equal(&per_member_values, alignment) {
+        return None;
+    }
+    Some(SpanCandidate {
+        hi,
+        zero_width: is_zero_width,
+        metavar: RunMetavar {
+            lo,
+            snapped_kind,
+            per_member_values,
+            kind,
+            type_hint,
+            confidence,
+            differing_callee,
+            // The syntactic type context at this occurrence — the recovered `: T` annotation text
+            // (Fix 3, Codex round-7). Part of the collapse key so two occurrences with the SAME
+            // value tuple but DIFFERENT annotations (`let a: i32 = 1` / `let b: u8 = 1`) stay
+            // SEPARATE metavars; collapsing them would make `propose_signature` reuse one param
+            // across two distinct typed slots (an invalid `i32`+`u8` signature).
+            type_context: annotation_type_context(anchor, lo),
+        },
+    })
+}
+
+/// Coverage and template text for the surviving variation points: the fixed-spine fraction once
+/// every surviving span is masked out, and the rendered template.
+fn coverage_and_render(
+    anchor: &RefineMember,
+    is_fixed: &[bool],
+    variation_points: &[VariationPoint],
+    surviving_spans: &[(usize, usize)],
+    zero_width_cols: &BTreeSet<usize>,
+) -> (f64, String) {
+    // ── Coverage (§1.10): fixed_spine_columns / total_spine_columns ──────────────────────────────
+    // Every column a SURVIVING metavar span covers counts as non-fixed (a subtree-snapped metavar
+    // marks its whole span). Dropped (all-identical) spans are fixed, so coverage is recomputed
+    // over the surviving spans only — the dropped columns rejoin the fixed mask and coverage rises.
+    // Zero-width member-only inserts occupy no anchor column → excluded from the mask.
+    let mut snapped_fixed = is_fixed.to_vec();
+    for &(lo, hi) in surviving_spans {
+        snapped_fixed[lo..=hi].fill(false);
+    }
+    let anti_unify_coverage = coverage_from_mask(&snapped_fixed);
+
+    // ── Template text (§1.9) ─────────────────────────────────────────────────────────────────────
+    // occurrences store only the lo column after collapse; map lo → hi so render recovers each
+    // span.
+    let lo_to_hi: BTreeMap<usize, usize> =
+        surviving_spans.iter().map(|&(lo, hi)| (lo, hi)).collect();
+    let text = render_template(anchor, variation_points, &lo_to_hi, zero_width_cols);
+    (anti_unify_coverage, text)
 }
 
 /// The recursive anchor-subtree descent's shared state: the class being anti-unified with its
