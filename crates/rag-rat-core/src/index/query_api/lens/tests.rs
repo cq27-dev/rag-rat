@@ -637,7 +637,8 @@ fn graph_compositions_exclude_edges_with_out_of_scope_endpoints() {
         }),
         importance: None,
     };
-    let adapted = adapt_hops(conn, vec![compiler_hop], false).unwrap();
+    let adapted =
+        adapt_hops(conn, vec![compiler_hop], rag_rat_query::graph::Direction::Callees).unwrap();
     assert_eq!(adapted.len(), 1);
     assert_eq!(adapted[0].name, "target");
     assert_eq!(adapted[0].qname.as_deref(), Some(target_qname.as_str()));

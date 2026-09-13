@@ -747,8 +747,15 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
         logical_symbol_id: target.logical_symbol_id,
         ..Default::default()
     };
-    let callers =
-        db.graph_traversal_report("find_callers", &target, true, 10, &graph_options).unwrap();
+    let callers = db
+        .graph_traversal_report(
+            "find_callers",
+            &target,
+            rag_rat_query::graph::Direction::Callers,
+            10,
+            &graph_options,
+        )
+        .unwrap();
     let edge_id = callers.results[0].edge_id;
 
     let edge_memory = db

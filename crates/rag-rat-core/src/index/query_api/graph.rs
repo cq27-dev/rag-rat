@@ -47,7 +47,7 @@ impl IndexDatabase {
         options: &GraphTraversalOptions,
     ) -> anyhow::Result<Vec<GraphHop>> {
         let options = self.graph_options_with_logical_group(options)?;
-        self.traverse_with_oracle(symbol, true, limit, &options)
+        self.traverse_with_oracle(symbol, Direction::Callers, limit, &options)
     }
 
     /// Upgrade graph hops to the `Compiler` confidence tier where a CURRENT, in-scope `edge_oracle`
@@ -176,7 +176,7 @@ impl IndexDatabase {
     fn traverse_with_oracle(
         &self,
         symbol: &str,
-        reverse: bool,
+        direction: Direction,
         limit: u32,
         options: &GraphTraversalOptions,
     ) -> anyhow::Result<Vec<GraphHop>> {
@@ -184,7 +184,7 @@ impl IndexDatabase {
         let mut hops = graph::traverse_with_options(
             self.storage.connection(),
             symbol,
-            if reverse { Direction::Callers } else { Direction::Callees },
+            direction,
             overfetch,
             options,
         )?;
@@ -216,14 +216,14 @@ impl IndexDatabase {
         options: &GraphTraversalOptions,
     ) -> anyhow::Result<Vec<GraphHop>> {
         let options = self.graph_options_with_logical_group(options)?;
-        self.traverse_with_oracle(symbol, false, limit, &options)
+        self.traverse_with_oracle(symbol, Direction::Callees, limit, &options)
     }
 
     pub fn graph_traversal_report(
         &self,
         tool: &str,
         symbol: &SymbolHit,
-        reverse: bool,
+        direction: Direction,
         limit: u32,
         options: &GraphTraversalOptions,
     ) -> anyhow::Result<GraphTraversalReport> {
@@ -233,11 +233,11 @@ impl IndexDatabase {
         // (its own COUNT query, independent of the returned window), so passing the truncated
         // `results.len()` as the returned count stays correct.
         let results =
-            self.traverse_with_oracle(&symbol.qualified_name, reverse, limit, &options)?;
+            self.traverse_with_oracle(&symbol.qualified_name, direction, limit, &options)?;
         let mut summary = graph::traversal_summary(
             self.storage.connection(),
             &symbol.qualified_name,
-            if reverse { Direction::Callers } else { Direction::Callees },
+            direction,
             limit,
             &options,
             results.len(),

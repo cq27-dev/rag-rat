@@ -95,12 +95,12 @@ pub(crate) fn call_tool_with_db(
         "find_callers" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
             let resolution_mode = resolution_mode(args.resolution);
-            graph_tool(db, args, resolution_mode, true, memory_surface)?
+            graph_tool(db, args, resolution_mode, Direction::Callers, memory_surface)?
         },
         "trace_callees" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
             let resolution_mode = resolution_mode(args.resolution);
-            graph_tool(db, args, resolution_mode, false, memory_surface)?
+            graph_tool(db, args, resolution_mode, Direction::Callees, memory_surface)?
         },
         "compare_graph_to_text" => {
             let args: CompareGraphTextArgs = serde_json::from_value(arguments)?;
@@ -385,7 +385,7 @@ pub(crate) fn graph_tool(
     db: &IndexDatabase,
     args: SymbolGraphArgs,
     resolution_mode: GraphResolutionMode,
-    reverse: bool,
+    direction: Direction,
     memory_surface: MemorySurface,
 ) -> anyhow::Result<Value> {
     let limit = args.limit;
@@ -406,13 +406,12 @@ pub(crate) fn graph_tool(
     match select_for_answer(db, &selector)? {
         SymbolAnswer::Selected(symbol) => {
             options.symbol_id = Some(symbol.symbol_id);
-            let mut value = json!(db.graph_traversal_report(
-                if reverse { "find_callers" } else { "trace_callees" },
-                &symbol,
-                reverse,
-                limit,
-                &options
-            )?);
+            let tool = match direction {
+                Direction::Callers => "find_callers",
+                Direction::Callees => "trace_callees",
+            };
+            let mut value =
+                json!(db.graph_traversal_report(tool, &symbol, direction, limit, &options)?);
             compact_graph_coverage(&mut value, include_coverage);
             if include_memories {
                 let edge_ids = value["results"]
@@ -423,8 +422,10 @@ pub(crate) fn graph_tool(
                     .collect::<Vec<_>>();
                 // find_callers crosses caller edges (X -> symbol); trace_callees crosses callee
                 // edges (symbol -> X). Pass the correct side so call-path hashes line up (#38).
-                let (caller_edge_ids, callee_edge_ids): (&[i64], &[i64]) =
-                    if reverse { (&edge_ids, &[]) } else { (&[], &edge_ids) };
+                let (caller_edge_ids, callee_edge_ids): (&[i64], &[i64]) = match direction {
+                    Direction::Callers => (&edge_ids, &[]),
+                    Direction::Callees => (&[], &edge_ids),
+                };
                 value["repo_memories"] = json!(db.memory_evidence_for_symbol_and_edges(
                     &symbol,
                     caller_edge_ids,
@@ -436,10 +437,9 @@ pub(crate) fn graph_tool(
             Ok(value)
         },
         SymbolAnswer::ByName(symbol) => {
-            let hops = if reverse {
-                db.find_callers_with_options(&symbol, limit, &options)?
-            } else {
-                db.trace_callees_with_options(&symbol, limit, &options)?
+            let hops = match direction {
+                Direction::Callers => db.find_callers_with_options(&symbol, limit, &options)?,
+                Direction::Callees => db.trace_callees_with_options(&symbol, limit, &options)?,
             };
             Ok(json!(hops))
         },

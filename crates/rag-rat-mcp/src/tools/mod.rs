@@ -15,7 +15,7 @@ use rag_rat_core::IndexDatabase;
 use rag_rat_core::query::clusters::RepoClustersOptions;
 use rag_rat_core::search::lexical::SearchOptions;
 use rag_rat_oracle::LibraryUsageOptions;
-use rag_rat_query::graph::{GraphResolutionMode, GraphTraversalOptions};
+use rag_rat_query::graph::{Direction, GraphResolutionMode, GraphTraversalOptions};
 use rag_rat_query::graph_meta::GraphMetaMode;
 use rag_rat_query::impact::ImpactSurfaceOptions;
 use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryUpdate};

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use rag_rat_query::graph::{self, GraphTraversalOptions};
+use rag_rat_query::graph::{self, Direction, GraphTraversalOptions};
 use rusqlite::{Connection, params_from_iter};
 use serde::Serialize;
 
@@ -126,7 +126,7 @@ impl IndexDatabase {
         };
         let hops = self.find_callers_with_options(&traversal.seed, limit, &traversal.options)?;
         Ok(Some(LensCallers {
-            callers: adapt_hops(self.storage.connection(), hops, true)?,
+            callers: adapt_hops(self.storage.connection(), hops, Direction::Callers)?,
             resolved_by: traversal.resolved_by,
             matched_symbols: traversal.matched_symbols,
         }))
@@ -143,7 +143,7 @@ impl IndexDatabase {
         };
         let hops = self.trace_callees_with_options(&traversal.seed, limit, &traversal.options)?;
         Ok(Some(LensCallees {
-            callees: adapt_hops(self.storage.connection(), hops, false)?,
+            callees: adapt_hops(self.storage.connection(), hops, Direction::Callees)?,
             resolved_by: traversal.resolved_by,
             matched_symbols: traversal.matched_symbols,
         }))
@@ -218,11 +218,11 @@ impl IndexDatabase {
 pub(super) fn adapt_hops(
     conn: &Connection,
     hops: Vec<graph::GraphHop>,
-    reverse: bool,
+    direction: Direction,
 ) -> anyhow::Result<Vec<LensSymbolHop>> {
     let edge_ids = hops.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
-    let mut info = symbol_info_for_edges(conn, &edge_ids, reverse)?;
-    if !reverse {
+    let mut info = symbol_info_for_edges(conn, &edge_ids, direction)?;
+    if direction == Direction::Callees {
         let compiler_targets = hops
             .iter()
             .filter(|hop| hop.confidence == "compiler")
@@ -248,7 +248,7 @@ pub(super) fn adapt_hops(
                     (symbol.name.clone(), symbol.qname.clone(), Some(symbol.kind.clone())),
                 // File-level callers deliberately have no `from_symbol_id`; traversal still
                 // supplies their indexed path as the source name and their real callsite.
-                None if reverse => (hop.from_symbol?, None, None),
+                None if direction == Direction::Callers => (hop.from_symbol?, None, None),
                 None => return None,
             };
             Some(LensSymbolHop {
@@ -270,13 +270,16 @@ pub(super) fn adapt_hops(
 fn symbol_info_for_edges(
     conn: &Connection,
     edge_ids: &[i64],
-    reverse: bool,
+    direction: Direction,
 ) -> anyhow::Result<HashMap<i64, HopSymbolInfo>> {
     if edge_ids.is_empty() {
         return Ok(HashMap::new());
     }
     let marks = edge_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let other_symbol_id = if reverse { "e.from_symbol_id" } else { "e.to_symbol_id" };
+    let other_symbol_id = match direction {
+        Direction::Callers => "e.from_symbol_id",
+        Direction::Callees => "e.to_symbol_id",
+    };
     let sql = format!(
         "SELECT e.id, s.name, ns.value, s.kind
          FROM edges e

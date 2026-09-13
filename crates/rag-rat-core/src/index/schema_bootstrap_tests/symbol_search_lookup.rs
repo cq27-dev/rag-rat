@@ -367,7 +367,7 @@ pub fn caller() {
         .graph_traversal_report(
             "find_callers",
             &lookup.candidates[0],
-            true,
+            rag_rat_query::graph::Direction::Callers,
             10,
             &rag_rat_query::graph::GraphTraversalOptions {
                 resolution_mode: rag_rat_query::graph::GraphResolutionMode::Exact,
