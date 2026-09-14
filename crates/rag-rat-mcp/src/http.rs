@@ -383,8 +383,8 @@ async fn file_clones(
     State(mut state): State<HttpState>,
     Query(query): Query<FileClonesQuery>,
 ) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileClones>>, ApiError> {
-    let path = query.path.ok_or_else(|| ApiError::bad_query("missing query parameter `path`"))?;
-    validate_relative_path(&path)?;
+    // Refuse a bad path before queueing on the clone gate; `file_lens` re-checks it (idempotent).
+    let path = required_path(query.path)?;
     let theta = query.theta.unwrap_or(DEFAULT_THETA);
     if !theta.is_finite() || !(DEFAULT_THETA..=1.0).contains(&theta) {
         return Err(ApiError::bad_query("`theta` must be finite and in [0.7, 1.0]"));
@@ -393,7 +393,6 @@ async fn file_clones(
     if min_tokens < 0 {
         return Err(ApiError::bad_query("`min_tokens` must be non-negative"));
     }
-    let case_insensitive = state.options.case_insensitive_paths;
     // Queue for the clone graph BEFORE taking a database worker. A cache hit costs one vector
     // scan, so serializing the visible editors' clone lanes here is cheap; letting them queue on
     // the worker pool instead is what starves every other lane during a cold build.
@@ -401,29 +400,26 @@ async fn file_clones(
     let (_clone_graph, remaining) =
         acquire_within_budget(&clone_graph_gate, state.options.timeout).await?;
     state.options.timeout = remaining;
-    run_db(state, move |db, _, cancelled| {
-        let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_answer(&path, || {
-            db.lens_file_clones_with_cancel(&path, theta, min_tokens, cancelled)
-        })?)
+    file_lens(state, FileQuery { path: Some(path) }, move |db, path, cancelled| {
+        db.lens_file_clones_with_cancel(path, theta, min_tokens, cancelled)
     })
     .await
-    .map(Json)
 }
 
-/// The shared body of the plain `/api/file/*` lenses: require a valid relative `path`, resolve it
-/// to the indexed spelling, and wrap `read` in the file-answer freshness envelope. A new
-/// validation rule lands here once for every file lens.
+/// The shared body of the `/api/file/*` lenses: require a valid relative `path`, resolve it to the
+/// indexed spelling, and wrap `read` in the file-answer freshness envelope. A new validation rule
+/// lands here once for every file lens. `read` gets the worker's cancellation flag for a lens
+/// heavy enough to poll it.
 async fn file_lens<T: Send + 'static>(
     state: HttpState,
     query: FileQuery,
-    read: impl FnOnce(&IndexDatabase, &str) -> anyhow::Result<T> + Send + 'static,
+    read: impl FnOnce(&IndexDatabase, &str, &AtomicBool) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<Json<LensFileAnswer<T>>, ApiError> {
     let path = required_path(query.path)?;
     let case_insensitive = state.options.case_insensitive_paths;
-    run_db(state, move |db, _, _| {
+    run_db(state, move |db, _, cancelled| {
         let path = canonical_file_path(db, path, case_insensitive)?;
-        Ok(db.lens_file_answer(&path, || read(db, &path))?)
+        Ok(db.lens_file_answer(&path, || read(db, &path, cancelled))?)
     })
     .await
     .map(Json)
@@ -433,35 +429,35 @@ async fn file_symbols(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileSymbols>>, ApiError> {
-    file_lens(state, query, |db, path| db.lens_file_symbols(path)).await
+    file_lens(state, query, |db, path, _| db.lens_file_symbols(path)).await
 }
 
 async fn file_graph(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileGraph>>, ApiError> {
-    file_lens(state, query, |db, path| db.lens_file_graph(path)).await
+    file_lens(state, query, |db, path, _| db.lens_file_graph(path)).await
 }
 
 async fn file_coupling(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileCoupling>>, ApiError> {
-    file_lens(state, query, |db, path| db.lens_file_coupling(path)).await
+    file_lens(state, query, |db, path, _| db.lens_file_coupling(path)).await
 }
 
 async fn file_memories(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFileMemories>>, ApiError> {
-    file_lens(state, query, |db, path| db.lens_file_memories(path)).await
+    file_lens(state, query, |db, path, _| db.lens_file_memories(path)).await
 }
 
 async fn file_papertrail(
     State(state): State<HttpState>,
     Query(query): Query<FileQuery>,
 ) -> Result<Json<LensFileAnswer<rag_rat_core::index::LensFilePapertrail>>, ApiError> {
-    file_lens(state, query, |db, path| db.lens_file_papertrail(path)).await
+    file_lens(state, query, |db, path, _| db.lens_file_papertrail(path)).await
 }
 
 /// The shared body of the symbol hop lenses: resolve the hop selector and limit, run `hop`, and
