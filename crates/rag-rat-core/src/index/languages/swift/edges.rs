@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use rag_rat_db::EdgeConfidence;
 use tree_sitter::Node;
 
 use super::syntax;

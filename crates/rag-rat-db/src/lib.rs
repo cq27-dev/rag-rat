@@ -6,10 +6,12 @@
 
 pub mod chunk_text_store;
 pub mod content_digest;
+mod edge_confidence;
 pub mod hooks;
 pub mod meta;
 pub mod schema;
 pub mod storage;
 pub mod text_compression;
 
+pub use edge_confidence::EdgeConfidence;
 pub use hooks::MigrationHooks;

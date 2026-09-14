@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use rag_rat_db::EdgeConfidence;
 use rusqlite::Connection;
 use serde::Serialize;
 
@@ -48,22 +49,15 @@ pub(crate) fn edge_weight(kind: &str) -> f64 {
     }
 }
 
-/// Multiplier on [`edge_weight`] by the heuristic resolver's confidence in the edge
-/// (`EdgeConfidence` db strings). A name-only guess is a weak signal that a dependency exists, so
-/// it should flow less of the source's rank to that callee than a structurally-resolved call.
-/// Unknown values default to `1.0` (same defensive posture as [`edge_weight`]). A SCIP-verified
-/// edge bypasses this entirely and uses [`COMPILER_FACTOR`].
+/// Multiplier on [`edge_weight`] by the heuristic resolver's confidence in the edge: the stored
+/// [`EdgeConfidence`] token's [`EdgeConfidence::weight`]. Unknown values default to `1.0` (same
+/// defensive posture as [`edge_weight`]). A SCIP-verified edge bypasses this entirely and uses
+/// [`COMPILER_FACTOR`].
 ///
 /// `pub(crate)` so `query::load_bearing` reuses the SAME confidence table for scoped-weighted
 /// fan-in — single source of truth; do not duplicate.
 pub(crate) fn confidence_factor(confidence: &str) -> f64 {
-    match confidence {
-        "Exact" => 1.0,
-        "Syntactic" => 0.85,
-        "NameOnly" => 0.4,
-        "Ambiguous" => 0.2,
-        _ => 1.0,
-    }
+    EdgeConfidence::from_db_str(confidence).map_or(1.0, EdgeConfidence::weight)
 }
 
 /// Confidence factor for an edge a SCIP oracle confirmed or resolved — above a heuristic `Exact`

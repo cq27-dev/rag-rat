@@ -5112,6 +5112,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "sha2",
+ "strum",
  "tempfile",
  "tracing",
  "zstd",
