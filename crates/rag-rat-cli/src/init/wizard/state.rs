@@ -8,6 +8,7 @@ use rag_rat_papertrail::ResolvedTracker;
 use super::catalog::CookbookCatalog;
 use super::draft::{TrackerMode, WizardDraft};
 use super::probe::ProbeRegistry;
+use super::steps::embedding::RemoteModeChoice;
 use super::steps::hooks::HookConflict;
 use super::steps::{CheckResult, StepId, StepState};
 use crate::init::RepoScan;
@@ -22,12 +23,11 @@ pub(crate) enum OneShotHelp {
 }
 
 impl OneShotHelp {
-    fn for_remote_mode(mode: usize) -> Option<Self> {
+    fn for_remote_mode(mode: RemoteModeChoice) -> Self {
         match mode {
-            0 => Some(Self::EmbeddingOff),
-            1 => Some(Self::Connect),
-            2 => Some(Self::Ephemeral),
-            _ => None,
+            RemoteModeChoice::Local => Self::EmbeddingOff,
+            RemoteModeChoice::Connect => Self::Connect,
+            RemoteModeChoice::Ephemeral => Self::Ephemeral,
         }
     }
 }
@@ -38,7 +38,7 @@ pub(crate) struct WizardUiState {
     pub tab: usize,
     pub help_visible: bool,
     pub popup: Option<OneShotHelp>,
-    pub remote_mode_help_seen: [bool; 3],
+    pub remote_mode_help_seen: [bool; RemoteModeChoice::ALL.len()],
     pub review_scroll: u16,
     pub provision_log_open: bool,
     pub provision_log_scroll: u16,
@@ -54,7 +54,7 @@ impl WizardUiState {
             tab: 0,
             help_visible: false,
             popup: None,
-            remote_mode_help_seen: [false; 3],
+            remote_mode_help_seen: [false; RemoteModeChoice::ALL.len()],
             review_scroll: 0,
             provision_log_open: false,
             provision_log_scroll: 0,
@@ -64,9 +64,9 @@ impl WizardUiState {
         }
     }
 
-    pub(crate) fn show_remote_mode_help_once(&mut self, mode: usize) {
-        let Some(help) = OneShotHelp::for_remote_mode(mode) else { return };
-        if let Some(seen) = self.remote_mode_help_seen.get_mut(mode)
+    pub(crate) fn show_remote_mode_help_once(&mut self, mode: RemoteModeChoice) {
+        let help = OneShotHelp::for_remote_mode(mode);
+        if let Some(seen) = self.remote_mode_help_seen.get_mut(mode.index())
             && !*seen
         {
             *seen = true;

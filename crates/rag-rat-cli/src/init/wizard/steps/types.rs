@@ -109,7 +109,7 @@ pub(crate) enum StepState {
     },
     Embedding {
         model_cursor: usize,
-        mode_cursor: usize,
+        mode_cursor: super::embedding::RemoteModeChoice,
         backend_cursor: usize,
         cookbook_cursor: usize,
         server_model_cursor: usize,

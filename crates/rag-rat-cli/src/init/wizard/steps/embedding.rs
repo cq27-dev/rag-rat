@@ -67,7 +67,7 @@ pub(super) fn default_remote_model_for(local_model: &str, backend: RemoteBackend
 
 /// The three remote-embedding choices the Embedding step lists, in list order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum RemoteModeChoice {
+pub(crate) enum RemoteModeChoice {
     /// No remote: embed locally.
     Local,
     Connect,
@@ -75,14 +75,20 @@ enum RemoteModeChoice {
 }
 
 impl RemoteModeChoice {
-    const ALL: [Self; 3] = [Self::Local, Self::Connect, Self::Ephemeral];
+    pub(crate) const ALL: [Self; 3] = [Self::Local, Self::Connect, Self::Ephemeral];
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         self as usize
     }
 
     fn from_index(index: usize) -> Option<Self> {
         Self::ALL.get(index).copied()
+    }
+
+    fn step(self, delta: isize) -> Self {
+        Self::ALL[(self.index() as isize)
+            .saturating_add(delta)
+            .clamp(0, Self::ALL.len().saturating_sub(1) as isize) as usize]
     }
 
     fn label(self) -> &'static str {
@@ -163,7 +169,7 @@ fn default_cookbook_command(state: &WizardState) -> String {
 pub(super) fn init_embedding_step(state: &WizardState) -> StepState {
     let rows = model_rows();
     let model_cursor = rows.iter().position(|(id, _)| id == &state.draft.model).unwrap_or(0);
-    let mode_cursor = remote_mode(state).index();
+    let mode_cursor = remote_mode(state);
     let backend = draft_backend(state);
     let backend_cursor = BACKENDS_BY_EFFICIENCY.iter().position(|&b| b == backend).unwrap_or(0);
     let cookbook_cursor = selected_cookbook_idx(state).unwrap_or(0);
@@ -268,7 +274,7 @@ pub(super) fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
         theme::focused_block("Remote mode", *focus == EmbedFocus::Mode),
         RemoteModeChoice::ALL.iter().map(|mode| (mode.label(), *mode == rmode)),
         0,
-        *mode_cursor,
+        mode_cursor.index(),
     );
 
     if model_none {
@@ -842,7 +848,7 @@ fn move_embedding_cursor(state: &mut WizardState, delta: isize) {
                 list_window(*model_cursor, model_scroll);
             },
             EmbedFocus::Mode => {
-                *mode_cursor = (*mode_cursor as isize).saturating_add(delta).clamp(0, 2) as usize;
+                *mode_cursor = mode_cursor.step(delta);
             },
             EmbedFocus::Backend => {
                 let last = BACKENDS_BY_EFFICIENCY.len().saturating_sub(1);
@@ -888,7 +894,7 @@ fn move_embedding_cursor_to_edge(state: &mut WizardState, end: bool) {
     let gpu_len = current_gpu_options(state).len();
     let target = match focus {
         EmbedFocus::Model => model_rows().len().saturating_sub(1),
-        EmbedFocus::Mode => 2,
+        EmbedFocus::Mode => RemoteModeChoice::ALL.len().saturating_sub(1),
         EmbedFocus::Backend => BACKENDS_BY_EFFICIENCY.len().saturating_sub(1),
         EmbedFocus::Cookbook => cookbook_len.saturating_sub(1),
         EmbedFocus::ServerModel => server_model_len.saturating_sub(1),
@@ -913,7 +919,10 @@ fn move_embedding_cursor_to_edge(state: &mut WizardState, end: bool) {
                 *model_cursor = value;
                 list_window(*model_cursor, model_scroll);
             },
-            EmbedFocus::Mode => *mode_cursor = value,
+            EmbedFocus::Mode =>
+                if let Some(mode) = RemoteModeChoice::from_index(value) {
+                    *mode_cursor = mode;
+                },
             EmbedFocus::Backend => *backend_cursor = value,
             EmbedFocus::Cookbook => *cookbook_cursor = value,
             EmbedFocus::ServerModel => {
@@ -963,21 +972,21 @@ fn select_embedding_focus(state: &mut WizardState) {
         EmbedFocus::Mode => {
             let cursor = match &state.step {
                 Some(StepState::Embedding { mode_cursor, .. }) => *mode_cursor,
-                _ => 0,
+                _ => RemoteModeChoice::Local,
             };
             let current = remote_mode(state);
-            if cursor != current.index() {
+            if cursor != current {
                 let existing = state.draft.remote.as_ref().cloned();
                 let default_cookbook = default_cookbook_command(state);
-                state.draft.remote = match RemoteModeChoice::from_index(cursor) {
-                    Some(RemoteModeChoice::Connect) =>
+                state.draft.remote = match cursor {
+                    RemoteModeChoice::Connect =>
                         Some(new_connect_remote_from(&state.draft.model, existing.as_ref())),
-                    Some(RemoteModeChoice::Ephemeral) => Some(new_ephemeral_remote_from(
+                    RemoteModeChoice::Ephemeral => Some(new_ephemeral_remote_from(
                         &state.draft.model,
                         existing.as_ref(),
                         &default_cookbook,
                     )),
-                    Some(RemoteModeChoice::Local) | None => None,
+                    RemoteModeChoice::Local => None,
                 };
                 // A new remote may default to a different backend than the cursor points at (e.g.
                 // ephemeral defaults to infinity while the fresh cursor is on ollama). Re-sync the

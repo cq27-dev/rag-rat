@@ -430,7 +430,7 @@ fn embedding_mode_switch_resets_mode_specific_concurrency_default() {
 
     if let Some(StepState::Embedding { focus, mode_cursor, .. }) = &mut state.step {
         *focus = EmbedFocus::Mode;
-        *mode_cursor = 1;
+        *mode_cursor = super::embedding::RemoteModeChoice::Connect;
     }
     step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
 
@@ -439,7 +439,7 @@ fn embedding_mode_switch_resets_mode_specific_concurrency_default() {
     assert_eq!(remote.concurrency, RemoteEmbeddingConfig::omitted_concurrency_default(true));
 
     if let Some(StepState::Embedding { mode_cursor, .. }) = &mut state.step {
-        *mode_cursor = 2;
+        *mode_cursor = super::embedding::RemoteModeChoice::Ephemeral;
     }
     step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
 
