@@ -332,7 +332,7 @@ pub fn refresh_worktree_overlays(
                     && let Some(options) = budget.next_options()
                     && let Err(err) = db.reconcile_with_options_progress(options, |_| {})
                 {
-                    eprintln!("watch: worktree overlay reconcile failed for {worktree}: {err}");
+                    tracing::warn!(target: "rag_rat_core::watch", worktree = %worktree, error = %err, "watch: worktree overlay reconcile failed for {worktree}: {err}");
                 }
             },
             Err(err) => {
@@ -340,7 +340,7 @@ pub fn refresh_worktree_overlays(
                 // (a dirty edit moves no HEAD) — drop the skip proof so scoped passes keep
                 // refreshing this worktree until a pass completes (#577 review).
                 let _ = db.clear_worktree_overlay_basis(&worktree);
-                eprintln!("watch: worktree overlay refresh failed for {worktree}: {err}");
+                tracing::warn!(target: "rag_rat_core::watch", worktree = %worktree, error = %err, "watch: worktree overlay refresh failed for {worktree}: {err}");
             },
         }
     }
@@ -351,7 +351,7 @@ pub fn refresh_worktree_overlays(
     // per-worktree refresh: on failure the marker survives its rollback and the next pass
     // retries.
     if let Err(err) = db.apply_pending_logical_rebuild() {
-        eprintln!("watch: batch logical-symbol rebuild failed: {err}");
+        tracing::warn!(target: "rag_rat_core::watch", error = %err, "watch: batch logical-symbol rebuild failed: {err}");
     }
     // Restore the base scope for the rest of the pass (index_worktree_overlay leaves the connection
     // scoped to the last worktree it touched).
