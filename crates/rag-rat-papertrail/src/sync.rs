@@ -687,16 +687,6 @@ fn default_branch_checkout_projects(
     eligible
 }
 
-/// Text-tier commit closing edges, derived as a REPLACE SET each discovery pass: the prior
-/// text/commit rows are dropped and re-derived from the CURRENT indexed history, so a commit
-/// rebased or reloaded away takes its closer claim with it (provider-attested rows and the
-/// converged rows they upgraded are untouched — the natural key keeps them, and re-insertion
-/// under a provider row never downgrades it).
-///
-/// Providers honor commit closing keywords only on the DEFAULT branch, so edges mint only when
-/// the indexed checkout's HEAD IS the default branch (`origin/HEAD`, read locally): then every
-/// indexed commit is default-reachable. On a feature/release checkout — or when `origin/HEAD`
-/// is unset — the refs stay annotations and the provider tier attests closures.
 /// Claim strength for the in-memory duplicate collapse — closing beats reverts beats plain
 /// reference beats every other token (unknown, the manual lane's syntax shapes, or a token this
 /// build does not know).
@@ -709,6 +699,16 @@ fn ref_kind_rank(kind: &str) -> u8 {
     }
 }
 
+/// Text-tier commit closing edges, derived as a REPLACE SET each discovery pass: the prior
+/// text/commit rows are dropped and re-derived from the CURRENT indexed history, so a commit
+/// rebased or reloaded away takes its closer claim with it (provider-attested rows and the
+/// converged rows they upgraded are untouched — the natural key keeps them, and re-insertion
+/// under a provider row never downgrades it).
+///
+/// Providers honor commit closing keywords only on the DEFAULT branch, so edges mint only when
+/// the indexed checkout's HEAD IS the default branch (`origin/HEAD`, read locally): then every
+/// indexed commit is default-reachable. On a feature/release checkout — or when `origin/HEAD`
+/// is unset — the refs stay annotations and the provider tier attests closures.
 pub(crate) fn store_text_closing_edges_from_commit_refs(
     conn: &Connection,
     refs: &[PapertrailRef],
