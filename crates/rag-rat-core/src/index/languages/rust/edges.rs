@@ -480,8 +480,7 @@ fn nameable_type_node(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn redundant_parenthesized_type(node: Node<'_>) -> bool {
-    let mut named = node.walk();
-    if node.named_children(&mut named).count() != 1 {
+    if named_children(node).count() != 1 {
         return false;
     }
     let mut all = node.walk();

@@ -430,8 +430,7 @@ fn result_handler_calls_impl<'a>(
                 None => Vec::new(),
             };
             if let Some(body) = node.child_by_field_name("body") {
-                let mut arm_cursor = body.walk();
-                for arm in body.named_children(&mut arm_cursor) {
+                for arm in named_children(body) {
                     if arm.kind() == "match_arm"
                         && let Some(value) = arm.child_by_field_name("value")
                     {
@@ -474,9 +473,7 @@ fn result_handler_calls_impl<'a>(
             else {
                 return;
             };
-            let mut field_cursor = fields.walk();
-            let values: Vec<Node<'a>> = fields
-                .named_children(&mut field_cursor)
+            let values: Vec<Node<'a>> = named_children(fields)
                 .filter(|f| {
                     matches!(
                         f.kind(),
@@ -492,12 +489,10 @@ fn result_handler_calls_impl<'a>(
                         if let Some(value) = field.child_by_field_name("value") {
                             result_handler_calls(value, text, scope, out);
                         },
-                    _ => {
-                        let mut inner_cursor = field.walk();
-                        for inner in field.named_children(&mut inner_cursor) {
+                    _ =>
+                        for inner in named_children(*field) {
                             result_handler_calls(inner, text, scope, out);
-                        }
-                    },
+                        },
                 }
             }
         },

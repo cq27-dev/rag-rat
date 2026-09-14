@@ -979,10 +979,8 @@ fn swift_name_is_type_parameter_in_scope(reference_name: &str, node: Node<'_>, t
                 "type_parameters" | "enum_type_parameters" | "lambda_function_type_parameters"
             )
         }) {
-            let mut parameter_cursor = parameters.walk();
-            for parameter in parameters
-                .named_children(&mut parameter_cursor)
-                .filter(|child| child.kind() == "type_parameter")
+            for parameter in
+                named_children(parameters).filter(|child| child.kind() == "type_parameter")
             {
                 if syntax::identifier_nodes(parameter)
                     .first()

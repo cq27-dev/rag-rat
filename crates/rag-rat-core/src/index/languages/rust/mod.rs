@@ -485,8 +485,7 @@ fn print_type_inner(
             // trailing comma is the only thing that tells them apart.
             let one_tuple = members == 1 && has_kind(node, ",");
             if members == 1 && !one_tuple {
-                let mut inner = node.walk();
-                if let Some(only) = node.named_children(&mut inner).next() {
+                if let Some(only) = named_children(node).next() {
                     print_type(only, text, binders, position, out);
                 }
                 return;
