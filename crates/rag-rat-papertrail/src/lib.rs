@@ -1046,6 +1046,27 @@ mod token_tests {
     }
 
     #[test]
+    fn error_class_tokens_are_exact_and_closed() {
+        for (class, token) in [
+            (PapertrailErrorClass::Authentication, "authentication"),
+            (PapertrailErrorClass::Network, "network"),
+            (PapertrailErrorClass::RateLimited, "rate_limited"),
+            (PapertrailErrorClass::Provider, "provider"),
+            (PapertrailErrorClass::Storage, "storage"),
+            (PapertrailErrorClass::Unknown, "unknown"),
+        ] {
+            assert_eq!(class.as_db_str(), token);
+            assert_eq!(PapertrailErrorClass::from_db_str(token).unwrap(), class);
+        }
+        for rejected in ["RateLimited", "rate-limited", " network", ""] {
+            assert!(
+                PapertrailErrorClass::from_db_str(rejected).is_err(),
+                "must reject `{rejected}`"
+            );
+        }
+    }
+
+    #[test]
     fn implicit_cloud_token_never_crosses_an_enterprise_binding() {
         let tracker = |base_url: Option<&str>| ResolvedTracker {
             provider: Tracker::Github,

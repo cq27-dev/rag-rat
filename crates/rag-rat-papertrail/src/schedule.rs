@@ -22,7 +22,9 @@ pub(crate) struct BindingScheduleState {
     pub continuation: MirrorContinuation,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+/// Class of a binding's last failure (`papertrail_sync_cursor.error_class`).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum PapertrailErrorClass {
     Authentication,
@@ -30,31 +32,19 @@ pub enum PapertrailErrorClass {
     RateLimited,
     Provider,
     Storage,
+    /// No writer produces this today; it stays in the closed set because stored rows may carry it.
     Unknown,
 }
 
 impl PapertrailErrorClass {
+    /// The exact persisted token (`papertrail_sync_cursor.error_class`).
     pub(crate) fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Authentication => "authentication",
-            Self::Network => "network",
-            Self::RateLimited => "rate_limited",
-            Self::Provider => "provider",
-            Self::Storage => "storage",
-            Self::Unknown => "unknown",
-        }
+        self.into()
     }
 
-    fn from_db_str(value: &str) -> Option<Self> {
-        match value {
-            "authentication" => Some(Self::Authentication),
-            "network" => Some(Self::Network),
-            "rate_limited" => Some(Self::RateLimited),
-            "provider" => Some(Self::Provider),
-            "storage" => Some(Self::Storage),
-            "unknown" => Some(Self::Unknown),
-            _ => None,
-        }
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub(crate) fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown error class token `{value}`"))
     }
 }
 
@@ -195,9 +185,15 @@ pub(crate) fn record_pause(
     let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
     conn.execute(
         "UPDATE papertrail_sync_cursor
-         SET retry_not_before_ms=?4, error_class='rate_limited', error_detail=NULL
+         SET retry_not_before_ms=?4, error_class=?5, error_detail=NULL
          WHERE repo_id=?1 AND tracker=?2 AND project=?3",
-        params![repo_id, binding.provider.as_db_str(), binding.project, resume_at_ms],
+        params![
+            repo_id,
+            binding.provider.as_db_str(),
+            binding.project,
+            resume_at_ms,
+            PapertrailErrorClass::RateLimited.as_db_str(),
+        ],
     )?;
     Ok(())
 }
@@ -290,7 +286,9 @@ pub(crate) fn load_persisted_health(
                         retry_not_before_ms: row.get(4)?,
                         continuation: MirrorContinuation::None,
                     },
-                    error_class: error.as_deref().and_then(PapertrailErrorClass::from_db_str),
+                    error_class: error
+                        .as_deref()
+                        .and_then(|token| PapertrailErrorClass::from_db_str(token).ok()),
                     error_detail: row.get(6)?,
                     filter_fingerprint: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
                 })
