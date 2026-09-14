@@ -687,16 +687,10 @@ fn default_branch_checkout_projects(
     eligible
 }
 
-/// Claim strength for the in-memory duplicate collapse — closing beats reverts beats plain
-/// reference beats every other token (unknown, the manual lane's syntax shapes, or a token this
-/// build does not know).
+/// Claim strength of a stored `ref_kind` token for the in-memory duplicate collapse
+/// ([`RefKind::claim_rank`]); a token this build does not know ranks with `unknown`.
 fn ref_kind_rank(kind: &str) -> u8 {
-    match kind.parse::<RefKind>() {
-        Ok(RefKind::Closing) => 0,
-        Ok(RefKind::Reverts) => 1,
-        Ok(RefKind::Reference) => 2,
-        _ => 3,
-    }
+    kind.parse::<RefKind>().unwrap_or(RefKind::Unknown).claim_rank()
 }
 
 /// Text-tier commit closing edges, derived as a REPLACE SET each discovery pass: the prior

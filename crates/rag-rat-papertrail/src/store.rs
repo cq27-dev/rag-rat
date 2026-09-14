@@ -937,6 +937,39 @@ mod fts_mirror_tests {
         assert_eq!(rows, 1, "one row per identity throughout");
     }
     #[test]
+    fn store_ref_upsert_ladder_matches_claim_rank_for_every_ordered_pair() {
+        // `store_ref`'s promote-never-demote ladder is SQL over stored tokens, so it cannot call
+        // `RefKind::claim_rank`; this pins the two to the same order for every variant pair.
+        use strum::VariantArray;
+
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let make = |kind: crate::RefKind| crate::PapertrailRef {
+            tracker: Tracker::Github,
+            project: "o/r".into(),
+            item_key: "5".into(),
+            item_kind: None,
+            ref_kind: kind.as_db_str().to_string(),
+            source_kind: crate::RefSourceKind::Commit.as_db_str().to_string(),
+            source_path: None,
+            source_commit: Some("abc".into()),
+            source_text: "fixes #5".into(),
+        };
+        for &first in crate::RefKind::VARIANTS {
+            for &second in crate::RefKind::VARIANTS {
+                conn.execute("DELETE FROM papertrail_refs", []).unwrap();
+                store_ref(&conn, &make(first)).unwrap();
+                store_ref(&conn, &make(second)).unwrap();
+                let stored: String = conn
+                    .query_row("SELECT ref_kind FROM papertrail_refs", [], |r| r.get(0))
+                    .unwrap();
+                let winner = if second.claim_rank() < first.claim_rank() { second } else { first };
+                assert_eq!(stored, winner.as_db_str(), "{first:?} then {second:?}");
+            }
+        }
+    }
+
+    #[test]
     fn rows_with_unrecognized_kind_tokens_still_read() {
         // `papertrail_refs.ref_kind`/`source_kind` and `papertrail_fts.doc_kind` are unconstrained
         // TEXT: a token this build does not know round-trips verbatim instead of failing the read.

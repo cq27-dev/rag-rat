@@ -340,8 +340,8 @@ impl ItemKind {
 }
 
 /// How a discovered reference claims its item (`papertrail_refs.ref_kind`), classified from the
-/// word before it. Claim strength for duplicate collapse is `ref_kind_rank`: `closing` beats
-/// `reverts` beats `reference` beats everything else.
+/// word before it. Claim strength is [`Self::claim_rank`], mirrored as a SQL `CASE` ladder in
+/// `store_ref`'s upsert; the pairwise store test keeps the two equal.
 #[derive(
     Debug,
     Clone,
@@ -374,6 +374,18 @@ impl RefKind {
     /// The exact persisted token (`papertrail_refs.ref_kind`).
     pub fn as_db_str(self) -> &'static str {
         self.into()
+    }
+
+    /// Claim strength, lower is stronger: `closing` beats `reverts` beats `reference` beats every
+    /// other token. Drives the in-memory duplicate collapse; `store_ref`'s promote-never-demote
+    /// upsert spells the same ladder in SQL, because it ranks stored rows.
+    pub(crate) fn claim_rank(self) -> u8 {
+        match self {
+            Self::Closing => 0,
+            Self::Reverts => 1,
+            Self::Reference => 2,
+            Self::Unknown | Self::Url | Self::CrossRepo | Self::LocalNumber | Self::GhDash => 3,
+        }
     }
 
     /// Parse a persisted token, rejecting anything outside the closed set.
