@@ -1219,6 +1219,9 @@ fn auto_seed_from_diff_picks_changed_symbols() {
         })
         .unwrap();
     assert_eq!(result.mode, rag_rat_query::pagerank::ImportanceMode::PersonalizedToChanges);
+    let wire = serde_json::to_value(&result).unwrap();
+    assert!(wire.get("diff_paths_considered").is_none());
+    assert!(wire.get("diff_paths_with_symbols").is_none());
     let seed = result.seed_source.expect("auto-seed reports provenance");
     assert_eq!(seed.kind, rag_rat_query::pagerank::SeedKind::GitDiff);
     assert!(seed.indexed_paths >= 1, "the dirty indexed file counted: {seed:?}");
@@ -1252,6 +1255,9 @@ fn diff_without_symbols_falls_back_to_global_with_reason() {
     assert_eq!(result.mode, rag_rat_query::pagerank::ImportanceMode::Global);
     assert_eq!(result.reason.as_deref(), Some("no symbols found in current diff"));
     assert_eq!(result.diff_paths_with_symbols, Some(0));
+    let wire = serde_json::to_value(&result).unwrap();
+    assert_eq!(wire["diff_paths_considered"], wire["seed_source"]["changed_paths"]);
+    assert_eq!(wire["diff_paths_with_symbols"], serde_json::json!(0));
     let seed = result.seed_source.expect("a fall-through still reports the diff it tried");
     assert!(seed.changed_paths >= 1, "the markdown change was considered: {seed:?}");
     assert_eq!(seed.symbol_seed_count, 0);

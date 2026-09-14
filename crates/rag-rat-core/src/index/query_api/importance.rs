@@ -4,8 +4,8 @@
 
 use rag_rat_query::graph::GraphHop;
 use rag_rat_query::pagerank::{
-    self, EdgeOracleEffect, ImportanceOptions, ImportantSymbolsResult, RankedImportance,
-    SkippedSeeds,
+    self, EdgeOracleEffect, ImportanceMode, ImportanceOptions, ImportantSymbolsResult,
+    RankedImportance, SeedKind, SeedSource, SkippedSeeds,
 };
 use rag_rat_query::symbol::{self, SymbolHit};
 use rusqlite::OptionalExtension;
@@ -49,6 +49,42 @@ enum ChangedPathSymbols {
     None,
 }
 
+fn diff_seed_source(diff: DiffSeed, effective: u64) -> SeedSource {
+    SeedSource {
+        kind: SeedKind::GitDiff,
+        changed_paths: diff.changed_paths,
+        indexed_paths: diff.indexed_paths,
+        symbol_seed_count: diff.symbol_ids.len() as u64,
+        effective_seed_count: effective,
+        skipped: diff.skipped,
+    }
+}
+
+fn importance_result(
+    mode: ImportanceMode,
+    seed_source: Option<SeedSource>,
+    reason: Option<&str>,
+    ranking_hint: Option<String>,
+    ranked: RankedImportance,
+) -> ImportantSymbolsResult {
+    // The legacy top-level diff counts diagnose only a global fallback from diff seeding;
+    // personalized results carry those counts exclusively in seed_source.
+    let diff_fallback = seed_source.as_ref().filter(|source| {
+        matches!(mode, ImportanceMode::Global) && matches!(source.kind, SeedKind::GitDiff)
+    });
+    let diff_paths_considered = diff_fallback.map(|source| source.changed_paths);
+    let diff_paths_with_symbols = diff_fallback.map(|source| source.indexed_paths);
+    ImportantSymbolsResult {
+        mode,
+        seed_source,
+        reason: reason.map(str::to_string),
+        diff_paths_considered,
+        diff_paths_with_symbols,
+        ranking_hint,
+        symbols: ranked.symbols,
+    }
+}
+
 impl IndexDatabase {
     /// Rank load-bearing symbols by weighted PageRank over the active checkout's edge graph
     /// (#108), returning the labeled [`ImportantSymbolsResult`] (mode + seed provenance) per the
@@ -77,8 +113,6 @@ impl IndexDatabase {
         &self,
         request: ImportantSymbolsRequest,
     ) -> anyhow::Result<ImportantSymbolsResult> {
-        use rag_rat_query::pagerank::{ImportanceMode, SeedKind, SeedSource};
-
         let oracle_effects = self.symbol_importance_oracle_effects()?;
         // Heuristic-only ranking (no oracle run for this checkout) earns a one-line nudge that
         // compiler-grade ranking is available. The config-unaware wording lives here; CLI/MCP swap
@@ -115,38 +149,32 @@ impl IndexDatabase {
                 } else {
                     "named symbols are not connected in the graph"
                 };
-                return Ok(ImportantSymbolsResult {
-                    mode: ImportanceMode::Global,
-                    seed_source: Some(seed_source),
-                    reason: Some(reason.to_string()),
-                    diff_paths_considered: None,
-                    diff_paths_with_symbols: None,
-                    ranking_hint: ranking_hint.clone(),
-                    symbols: ranked.symbols,
-                });
+                return Ok(importance_result(
+                    ImportanceMode::Global,
+                    Some(seed_source),
+                    Some(reason),
+                    ranking_hint,
+                    ranked,
+                ));
             }
-            return Ok(ImportantSymbolsResult {
-                mode: ImportanceMode::PersonalizedToChanges,
-                seed_source: Some(seed_source),
-                reason: None,
-                diff_paths_considered: None,
-                diff_paths_with_symbols: None,
+            return Ok(importance_result(
+                ImportanceMode::PersonalizedToChanges,
+                Some(seed_source),
+                None,
                 ranking_hint,
-                symbols: ranked.symbols,
-            });
+                ranked,
+            ));
         }
 
         // No explicit seed. CLI stays global-by-default; only the MCP default auto-seeds from diff.
         if !request.auto_seed_from_diff {
-            return Ok(ImportantSymbolsResult {
-                mode: ImportanceMode::Global,
-                seed_source: None,
-                reason: None,
-                diff_paths_considered: None,
-                diff_paths_with_symbols: None,
-                ranking_hint: ranking_hint.clone(),
-                symbols: rank(&[])?.symbols,
-            });
+            return Ok(importance_result(
+                ImportanceMode::Global,
+                None,
+                None,
+                ranking_hint,
+                rank(&[])?,
+            ));
         }
 
         let diff = self.diff_seed()?;
@@ -161,39 +189,21 @@ impl IndexDatabase {
             } else {
                 "diff symbols are not connected in the graph"
             };
-            return Ok(ImportantSymbolsResult {
-                mode: ImportanceMode::Global,
-                seed_source: Some(SeedSource {
-                    kind: SeedKind::GitDiff,
-                    changed_paths: diff.changed_paths,
-                    indexed_paths: diff.indexed_paths,
-                    symbol_seed_count: diff.symbol_ids.len() as u64,
-                    effective_seed_count: 0,
-                    skipped: diff.skipped,
-                }),
-                reason: Some(reason.to_string()),
-                diff_paths_considered: Some(diff.changed_paths),
-                diff_paths_with_symbols: Some(diff.indexed_paths),
-                ranking_hint: ranking_hint.clone(),
-                symbols: ranked.symbols,
-            });
+            return Ok(importance_result(
+                ImportanceMode::Global,
+                Some(diff_seed_source(diff, 0)),
+                Some(reason),
+                ranking_hint,
+                ranked,
+            ));
         }
-        Ok(ImportantSymbolsResult {
-            mode: ImportanceMode::PersonalizedToChanges,
-            seed_source: Some(SeedSource {
-                kind: SeedKind::GitDiff,
-                changed_paths: diff.changed_paths,
-                indexed_paths: diff.indexed_paths,
-                symbol_seed_count: diff.symbol_ids.len() as u64,
-                effective_seed_count: ranked.effective_seed_count,
-                skipped: diff.skipped,
-            }),
-            reason: None,
-            diff_paths_considered: None,
-            diff_paths_with_symbols: None,
+        Ok(importance_result(
+            ImportanceMode::PersonalizedToChanges,
+            Some(diff_seed_source(diff, ranked.effective_seed_count)),
+            None,
             ranking_hint,
-            symbols: ranked.symbols,
-        })
+            ranked,
+        ))
     }
 
     /// Resolve a mixed list of explicit seed selectors (numeric symbol ids, symbol paths, or bare
