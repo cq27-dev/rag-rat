@@ -32,7 +32,8 @@ pub enum PapertrailErrorClass {
     RateLimited,
     Provider,
     Storage,
-    /// No writer produces this today; it stays in the closed set because stored rows may carry it.
+    /// No writer produces this today. Stored rows may carry it, and a stored token outside this set
+    /// reads back as it (see `load_persisted_health`).
     Unknown,
 }
 
@@ -286,9 +287,15 @@ pub(crate) fn load_persisted_health(
                         retry_not_before_ms: row.get(4)?,
                         continuation: MirrorContinuation::None,
                     },
-                    error_class: error
-                        .as_deref()
-                        .and_then(|token| PapertrailErrorClass::from_db_str(token).ok()),
+                    // A token outside the closed set (a newer build's class, a hand-edited row)
+                    // reads as `Unknown` — a failure the status surface reports
+                    // — never as `None`, which every consumer takes to mean
+                    // healthy. Propagating the parse error instead would wedge
+                    // scheduling on one bad row.
+                    error_class: error.as_deref().map(|token| {
+                        PapertrailErrorClass::from_db_str(token)
+                            .unwrap_or(PapertrailErrorClass::Unknown)
+                    }),
                     error_detail: row.get(6)?,
                     filter_fingerprint: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
                 })

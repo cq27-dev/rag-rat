@@ -910,6 +910,21 @@ mod capability_tests {
     }
 
     #[test]
+    fn a_drifted_error_class_token_reads_as_an_unknown_failure_not_healthy() {
+        let binding = github(None);
+        let ctx =
+            PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &crate::test_hooks()).unwrap();
+        record_failure(&conn, &binding, PapertrailErrorClass::Network, Some("boom")).unwrap();
+        conn.execute("UPDATE papertrail_sync_cursor SET error_class = 'mystery'", []).unwrap();
+
+        let binding_status = status(&conn, &ctx).unwrap().bindings.remove(0);
+        assert_eq!(binding_status.error_class, Some(PapertrailErrorClass::Unknown));
+        assert!(binding_status.failed, "a drifted class surfaces as a failure, never as healthy");
+    }
+
+    #[test]
     fn paused_mirror_is_not_a_successful_operation() {
         let report = MirrorBindingReport {
             tracker: Tracker::Github,
