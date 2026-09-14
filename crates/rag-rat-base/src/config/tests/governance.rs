@@ -4,22 +4,20 @@ use super::*;
 fn config_load_resolves_main_and_linked_worktrees_to_one_database() {
     // The actual guarantee (review item 1): Config::load from the main worktree and from a
     // linked worktree of the same repo produce the *same* database path — not two DBs.
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("cfgload");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n[target_bindings]\nrust = \
-         [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "."
+database = ".rag-rat/index.sqlite"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@example.com"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
@@ -52,12 +50,16 @@ fn repo_id_override_is_parsed_and_does_not_change_the_database_path() {
     let tmp = scratch("repoid");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(
-        tmp.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\nrepo_id = \"  pinned-id  \
-         \"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &tmp,
+        r#"[index]
+root = "."
+database = ".rag-rat/index.sqlite"
+repo_id = "  pinned-id  "
+[target_bindings]
+rust = ["src"]
+"#,
+    );
 
     let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
     assert_eq!(
@@ -68,20 +70,6 @@ fn repo_id_override_is_parsed_and_does_not_change_the_database_path() {
     // Parse-only: the override must NOT influence path resolution — the explicit database stays
     // at the per-repo path beside `root`.
     assert_eq!(config.database, config.root.join(".rag-rat/index.sqlite"));
-}
-
-/// Seed a minimal COMMITTED git repo at `dir` — the identity-bearing fixture the global
-/// default requires (a keyless config resolves globally only for a root with a derivable repo
-/// identity).
-fn git_commit_all(dir: &Path) {
-    let git = |args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
-    git(&["init", "-q"]);
-    git(&["config", "user.email", "t@e"]);
-    git(&["config", "user.name", "t"]);
-    git(&["add", "-A"]);
-    git(&["commit", "-qm", "seed"]);
 }
 
 /// A7 default flip: a keyless config in an IDENTITY-BEARING repo (a committed git root) with
@@ -95,11 +83,7 @@ fn config_load_without_a_database_key_resolves_to_the_global_database() {
     let tmp = scratch("globaldb");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(
-        tmp.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(&tmp, MINIMAL_CONFIG);
     git_commit_all(&tmp);
 
     let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
@@ -117,34 +101,39 @@ fn config_load_without_a_database_key_resolves_to_the_global_database() {
 /// must produce the SAME resolved `Config`.
 #[test]
 fn config_load_in_a_linked_worktree_is_governed_wholesale_by_the_main_config() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("wholecfg");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \"main.sqlite\"\n[watch]\ndebounce_ms = \
-         1111\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "."
+database = "main.sqlite"
+[watch]
+debounce_ms = 1111
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@e"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
 
     // The branch config diverges on a key with NO historical per-key anchoring: `[watch]`.
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \"branch.sqlite\"\n[watch]\ndebounce_ms = \
-         9999\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &linked,
+        r#"[index]
+root = "."
+database = "branch.sqlite"
+[watch]
+debounce_ms = 9999
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     let from_main = Config::load(main.join("rag-rat.toml")).unwrap();
     let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
     assert_eq!(
@@ -163,28 +152,26 @@ fn config_load_in_a_linked_worktree_is_governed_wholesale_by_the_main_config() {
 /// to main so the shared index keys off one base checkout.
 #[test]
 fn config_load_falls_back_to_the_local_config_when_main_has_none() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("nomaincfg");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@e"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
 
     // Only the LINKED checkout has a config (e.g. authored on a branch, not yet merged).
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \"branch.sqlite\"\n[target_bindings]\nrust = \
-         [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &linked,
+        r#"[index]
+root = "."
+database = "branch.sqlite"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     let cfg = Config::load(linked.join("rag-rat.toml")).unwrap();
     let canonical_main = crate::paths::canonicalize(&main).unwrap();
     assert_eq!(cfg.root, canonical_main, "root anchors to main even on the fallback");
@@ -202,16 +189,11 @@ fn config_load_falls_back_to_the_local_config_when_main_has_none() {
 /// main/non-git checkouts stay local.
 #[test]
 fn discover_config_path_resolves_the_governing_checkout() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("discover");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@e"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
@@ -224,7 +206,7 @@ fn discover_config_path_resolves_the_governing_checkout() {
     assert_eq!(config::discover_config_path(&main), main.join("rag-rat.toml"));
     // Linked WITH a local (divergent) file: the local path — the load then routes through
     // the governing seam, which warns; discovery must not silently skip that.
-    std::fs::write(linked.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
+    write_config(&linked, ROOT_ONLY_CONFIG);
     assert_eq!(config::discover_config_path(&linked), linked.join("rag-rat.toml"));
     // Non-git: local.
     let plain = tmp.join("plain");
@@ -245,7 +227,7 @@ fn discover_config_path_walks_up_to_a_parent_repo_config() {
     let repo = tmp.join("repo");
     let nested = repo.join("crates").join("cli").join("src");
     std::fs::create_dir_all(&nested).unwrap();
-    std::fs::write(repo.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
+    write_config(&repo, ROOT_ONLY_CONFIG);
 
     // The walk returns a canonical absolute path (a found file), so compare canonically — temp
     // roots can be symlinked (macOS `/tmp` → `/private/tmp`).
@@ -274,16 +256,13 @@ fn discover_config_path_walks_up_to_a_parent_repo_config() {
 /// P2).
 #[test]
 fn discover_config_path_does_not_cross_a_nested_repo_boundary() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("nested");
     let parent = tmp.join("parent");
     let nested = parent.join("vendor").join("nested");
     std::fs::create_dir_all(&nested).unwrap();
     // Parent IS a rag-rat repo (git + rag-rat.toml at its root).
     git(&parent, &["init", "-q"]);
-    std::fs::write(parent.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
+    write_config(&parent, ROOT_ONLY_CONFIG);
     // `nested` is its OWN git repo (submodule-like), with no rag-rat.toml.
     git(&nested, &["init", "-q"]);
 
@@ -304,16 +283,11 @@ fn discover_config_path_does_not_cross_a_nested_repo_boundary() {
 /// resolves to MAIN's path (the governing-seam invariant). #611 review, P2 (linked arm).
 #[test]
 fn discover_config_path_finds_a_branch_local_config_from_a_linked_worktree_subdir() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("wtsub");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@e"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
@@ -331,7 +305,7 @@ fn discover_config_path_finds_a_branch_local_config_from_a_linked_worktree_subdi
 
     // A branch-local config at the LINKED worktree root: the subdir launch now finds IT (never
     // climbing past the worktree root into main).
-    std::fs::write(linked.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
+    write_config(&linked, ROOT_ONLY_CONFIG);
     assert_eq!(
         crate::paths::canonicalize(config::discover_config_path(&sub)).unwrap(),
         crate::paths::canonicalize(linked.join("rag-rat.toml")).unwrap(),
@@ -345,16 +319,11 @@ fn discover_config_path_finds_a_branch_local_config_from_a_linked_worktree_subdi
 /// checkout (its top OR a subdir) is.
 #[test]
 fn linked_worktree_main_root_derives_linkedness_from_topology() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("linkpred");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@e"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
@@ -385,28 +354,27 @@ fn linked_worktree_main_root_derives_linkedness_from_topology() {
 /// contents are irrelevant by design when main governs.
 #[test]
 fn config_load_ignores_an_invalid_branch_config_when_main_governs() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("brokecfg");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \"main.sqlite\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "."
+database = "main.sqlite"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@e"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
 
     // Unparseable garbage on the branch: main still governs.
-    std::fs::write(linked.join("rag-rat.toml"), "this is [not toml").unwrap();
+    write_config(&linked, r#"this is [not toml"#);
     let cfg = Config::load(linked.join("rag-rat.toml"))
         .expect("a broken branch config is ignored when main governs");
     let main_c = crate::paths::canonicalize(&main).unwrap();
@@ -414,16 +382,21 @@ fn config_load_ignores_an_invalid_branch_config_when_main_governs() {
 
     // The deprecated `[local_ai]` table on the branch: same posture (it is a VALIDATION
     // failure, not a parse failure — both fold into the warning).
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[local_ai]\nmodel = \"x\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &linked,
+        r#"[index]
+root = "."
+[local_ai]
+model = "x"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     let cfg = Config::load(linked.join("rag-rat.toml")).unwrap();
     assert_eq!(cfg.database, main_c.join("main.sqlite"));
 
     // In the checkout that GOVERNS (main), the same brokenness stays fatal.
-    std::fs::write(main.join("rag-rat.toml"), "this is [not toml").unwrap();
+    write_config(&main, r#"this is [not toml"#);
     assert!(
         Config::load(main.join("rag-rat.toml")).is_err(),
         "the governing config's validation is fatal as always",
@@ -437,22 +410,22 @@ fn config_load_ignores_an_invalid_branch_config_when_main_governs() {
 /// split-brain the seam prevents. Governance must be unconditional on linked-ness.
 #[test]
 fn config_load_governs_from_main_even_when_a_branch_only_root_defeats_anchoring() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("branchroot");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \"main.sqlite\"\n[watch]\ndebounce_ms = \
-         1111\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "."
+database = "main.sqlite"
+[watch]
+debounce_ms = 1111
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@e"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
@@ -463,12 +436,17 @@ fn config_load_governs_from_main_even_when_a_branch_only_root_defeats_anchoring(
     std::fs::create_dir_all(linked.join("branch_only/src")).unwrap();
     std::fs::write(linked.join("branch_only/src/lib.rs"), "pub fn b() {}\n").unwrap();
     assert!(!main.join("branch_only").exists(), "main never had this dir");
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \"branch_only\"\ndatabase = \"branch.sqlite\"\n[watch]\ndebounce_ms = \
-         9999\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &linked,
+        r#"[index]
+root = "branch_only"
+database = "branch.sqlite"
+[watch]
+debounce_ms = 9999
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     let cfg = Config::load(linked.join("rag-rat.toml")).unwrap();
     let main_c = crate::paths::canonicalize(&main).unwrap();
     assert_eq!(
@@ -496,17 +474,21 @@ fn config_load_refuses_an_identity_less_pin_at_the_global_store() {
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     let config_path = tmp.join("rag-rat.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[index]\nroot = \".\"\ndatabase = \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
+    write_config(
+        &tmp,
+        &format!(
+            r#"[index]
+root = "."
+database = "{}"
+[target_bindings]
+rust = ["src"]
+"#,
             // Forward-slash (path-slash): a Windows `C:\…` path has invalid TOML escapes
             // (`\U`, …); `/` is TOML-safe and `Path` treats the separators as equivalent
             // there.
             global.to_slash_lossy()
         ),
-    )
-    .unwrap();
+    );
     let err = Config::load(&config_path).expect_err("identity-less global pin is refused");
     assert!(
         matches!(err, ConfigError::GlobalPinWithoutIdentity),
@@ -514,18 +496,22 @@ fn config_load_refuses_an_identity_less_pin_at_the_global_store() {
     );
 
     // A `repo_id` pin IS a resolvable identity — the same config with one loads fine.
-    std::fs::write(
-        &config_path,
-        format!(
-            "[index]\nroot = \".\"\nrepo_id = \"pinned-project\"\ndatabase = \
-             \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
+    write_config(
+        &tmp,
+        &format!(
+            r#"[index]
+root = "."
+repo_id = "pinned-project"
+database = "{}"
+[target_bindings]
+rust = ["src"]
+"#,
             // Forward-slash (path-slash): a Windows `C:\…` path has invalid TOML escapes
             // (`\U`, …); `/` is TOML-safe and `Path` treats the separators as equivalent
             // there.
             global.to_slash_lossy()
         ),
-    )
-    .unwrap();
+    );
     let cfg = Config::load(&config_path).expect("a repo_id pin lifts the refusal");
     assert_eq!(cfg.database, global);
 }
@@ -537,23 +523,21 @@ fn config_load_refuses_an_identity_less_pin_at_the_global_store() {
 /// as it is for `repo_id`.
 #[test]
 fn config_load_anchors_the_database_key_to_the_main_worktree() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("dbanchor");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     // MAIN pins an explicit per-repo database.
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \"custom/pinned.sqlite\"\n[target_bindings]\nrust = \
-         [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "."
+database = "custom/pinned.sqlite"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@e"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
@@ -561,11 +545,7 @@ fn config_load_anchors_the_database_key_to_the_main_worktree() {
 
     // The BRANCH config omits the key (a branch predating the pin): pre-fix the keyless
     // default resolved the linked checkout to the GLOBAL store — a different DB than main's.
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(&linked, MINIMAL_CONFIG);
     let from_main = Config::load(main.join("rag-rat.toml")).unwrap();
     let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
     assert_eq!(
@@ -576,17 +556,16 @@ fn config_load_anchors_the_database_key_to_the_main_worktree() {
 
     // The BRANCH config pinning its OWN key: main (keyless here) stays authoritative — a
     // branch cannot fork the repo onto a private database.
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \"branch/fork.sqlite\"\n[target_bindings]\nrust = \
-         [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(&main, MINIMAL_CONFIG);
+    write_config(
+        &linked,
+        r#"[index]
+root = "."
+database = "branch/fork.sqlite"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     let from_main = Config::load(main.join("rag-rat.toml")).unwrap();
     let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
     assert_eq!(
@@ -608,11 +587,7 @@ fn config_load_without_a_database_key_prefers_an_existing_legacy_index() {
     std::fs::create_dir_all(tmp.join(".rag-rat")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     std::fs::write(tmp.join(".rag-rat/index.sqlite"), b"legacy").unwrap();
-    std::fs::write(
-        tmp.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(&tmp, MINIMAL_CONFIG);
     git_commit_all(&tmp);
 
     let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
@@ -657,11 +632,7 @@ fn config_load_without_a_database_key_stays_per_root_for_identity_less_roots() {
         let tmp = scratch(&format!("noident-{tag}"));
         std::fs::create_dir_all(tmp.join("src")).unwrap();
         std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-        std::fs::write(
-            tmp.join("rag-rat.toml"),
-            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-        )
-        .unwrap();
+        write_config(&tmp, MINIMAL_CONFIG);
         tmp
     };
 
@@ -687,10 +658,7 @@ fn config_load_without_a_database_key_stays_per_root_for_identity_less_roots() {
     // its placeholder rows adopt IN THAT DB when the first commit mints a real id (the
     // existing single-repo adoption flow), instead of stranding in the global store.
     let unborn = keyless_config("unborn");
-    let git = |args: &[&str]| {
-        crate::test_git::run(&unborn, args);
-    };
-    git(&["init", "-q"]);
+    git(&unborn, &["init", "-q"]);
     let config = Config::load(unborn.join("rag-rat.toml")).unwrap();
     assert_eq!(
         config.database,
@@ -698,12 +666,15 @@ fn config_load_without_a_database_key_stays_per_root_for_identity_less_roots() {
         "an unborn repo stays per-root until its first commit mints an identity",
     );
     // A `[index] repo_id` pin IS an identity: the same root then resolves globally.
-    std::fs::write(
-        unborn.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\nrepo_id = \"pinned-project\"\n[target_bindings]\nrust = \
-         [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &unborn,
+        r#"[index]
+root = "."
+repo_id = "pinned-project"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     let config = Config::load(unborn.join("rag-rat.toml")).unwrap();
     assert_eq!(
         config.database,
@@ -717,11 +688,7 @@ fn repo_id_override_absent_is_none() {
     let tmp = scratch("repoid-none");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(
-        tmp.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(&tmp, MINIMAL_CONFIG);
 
     let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
     assert_eq!(config.repo_id_override, None, "no [index] repo_id → None");
@@ -737,23 +704,21 @@ fn config_load_in_a_linked_worktree_uses_main_base_targets_not_the_branch() {
     // branch's — otherwise base discovery walks main with the branch target set and tombstones
     // any main file outside it. The branch's extra target is served via the overlay, not the
     // base config.
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("cfgbranch");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     // Main's config indexes only `src`.
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n[target_bindings]\nrust = \
-         [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "."
+database = ".rag-rat/index.sqlite"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@example.com"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
 
@@ -763,11 +728,14 @@ fn config_load_in_a_linked_worktree_uses_main_base_targets_not_the_branch() {
     git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
     std::fs::create_dir_all(linked.join("extra")).unwrap();
     std::fs::write(linked.join("extra/more.rs"), "pub fn b() {}\n").unwrap();
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\", \"extra\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &linked,
+        r#"[index]
+root = "."
+[target_bindings]
+rust = ["src", "extra"]
+"#,
+    );
     git(&linked, &["add", "-A"]);
     git(&linked, &["commit", "-qm", "branch adds extra"]);
 
@@ -802,9 +770,6 @@ fn config_load_in_a_linked_worktree_keeps_main_targets_when_the_branch_narrows_t
     // narrowed targets, main-only files would be classified `deleted` and tombstoned in the
     // base scope — hiding committed files from main queries. The stored base targets
     // must be MAIN's.
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("cfgnarrow");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
@@ -812,25 +777,22 @@ fn config_load_in_a_linked_worktree_keeps_main_targets_when_the_branch_narrows_t
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     std::fs::write(main.join("extra/more.rs"), "pub fn b() {}\n").unwrap();
     // Main indexes BOTH `src` and `extra`.
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\", \"extra\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "."
+[target_bindings]
+rust = ["src", "extra"]
+"#,
+    );
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@example.com"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
 
     // The branch NARROWS to `src` only (drops `extra`), committed on the branch.
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(&linked, MINIMAL_CONFIG);
     git(&linked, &["add", "-A"]);
     git(&linked, &["commit", "-qm", "branch narrows to src"]);
 
@@ -851,34 +813,36 @@ fn config_load_anchors_repo_id_override_to_main_when_the_branch_diverges() {
     // MAIN worktree's config, NOT the launching (branch-local) one. A linked worktree that pins
     // a DIFFERENT id must still resolve MAIN's — otherwise identity splits by which checkout
     // launched. This mirrors the root/database/targets anchoring above.
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("repoid-anchor");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     // Main pins a canonical repo_id.
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\nrepo_id = \"canonical-id\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "."
+repo_id = "canonical-id"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@example.com"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
 
     // The branch pins a DIVERGENT id, committed on the branch and checked out in the worktree.
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\nrepo_id = \"branch-divergent-id\"\n[target_bindings]\nrust = \
-         [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &linked,
+        r#"[index]
+root = "."
+repo_id = "branch-divergent-id"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     git(&linked, &["add", "-A"]);
     git(&linked, &["commit", "-qm", "branch pins a different repo_id"]);
 
@@ -903,34 +867,35 @@ fn config_load_anchors_repo_id_override_to_main_when_main_omits_it() {
     // None, so identity stays derived and launch-point-independent; the branch pin is
     // NOT honored for the shared identity (honoring it would make identity depend on
     // which worktree launched).
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("repoid-mainomit");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     // Main OMITS repo_id.
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n[target_bindings]\nrust = \
-         [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "."
+database = ".rag-rat/index.sqlite"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@example.com"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
 
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\nrepo_id = \"branch-only-id\"\n[target_bindings]\nrust = \
-         [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &linked,
+        r#"[index]
+root = "."
+repo_id = "branch-only-id"
+[target_bindings]
+rust = ["src"]
+"#,
+    );
     git(&linked, &["add", "-A"]);
     git(&linked, &["commit", "-qm", "branch pins a repo_id main lacks"]);
 
@@ -948,26 +913,17 @@ fn config_load_anchors_repo_id_override_to_main_when_main_omits_it() {
 /// checkout than the one named.
 #[test]
 fn load_records_the_pre_anchor_root_for_a_linked_worktree() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("reanchor");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(&main, MINIMAL_CONFIG);
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@e"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
-    std::fs::write(linked.join("rag-rat.toml"), "[index]\nroot = \".\"\n").unwrap();
+    write_config(&linked, ROOT_ONLY_CONFIG);
 
     let main_c = crate::paths::canonicalize(&main).unwrap();
     let linked_c = crate::paths::canonicalize(&linked).unwrap();
@@ -987,11 +943,7 @@ fn load_leaves_reanchor_none_for_the_main_worktree() {
     let tmp = scratch("reanchor-none");
     std::fs::create_dir_all(tmp.join("src")).unwrap();
     std::fs::write(tmp.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(
-        tmp.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(&tmp, MINIMAL_CONFIG);
     git_commit_all(&tmp);
 
     let config = Config::load(tmp.join("rag-rat.toml")).unwrap();
@@ -1003,15 +955,10 @@ fn load_leaves_reanchor_none_for_the_main_worktree() {
 
 #[test]
 fn anchor_root_preserves_subdir_and_redirects_linked_to_main() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("cfg");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@example.com"]);
-    git(&main, &["config", "user.name", "t"]);
     std::fs::write(main.join("seed.txt"), "x").unwrap();
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
@@ -1055,21 +1002,12 @@ fn anchor_root_preserves_subdir_and_redirects_linked_to_main() {
 
 #[test]
 fn for_linked_worktree_overlay_falls_back_when_branch_config_is_missing_or_invalid() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("overlay-fallback");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(&main, MINIMAL_CONFIG);
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@example.com"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
 
@@ -1080,15 +1018,22 @@ fn for_linked_worktree_overlay_falls_back_when_branch_config_is_missing_or_inval
     let missing = base.for_linked_worktree_overlay(&linked);
     assert_eq!(missing.targets, base.targets, "missing branch config keeps base targets");
 
-    std::fs::write(linked.join("rag-rat.toml"), "not valid toml [[[\n").unwrap();
+    write_config(
+        &linked,
+        r#"not valid toml [[[
+"#,
+    );
     let invalid = base.for_linked_worktree_overlay(&linked);
     assert_eq!(invalid.targets, base.targets, "invalid branch config keeps base targets");
 
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\", \"extra\"]\n",
-    )
-    .unwrap();
+    write_config(
+        &linked,
+        r#"[index]
+root = "."
+[target_bindings]
+rust = ["src", "extra"]
+"#,
+    );
     std::fs::create_dir_all(linked.join("extra")).unwrap();
     std::fs::write(linked.join("extra/more.rs"), "pub fn b() {}\n").unwrap();
     let branch = base.for_linked_worktree_overlay(&linked);
@@ -1098,27 +1043,24 @@ fn for_linked_worktree_overlay_falls_back_when_branch_config_is_missing_or_inval
 
 #[test]
 fn config_load_propagates_main_parse_error_from_linked_worktree() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("main-broken");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(main.join("rag-rat.toml"), "[index]\nroot = \".\"\n[local_ai]\n").unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "."
+[local_ai]
+"#,
+    );
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@example.com"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
 
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(&linked, MINIMAL_CONFIG);
 
     let err = Config::load(linked.join("rag-rat.toml")).unwrap_err();
     assert!(
@@ -1129,31 +1071,25 @@ fn config_load_propagates_main_parse_error_from_linked_worktree() {
 
 #[test]
 fn config_load_rejects_reserved_papertrail_table_from_governing_main() {
-    let git = |dir: &Path, args: &[&str]| {
-        crate::test_git::run(dir, args);
-    };
     let tmp = scratch("main-papertrail");
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
     std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-    std::fs::write(
-        main.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[papertrail]\nprobe_interval_secs = 60\n",
-    )
-    .unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "."
+[papertrail]
+probe_interval_secs = 60
+"#,
+    );
     git(&main, &["init", "-q"]);
-    git(&main, &["config", "user.email", "t@example.com"]);
-    git(&main, &["config", "user.name", "t"]);
     git(&main, &["add", "-A"]);
     git(&main, &["commit", "-qm", "seed"]);
 
     let linked = tmp.join("wt");
     git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
-    std::fs::write(
-        linked.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
-    )
-    .unwrap();
+    write_config(&linked, MINIMAL_CONFIG);
 
     Config::load(linked.join("rag-rat.toml")).unwrap();
 }
@@ -1180,7 +1116,12 @@ fn a_loaded_config_root_is_a_spelling_git_and_gix_both_accept() {
     std::fs::write(main.join("crate/src/a.rs"), "pub fn base_fn() {}\n").unwrap();
     crate::test_git::run(&main, &["add", "."]);
     crate::test_git::run(&main, &["commit", "-qm", "seed"]);
-    std::fs::write(main.join("rag-rat.toml"), "[index]\nroot = \"crate\"\n").unwrap();
+    write_config(
+        &main,
+        r#"[index]
+root = "crate"
+"#,
+    );
 
     let cfg = Config::load(main.join("rag-rat.toml")).unwrap();
     assert!(
