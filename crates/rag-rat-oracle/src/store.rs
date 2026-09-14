@@ -352,41 +352,8 @@ pub(crate) fn edge_join_candidates(
     checkout: CheckoutRef<'_>,
 ) -> anyhow::Result<Vec<EdgeJoinCandidate>> {
     let CheckoutRef { commit_sha, worktree_id } = checkout;
-    let mut stmt = conn.prepare(&format!(
-        "
-        SELECT edges.id,
-               files.path,
-               files.sha256,
-               edges.source_start_byte,
-               edges.source_end_byte,
-               edges.callee_start_byte,
-               edges.callee_end_byte,
-               edges.confidence,
-               edges.edge_kind,
-               edges.to_symbol_id
-        FROM edges
-        JOIN files ON files.id = edges.source_file_id
-        WHERE edges.callee_start_byte IS NOT NULL
-          AND edges.callee_end_byte IS NOT NULL
-          AND {scope}
-        ORDER BY files.path, edges.callee_start_byte
-        ",
-        scope = active_checkout_file_predicate("?1", "?2"),
-    ))?;
-    let rows = stmt.query_map(params![commit_sha, worktree_id], |row| {
-        Ok(EdgeJoinCandidate {
-            edge_id: row.get(0)?,
-            source_path: row.get(1)?,
-            file_sha: row.get(2)?,
-            source_start_byte: row.get(3)?,
-            source_end_byte: row.get(4)?,
-            callee_start_byte: row.get(5)?,
-            callee_end_byte: row.get(6)?,
-            confidence: HeuristicConfidence::from_db_str(&row.get::<_, String>(7)?),
-            edge_kind: row.get(8)?,
-            to_symbol_id: row.get(9)?,
-        })
-    })?;
+    let mut stmt = conn.prepare(&edge_join_candidates_sql(""))?;
+    let rows = stmt.query_map(params![commit_sha, worktree_id], map_edge_join_candidate)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -670,7 +637,29 @@ fn edge_join_candidates_in_paths(
     // Numbered params, NOT anonymous `?`: the scope predicate binds ?1/?2 (and an anonymous
     // parameter would take slot 1, colliding with them), so the path list numbers from ?3.
     let marks = (3..3 + paths.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
-    let sql = format!(
+    let mut stmt = conn
+        .prepare(&edge_join_candidates_sql(&format!("\n          AND files.path IN ({marks})")))?;
+    // ?1/?2 are the checkout scope; the path list binds from ?3.
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&commit_sha, &worktree_id];
+    for path in paths {
+        params.push(path);
+    }
+    let rows = stmt.query_map(params.as_slice(), map_edge_join_candidate)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The SELECT both edge-join-candidate loaders run, with `extra` spliced in as additional `AND`
+/// lines ahead of the `?1`/`?2` checkout scope. One text for both, because
+/// [`map_edge_join_candidate`] reads its columns by POSITION: a column added or reordered in only
+/// one copy would silently shift the other's meaning — a `String` landing in `confidence` reads as
+/// no confidence rather than failing — and the batch and live passes would then disagree about the
+/// same edges.
+fn edge_join_candidates_sql(extra: &str) -> String {
+    format!(
         "
         SELECT edges.id,
                files.path,
@@ -685,38 +674,28 @@ fn edge_join_candidates_in_paths(
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.callee_start_byte IS NOT NULL
-          AND edges.callee_end_byte IS NOT NULL
-          AND files.path IN ({marks})
+          AND edges.callee_end_byte IS NOT NULL{extra}
           AND {scope}
         ORDER BY files.path, edges.callee_start_byte
         ",
         scope = active_checkout_file_predicate("?1", "?2"),
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    // ?1/?2 are the checkout scope; the path list binds from ?3.
-    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&commit_sha, &worktree_id];
-    for path in paths {
-        params.push(path);
-    }
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok(EdgeJoinCandidate {
-            edge_id: row.get(0)?,
-            source_path: row.get(1)?,
-            file_sha: row.get(2)?,
-            source_start_byte: row.get(3)?,
-            source_end_byte: row.get(4)?,
-            callee_start_byte: row.get(5)?,
-            callee_end_byte: row.get(6)?,
-            confidence: HeuristicConfidence::from_db_str(&row.get::<_, String>(7)?),
-            edge_kind: row.get(8)?,
-            to_symbol_id: row.get(9)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    )
+}
+
+/// One row of [`edge_join_candidates_sql`], by column position.
+fn map_edge_join_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeJoinCandidate> {
+    Ok(EdgeJoinCandidate {
+        edge_id: row.get(0)?,
+        source_path: row.get(1)?,
+        file_sha: row.get(2)?,
+        source_start_byte: row.get(3)?,
+        source_end_byte: row.get(4)?,
+        callee_start_byte: row.get(5)?,
+        callee_end_byte: row.get(6)?,
+        confidence: HeuristicConfidence::from_db_str(&row.get::<_, String>(7)?),
+        edge_kind: row.get(8)?,
+        to_symbol_id: row.get(9)?,
+    })
 }
 
 /// The batch tool's persisted moniker for the logical symbol `symbol_id` belongs to — the string
