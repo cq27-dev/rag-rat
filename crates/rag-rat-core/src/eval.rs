@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::IndexDatabase;
 use crate::index::git_history;
+use crate::search::lexical::SearchHit;
 
 const TOP_K: usize = 10;
 
@@ -340,18 +341,16 @@ pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport>
     let expected = load_expected(&options.expected_path)?;
     let mut results = Vec::new();
     let mut observed = Vec::new();
+    let tuning = SearchTuning {
+        mode: SearchMode::Active,
+        rerank: options.rerank,
+        search_limit: options.search_limit,
+    };
 
     for query in &suite.query {
         let expected_query = expected.get(&query.id);
         let merged = merge_expected(query.clone(), expected_query);
-        let report = evaluate_query(
-            config,
-            &db,
-            &merged,
-            SearchMode::Active,
-            options.rerank,
-            options.search_limit,
-        )?;
+        let report = evaluate_query(config, &db, &merged, tuning)?;
         observed.push(observed_expected(&report));
         results.push(report);
     }
@@ -361,15 +360,7 @@ pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport>
     }
 
     let metrics = aggregate(&results);
-    let baseline = hash_vector_baseline(
-        config,
-        &db,
-        &suite.query,
-        &expected,
-        &metrics,
-        options.rerank,
-        options.search_limit,
-    )?;
+    let baseline = hash_vector_baseline(config, &db, &suite.query, &expected, &metrics, tuning)?;
     let oracle_eval = run_oracle_eval(&db, options)?;
     let (oracle, oracle_skipped_drifted) = match oracle_eval {
         Some((metrics, skipped_drifted)) => (Some(metrics), skipped_drifted),
@@ -547,7 +538,11 @@ fn score_case_at_parent(
         // Parent-state replay is the leakage-free HEADLINE number, not the reranker A/B dial (that
         // is HEAD-scored `--replay --rerank`); score it with the default fuse (rerank off) and the
         // default `TOP_K` candidate width (the candidate-ceiling dial is HEAD-scored).
-        evaluate_query(&case_config, &case_db, &query, SearchMode::Active, false, TOP_K)?
+        evaluate_query(&case_config, &case_db, &query, SearchTuning {
+            mode: SearchMode::Active,
+            rerank: false,
+            search_limit: TOP_K,
+        })?
     };
     Ok(Some(report))
 }
@@ -739,9 +734,7 @@ fn evaluate_query(
     config: &Config,
     db: &IndexDatabase,
     query: &EvalQuery,
-    mode: SearchMode,
-    rerank: bool,
-    search_limit: usize,
+    tuning: SearchTuning,
 ) -> anyhow::Result<EvalQueryReport> {
     if query.requires_papertrail_cache && !papertrail_cache_available(db)? {
         return Ok(skipped_report(
@@ -751,26 +744,21 @@ fn evaluate_query(
     }
 
     let started = Instant::now();
-    let mut hits = search(db, mode, &query.text, rerank, search_limit)?;
+    let mut hits = search(db, &query.text, tuning)?;
     let mut latency_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut current_source_violations = find_current_source_violations(config, db, &hits)?;
     if !current_source_violations.is_empty() {
         let retry_started = Instant::now();
-        hits = search(db, mode, &query.text, rerank, search_limit)?;
+        hits = search(db, &query.text, tuning)?;
         latency_ms += retry_started.elapsed().as_secs_f64() * 1000.0;
         current_source_violations = find_current_source_violations(config, db, &hits)?;
     }
     let top_hits = top_hits(&hits);
 
-    let (path_hits, missing_paths) = partition_expected(&query.must_include_paths, |expected| {
-        hits.iter().any(|hit| hit.path == expected)
-    });
+    let (path_hits, missing_paths) =
+        partition_expected(&query.must_include_paths, |expected| path_hit(&hits, expected));
     let (symbol_hits, missing_symbols) =
-        partition_expected(&query.must_include_symbols, |expected| {
-            hits.iter()
-                .filter_map(|hit| hit.symbol_path.as_deref())
-                .any(|symbol| symbol == expected || symbol.ends_with(expected))
-        });
+        partition_expected(&query.must_include_symbols, |expected| symbol_hit(&hits, expected));
     let (graph_target_hits, missing_graph_targets) =
         partition_expected(&query.must_include_graph_targets, |expected| {
             hits.iter().any(|hit| graph_hit_matches(hit, expected))
@@ -797,7 +785,7 @@ fn evaluate_query(
             impact
                 .iter()
                 .filter_map(|item| item.symbol.as_deref())
-                .any(|symbol| symbol == expected || symbol.ends_with(expected))
+                .any(|symbol| symbol_matches(symbol, expected))
         });
 
     let commit_hits = db.commit_search(&query.text, TOP_K as u32).unwrap_or_default();
@@ -843,51 +831,11 @@ fn evaluate_query(
     let found_relevant = path_hits.len() + symbol_hits.len();
     let recall_at_returned =
         if expected_relevant == 0 { 1.0 } else { found_relevant as f64 / expected_relevant as f64 };
-    // recall@10 fixes the cutoff at the first 10 hits regardless of `search_limit` — slicing the
-    // SAME membership predicates over `hits[..10]` keeps its meaning stable even at a wide limit.
-    let top10 = &hits[..TOP_K.min(hits.len())];
-    let found_relevant_at_10 = query
-        .must_include_paths
-        .iter()
-        .filter(|expected| top10.iter().any(|hit| hit.path == **expected))
-        .count()
-        + query
-            .must_include_symbols
-            .iter()
-            .filter(|expected| {
-                top10.iter().filter_map(|hit| hit.symbol_path.as_deref()).any(|symbol| {
-                    symbol == expected.as_str() || symbol.ends_with(expected.as_str())
-                })
-            })
-            .count();
-    let recall_at_10 = if expected_relevant == 0 {
-        1.0
-    } else {
-        found_relevant_at_10 as f64 / expected_relevant as f64
-    };
-    // recall@3 reuses the identical path/symbol membership predicates as recall@10 above; the only
-    // difference is the slice — membership is tested over the first 3 hits, not the full top-10.
-    // A within-top-10 reorder (the reranker A/B target) moves this but not recall@10.
-    let top3 = &hits[..3.min(hits.len())];
-    let found_relevant_at_3 = query
-        .must_include_paths
-        .iter()
-        .filter(|expected| top3.iter().any(|hit| hit.path == **expected))
-        .count()
-        + query
-            .must_include_symbols
-            .iter()
-            .filter(|expected| {
-                top3.iter().filter_map(|hit| hit.symbol_path.as_deref()).any(|symbol| {
-                    symbol == expected.as_str() || symbol.ends_with(expected.as_str())
-                })
-            })
-            .count();
-    let recall_at_3 = if expected_relevant == 0 {
-        1.0
-    } else {
-        found_relevant_at_3 as f64 / expected_relevant as f64
-    };
+    // recall@10 fixes the cutoff at the first 10 hits regardless of `search_limit`, so its meaning
+    // stays stable even at a wide limit. recall@3 slices the same membership over the first 3: a
+    // within-top-10 reorder (the reranker A/B target) moves it but not recall@10.
+    let recall_at_10 = recall_at(&hits, query, TOP_K);
+    let recall_at_3 = recall_at(&hits, query, 3);
     let passed = stale_current_source_violations == 0
         && missing_paths.is_empty()
         && missing_symbols.is_empty()
@@ -978,29 +926,32 @@ enum SearchMode {
     HashBaseline,
 }
 
-fn search(
-    db: &IndexDatabase,
+/// How one eval pass searches: which index mode, whether the graded-git rerank is on, and how many
+/// hits each search returns.
+#[derive(Debug, Clone, Copy)]
+struct SearchTuning {
     mode: SearchMode,
-    query: &str,
     rerank: bool,
     search_limit: usize,
-) -> anyhow::Result<Vec<crate::search::lexical::SearchHit>> {
+}
+
+fn search(db: &IndexDatabase, query: &str, tuning: SearchTuning) -> anyhow::Result<Vec<SearchHit>> {
     // `rerank` flows identically into BOTH search modes so the active-vs-baseline delta compares
     // the same reranker axis (#109). The active path threads it through
     // `SearchRequest.options`; the hash baseline takes it directly. `search_limit` is the width of
     // the candidate pool both modes return (default `TOP_K`); it never changes the fixed
     // `recall_at_3`/`recall_at_10` cutoffs — only the `recall_at_returned` ceiling.
-    let limit = u32::try_from(search_limit).unwrap_or(u32::MAX);
-    match mode {
+    let limit = u32::try_from(tuning.search_limit).unwrap_or(u32::MAX);
+    match tuning.mode {
         SearchMode::Active => db.search_with_graph_meta(crate::index::SearchRequest {
             include_generated: false,
             options: crate::search::lexical::SearchOptions {
-                graded_history: rerank,
+                graded_history: tuning.rerank,
                 ..crate::search::lexical::SearchOptions::default()
             },
             ..crate::index::SearchRequest::new(query, limit)
         }),
-        SearchMode::HashBaseline => db.search_hash_baseline(query, limit, false, rerank),
+        SearchMode::HashBaseline => db.search_hash_baseline(query, limit, false, tuning.rerank),
     }
 }
 
@@ -1010,22 +961,15 @@ fn hash_vector_baseline(
     queries: &[EvalQuery],
     expected: &BTreeMap<String, ExpectedQuery>,
     active_metrics: &EvalMetrics,
-    rerank: bool,
-    search_limit: usize,
+    active_tuning: SearchTuning,
 ) -> anyhow::Result<EvalBaselineReport> {
+    // SAME `rerank` value AND `search_limit` as the active pass so the delta block compares the
+    // same axes (#109); only the index mode differs.
+    let tuning = SearchTuning { mode: SearchMode::HashBaseline, ..active_tuning };
     let mut results = Vec::new();
     for query in queries {
         let merged = merge_expected(query.clone(), expected.get(&query.id));
-        // SAME `rerank` value AND `search_limit` as the active pass so the delta block compares the
-        // same axes (#109).
-        results.push(evaluate_query(
-            config,
-            db,
-            &merged,
-            SearchMode::HashBaseline,
-            rerank,
-            search_limit,
-        )?);
+        results.push(evaluate_query(config, db, &merged, tuning)?);
     }
     let metrics = aggregate(&results);
     let current_artifacts =
@@ -1044,7 +988,7 @@ fn hash_vector_baseline(
     })
 }
 
-fn top_hits(hits: &[crate::search::lexical::SearchHit]) -> Vec<EvalSearchHit> {
+fn top_hits(hits: &[SearchHit]) -> Vec<EvalSearchHit> {
     hits.iter()
         .enumerate()
         .map(|(index, hit)| EvalSearchHit {
@@ -1059,18 +1003,44 @@ fn top_hits(hits: &[crate::search::lexical::SearchHit]) -> Vec<EvalSearchHit> {
         .collect()
 }
 
-fn relevant(hit: &crate::search::lexical::SearchHit, query: &EvalQuery) -> bool {
+fn relevant(hit: &SearchHit, query: &EvalQuery) -> bool {
     query.must_include_paths.iter().any(|path| path == &hit.path)
         || hit.symbol_path.as_deref().is_some_and(|symbol| {
-            query
-                .must_include_symbols
-                .iter()
-                .any(|expected| symbol == expected || symbol.ends_with(expected))
+            query.must_include_symbols.iter().any(|expected| symbol_matches(symbol, expected))
         })
         || query.must_include_graph_targets.iter().any(|expected| graph_hit_matches(hit, expected))
 }
 
-fn graph_hit_matches(hit: &crate::search::lexical::SearchHit, expected: &str) -> bool {
+/// Recall of the path + symbol gold over the first `cutoff` hits: the share of expected paths and
+/// symbols matched within that prefix, or 1.0 when the query has no such gold.
+fn recall_at(hits: &[SearchHit], query: &EvalQuery, cutoff: usize) -> f64 {
+    let expected_relevant = query.must_include_paths.len() + query.must_include_symbols.len();
+    if expected_relevant == 0 {
+        return 1.0;
+    }
+    let top = &hits[..cutoff.min(hits.len())];
+    let found = query.must_include_paths.iter().filter(|expected| path_hit(top, expected)).count()
+        + query.must_include_symbols.iter().filter(|expected| symbol_hit(top, expected)).count();
+    found as f64 / expected_relevant as f64
+}
+
+fn path_hit(hits: &[SearchHit], expected: &str) -> bool {
+    hits.iter().any(|hit| hit.path == expected)
+}
+
+fn symbol_hit(hits: &[SearchHit], expected: &str) -> bool {
+    hits.iter()
+        .filter_map(|hit| hit.symbol_path.as_deref())
+        .any(|symbol| symbol_matches(symbol, expected))
+}
+
+/// A symbol matches expected gold when it IS the gold or ends with it — a qualified hit for a bare
+/// or partially qualified gold name.
+fn symbol_matches(symbol: &str, expected: &str) -> bool {
+    symbol == expected || symbol.ends_with(expected)
+}
+
+fn graph_hit_matches(hit: &SearchHit, expected: &str) -> bool {
     let Some(graph) = &hit.graph else {
         return false;
     };
@@ -1102,7 +1072,7 @@ fn partition_expected(
 fn find_current_source_violations(
     config: &Config,
     db: &IndexDatabase,
-    hits: &[crate::search::lexical::SearchHit],
+    hits: &[SearchHit],
 ) -> anyhow::Result<Vec<CurrentSourceViolation>> {
     // `read_chunk_current` builds its own dict decoder per call; this eval pass is a cold CLI
     // diagnostic (not the hot retrieval path), so the per-call dict load is fine. It also drops the
