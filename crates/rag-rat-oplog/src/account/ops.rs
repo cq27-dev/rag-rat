@@ -1004,6 +1004,20 @@ mod tests {
         assert_eq!(hex(&encode(&sample(entry_type::ACCOUNT_REROOT)).unwrap()), "825820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd6b636f6d70726f6d69736564");
     }
 
+    /// V1 readers reject an added revocation field, even when it is canonical CBOR.
+    /// A signed credit frontier therefore needs a new control-log envelope version (#1311).
+    #[test]
+    fn v1_revocations_reject_an_added_credit_frontier() {
+        for tag in [entry_type::DEVICE_REMOVE, entry_type::OWNER_DEMOTE] {
+            let mut payload = encode(&sample(tag)).unwrap();
+            assert_eq!(payload[0], 0x85, "v1 revocations are five-field arrays");
+            assert!(matches!(decode(tag, &payload), Ok(DecodedAccountOp::Known(_))));
+            payload[0] = 0x86;
+            payload.push(0x80); // A sixth field: an empty, canonical frontier array.
+            assert!(decode(tag, &payload).is_err());
+        }
+    }
+
     #[test]
     fn unknown_entry_type_is_retained_not_rejected() {
         let bytes = vec![0x81, 0x00];
