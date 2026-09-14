@@ -1220,11 +1220,9 @@ fn fold_account_pass(
         incarnations: &incarnations,
         view: CandidateView { headers: &all_headers },
         genesis_owner_id,
-        state: FoldState { live: HashSet::from([genesis_owner_id]), ..Default::default() },
+        state: FoldState::seeded(genesis_owner_id),
         registers: HashMap::new(),
-        condemned: HashMap::new(),
-        parked: HashMap::new(),
-        cut_verdicts: HashMap::new(),
+        verdicts: FoldVerdicts::default(),
         register_contributors: HashSet::new(),
         classification: AccountClassification::Live,
     };
@@ -1233,15 +1231,7 @@ fn fold_account_pass(
             break;
         }
     }
-    let DepthPass {
-        registers,
-        condemned,
-        parked,
-        cut_verdicts,
-        register_contributors,
-        classification,
-        ..
-    } = pass;
+    let DepthPass { registers, verdicts, register_contributors, classification, .. } = pass;
 
     // Registers and their per-depth condemnation decisions are now final. Rebuild ONLY phase-E
     // state against those fixed verdicts so a retroactively condemned non-mint cannot leave a
@@ -1255,11 +1245,8 @@ fn fold_account_pass(
         &candidates,
         &strata,
         &incarnations,
-        genesis_owner_id,
         replay_before_depth,
-        &condemned,
-        &parked,
-        &cut_verdicts,
+        &verdicts,
         &mut outcomes,
     );
 
@@ -1267,9 +1254,9 @@ fn fold_account_pass(
     // condemned / parked by a later register reflects that here (the strictest verdict
     // wins over an earlier one).
     for c in &candidates {
-        if let Some(reason) = condemned.get(&c.hash()) {
+        if let Some(reason) = verdicts.condemned.get(&c.hash()) {
             outcomes.insert(c.hash(), Outcome::Condemned(*reason));
-        } else if let Some(reason) = parked.get(&c.hash()) {
+        } else if let Some(reason) = verdicts.parked.get(&c.hash()) {
             outcomes.insert(c.hash(), Outcome::Parked(*reason));
         }
     }
@@ -1302,9 +1289,9 @@ fn fold_account_pass(
                 // before or after the contest surfaced; the account's transition to
                 // `contested` is what makes it admissible.
                 AccountOp::AccountReRoot { successor_account_id, .. }
-                    if !condemned.contains_key(&c.hash())
+                    if !verdicts.condemned.contains_key(&c.hash())
                         && matches!(
-                            authority_status(c, &incarnations, &state, &parked),
+                            authority_status(c, &incarnations, &state, &verdicts.parked),
                             AuthorityStatus::Live
                         )
                         && incarnations.author_incarnation_id(c).is_some_and(|inc| {
@@ -1414,6 +1401,13 @@ struct DepthPass<'a> {
     state: FoldState,
     /// The revocation registers accumulated so far (extend-only, joined by `⊔`).
     registers: HashMap<RegisterKey, Cut>,
+    verdicts: FoldVerdicts,
+    register_contributors: HashSet<[u8; 32]>,
+    classification: AccountClassification,
+}
+
+#[derive(Default)]
+struct FoldVerdicts {
     /// Every entry a register condemns. Grows monotonically — a lower-depth decision is final, no
     /// oscillation.
     condemned: HashMap<[u8; 32], CondemnedReason>,
@@ -1421,8 +1415,6 @@ struct DepthPass<'a> {
     parked: HashMap<[u8; 32], ParkReason>,
     /// The cut ops decided in the register pass (a binding failure / I2).
     cut_verdicts: HashMap<[u8; 32], Outcome>,
-    register_contributors: HashSet<[u8; 32]>,
-    classification: AccountClassification,
 }
 
 impl<'a> DepthPass<'a> {
@@ -1471,7 +1463,9 @@ impl<'a> DepthPass<'a> {
             // A condemned OR parked cut op installs nothing — parked authority (its own chain is
             // under a not-yet-decided watermark) must not have register side effects before it is
             // on a known-valid branch.
-            if self.condemned.contains_key(&c.hash()) || self.parked.contains_key(&c.hash()) {
+            if self.verdicts.condemned.contains_key(&c.hash())
+                || self.verdicts.parked.contains_key(&c.hash())
+            {
                 continue;
             }
             let op_registers = cut_op_registers(c);
@@ -1479,7 +1473,7 @@ impl<'a> DepthPass<'a> {
                 continue; // not a cut op
             }
             if !matches!(
-                authority_status(c, self.incarnations, &self.state, &self.parked),
+                authority_status(c, self.incarnations, &self.state, &self.verdicts.parked),
                 AuthorityStatus::Live
             ) {
                 continue; // unauthorized → the effect pass classifies it (wrong-device / stale / park)
@@ -1498,12 +1492,14 @@ impl<'a> DepthPass<'a> {
             if let AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } = &c.op {
                 match self.incarnations.candidate(owner_id) {
                     None => {
-                        self.cut_verdicts
+                        self.verdicts
+                            .cut_verdicts
                             .insert(c.hash(), Outcome::Parked(ParkReason::UnknownOwnerRef));
                         continue;
                     },
                     Some(target) if target.subject_device() != *device_fingerprint => {
-                        self.cut_verdicts
+                        self.verdicts
+                            .cut_verdicts
                             .insert(c.hash(), Outcome::Rejected(RejectReason::WrongDevice));
                         continue;
                     },
@@ -1526,7 +1522,8 @@ impl<'a> DepthPass<'a> {
                     == candidate::CutBinding::Mismatch
             });
             if misbound {
-                self.cut_verdicts
+                self.verdicts
+                    .cut_verdicts
                     .insert(c.hash(), Outcome::Rejected(RejectReason::CutTargetMismatch));
                 continue;
             }
@@ -1562,7 +1559,9 @@ impl<'a> DepthPass<'a> {
         admitted.retain(|a| {
             let closes_sole_owner = closes_open_incarnation(&a.op.op, &self.state.owners).is_some();
             if closes_sole_owner {
-                self.cut_verdicts.insert(a.op.hash(), Outcome::Rejected(RejectReason::LastOwner));
+                self.verdicts
+                    .cut_verdicts
+                    .insert(a.op.hash(), Outcome::Rejected(RejectReason::LastOwner));
                 return false;
             }
             true
@@ -1597,7 +1596,8 @@ impl<'a> DepthPass<'a> {
                 }
             }
             if any_parked {
-                self.cut_verdicts
+                self.verdicts
+                    .cut_verdicts
                     .insert(a.op.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
                 parked_cuts.insert(a.op.hash());
             } else {
@@ -1623,7 +1623,8 @@ impl<'a> DepthPass<'a> {
             let closes = closes_open_incarnation(&a.op.op, &surviving);
             if let Some(dev) = closes {
                 if surviving.len() == 1 {
-                    self.cut_verdicts
+                    self.verdicts
+                        .cut_verdicts
                         .insert(a.op.hash(), Outcome::Rejected(RejectReason::LastOwner));
                     return false;
                 }
@@ -1671,14 +1672,16 @@ impl<'a> DepthPass<'a> {
         let mut extends: Vec<(&Candidate, RegisterKey, Cut)> = Vec::new();
         for &i in idxs {
             let c = &candidates[i];
-            if self.condemned.contains_key(&c.hash()) || self.parked.contains_key(&c.hash()) {
+            if self.verdicts.condemned.contains_key(&c.hash())
+                || self.verdicts.parked.contains_key(&c.hash())
+            {
                 continue;
             }
             let Some((key, cut, coord)) = cut_extend_register(c) else {
                 continue;
             };
             if !matches!(
-                authority_status(c, self.incarnations, &self.state, &self.parked),
+                authority_status(c, self.incarnations, &self.state, &self.verdicts.parked),
                 AuthorityStatus::Live
             ) {
                 continue;
@@ -1686,12 +1689,15 @@ impl<'a> DepthPass<'a> {
             if candidate::validate_cut_target(&cut, &coord, &self.view)
                 == candidate::CutBinding::Mismatch
             {
-                self.cut_verdicts
+                self.verdicts
+                    .cut_verdicts
                     .insert(c.hash(), Outcome::Rejected(RejectReason::CutTargetMismatch));
                 continue;
             }
             if !depth_registers.contains_key(&key) {
-                self.cut_verdicts.insert(c.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
+                self.verdicts
+                    .cut_verdicts
+                    .insert(c.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
                 continue;
             }
             extends.push((c, key, cut));
@@ -1708,7 +1714,8 @@ impl<'a> DepthPass<'a> {
                 },
                 RegisterJoin::Contested => return self.contest(depth),
                 RegisterJoin::Parked => {
-                    self.cut_verdicts
+                    self.verdicts
+                        .cut_verdicts
                         .insert(c.hash(), Outcome::Parked(ParkReason::UnknownCutTarget));
                 },
             }
@@ -1724,19 +1731,20 @@ impl<'a> DepthPass<'a> {
     /// monotonically: the frozen stratified model never lets a deeper authority revise a
     /// lower-depth decision. Parking is rebuilt because missing ancestry can arrive later.
     fn rederive_condemnation(&mut self) {
-        self.parked.clear();
+        self.verdicts.parked.clear();
         for c in self.candidates {
             // The genesis is the account's ROOT axiom — it can never be condemned, else a cut on
             // the founder's own chain (e.g. a self-DeviceRemove with an empty cut,
             // which condemns everything on that chain incl. seq 0) would leave a `Live`
             // account with no effective root. The founder's LATER entries stay
             // condemnable; only the seq-0 root is exempt.
-            if c.hash() == self.genesis_owner_id || self.condemned.contains_key(&c.hash()) {
+            if c.hash() == self.genesis_owner_id || self.verdicts.condemned.contains_key(&c.hash())
+            {
                 continue;
             }
             match register_verdict(c, &self.registers, &self.view) {
                 RegisterVerdict::Condemned(reason) => {
-                    self.condemned.insert(c.hash(), reason);
+                    self.verdicts.condemned.insert(c.hash(), reason);
                     // A condemned mint leaves `live` (kills dependents transitively) and, if it is
                     // the device's open incarnation, `owners`. A condemned DeviceAdd ALSO leaves
                     // the roster — its enrollment is invalidated, so a later
@@ -1761,7 +1769,7 @@ impl<'a> DepthPass<'a> {
                     }
                 },
                 RegisterVerdict::Parked(reason) => {
-                    self.parked.insert(c.hash(), reason);
+                    self.verdicts.parked.insert(c.hash(), reason);
                 },
                 RegisterVerdict::Clear => {},
             }
@@ -1780,19 +1788,19 @@ impl<'a> DepthPass<'a> {
         });
         for i in ordered {
             let c = &candidates[i];
-            if let Some(reason) = self.condemned.get(&c.hash()) {
+            if let Some(reason) = self.verdicts.condemned.get(&c.hash()) {
                 outcomes.insert(c.hash(), Outcome::Condemned(*reason));
                 continue;
             }
-            if let Some(reason) = self.parked.get(&c.hash()) {
+            if let Some(reason) = self.verdicts.parked.get(&c.hash()) {
                 outcomes.insert(c.hash(), Outcome::Parked(*reason));
                 continue;
             }
-            if let Some(verdict) = self.cut_verdicts.get(&c.hash()) {
+            if let Some(verdict) = self.verdicts.cut_verdicts.get(&c.hash()) {
                 outcomes.insert(c.hash(), *verdict);
                 continue;
             }
-            let outcome = classify_effect(c, self.incarnations, &self.state, &self.parked);
+            let outcome = classify_effect(c, self.incarnations, &self.state, &self.verdicts.parked);
             if let Outcome::Effective { .. } = outcome {
                 apply_effect(c, &mut self.state);
             }
@@ -1800,19 +1808,15 @@ impl<'a> DepthPass<'a> {
         }
     }
 }
-#[expect(clippy::too_many_arguments, reason = "fixed fold verdicts are explicit replay inputs")]
 fn replay_effect_state(
     candidates: &[Candidate],
     strata: &BTreeMap<usize, Vec<usize>>,
     incarnations: &Incarnations<'_>,
-    genesis_owner_id: [u8; 32],
     before_depth: Option<usize>,
-    condemned: &HashMap<[u8; 32], CondemnedReason>,
-    parked: &HashMap<[u8; 32], ParkReason>,
-    cut_verdicts: &HashMap<[u8; 32], Outcome>,
+    verdicts: &FoldVerdicts,
     outcomes: &mut HashMap<[u8; 32], Outcome>,
 ) -> FoldState {
-    let mut state = FoldState { live: HashSet::from([genesis_owner_id]), ..Default::default() };
+    let mut state = FoldState::seeded(incarnations.genesis_owner_id);
     for (&depth, idxs) in strata {
         if before_depth.is_some_and(|limit| depth >= limit) {
             break;
@@ -1824,14 +1828,14 @@ fn replay_effect_state(
         });
         for i in ordered {
             let candidate = &candidates[i];
-            let outcome = if let Some(reason) = condemned.get(&candidate.hash()) {
+            let outcome = if let Some(reason) = verdicts.condemned.get(&candidate.hash()) {
                 Outcome::Condemned(*reason)
-            } else if let Some(reason) = parked.get(&candidate.hash()) {
+            } else if let Some(reason) = verdicts.parked.get(&candidate.hash()) {
                 Outcome::Parked(*reason)
-            } else if let Some(verdict) = cut_verdicts.get(&candidate.hash()) {
+            } else if let Some(verdict) = verdicts.cut_verdicts.get(&candidate.hash()) {
                 *verdict
             } else {
-                classify_effect(candidate, incarnations, &state, parked)
+                classify_effect(candidate, incarnations, &state, &verdicts.parked)
             };
             if outcome.is_effective() {
                 apply_effect(candidate, &mut state);
@@ -2670,6 +2674,12 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
             state.owners.remove(device_fingerprint);
         },
         _ => {},
+    }
+}
+
+impl FoldState {
+    fn seeded(genesis_owner_id: [u8; 32]) -> Self {
+        Self { live: HashSet::from([genesis_owner_id]), ..Default::default() }
     }
 }
 
