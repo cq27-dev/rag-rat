@@ -65,6 +65,19 @@ impl Typedness {
     }
 }
 
+/// How a [`SigParam`]'s type was recovered. Serialized into the persisted
+/// `proposed_signature_json`, so the tokens (`none` / `annotation` / `literal_bucket`) are schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TypeSource {
+    /// No type found.
+    None,
+    /// An AST colon + type node.
+    Annotation,
+    /// A uniform literal kind mapped to a coarse Rust type.
+    LiteralBucket,
+}
+
 /// One parameter in the proposed helper signature.
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct SigParam {
@@ -72,9 +85,8 @@ pub(crate) struct SigParam {
     pub(crate) name: String,
     /// Recovered type text, if any (`"i32"`, `"T0"`, `"impl Fn()"`, …).
     pub(crate) type_text: Option<String>,
-    /// How the type was recovered: `"annotation"` (AST colon+type node), `"literal_bucket"`
-    /// (uniform literal kind → coarse Rust type), or `"none"` (no type found).
-    pub(crate) type_source: &'static str,
+    /// How the type was recovered.
+    pub(crate) type_source: TypeSource,
     /// The metavar this param was promoted from.
     pub(crate) metavar_id: String,
 }
@@ -203,7 +215,7 @@ pub(crate) fn propose_signature(
     let return_type = if is_rust { recover_return_type(anchor, &type_param_cols) } else { None };
 
     // ── Typedness ────────────────────────────────────────────────────────────────────────────────
-    let typed_count = params.iter().filter(|p| p.type_source != "none").count();
+    let typed_count = params.iter().filter(|p| p.type_source != TypeSource::None).count();
     let typedness =
         compute_typedness(&params, typed_count, &generic_params, &unresolved_type_slots);
 
@@ -232,8 +244,8 @@ pub(crate) fn propose_signature(
 struct RecoveredType {
     /// Recovered type text, if any.
     type_text: Option<String>,
-    /// How the type was recovered (`"annotation"` / `"literal_bucket"` / `"none"`).
-    type_source: &'static str,
+    /// How the type was recovered.
+    type_source: TypeSource,
     /// `true` when the slot has no stable class-wide type and must be listed in
     /// `unresolved_type_slots` (so it cannot lift typedness to `Syntactic`). Set for a value_param
     /// whose per-member values are different literal kinds — the anchor annotation describes the
@@ -265,12 +277,16 @@ fn recover_param_type(
             // Best-effort: we can't recover the concrete type without SCIP.
             // Produce `impl Fn()` as a placeholder for Rust; `None` otherwise.
             let type_text = if is_rust { Some("impl Fn()".to_string()) } else { None };
-            RecoveredType { type_text, type_source: "none", unresolved: false }
+            RecoveredType { type_text, type_source: TypeSource::None, unresolved: false }
         },
 
         MetavarKind::ValueParam => {
             if !is_rust {
-                return RecoveredType { type_text: None, type_source: "none", unresolved: false };
+                return RecoveredType {
+                    type_text: None,
+                    type_source: TypeSource::None,
+                    unresolved: false,
+                };
             }
             let lo = vp.occurrences.first().copied().unwrap_or(0);
             // A literal-leaf value_param has NO stable class-wide type whenever its `type_hint`
@@ -295,7 +311,7 @@ fn recover_param_type(
                 *type_param_counter += 1;
                 return RecoveredType {
                     type_text: Some(format!("T{n}")),
-                    type_source: "none",
+                    type_source: TypeSource::None,
                     unresolved: true,
                 };
             }
@@ -312,7 +328,7 @@ fn recover_param_type(
             {
                 return RecoveredType {
                     type_text: Some(annotated),
-                    type_source: "annotation",
+                    type_source: TypeSource::Annotation,
                     unresolved: false,
                 };
             }
@@ -325,11 +341,11 @@ fn recover_param_type(
             {
                 return RecoveredType {
                     type_text: Some(coarse.to_string()),
-                    type_source: "literal_bucket",
+                    type_source: TypeSource::LiteralBucket,
                     unresolved: false,
                 };
             }
-            RecoveredType { type_text: None, type_source: "none", unresolved: false }
+            RecoveredType { type_text: None, type_source: TypeSource::None, unresolved: false }
         },
     }
 }
@@ -699,6 +715,20 @@ mod tests {
     }
 
     #[test]
+    fn type_source_serializes_to_the_persisted_tokens() {
+        for (source, token) in [
+            (TypeSource::None, "none"),
+            (TypeSource::Annotation, "annotation"),
+            (TypeSource::LiteralBucket, "literal_bucket"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(source).unwrap(),
+                serde_json::Value::String(token.into())
+            );
+        }
+    }
+
+    #[test]
     fn typedness_db_str_matches_serde_for_all_variants() {
         for (typedness, token) in [
             (Typedness::Syntactic, "syntactic"),
@@ -927,10 +957,12 @@ mod tests {
             .find(|p| p.metavar_id == lit_vp.metavar_id)
             .expect("the mixed-kind value_param is promoted to a positional param");
         assert_ne!(
-            lit_param.type_source, "annotation",
+            lit_param.type_source,
+            TypeSource::Annotation,
             "a mixed-kind literal value_param must NOT claim the anchor's annotation as its type, \
              got type_source={:?} type_text={:?}",
-            lit_param.type_source, lit_param.type_text
+            lit_param.type_source,
+            lit_param.type_text
         );
 
         // The metavar id must be listed as an unresolved type slot.
@@ -1074,7 +1106,8 @@ mod tests {
         let p = &sig.params[0];
         assert_eq!(p.type_text.as_deref(), Some("impl Fn()"), "closure param renders impl Fn()");
         assert_eq!(
-            p.type_source, "none",
+            p.type_source,
+            TypeSource::None,
             "a closure param has NO concrete type source — recovering one would over-claim a \
              resolved referent the class does not have"
         );
@@ -1114,13 +1147,13 @@ mod tests {
         let closure = SigParam {
             name: "arg0".to_string(),
             type_text: Some("impl Fn()".to_string()),
-            type_source: "none",
+            type_source: TypeSource::None,
             metavar_id: "m0".to_string(),
         };
         let bare = SigParam {
             name: "arg1".to_string(),
             type_text: None,
-            type_source: "none",
+            type_source: TypeSource::None,
             metavar_id: "m1".to_string(),
         };
 
