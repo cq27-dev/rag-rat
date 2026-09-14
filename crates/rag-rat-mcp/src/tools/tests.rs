@@ -294,12 +294,15 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_array_item_enum(tools, "read_chunk", "include", &["memories"]);
     assert_schema_requires(tools, "papertrail_for_commit", "commit_hash");
     assert_schema_array_item_enum(tools, "papertrail_for_commit", "include", &["fallback"]);
-    assert_schema_array_item_enum(tools, "rationale_search", "include", &[
-        "generated",
-        "git",
-        "papertrail",
-        "fallback",
-    ]);
+    assert_schema_array_item_enum(tools, "rationale_search", "include", &["fallback"]);
+    // The plain full-text tools honor only `query` + `limit`; they must not advertise the
+    // semantic_search knobs they would silently discard.
+    for tool in ["commit_search", "commits_touching_query", "papertrail_issue_search"] {
+        for knob in ["explain", "include", "include_graph", "graph_limit"] {
+            assert_schema_lacks_property(tools, tool, knob);
+        }
+    }
+    assert_schema_lacks_property(tools, "rationale_search", "include_graph");
     assert_schema_has_property(tools, "heal_index", "limit");
     assert_schema_requires(tools, "memory_create", "kind");
     assert_schema_has_property(tools, "memory_create", "title");

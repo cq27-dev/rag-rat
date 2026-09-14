@@ -675,11 +675,53 @@ pub struct MemoryUpdateArgs {
     pub payload: Option<serde_json::Value>,
 }
 
+// A bare keyword query: the whole surface of the full-text search tools that honor nothing beyond
+// `query` + `limit` (`commit_search`, `commits_touching_query`, `papertrail_issue_search`,
+// `memory_search`). They carry no `explain`/`include`/graph knobs because they would ignore them.
+// A plain comment, not a doc comment: schemars would publish a doc comment as the schema's
+// top-level `description`.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct MemorySearchArgs {
+pub struct QueryArgs {
     pub query: String,
     #[serde(default = "default_search_limit")]
     pub limit: u32,
+}
+
+/// `rationale_search` `include` flags. `fallback` off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RationaleInclude {
+    Fallback,
+}
+
+// Older schemas advertised all search flags here. Continue accepting those requests while
+// publishing only the flag this tool honors; parsing through SearchInclude also keeps invalid
+// tokens rejected with the same diagnostics.
+fn de_rationale_include<'de, D>(deserializer: D) -> Result<Option<Vec<RationaleInclude>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let include: Option<Vec<SearchInclude>> = de_seq_or_json_string(deserializer)?;
+    Ok(include.map(|values| {
+        values
+            .into_iter()
+            .filter_map(|value| match value {
+                SearchInclude::Fallback => Some(RationaleInclude::Fallback),
+                SearchInclude::Generated | SearchInclude::Git | SearchInclude::Papertrail => None,
+            })
+            .collect()
+    }))
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RationaleSearchArgs {
+    pub query: String,
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+    /// What to include: `fallback` (off by default). Without it, a query naming a tracker item
+    /// answers with that item's literal references alone whenever any exist.
+    #[serde(default, deserialize_with = "de_rationale_include")]
+    pub include: Option<Vec<RationaleInclude>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1047,6 +1089,33 @@ impl From<MemoryBindArgs> for RepoMemoryBindTarget {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rationale_include_keeps_legacy_ignored_flags_compatible() {
+        use serde_json::json;
+
+        use super::{RationaleInclude, RationaleSearchArgs};
+
+        for (tokens, expected) in [
+            (json!(["git", "papertrail", "generated"]), vec![]),
+            (json!(["git", "fallback", "generated"]), vec![RationaleInclude::Fallback]),
+        ] {
+            for include in [tokens.clone(), json!(tokens.to_string())] {
+                let args: RationaleSearchArgs =
+                    serde_json::from_value(json!({"query": "subject", "include": include}))
+                        .expect("previously advertised flags remain accepted");
+                assert_eq!(args.include, Some(expected.clone()));
+            }
+        }
+        for include in [json!(["bogus"]), json!("[\"bogus\"]")] {
+            assert!(
+                serde_json::from_value::<RationaleSearchArgs>(
+                    json!({"query": "subject", "include": include}),
+                )
+                .is_err()
+            );
+        }
+    }
+
     use rag_rat_core::index::CloneSymbolSelector;
 
     use super::ClonesForSymbolArgs;
