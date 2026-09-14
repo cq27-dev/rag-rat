@@ -30,6 +30,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 use rag_rat_oplog::{self, AccountId, DeviceFingerprint};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
+use strum::IntoEnumIterator;
 use tokio::time::timeout;
 
 use crate::auth::{
@@ -474,17 +475,17 @@ pub async fn accept_enrollment(
 pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
     endpoint: &Endpoint,
     peer: impl Into<EndpointAddr>,
-    alpn: &[u8],
+    stream: SyncAlpn,
     store: &mut S,
     policy: AuthPolicy,
     now_ms: i64,
 ) -> Result<SessionReport, SyncFailure> {
-    // The `alpn` selects the STREAM the dialer wants — [`SYNC_ALPN`] for the account log,
-    // [`CONTENT_SYNC_ALPN`] for the content lane — and must match `store`'s type. The acceptor
+    // `stream` selects what the dialer wants — [`SyncAlpn::Account`] for the account log,
+    // [`SyncAlpn::Content`] for the content lane — and must match `store`'s type. The acceptor
     // routes to the matching store by the negotiated ALPN.
     let account_id = store.account_id();
     let AuthedDial { conn, send, recv, capabilities } =
-        dial_authed(endpoint, peer, alpn, &*store, account_id, policy, now_ms).await?;
+        dial_authed(endpoint, peer, stream, &*store, account_id, policy, now_ms).await?;
     let report = run_session(store, send, recv, AuthRole::Dialer, capabilities)
         .await
         .map_err(SyncFailure::Session)?;
@@ -507,7 +508,7 @@ pub async fn connect_and_table_sync<S: TableSyncStore + NodeAuth>(
     let AuthedDial { conn, send, recv, capabilities } = dial_authed(
         endpoint,
         peer,
-        TABLE_SYNC_ALPN,
+        SyncAlpn::Table,
         &*store,
         account_id,
         AuthPolicy::Closed,
@@ -537,15 +538,14 @@ struct AuthedDial {
 async fn dial_authed<A: NodeAuth>(
     endpoint: &Endpoint,
     peer: impl Into<EndpointAddr>,
-    alpn: &[u8],
+    stream: SyncAlpn,
     auth: &A,
     account_id: [u8; 32],
     policy: AuthPolicy,
     now_ms: i64,
 ) -> Result<AuthedDial, SyncFailure> {
-    // A table-sync dial names its stream in the timeout messages.
-    let lane = if alpn == TABLE_SYNC_ALPN { "table-sync " } else { "" };
-    let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, alpn))
+    let lane = stream.dial_label();
+    let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, stream.as_bytes()))
         .await
         .map_err(|_| connect_failed(format!("{lane}dial timed out")))?
         .map_err(|error| connect_failed(error.to_string()))?;
@@ -672,7 +672,7 @@ impl RoundTally {
 pub async fn connect_and_reconcile<S: SyncStore + NodeAuth>(
     endpoint: &Endpoint,
     peer: EndpointAddr,
-    alpn: &[u8],
+    stream: SyncAlpn,
     store: &mut S,
     policy: AuthPolicy,
     now_ms: impl Fn() -> i64,
@@ -681,7 +681,7 @@ pub async fn connect_and_reconcile<S: SyncStore + NodeAuth>(
     let mut tally = RoundTally::default();
     loop {
         let report =
-            connect_and_sync(endpoint, peer.clone(), alpn, store, policy, now_ms()).await?;
+            connect_and_sync(endpoint, peer.clone(), stream, store, policy, now_ms()).await?;
         let moved =
             tally.record(report.entries_newly_stored, report.entries_sent, report.entries_received);
         if let ReconcileStep::Stop { converged } = reconcile_step(moved, tally.rounds, max_rounds) {
@@ -792,7 +792,7 @@ pub async fn accept_and_dispatch<C>(
     content_store: &mut C,
     policy: AuthPolicy,
     now_ms: impl Fn() -> i64 + Copy,
-) -> Result<(Vec<u8>, SessionReport), SyncFailure>
+) -> Result<(SyncAlpn, SessionReport), SyncFailure>
 where
     C: SyncStore,
 {
@@ -970,22 +970,37 @@ fn serve_scope_for(policy: AuthPolicy, admission: PeerAdmission) -> ServeScope {
     }
 }
 
-/// The streams an acceptor routes, named by the ALPN the connection negotiated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SyncAlpn {
+/// The streams this endpoint binds, named by the ALPN a connection negotiates. The byte values
+/// are the frozen ALPN constants; this type is how dialers, dispatchers and their callers name a
+/// stream without comparing bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
+pub enum SyncAlpn {
+    /// The account log, [`SYNC_ALPN`].
     Account,
+    /// The content lane, [`CONTENT_SYNC_ALPN`].
     Content,
+    /// The table lane, [`TABLE_SYNC_ALPN`].
     Table,
+    /// Owner-side enrollment, [`ENROLL_ALPN`].
     Enroll,
 }
 
 impl SyncAlpn {
-    fn as_bytes(self) -> &'static [u8] {
+    /// The ALPN bytes this stream negotiates.
+    pub fn as_bytes(self) -> &'static [u8] {
         match self {
             Self::Account => SYNC_ALPN,
             Self::Content => CONTENT_SYNC_ALPN,
             Self::Table => TABLE_SYNC_ALPN,
             Self::Enroll => ENROLL_ALPN,
+        }
+    }
+
+    /// The lane name a dial's timeout messages carry; only the table lane names itself.
+    fn dial_label(self) -> &'static str {
+        match self {
+            Self::Table => "table-sync ",
+            Self::Account | Self::Content | Self::Enroll => "",
         }
     }
 }
@@ -994,10 +1009,7 @@ impl TryFrom<&[u8]> for SyncAlpn {
     type Error = ();
 
     fn try_from(alpn: &[u8]) -> Result<Self, ()> {
-        [Self::Account, Self::Content, Self::Table, Self::Enroll]
-            .into_iter()
-            .find(|stream| stream.as_bytes() == alpn)
-            .ok_or(())
+        Self::iter().find(|stream| stream.as_bytes() == alpn).ok_or(())
     }
 }
 
@@ -1077,7 +1089,7 @@ pub async fn dispatch_connection<C>(
     policy: AuthPolicy,
     now_ms: impl Fn() -> i64 + Copy,
     egress: Option<std::sync::Arc<std::sync::Mutex<GlobalEgressLimiter>>>,
-) -> Result<(Vec<u8>, SessionReport), SyncFailure>
+) -> Result<(SyncAlpn, SessionReport), SyncFailure>
 where
     C: SyncStore,
 {
@@ -1129,7 +1141,7 @@ where
         close_enrollment_connection(conn, &mut recv, served).await;
         return match outcome {
             EnrollmentAcceptorOutcome::Enrolled(_, _)
-            | EnrollmentAcceptorOutcome::WriterGranted(_) => Ok((alpn, SessionReport::default())),
+            | EnrollmentAcceptorOutcome::WriterGranted(_) => Ok((stream, SessionReport::default())),
             EnrollmentAcceptorOutcome::Refused(error) => Err(SyncFailure::Enrollment(error)),
         };
     }
@@ -1162,7 +1174,7 @@ where
         policy: alpn_policy,
     };
     let report = run_dispatched(authorized, account_store, content_store, now_ms, egress).await?;
-    Ok((alpn, report))
+    Ok((stream, report))
 }
 
 /// One account a multi-account host serves: the account-log + content stores (BOTH for that one
@@ -1219,7 +1231,7 @@ pub async fn dispatch_connection_multi(
     accounts: &mut [HostedAccount<'_>],
     now_ms: impl Fn() -> i64 + Copy,
     egress: Option<std::sync::Arc<std::sync::Mutex<GlobalEgressLimiter>>>,
-) -> Result<(Vec<u8>, SessionReport), SyncFailure> {
+) -> Result<(SyncAlpn, SessionReport), SyncFailure> {
     let remote_node = *conn.remote_id().as_bytes();
     let alpn = conn.alpn().to_vec();
     // The multi host serves the account-log, content, and table streams. ENROLL_ALPN (and any
@@ -1286,7 +1298,7 @@ pub async fn dispatch_connection_multi(
     };
     let report =
         run_dispatched(authorized, &mut account.sync, &mut account.content, now_ms, egress).await?;
-    Ok((alpn, report))
+    Ok((stream, report))
 }
 
 /// Whether `enrollment_database`'s local account is exactly `account_id` — see the ENROLL_ALPN
@@ -2045,7 +2057,7 @@ mod tests {
         let client = connect_and_sync(
             &dialer,
             direct_addr(&listener),
-            SYNC_ALPN,
+            SyncAlpn::Account,
             &mut source_store,
             policy,
             NOW,
@@ -2086,7 +2098,7 @@ mod tests {
         let client = connect_and_sync(
             &dialer,
             direct_addr(&listener),
-            SYNC_ALPN,
+            SyncAlpn::Account,
             &mut reader_store,
             AuthPolicy::Closed,
             NOW,
@@ -2129,7 +2141,7 @@ mod tests {
         let client = connect_and_sync(
             &dialer,
             direct_addr(&listener),
-            SYNC_ALPN,
+            SyncAlpn::Account,
             &mut dialer_store,
             AuthPolicy::Closed,
             NOW,
@@ -2151,7 +2163,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatcher_honors_remote_read_only_grants_for_both_streams() {
-        for alpn in [SYNC_ALPN, CONTENT_SYNC_ALPN] {
+        for alpn in [SyncAlpn::Account, SyncAlpn::Content] {
             let database = database();
             let account_id = rag_rat_oplog::local_account(&database, NOW).unwrap();
             let account = account_id.to_bytes();
@@ -2201,7 +2213,7 @@ mod tests {
             assert_eq!(server_report.entries_received, 0);
             assert_eq!(
                 client_report.entries_newly_stored,
-                if alpn == SYNC_ALPN { account_entries } else { 1 },
+                if alpn == SyncAlpn::Account { account_entries } else { 1 },
             );
             assert!(!content_store.entries.contains_key(&stale_local_entry.0));
         }
@@ -2222,7 +2234,7 @@ mod tests {
         let client = connect_and_sync(
             &dialer,
             direct_addr(&listener),
-            SYNC_ALPN,
+            SyncAlpn::Account,
             &mut destination_store,
             AuthPolicy::Open,
             NOW,
@@ -2281,7 +2293,7 @@ mod tests {
         let client = connect_and_sync(
             &dialer,
             direct_addr(&listener),
-            SYNC_ALPN,
+            SyncAlpn::Account,
             &mut dest_a_store,
             AuthPolicy::Open,
             NOW,
@@ -2305,7 +2317,7 @@ mod tests {
         let client = connect_and_sync(
             &dialer,
             direct_addr(&listener),
-            SYNC_ALPN,
+            SyncAlpn::Account,
             &mut dest_b_store,
             AuthPolicy::Open,
             NOW,
@@ -2373,7 +2385,7 @@ mod tests {
         let client = connect_and_sync(
             &dialer,
             direct_addr(&listener),
-            SYNC_ALPN,
+            SyncAlpn::Account,
             &mut dest_a_store,
             AuthPolicy::Open,
             NOW,
@@ -2395,7 +2407,7 @@ mod tests {
         let client = connect_and_sync(
             &dialer,
             direct_addr(&listener),
-            SYNC_ALPN,
+            SyncAlpn::Account,
             &mut dest_b_store,
             AuthPolicy::Open,
             NOW,
@@ -2421,7 +2433,7 @@ mod tests {
         let client = connect_and_sync(
             &dialer,
             direct_addr(&listener),
-            SYNC_ALPN,
+            SyncAlpn::Account,
             &mut source_store,
             AuthPolicy::Open,
             NOW,
@@ -2524,7 +2536,7 @@ mod tests {
         let client = connect_and_enroll(&dialer, peer, &joiner_db, account, &request, NOW);
         let (server_r, client_r) = tokio::join!(server, client);
         let (alpn, _) = server_r.unwrap();
-        assert_eq!(alpn, ENROLL_ALPN, "the dispatcher routed the enrollment stream");
+        assert_eq!(alpn, SyncAlpn::Enroll, "the dispatcher routed the enrollment stream");
         client_r.unwrap();
     }
 

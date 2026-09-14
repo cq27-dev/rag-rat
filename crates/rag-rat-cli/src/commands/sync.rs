@@ -10,6 +10,7 @@ use rag_rat_base::{hash, locks, time};
 use rag_rat_core::IndexDatabase;
 use rag_rat_sync::{
     AuthPolicy, NodeAuth, OplogContentSyncStore, OplogSyncStore, PeerAuthorization, PeerCapability,
+    SyncAlpn,
 };
 use rusqlite::{Connection, params};
 use zeroize::Zeroizing;
@@ -610,22 +611,27 @@ fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::R
                 // Refused by the accept-rate limit before the handshake — nothing served, take the
                 // next connection (never an error, so `--once` is unaffected by a refusal).
                 Some(None) => continue,
-                Some(Some(Ok((alpn, report)))) => {
-                    if alpn.as_slice() == rag_rat_sync::SYNC_ALPN
-                        && report.entries_sent == 0
-                        && report.entries_received == 0
-                        && report.entries_newly_stored == 0
-                    {
-                        ensure_founder_table_repo_incarnations(conn)?;
-                    } else if alpn.as_slice() == rag_rat_sync::CONTENT_SYNC_ALPN {
-                        rag_rat_core::drain_synced_memory(conn)?;
-                    } else if alpn.as_slice() == rag_rat_sync::TABLE_SYNC_ALPN {
+                Some(Some(Ok((stream, report)))) => {
+                    match stream {
+                        SyncAlpn::Account
+                            if report.entries_sent == 0
+                                && report.entries_received == 0
+                                && report.entries_newly_stored == 0 =>
+                        {
+                            ensure_founder_table_repo_incarnations(conn)?;
+                        },
+                        SyncAlpn::Content => {
+                            rag_rat_core::drain_synced_memory(conn)?;
+                        },
                         // Synced anchors arrive without device-local resolution; derive it now so
                         // they surface as drive-by this session rather than at the next index open.
-                        rag_rat_core::resolve_synced_distill_anchors(conn)?;
+                        SyncAlpn::Table => {
+                            rag_rat_core::resolve_synced_distill_anchors(conn)?;
+                        },
+                        SyncAlpn::Account | SyncAlpn::Enroll => {},
                     }
                     tracing::info!(
-                        stream = %String::from_utf8_lossy(&alpn),
+                        stream = %String::from_utf8_lossy(stream.as_bytes()),
                         sent = report.entries_sent,
                         received = report.entries_received,
                         stored = report.entries_newly_stored,
@@ -796,7 +802,7 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             let report = rag_rat_sync::connect_and_reconcile(
                 &endpoint,
                 peer.clone(),
-                rag_rat_sync::SYNC_ALPN,
+                SyncAlpn::Account,
                 &mut store,
                 AuthPolicy::Closed,
                 time::now_ms,
@@ -817,7 +823,7 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             rag_rat_sync::connect_and_reconcile(
                 &endpoint,
                 peer.clone(),
-                rag_rat_sync::CONTENT_SYNC_ALPN,
+                SyncAlpn::Content,
                 &mut store,
                 AuthPolicy::Closed,
                 time::now_ms,

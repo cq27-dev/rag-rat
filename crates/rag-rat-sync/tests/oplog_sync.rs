@@ -501,8 +501,8 @@ fn public_only_serve_refuses_an_account_with_a_private_stream() {
 async fn an_anonymous_dialer_pulls_a_public_account_over_dispatch_and_accepts_it() {
     use rag_rat_oplog::{ContentRefoldBudget, settle_pending_content_refolds};
     use rag_rat_sync::{
-        AuthPolicy, CONTENT_SYNC_ALPN, OplogContentSyncStore, OplogSyncStore, SYNC_ALPN,
-        accept_and_dispatch, connect_and_sync,
+        AuthPolicy, OplogContentSyncStore, OplogSyncStore, SyncAlpn, accept_and_dispatch,
+        connect_and_sync,
     };
 
     // Owner: a fully-public account with a public stream + content. Subscriber: fresh, un-enrolled.
@@ -519,10 +519,16 @@ async fn an_anonymous_dialer_pulls_a_public_account_over_dispatch_and_accepts_it
         let mut sub_acc = OplogSyncStore::new(&subscriber, owner_account, || NOW);
         let server =
             accept_and_dispatch(&owner_ep, &mut owner_acc, &mut owner_cont, policy, || NOW);
-        let client =
-            connect_and_sync(&sub_ep, direct_addr(&owner_ep), SYNC_ALPN, &mut sub_acc, policy, NOW);
+        let client = connect_and_sync(
+            &sub_ep,
+            direct_addr(&owner_ep),
+            SyncAlpn::Account,
+            &mut sub_acc,
+            policy,
+            NOW,
+        );
         let (s, c) = tokio::join!(server, client);
-        assert_eq!(s.unwrap().0, SYNC_ALPN);
+        assert_eq!(s.unwrap().0, SyncAlpn::Account);
         c.unwrap();
     }
     // Content next — accepted now that its authority is present on the subscriber.
@@ -535,13 +541,13 @@ async fn an_anonymous_dialer_pulls_a_public_account_over_dispatch_and_accepts_it
         let client = connect_and_sync(
             &sub_ep,
             direct_addr(&owner_ep),
-            CONTENT_SYNC_ALPN,
+            SyncAlpn::Content,
             &mut sub_cont,
             policy,
             NOW,
         );
         let (s, c) = tokio::join!(server, client);
-        assert_eq!(s.unwrap().0, CONTENT_SYNC_ALPN);
+        assert_eq!(s.unwrap().0, SyncAlpn::Content);
         c.unwrap();
     }
 
@@ -795,7 +801,7 @@ async fn a_real_iroh_round_trip_restores_an_account() {
         rag_rat_sync::connect_and_sync(
             &dialer,
             listener_addr,
-            rag_rat_sync::SYNC_ALPN,
+            rag_rat_sync::SyncAlpn::Account,
             &mut dest_store,
             policy,
             NOW,
@@ -820,7 +826,7 @@ async fn a_real_iroh_round_trip_restores_content_via_alpn_dispatch() {
         MemoryOp, NodeContent, NodeId, SealPolicy, author_content_batch, content_entries_for_sync,
         ensure_owned_stream_v2_in_tx,
     };
-    use rag_rat_sync::{CONTENT_SYNC_ALPN, OplogContentSyncStore, SYNC_ALPN};
+    use rag_rat_sync::{OplogContentSyncStore, SyncAlpn};
     use rusqlite::{Transaction, TransactionBehavior};
 
     let relay = std::env::var("RAG_RAT_SYNC_RELAY").expect("set RAG_RAT_SYNC_RELAY to run this");
@@ -883,7 +889,7 @@ async fn a_real_iroh_round_trip_restores_content_via_alpn_dispatch() {
             rag_rat_sync::connect_and_sync(
                 &dialer,
                 listener_addr.clone(),
-                SYNC_ALPN,
+                SyncAlpn::Account,
                 &mut dst_account,
                 policy,
                 NOW,
@@ -892,7 +898,11 @@ async fn a_real_iroh_round_trip_restores_content_via_alpn_dispatch() {
         };
         let (server_r, client_r) = tokio::join!(server, client);
         let (alpn, _) = server_r.unwrap();
-        assert_eq!(alpn, SYNC_ALPN, "the account-log connection routes to the account store");
+        assert_eq!(
+            alpn,
+            SyncAlpn::Account,
+            "the account-log connection routes to the account store"
+        );
         client_r.unwrap();
     }
 
@@ -915,7 +925,7 @@ async fn a_real_iroh_round_trip_restores_content_via_alpn_dispatch() {
             rag_rat_sync::connect_and_sync(
                 &dialer,
                 listener_addr,
-                CONTENT_SYNC_ALPN,
+                SyncAlpn::Content,
                 &mut dst_content,
                 policy,
                 NOW,
@@ -924,7 +934,7 @@ async fn a_real_iroh_round_trip_restores_content_via_alpn_dispatch() {
         };
         let (server_r, client_r) = tokio::join!(server, client);
         let (alpn, _) = server_r.unwrap();
-        assert_eq!(alpn, CONTENT_SYNC_ALPN, "the content connection routes to the content store");
+        assert_eq!(alpn, SyncAlpn::Content, "the content connection routes to the content store");
         client_r.unwrap();
     }
 
@@ -973,8 +983,8 @@ fn direct_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
 #[tokio::test]
 async fn production_anchors_replicate_through_dispatch_before_local_repo_registration() {
     use rag_rat_sync::{
-        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,
-        accept_and_dispatch, connect_and_table_sync,
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, SyncAlpn, accept_and_dispatch,
+        connect_and_table_sync,
     };
 
     let owner = fresh_db();
@@ -1033,7 +1043,7 @@ async fn production_anchors_replicate_through_dispatch_before_local_repo_registr
     let (server, client) = tokio::join!(server, client);
     let (alpn, server_report) = server.unwrap();
     let client_report = client.unwrap();
-    assert_eq!(alpn, TABLE_SYNC_ALPN);
+    assert_eq!(alpn, SyncAlpn::Table);
     assert_eq!(server_report.entries_sent, 1);
     assert_eq!(client_report.entries_newly_stored, 1);
     let replicated: bool = joiner
@@ -1052,8 +1062,8 @@ async fn production_anchors_replicate_through_dispatch_before_local_repo_registr
 #[tokio::test]
 async fn production_overlay_replicates_summaries_and_verdicts() {
     use rag_rat_sync::{
-        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,
-        accept_and_dispatch, connect_and_table_sync,
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, SyncAlpn, accept_and_dispatch,
+        connect_and_table_sync,
     };
 
     let owner = fresh_db();
@@ -1132,7 +1142,7 @@ async fn production_overlay_replicates_summaries_and_verdicts() {
     let (server, client) = tokio::join!(server, client);
     let (alpn, server_report) = server.unwrap();
     let client_report = client.unwrap();
-    assert_eq!(alpn, TABLE_SYNC_ALPN);
+    assert_eq!(alpn, SyncAlpn::Table);
     assert_eq!(server_report.entries_sent, 2, "one verdict and one summary");
     assert_eq!(client_report.entries_newly_stored, 2);
 
@@ -1453,8 +1463,8 @@ async fn a_deleted_overlay_verdict_is_removed_on_the_peer() {
 #[tokio::test]
 async fn production_distill_records_replicate_and_regenerate() {
     use rag_rat_sync::{
-        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,
-        accept_and_dispatch, connect_and_table_sync,
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, SyncAlpn, accept_and_dispatch,
+        connect_and_table_sync,
     };
 
     let owner = fresh_db();
@@ -1579,7 +1589,7 @@ async fn production_distill_records_replicate_and_regenerate() {
         let (server, client) = tokio::join!(server, client);
         let (alpn, _) = server.unwrap();
         client.unwrap();
-        assert_eq!(alpn, TABLE_SYNC_ALPN);
+        assert_eq!(alpn, SyncAlpn::Table);
     };
 
     reconcile().await;
@@ -1727,8 +1737,8 @@ async fn production_distill_records_replicate_and_regenerate() {
 #[tokio::test]
 async fn a_fresh_peer_converges_through_a_compacted_chain_via_the_advertised_floor() {
     use rag_rat_sync::{
-        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,
-        accept_and_dispatch, connect_and_table_sync,
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, SyncAlpn, accept_and_dispatch,
+        connect_and_table_sync,
     };
 
     let owner = fresh_db();
@@ -1803,7 +1813,7 @@ async fn a_fresh_peer_converges_through_a_compacted_chain_via_the_advertised_flo
     let (server, client) = tokio::join!(server, client);
     let (alpn, _server_report) = server.unwrap();
     let client_report = client.unwrap();
-    assert_eq!(alpn, TABLE_SYNC_ALPN);
+    assert_eq!(alpn, SyncAlpn::Table);
     assert_eq!(
         client_report.entries_newly_stored, 2,
         "only the retained suffix transfers — the floor entry roots the fresh chain",
@@ -1878,7 +1888,7 @@ async fn closed_table_auth_refusal_reveals_no_manifest() {
 #[tokio::test]
 async fn connect_and_reconcile_pulls_an_account_to_a_fixpoint_over_loopback() {
     use rag_rat_sync::{
-        AuthPolicy, MAX_RECONCILE_ROUNDS, OplogSyncStore, ReconcileReport, SYNC_ALPN,
+        AuthPolicy, MAX_RECONCILE_ROUNDS, OplogSyncStore, ReconcileReport, SyncAlpn,
         accept_and_sync, connect_and_reconcile,
     };
 
@@ -1908,7 +1918,7 @@ async fn connect_and_reconcile_pulls_an_account_to_a_fixpoint_over_loopback() {
         let client = connect_and_reconcile(
             dialer,
             addr,
-            SYNC_ALPN,
+            SyncAlpn::Account,
             &mut dst_store,
             policy,
             || NOW,
@@ -1970,9 +1980,8 @@ async fn a_fresh_device_enrolls_then_restores_the_account_byte_for_byte() {
         content_entries_for_sync, ensure_owned_stream_v2_in_tx,
     };
     use rag_rat_sync::{
-        AuthPolicy, CONTENT_SYNC_ALPN, EnrollmentRequest, InviteSpec, OplogContentSyncStore,
-        SYNC_ALPN, accept_and_dispatch, accept_enrollment, connect_and_enroll, connect_and_sync,
-        mint_invite,
+        AuthPolicy, EnrollmentRequest, InviteSpec, OplogContentSyncStore, SyncAlpn,
+        accept_and_dispatch, accept_enrollment, connect_and_enroll, connect_and_sync, mint_invite,
     };
     use rusqlite::{Transaction, TransactionBehavior};
 
@@ -2070,13 +2079,17 @@ async fn a_fresh_device_enrolls_then_restores_the_account_byte_for_byte() {
         let client = connect_and_sync(
             &joiner_ep,
             owner_addr.clone(),
-            SYNC_ALPN,
+            SyncAlpn::Account,
             &mut joiner_account,
             policy,
             NOW,
         );
         let (server_r, client_r) = tokio::join!(server, client);
-        assert_eq!(server_r.unwrap().0, SYNC_ALPN, "the account-log connection routed by ALPN");
+        assert_eq!(
+            server_r.unwrap().0,
+            SyncAlpn::Account,
+            "the account-log connection routed by ALPN"
+        );
         client_r.unwrap();
     }
 
@@ -2090,13 +2103,13 @@ async fn a_fresh_device_enrolls_then_restores_the_account_byte_for_byte() {
         let client = connect_and_sync(
             &joiner_ep,
             owner_addr,
-            CONTENT_SYNC_ALPN,
+            SyncAlpn::Content,
             &mut joiner_content,
             policy,
             NOW,
         );
         let (server_r, client_r) = tokio::join!(server, client);
-        assert_eq!(server_r.unwrap().0, CONTENT_SYNC_ALPN, "the content connection routed by ALPN");
+        assert_eq!(server_r.unwrap().0, SyncAlpn::Content, "the content connection routed by ALPN");
         client_r.unwrap();
     }
 
@@ -2186,8 +2199,8 @@ async fn an_owner_collects_a_contributors_memory_by_pulling_the_contributors_acc
         effective_writer_grant, owner_stream_v2_id_for_account, settle_pending_content_refolds,
     };
     use rag_rat_sync::{
-        AuthPolicy, CONTENT_SYNC_ALPN, OplogContentSyncStore, OplogSyncStore, SYNC_ALPN,
-        accept_and_dispatch, connect_and_sync,
+        AuthPolicy, OplogContentSyncStore, OplogSyncStore, SyncAlpn, accept_and_dispatch,
+        connect_and_sync,
     };
     use rusqlite::{Transaction, TransactionBehavior};
 
@@ -2263,12 +2276,12 @@ async fn an_owner_collects_a_contributors_memory_by_pulling_the_contributors_acc
     // acceptance re-derives authority from it), then content.
     let (contributor_ep, owner_ep) = loopback_endpoints().await;
     let policy = AuthPolicy::PublicRead;
-    for alpn in [SYNC_ALPN, CONTENT_SYNC_ALPN] {
+    for alpn in [SyncAlpn::Account, SyncAlpn::Content] {
         let mut serve_acc = OplogSyncStore::new(&contributor, contributor_account, || NOW);
         let mut serve_cont = OplogContentSyncStore::new(&contributor, contributor_account, || NOW);
         let server =
             accept_and_dispatch(&contributor_ep, &mut serve_acc, &mut serve_cont, policy, || NOW);
-        if alpn == SYNC_ALPN {
+        if alpn == SyncAlpn::Account {
             let mut pull = OplogSyncStore::new(&owner, contributor_account, || NOW);
             let client = connect_and_sync(
                 &owner_ep,
@@ -2718,8 +2731,8 @@ fn the_public_serve_skips_a_grantee_that_owns_a_private_stream() {
 async fn an_anonymous_pull_of_an_owner_converges_on_its_contributions() {
     use rag_rat_oplog::{ContentRefoldBudget, settle_pending_content_refolds};
     use rag_rat_sync::{
-        AuthPolicy, CONTENT_SYNC_ALPN, OplogContentSyncStore, SYNC_ALPN, SessionReport,
-        accept_and_dispatch, connect_and_sync,
+        AuthPolicy, OplogContentSyncStore, SessionReport, SyncAlpn, accept_and_dispatch,
+        connect_and_sync,
     };
 
     let (owner, owner_account, _contributor, _contributor_account, stream) =
@@ -2730,12 +2743,12 @@ async fn an_anonymous_pull_of_an_owner_converges_on_its_contributions() {
 
     let mut reports: Vec<SessionReport> = Vec::new();
     for _ in 0..2 {
-        for alpn in [SYNC_ALPN, CONTENT_SYNC_ALPN] {
+        for alpn in [SyncAlpn::Account, SyncAlpn::Content] {
             let mut owner_acc = OplogSyncStore::new(&owner, owner_account, || NOW);
             let mut owner_cont = OplogContentSyncStore::new(&owner, owner_account, || NOW);
             let server =
                 accept_and_dispatch(&owner_ep, &mut owner_acc, &mut owner_cont, policy, || NOW);
-            let report = if alpn == SYNC_ALPN {
+            let report = if alpn == SyncAlpn::Account {
                 let mut pull = OplogSyncStore::new(&subscriber, owner_account, || NOW);
                 let client =
                     connect_and_sync(&sub_ep, direct_addr(&owner_ep), alpn, &mut pull, policy, NOW);
