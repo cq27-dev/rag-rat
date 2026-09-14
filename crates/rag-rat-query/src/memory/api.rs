@@ -108,8 +108,7 @@ pub fn memories_for_chunk(
           AND (
               repo_memory_bindings.chunk_id = ?1
               OR (files.path IS NOT NULL
-                  AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
-         repo_memory_bindings.path)
+                  AND {BINDING_CURRENT_PATH}
                       = files.path)
           )
         GROUP BY repo_memories.id
@@ -137,8 +136,7 @@ pub fn memories_for_path(
         SELECT DISTINCT repo_memories.id AS memory_id
         {MEMORY_WITH_BINDINGS_FROM_SQL}
         WHERE {live}{repo_clause}
-          AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
-         repo_memory_bindings.path) = ?1
+          AND {BINDING_CURRENT_PATH} = ?1
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?2
         "
@@ -166,12 +164,10 @@ pub fn memories_for_symbol(
           AND (
               repo_memory_bindings.logical_symbol_id = ?1
               OR repo_memory_bindings.symbol_id = ?2
-              OR IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_binding_id, \
-         repo_memory_bindings.binding_id) = ?3
+              OR {BINDING_CURRENT_BINDING_ID} = ?3
               OR (
                   repo_memory_bindings.binding_kind = 'path'
-                  AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
-         repo_memory_bindings.path) = ?4
+                  AND {BINDING_CURRENT_PATH} = ?4
               )
           )
         ORDER BY repo_memories.updated_at_ms DESC
@@ -676,14 +672,17 @@ pub fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>
     // hydrates them); the identity stays the authored `binding_id` the entry is listed under.
     let scope = memory_repo_scope(conn)?;
     let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
+    let [b_path, b_symbol_kind, b_signature_hash, b_binding_id] =
+        ["path", "symbol_kind", "signature_hash", "binding_id"]
+            .map(|column| binding_current("b", column));
     let mut stmt = conn.prepare(&format!(
         "
         SELECT b.memory_id, b.binding_kind, b.binding_id,
-               IIF(b.resolved, b.resolved_path, b.path),
-               IIF(b.resolved, b.resolved_symbol_kind, b.symbol_kind),
-               IIF(b.resolved, b.resolved_signature_hash, b.signature_hash),
+               {b_path},
+               {b_symbol_kind},
+               {b_signature_hash},
                b.anchor_status, m.title,
-               IIF(b.resolved, b.resolved_binding_id, b.binding_id)
+               {b_binding_id}
         FROM repo_memory_bindings AS b
         JOIN repo_memories AS m ON m.id = b.memory_id AND m.repo_id = b.repo_id
         WHERE m.status = 'active'

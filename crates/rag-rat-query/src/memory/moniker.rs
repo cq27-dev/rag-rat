@@ -230,15 +230,19 @@ pub(crate) fn moniker_binding_for_memory(
     conn: &Connection,
     memory_id: &str,
 ) -> anyhow::Result<Option<MonikerRow>> {
+    let current_moniker_tool_version =
+        binding_current("repo_memory_bindings", "moniker_tool_version");
     conn.query_row(
-        "
-        SELECT IIF(resolved, resolved_binding_id, binding_id), moniker_tool,
-               IIF(resolved, resolved_moniker_tool_version, moniker_tool_version)
+        &format!(
+            "
+        SELECT {BINDING_CURRENT_BINDING_ID}, moniker_tool,
+               {current_moniker_tool_version}
         FROM repo_memory_bindings
         WHERE memory_id = ?1 AND binding_kind = ?2
           AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
         LIMIT 1
-        ",
+        "
+        ),
         params![memory_id, BindingKind::ScipMoniker.as_db_str()],
         |row| {
             Ok((

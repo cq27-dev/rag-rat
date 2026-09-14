@@ -1017,7 +1017,8 @@ fn unused_working_hash(
 
 fn call_path_key_exists(conn: &Connection, memory_id: &str, hash: &str) -> rusqlite::Result<bool> {
     conn.query_row(
-        "SELECT EXISTS(
+        &format!(
+            "SELECT EXISTS(
              SELECT 1 FROM repo_memory_call_path_edges
               WHERE memory_id = ?1 AND edge_sequence_hash = ?2
              UNION ALL
@@ -1026,9 +1027,10 @@ fn call_path_key_exists(conn: &Connection, memory_id: &str, hash: &str) -> rusql
              UNION ALL
               SELECT 1 FROM repo_memory_bindings
                WHERE memory_id = ?1 AND binding_kind = 'call_path'
-                 AND IIF(resolved, resolved_binding_id, binding_id) = ?2
+                 AND {BINDING_CURRENT_BINDING_ID} = ?2
                  AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
-         )",
+         )"
+        ),
         params![memory_id, hash],
         |row| row.get::<_, i64>(0).map(|value| value != 0),
     )
@@ -1060,7 +1062,7 @@ fn move_call_path_key(
             "UPDATE repo_memory_bindings
                 SET resolved_binding_id = ?1, {BINDING_RESOLUTION_CARRY_SQL}
               WHERE memory_id = ?2 AND binding_kind = 'call_path'
-                AND IIF(resolved, resolved_binding_id, binding_id) = ?3
+                AND {BINDING_CURRENT_BINDING_ID} = ?3
                 AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)"
         ),
         params![to, memory_id, from],
@@ -1094,13 +1096,13 @@ fn load_call_path_bindings(
     memory_id: &str,
     hash: &str,
 ) -> rusqlite::Result<Vec<PersistedCallPathBinding>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT logical_symbol_id FROM repo_memory_bindings
           WHERE memory_id = ?1 AND binding_kind = 'call_path'
-            AND IIF(resolved, resolved_binding_id, binding_id) = ?2
+            AND {BINDING_CURRENT_BINDING_ID} = ?2
             AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
-          ORDER BY binding_id",
-    )?;
+          ORDER BY binding_id"
+    ))?;
     let rows = stmt.query_map(params![memory_id, hash], |row| {
         Ok(PersistedCallPathBinding { logical_symbol_id: row.get(0)? })
     })?;
@@ -1232,7 +1234,7 @@ fn finalize_call_path_binding(
                     SET resolved_binding_id = ?1, logical_symbol_id = ?2,
                         {BINDING_RESOLUTION_CARRY_SQL}
                   WHERE memory_id = ?3 AND binding_kind = 'call_path'
-                    AND IIF(resolved, resolved_binding_id, binding_id) = ?4
+                    AND {BINDING_CURRENT_BINDING_ID} = ?4
                     AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?3)"
             ),
             params![new_hash, logical_symbol_id, memory_id, path.working_hash],
@@ -1240,10 +1242,12 @@ fn finalize_call_path_binding(
     }
     if !existing.is_empty() {
         conn.execute(
-            "UPDATE repo_memory_bindings SET logical_symbol_id = ?1
-              WHERE memory_id = ?2 AND binding_kind = 'call_path'
-                AND IIF(resolved, resolved_binding_id, binding_id) = ?3
-                AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)",
+            &format!(
+                "UPDATE repo_memory_bindings SET logical_symbol_id = ?1
+                  WHERE memory_id = ?2 AND binding_kind = 'call_path'
+                    AND {BINDING_CURRENT_BINDING_ID} = ?3
+                    AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)"
+            ),
             params![logical_symbol_id, memory_id, new_hash],
         )?;
     }
