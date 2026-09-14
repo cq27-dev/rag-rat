@@ -32,8 +32,7 @@ pub fn duplicate_memory_id(
           AND lower(repo_memories.title) = lower(?1)
           AND lower(repo_memories.body) = lower(?2)
           AND repo_memory_bindings.binding_kind = ?3
-          AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_binding_id, \
-                 repo_memory_bindings.binding_id) = ?4
+          AND {BINDING_CURRENT_BINDING_ID} = ?4
           AND repo_memories.payload_json IS ?5
           AND repo_memories.status != 'obsolete'{repo_clause}
         LIMIT 1
@@ -338,8 +337,11 @@ pub(crate) fn mark_drifted_synced_anchor(
     // whose path a linked worktree overrides. Selecting from `main.files` retains both rows, so a
     // stamp matching the hidden base hash would read as current while the checkout serves changed
     // overlay text.
+    let current_start_line = binding_current("repo_memory_bindings", "start_line");
+    let current_end_line = binding_current("repo_memory_bindings", "end_line");
     let (candidates, matches): (i64, i64) = conn.query_row(
-        "
+        &format!(
+            "
         SELECT COUNT(*), COALESCE(SUM(current_hash = ?2), 0)
         FROM (
             SELECT chunks.text_hash AS current_hash
@@ -356,15 +358,13 @@ pub(crate) fn mark_drifted_synced_anchor(
             UNION ALL
             SELECT files.sha256 AS current_hash
             FROM repo_memory_bindings
-            JOIN files ON files.path = IIF(repo_memory_bindings.resolved, \
-         repo_memory_bindings.resolved_path, repo_memory_bindings.path)
+            JOIN files ON files.path = {BINDING_CURRENT_PATH}
             WHERE repo_memory_bindings.memory_id = ?1
               AND repo_memory_bindings.binding_kind = 'path'
             UNION ALL
             SELECT files.sha256 AS current_hash
             FROM repo_memory_bindings
-            JOIN files ON files.path = IIF(repo_memory_bindings.resolved, \
-         repo_memory_bindings.resolved_path, repo_memory_bindings.path)
+            JOIN files ON files.path = {BINDING_CURRENT_PATH}
             WHERE repo_memory_bindings.memory_id = ?1
               AND repo_memory_bindings.binding_kind = 'edge'
               AND NOT EXISTS (
@@ -375,13 +375,10 @@ pub(crate) fn mark_drifted_synced_anchor(
             UNION ALL
             SELECT chunks.text_hash AS current_hash
             FROM repo_memory_bindings
-            JOIN files ON files.path = IIF(repo_memory_bindings.resolved, \
-         repo_memory_bindings.resolved_path, repo_memory_bindings.path)
+            JOIN files ON files.path = {BINDING_CURRENT_PATH}
             JOIN chunks ON chunks.file_id = files.id
-                       AND chunks.start_line <= IIF(repo_memory_bindings.resolved, \
-         repo_memory_bindings.resolved_start_line, repo_memory_bindings.start_line)
-                       AND chunks.end_line >= IIF(repo_memory_bindings.resolved, \
-         repo_memory_bindings.resolved_end_line, repo_memory_bindings.end_line)
+                       AND chunks.start_line <= {current_start_line}
+                       AND chunks.end_line >= {current_end_line}
             WHERE repo_memory_bindings.memory_id = ?1
               AND repo_memory_bindings.binding_kind IN ('symbol', 'logical_symbol')
               AND NOT EXISTS (
@@ -389,12 +386,11 @@ pub(crate) fn mark_drifted_synced_anchor(
                   JOIN files AS served ON served.id = resolved.file_id
                   WHERE resolved.id = repo_memory_bindings.chunk_id
               )
-              AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_start_line, \
-         repo_memory_bindings.start_line) IS NOT NULL
-              AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_end_line, \
-         repo_memory_bindings.end_line) IS NOT NULL
+              AND {current_start_line} IS NOT NULL
+              AND {current_end_line} IS NOT NULL
         )
-        ",
+        "
+        ),
         params![&memory.memory_id, stamp],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;

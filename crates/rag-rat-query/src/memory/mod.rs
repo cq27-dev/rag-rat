@@ -234,6 +234,26 @@ pub const BINDING_RESOLUTION_CARRY_SQL: &str = "resolved = 1,
      resolved_moniker_tool_version = IIF(resolved, resolved_moniker_tool_version, \
                                                 moniker_tool_version)";
 
+/// The read side of [`BINDING_RESOLUTION_CARRY_SQL`]: a shadowed column's value on the
+/// `repo_memory_bindings` row named `alias` — this store's resolution when `resolved` is set (then
+/// the shadow is its view, NULL included), else the authored value. The shadowed columns are the
+/// authored identity `binding_id`, which the writer moving it assigns itself, and the six the carry
+/// names; read them only through this in SQL, or `binding_row` in Rust. A read that names the
+/// authored column directly returns the AUTHORED location of a relocated binding.
+pub(crate) fn binding_current(alias: &str, column: &str) -> String {
+    format!("IIF({alias}.resolved, {alias}.resolved_{column}, {alias}.{column})")
+}
+
+/// [`binding_current`] of `path` on the unaliased `repo_memory_bindings` table.
+pub(crate) const BINDING_CURRENT_PATH: &str = "IIF(repo_memory_bindings.resolved, \
+                                               repo_memory_bindings.resolved_path, \
+                                               repo_memory_bindings.path)";
+
+/// [`binding_current`] of `binding_id` on the unaliased `repo_memory_bindings` table.
+pub(crate) const BINDING_CURRENT_BINDING_ID: &str = "IIF(repo_memory_bindings.resolved, \
+                                                     repo_memory_bindings.resolved_binding_id, \
+                                                     repo_memory_bindings.binding_id)";
+
 impl RepoMemoryBinding {
     /// The name, fingerprint or hash the target carries on this store: the resolution where
     /// relocation moved it, the authored identity otherwise. What lookups against the index and
@@ -1170,6 +1190,93 @@ mod tests {
     #[test]
     fn live_memory_status_sql_is_the_live_variants() {
         assert_eq!(live_memory_status_sql("m"), "m.status IN ('active', 'stale')");
+    }
+
+    /// "This store's resolution when `resolved` is set, else the authored value" is written three
+    /// ways — the carry a partial writer pairs with its own assignment, the `binding_current` SQL
+    /// fragment, and `binding_row`'s Rust-side pick. All three must govern exactly the same shadow
+    /// columns, or a read that misses one returns the AUTHORED value of a relocated binding.
+    #[test]
+    fn binding_shadow_readers_and_the_carry_cover_the_same_columns() {
+        const BINDING_SHADOWED_COLUMNS: [&str; 7] = [
+            "binding_id",
+            "path",
+            "start_line",
+            "end_line",
+            "symbol_kind",
+            "signature_hash",
+            "moniker_tool_version",
+        ];
+        // The carry names every shadow but the identity, which its caller assigns itself.
+        assert_eq!(
+            BINDING_RESOLUTION_CARRY_SQL.matches("= IIF(").count(),
+            BINDING_SHADOWED_COLUMNS.len() - 1
+        );
+        for column in BINDING_SHADOWED_COLUMNS.iter().filter(|column| **column != "binding_id") {
+            let carried = format!("resolved_{column} = IIF(resolved, resolved_{column}, {column})");
+            assert!(BINDING_RESOLUTION_CARRY_SQL.contains(&carried), "the carry misses {column}");
+        }
+        assert_eq!(BINDING_CURRENT_PATH, binding_current("repo_memory_bindings", "path"));
+        assert_eq!(
+            BINDING_CURRENT_BINDING_ID,
+            binding_current("repo_memory_bindings", "binding_id")
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        conn.execute_batch(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0);
+             INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms,
+                     updated_at_ms, source, memory_version, repo_id)
+             VALUES ('m', 'Invariant', 't', 'b', 'high', 'active', 0, 0, 'agent', 'v1', 'r');
+             INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path,
+                     start_line, end_line, symbol_kind, signature_hash, moniker_tool_version,
+                     anchor_status, created_at_ms, repo_id, resolved, resolved_binding_id,
+                     resolved_path, resolved_start_line, resolved_end_line, resolved_symbol_kind,
+                     resolved_signature_hash, resolved_moniker_tool_version)
+             VALUES ('m', 'symbol', 'moved', 'a.rs', 1, 2, 'fn', 's1', 'v1', 'relocated', 0, 'r',
+                     1, 'there', 'b.rs', 10, 20, 'struct', 's2', 'v2'),
+                    ('m', 'symbol', 'unmoved', 'a.rs', 1, 2, 'fn', 's1', 'v1', 'current', 0, 'r',
+                     0, 'there', 'b.rs', 10, 20, 'struct', 's2', 'v2');",
+        )
+        .unwrap();
+        for (binding_id, expected_path) in [("moved", "b.rs"), ("unmoved", "a.rs")] {
+            let binding = conn
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM repo_memory_bindings WHERE binding_id = ?1",
+                        hydrate::BINDING_ROW_COLUMNS
+                    ),
+                    [binding_id],
+                    binding_row,
+                )
+                .unwrap();
+            assert_eq!(binding.path.as_deref(), Some(expected_path));
+            for column in BINDING_SHADOWED_COLUMNS {
+                use rusqlite::types::Value;
+                let from_sql: Value = conn
+                    .query_row(
+                        &format!(
+                            "SELECT {} FROM repo_memory_bindings AS b WHERE b.binding_id = ?1",
+                            binding_current("b", column)
+                        ),
+                        [binding_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let from_row = match column {
+                    "binding_id" => Value::from(binding.current_binding_id().to_string()),
+                    "path" => binding.path.clone().into(),
+                    "start_line" => binding.start_line.into(),
+                    "end_line" => binding.end_line.into(),
+                    "symbol_kind" => binding.symbol_kind.clone().into(),
+                    "signature_hash" => binding.signature_hash.clone().into(),
+                    "moniker_tool_version" => binding.moniker_tool_version.clone().into(),
+                    other => panic!("binding_row does not hydrate the shadowed column `{other}`"),
+                };
+                assert_eq!(from_row, from_sql, "`{column}` on the `{binding_id}` row");
+            }
+        }
     }
 
     #[test]

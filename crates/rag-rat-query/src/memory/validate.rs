@@ -700,9 +700,11 @@ pub(crate) fn validate_call_path_binding(
     // rows up under the old hash and stamp that hash back over the re-point.
     let current: Option<String> = conn
         .query_row(
-            "SELECT IIF(resolved, resolved_binding_id, binding_id) FROM repo_memory_bindings
-             WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
-               AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)",
+            &format!(
+                "SELECT {BINDING_CURRENT_BINDING_ID} FROM repo_memory_bindings
+                 WHERE memory_id = ?1 AND binding_kind = 'call_path' AND binding_id = ?2
+                   AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)"
+            ),
             params![binding.memory_id, binding.binding_id],
             |row| row.get(0),
         )
@@ -841,7 +843,7 @@ fn converge_call_path_identity(
             "UPDATE repo_memory_bindings
                 SET resolved_binding_id = ?1, {BINDING_RESOLUTION_CARRY_SQL}
               WHERE memory_id = ?2 AND binding_kind = 'call_path'
-                AND IIF(resolved, resolved_binding_id, binding_id) = ?3
+                AND {BINDING_CURRENT_BINDING_ID} = ?3
                 AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)"
         ),
         params![converged, binding.memory_id, current],

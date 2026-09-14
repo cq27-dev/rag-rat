@@ -5,6 +5,8 @@ use rag_rat_db::meta::scoped_table_row_count;
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde::Serialize;
 
+use crate::memory::BINDING_CURRENT_PATH;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoBriefMode {
     Spine,
@@ -708,8 +710,7 @@ fn memory_counts(conn: &Connection, path: Option<&str>) -> anyhow::Result<RepoBr
             FROM repo_memories
             JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
              AND repo_memory_bindings.repo_id = repo_memories.repo_id
-            WHERE IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
-             repo_memory_bindings.path) = ?1{repo_clause}
+            WHERE {BINDING_CURRENT_PATH} = ?1{repo_clause}
             GROUP BY repo_memories.status
             "
         ))?;
@@ -797,15 +798,13 @@ fn memory_counts_by_path(
     let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "repo_memories");
     let mut stmt = conn.prepare(&format!(
         "
-        SELECT IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
-         repo_memory_bindings.path) AS path,
+        SELECT {BINDING_CURRENT_PATH} AS path,
                repo_memories.status,
                COUNT(DISTINCT repo_memories.id)
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
          AND repo_memory_bindings.repo_id = repo_memories.repo_id
-        WHERE IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
-         repo_memory_bindings.path) IS NOT NULL{repo_clause}
+        WHERE {BINDING_CURRENT_PATH} IS NOT NULL{repo_clause}
         GROUP BY 1, repo_memories.status
         "
     ))?;
