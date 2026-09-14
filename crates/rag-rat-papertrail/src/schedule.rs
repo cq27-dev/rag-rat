@@ -256,8 +256,15 @@ fn sanitize_error_detail(detail: &str) -> String {
         .join(" ")
 }
 
-pub(crate) type PersistedHealth =
-    (BindingScheduleState, Option<PapertrailErrorClass>, Option<String>, String);
+/// One binding's persisted health row; `Default` for a binding that has no row yet.
+#[derive(Default)]
+pub(crate) struct PersistedHealth {
+    pub state: BindingScheduleState,
+    pub error_class: Option<PapertrailErrorClass>,
+    pub error_detail: Option<String>,
+    /// The tag-filter fingerprint the cursor was walked under (empty when none is stored).
+    pub filter_fingerprint: String,
+}
 
 pub(crate) fn load_persisted_health(
     conn: &Connection,
@@ -274,8 +281,8 @@ pub(crate) fn load_persisted_health(
             params![repo_id, binding.provider.as_db_str(), binding.project],
             |row| {
                 let error: Option<String> = row.get(5)?;
-                Ok((
-                    BindingScheduleState {
+                Ok(PersistedHealth {
+                    state: BindingScheduleState {
                         last_attempt_ms: row.get(0)?,
                         last_successful_probe_ms: row.get(1)?,
                         last_successful_mirror_ms: row.get(2)?,
@@ -283,18 +290,18 @@ pub(crate) fn load_persisted_health(
                         retry_not_before_ms: row.get(4)?,
                         continuation: MirrorContinuation::None,
                     },
-                    error.as_deref().and_then(PapertrailErrorClass::from_db_str),
-                    row.get(6)?,
-                    row.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                ))
+                    error_class: error.as_deref().and_then(PapertrailErrorClass::from_db_str),
+                    error_detail: row.get(6)?,
+                    filter_fingerprint: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                })
             },
         )
         .optional()?;
-    let Some((mut state, error, detail, fingerprint)) = persisted else {
+    let Some(mut health) = persisted else {
         return Ok(PersistedHealth::default());
     };
-    state.continuation = load_mirror_continuation(conn, binding)?;
-    Ok((state, error, detail, fingerprint))
+    health.state.continuation = load_mirror_continuation(conn, binding)?;
+    Ok(health)
 }
 
 #[cfg(test)]
@@ -374,7 +381,8 @@ mod tests {
         record_pause(&conn, &binding, 20_000).unwrap();
         record_success(&conn, &binding, SuccessfulOperation::IncrementalMirror, 10_000).unwrap();
         let repo_id = schema::active_repo_id(&conn).unwrap();
-        let (state, error, _, _) = load_persisted_health(&conn, &repo_id, &binding).unwrap();
+        let PersistedHealth { state, error_class: error, .. } =
+            load_persisted_health(&conn, &repo_id, &binding).unwrap();
         assert_eq!(state.last_successful_probe_ms, Some(10_000));
         assert_eq!(state.last_successful_mirror_ms, Some(10_000));
         assert_eq!(state.retry_not_before_ms, None);
@@ -388,7 +396,8 @@ mod tests {
         let binding = binding();
         record_pause(&conn, &binding, 20_000).unwrap();
         let repo_id = schema::active_repo_id(&conn).unwrap();
-        let (state, error, detail, _) = load_persisted_health(&conn, &repo_id, &binding).unwrap();
+        let PersistedHealth { state, error_class: error, error_detail: detail, .. } =
+            load_persisted_health(&conn, &repo_id, &binding).unwrap();
         assert_eq!(state.retry_not_before_ms, Some(20_000));
         assert_eq!(error, Some(PapertrailErrorClass::RateLimited));
         assert_eq!(detail, None);
@@ -408,7 +417,8 @@ mod tests {
         .unwrap();
         record_pause(&conn, &binding, 20_000).unwrap();
         let repo_id = schema::active_repo_id(&conn).unwrap();
-        let (_, error, detail, _) = load_persisted_health(&conn, &repo_id, &binding).unwrap();
+        let PersistedHealth { error_class: error, error_detail: detail, .. } =
+            load_persisted_health(&conn, &repo_id, &binding).unwrap();
         assert_eq!(error, Some(PapertrailErrorClass::RateLimited));
         assert_eq!(detail, None);
     }
@@ -427,7 +437,8 @@ mod tests {
         )
         .unwrap();
         let repo_id = schema::active_repo_id(&conn).unwrap();
-        let (state, error, detail, _) = load_persisted_health(&conn, &repo_id, &binding).unwrap();
+        let PersistedHealth { state, error_class: error, error_detail: detail, .. } =
+            load_persisted_health(&conn, &repo_id, &binding).unwrap();
         assert_eq!(state.retry_not_before_ms, None);
         assert_eq!(error, Some(PapertrailErrorClass::Authentication));
         assert_eq!(detail.as_deref(), Some("new auth failure"));
@@ -472,7 +483,8 @@ mod tests {
         )
         .unwrap();
         let repo_id = schema::active_repo_id(&conn).unwrap();
-        let (state, _, _, fingerprint) = load_persisted_health(&conn, &repo_id, &binding).unwrap();
+        let PersistedHealth { state, filter_fingerprint: fingerprint, .. } =
+            load_persisted_health(&conn, &repo_id, &binding).unwrap();
         assert_eq!(state.continuation, MirrorContinuation::Incremental);
         assert_eq!(fingerprint, "old");
     }

@@ -20,10 +20,19 @@ pub(crate) fn evidence_for_path(
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(evidence)
 }
+/// The chunk currently holding a symbol, in the SQL's own column order; all `None` when the symbol
+/// resolves to no chunk.
+#[derive(Default)]
+pub(crate) struct SymbolSpan {
+    pub chunk_id: Option<i64>,
+    pub start_line: Option<i64>,
+    pub end_line: Option<i64>,
+}
+
 pub(crate) fn current_symbol_span(
     conn: &Connection,
     symbol: &super::api::SymbolRef<'_>,
-) -> anyhow::Result<(Option<i64>, Option<i64>, Option<i64>)> {
+) -> anyhow::Result<SymbolSpan> {
     let span = conn
         .query_row(
             "
@@ -38,14 +47,16 @@ pub(crate) fn current_symbol_span(
             LIMIT 1
             ",
             params![symbol.path, symbol.qualified_name, symbol.symbol_path],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+            |row| {
+                Ok(SymbolSpan {
+                    chunk_id: Some(row.get(0)?),
+                    start_line: Some(row.get(1)?),
+                    end_line: Some(row.get(2)?),
+                })
+            },
         )
         .optional()?;
-    Ok(match span {
-        Some((chunk_id, start_line, end_line)) =>
-            (Some(start_line), Some(end_line), Some(chunk_id)),
-        None => (None, None, None),
-    })
+    Ok(span.unwrap_or_default())
 }
 /// Every mirror row (the item's own text AND its comments) for ONE tracker item. No `item_kind`
 /// filter: refs don't know the kind of the item they name, and either cached kind is the item.

@@ -10,6 +10,12 @@ use super::*;
 // the writers' `ON CONFLICT` upserts refresh content in place and can never restamp a sibling
 // repo's copy.
 //
+// REPO SCOPE BY SIGNATURE: the public readers/writers (`store_ref`, `store_item`, `store_comment`,
+// `store_closing_edge`, `closing_edges_for_item`) resolve `active_repo_id` themselves; the
+// attested-walk helpers (`cached_issue_is_closed`, `has_conflicting_provider_closer`,
+// `reap_provider_closers_for_issue`, `stamp_attested_*`) take `repo_id` from a caller that
+// resolved it once for the whole walk.
+//
 // FTS MIRROR (incremental): `papertrail_fts` is maintained INCREMENTALLY — each writer deletes and
 // reinserts ONLY its own mirror row(s), keyed the same way as its base row (`doc_kind = 'item'`
 // rows by the item identity, `doc_kind = 'comment'` rows by the comment identity). The
@@ -323,15 +329,22 @@ pub fn closing_edges_for_item(
     Ok(edges)
 }
 
-/// Whether `issue_key` is a CACHED issue that is not open — the only target a closing edge may be
+/// One issue within a (repo, tracker) scope. The project and key travel together so the two
+/// adjacent string identities can never be passed transposed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IssueTarget<'a> {
+    pub project: &'a str,
+    pub issue_key: &'a str,
+}
+
+/// Whether `issue` is a CACHED issue that is not open — the only target a closing edge may be
 /// stored for. Cached ⇒ the item passed its binding's tag filter; not open ⇒ a reopened issue has
 /// no closure evidence.
 pub(crate) fn cached_issue_is_closed(
     conn: &Connection,
     repo_id: &str,
     tracker: Tracker,
-    project: &str,
-    issue_key: &str,
+    issue: IssueTarget<'_>,
 ) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM papertrail_items WHERE repo_id = ?1 AND tracker = ?2 AND \
@@ -339,9 +352,9 @@ pub(crate) fn cached_issue_is_closed(
         params![
             repo_id,
             tracker.as_db_str(),
-            project,
+            issue.project,
             ItemKind::Issue.as_db_str(),
-            issue_key,
+            issue.issue_key,
             NormalizedState::Open.as_db_str(),
         ],
         |row| row.get(0),
@@ -380,8 +393,7 @@ pub(crate) fn reap_provider_closers_for_issue(
     conn: &Connection,
     repo_id: &str,
     tracker: Tracker,
-    project: &str,
-    issue_key: &str,
+    issue: IssueTarget<'_>,
 ) -> rusqlite::Result<usize> {
     conn.execute(
         "DELETE FROM papertrail_closing_edges WHERE repo_id = ?1 AND tracker = ?2 AND project = \
@@ -389,9 +401,9 @@ pub(crate) fn reap_provider_closers_for_issue(
         params![
             repo_id,
             tracker.as_db_str(),
-            project,
+            issue.project,
             ClosingEdgeSource::Provider.as_db_str(),
-            issue_key,
+            issue.issue_key,
         ],
     )
 }

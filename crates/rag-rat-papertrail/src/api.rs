@@ -75,7 +75,8 @@ pub async fn sync_mirror_scheduled(
         if tracker_synchronization(binding) != TrackerSynchronization::Native {
             continue;
         }
-        let (health, _, _, stored_fingerprint) = load_persisted_health(conn, &repo_id, binding)?;
+        let PersistedHealth { state: health, filter_fingerprint: stored_fingerprint, .. } =
+            load_persisted_health(conn, &repo_id, binding)?;
         let filter_changed = stored_fingerprint != binding.filter_fingerprint();
         let change_detected = filter_changed || request >= AutosyncRequest::Incremental;
         let decision = decide_schedule(now, &ctx.schedule, health, change_detected);
@@ -554,8 +555,12 @@ pub fn status(conn: &Connection, ctx: &PapertrailContext) -> anyhow::Result<Pape
         .trackers
         .iter()
         .map(|binding| {
-            let (health, error_class, error_detail, stored_filter_fingerprint) =
-                load_persisted_health(conn, &repo_id, binding)?;
+            let PersistedHealth {
+                state: health,
+                error_class,
+                error_detail,
+                filter_fingerprint: stored_filter_fingerprint,
+            } = load_persisted_health(conn, &repo_id, binding)?;
             let filter_changed = stored_filter_fingerprint != binding.filter_fingerprint();
             let synchronization = tracker_synchronization(binding);
             let decision = decide_schedule(now, &ctx.schedule, health, filter_changed);
@@ -774,13 +779,13 @@ pub fn papertrail_for_symbol(
     evidence.extend(rationale_search(conn, symbol.qualified_name, limit, ctx)?);
     dedupe_evidence(&mut evidence);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    let (start_line, end_line, chunk_id) = current_symbol_span(conn, symbol)?;
+    let span = current_symbol_span(conn, symbol)?;
     Ok(Papertrail {
         current_source: Some(CurrentSourceEvidence {
-            chunk_id,
+            chunk_id: span.chunk_id,
             path: symbol.path.to_string(),
-            start_line,
-            end_line,
+            start_line: span.start_line,
+            end_line: span.end_line,
             symbol: Some(symbol.qualified_name.to_string()),
         }),
         evidence,
@@ -1243,7 +1248,7 @@ mod scheduled_tests {
 
     fn persisted(conn: &Connection, binding: &ResolvedTracker) -> BindingScheduleState {
         let repo_id = schema::active_repo_id(conn).unwrap();
-        load_persisted_health(conn, &repo_id, binding).unwrap().0
+        load_persisted_health(conn, &repo_id, binding).unwrap().state
     }
 
     /// The wire shape of a quiet probe run: a not-modified item probe, then one empty page per
@@ -1628,7 +1633,7 @@ mod scheduled_tests {
             )
             .unwrap();
         assert_eq!(items, 1);
-        let (_, error, _, _) = load_persisted_health(&conn, &repo_id, &resumed_binding).unwrap();
+        let error = load_persisted_health(&conn, &repo_id, &resumed_binding).unwrap().error_class;
         assert_eq!(error, None, "a completed walk clears the persisted failure");
     }
 

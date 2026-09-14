@@ -748,13 +748,10 @@ pub(crate) fn store_text_closing_edges_from_commit_refs(
         // but this rederive runs at sync END, so without it a reopened issue whose closing
         // commit is still in history would have its text-tier closer re-minted every sync.
         // (Un-mirrored targets stay annotations; the provider lane attests them.)
-        if !cached_issue_is_closed(
-            conn,
-            &repo_id,
-            reference.tracker,
-            &reference.project,
-            &reference.item_key,
-        )? {
+        if !cached_issue_is_closed(conn, &repo_id, reference.tracker, IssueTarget {
+            project: &reference.project,
+            issue_key: &reference.item_key,
+        })? {
             continue;
         }
         // Defer to the provider tier. The text tier is the FALLBACK for issues the provider lane
