@@ -308,12 +308,7 @@ pub(super) async fn read_blob<R: AsyncRead + Unpin>(
 ) -> Result<Vec<u8>, InviteError> {
     let mut prefix = [0u8; 4];
     read_within(recv, &mut prefix, progress).await?;
-    let len = u32::from_be_bytes(prefix);
-    if len > max_len {
-        return Err(InviteError::Malformed(format!(
-            "enrollment {frame_name} frame exceeds {max_len} bytes"
-        )));
-    }
+    let len = ensure_frame_len(u32::from_be_bytes(prefix) as usize, max_len, frame_name)?;
     let mut body = vec![0; len as usize];
     for chunk in body.chunks_mut(ENROLL_PROGRESS_CHUNK_BYTES) {
         read_within(recv, chunk, progress).await?;

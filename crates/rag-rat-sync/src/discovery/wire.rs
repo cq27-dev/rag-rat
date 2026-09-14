@@ -23,7 +23,9 @@
 //! list private from the operator (see [`super::account_tag`]).
 
 use minicbor::{Decoder, Encoder};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+use crate::codec::{self, FramingError};
 
 /// Writing CBOR into a `Vec` cannot fail, mirroring the op-log's envelope style.
 const INFALLIBLE: &str = "encoding CBOR to a Vec is infallible";
@@ -364,32 +366,26 @@ fn expect_fields(actual: u64, expected: u64, what: &str) -> Result<(), WireError
 
 /// Write a length-prefixed frame: 4-byte big-endian length, then the body.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, body: &[u8]) -> std::io::Result<()> {
-    if body.len() > MAX_FRAME_LEN {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("frame too large: {} > {MAX_FRAME_LEN}", body.len()),
-        ));
-    }
-    w.write_all(&(body.len() as u32).to_be_bytes()).await?;
-    w.write_all(body).await?;
+    codec::write_framed(w, body, MAX_FRAME_LEN as u32).await.map_err(framing_io)?;
     w.flush().await
 }
 
 /// Read one length-prefixed frame, refusing an over-cap declared length BEFORE allocating — the
 /// length is peer-supplied, so trusting it is a trivial memory-exhaustion lever.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
-    let mut len_bytes = [0u8; 4];
-    r.read_exact(&mut len_bytes).await?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(std::io::Error::new(
+    codec::read_framed(r, MAX_FRAME_LEN as u32).await.map_err(framing_io)
+}
+
+/// The discovery client's framing errors stay plain `io::Error`s: an over-cap length is
+/// `InvalidData`, and a stream error passes through unchanged.
+fn framing_io(error: FramingError) -> std::io::Error {
+    match error {
+        FramingError::OverCap(len) => std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("frame too large: {len} > {MAX_FRAME_LEN}"),
-        ));
+        ),
+        FramingError::Eof(error) | FramingError::Io(error) => error,
     }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body).await?;
-    Ok(body)
 }
 
 #[cfg(test)]
