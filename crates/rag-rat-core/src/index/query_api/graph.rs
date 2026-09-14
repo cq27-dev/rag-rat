@@ -327,120 +327,22 @@ impl IndexDatabase {
             .into_iter()
             .map(|failure| failure.path)
             .collect::<BTreeSet<_>>();
-        let mut matched_hits = Vec::new();
-        let mut text_only_hits = Vec::new();
-        let mut likely_parser_gaps = Vec::new();
-        for hit in &text_hits {
-            if let Some(edge) = graph_by_location.get(&(hit.path.clone(), hit.line)) {
-                matched_hits.push(MatchedGraphTextHit {
-                    path: hit.path.clone(),
-                    line: hit.line,
-                    text: hit.text.clone(),
-                    target: edge.target.clone(),
-                    edge_kind: edge.edge_kind.clone(),
-                    confidence: edge.confidence.clone(),
-                    resolution: edge.resolution.clone(),
-                });
-            } else {
-                let gap_kind = text_compare::classify_text_only_hit(
-                    &hit.path,
-                    &hit.text,
-                    &parser_failure_paths,
-                );
-                let text_only_hit = TextOnlyHit {
-                    path: hit.path.clone(),
-                    line: hit.line,
-                    text: hit.text.clone(),
-                    reason: if gap_kind == "parser_call_extraction" || gap_kind == "parser_failure"
-                    {
-                        "no graph edge extracted"
-                    } else {
-                        "text mention outside graph-call evidence"
-                    }
-                    .to_string(),
-                    likely_gap: gap_kind.to_string(),
-                };
-                if text_compare::is_likely_parser_gap_kind(gap_kind) {
-                    likely_parser_gaps.push(text_only_hit.clone());
-                }
-                text_only_hits.push(text_only_hit);
-            }
-        }
-
-        let mut graph_only_edges = Vec::new();
-        let mut likely_false_positives = Vec::new();
-        for edge in &graph_edges {
-            let Some(callsite) = &edge.callsite else {
-                continue;
-            };
-            if text_by_location.contains_key(&(callsite.path.clone(), callsite.line)) {
-                continue;
-            }
-            let current_line = self.read_current_line_text(&callsite.path, callsite.line)?;
-            let graph_only = GraphOnlyEdge {
-                path: callsite.path.clone(),
-                line: callsite.line,
-                target: edge.target.clone(),
-                edge_kind: edge.edge_kind.clone(),
-                confidence: edge.confidence.clone(),
-                resolution: edge.resolution.clone(),
-                evidence: edge.evidence.clone(),
-                reason: "graph edge exists but pattern did not match text".to_string(),
-                likely_reason: text_compare::graph_only_reason(edge, current_line.as_deref()),
-            };
-            if text_compare::is_likely_false_positive_graph_only(edge, &graph_only) {
-                likely_false_positives.push(graph_only.clone());
-            }
-            graph_only_edges.push(graph_only);
-        }
-        let complete = likely_parser_gaps.is_empty() && likely_false_positives.is_empty();
-        let recommended_fallback =
-            text_compare::recommended_graph_text_fallback(&likely_parser_gaps, &graph_only_edges);
-        let pattern_match_mode = text_compare::compare_pattern_match_mode(pattern, &symbol.name);
-        let mut warnings = Vec::new();
-        if pattern_match_mode == "substring_identifier" {
-            warnings.push(format!(
-                "pattern may match identifiers that merely contain `{}`; use an identifier \
-                 boundary or escaped call suffix for exact text auditing",
-                symbol.name
-            ));
-        }
-
-        Ok(CompareGraphTextReport {
-            query: CompareGraphTextQuery {
-                symbol_id: Some(symbol.symbol_id),
-                logical_symbol_id: options.logical_symbol_id,
-                symbol_path: symbol.qualified_name.clone(),
-                pattern: pattern.to_string(),
-                resolution: options.resolution_mode.as_str().to_string(),
+        let text = classify_text_hits(&text_hits, &graph_by_location, &parser_failure_paths);
+        let graph = self.classify_graph_only_edges(&graph_edges, &text_by_location)?;
+        self.graph_text_report(
+            GraphTextReportInput {
+                symbol,
+                pattern,
+                options: &options,
+                logical_symbol,
+                variants,
+                graph_count: graph_edges.len(),
+                text_count: text_hits.len(),
+                paths,
             },
-            logical_symbol,
-            variants,
-            summary: CompareGraphTextSummary {
-                graph_hits: u64::try_from(graph_edges.len()).unwrap_or(u64::MAX),
-                graph_edges: u64::try_from(graph_edges.len()).unwrap_or(u64::MAX),
-                text_hits: u64::try_from(text_hits.len()).unwrap_or(u64::MAX),
-                matched: u64::try_from(matched_hits.len()).unwrap_or(u64::MAX),
-                graph_only: u64::try_from(graph_only_edges.len()).unwrap_or(u64::MAX),
-                text_only: u64::try_from(text_only_hits.len()).unwrap_or(u64::MAX),
-                text_mentions: u64::try_from(text_only_hits.len() - likely_parser_gaps.len())
-                    .unwrap_or(u64::MAX),
-                likely_parser_gaps: u64::try_from(likely_parser_gaps.len()).unwrap_or(u64::MAX),
-                likely_false_positives: u64::try_from(likely_false_positives.len())
-                    .unwrap_or(u64::MAX),
-                likely_index_gaps: u64::try_from(likely_parser_gaps.len()).unwrap_or(u64::MAX),
-                complete,
-                recommended_fallback,
-                pattern_match_mode,
-                warnings,
-            },
-            coverage: self.graph_coverage(paths)?,
-            matched_hits,
-            text_only_hits,
-            graph_only_edges,
-            likely_parser_gaps,
-            likely_false_positives,
-        })
+            text,
+            graph,
+        )
     }
 
     /// `compare_graph_to_scip` — report where tree-sitter and the compiler (SCIP) DISAGREE on edge
@@ -956,3 +858,177 @@ fn annotate_completeness_with_externals(
 #[cfg(test)]
 #[path = "oracle_surfacing_tests.rs"]
 mod oracle_surfacing_tests;
+
+struct TextHitBuckets {
+    matched: Vec<MatchedGraphTextHit>,
+    text_only: Vec<TextOnlyHit>,
+    likely_parser_gaps: Vec<TextOnlyHit>,
+}
+
+fn classify_text_hits(
+    text_hits: &[TextOnlyHit],
+    graph_by_location: &BTreeMap<(String, i64), &GraphHop>,
+    parser_failure_paths: &BTreeSet<String>,
+) -> TextHitBuckets {
+    let mut matched_hits = Vec::new();
+    let mut text_only_hits = Vec::new();
+    let mut likely_parser_gaps = Vec::new();
+    for hit in text_hits {
+        if let Some(edge) = graph_by_location.get(&(hit.path.clone(), hit.line)) {
+            matched_hits.push(MatchedGraphTextHit {
+                path: hit.path.clone(),
+                line: hit.line,
+                text: hit.text.clone(),
+                target: edge.target.clone(),
+                edge_kind: edge.edge_kind.clone(),
+                confidence: edge.confidence.clone(),
+                resolution: edge.resolution.clone(),
+            });
+        } else {
+            let gap_kind =
+                text_compare::classify_text_only_hit(&hit.path, &hit.text, parser_failure_paths);
+            let text_only_hit = TextOnlyHit {
+                path: hit.path.clone(),
+                line: hit.line,
+                text: hit.text.clone(),
+                reason: if gap_kind == "parser_call_extraction" || gap_kind == "parser_failure" {
+                    "no graph edge extracted"
+                } else {
+                    "text mention outside graph-call evidence"
+                }
+                .to_string(),
+                likely_gap: gap_kind.to_string(),
+            };
+            if text_compare::is_likely_parser_gap_kind(gap_kind) {
+                likely_parser_gaps.push(text_only_hit.clone());
+            }
+            text_only_hits.push(text_only_hit);
+        }
+    }
+
+    TextHitBuckets { matched: matched_hits, text_only: text_only_hits, likely_parser_gaps }
+}
+
+struct GraphOnlyBuckets {
+    graph_only: Vec<GraphOnlyEdge>,
+    likely_false_positives: Vec<GraphOnlyEdge>,
+}
+
+struct GraphTextReportInput<'a> {
+    symbol: &'a SymbolHit,
+    pattern: &'a str,
+    options: &'a GraphTraversalOptions,
+    logical_symbol: Option<LogicalSymbol>,
+    variants: Vec<LogicalSymbolVariant>,
+    graph_count: usize,
+    text_count: usize,
+    paths: BTreeSet<String>,
+}
+
+impl IndexDatabase {
+    fn classify_graph_only_edges(
+        &self,
+        graph_edges: &[GraphHop],
+        text_by_location: &BTreeMap<(String, i64), &TextOnlyHit>,
+    ) -> anyhow::Result<GraphOnlyBuckets> {
+        let mut graph_only_edges = Vec::new();
+        let mut likely_false_positives = Vec::new();
+        for edge in graph_edges {
+            let Some(callsite) = &edge.callsite else {
+                continue;
+            };
+            if text_by_location.contains_key(&(callsite.path.clone(), callsite.line)) {
+                continue;
+            }
+            let current_line = self.read_current_line_text(&callsite.path, callsite.line)?;
+            let graph_only = GraphOnlyEdge {
+                path: callsite.path.clone(),
+                line: callsite.line,
+                target: edge.target.clone(),
+                edge_kind: edge.edge_kind.clone(),
+                confidence: edge.confidence.clone(),
+                resolution: edge.resolution.clone(),
+                evidence: edge.evidence.clone(),
+                reason: "graph edge exists but pattern did not match text".to_string(),
+                likely_reason: text_compare::graph_only_reason(edge, current_line.as_deref()),
+            };
+            if text_compare::is_likely_false_positive_graph_only(edge, &graph_only) {
+                likely_false_positives.push(graph_only.clone());
+            }
+            graph_only_edges.push(graph_only);
+        }
+        Ok(GraphOnlyBuckets { graph_only: graph_only_edges, likely_false_positives })
+    }
+
+    fn graph_text_report(
+        &self,
+        input: GraphTextReportInput<'_>,
+        text: TextHitBuckets,
+        graph: GraphOnlyBuckets,
+    ) -> anyhow::Result<CompareGraphTextReport> {
+        let GraphTextReportInput {
+            symbol,
+            pattern,
+            options,
+            logical_symbol,
+            variants,
+            graph_count,
+            text_count,
+            paths,
+        } = input;
+        let TextHitBuckets { matched: matched_hits, text_only: text_only_hits, likely_parser_gaps } =
+            text;
+        let GraphOnlyBuckets { graph_only: graph_only_edges, likely_false_positives } = graph;
+        let complete = likely_parser_gaps.is_empty() && likely_false_positives.is_empty();
+        let recommended_fallback =
+            text_compare::recommended_graph_text_fallback(&likely_parser_gaps, &graph_only_edges);
+        let pattern_match_mode = text_compare::compare_pattern_match_mode(pattern, &symbol.name);
+        let mut warnings = Vec::new();
+        if pattern_match_mode == "substring_identifier" {
+            warnings.push(format!(
+                "pattern may match identifiers that merely contain `{}`; use an identifier \
+                 boundary or escaped call suffix for exact text auditing",
+                symbol.name
+            ));
+        }
+
+        Ok(CompareGraphTextReport {
+            query: CompareGraphTextQuery {
+                symbol_id: Some(symbol.symbol_id),
+                logical_symbol_id: options.logical_symbol_id,
+                symbol_path: symbol.qualified_name.clone(),
+                pattern: pattern.to_string(),
+                resolution: options.resolution_mode.as_str().to_string(),
+            },
+            logical_symbol,
+            variants,
+            // graph_hits/graph_edges and likely_index_gaps/likely_parser_gaps are wire aliases.
+            summary: CompareGraphTextSummary {
+                graph_hits: u64::try_from(graph_count).unwrap_or(u64::MAX),
+                graph_edges: u64::try_from(graph_count).unwrap_or(u64::MAX),
+                text_hits: u64::try_from(text_count).unwrap_or(u64::MAX),
+                matched: u64::try_from(matched_hits.len()).unwrap_or(u64::MAX),
+                graph_only: u64::try_from(graph_only_edges.len()).unwrap_or(u64::MAX),
+                text_only: u64::try_from(text_only_hits.len()).unwrap_or(u64::MAX),
+                text_mentions: u64::try_from(
+                    text_only_hits.len().saturating_sub(likely_parser_gaps.len()),
+                )
+                .unwrap_or(u64::MAX),
+                likely_parser_gaps: u64::try_from(likely_parser_gaps.len()).unwrap_or(u64::MAX),
+                likely_false_positives: u64::try_from(likely_false_positives.len())
+                    .unwrap_or(u64::MAX),
+                likely_index_gaps: u64::try_from(likely_parser_gaps.len()).unwrap_or(u64::MAX),
+                complete,
+                recommended_fallback,
+                pattern_match_mode,
+                warnings,
+            },
+            coverage: self.graph_coverage(paths)?,
+            matched_hits,
+            text_only_hits,
+            graph_only_edges,
+            likely_parser_gaps,
+            likely_false_positives,
+        })
+    }
+}
