@@ -568,6 +568,22 @@ pub(crate) struct QueryArgs {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct OrientationFilterArgs {
+    /// Include generated files.
+    #[arg(long)]
+    pub include_generated: bool,
+    /// Omit drive-by repo memories.
+    #[arg(long)]
+    pub no_memories: bool,
+}
+
+impl OrientationFilterArgs {
+    pub(crate) fn include_memories(&self) -> bool {
+        !self.no_memories
+    }
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct BriefArgs {
     /// Brief mode: spine, churn, god_modules, ownership.
     #[arg(long)]
@@ -575,12 +591,8 @@ pub(crate) struct BriefArgs {
     /// Max rows to return.
     #[arg(long)]
     pub limit: Option<u32>,
-    /// Include generated files.
-    #[arg(long)]
-    pub include_generated: bool,
-    /// Omit drive-by repo memories.
-    #[arg(long)]
-    pub no_memories: bool,
+    #[command(flatten)]
+    pub filters: OrientationFilterArgs,
 }
 
 #[derive(Debug, Args)]
@@ -715,12 +727,8 @@ pub(crate) struct ClustersArgs {
     /// Minimum cluster size.
     #[arg(long)]
     pub min_cluster_size: Option<u32>,
-    /// Include generated files.
-    #[arg(long)]
-    pub include_generated: bool,
-    /// Omit drive-by repo memories.
-    #[arg(long)]
-    pub no_memories: bool,
+    #[command(flatten)]
+    pub filters: OrientationFilterArgs,
 }
 
 #[derive(Debug, Args)]

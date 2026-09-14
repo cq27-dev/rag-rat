@@ -31,8 +31,8 @@ pub(crate) fn brief(config: &Config, args: &BriefArgs) -> anyhow::Result<()> {
     render::print_output(&db.repo_brief(rag_rat_query::repo_brief::RepoBriefOptions {
         mode,
         limit: args.limit.unwrap_or(10),
-        include_generated: args.include_generated,
-        include_memories: !args.no_memories,
+        include_generated: args.filters.include_generated,
+        include_memories: args.filters.include_memories(),
     })?)
 }
 
@@ -40,8 +40,8 @@ pub(crate) fn clusters(config: &Config, args: &ClustersArgs) -> anyhow::Result<(
     let db = open_index(config)?;
     render::print_output(&db.repo_clusters(rag_rat_core::query::clusters::RepoClustersOptions {
         limit: args.limit.unwrap_or(10),
-        include_generated: args.include_generated,
-        include_memories: !args.no_memories,
+        include_generated: args.filters.include_generated,
+        include_memories: args.filters.include_memories(),
         min_cluster_size: args.min_cluster_size.unwrap_or(2),
     })?)
 }
