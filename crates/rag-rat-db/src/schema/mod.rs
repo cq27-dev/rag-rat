@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 126;
+pub const LATEST_SCHEMA_VERSION: u32 = 127;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -1103,6 +1103,14 @@ additive_migrations! {
          memory_summaries, so a regeneration syncs as one upsert instead of a delete plus an insert \
          (#1319); memory_summaries stays for the entries that name it",
     ) => MigrationFn::Plain(migrations::apply_memory_note_summaries);
+    MIGRATION_127_ID, MIGRATION_127_CHECKSUM, MIGRATION_127_DESCRIPTION = (
+        "127_tombstone_statements",
+        "sha256:rag-rat-tombstone-statements-v127",
+        "Add sync_tombstone_statements: per chain that states a row's current tombstone, the lamport \
+         of that chain's newest statement, so a writer can restate its own deletes at its tail and \
+         retention can reclaim the entries that first stated them (#1295); backfilled with one \
+         statement per tombstone at its own identity",
+    ) => MigrationFn::Plain(migrations::apply_tombstone_statements);
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

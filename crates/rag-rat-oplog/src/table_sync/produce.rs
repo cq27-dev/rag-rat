@@ -276,7 +276,7 @@ mod tests {
         let ops = produce_row_ops(&tx, &SCOPED, "A", test_stream()).unwrap();
         assert_eq!(ops.len(), 1, "only repo A's row is produced — never repo B's");
         assert_eq!(
-            ops[0].pk()[0],
+            ops[0].pks().next().unwrap()[0],
             TypedValue::Text("A".to_string()),
             "the produced row belongs to the repo being synced",
         );
@@ -342,7 +342,7 @@ mod tests {
         tx.execute("INSERT INTO t_flagged(id, flag) VALUES ('bad', 2), ('good', 1)", []).unwrap();
         let ops = produce_row_ops(&tx, &FLAGGED, "repo", test_stream()).unwrap();
         assert_eq!(ops.len(), 1, "the readable row is still produced");
-        assert_eq!(ops[0].pk(), vec![TypedValue::Text("good".to_string())]);
+        assert_eq!(ops[0].pks().next().unwrap(), [TypedValue::Text("good".to_string())]);
     }
 
     #[test]

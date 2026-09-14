@@ -39,7 +39,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use super::apply::{self, ApplyOutcome};
 use super::registry::TableSpec;
-use super::row_op::{self, DecodedRowOp};
+use super::row_op::{self, DecodedRowOp, RowOp};
 use super::store::{self, PendingEntry, PendingReason, Worklist};
 use crate::entry;
 use crate::op::OpMeta;
@@ -57,7 +57,7 @@ use crate::op::OpMeta;
 /// registering a table or widening a spec forces an append, and an append is the bump. A widening
 /// that is not a registry change (a new row-op kind) still has to append a generation by hand,
 /// repeating the previous snapshot.
-pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 9;
+pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 10;
 
 const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
 
@@ -321,12 +321,40 @@ fn replay_pending_entry(
         crate::identity::local_device_fingerprint(tx)?,
         apply::RowDoubt::DeferOnAnyDoubt,
     )?;
+    let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
     if let apply::PreApply::Park(reason) =
-        apply::pre_apply(tx, spec, &context.repo_id, pending.stream_id, &op, doubt)?
+        apply::pre_apply(tx, spec, &context.repo_id, pending.stream_id, &op, meta.lamport, doubt)?
     {
+        // A restatement's other deletes settle now rather than wait on one row (see
+        // `restate_settleable_now`); the entry stays parked and replays whole later. What the
+        // subset materialises is merge state like any other, so it re-arms re-adoption the same
+        // way. A constraint failure inside the subset is NOT terminal here: every other stated
+        // delete still settled (so the sweep runs), and the deletes the subset excluded are still
+        // owed — the whole replay reaches the same terminal verdict once they can settle.
+        if let Some(now) =
+            apply::restate_settleable_now(tx, spec, &context.repo_id, pending.stream_id, &op)?
+        {
+            match apply::apply_row_op_on_stream(
+                tx,
+                spec,
+                &context.repo_id,
+                pending.stream_id,
+                &now,
+                meta,
+            )? {
+                // Only a subset that moved something is swept: the next open finds those
+                // deletes settled already and does nothing, so a deferral costs no writes.
+                ApplyOutcome::Applied | ApplyOutcome::Quarantined { changed: true, .. } => {
+                    super::registry::bump_scope_lanes(tx, &context.scope_id, &context.repo_id)?;
+                    rearm_removed_writers(tx, account_id, pending.stream_id, &now, meta)?;
+                },
+                ApplyOutcome::Superseded
+                | ApplyOutcome::Quarantined { changed: false, .. }
+                | ApplyOutcome::Unprojectable(_) => {},
+            }
+        }
         return repark(tx, pending, reason);
     }
-    let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
     match apply::apply_row_op_on_stream(tx, spec, &context.repo_id, pending.stream_id, &op, meta)? {
         // Folded and CHANGED the projection: advance the Lens lanes the applied table's scope feeds
         // so a row landed by replay (e.g. an entry parked as `NewerSpecVersion` by an older binary,
@@ -336,12 +364,14 @@ fn replay_pending_entry(
         // exact lane set for the applied entry's scope (memories for anchors/overlay,
         // papertrail for distill), so an unsupported scope bumps nothing.
         ApplyOutcome::Applied => {
-            let lens_metas = super::registry::scope_lens_metas(&context.scope_id);
-            if !lens_metas.is_empty()
-                && rag_rat_db::schema::repo_id_is_registered(tx, &context.repo_id)?
-            {
-                rag_rat_db::meta::bump_lens_revisions(tx, &context.repo_id, lens_metas)?;
-            }
+            super::registry::bump_scope_lanes(tx, &context.scope_id, &context.repo_id)?;
+            // The merge state this replay materialised — a live clock under the signer, or a
+            // tombstone identity under each stated device — may belong to a writer removed
+            // while the entry sat parked, after the drain for that removal already ran and found
+            // nothing. Re-arm that device's EXISTING work row so the drain (which follows the
+            // deferred replay in the producer transaction) carries the row under a live chain;
+            // a device with no removal fact has no row and gets none.
+            rearm_removed_writers(tx, account_id, pending.stream_id, &op, meta)?;
             store::clear_entry_pending(tx, &pending.entry_hash)
         },
         // `Superseded` — outranked by a newer winner, or suppressed by a tombstone — is equally a
@@ -355,12 +385,44 @@ fn replay_pending_entry(
         // is an older producer, which reports `Unprojectable` and stays on the worklist.) Recorded
         // rather than merely cleared: this path has no caller to return an outcome to, so without a
         // durable reason a rejected payload would be indistinguishable from a projected one.
-        ApplyOutcome::Quarantined(why) =>
-            store::record_entry_quarantine(tx, &pending.entry_hash, &why),
+        ApplyOutcome::Quarantined { why, changed } => {
+            // A restatement quarantines on one row's constraint failure AFTER settling every
+            // other stated delete, so what those materialised is swept like an applied entry.
+            if changed {
+                super::registry::bump_scope_lanes(tx, &context.scope_id, &context.repo_id)?;
+                rearm_removed_writers(tx, account_id, pending.stream_id, &op, meta)?;
+            }
+            store::record_entry_quarantine(tx, &pending.entry_hash, &why)
+        },
         // Still ahead of us — record which gap, under this version, so the next bump can tell
         // "newly stuck" from "stuck since v1".
         ApplyOutcome::Unprojectable(reason) => repark(tx, pending, reason),
     }
+}
+
+/// Re-open the completed re-adoption of every device whose merge state an applied `op` (signed
+/// by `meta.device`) may have materialised — the signer's live clock or tombstone, and each
+/// identity a restatement names — when that device is no longer an effective writer. See
+/// `store::reopen_readoption_work` for what a re-open is and is not.
+fn rearm_removed_writers(
+    tx: &Transaction<'_>,
+    account_id: crate::AccountId,
+    stream: crate::stream::StreamId,
+    op: &RowOp,
+    meta: OpMeta,
+) -> anyhow::Result<()> {
+    let mut devices = vec![meta.device];
+    if let RowOp::Restate { deletes, .. } = op {
+        devices.extend(deletes.iter().map(|delete| delete.device));
+    }
+    devices.sort_unstable();
+    devices.dedup();
+    for device in devices {
+        if !crate::account::device_is_effective_writer(tx, account_id, device)? {
+            store::reopen_readoption_work(tx, account_id, device, stream)?;
+        }
+    }
+    Ok(())
 }
 
 /// Re-record why an entry is still outstanding, under THIS projector version.

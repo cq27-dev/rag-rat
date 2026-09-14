@@ -23,6 +23,12 @@ mod transport;
 /// Largest signed table-entry envelope accepted by storage and the `/5` transport.
 pub const TABLE_SYNC_ENTRY_MAX_BYTES: usize = 64 * 1024;
 
+/// The most bytes the signed envelope adds around an op's bytes — domain tags, stream id,
+/// predecessor hash, a full-width lamport, the device fingerprint, the signature and every CBOR
+/// header — pinned by `an_envelope_never_adds_more_than_the_overhead_bound` in `store.rs`. What a
+/// restatement can pack into one entry is the transport limit less this.
+pub(crate) const TABLE_SYNC_ENTRY_OVERHEAD_MAX: usize = 320;
+
 pub use apply::LocalWriterMemo;
 #[cfg(test)]
 pub(crate) use refold::refold_stale_projections_against;
@@ -32,7 +38,7 @@ pub use refold::refold_stale_table_sync_projections;
 #[cfg(test)]
 pub(crate) use registry::{ColumnSpec, TableSpec, ValueType};
 #[cfg(test)]
-pub(crate) use row_op::{Cell, RowOp, TypedValue};
+pub(crate) use row_op::{Cell, RowOp, StatedDelete, TypedValue};
 #[cfg(test)]
 pub(crate) use scope_stream::scope_stream_id;
 pub(crate) use store::enqueue_readoption_work;

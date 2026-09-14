@@ -14,7 +14,8 @@ use rusqlite::Transaction;
 
 use super::apply::{self, ApplyOutcome};
 use super::registry::TableSpec;
-use super::row_op::{self, RowOp};
+use super::retention::{Pin, PinKind};
+use super::row_op::{self, RowOp, StatedDelete};
 use super::scope_stream::scope_stream_id;
 use super::store::{self, AcceptOutcome};
 use super::{produce, refold};
@@ -148,7 +149,7 @@ pub(crate) fn produce_and_author(
                 // it back rather than leaving it stored-but-unpublished and
                 // re-authored (re-signed) every pass (unbounded log growth). Assert
                 // first, so a test catches the lint/producer gap.
-                outcome @ (apply::ApplyOutcome::Quarantined(_)
+                outcome @ (apply::ApplyOutcome::Quarantined { .. }
                 | apply::ApplyOutcome::Unprojectable(_)) => {
                     debug_assert!(
                         false,
@@ -210,31 +211,23 @@ pub(crate) fn process_readoption_work_for_stream(
     };
     let removed = work.device_fingerprint;
     let removed_hex = removed.to_string();
+    let local_hex = ctx.device.fingerprint().to_string();
+    // The scope policy chooses the deletion arm in one place: a bounded scope restates the
+    // removed writer's orphan tombstones at their identities, packed into `Restate` batches, so
+    // its own chain carries a statement of each without a tail-signed delete that could beat a
+    // concurrent re-insert; a fully retained scope keeps today's tail-signed `Remove`, because
+    // nothing there is ever compacted and a `Restate` would only park on a pre-restate device.
+    let restates = super::transport::scope_retention_budget(&context.scope_id).is_some();
     let mut authored = 0;
     let mut unrepairable = 0;
-    for candidate in store::readoption_candidates(tx, stream, work.device_fingerprint)? {
-        let Some(spec) = ctx
-            .registry
-            .iter()
-            .find(|spec| spec.scope_id == context.scope_id && spec.name == candidate.table_name)
-        else {
-            continue;
-        };
-        let op =
-            match row_repair_op(tx, ctx.repo_id, spec, stream, &candidate.row_pk, &removed_hex)? {
-                RowRepair::Skip => continue,
-                RowRepair::Unrepairable => {
-                    unrepairable += 1;
-                    continue;
-                },
-                RowRepair::Repair(op) => op,
-            };
-        let Some(adopted_entry_hash) = author_repair(tx, ctx, spec, stream, &op, "re-adoption")?
-        else {
-            unrepairable += 1;
-            continue;
-        };
-        store::record_readoption_audit(tx, store::ReadoptionAudit {
+    // Deletes gathered per table for the restate arm, each with the candidate it carries.
+    let mut deletes: Vec<(&TableSpec, Vec<(store::ReadoptionCandidate, StatedDelete)>)> =
+        Vec::new();
+    let audit = |candidate: &store::ReadoptionCandidate,
+                 spec: &TableSpec,
+                 adopted_entry_hash: EntryHash|
+     -> store::ReadoptionAudit {
+        store::ReadoptionAudit {
             account_id: ctx.account_id,
             removed,
             adopter: ctx.device.fingerprint(),
@@ -247,8 +240,72 @@ pub(crate) fn process_readoption_work_for_stream(
             original_entry_hash: candidate.entry_hash,
             adopted_entry_hash,
             adopted_at_ms: ctx.now_ms,
-        })?;
+        }
+    };
+    for candidate in store::readoption_candidates(tx, stream, work.device_fingerprint, &local_hex)?
+    {
+        let Some(spec) = ctx
+            .registry
+            .iter()
+            .find(|spec| spec.scope_id == context.scope_id && spec.name == candidate.table_name)
+        else {
+            continue;
+        };
+        let op = match row_repair_op(
+            tx,
+            ctx.repo_id,
+            spec,
+            stream,
+            &candidate.row_pk,
+            &removed_hex,
+            !restates,
+        )? {
+            RowRepair::Skip => continue,
+            RowRepair::Unrepairable => {
+                unrepairable += 1;
+                continue;
+            },
+            RowRepair::Upsert(op) => op,
+            RowRepair::Delete(delete) if restates => {
+                match deletes.iter_mut().find(|(table, _)| table.name == spec.name) {
+                    Some((_, rows)) => rows.push((candidate, delete)),
+                    None => deletes.push((spec, vec![(candidate, delete)])),
+                }
+                continue;
+            },
+            RowRepair::Delete(_) => apply::readopt_remove(spec, &candidate.row_pk)?,
+        };
+        let Some(adopted_entry_hash) = author_repair(tx, ctx, spec, stream, &op, "re-adoption")?
+        else {
+            unrepairable += 1;
+            continue;
+        };
+        store::record_readoption_audit(tx, audit(&candidate, spec, adopted_entry_hash))?;
         authored += 1;
+    }
+    for (spec, rows) in deletes {
+        let stated: Vec<StatedDelete> = rows.iter().map(|(_, delete)| delete.clone()).collect();
+        let packed =
+            row_op::pack_restates(spec.name, spec.spec_version, &stated, restate_payload_max());
+        // A key that does not fit a batch alone is left uncarried and is not owed: counting it
+        // would keep the removal pending on every pass with nothing this path could ever settle.
+        // Its tombstone stays stated only on the removed writer's chain, which nothing
+        // re-authors — the same standing an oversized live row has under compaction.
+        for (op, members) in packed.batches {
+            let Some(adopted_entry_hash) =
+                author_repair(tx, ctx, spec, stream, &op, "re-adoption")?
+            else {
+                unrepairable += members.len();
+                continue;
+            };
+            for index in members {
+                store::record_readoption_audit(
+                    tx,
+                    audit(&rows[index].0, spec, adopted_entry_hash),
+                )?;
+                authored += 1;
+            }
+        }
     }
     if unrepairable > 0 {
         // A row the pass cannot carry today is NOT written off: completing here would abandon it
@@ -268,22 +325,39 @@ pub(crate) fn process_readoption_work_for_stream(
     Ok(Some(authored))
 }
 
-/// Re-author the oldest `pins` of this device's own chain at its tail, in order, so compaction can
-/// drop the entries that carried them (#1277). Stops at the first pin that cannot be carried today
-/// and returns how many leading pins moved; the rest still pin. A pin cannot be carried while its
-/// physical row disagrees with its merge state (the producer owes that row), a synced column is
-/// unreadable, an accepted entry this binary cannot apply yet sits above it, or its re-signed
-/// entry would not fit the transport limit.
+/// The op bytes one `Restate` may carry and still fit the transport limit once signed.
+pub(crate) fn restate_payload_max() -> usize {
+    super::TABLE_SYNC_ENTRY_MAX_BYTES - super::TABLE_SYNC_ENTRY_OVERHEAD_MAX
+}
+
+/// Carry the oldest `pins` of this device's own chain to its tail, in order, so compaction can
+/// drop the entries that carried them (#1277, #1295): a live winner is re-authored as an `Upsert`
+/// of the row's current cells; the orphan tombstones this chain states are restated at their
+/// identities, packed per table into `Restate` batches by signed size. Returns how many LEADING
+/// pins moved — a pin moves only once every row it holds has been authored, so the floor after
+/// the pass is the first pin not fully moved. At most `cap` entries are authored; a batch that
+/// would cross the cap is not started, so what was charged to the move is exactly what was
+/// released.
 ///
-/// A re-authored pin is a NEW write of the row's current cells. It competes under LWW with any
-/// concurrent edit to the same row this device has not received yet, and can win it — the same
-/// cost re-adoption accepts when it re-authors a removed writer's rows.
+/// A pin cannot be carried while its physical row disagrees with its merge state (the producer
+/// owes that row), a synced column is unreadable, an accepted entry this binary cannot apply yet
+/// sits above a live winner, or a key would not fit an entry alone. The budget loop stops at the
+/// first such pin (the floor cannot pass it, so nothing beyond it pays); the mandatory below-floor
+/// repair passes `past_stuck` and carries everything it can, since each pin there is independent
+/// debt.
+///
+/// A re-authored live row is a NEW write of the row's current cells. It competes under LWW with
+/// any concurrent edit to the same row this device has not received yet, and can win it — the
+/// same cost re-adoption accepts. A restatement asserts nothing newer: each delete settles at its
+/// original identity.
 pub(crate) fn reauthor_chain_pins(
     tx: &Transaction<'_>,
     ctx: &SyncCtx<'_>,
     scope_id: &str,
     stream: crate::stream::StreamId,
-    pins: &[super::retention::Pin],
+    pins: &[Pin],
+    cap: usize,
+    past_stuck: bool,
 ) -> anyhow::Result<usize> {
     if pins.is_empty() {
         return Ok(0);
@@ -291,24 +365,114 @@ pub(crate) fn reauthor_chain_pins(
     // Never author into a store a NEWER projector folded (the producer's gate).
     refold::assert_projector_not_newer(tx)?;
     let device_hex = ctx.device.fingerprint().to_string();
-    for (moved, pin) in pins.iter().enumerate() {
-        let Some(spec) = ctx
-            .registry
-            .iter()
-            .find(|spec| spec.scope_id == scope_id && spec.name == pin.table_name)
-        else {
-            return Ok(moved);
-        };
-        let RowRepair::Repair(op) =
-            row_repair_op(tx, ctx.repo_id, spec, stream, &pin.row_pk, &device_hex)?
-        else {
-            return Ok(moved);
-        };
-        if author_repair(tx, ctx, spec, stream, &op, "compaction")?.is_none() {
-            return Ok(moved);
+    let spec_for = |table: &str| {
+        ctx.registry.iter().find(|spec| spec.scope_id == scope_id && spec.name == table)
+    };
+    let mut authored = 0;
+    // Per pin: rows still to author, and whether it is stuck today.
+    let mut remaining: Vec<usize> = pins.iter().map(Pin::held).collect();
+    let mut stuck = vec![false; pins.len()];
+    // Stated deletes gathered per table in pin order, each tagged with its pin.
+    let mut deletes: Vec<(&TableSpec, Vec<(usize, StatedDelete)>)> = Vec::new();
+    'pins: for (index, pin) in pins.iter().enumerate() {
+        match &pin.kind {
+            PinKind::LiveRow { table_name, row_pk } => {
+                let Some(spec) = spec_for(table_name) else {
+                    stuck[index] = true;
+                    if past_stuck {
+                        continue;
+                    } else {
+                        break;
+                    };
+                };
+                let RowRepair::Upsert(op) =
+                    row_repair_op(tx, ctx.repo_id, spec, stream, row_pk, &device_hex, false)?
+                else {
+                    stuck[index] = true;
+                    if past_stuck {
+                        continue;
+                    } else {
+                        break;
+                    };
+                };
+                if authored >= cap {
+                    break;
+                }
+                if author_repair(tx, ctx, spec, stream, &op, "compaction")?.is_none() {
+                    stuck[index] = true;
+                    if past_stuck {
+                        continue;
+                    } else {
+                        break;
+                    };
+                }
+                authored += 1;
+                remaining[index] = 0;
+            },
+            PinKind::Statements(rows) =>
+                for row in rows {
+                    let Some(spec) = spec_for(&row.table_name) else {
+                        stuck[index] = true;
+                        if past_stuck {
+                            continue 'pins;
+                        } else {
+                            break 'pins;
+                        };
+                    };
+                    let RowRepair::Delete(delete) = row_repair_op(
+                        tx,
+                        ctx.repo_id,
+                        spec,
+                        stream,
+                        &row.row_pk,
+                        &device_hex,
+                        false,
+                    )?
+                    else {
+                        stuck[index] = true;
+                        if past_stuck {
+                            continue 'pins;
+                        } else {
+                            break 'pins;
+                        };
+                    };
+                    match deletes.iter_mut().find(|(table, _)| table.name == spec.name) {
+                        Some((_, gathered)) => gathered.push((index, delete)),
+                        None => deletes.push((spec, vec![(index, delete)])),
+                    }
+                },
         }
     }
-    Ok(pins.len())
+    // Batches fill in pin order, so the leading pins complete first; a batch beyond the cap is
+    // not started and its rows keep their pins standing.
+    for (spec, gathered) in deletes {
+        let stated: Vec<StatedDelete> = gathered.iter().map(|(_, delete)| delete.clone()).collect();
+        let packed =
+            row_op::pack_restates(spec.name, spec.spec_version, &stated, restate_payload_max());
+        for unfit in packed.unfit {
+            stuck[gathered[unfit].0] = true;
+        }
+        for (op, members) in packed.batches {
+            if authored >= cap {
+                break;
+            }
+            if author_repair(tx, ctx, spec, stream, &op, "compaction")?.is_none() {
+                for member in members {
+                    stuck[gathered[member].0] = true;
+                }
+                continue;
+            }
+            authored += 1;
+            for member in members {
+                remaining[gathered[member].0] -= 1;
+            }
+        }
+    }
+    Ok(pins
+        .iter()
+        .enumerate()
+        .take_while(|(index, _)| !stuck[*index] && remaining[*index] == 0)
+        .count())
 }
 
 /// Sign `op` under the local key and self-apply it, returning the new entry's hash — `None`, with
@@ -340,7 +504,7 @@ fn author_repair(
              carries a lamport from another stream",
             spec.name
         ),
-        outcome @ (ApplyOutcome::Quarantined(_) | ApplyOutcome::Unprojectable(_)) => {
+        outcome @ (ApplyOutcome::Quarantined { .. } | ApplyOutcome::Unprojectable(_)) => {
             anyhow::bail!(
                 "table-sync: a {what} op did not self-apply on `{}`: {outcome:?}",
                 spec.name
@@ -351,10 +515,13 @@ fn author_repair(
 
 /// What a repair pass can do with one row it wants to carry under the local key.
 enum RowRepair {
-    /// Re-author this op under the local key.
-    Repair(RowOp),
+    /// Re-author the row's current cells under the local key: a live winner carried forward.
+    Upsert(RowOp),
+    /// Restate this delete at its identity: the row's current tombstone, carried without a row.
+    Delete(StatedDelete),
     /// Nothing to carry: the row is settled under another writer, or physically inconsistent with
-    /// its merge state (an absent row under a live clock is the producer's `Remove` to author).
+    /// its merge state (an absent row under a live clock is the producer's `Remove` to author; a
+    /// present row under a bare tombstone is local work a stale delete must not destroy).
     Skip,
     /// The row cannot be carried today: a synced column cannot be read as its declared type, or an
     /// accepted entry this binary cannot apply yet sits above the winner. Retried later, never
@@ -362,7 +529,11 @@ enum RowRepair {
     Unrepairable,
 }
 
-/// The physical-table repair for one row while `winner_hex` still owns its merge state.
+/// The physical-table repair for one row. A live clock is carried only by its owner, so
+/// `winner_hex` must own it; a tombstone may be stated by any effective writer at its unchanged
+/// identity, so the caller's selection (its own chain's statements, or a removed writer's) is the
+/// only ownership test a delete gets. `deletes_at_tail` says whether the caller will sign a
+/// `Delete` as a tail `Remove` (a new identity) rather than restate it.
 fn row_repair_op(
     tx: &Transaction<'_>,
     repo_id: &str,
@@ -370,6 +541,7 @@ fn row_repair_op(
     stream: crate::stream::StreamId,
     row_pk: &str,
     winner_hex: &str,
+    deletes_at_tail: bool,
 ) -> anyhow::Result<RowRepair> {
     let key = apply::RowKey { stream, repo_id, table: spec.name, row_pk };
     let clock = apply::row_clock_winner_on_stream(tx, &key)?;
@@ -377,34 +549,47 @@ fn row_repair_op(
     // A live clock and a tombstone can only coexist with the clock newer: a remove raises the
     // tombstone at its own lamport, and a remove that BEATS the clock clears the clock. So a live
     // clock always owns the row, and a tombstone owns the deletion only without one.
-    let (winner_lamport, live) = match (clock, tombstone) {
-        (Some((lamport, winner)), _) if winner == winner_hex => (lamport, true),
-        (None, Some((lamport, winner))) if winner == winner_hex => (lamport, false),
+    let (winner_lamport, identity) = match (clock, tombstone) {
+        (Some((lamport, winner)), _) if winner == winner_hex => (lamport, None),
+        (None, Some((lamport, device))) => (lamport, Some((lamport, device))),
         _ => return Ok(RowRepair::Skip),
     };
     // What the PHYSICAL row allows decides the repair. A live winner is carried while its row is
     // (an absent one is the producer's Remove to author); a deletion is carried only while no row
     // exists, or a live local row would be destroyed by a stale repair.
     let pk = row_op::row_pk_values(row_pk)?;
-    let repair = match (live, apply::read_synced_cells(tx, spec, &pk)?) {
-        (true, apply::SyncedRow::Cells(cells)) => RowRepair::Repair(RowOp::Upsert {
+    let repair = match (identity, apply::read_synced_cells(tx, spec, &pk)?) {
+        (None, apply::SyncedRow::Cells(cells)) => RowRepair::Upsert(RowOp::Upsert {
             table: spec.name.to_string(),
             spec_version: spec.spec_version,
             pk,
             cells,
         }),
-        (false, apply::SyncedRow::Absent) =>
-            RowRepair::Repair(apply::readopt_remove(spec, row_pk)?),
+        (Some((lamport, device_hex)), apply::SyncedRow::Absent) =>
+            RowRepair::Delete(StatedDelete {
+                pk,
+                device: device_hex.parse().map_err(|err| {
+                    anyhow::anyhow!(
+                        "tombstone device fingerprint `{device_hex}` is not hex: {err:?}"
+                    )
+                })?,
+                lamport,
+            }),
         (_, apply::SyncedRow::Unreadable(_)) => RowRepair::Unrepairable,
         _ => RowRepair::Skip,
     };
-    // A repair is signed at the stream tail, above every accepted entry. One retained for replay
+    // A repair signed at the stream tail sits above every accepted entry. One retained for replay
     // above the winner (a newer spec version during a rolling upgrade) may be a newer write to
-    // this very row: peers that understand it have applied it, and the repair would beat it there
-    // with the stale cells. Hold the repair until that entry replays.
-    if matches!(repair, RowRepair::Repair(_))
-        && store::pending_entry_at_or_above(tx, stream, winner_lamport)?
-    {
+    // this very row: peers that understand it have applied it, and a tail-signed repair — a
+    // re-authored row, or a tail `Remove` — would beat it there. Hold such a repair until that
+    // entry replays. A restatement beats nothing newer — it settles at the delete's own identity
+    // — so it is never held.
+    let signed_at_tail = match repair {
+        RowRepair::Upsert(_) => true,
+        RowRepair::Delete(_) => deletes_at_tail,
+        RowRepair::Skip | RowRepair::Unrepairable => false,
+    };
+    if signed_at_tail && store::pending_entry_at_or_above(tx, stream, winner_lamport)? {
         return Ok(RowRepair::Unrepairable);
     }
     Ok(repair)
@@ -612,8 +797,36 @@ fn ingest_one(
                     apply::RowDoubt::DeferExceptUnprovableRemoval,
                 )?;
                 if let apply::PreApply::Park(deferral) =
-                    apply::pre_apply(tx, spec, ctx.repo_id, stream, &op, doubt)?
+                    apply::pre_apply(tx, spec, ctx.repo_id, stream, &op, meta.lamport, doubt)?
                 {
+                    // A restatement parks whole on one row's unsent work; the rest of its
+                    // deletes settle now (idempotent under the later replay), so hundreds of
+                    // unrelated deletes never wait on one row.
+                    if let Some(now) =
+                        apply::restate_settleable_now(tx, spec, ctx.repo_id, stream, &op)?
+                    {
+                        match apply::apply_row_op_on_stream(
+                            tx,
+                            spec,
+                            ctx.repo_id,
+                            stream,
+                            &now,
+                            meta,
+                        )? {
+                            // A quarantine inside the subset is one row's constraint failure;
+                            // every other stated delete settled, and the deletes the subset
+                            // excluded are still owed, so the entry parks all the same and the
+                            // whole replay reaches the terminal verdict once they can settle.
+                            // Only a subset that moved something bumps: the next open finds it
+                            // settled already and bumps nothing.
+                            ApplyOutcome::Applied
+                            | ApplyOutcome::Quarantined { changed: true, .. } =>
+                                super::registry::bump_scope_lanes(tx, scope_id, ctx.repo_id)?,
+                            ApplyOutcome::Superseded
+                            | ApplyOutcome::Quarantined { changed: false, .. }
+                            | ApplyOutcome::Unprojectable(_) => {},
+                        }
+                    }
                     store::mark_entry_pending(
                         tx,
                         &entry_hash,
@@ -635,7 +848,12 @@ fn ingest_one(
                     ApplyOutcome::Applied | ApplyOutcome::Superseded => IngestOutcome::Applied,
                     // Durably recorded as well as returned: the caller sees this one, but nothing
                     // later could tell a rejected payload from a projected one without the mark.
-                    ApplyOutcome::Quarantined(why) => {
+                    ApplyOutcome::Quarantined { why, changed } => {
+                        // A restatement quarantines on one row's constraint failure after
+                        // settling every other stated delete, which changed derived state.
+                        if changed {
+                            super::registry::bump_scope_lanes(tx, scope_id, ctx.repo_id)?;
+                        }
                         store::record_entry_quarantine(tx, &entry_hash, &why)?;
                         IngestOutcome::Quarantined(why)
                     },

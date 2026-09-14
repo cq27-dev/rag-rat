@@ -12,6 +12,15 @@
 //! what stops the producer re-emitting a row it just received (see [`super::produce`]).
 //! Deletes and the resurrection guard use the same row clock plus a per-row tombstone; a losing op
 //! never touches the published hash, so an unsent local edit is never silently marked as sent.
+//!
+//! A tombstone is merge state (the latest delete of a row, permanent) and the entry that states it
+//! is its delivery. The two are kept apart (#1295): `sync_row_tombstones` holds the identity, and
+//! `sync_tombstone_statements` holds, per chain that states the current identity, the lamport of
+//! that chain's newest statement — the entry retention pins while the deleted row has no live
+//! successor. A `Remove` states its own identity; a `Restate` re-carries earlier deletes at their
+//! original identities, so the signer's statement moves to the tail and the entry that first
+//! stated the delete can be reclaimed. When a newer delete wins the row, the old identity's
+//! statements go with it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -20,7 +29,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{OptionalExtension, Transaction, params_from_iter};
 
 use super::registry::{self, DefaultValue, TableSpec, ValueType};
-use super::row_op::{self, Cell, RowOp, TypedValue};
+use super::row_op::{self, Cell, RowOp, StatedDelete, TypedValue};
 use super::store::PendingReason;
 use crate::op::OpMeta;
 use crate::stream::StreamId;
@@ -49,7 +58,14 @@ pub(crate) enum ApplyOutcome {
     /// as settlement while nothing is published, so the producer re-derives the same delta and
     /// re-signs it on every pass.
     Superseded,
-    Quarantined(String),
+    /// Terminal: the payload does not fit the table (a broken producer), or a physical delete
+    /// failed on a constraint. `changed` says whether the op moved any merge state before that —
+    /// only a `Restate` can, since it settles every other stated delete first — so callers
+    /// sweep what it materialised exactly as they would after `Applied`.
+    Quarantined {
+        why: String,
+        changed: bool,
+    },
     Unprojectable(PendingReason),
 }
 
@@ -74,17 +90,38 @@ pub(crate) fn apply_row_op_on_stream(
     meta: OpMeta,
 ) -> anyhow::Result<ApplyOutcome> {
     debug_assert_eq!(op.table(), spec.name, "caller resolves the spec from the op's table");
+    // A restatement carries deletes that were signed BEFORE it, at their own identities; one at
+    // or above its own lamport would let a signer mint a delete identity its chain never held.
+    // The wire cannot check this (it carries no entry metadata), so it is checked wherever an
+    // entry is applied — accept, replay and self-apply all pass through here. Quarantined, not
+    // parked: no later binary makes it sound.
+    if let RowOp::Restate { deletes, .. } = op
+        && deletes.iter().any(|delete| delete.lamport >= meta.lamport)
+    {
+        return Ok(ApplyOutcome::Quarantined {
+            why: format!(
+                "restate on `{}` states a delete at or above its own lamport {}",
+                spec.name, meta.lamport
+            ),
+            changed: false,
+        });
+    }
     let known = match payload_verdict(spec, repo_id, op) {
         PayloadVerdict::Gap(reason) => return Ok(ApplyOutcome::Unprojectable(reason)),
-        PayloadVerdict::Rejected(why) => return Ok(ApplyOutcome::Quarantined(why)),
+        PayloadVerdict::Rejected(why) =>
+            return Ok(ApplyOutcome::Quarantined { why, changed: false }),
         PayloadVerdict::RowDecides(known) => known,
     };
-    let pk_vals = op.pk();
-    match known {
+    match (known, op) {
         // A complete after-image: an upsert, whose whole column set the row will take.
-        Some(known) => apply_upsert(tx, spec, repo_id, stream, pk_vals, known, meta),
+        (Some(known), RowOp::Upsert { pk, .. }) =>
+            apply_upsert(tx, spec, repo_id, stream, pk, known, meta),
         // Nothing to project — a remove names only the row identity.
-        None => apply_remove(tx, spec, repo_id, stream, pk_vals, meta),
+        (None, RowOp::Remove { pk, .. }) => apply_remove(tx, spec, repo_id, stream, pk, meta),
+        (None, RowOp::Restate { deletes, .. }) =>
+            apply_restate(tx, spec, repo_id, stream, deletes, meta),
+        (Some(_), RowOp::Remove { .. } | RowOp::Restate { .. }) | (None, RowOp::Upsert { .. }) =>
+            unreachable!("payload_verdict pairs an after-image with an upsert only"),
     }
 }
 
@@ -92,7 +129,8 @@ pub(crate) fn apply_row_op_on_stream(
 #[derive(Debug, PartialEq)]
 pub(crate) enum PayloadVerdict {
     /// Nothing in the payload stands in the way; the ROW STATE decides what happens next. Carries
-    /// the complete after-image for an upsert, and `None` for a remove, which has no column set.
+    /// the complete after-image for an upsert, and `None` for a remove or a restate, which name
+    /// row identities and no column set.
     RowDecides(Option<Vec<(&'static str, TypedValue)>>),
     /// A version gap: this binary does not understand the payload yet. No row read changes that.
     Gap(PendingReason),
@@ -127,52 +165,56 @@ pub(crate) fn payload_verdict(spec: &TableSpec, repo_id: &str, op: &RowOp) -> Pa
     if matches!(op, RowOp::Upsert { .. }) && op.spec_version() > spec.spec_version {
         return PayloadVerdict::Gap(PendingReason::NewerSpecVersion);
     }
-    let pk_vals = op.pk();
-    if pk_vals.len() != spec.pk.len() {
-        return PayloadVerdict::Rejected(format!(
-            "pk arity {} does not match `{}`'s {} identity columns",
-            pk_vals.len(),
-            spec.name,
-            spec.pk.len()
-        ));
-    }
-    // A NULL identity value is unaddressable: `WHERE pk = NULL` never matches, so upserts would
-    // insert duplicate unreachable rows and removes could never delete them. Reject the whole op.
-    if pk_vals.iter().any(|v| matches!(v, TypedValue::Null)) {
-        return PayloadVerdict::Rejected(format!(
-            "a null primary-key value is not addressable on `{}`",
-            spec.name
-        ));
-    }
-    // Validate each pk value against its declared type before it reaches a WHERE clause. SQLite
-    // affinity would otherwise coerce a mismatched pk (e.g. `I64(1)` matching a TEXT key `'1'`)
-    // onto a different physical row than its type-exact `row_pk` clock identity, splitting the
-    // row's bookkeeping and allowing resurrection. (Arity is checked above, so `zip` covers
-    // every pk.)
-    for (column, value) in spec.pk.iter().zip(pk_vals) {
-        if !value_matches(value, column.value_type) {
+    // Every identity the op names is checked before anything is written, so a restatement with
+    // one malformed element quarantines whole, with no effect.
+    for pk_vals in op.pks() {
+        if pk_vals.len() != spec.pk.len() {
             return PayloadVerdict::Rejected(format!(
-                "pk column `{}` value does not match its declared type on `{}`",
-                column.name, spec.name
+                "pk arity {} does not match `{}`'s {} identity columns",
+                pk_vals.len(),
+                spec.name,
+                spec.pk.len()
             ));
         }
-    }
-    // Repo-identity gate: for a table scoped by a pk column, an op naming a different repo than the
-    // stream being synced is rejected — a peer cannot write another project's rows through this
-    // stream. (The producer already only emits the local repo's rows.)
-    if let Some(idx) = spec.repo_pk_index()
-        && pk_vals.get(idx) != Some(&TypedValue::Text(repo_id.to_string()))
-    {
-        return PayloadVerdict::Rejected(format!(
-            "op names a different repo than the `{}` stream being synced",
-            spec.name
-        ));
+        // A NULL identity value is unaddressable: `WHERE pk = NULL` never matches, so upserts
+        // would insert duplicate unreachable rows and removes could never delete them. Reject the
+        // whole op.
+        if pk_vals.iter().any(|v| matches!(v, TypedValue::Null)) {
+            return PayloadVerdict::Rejected(format!(
+                "a null primary-key value is not addressable on `{}`",
+                spec.name
+            ));
+        }
+        // Validate each pk value against its declared type before it reaches a WHERE clause.
+        // SQLite affinity would otherwise coerce a mismatched pk (e.g. `I64(1)` matching a TEXT
+        // key `'1'`) onto a different physical row than its type-exact `row_pk` clock identity,
+        // splitting the row's bookkeeping and allowing resurrection. (Arity is checked above, so
+        // `zip` covers every pk.)
+        for (column, value) in spec.pk.iter().zip(pk_vals) {
+            if !value_matches(value, column.value_type) {
+                return PayloadVerdict::Rejected(format!(
+                    "pk column `{}` value does not match its declared type on `{}`",
+                    column.name, spec.name
+                ));
+            }
+        }
+        // Repo-identity gate: for a table scoped by a pk column, an op naming a different repo
+        // than the stream being synced is rejected — a peer cannot write another project's rows
+        // through this stream. (The producer already only emits the local repo's rows.)
+        if let Some(idx) = spec.repo_pk_index()
+            && pk_vals.get(idx) != Some(&TypedValue::Text(repo_id.to_string()))
+        {
+            return PayloadVerdict::Rejected(format!(
+                "op names a different repo than the `{}` stream being synced",
+                spec.name
+            ));
+        }
     }
     match op {
         // A remove names only the row identity, so no column set is involved: its `spec_version` is
         // carried for wire symmetry and diagnostics, never acted on. Gating a deletion on a version
-        // skew would delay it for no benefit.
-        RowOp::Remove { .. } => PayloadVerdict::RowDecides(None),
+        // skew would delay it for no benefit. A restate names identities the same way.
+        RowOp::Remove { .. } | RowOp::Restate { .. } => PayloadVerdict::RowDecides(None),
         // Resolve the payload into the full after-image THIS registry expects, from the payload
         // alone, so the decision is deterministic and idempotent.
         RowOp::Upsert { spec_version, cells, .. } =>
@@ -184,11 +226,7 @@ pub(crate) fn payload_verdict(spec: &TableSpec, repo_id: &str, op: &RowOp) -> Pa
     }
 }
 
-/// Apply a delete. It wins unless the row's write clock is strictly newer than the delete (a
-/// concurrent later write keeps the row); either way it raises the row's tombstone so a later
-/// Upsert older than the delete cannot resurrect the row. Order-independent: a stale delete
-/// arriving after a newer write loses, and an even older insert arriving after the delete is
-/// suppressed by the tombstone.
+/// Apply a delete at the entry's own identity, stated by the entry itself.
 fn apply_remove(
     tx: &Transaction<'_>,
     spec: &TableSpec,
@@ -197,40 +235,134 @@ fn apply_remove(
     pk_vals: &[TypedValue],
     meta: OpMeta,
 ) -> anyhow::Result<ApplyOutcome> {
+    let identity = DeleteIdentity { lamport: meta.lamport, device_hex: meta.device.to_string() };
+    let effect = settle_delete(tx, spec, repo_id, stream, pk_vals, &identity, &identity)?;
+    Ok(match effect.row {
+        RowFate::Quarantined(why) => ApplyOutcome::Quarantined { why, changed: false },
+        RowFate::Won { .. } => ApplyOutcome::Applied,
+        // The tombstone is raised either way, but a delete a newer write outranks did not delete
+        // anything — and, crucially, left the published record in place. Say so.
+        RowFate::Kept => ApplyOutcome::Superseded,
+    })
+}
+
+/// Apply a restatement: every stated delete settles at ITS OWN identity exactly as the entry that
+/// first stated it did, and the signer's statement of each identity that is current moves to
+/// this entry. The batch was validated whole by [`payload_verdict`] before anything is written.
+/// A physical delete that fails on a constraint quarantines the ENTRY (retained, never replayed)
+/// but not the batch: every other row still settles, since each is correct merge state on its
+/// own and nothing would ever restate them here again — the entries that first stated them may
+/// be gone from every peer. No savepoint is taken. `Superseded` when nothing changed — every
+/// stated delete was already outranked, and the signer already stated what is current — which
+/// only the compaction and re-adoption callers can see and which they never produce.
+fn apply_restate(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    stream: StreamId,
+    deletes: &[StatedDelete],
+    meta: OpMeta,
+) -> anyhow::Result<ApplyOutcome> {
+    let signer = DeleteIdentity { lamport: meta.lamport, device_hex: meta.device.to_string() };
+    let mut changed = false;
+    let mut quarantined = None;
+    for delete in deletes {
+        let identity =
+            DeleteIdentity { lamport: delete.lamport, device_hex: delete.device.to_string() };
+        let effect = settle_delete(tx, spec, repo_id, stream, &delete.pk, &identity, &signer)?;
+        match effect.row {
+            RowFate::Quarantined(why) => {
+                quarantined.get_or_insert(why);
+            },
+            RowFate::Won { deleted } => changed |= deleted || effect.merge_changed,
+            RowFate::Kept => changed |= effect.merge_changed,
+        }
+    }
+    Ok(match quarantined {
+        Some(why) => ApplyOutcome::Quarantined { why, changed },
+        None if changed => ApplyOutcome::Applied,
+        None => ApplyOutcome::Superseded,
+    })
+}
+
+/// A delete's `(lamport, device)` — what it competes under, and what its statements name.
+struct DeleteIdentity {
+    lamport: u64,
+    device_hex: String,
+}
+
+/// What one delete did to its row.
+enum RowFate {
+    /// The delete won the row: no write outranks it. `deleted` says whether a physical row went
+    /// (a delete of a row already absent — the producer's own `Remove` after a local deletion —
+    /// wins with nothing to delete).
+    Won { deleted: bool },
+    /// A write strictly newer than the delete kept the row.
+    Kept,
+    /// The physical delete failed on a constraint; the entry is retained, the row untouched.
+    Quarantined(String),
+}
+
+/// What one delete changed: its row, and whether the merge state (tombstone identity or the
+/// signer's statement) moved at all.
+struct DeleteEffect {
+    row: RowFate,
+    merge_changed: bool,
+}
+
+/// The one delete decision, run by a `Remove` at its own identity and by a `Restate` once per
+/// stated delete: the delete at `identity` wins the row unless the row's write clock is strictly
+/// newer (a concurrent later write keeps the row); either way the row's tombstone is raised to the
+/// identity if it beats the current one, so a later `Upsert` older than the delete cannot
+/// resurrect the row, and `signer`'s statement of a current identity advances to `signer.lamport`.
+/// Order-independent: a stale delete arriving after a newer write loses, and an even older insert
+/// arriving after the delete is suppressed by the tombstone.
+fn settle_delete(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    stream: StreamId,
+    pk_vals: &[TypedValue],
+    identity: &DeleteIdentity,
+    signer: &DeleteIdentity,
+) -> anyhow::Result<DeleteEffect> {
     let row_pk = &row_op::row_pk_string(pk_vals);
-    let device_hex = &meta.device.to_string();
     let key = RowKey { stream, repo_id, table: spec.name, row_pk };
     let survives = match current_row_clock_on_stream(tx, &key)? {
         // A write strictly newer than the delete keeps the row alive.
         Some((clock_lamport, clock_device)) =>
-            beats(clock_lamport, &clock_device, meta.lamport, device_hex),
+            beats(clock_lamport, &clock_device, identity.lamport, &identity.device_hex),
         // No recorded write — nothing can outrank the delete.
         None => false,
     };
-    if !survives {
+    let row = if survives {
+        RowFate::Kept
+    } else {
         // Attempt the physical delete BEFORE raising the tombstone. A constraint violation — an FK
         // RESTRICT child row, an `ON DELETE RESTRICT`, a trigger abort — means the remove cannot
         // apply; quarantine it (leaving the tombstone/clock untouched) so the already-stored entry
         // is retained and the chain advances, instead of erroring and rolling back the entry (which
         // would wedge every later entry on that device's chain as a permanent MissingPredecessor).
-        if let Err(err) = delete_row(tx, spec, pk_vals) {
-            if is_constraint_violation(&err) {
-                return Ok(ApplyOutcome::Quarantined(format!(
-                    "remove violates a column constraint on `{}`",
-                    spec.name
-                )));
-            }
-            return Err(err);
-        }
+        let deleted = match delete_row(tx, spec, pk_vals) {
+            Ok(deleted) => deleted,
+            Err(err) if is_constraint_violation(&err) =>
+                return Ok(DeleteEffect {
+                    row: RowFate::Quarantined(format!(
+                        "remove violates a column constraint on `{}`",
+                        spec.name
+                    )),
+                    merge_changed: false,
+                }),
+            Err(err) => return Err(err),
+        };
         clear_row_clock(tx, stream, repo_id, spec.name, row_pk)?;
         clear_published(tx, stream, repo_id, spec.name, row_pk)?;
-    }
+        RowFate::Won { deleted }
+    };
     // Raise the tombstone only once the remove has actually applied (the row was deleted, or a
     // newer write kept it): the tombstone guards against an older upsert resurrecting the row.
-    raise_tombstone(tx, &key, meta.lamport, device_hex)?;
-    // The tombstone is raised either way, but a delete a newer write outranks did not delete
-    // anything — and, crucially, left the published record in place. Say so.
-    Ok(if survives { ApplyOutcome::Superseded } else { ApplyOutcome::Applied })
+    let merge_changed = raise_tombstone(tx, &key, identity, signer)?;
+    Ok(DeleteEffect { row, merge_changed })
 }
 
 /// What an op's cells resolve to under THIS registry.
@@ -379,10 +511,10 @@ fn apply_upsert(
     };
     if let Err(err) = write {
         if is_constraint_violation(&err) {
-            return Ok(ApplyOutcome::Quarantined(format!(
-                "op violates a column constraint on `{}`",
-                spec.name
-            )));
+            return Ok(ApplyOutcome::Quarantined {
+                why: format!("op violates a column constraint on `{}`", spec.name),
+                changed: false,
+            });
         }
         return Err(err);
     }
@@ -549,14 +681,71 @@ pub(crate) fn tombstone_winner_on_stream(
     current_tombstone(tx, key)
 }
 
-/// Raise the row's tombstone to `(lamport, device_hex)` under LWW — a lower clock never lowers it.
+/// Raise the row's tombstone to `identity` under LWW — a lower clock never lowers it — and record
+/// `signer`'s statement of it. A newly winning identity replaces the old identity's statements
+/// (the deletes they carried are outranked, so nothing needs their entries any more) with the
+/// signer's; the same identity restated by `signer` advances that chain's statement, never
+/// lowering it. Returns whether anything moved.
 fn raise_tombstone(
     tx: &Transaction<'_>,
     key: &RowKey<'_>,
-    lamport: u64,
-    device_hex: &str,
-) -> anyhow::Result<()> {
-    raise_clock(tx, ClockTable::Tombstones, key, lamport, device_hex)
+    identity: &DeleteIdentity,
+    signer: &DeleteIdentity,
+) -> anyhow::Result<bool> {
+    let current = current_tombstone(tx, key)?;
+    let is_current = current.as_ref().is_some_and(|(lamport, device)| {
+        *lamport == identity.lamport && *device == identity.device_hex
+    });
+    let wins = match &current {
+        Some((lamport, device)) => beats(identity.lamport, &identity.device_hex, *lamport, device),
+        None => true,
+    };
+    if wins {
+        raise_clock(tx, ClockTable::Tombstones, key, identity.lamport, &identity.device_hex)?;
+        tx.execute(
+            "DELETE FROM sync_tombstone_statements
+              WHERE stream_id = ?1 AND table_name = ?2 AND row_pk = ?3",
+            rusqlite::params![key.stream.to_bytes().as_slice(), key.table, key.row_pk],
+        )?;
+    } else if !is_current {
+        return Ok(false);
+    }
+    let advanced = tx.execute(
+        "INSERT INTO sync_tombstone_statements(
+             stream_id, repo_id, table_name, row_pk, device_fingerprint, lamport
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(stream_id, table_name, row_pk, device_fingerprint)
+         DO UPDATE SET lamport = excluded.lamport
+         WHERE excluded.lamport > sync_tombstone_statements.lamport",
+        rusqlite::params![
+            key.stream.to_bytes().as_slice(),
+            key.repo_id,
+            key.table,
+            key.row_pk,
+            signer.device_hex,
+            i64::try_from(signer.lamport)?,
+        ],
+    )?;
+    Ok(wins || advanced > 0)
+}
+
+/// The lamport at which `signer_hex`'s chain last stated the row's current tombstone, if it
+/// states it at all.
+#[cfg(test)]
+pub(crate) fn statement_on_stream(
+    tx: &Transaction<'_>,
+    key: &RowKey<'_>,
+    signer_hex: &str,
+) -> anyhow::Result<Option<u64>> {
+    let lamport: Option<i64> = tx
+        .query_row(
+            "SELECT lamport FROM sync_tombstone_statements
+              WHERE stream_id = ?1 AND table_name = ?2 AND row_pk = ?3 AND device_fingerprint = ?4",
+            rusqlite::params![key.stream.to_bytes().as_slice(), key.table, key.row_pk, signer_hex],
+            |row| row.get(0),
+        )
+        .optional()?;
+    lamport.map(u64::try_from).transpose().map_err(Into::into)
 }
 
 /// The row's current synced-column hash (the anti-echo identity), or `None` if the row is absent.
@@ -754,14 +943,14 @@ fn is_constraint_violation(err: &anyhow::Error) -> bool {
     )
 }
 
+/// Delete the row, reporting whether one was there.
 fn delete_row(
     tx: &Transaction<'_>,
     spec: &TableSpec,
     pk_vals: &[TypedValue],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let sql = format!("DELETE FROM {} WHERE {}", quote_ident(spec.name), pk_where(spec));
-    tx.execute(&sql, params_from_iter(pk_params(pk_vals)))?;
-    Ok(())
+    Ok(tx.execute(&sql, params_from_iter(pk_params(pk_vals)))? > 0)
 }
 
 // ── row clock + published-row bookkeeping ────────────────────────────────────────────────────
@@ -876,13 +1065,13 @@ pub(crate) fn stale_row_disposition(
     // Without this, two tables with coincidentally similar columns can project `Complete` and
     // return `Unchanged` for a row that actually holds an unsent edit — which lets the refold
     // replay straight over it.
-    if op.table() != spec.name || op.pk() != pk_vals {
-        return Ok(StaleRow::Unknown);
-    }
     // A winning REMOVE clears the row clock, so a live clock can only ever point at an upsert.
-    let RowOp::Upsert { spec_version, cells, .. } = &op else {
+    let RowOp::Upsert { spec_version, cells, pk, .. } = &op else {
         return Ok(StaleRow::Unknown);
     };
+    if op.table() != spec.name || pk != pk_vals {
+        return Ok(StaleRow::Unknown);
+    }
     match project_cells(spec, *spec_version, cells) {
         Projection::Complete(projected) => {
             let as_cells: Vec<Cell> = projected
@@ -929,7 +1118,105 @@ pub(crate) fn unsent_work_blocking_replay(
     stream: StreamId,
     op: &RowOp,
 ) -> anyhow::Result<Option<PendingReason>> {
-    let pk_vals = op.pk();
+    match op {
+        RowOp::Upsert { pk, .. } => unsent_work_on_row(tx, spec, repo_id, stream, pk, false),
+        RowOp::Remove { pk, .. } => unsent_work_on_row(tx, spec, repo_id, stream, pk, true),
+        // A restatement is asked row by row, and only about the rows it would physically remove:
+        // a stated delete whose row is absent, or whose clock beats it, changes no row (it may
+        // still raise or leave the tombstone and advance the statement) and can never park the
+        // entry — so the refold's "defer on any doubt" cannot re-park a restate on rows it would
+        // not touch. Whether the tombstone table already holds the stated identity is irrelevant:
+        // a locally recreated, unpublished row under an existing tombstone is still a row the
+        // delete would destroy, and it gets the exact protection a `Remove` of it would.
+        RowOp::Restate { deletes, .. } => {
+            // Every row is asked, and a PROVEN blocker outranks an unprovable one: the batch is
+            // exempted or deferred as a whole, so the first unprovable verdict must not hide a
+            // later row's genuine unsent edit behind the removal exemption.
+            let mut unprovable = None;
+            for delete in deletes {
+                if !delete_would_remove_row(tx, spec, repo_id, stream, delete)? {
+                    continue;
+                }
+                match unsent_work_on_row(tx, spec, repo_id, stream, &delete.pk, true)? {
+                    Some(reason) if reason.is_proven_unsent_work() => return Ok(Some(reason)),
+                    Some(reason) => unprovable.get_or_insert(reason),
+                    None => continue,
+                };
+            }
+            Ok(unprovable)
+        },
+    }
+}
+
+/// Whether a stated delete would physically remove its row here: the row is present and no write
+/// clock beats the delete (ties included; a row with no clock counts). The same test
+/// [`settle_delete`] applies, asked before anything is written.
+///
+/// An ABSENT row is never "would remove", so a restatement skips the `DeferredUnsentDelete`
+/// protection a `Remove` gets for a row deleted locally but not yet authored: the stated delete
+/// then clears that row's published record. That converges — the row ends deleted either way,
+/// and the local producer's own `Remove` had nothing left to say — and it is what keeps a
+/// restatement from parking on rows it would not touch.
+fn delete_would_remove_row(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    stream: StreamId,
+    delete: &StatedDelete,
+) -> anyhow::Result<bool> {
+    if delete.pk.len() != spec.pk.len() || !row_exists(tx, spec, &delete.pk)? {
+        return Ok(false);
+    }
+    let row_pk = row_op::row_pk_string(&delete.pk);
+    let key = RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk };
+    Ok(match current_row_clock_on_stream(tx, &key)? {
+        Some((lamport, device)) =>
+            !beats(lamport, &device, delete.lamport, &delete.device.to_string()),
+        None => true,
+    })
+}
+
+/// The part of a `Restate` that can settle NOW while the rest waits: every stated delete that
+/// would not physically remove a row, or whose row holds no unsent work. `None` for any other op
+/// kind or when nothing in the batch is settleable. A parked entry is replayed whole later, and
+/// [`settle_delete`] is idempotent, so applying this subset first and parking the entry is safe —
+/// and it is what keeps one row's unsent edit from holding hundreds of unrelated deletes (and,
+/// through the pending clamp, the chain's floor) behind it.
+pub(crate) fn restate_settleable_now(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    stream: StreamId,
+    op: &RowOp,
+) -> anyhow::Result<Option<RowOp>> {
+    let RowOp::Restate { table, spec_version, deletes } = op else {
+        return Ok(None);
+    };
+    let mut settleable = Vec::with_capacity(deletes.len());
+    for delete in deletes {
+        if !delete_would_remove_row(tx, spec, repo_id, stream, delete)?
+            || unsent_work_on_row(tx, spec, repo_id, stream, &delete.pk, true)?.is_none()
+        {
+            settleable.push(delete.clone());
+        }
+    }
+    Ok((!settleable.is_empty() && settleable.len() < deletes.len()).then(|| RowOp::Restate {
+        table: table.clone(),
+        spec_version: *spec_version,
+        deletes: settleable,
+    }))
+}
+
+/// [`unsent_work_blocking_replay`] for one row: `removing` says whether the op deletes the row
+/// outright (a `Remove`, or a stated delete that would remove it) rather than rewriting it.
+fn unsent_work_on_row(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    stream: StreamId,
+    pk_vals: &[TypedValue],
+    removing: bool,
+) -> anyhow::Result<Option<PendingReason>> {
     // A malformed key never reached `apply_row_op`'s arity check (an entry parked as out-of-scope
     // or unknown-kind was never validated), and binding it against `spec.pk`'s placeholders
     // would be a parameter-count ERROR — which, propagating out of the refold, would roll back
@@ -965,9 +1252,7 @@ pub(crate) fn unsent_work_blocking_replay(
         // happens to be unreadable. Deferring it is the safe stuck state: the row survives, and the
         // entry replays on the merits once the cell is repaired.
         SyncedRow::Unreadable(_) =>
-            return Ok(
-                matches!(op, RowOp::Remove { .. }).then_some(PendingReason::DeferredUnreadableRow)
-            ),
+            return Ok(removing.then_some(PendingReason::DeferredUnreadableRow)),
     };
     let current = row_op::cells_hash(&current_cells);
     Ok(match published_hash_on_stream(tx, stream, repo_id, spec.name, &row_pk)? {
@@ -1105,6 +1390,7 @@ pub(crate) fn pre_apply(
     repo_id: &str,
     stream: StreamId,
     op: &RowOp,
+    entry_lamport: u64,
     doubt: RowDoubt,
 ) -> anyhow::Result<PreApply> {
     match payload_verdict(spec, repo_id, op) {
@@ -1114,6 +1400,13 @@ pub(crate) fn pre_apply(
         // enter a retry family it can never leave.
         PayloadVerdict::Rejected(_) => return Ok(PreApply::Apply),
         PayloadVerdict::RowDecides(_) => {},
+    }
+    // Same rule for a restatement that names a lamport its chain never held: terminal, so it
+    // must reach the applier's quarantine rather than park behind a row it will never touch.
+    if let RowOp::Restate { deletes, .. } = op
+        && deletes.iter().any(|delete| delete.lamport >= entry_lamport)
+    {
+        return Ok(PreApply::Apply);
     }
     if doubt == RowDoubt::NothingUnsent {
         return Ok(PreApply::Apply);
@@ -1125,8 +1418,8 @@ pub(crate) fn pre_apply(
     // resolve. Everything else defers, including an unprovable verdict against an `Upsert` — see
     // [`RowDoubt::DeferExceptUnprovableRemoval`] for why the op kind, not the confidence, is what
     // makes the difference.
-    let unprovable_removal =
-        !deferral.is_proven_unsent_work() && matches!(op, RowOp::Remove { .. });
+    let unprovable_removal = !deferral.is_proven_unsent_work()
+        && matches!(op, RowOp::Remove { .. } | RowOp::Restate { .. });
     Ok(match doubt {
         RowDoubt::DeferExceptUnprovableRemoval if unprovable_removal => PreApply::Apply,
         RowDoubt::DeferOnAnyDoubt | RowDoubt::DeferExceptUnprovableRemoval =>
