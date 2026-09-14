@@ -327,3 +327,7 @@ a raw local repair becomes visible on the next producer scan or replay. A row wi
 primary key has no addressable row identity and is not included in this per-row report. The command
 reads existing observations; it does not trigger a scan or author entries. An empty report therefore
 means no observations were found for the current streams, not proof that every row was scanned.
+
+### Interrupted table recovery
+
+An adopted retention floor may still be missing a suffix carrying updates or deletes. New sessions retain that promised suffix tip across restarts and report continuation until it arrives. Table authoring and compaction on the affected stream wait; local edits remain unsent. Reconnect to a peer retaining the missing history. Older intermediaries and floor adoptions predating this tracking do not carry the same guarantee. See [suffix delivery and recovery limits](../design/table-suffix-coverage.md).

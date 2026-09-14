@@ -2188,6 +2188,14 @@ CREATE TABLE table_sync_row_diagnostics(
              self_apply_failed INTEGER NOT NULL DEFAULT 0 CHECK(self_apply_failed IN (0,1)),
              PRIMARY KEY(stream_id, repo_id, table_name, row_pk)
          ) STRICT;
+CREATE TABLE table_sync_suffix_coverage(
+            stream_id BLOB NOT NULL CHECK(length(stream_id) = 32),
+            device_fingerprint BLOB NOT NULL CHECK(length(device_fingerprint) = 32),
+            floor_lamport INTEGER NOT NULL,
+            tip_lamport INTEGER NOT NULL CHECK(tip_lamport >= floor_lamport),
+            tip_hash BLOB NOT NULL CHECK(length(tip_hash) = 32),
+            PRIMARY KEY(stream_id, device_fingerprint)
+        ) STRICT;
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('001_sqlite_storage_baseline',1789374675829,'sha256:rag-rat-sqlite-baseline-v1','SQLite storage baseline with FTS, tree-sitter graph edges, git/GitHub, and local AI metadata');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('002_embedding_vector_metadata',1789374675829,'sha256:rag-rat-embedding-vector-metadata-v2','Add embedding model dimension metadata and per-vector dimensions for hybrid vector search');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('003_derived_artifact_reconcile_metadata',1789374675829,'sha256:rag-rat-derived-artifact-reconcile-metadata-v3','Add model version, retry metadata, summaries, and reconcile meta for diff-based derived artifact reconciliation');
@@ -2316,5 +2324,6 @@ INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALU
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('126_memory_note_summaries',1789374676265,'sha256:rag-rat-memory-note-summaries-v126','Add memory_note_summaries, the summary of a memory''s current note keyed (repo_id, memory_id) with content_hash as a synced column, seeded with each memory''s newest row from memory_summaries, so a regeneration syncs as one upsert instead of a delete plus an insert (#1319); memory_summaries stays for the entries that name it');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('127_tombstone_statements',1789374676265,'sha256:rag-rat-tombstone-statements-v127','Add sync_tombstone_statements: per chain that states a row''s current tombstone, the lamport of that chain''s newest statement, so a writer can restate its own deletes at its tail and retention can reclaim the entries that first stated them (#1295); backfilled with one statement per tombstone at its own identity');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('128_table_sync_row_diagnostics',1789402525979,'sha256:rag-rat-table-sync-row-diagnostics-v128','Persist local per-row table-sync diagnostic causes independently of pending entries (#1020)');
+INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('129_table_sync_suffix_coverage',1789406001601,'sha256:rag-rat-table-sync-suffix-coverage-v129','Retain promised suffix tips across interrupted table floor adoption (#892)');
 INSERT INTO "repos"("repo_id","display_name","registered_at_ms") VALUES('__unassigned__','',0);
 INSERT INTO "content_digest_state"("id","state","rows_folded") VALUES(1,'0000000000000000000000000000000000000000000000000000000000000000',0);

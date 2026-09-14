@@ -926,3 +926,68 @@ mod diagnostic_tests {
         );
     }
 }
+
+/// V129: routing obligations, never accepted chain state or a Lamport clock. Older floors have
+/// no recoverable promised tip; this table records only new observations, without inventing one.
+pub fn apply_table_sync_suffix_coverage(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS table_sync_suffix_coverage(
+            stream_id BLOB NOT NULL CHECK(length(stream_id) = 32),
+            device_fingerprint BLOB NOT NULL CHECK(length(device_fingerprint) = 32),
+            floor_lamport INTEGER NOT NULL,
+            tip_lamport INTEGER NOT NULL CHECK(tip_lamport >= floor_lamport),
+            tip_hash BLOB NOT NULL CHECK(length(tip_hash) = 32),
+            PRIMARY KEY(stream_id, device_fingerprint)
+        ) STRICT;",
+    )
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn suffix_coverage_migration_retries_and_preserves_obligations_across_repository_purge() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        conn.execute_batch(
+            "DROP TABLE table_sync_suffix_coverage; DELETE FROM schema_version WHERE id = \
+             '129_table_sync_suffix_coverage';",
+        )
+        .unwrap();
+        crate::schema::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        for (stream, repo) in [(1_u8, "main-checkout"), (2, "linked-sibling")] {
+            conn.execute(
+                "INSERT INTO \
+                 table_sync_streams(stream_id,repo_id,account_id,scope_id,incarnation_ref) VALUES \
+                 (?1,?2,?3,'overlay/1',?3)",
+                params![[stream; 32].as_slice(), repo, [3_u8; 32].as_slice()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO table_sync_suffix_coverage VALUES (?1,?2,10,20,?3)",
+                params![[stream; 32].as_slice(), [4_u8; 32].as_slice(), [5_u8; 32].as_slice()],
+            )
+            .unwrap();
+        }
+        apply_table_sync_suffix_coverage(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM table_sync_suffix_coverage", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        crate::schema::purge_repo_rows(&conn, "main-checkout").unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM table_sync_suffix_coverage", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT repo_id FROM table_sync_streams", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "linked-sibling"
+        );
+    }
+}

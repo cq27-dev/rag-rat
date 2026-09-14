@@ -281,6 +281,10 @@ fn sign_next_row_entry(
     op: &RowOp,
 ) -> anyhow::Result<SignedEntry> {
     let device = secret.public().fingerprint();
+    anyhow::ensure!(
+        !super::coverage::stream_pending(tx, stream)?,
+        "table-sync suffix delivery is incomplete; authoring waits for recovery"
+    );
     let stored_tail = chain_tail(tx, stream, device)?;
     if let Some(witness) = chain_witness(tx, stream, device)?
         && stored_tail != Some(witness)

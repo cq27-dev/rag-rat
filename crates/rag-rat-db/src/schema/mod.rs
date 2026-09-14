@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 128;
+pub const LATEST_SCHEMA_VERSION: u32 = 129;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -1145,6 +1145,11 @@ additive_migrations! {
         "sha256:rag-rat-table-sync-row-diagnostics-v128",
         "Persist local per-row table-sync diagnostic causes independently of pending entries (#1020)",
     ) => MigrationFn::Plain(migrations::apply_table_sync_row_diagnostics);
+    MIGRATION_129_ID, MIGRATION_129_CHECKSUM, MIGRATION_129_DESCRIPTION = (
+        "129_table_sync_suffix_coverage",
+        "sha256:rag-rat-table-sync-suffix-coverage-v129",
+        "Retain promised suffix tips across interrupted table floor adoption (#892)",
+    ) => MigrationFn::Plain(migrations::apply_table_sync_suffix_coverage);
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

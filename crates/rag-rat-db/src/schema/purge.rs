@@ -48,7 +48,9 @@
 //! chains. `table_sync_chain_tips` therefore survives this purge as store-global high-water
 //! witnesses (it deliberately has no `repo_id` column or directory FK); local authoring refuses a
 //! second genesis until its witnessed tip is restored. The directory and row projection remain
-//! repo-local and are still swept.
+//! repo-local and are still swept. `table_sync_suffix_coverage` likewise survives: restoring the
+//! witnessed entry does not settle a previously known missing suffix. Its derived stream key
+//! cannot block a different incarnation, and an obligation never recreates directory or row data.
 
 use rusqlite::{Connection, params};
 

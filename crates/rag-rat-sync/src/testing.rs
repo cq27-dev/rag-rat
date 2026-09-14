@@ -61,6 +61,7 @@ pub(crate) struct TableMemStore {
     pub(crate) entries: HashMap<Hash, HashMap<Hash, TestEntry>>,
     pub(crate) forbidden_snapshots: HashSet<Hash>,
     pub(crate) prepare_count: usize,
+    pub(crate) owed_tips: HashMap<(Hash, Hash), (u64, Hash)>,
 }
 
 impl TableMemStore {
@@ -71,6 +72,7 @@ impl TableMemStore {
             entries: HashMap::new(),
             forbidden_snapshots: HashSet::new(),
             prepare_count: 0,
+            owed_tips: HashMap::new(),
         }
     }
 
@@ -96,6 +98,9 @@ impl TableMemStore {
 }
 
 impl TableSyncStore for TableMemStore {
+    fn has_pending_coverage(&self, item: &ManifestItem) -> anyhow::Result<bool> {
+        Ok(self.owed_tips.keys().any(|(stream, _)| *stream == item.stream_id))
+    }
     fn account_id(&self) -> Hash {
         self.account
     }
@@ -128,6 +133,11 @@ impl TableSyncStore for TableMemStore {
             let head = chains.entry(entry.device).or_insert((entry.lamport, *hash));
             if entry.lamport > head.0 {
                 *head = (entry.lamport, *hash);
+            }
+        }
+        for (&(stream, device), &tip) in &self.owed_tips {
+            if stream == item.stream_id {
+                chains.insert(device, tip);
             }
         }
         Ok(chains
@@ -176,6 +186,13 @@ impl TableSyncStore for TableMemStore {
                         .get(&entry_hash)
                         .is_some_and(|entry| entry.device == device && entry.lamport == lamport)
                 }) {
+                    if self
+                        .owed_tips
+                        .get(&(item.stream_id, device))
+                        .is_some_and(|(tip, _)| lamport <= *tip)
+                    {
+                        return Ok(Vec::new());
+                    }
                     anyhow::bail!("test cursor is not present")
                 }
                 (Some(lamport), false)
@@ -213,9 +230,8 @@ impl TableSyncStore for TableMemStore {
     fn ingest(
         &mut self,
         item: &ManifestItem,
-        expected_device: Hash,
+        offered: &crate::table_wire::ChainHead,
         bytes: &[u8],
-        _advertised_floor: Option<(u64, Hash)>,
     ) -> anyhow::Result<Ingested> {
         if !self.supported.contains(item) {
             return Ok(Ingested::NoChange);
@@ -223,8 +239,11 @@ impl TableSyncStore for TableMemStore {
         let hash: Hash = bytes[..32].try_into()?;
         let device = [bytes[32]; 32];
         let lamport = u64::from_be_bytes(bytes[33..41].try_into()?);
-        if device != expected_device {
+        if device != offered.device_fingerprint {
             return Ok(Ingested::NoChange);
+        }
+        if self.owed_tips.get(&(item.stream_id, device)) == Some(&(lamport, hash)) {
+            self.owed_tips.remove(&(item.stream_id, device));
         }
         Ok(match self.entries.entry(item.stream_id).or_default().entry(hash) {
             std::collections::hash_map::Entry::Occupied(_) => Ingested::NoChange,
@@ -425,15 +444,14 @@ impl TableSyncStore for TableTestStore {
     fn ingest(
         &mut self,
         item: &crate::table_wire::ManifestItem,
-        expected_device: [u8; 32],
+        offered: &crate::table_wire::ChainHead,
         signed_bytes: &[u8],
-        _advertised_floor: Option<(u64, [u8; 32])>,
     ) -> anyhow::Result<crate::session::Ingested> {
         if !self.supported.contains(item) {
             return Ok(crate::session::Ingested::NoChange);
         }
         let hash: [u8; 32] = signed_bytes[..32].try_into()?;
-        if hash != expected_device {
+        if hash != offered.device_fingerprint {
             return Ok(crate::session::Ingested::NoChange);
         }
         Ok(match self.entries.entry(item.stream_id).or_default().entry(hash) {
