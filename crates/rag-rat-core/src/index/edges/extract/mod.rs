@@ -387,6 +387,32 @@ impl EdgeEmitter<'_> {
     }
 }
 
+/// Build a qualified call from the callee's captured identifiers. Borrow the path so callers
+/// that also emit a receiver-type edge do not need to walk the callee again.
+pub(crate) fn qualified_call_edge(
+    locator: &SymbolLocator<'_>,
+    node: Node<'_>,
+    text: &str,
+    identifiers: &IdentifierPath<'_>,
+    edge_kind: EdgeKind,
+) -> Option<EdgeCandidate> {
+    let name =
+        identifiers.last_text().map(ToOwned::to_owned).or_else(|| call_target_name(node, text))?;
+    Some(symbol_edge_with_context(
+        locator,
+        node,
+        Some(text),
+        name,
+        edge_kind,
+        EdgeContext {
+            target_qualified_name: identifiers.qualified_name(),
+            receiver_hint: identifiers.receiver_text().map(ToOwned::to_owned),
+            ..Default::default()
+        },
+        identifiers.last_node().map(CalleeRange::of_node),
+    ))
+}
+
 pub(crate) fn file_edge(
     path: &Path,
     node: Node<'_>,

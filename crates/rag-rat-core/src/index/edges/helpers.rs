@@ -243,6 +243,14 @@ impl<'tree> IdentifierPath<'tree> {
         self.segments.first().map(|segment| segment.text.as_str())
     }
 
+    pub(crate) fn receiver_text(&self) -> Option<&str> {
+        self.first_text().filter(|_| self.len() > 1)
+    }
+
+    pub(crate) fn receiver_node(&self) -> Option<Node<'tree>> {
+        self.first_node().filter(|_| self.len() > 1)
+    }
+
     pub(crate) fn last_text(&self) -> Option<&str> {
         self.segments.last().map(|segment| segment.text.as_str())
     }

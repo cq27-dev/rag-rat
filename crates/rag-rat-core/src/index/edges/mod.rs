@@ -11,8 +11,8 @@ use std::path::Path;
 
 pub(crate) use extract::{
     EdgeEmitter, EdgeVisit, edge_candidates_from_root, enclosing_use_scope, file_edge,
-    file_edge_scoped, index_file_edges, inline_mod_scope, qn_tail, symbol_edge,
-    symbol_edge_with_context,
+    file_edge_scoped, index_file_edges, inline_mod_scope, qn_tail, qualified_call_edge,
+    symbol_edge, symbol_edge_with_context,
 };
 #[cfg(test)]
 pub(crate) use extract::{edge_candidates, syntactic_edges};

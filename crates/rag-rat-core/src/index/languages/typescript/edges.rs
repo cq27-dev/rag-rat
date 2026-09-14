@@ -18,36 +18,15 @@ pub(in crate::index::languages) fn typescript_edges(
         "call_expression" | "new_expression" => {
             let function = node.child_by_field_name("function").unwrap_or(node);
             let identifiers = IdentifierPath::under(function, text);
-            if let Some(name) = identifiers
-                .last_text()
-                .map(ToOwned::to_owned)
-                .or_else(|| call_target_name(node, text))
-            {
-                let edge_kind = if node.kind() == "new_expression" {
-                    EdgeKind::Constructs
-                } else {
-                    EdgeKind::CallsName
-                };
-                out.push(symbol_edge_with_context(
-                    locator,
-                    node,
-                    Some(text),
-                    name,
-                    edge_kind,
-                    EdgeContext {
-                        target_qualified_name: identifiers.qualified_name(),
-                        receiver_hint: identifiers
-                            .first_text()
-                            .filter(|_| identifiers.len() > 1)
-                            .map(ToOwned::to_owned),
-                        ..Default::default()
-                    },
-                    identifiers.last_node().map(CalleeRange::of_node),
-                ));
+            let edge_kind = if node.kind() == "new_expression" {
+                EdgeKind::Constructs
+            } else {
+                EdgeKind::CallsName
+            };
+            if let Some(edge) = qualified_call_edge(locator, node, text, &identifiers, edge_kind) {
+                out.push(edge);
             }
-            if let Some(receiver) =
-                identifiers.first_text().filter(|_| identifiers.len() > 1).map(ToOwned::to_owned)
-            {
+            if let Some(receiver) = identifiers.receiver_text().map(ToOwned::to_owned) {
                 out.push(symbol_edge(
                     locator,
                     node,
@@ -55,10 +34,7 @@ pub(in crate::index::languages) fn typescript_edges(
                     EdgeKind::ReferencesType,
                     // The type is the receiver — the FIRST segment, matching
                     // `identifiers.first()`.
-                    identifiers
-                        .first_node()
-                        .filter(|_| identifiers.len() > 1)
-                        .map(CalleeRange::of_node),
+                    identifiers.receiver_node().map(CalleeRange::of_node),
                 ));
             }
         },

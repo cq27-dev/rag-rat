@@ -21,27 +21,10 @@ pub(in crate::index::languages) fn c_like_edges(
         "call_expression" => {
             let function = node.child_by_field_name("function").unwrap_or(node);
             let identifiers = IdentifierPath::under(function, text);
-            if let Some(name) = identifiers
-                .last_text()
-                .map(ToOwned::to_owned)
-                .or_else(|| call_target_name(node, text))
+            if let Some(edge) =
+                qualified_call_edge(locator, node, text, &identifiers, EdgeKind::CallsName)
             {
-                out.push(symbol_edge_with_context(
-                    locator,
-                    node,
-                    Some(text),
-                    name,
-                    EdgeKind::CallsName,
-                    EdgeContext {
-                        target_qualified_name: identifiers.qualified_name(),
-                        receiver_hint: identifiers
-                            .first_text()
-                            .filter(|_| identifiers.len() > 1)
-                            .map(ToOwned::to_owned),
-                        ..Default::default()
-                    },
-                    identifiers.last_node().map(CalleeRange::of_node),
-                ));
+                out.push(edge);
             }
         },
         "type_identifier" | "qualified_identifier" | "namespace_identifier" => {

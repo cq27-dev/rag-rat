@@ -106,10 +106,7 @@ fn python_call_edges(
             EdgeKind::CallsName,
             EdgeContext {
                 target_qualified_name: identifiers.qualified_name(),
-                receiver_hint: identifiers
-                    .first_text()
-                    .filter(|_| identifiers.len() > 1)
-                    .map(ToOwned::to_owned),
+                receiver_hint: identifiers.receiver_text().map(ToOwned::to_owned),
                 ..Default::default()
             },
             identifiers.last_node().map(CalleeRange::of_node),
@@ -195,10 +192,7 @@ fn python_decorator_edges(
         EdgeKind::CallsName,
         EdgeContext {
             target_qualified_name: identifiers.qualified_name(),
-            receiver_hint: identifiers
-                .first_text()
-                .filter(|_| identifiers.len() > 1)
-                .map(ToOwned::to_owned),
+            receiver_hint: identifiers.receiver_text().map(ToOwned::to_owned),
             ..Default::default()
         },
         identifiers.last_node().map(final_segment_node).map(CalleeRange::of_node),

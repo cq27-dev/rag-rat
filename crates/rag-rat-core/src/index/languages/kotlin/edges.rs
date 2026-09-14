@@ -27,27 +27,19 @@ pub(in crate::index::languages) fn kotlin_edges(
                     EdgeKind::CallsName,
                     EdgeContext {
                         target_qualified_name: identifiers.qualified_name(),
-                        receiver_hint: identifiers
-                            .first_text()
-                            .filter(|_| identifiers.len() > 1)
-                            .map(ToOwned::to_owned),
+                        receiver_hint: identifiers.receiver_text().map(ToOwned::to_owned),
                         ..Default::default()
                     },
                     identifiers.last_node().map(CalleeRange::of_node),
                 ));
             }
-            if let Some(receiver) =
-                identifiers.first_text().filter(|_| identifiers.len() > 1).map(ToOwned::to_owned)
-            {
+            if let Some(receiver) = identifiers.receiver_text().map(ToOwned::to_owned) {
                 out.push(symbol_edge(
                     locator,
                     node,
                     receiver,
                     EdgeKind::ReferencesType,
-                    identifiers
-                        .first_node()
-                        .filter(|_| identifiers.len() > 1)
-                        .map(CalleeRange::of_node),
+                    identifiers.receiver_node().map(CalleeRange::of_node),
                 ));
             }
             if let Some(constructor) = identifiers
