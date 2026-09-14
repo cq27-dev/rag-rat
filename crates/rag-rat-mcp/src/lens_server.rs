@@ -305,25 +305,9 @@ async fn run_on_ports(
         }
     };
 
-    let db = rag_rat_core::IndexDatabase::open_config(&config)?;
-    db.materialize_lens_coupling()?;
-    drop(db);
+    rag_rat_core::IndexDatabase::open_config(&config)?.materialize_lens_coupling()?;
     let listener = bind_first_free(ports).await?;
-    let ownership_token = ownership_token()?;
-    let repo_id = rag_rat_base::repo_identity::resolve_repo_identity(
-        &config.root,
-        config.repo_id_override.as_deref(),
-    )
-    .ok()
-    .map(|identity| identity.repo_id);
-    let indexed_root = indexed_root_relative(&config, &workspace_root)?;
-    let discovery = LensDiscovery::new(
-        listener.local_addr()?,
-        repo_id,
-        indexed_root,
-        path_case_insensitive(&workspace_root),
-        ownership_token.clone(),
-    );
+    let discovery = lens_discovery(&config, &workspace_root, &listener, ownership_token()?)?;
     let discovery_path = lens_discovery_path(&workspace_root);
     let _discovery = DiscoveryGuard::publish(discovery_path.clone(), &discovery)
         .with_context(|| format!("publishing lens discovery at {}", discovery_path.display()))?;
@@ -335,15 +319,7 @@ async fn run_on_ports(
         "lens HTTP server listening"
     );
     let origins = origins_from_env()?;
-    let options = ServeOptions {
-        workspace_root: Some(workspace_root),
-        indexed_root: discovery.indexed_root.clone(),
-        case_insensitive_paths: discovery.case_insensitive_paths,
-        auth_token: Some(ownership_token),
-        allowed_origins: origins,
-        control: control.clone(),
-        ..ServeOptions::default()
-    };
+    let options = lens_serve_options(workspace_root, &discovery, origins, control.clone());
     let shutdown_control = control.clone();
     http::serve(listener, config, options, async move {
         shutdown_control.stopped().await;
@@ -401,24 +377,9 @@ where
     // The caller acquires the election lock before any side effects (index heal, watcher) so a
     // contended worktree fails fast.
     let _election_lock = election_lock;
-    let db = rag_rat_core::IndexDatabase::open_config(&config)?;
-    db.materialize_lens_coupling()?;
-    drop(db);
+    rag_rat_core::IndexDatabase::open_config(&config)?.materialize_lens_coupling()?;
     let listener = bind(address).await?;
-    let repo_id = rag_rat_base::repo_identity::resolve_repo_identity(
-        &config.root,
-        config.repo_id_override.as_deref(),
-    )
-    .ok()
-    .map(|identity| identity.repo_id);
-    let indexed_root = indexed_root_relative(&config, &workspace_root)?;
-    let mut discovery = LensDiscovery::new(
-        listener.local_addr()?,
-        repo_id,
-        indexed_root,
-        path_case_insensitive(&workspace_root),
-        auth_token.clone(),
-    );
+    let mut discovery = lens_discovery(&config, &workspace_root, &listener, auth_token)?;
     if let Some(advertise) = advertise_url.as_deref() {
         // The advertised URL replaces the bind address in the published discovery: the
         // extension dials it, so it must parse and carry a usable host + port (a
@@ -456,17 +417,53 @@ where
     };
     eprintln!("rag-rat serve listening on {}", discovery.url);
     let control = ServeControl::default();
-    let options = ServeOptions {
+    let options = lens_serve_options(workspace_root, &discovery, allowed_origins, control.clone());
+    http::serve(listener, config, options, shutdown).await?;
+    Ok(())
+}
+
+/// The discovery record for a lens server bound to `listener`, shared by both serve paths so the
+/// published record cannot drift between them. The repo identity is best effort: a checkout
+/// without one publishes `null`.
+fn lens_discovery(
+    config: &Config,
+    workspace_root: &Path,
+    listener: &TcpListener,
+    ownership_token: String,
+) -> anyhow::Result<LensDiscovery> {
+    let repo_id = rag_rat_base::repo_identity::resolve_repo_identity(
+        &config.root,
+        config.repo_id_override.as_deref(),
+    )
+    .ok()
+    .map(|identity| identity.repo_id);
+    let indexed_root = indexed_root_relative(config, workspace_root)?;
+    Ok(LensDiscovery::new(
+        listener.local_addr()?,
+        repo_id,
+        indexed_root,
+        path_case_insensitive(workspace_root),
+        ownership_token,
+    ))
+}
+
+/// The HTTP options both serve paths hand to [`http::serve`]. The bearer token the server enforces
+/// is the one `discovery` publishes, by construction.
+fn lens_serve_options(
+    workspace_root: PathBuf,
+    discovery: &LensDiscovery,
+    allowed_origins: Vec<String>,
+    control: ServeControl,
+) -> ServeOptions {
+    ServeOptions {
         workspace_root: Some(workspace_root),
         indexed_root: discovery.indexed_root.clone(),
         case_insensitive_paths: discovery.case_insensitive_paths,
-        auth_token: Some(auth_token),
+        auth_token: Some(discovery.ownership_token.clone()),
         allowed_origins,
-        control: control.clone(),
+        control,
         ..ServeOptions::default()
-    };
-    http::serve(listener, config, options, shutdown).await?;
-    Ok(())
+    }
 }
 
 fn lens_runtime_dir(workspace_root: &Path) -> PathBuf {
