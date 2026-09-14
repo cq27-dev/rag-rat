@@ -12,7 +12,7 @@ use rag_rat_query::impact::{self, ImpactItem, ImpactSurfaceOptions, ImpactSurfac
 use rag_rat_query::symbol::{self, SymbolHit};
 use rag_rat_query::text_compare;
 
-use super::{annotate_completeness_with_externals, resolved_external_label, *};
+use super::*;
 
 impl IndexDatabase {
     pub fn ffi_surface(&self, limit: u32) -> anyhow::Result<Vec<ImpactItem>> {
@@ -572,7 +572,7 @@ impl IndexDatabase {
             resolved_external: comparison
                 .resolved_symbol_id
                 .is_none()
-                .then(|| resolved_external_label(&comparison.scip_symbol))
+                .then(|| scip_resolved_external_label(&comparison.scip_symbol))
                 .flatten(),
             scip_symbol: comparison.scip_symbol,
             callsite: Some(Callsite {
@@ -903,3 +903,56 @@ impl IndexDatabase {
         )
     }
 }
+
+/// `resolved-external(<package>)` for a SCIP symbol that names a dependency outside the corpus, or
+/// `None` when it has no package component. Shared by `compare_graph_to_scip` to label a
+/// contradiction whose compiler resolution is external.
+fn scip_resolved_external_label(scip_symbol: &str) -> Option<String> {
+    rag_rat_oracle::package_of(scip_symbol).map(|package| format!("resolved-external({package})"))
+}
+
+/// Append a quantitative clause to `summary.completeness_risk` describing how many of the SHOWN
+/// neighbors the oracle placed in an external dependency, e.g. " (2 shown neighbors are
+/// resolved-external: libc, tokio)". Quantitative completeness is the #69 ask: turn the qualitative
+/// risk into a count when the oracle has data. No-op when no hop carries a `resolved-external`
+/// verdict (then the risk string stays purely qualitative).
+///
+/// COUNTING SCOPE (#82 P3): `external_count` is counted over the TRUNCATED `hops` window (the
+/// neighbors actually returned), so the clause speaks of "shown neighbors" — it does NOT divide by
+/// the population-wide `summary.unresolved + name_only + ambiguous`. Mixing a shown-window
+/// numerator with a population-wide denominator produced a misleading ratio (`5 of 7` where 5
+/// counts only the displayed window and 7 the whole graph). The honest statement is the count over
+/// what was shown.
+fn annotate_completeness_with_externals(
+    summary: &mut rag_rat_query::graph::GraphTraversalSummary,
+    hops: &[rag_rat_query::graph::GraphHop],
+) {
+    let mut packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut external_count = 0u64;
+    for hop in hops {
+        if let Some(label) = &hop.resolved_external {
+            external_count += 1;
+            // `resolved-external(<package>)` → `<package>` for the readable list.
+            if let Some(package) =
+                label.strip_prefix("resolved-external(").and_then(|rest| rest.strip_suffix(')'))
+            {
+                packages.insert(package.to_string());
+            }
+        }
+    }
+    if external_count == 0 {
+        return;
+    }
+    let neighbor_word = if external_count == 1 { "neighbor is" } else { "neighbors are" };
+    let package_list = packages.into_iter().collect::<Vec<_>>().join(", ");
+    let clause = if package_list.is_empty() {
+        format!(" ({external_count} shown {neighbor_word} resolved-external)")
+    } else {
+        format!(" ({external_count} shown {neighbor_word} resolved-external: {package_list})")
+    };
+    summary.completeness_risk.push_str(&clause);
+}
+
+#[cfg(test)]
+#[path = "oracle_surfacing_tests.rs"]
+mod oracle_surfacing_tests;

@@ -919,11 +919,11 @@ fn gc_prunes_oracle_runs_for_dead_contexts() {
 #[test]
 fn resolved_external_label_extracts_package() {
     assert_eq!(
-        resolved_external_label("scip-rust cargo tokio 1.0 `spawn`()."),
+        scip_resolved_external_label("scip-rust cargo tokio 1.0 `spawn`()."),
         Some("resolved-external(tokio)".to_string())
     );
     // A symbol with no package component yields no label.
-    assert_eq!(resolved_external_label("local 0"), None);
+    assert_eq!(scip_resolved_external_label("local 0"), None);
 }
 
 #[test]
