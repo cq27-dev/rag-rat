@@ -1276,6 +1276,8 @@ fn delete_item(
     key: &str,
 ) -> anyhow::Result<bool> {
     let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    // The item identity. Every statement here keys on exactly this list except the two mined-ref
+    // prunes, which also bind their source-kind token.
     let args =
         params![repo_id, binding.provider.as_db_str(), binding.project, kind.as_db_str(), key];
     conn.execute(
@@ -1286,7 +1288,7 @@ fn delete_item(
     conn.execute(
         "DELETE FROM papertrail_comments WHERE repo_id=?1 AND tracker=?2 AND project=?3 AND \
          item_kind=?4 AND item_key=?5",
-        params![repo_id, binding.provider.as_db_str(), binding.project, kind.as_db_str(), key],
+        args,
     )?;
     // #702: mined evidence dies with its source. The mined identities are constructible in SQL
     // (item: `project:kind:key`; comment: that + `:comment_id` — a prefix match), so the pruned
@@ -1323,7 +1325,7 @@ fn delete_item(
     conn.execute(
         "DELETE FROM papertrail_item_tags WHERE repo_id=?1 AND tracker=?2 AND project=?3 AND \
          item_kind=?4 AND item_key=?5",
-        params![repo_id, binding.provider.as_db_str(), binding.project, kind.as_db_str(), key],
+        args,
     )?;
     // An issue leaving the cache (pruned out of scope, or deleted) takes its closing edges with
     // it — of BOTH tiers. The attested walk stores an edge only for a cached issue, so the cache
@@ -1334,13 +1336,13 @@ fn delete_item(
         conn.execute(
             "DELETE FROM papertrail_closing_edges WHERE repo_id=?1 AND tracker=?2 AND project=?3 \
              AND issue_kind=?4 AND issue_key=?5",
-            params![repo_id, binding.provider.as_db_str(), binding.project, kind.as_db_str(), key],
+            args,
         )?;
     }
     Ok(conn.execute(
         "DELETE FROM papertrail_items WHERE repo_id=?1 AND tracker=?2 AND project=?3 AND \
          item_kind=?4 AND item_key=?5",
-        params![repo_id, binding.provider.as_db_str(), binding.project, kind.as_db_str(), key],
+        args,
     )? > 0)
 }
 
