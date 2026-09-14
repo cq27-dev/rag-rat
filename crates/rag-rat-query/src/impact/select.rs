@@ -1,14 +1,5 @@
 use super::*;
 
-pub(crate) fn category_rank(category: &str) -> u8 {
-    match category {
-        "Direct structural impact" => 0,
-        "Probable textual impact" => 1,
-        "Historical/papertrail evidence" => 2,
-        _ => 3,
-    }
-}
-
 pub(crate) fn reason_rank(reason: &str) -> u8 {
     match reason {
         "exact_symbol_definition" => 0,
