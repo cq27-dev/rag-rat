@@ -1,6 +1,9 @@
 use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_db::meta::{read_meta, repo_meta};
-use rag_rat_db::schema;
+use rag_rat_db::schema::{
+    self, CONNECTION_CONTEXT_COMMIT_KEY, CONNECTION_CONTEXT_GENERATION_KEY,
+    CONNECTION_CONTEXT_REPO_KEY, CONNECTION_CONTEXT_WORKTREE_KEY,
+};
 use rag_rat_papertrail as papertrail;
 
 use super::*;
@@ -51,6 +54,85 @@ pub struct GlobalStoreOverview {
     pub repos: Vec<schema::RegisteredRepo>,
 }
 
+/// One ordered pairing for every on-open repair. Read-only probes preserve their historical
+/// graph/generated/manifest/seed order; writes preserve manifest/graph/generated/seed order.
+pub(super) struct OnOpenHeal {
+    #[cfg_attr(not(test), allow(dead_code))]
+    name: &'static str,
+    read_order: u8,
+    bare_phase: Option<BareHealPhase>,
+    owed: fn(&IndexDatabase, &Config) -> anyhow::Result<bool>,
+    apply: fn(&IndexDatabase, Option<&Config>) -> anyhow::Result<()>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BareHealPhase {
+    BeforeScope,
+    AfterScope,
+}
+
+pub(super) const ON_OPEN_HEALS: &[OnOpenHeal] = &[
+    OnOpenHeal {
+        name: "model manifest",
+        read_order: 2,
+        bare_phase: Some(BareHealPhase::BeforeScope),
+        owed: |db, _| Ok(!ai::model_manifest_is_current(db.storage.connection())?),
+        apply: |db, _| ai::ensure_model_manifest(db.storage.connection()),
+    },
+    OnOpenHeal {
+        name: "graph index",
+        read_order: 0,
+        bare_phase: Some(BareHealPhase::AfterScope),
+        owed: |db, _| db.active_derivation_rows_owed(),
+        apply: |db, _| db.ensure_graph_index_current(),
+    },
+    OnOpenHeal {
+        name: "generated flags",
+        read_order: 1,
+        bare_phase: Some(BareHealPhase::AfterScope),
+        owed: |db, _| {
+            Ok(read_meta(db.storage.connection(), GENERATED_FLAGS_VERSION_KEY)?.as_deref()
+                != Some(GENERATED_FLAGS_VERSION))
+        },
+        apply: |db, _| db.ensure_generated_flags_current(),
+    },
+    OnOpenHeal {
+        name: "active embedding model",
+        read_order: 3,
+        bare_phase: None,
+        owed: |db, config| {
+            ai::active_embedding_model_seed_owed(
+                db.storage.connection(),
+                config.llm.embedding.backend.model_id(),
+            )
+        },
+        apply: |db, config| {
+            ai::seed_active_embedding_model(
+                db.storage.connection(),
+                config
+                    .expect("embedding seed requires a config-bearing open")
+                    .llm
+                    .embedding
+                    .backend
+                    .model_id(),
+            )
+        },
+    },
+];
+
+fn apply_bare_heals(
+    db: &IndexDatabase,
+    mode: &BareOpenMode,
+    phase: BareHealPhase,
+) -> anyhow::Result<()> {
+    if matches!(mode, BareOpenMode::ConfigLess) {
+        for heal in ON_OPEN_HEALS.iter().filter(|heal| heal.bare_phase == Some(phase)) {
+            (heal.apply)(db, None)?;
+        }
+    }
+    Ok(())
+}
+
 impl IndexDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         Self::open_bare(path, BareOpenMode::ConfigLess)
@@ -82,7 +164,7 @@ impl IndexDatabase {
     /// or when `f` panics and the unwind drops it. IMMEDIATE takes the write lock up front, so a
     /// racing writer waits out busy_timeout instead of failing a deferred read→write upgrade with
     /// SQLITE_BUSY. Used by the heal paths, whose contract this is. Sites with a different failure
-    /// policy keep their own BEGIN/COMMIT: the standalone finalize and the generated-flags heal
+    /// policy keep their own BEGIN/COMMIT: the standalone finalize and generated-flags heal
     /// leave a failed COMMIT's transaction open, and the rebuild's wave loop and phase-2/terminal
     /// transactions leave the rollback to the rebuild's outer handler, which joins the
     /// git-history worker first.
@@ -179,7 +261,16 @@ impl IndexDatabase {
     }
 
     pub(super) fn open_bare(path: &Path, mode: BareOpenMode) -> anyhow::Result<Self> {
-        let mut storage = Self::open_and_migrate(path)?;
+        let storage = Self::open_and_migrate(path)?;
+        // Constructing a handle performs no reads or writes. Scope fields are filled only after
+        // the pre-scope manifest phase, preserving bare-open ordering.
+        let mut db = Self::new_handle(
+            storage,
+            String::new(),
+            0,
+            papertrail::PapertrailContext::default(),
+            None,
+        );
         // A bare `open` has no config identity to register, so it scopes to the SOLE repo of a
         // single-repo DB. On a CONSOLIDATED multi-repo DB (A7) there is no sole repo to pick —
         // `sole_repo_id`'s deterministic lexicographic tiebreak would silently serve whichever repo
@@ -191,7 +282,7 @@ impl IndexDatabase {
         // exempt: the caller adopts the config's repo immediately after, which re-scopes the
         // connection before any repo-scoped heal runs.
         if matches!(mode, BareOpenMode::ConfigLess)
-            && schema::multiple_real_repos(storage.connection())?
+            && schema::multiple_real_repos(db.storage.connection())?
         {
             anyhow::bail!(
                 "this database holds multiple repos; a bare open cannot choose one. Open through \
@@ -206,12 +297,10 @@ impl IndexDatabase {
         // mutate the FIRST-SORTING repo's meta while the caller holds only its own repo's lock —
         // so the heal is DEFERRED to the caller, after adopt + set_context scope the connection
         // (the exact ordering `open_config` uses).
-        if matches!(mode, BareOpenMode::ConfigLess) {
-            ai::ensure_model_manifest(storage.connection())?;
-        }
-        let repo_id = schema::sole_repo_id(storage.connection())?;
-        if let Some(root) = repo_meta(storage.connection(), &repo_id, "source_root")? {
-            storage.set_source_root(PathBuf::from(root));
+        apply_bare_heals(&db, &mode, BareHealPhase::BeforeScope)?;
+        let repo_id = schema::sole_repo_id(db.storage.connection())?;
+        if let Some(root) = repo_meta(db.storage.connection(), &repo_id, "source_root")? {
+            db.storage.set_source_root(PathBuf::from(root));
         }
         // Stamp the sole repo's LIVE generation (a heal write on this connection lands on the
         // live generation, not 0) AND install the repo+generation `files` view (A6, P2 review):
@@ -222,19 +311,11 @@ impl IndexDatabase {
         // closes it for every reader on this connection at once, while deliberately keeping the
         // bare open's CROSS-SCOPE semantics (all commits/worktrees of the sole repo — #360
         // pins that `open` counts more than the base-scoped `open_config`).
-        let active_generation = schema::live_files_generation(storage.connection(), &repo_id)?;
-        write_repo_generation_view(storage.connection(), &repo_id, active_generation)?;
-        let db = Self::new_handle(
-            storage,
-            repo_id,
-            active_generation,
-            papertrail::PapertrailContext::default(),
-            None,
-        );
-        if matches!(mode, BareOpenMode::ConfigLess) {
-            db.ensure_graph_index_current()?;
-            db.ensure_generated_flags_current()?;
-        }
+        let active_generation = schema::live_files_generation(db.storage.connection(), &repo_id)?;
+        write_repo_generation_view(db.storage.connection(), &repo_id, active_generation)?;
+        db.active_repo_id = repo_id;
+        db.active_generation = active_generation;
+        apply_bare_heals(&db, &mode, BareHealPhase::AfterScope)?;
         Ok(db)
     }
 
@@ -259,16 +340,9 @@ impl IndexDatabase {
         // "indexed here".
         db.adopt_repo_from_config(config, AdoptIntent::ReadOnly)?;
         db.set_context(resolve_git_context(&config.root).borrowed())?;
-        ai::ensure_model_manifest(db.storage.connection())?;
-        db.ensure_graph_index_current()?;
-        db.ensure_generated_flags_current()?;
-        // Adopt the configured embedding model as the index's active model when it has none yet, so
-        // reconcile targets it (and its "install" hint names it) instead of the hash fallback
-        // (#394).
-        ai::seed_active_embedding_model(
-            db.storage.connection(),
-            config.llm.embedding.backend.model_id(),
-        )?;
+        for heal in ON_OPEN_HEALS {
+            (heal.apply)(&db, Some(config))?;
+        }
         Ok(db)
     }
 
@@ -387,12 +461,8 @@ impl IndexDatabase {
     /// store) stays unresolved until the next read-write open resolves it, the same
     /// deferred-materialization posture as the synced-memory drain.
     ///
-    /// Returns `Ok(None)` — caller falls back to the read-write `open_config`, which heals once and
-    /// after which reads are lock-free again — when any of these is true:
-    /// - the DB has never been opened for write (read-only open errors),
-    /// - the schema is not `Compatible` (a forward migrate is owed; that is a write),
-    /// - the graph index is stale (`ensure_graph_index_current` would rebuild — a write),
-    /// - the model manifest is not yet current (`ensure_model_manifest` would write).
+    /// Returns `Ok(None)` when opening read-only fails, migration or repo registration is owed,
+    /// or any paired repair in [`ON_OPEN_HEALS`] is owed. The caller falls back to `open_config`.
     ///
     /// The temp-scope view (`set_context` → `install_scope_view`) is still installed: it writes
     /// only the per-connection `temp.*` database, which is writable even on a read-only main DB.
@@ -436,23 +506,12 @@ impl IndexDatabase {
         // SIBLING in a consolidated DB and would make them falsely report a heal is owed under an
         // empty scope. The graph / generated-flags gates read `repo_id` explicitly.
         db.set_context(checkout.borrowed())?;
-        let conn = db.storage.connection();
-        if db.active_derivation_rows_owed()? {
-            return Ok(None);
-        }
-        // A stale generated-flags version owes a re-derive (a write); fall back to read-write so it
-        // heals once, after which reads are lock-free again (#202, same posture as the graph gate).
-        if read_meta(conn, GENERATED_FLAGS_VERSION_KEY)?.as_deref() != Some(GENERATED_FLAGS_VERSION)
-        {
-            return Ok(None);
-        }
-        if !ai::model_manifest_is_current(conn)? {
-            return Ok(None);
-        }
-        // A fresh index owes an active-embedding-model seed from config (a write); fall back to the
-        // read-write open so it heals once (#394, same posture as the manifest / graph gates).
-        if ai::active_embedding_model_seed_owed(conn, config.llm.embedding.backend.model_id())? {
-            return Ok(None);
+        let mut heals: Vec<_> = ON_OPEN_HEALS.iter().collect();
+        heals.sort_by_key(|heal| heal.read_order);
+        for heal in heals {
+            if (heal.owed)(&db, config)? {
+                return Ok(None);
+            }
         }
         Ok(Some(db))
     }
@@ -835,10 +894,6 @@ pub fn install_scope_view(
     write_scope_view(conn, &ScopeContext { repo_id: &repo_id, checkout, generation })
 }
 
-/// Installs the per-connection repo/commit/worktree scoping view; callers query `files` afterward
-/// and see only the active context. The `files` view filters on `repo_id` FIRST (A3) so a
-/// consolidated DB never leaks another repo's rows through the view — every read path that goes
-/// through `temp.files` is repo-scoped for free.
 /// Install the connection's scope, ALL-OR-NOTHING.
 ///
 /// The view body reads `temp.connection_context` through sub-selects at query time, so writing
@@ -860,6 +915,14 @@ fn write_scope_view(conn: &rusqlite::Connection, ctx: &ScopeContext<'_>) -> rusq
     }
 }
 
+const SCOPED_FILES_COLUMNS: &str = "id, path, language, kind, sha256, modified_at_ms, generated, \
+                                    indexed_at_ms, indexed_revision, commit_sha, worktree_id, \
+                                    has_test_code, graph_version, scope_version";
+
+/// Installs the per-connection repo/commit/worktree scoping view; callers query `files` afterward
+/// and see only the active context. The `files` view filters on `repo_id` FIRST (A3) so a
+/// consolidated DB never leaks another repo's rows through the view — every read path that goes
+/// through `temp.files` is repo-scoped for free.
 fn write_scope_view_inner(
     conn: &rusqlite::Connection,
     ctx: &ScopeContext<'_>,
@@ -873,8 +936,8 @@ fn write_scope_view_inner(
     let mut stmt =
         conn.prepare("INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES (?1, ?2)")?;
     stmt.execute(params![schema::CONNECTION_CONTEXT_REPO_KEY, ctx.repo_id])?;
-    stmt.execute(params!["commit_sha", ctx.checkout.commit_sha])?;
-    stmt.execute(params!["worktree_id", ctx.checkout.worktree_id])?;
+    stmt.execute(params![CONNECTION_CONTEXT_COMMIT_KEY, ctx.checkout.commit_sha])?;
+    stmt.execute(params![CONNECTION_CONTEXT_WORKTREE_KEY, ctx.checkout.worktree_id])?;
     // A6: the file generation the view filters on. Stored as TEXT beside the other context keys;
     // the INTEGER `generation` column's numeric affinity coerces it back in the comparisons
     // below.
@@ -887,38 +950,40 @@ fn write_scope_view_inner(
     // the `generation` predicate keeps a superseded full-rebuild generation (dead until gc sweeps
     // it) out, so a reader sees the COMPLETE old generation until the rebuild flips
     // `live_files_generation`, then the complete new one — never a half-built mix.
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "
             DROP VIEW IF EXISTS temp.files;
             CREATE TEMP VIEW temp.files AS
-            SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-         indexed_revision, commit_sha, worktree_id, has_test_code, graph_version, scope_version
+            SELECT {SCOPED_FILES_COLUMNS}
             FROM main.files
-            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = \
+         '{CONNECTION_CONTEXT_REPO_KEY}')
               AND generation = (SELECT value FROM temp.connection_context WHERE key = \
-         'files_generation')
+         '{CONNECTION_CONTEXT_GENERATION_KEY}')
               AND worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
-         'worktree_id') AND worktree_id != '' AND kind != 'deleted'
+         '{CONNECTION_CONTEXT_WORKTREE_KEY}') AND worktree_id != '' AND kind != 'deleted'
             UNION ALL
-            SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-         indexed_revision, commit_sha, worktree_id, has_test_code, graph_version, scope_version
+            SELECT {SCOPED_FILES_COLUMNS}
             FROM main.files
-            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = \
+         '{CONNECTION_CONTEXT_REPO_KEY}')
               AND generation = (SELECT value FROM temp.connection_context WHERE key = \
-         'files_generation')
-              AND commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
+         '{CONNECTION_CONTEXT_GENERATION_KEY}')
+              AND commit_sha = (SELECT value FROM temp.connection_context WHERE key = \
+         '{CONNECTION_CONTEXT_COMMIT_KEY}')
               AND commit_sha != ''
               AND path NOT IN (
                   SELECT path FROM main.files
-                  WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+                  WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = \
+         '{CONNECTION_CONTEXT_REPO_KEY}')
                     AND generation = (SELECT value FROM temp.connection_context WHERE key = \
-         'files_generation')
+         '{CONNECTION_CONTEXT_GENERATION_KEY}')
                     AND worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
-         'worktree_id')
+         '{CONNECTION_CONTEXT_WORKTREE_KEY}')
                     AND worktree_id != ''
               );
-        ",
-    )?;
+        "
+    ))?;
 
     Ok(())
 }
@@ -944,22 +1009,22 @@ fn write_repo_generation_view(
     let mut stmt =
         conn.prepare("INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES (?1, ?2)")?;
     stmt.execute(params![schema::CONNECTION_CONTEXT_REPO_KEY, repo_id])?;
-    stmt.execute(params!["commit_sha", ""])?;
-    stmt.execute(params!["worktree_id", ""])?;
+    stmt.execute(params![CONNECTION_CONTEXT_COMMIT_KEY, ""])?;
+    stmt.execute(params![CONNECTION_CONTEXT_WORKTREE_KEY, ""])?;
     stmt.execute(params![schema::CONNECTION_CONTEXT_GENERATION_KEY, generation.to_string()])?;
     drop(stmt);
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "
             DROP VIEW IF EXISTS temp.files;
             CREATE TEMP VIEW temp.files AS
-            SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-         indexed_revision, commit_sha, worktree_id, has_test_code, graph_version, scope_version
+            SELECT {SCOPED_FILES_COLUMNS}
             FROM main.files
-            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = \
+         '{CONNECTION_CONTEXT_REPO_KEY}')
               AND generation = (SELECT value FROM temp.connection_context WHERE key = \
-         'files_generation');
-        ",
-    )?;
+         '{CONNECTION_CONTEXT_GENERATION_KEY}');
+        "
+    ))?;
     Ok(())
 }
 
@@ -1086,5 +1151,25 @@ mod global_store_overview_tests {
         assert_eq!(repo.roots, vec!["/src/demo".to_string()]);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod on_open_heal_tests {
+    use super::*;
+    #[test]
+    fn heal_registry_pins_order_and_bare_subset() {
+        assert_eq!(ON_OPEN_HEALS.iter().map(|heal| heal.name).collect::<Vec<_>>(), [
+            "model manifest",
+            "graph index",
+            "generated flags",
+            "active embedding model"
+        ]);
+        let bare: Vec<_> = ON_OPEN_HEALS
+            .iter()
+            .filter(|heal| heal.bare_phase.is_some())
+            .map(|heal| heal.name)
+            .collect();
+        assert_eq!(bare, ["model manifest", "graph index", "generated flags"]);
     }
 }

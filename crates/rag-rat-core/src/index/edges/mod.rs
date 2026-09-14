@@ -27,6 +27,7 @@ pub(crate) use helpers::{
 pub(crate) use imports::scan_packages;
 use intern::{OptSym, StrArena, Sym};
 use rag_rat_base::language::Language;
+use rag_rat_db::EdgeConfidence;
 pub(crate) use resolve::{
     resolve_all_edges, resolve_and_insert_edges, resolve_changed_edges, resolve_overlay_edges,
 };
@@ -171,25 +172,6 @@ pub(crate) fn assert_hidden_agrees_with_visibility(conn: &rusqlite::Connection) 
         disagreeing, 0,
         "edges_data.hidden must match the visibility predicate on every row"
     );
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub enum EdgeConfidence {
-    Exact,
-    Syntactic,
-    NameOnly,
-    Ambiguous,
-}
-
-impl EdgeConfidence {
-    pub fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Exact => "Exact",
-            Self::Syntactic => "Syntactic",
-            Self::NameOnly => "NameOnly",
-            Self::Ambiguous => "Ambiguous",
-        }
-    }
 }
 
 /// Which resolution stage bound an edge — persisted as `edges_data.resolution_id`.

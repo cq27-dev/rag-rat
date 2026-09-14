@@ -79,6 +79,27 @@ const DELTA_SQL_CHUNK: usize = 400;
 /// more than one clean generation build).
 pub const CLONE_DELTA_MAX_FILES: usize = 64;
 
+/// Closed status tokens shared by clone-delta reports and their consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum CloneDeltaStatus {
+    Applied,
+    Noop,
+    NotEligible,
+    Escalate,
+}
+
+impl CloneDeltaStatus {
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        value.parse().ok()
+    }
+}
+
 /// Outcome of one [`IndexDatabase::apply_clone_graph_delta`] attempt. `status`:
 /// - `Applied` — the live generation now matches `content_revision()`; counts say what changed.
 /// - `Noop` — already current, nothing to do.
@@ -89,7 +110,7 @@ pub const CLONE_DELTA_MAX_FILES: usize = 64;
 ///   a full rebuild instead. Nothing was written.
 #[derive(Debug, Clone, Serialize)]
 pub struct CloneDeltaReport {
-    pub status: String,
+    pub status: CloneDeltaStatus,
     pub reason: Option<String>,
     pub files_changed: u64,
     pub edges_added: u64,
@@ -198,14 +219,28 @@ impl IndexDatabase {
         // Eligibility — anything here sends the caller to the full-rebuild path instead.
         if self.active_scope_is_linked_overlay() {
             // The graph is built in the BASE scope only (see `clone_check_indexed_generation`).
-            return Ok(report("NotEligible", Some("linked-overlay scope"), 0, 0, 0, started));
+            return Ok(report(
+                CloneDeltaStatus::NotEligible,
+                Some("linked-overlay scope"),
+                0,
+                0,
+                0,
+                started,
+            ));
         }
         let Some(live) = live_generation_row(conn)? else {
-            return Ok(report("NotEligible", Some("no live generation"), 0, 0, 0, started));
+            return Ok(report(
+                CloneDeltaStatus::NotEligible,
+                Some("no live generation"),
+                0,
+                0,
+                0,
+                started,
+            ));
         };
         if live.normalizer_version != NORM_VERSION || !live.postings_written {
             return Ok(report(
-                "NotEligible",
+                CloneDeltaStatus::NotEligible,
                 Some("live generation predates the current normalizer or postings"),
                 0,
                 0,
@@ -217,7 +252,7 @@ impl IndexDatabase {
             // A partial full build is owed; patching the live generation now would race its
             // eventual publish. Let the full-rebuild path finish (or discard) it.
             return Ok(report(
-                "NotEligible",
+                CloneDeltaStatus::NotEligible,
                 Some("a full rebuild is in flight"),
                 0,
                 0,
@@ -230,7 +265,7 @@ impl IndexDatabase {
             // the epoch rows the build order is unrecoverable, and patching under a different
             // order would silently drop edges. One full rebuild re-pins it.
             return Ok(report(
-                "NotEligible",
+                CloneDeltaStatus::NotEligible,
                 Some("live generation has no df epoch (pre-epoch build)"),
                 0,
                 0,
@@ -252,7 +287,7 @@ impl IndexDatabase {
         if live.source_revision == revision && !hint.scans_when_revision_unchanged() {
             return Ok(CloneDeltaReport {
                 full_rebuild_owed: live.delta_files_applied >= CLONE_GRAPH_DRIFT_REBUILD_FILES,
-                ..report("Noop", None, 0, 0, 0, started)
+                ..report(CloneDeltaStatus::Noop, None, 0, 0, 0, started)
             });
         }
         let generation = live.generation;
@@ -271,7 +306,7 @@ impl IndexDatabase {
         };
         if paths.len() > max_files {
             return Ok(report(
-                "Escalate",
+                CloneDeltaStatus::Escalate,
                 Some("more changed files than the delta cap — a full rebuild is cheaper"),
                 paths.len() as u64,
                 0,
@@ -295,7 +330,14 @@ impl IndexDatabase {
             }
             return Ok(CloneDeltaReport {
                 full_rebuild_owed: drift_after(0),
-                ..report(if repinned { "Applied" } else { "Noop" }, None, 0, 0, 0, started)
+                ..report(
+                    if repinned { CloneDeltaStatus::Applied } else { CloneDeltaStatus::Noop },
+                    None,
+                    0,
+                    0,
+                    0,
+                    started,
+                )
             });
         }
 
@@ -363,7 +405,7 @@ impl IndexDatabase {
                     posting_rows_requested: hydrator.posting_rows_requested,
                     posting_rows_fetched: hydrator.posting_rows_fetched,
                     ..report(
-                        "Escalate",
+                        CloneDeltaStatus::Escalate,
                         Some(
                             "posting hydration exceeded the delta work budget — a full rebuild is \
                              cheaper",
@@ -529,7 +571,7 @@ impl IndexDatabase {
                     posting_rows_requested: hydrator.posting_rows_requested,
                     posting_rows_fetched: hydrator.posting_rows_fetched,
                     ..report(
-                        "Applied",
+                        CloneDeltaStatus::Applied,
                         None,
                         paths.len() as u64,
                         edges_added,
@@ -547,7 +589,7 @@ impl IndexDatabase {
 }
 
 fn report(
-    status: &str,
+    status: CloneDeltaStatus,
     reason: Option<&str>,
     files_changed: u64,
     edges_added: u64,
@@ -555,7 +597,7 @@ fn report(
     started: Instant,
 ) -> CloneDeltaReport {
     CloneDeltaReport {
-        status: status.to_string(),
+        status,
         reason: reason.map(str::to_string),
         files_changed,
         edges_added,
@@ -1006,10 +1048,26 @@ impl<'a> CandidateHydrator<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn clone_delta_status_tokens_are_stable() {
+        for (status, token) in [
+            (CloneDeltaStatus::Applied, "Applied"),
+            (CloneDeltaStatus::Noop, "Noop"),
+            (CloneDeltaStatus::NotEligible, "NotEligible"),
+            (CloneDeltaStatus::Escalate, "Escalate"),
+        ] {
+            assert_eq!(status.as_db_str(), token);
+            assert_eq!(CloneDeltaStatus::from_db_str(token), Some(status));
+            assert_eq!(serde_json::to_value(status).unwrap(), token);
+        }
+        assert_eq!(CloneDeltaStatus::from_db_str("future-token"), None);
+    }
+
     use super::super::precompute::tests::{clone_fixture_config, edge_keys};
     use super::{
-        BTreeSet, CLONE_PRECOMPUTE_THETA, CloneDeltaHint, load_scoped_baseline_bags_for_paths,
-        params, sub_block_tokens,
+        BTreeSet, CLONE_PRECOMPUTE_THETA, CloneDeltaHint, CloneDeltaStatus,
+        load_scoped_baseline_bags_for_paths, params, sub_block_tokens,
     };
     use crate::index::query_api::clones::precompute::CloneEdgeOptions;
 
@@ -1069,7 +1127,11 @@ mod tests {
             }
             let db = reindex(&config);
             let report = db.apply_clone_graph_delta(64).unwrap();
-            assert_eq!(report.status, "Applied", "delta applies for {path}: {report:?}");
+            assert_eq!(
+                report.status,
+                CloneDeltaStatus::Applied,
+                "delta applies for {path}: {report:?}"
+            );
             let delta_edges = edge_keys(&db);
             let rebuilt_edges = force_rebuild_edges(&db);
             assert_eq!(
@@ -1086,7 +1148,7 @@ mod tests {
         )
         .unwrap();
         let db = reindex(&config);
-        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, "Applied");
+        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, CloneDeltaStatus::Applied);
         drop(db);
         std::fs::write(
             config.root.join("src/c.rs"),
@@ -1095,7 +1157,7 @@ mod tests {
         )
         .unwrap();
         let db = reindex(&config);
-        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, "Applied");
+        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, CloneDeltaStatus::Applied);
         let delta_edges = edge_keys(&db);
         let rebuilt_edges = force_rebuild_edges(&db);
         assert_eq!(delta_edges, rebuilt_edges, "compound deltas stay parity-equal");
@@ -1121,7 +1183,7 @@ mod tests {
         )
         .unwrap();
         let db = reindex(&config);
-        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, "Applied");
+        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, CloneDeltaStatus::Applied);
         let delta_edges = edge_keys(&db);
         let rebuilt_edges = force_rebuild_edges(&db);
         assert_eq!(
@@ -1154,7 +1216,7 @@ mod tests {
         )
         .unwrap();
         let db = reindex(&config);
-        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, "Applied");
+        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, CloneDeltaStatus::Applied);
 
         let conn = db.storage.connection();
         let paths = vec![touched.clone()];
@@ -1200,7 +1262,7 @@ mod tests {
         let config = clone_fixture_config("delta-noop");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
         assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
-        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, "Noop");
+        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, CloneDeltaStatus::Noop);
         drop(db);
 
         std::fs::write(
@@ -1210,10 +1272,10 @@ mod tests {
         .unwrap();
         let db = reindex(&config);
         let applied = db.apply_clone_graph_delta(64).unwrap();
-        assert_eq!(applied.status, "Applied");
+        assert_eq!(applied.status, CloneDeltaStatus::Applied);
         assert_eq!(applied.files_changed, 1, "exactly the touched file: {applied:?}");
         let again = db.apply_clone_graph_delta(64).unwrap();
-        assert_eq!(again.status, "Noop", "an applied delta leaves nothing owed");
+        assert_eq!(again.status, CloneDeltaStatus::Noop, "an applied delta leaves nothing owed");
         assert_eq!(again.edges_added + again.edges_removed, 0);
     }
 
@@ -1224,7 +1286,7 @@ mod tests {
         let config = clone_fixture_config("delta-no-gen");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
         let report = db.apply_clone_graph_delta(64).unwrap();
-        assert_eq!(report.status, "NotEligible", "{report:?}");
+        assert_eq!(report.status, CloneDeltaStatus::NotEligible, "{report:?}");
     }
 
     /// The remaining eligibility gates: a postings-stale live generation (pre-upgrade or
@@ -1240,7 +1302,11 @@ mod tests {
 
         conn.execute("UPDATE clone_graph_generations SET postings_written = 0", []).unwrap();
         let report = db.apply_clone_graph_delta(64).unwrap();
-        assert_eq!(report.status, "NotEligible", "postings-stale generation: {report:?}");
+        assert_eq!(
+            report.status,
+            CloneDeltaStatus::NotEligible,
+            "postings-stale generation: {report:?}"
+        );
         conn.execute("UPDATE clone_graph_generations SET postings_written = 1", []).unwrap();
 
         // An in-flight (Building) generation means a full rebuild is owed — patching the live
@@ -1254,7 +1320,11 @@ mod tests {
         )
         .unwrap();
         let report = db.apply_clone_graph_delta(64).unwrap();
-        assert_eq!(report.status, "NotEligible", "in-flight full rebuild: {report:?}");
+        assert_eq!(
+            report.status,
+            CloneDeltaStatus::NotEligible,
+            "in-flight full rebuild: {report:?}"
+        );
     }
 
     /// A content-revision move with NO clone-relevant file change (a new file with no
@@ -1273,7 +1343,7 @@ mod tests {
         std::fs::write(config.root.join("src/j.rs"), "pub struct MarkerOnly;\n").unwrap();
         let db = reindex(&config);
         let report = db.apply_clone_graph_delta(64).unwrap();
-        assert_eq!(report.status, "Applied", "{report:?}");
+        assert_eq!(report.status, CloneDeltaStatus::Applied, "{report:?}");
         assert_eq!(report.files_changed, 0, "no clone-relevant file changed");
         assert_eq!(report.edges_added + report.edges_removed, 0);
         assert_eq!(edge_keys(&db), edges_before, "the graph itself is untouched");
@@ -1298,7 +1368,7 @@ mod tests {
         .unwrap();
         let db = reindex(&config);
         let report = db.apply_clone_graph_delta(0).unwrap();
-        assert_eq!(report.status, "Escalate", "{report:?}");
+        assert_eq!(report.status, CloneDeltaStatus::Escalate, "{report:?}");
         assert_eq!(edge_keys(&db), edges_before, "an escalated delta writes nothing");
     }
 
@@ -1382,7 +1452,7 @@ mod tests {
         std::fs::write(config.root.join("src/a.rs"), text).unwrap();
         let db = reindex(&config);
         let report = db.apply_clone_graph_delta(64).unwrap();
-        assert_eq!(report.status, "Applied", "{report:?}");
+        assert_eq!(report.status, CloneDeltaStatus::Applied, "{report:?}");
         let delta_edges = edge_keys(&db);
         let rebuilt_edges = force_rebuild_edges(&db);
         assert_eq!(
@@ -1542,7 +1612,7 @@ mod tests {
             db.clone_check_indexed_generation().unwrap().is_none(),
             "stale revision → write-time fast path ineligible before the delta"
         );
-        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, "Applied");
+        assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, CloneDeltaStatus::Applied);
         assert!(
             db.clone_check_indexed_generation().unwrap().is_some(),
             "the applied delta restores exact freshness (source_revision == content_revision)"
@@ -1584,7 +1654,11 @@ mod tests {
         let before = edge_keys(&db);
 
         let report = db.apply_clone_graph_delta_with_budget(64, 0).unwrap();
-        assert_eq!(report.status, "Escalate", "budget exhaustion escalates: {report:?}");
+        assert_eq!(
+            report.status,
+            CloneDeltaStatus::Escalate,
+            "budget exhaustion escalates: {report:?}"
+        );
         assert!(
             report.reason.as_deref().is_some_and(|r| r.contains("work budget")),
             "the reason names the work budget: {report:?}"
@@ -1594,7 +1668,7 @@ mod tests {
 
         // The default budget applies the same delta — the bail is about pathology, not size 1.
         let report = db.apply_clone_graph_delta(64).unwrap();
-        assert_eq!(report.status, "Applied", "{report:?}");
+        assert_eq!(report.status, CloneDeltaStatus::Applied, "{report:?}");
     }
 
     /// #598: posting lists are hydrated ONCE per token per delta application — bags sharing hot
@@ -1621,7 +1695,7 @@ mod tests {
         let db = reindex(&config);
 
         let report = db.apply_clone_graph_delta(64).unwrap();
-        assert_eq!(report.status, "Applied", "{report:?}");
+        assert_eq!(report.status, CloneDeltaStatus::Applied, "{report:?}");
         assert!(report.posting_rows_fetched > 0, "hydration touched the postings: {report:?}");
         assert!(
             report.posting_rows_fetched < report.posting_rows_requested,
@@ -1761,7 +1835,7 @@ mod tests {
             let db = reindex(&config);
             assert_eq!(
                 db.apply_clone_graph_delta(64).unwrap().status,
-                "Applied",
+                CloneDeltaStatus::Applied,
                 "delta for {path}"
             );
             cached_matches_scan(&db);
@@ -1818,8 +1892,8 @@ mod tests {
             hint_db.apply_clone_graph_delta_hinted(64, CloneDeltaHint::Paths(&touched)).unwrap();
         let hint_edges = edge_keys(&hint_db);
 
-        assert_eq!(scan_report.status, "Applied", "scan applied: {scan_report:?}");
-        assert_eq!(hint_report.status, "Applied", "hint applied: {hint_report:?}");
+        assert_eq!(scan_report.status, CloneDeltaStatus::Applied, "scan applied: {scan_report:?}");
+        assert_eq!(hint_report.status, CloneDeltaStatus::Applied, "hint applied: {hint_report:?}");
         assert_eq!(
             (hint_report.files_changed, hint_report.edges_added, hint_report.edges_removed),
             (scan_report.files_changed, scan_report.edges_added, scan_report.edges_removed),
@@ -1855,7 +1929,7 @@ mod tests {
         let touched: BTreeSet<String> = ["src/j.rs"].iter().map(|s| s.to_string()).collect();
         let report =
             db.apply_clone_graph_delta_hinted(64, CloneDeltaHint::Paths(&touched)).unwrap();
-        assert_eq!(report.status, "Applied", "{report:?}");
+        assert_eq!(report.status, CloneDeltaStatus::Applied, "{report:?}");
         assert_eq!(report.files_changed, 0, "no clone-relevant path in the hint");
         assert_eq!(report.edges_added + report.edges_removed, 0);
         assert_eq!(edge_keys(&db), edges_before, "the graph itself is untouched");
@@ -1911,7 +1985,11 @@ mod tests {
 
         // A plain FullScan honors the revision-equality fast path: Noop, drift left in place.
         let full = db.apply_clone_graph_delta_hinted(64, CloneDeltaHint::FullScan).unwrap();
-        assert_eq!(full.status, "Noop", "FullScan Noops when the revision is unchanged: {full:?}");
+        assert_eq!(
+            full.status,
+            CloneDeltaStatus::Noop,
+            "FullScan Noops when the revision is unchanged: {full:?}"
+        );
         assert!(
             postings_for(&db) > 0,
             "FullScan left the stale postings — the gap SelfHeal closes"
@@ -1919,7 +1997,11 @@ mod tests {
 
         // SelfHeal scans past the early return and drops the now-ineligible file's postings.
         let heal = db.apply_clone_graph_delta_hinted(64, CloneDeltaHint::SelfHeal).unwrap();
-        assert_eq!(heal.status, "Applied", "SelfHeal applies the drift repair: {heal:?}");
+        assert_eq!(
+            heal.status,
+            CloneDeltaStatus::Applied,
+            "SelfHeal applies the drift repair: {heal:?}"
+        );
         assert_eq!(postings_for(&db), 0, "SelfHeal removed the generated file's stale postings");
     }
 
@@ -1958,7 +2040,8 @@ mod tests {
         // (unmoved) revision — the watcher's `force_revision_neutral_rebuild` condition.
         let report = db.apply_clone_graph_delta_hinted(1, CloneDeltaHint::SelfHeal).unwrap();
         assert_eq!(
-            report.status, "Escalate",
+            report.status,
+            CloneDeltaStatus::Escalate,
             "oversized revision-neutral drift escalates: {report:?}"
         );
         assert!(

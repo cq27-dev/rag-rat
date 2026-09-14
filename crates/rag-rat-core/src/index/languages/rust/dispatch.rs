@@ -4,6 +4,7 @@
 //! `scoped_identifier_in_value_position`, `rust_dispatch_handle_facts`); everything else is the
 //! CLOSED conservative handler-call recognizer (`result_handler_calls` & friends) whose
 //! false-edge-is-a-bug contract is documented in the repo memories bound here and on the parent.
+use rag_rat_db::EdgeConfidence;
 use tree_sitter::Node;
 use unicode_ident::is_xid_continue;
 

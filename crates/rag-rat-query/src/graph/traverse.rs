@@ -1,3 +1,5 @@
+use rag_rat_db::EdgeConfidence;
+
 use super::*;
 
 pub fn traverse(
@@ -19,40 +21,20 @@ pub fn traverse_with_options(
     let quoted = quoted_placeholders(edge_kinds.len());
     let unique_short_name = unique_symbol_name(conn, short_name(symbol))?;
     let mode = options.resolution_mode;
+    let confidence_order = EdgeConfidence::order_sql();
     let sql = match direction {
         Direction::Callers => {
             let oracle_edge_ids = reverse_oracle_seeded_edge_ids(conn, symbol, options)?;
             let predicate =
                 reverse_predicate(mode, options.logical_symbol_id.is_some(), &oracle_edge_ids);
             let tier = reverse_tier(mode, &oracle_edge_ids);
+            let hop_select = hop_select_sql(&tier);
             format!(
-                "
-            SELECT COALESCE(from_qn.value, edges.from_name) AS from_symbol,
-                   COALESCE(to_qn.value, edges.to_name) AS to_symbol,
-                   edges.id AS edge_id,
-                   edges.edge_kind AS edge_kind,
-                   edges.confidence AS confidence,
-                   edges.to_name AS target,
-                   edges.target_qualified_name AS target_qualified_name,
-                   edges.evidence AS evidence,
-                   edges.receiver_hint AS receiver_hint,
-                   edges.resolution AS edge_resolution,
-                   edges.to_symbol_id IS NOT NULL AS verified_target_symbol,
-                   source_files.path AS callsite_path,
-                   COALESCE(NULLIF(edges.source_start_line, 0), 1) AS callsite_start_line,
-                   COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), \
-                 1) AS callsite_end_line,
-                   {tier} AS match_tier
-            FROM edges
-            JOIN files source_files ON source_files.id = edges.source_file_id
-            LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
-            LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
-            LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
-            LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id
+                "{hop_select}
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
             ORDER BY match_tier,
-                {CONFIDENCE_ORDER_SQL},
+                {confidence_order},
                 edges.edge_kind,
                 edges.from_name
             LIMIT ?5
@@ -63,36 +45,15 @@ pub fn traverse_with_options(
             let predicate = forward_source_predicate(mode, options.logical_symbol_id.is_some());
             let target_filter = forward_target_filter(mode, options);
             let visibility_filter = forward_visibility_filter(options);
+            let hop_select = hop_select_sql("0");
             format!(
-                "
-            SELECT COALESCE(from_qn.value, edges.from_name) AS from_symbol,
-                   COALESCE(to_qn.value, edges.to_name) AS to_symbol,
-                   edges.id AS edge_id,
-                   edges.edge_kind AS edge_kind,
-                   edges.confidence AS confidence,
-                   edges.to_name AS target,
-                   edges.target_qualified_name AS target_qualified_name,
-                   edges.evidence AS evidence,
-                   edges.receiver_hint AS receiver_hint,
-                   edges.resolution AS edge_resolution,
-                   edges.to_symbol_id IS NOT NULL AS verified_target_symbol,
-                   source_files.path AS callsite_path,
-                   COALESCE(NULLIF(edges.source_start_line, 0), 1) AS callsite_start_line,
-                   COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), \
-                 1) AS callsite_end_line,
-                   0 AS match_tier
-            FROM edges
-            JOIN files source_files ON source_files.id = edges.source_file_id
-            LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
-            LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
-            LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
-            LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id
+                "{hop_select}
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
               AND ({target_filter})
               AND ({visibility_filter})
             ORDER BY
-                {CONFIDENCE_ORDER_SQL},
+                {confidence_order},
                 edges.edge_kind,
                 edges.to_name
             LIMIT ?5
@@ -168,6 +129,55 @@ pub(crate) fn dedupe_hops(hops: &mut Vec<GraphHop>) {
         ))
     });
 }
+/// The column list and joins every traversal hop row is read through, shared by both directions so
+/// the row mapper's column names hold for each. Only `match_tier` differs: the callers arm ranks
+/// its candidates by `tier`, the callees arm passes `0`. Carries both the `from_qn` and `to_qn`
+/// joins the `#224 ALIAS CONTRACT` in `predicates` requires.
+fn hop_select_sql(tier: &str) -> String {
+    format!(
+        "
+            SELECT COALESCE(from_qn.value, edges.from_name) AS from_symbol,
+                   COALESCE(to_qn.value, edges.to_name) AS to_symbol,
+                   edges.id AS edge_id,
+                   edges.edge_kind AS edge_kind,
+                   edges.confidence AS confidence,
+                   edges.to_name AS target,
+                   edges.target_qualified_name AS target_qualified_name,
+                   edges.evidence AS evidence,
+                   edges.receiver_hint AS receiver_hint,
+                   edges.resolution AS edge_resolution,
+                   edges.to_symbol_id IS NOT NULL AS verified_target_symbol,
+                   source_files.path AS callsite_path,
+                   COALESCE(NULLIF(edges.source_start_line, 0), 1) AS callsite_start_line,
+                   COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), \
+         1) AS callsite_end_line,
+                   {tier} AS match_tier
+            FROM edges
+            JOIN files source_files ON source_files.id = edges.source_file_id
+            LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
+            LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
+            LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
+            LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id"
+    )
+}
+
+/// The traversal summary's bucket counts, in the column order its row mapper reads: total,
+/// resolved, the three heuristic confidence buckets, unresolved, and compiler-verified.
+/// `heuristic` prefixes each heuristic bucket's condition (an `… AND ` excluding compiler-seeded
+/// rows, or empty) and `compiler_verified` is the compiler bucket's expression.
+fn traversal_confidence_counts_sql(heuristic: &str, compiler_verified: &str) -> String {
+    format!(
+        "
+                COUNT(*),
+                SUM(CASE WHEN edges.to_symbol_id IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {heuristic}edges.confidence = 'Syntactic' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {heuristic}edges.confidence = 'NameOnly' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {heuristic}edges.confidence = 'Ambiguous' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {heuristic}edges.to_symbol_id IS NULL THEN 1 ELSE 0 END),
+                {compiler_verified}"
+    )
+}
+
 pub fn traversal_summary(
     conn: &Connection,
     symbol: &str,
@@ -206,16 +216,10 @@ pub fn traversal_summary(
             };
             let heuristic =
                 compiler_only.as_ref().map(|expr| format!("NOT {expr} AND ")).unwrap_or_default();
+            let counts = traversal_confidence_counts_sql(&heuristic, &compiler_verified);
             format!(
                 "
-            SELECT
-                COUNT(*),
-                SUM(CASE WHEN edges.to_symbol_id IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN {heuristic}edges.confidence = 'Syntactic' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN {heuristic}edges.confidence = 'NameOnly' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN {heuristic}edges.confidence = 'Ambiguous' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN {heuristic}edges.to_symbol_id IS NULL THEN 1 ELSE 0 END),
-                {compiler_verified}
+            SELECT{counts}
             FROM edges
             JOIN files source_files ON source_files.id = edges.source_file_id
             LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
@@ -229,16 +233,10 @@ pub fn traversal_summary(
             let predicate = forward_source_predicate(mode, options.logical_symbol_id.is_some());
             let target_filter = forward_target_filter(mode, options);
             let visibility_filter = forward_visibility_filter(options);
+            let counts = traversal_confidence_counts_sql("", "0");
             format!(
                 "
-            SELECT
-                COUNT(*),
-                SUM(CASE WHEN edges.to_symbol_id IS NOT NULL THEN 1 ELSE 0 END),
-                SUM(CASE WHEN edges.confidence = 'Syntactic' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN edges.confidence = 'NameOnly' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN edges.confidence = 'Ambiguous' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN edges.to_symbol_id IS NULL THEN 1 ELSE 0 END),
-                0
+            SELECT{counts}
             FROM edges
             JOIN files source_files ON source_files.id = edges.source_file_id
             LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
@@ -304,29 +302,25 @@ pub(crate) fn count_col(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Resu
 /// snake_case form used everywhere in tool output, so graph traversal, read_chunk, and search all
 /// serialize confidence identically.
 pub fn normalize_confidence(value: &str) -> &'static str {
-    match value {
-        "Exact" => "exact",
-        "Syntactic" => "syntactic",
-        "NameOnly" => "name_only",
-        "Ambiguous" => "ambiguous",
-        _ => "name_only",
-    }
+    // An unknown stored token reads as `name_only`.
+    EdgeConfidence::from_db_str(value).unwrap_or(EdgeConfidence::NameOnly).normalized()
 }
 /// Effective confidence ordering AFTER oracle enrichment, lowest rank = highest priority (so a
 /// stable ascending sort puts the strongest tier first). `compiler` (the SCIP oracle tier) ranks
 /// ABOVE `exact` — that is the whole point of the tier — then the heuristic ladder. Unknown strings
 /// rank last so a future tier can't silently jump the queue. Used to re-sort the overfetched
 /// candidate set before truncating to the caller's limit, so a compiler-upgraded low-confidence
-/// edge isn't dropped by the heuristic `LIMIT` (#82 finding 4).
+/// edge isn't dropped by the heuristic `LIMIT` (#82 finding 4). The heuristic tiers sit one below
+/// [`EdgeConfidence::rank`] — the ladder [`EdgeConfidence::order_sql`] orders SQL by — which
+/// `confidence_order_sql_agrees_with_effective_confidence_rank` pins.
 pub fn effective_confidence_rank(confidence: &str) -> u8 {
-    match confidence {
-        "compiler" => 0,
-        "exact" => 1,
-        "syntactic" => 2,
-        "name_only" => 3,
-        "ambiguous" => 4,
-        _ => 5,
+    if confidence == "compiler" {
+        return 0;
     }
+    <EdgeConfidence as strum::VariantArray>::VARIANTS
+        .iter()
+        .find(|tier| tier.normalized() == confidence)
+        .map_or(5, |tier| tier.rank() + 1)
 }
 /// The overfetch cap for an oracle-aware traversal: traverse this many heuristic candidates so a
 /// compiler-upgraded low-confidence edge — which the heuristic ranks below the `limit` cutoff — is
@@ -458,4 +452,107 @@ pub(crate) fn hidden_unresolved_candidate_count(
     let params = traversal_params(symbol, 0, edge_kinds, options, unique_short_name);
     let count = conn.query_row(&sql, params_from_iter(params), |row| count_col(row, 0))?;
     Ok(count)
+}
+
+#[cfg(test)]
+mod sql_tests {
+    use super::{hop_select_sql, traversal_confidence_counts_sql};
+
+    // These are the original direction-specific fragments, including whitespace. A shared
+    // SELECT must preserve the row mapper's contract and the indexed seed query shape.
+    #[test]
+    fn shared_hop_select_preserves_both_direction_strings() {
+        for tier in ["0", "1", "CASE WHEN edges.to_symbol_id IS NULL THEN 2 ELSE 0 END"] {
+            assert_eq!(
+                hop_select_sql(tier),
+                format!(
+                    "
+            SELECT COALESCE(from_qn.value, edges.from_name) AS from_symbol,
+                   COALESCE(to_qn.value, edges.to_name) AS to_symbol,
+                   edges.id AS edge_id,
+                   edges.edge_kind AS edge_kind,
+                   edges.confidence AS confidence,
+                   edges.to_name AS target,
+                   edges.target_qualified_name AS target_qualified_name,
+                   edges.evidence AS evidence,
+                   edges.receiver_hint AS receiver_hint,
+                   edges.resolution AS edge_resolution,
+                   edges.to_symbol_id IS NOT NULL AS verified_target_symbol,
+                   source_files.path AS callsite_path,
+                   COALESCE(NULLIF(edges.source_start_line, 0), 1) AS callsite_start_line,
+                   COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), \
+                     1) AS callsite_end_line,
+                   {tier} AS match_tier
+            FROM edges
+            JOIN files source_files ON source_files.id = edges.source_file_id
+            LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
+            LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
+            LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
+            LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id"
+                )
+            );
+        }
+        assert_eq!(
+            hop_select_sql("0"),
+            "
+            SELECT COALESCE(from_qn.value, edges.from_name) AS from_symbol,
+                   COALESCE(to_qn.value, edges.to_name) AS to_symbol,
+                   edges.id AS edge_id,
+                   edges.edge_kind AS edge_kind,
+                   edges.confidence AS confidence,
+                   edges.to_name AS target,
+                   edges.target_qualified_name AS target_qualified_name,
+                   edges.evidence AS evidence,
+                   edges.receiver_hint AS receiver_hint,
+                   edges.resolution AS edge_resolution,
+                   edges.to_symbol_id IS NOT NULL AS verified_target_symbol,
+                   source_files.path AS callsite_path,
+                   COALESCE(NULLIF(edges.source_start_line, 0), 1) AS callsite_start_line,
+                   COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), \
+             1) AS callsite_end_line,
+                   0 AS match_tier
+            FROM edges
+            JOIN files source_files ON source_files.id = edges.source_file_id
+            LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
+            LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
+            LEFT JOIN name_strings from_qn ON from_qn.id = from_symbols.qualified_name_id
+            LEFT JOIN name_strings to_qn ON to_qn.id = to_symbols.qualified_name_id"
+        );
+    }
+    #[test]
+    fn shared_confidence_counts_preserve_both_direction_strings() {
+        for (heuristic, compiler_verified) in [
+            ("", "0"),
+            (
+                "NOT (edges.id IN (1, 2) AND edges.to_symbol_id IS NULL) AND ",
+                "SUM(CASE WHEN edges.id IN (1, 2) AND edges.to_symbol_id IS NULL THEN 1 ELSE 0 \
+                 END)",
+            ),
+        ] {
+            assert_eq!(
+                traversal_confidence_counts_sql(heuristic, compiler_verified),
+                format!(
+                    "
+                COUNT(*),
+                SUM(CASE WHEN edges.to_symbol_id IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {heuristic}edges.confidence = 'Syntactic' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {heuristic}edges.confidence = 'NameOnly' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {heuristic}edges.confidence = 'Ambiguous' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN {heuristic}edges.to_symbol_id IS NULL THEN 1 ELSE 0 END),
+                {compiler_verified}"
+                )
+            );
+        }
+        assert_eq!(
+            traversal_confidence_counts_sql("", "0"),
+            "
+                COUNT(*),
+                SUM(CASE WHEN edges.to_symbol_id IS NOT NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN edges.confidence = 'Syntactic' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN edges.confidence = 'NameOnly' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN edges.confidence = 'Ambiguous' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN edges.to_symbol_id IS NULL THEN 1 ELSE 0 END),
+                0"
+        );
+    }
 }

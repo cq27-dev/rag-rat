@@ -9,12 +9,18 @@ impl IndexDatabase {
     pub(super) fn overlay_source_row_exists(
         &self,
         path: &Path,
-        worktree_id: &str,
+        checkout: CheckoutRef<'_>,
     ) -> anyhow::Result<bool> {
         Ok(self.storage.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
-             commit_sha = '' AND worktree_id = ?3 AND kind != 'deleted' AND generation = ?4)",
-            params![self.active_repo_id, path_string(path), worktree_id, self.active_generation],
+             commit_sha = ?5 AND worktree_id = ?3 AND kind != 'deleted' AND generation = ?4)",
+            params![
+                self.active_repo_id,
+                path_string(path),
+                checkout.worktree_id,
+                self.active_generation,
+                checkout.commit_sha
+            ],
             |row| row.get(0),
         )?)
     }
@@ -26,23 +32,39 @@ impl IndexDatabase {
     pub(super) fn overlay_tombstone_exists(
         &self,
         path: &Path,
-        worktree_id: &str,
+        checkout: CheckoutRef<'_>,
     ) -> anyhow::Result<bool> {
         Ok(self.storage.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
-             commit_sha = '' AND worktree_id = ?3 AND kind = 'deleted' AND generation = ?4)",
-            params![self.active_repo_id, path_string(path), worktree_id, self.active_generation],
+             commit_sha = ?5 AND worktree_id = ?3 AND kind = 'deleted' AND generation = ?4)",
+            params![
+                self.active_repo_id,
+                path_string(path),
+                checkout.worktree_id,
+                self.active_generation,
+                checkout.commit_sha
+            ],
             |row| row.get(0),
         )?)
     }
 
     /// Whether the BASE scope has a live (non-deleted) row for `path` at `base_sha` — the gate for
     /// shadowing a base row with an overlay tombstone (there is nothing to shadow otherwise).
-    pub(super) fn base_scope_has_path(&self, base_sha: &str, path: &Path) -> anyhow::Result<bool> {
+    pub(super) fn base_scope_has_path(
+        &self,
+        path: &Path,
+        checkout: CheckoutRef<'_>,
+    ) -> anyhow::Result<bool> {
         Ok(self.storage.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
-             commit_sha = ?3 AND worktree_id = '' AND kind != 'deleted' AND generation = ?4)",
-            params![self.active_repo_id, path_string(path), base_sha, self.active_generation],
+             commit_sha = ?3 AND worktree_id = ?5 AND kind != 'deleted' AND generation = ?4)",
+            params![
+                self.active_repo_id,
+                path_string(path),
+                checkout.commit_sha,
+                self.active_generation,
+                checkout.worktree_id
+            ],
             |row| row.get(0),
         )?)
     }
@@ -66,15 +88,15 @@ impl IndexDatabase {
         config: &Config,
     ) -> anyhow::Result<CommittedDeltaSource> {
         let heads_unchanged =
-            self.worktree_overlay_basis(&overlay.worktree_id)?.is_some_and(|recorded| {
-                recorded.base_sha == overlay.base_sha
+            self.worktree_overlay_basis(&overlay.checkout.worktree_id)?.is_some_and(|recorded| {
+                recorded.base_sha == overlay.checkout.commit_sha
                     && recorded.linked_head_sha == git_context::repo_head_sha(&overlay.linked_repo)
             });
         if !heads_unchanged || self.overlay_targets_may_drift(&config.targets)? {
             return Ok(CommittedDeltaSource::TreeDiff);
         }
         Ok(CommittedDeltaSource::UnchangedSinceBasis {
-            shadowed_paths: self.list_overlay_shadowed_paths(&overlay.worktree_id)?,
+            shadowed_paths: self.list_overlay_shadowed_paths(&overlay.checkout.worktree_id)?,
         })
     }
 

@@ -33,10 +33,9 @@
 
 use minicbor::data::Type;
 use minicbor::{Decoder, Encoder};
-use sha2::{Digest, Sha256};
 
 use super::account::AccountId;
-use super::cbor::{self, INFALLIBLE};
+use super::cbor::{self, VecEncoder, VecEncoderExt};
 
 /// Domain tag + version for the stream-identity derivation. Bump only when the canonical rule
 /// itself changes — never when a kind/relation token is added.
@@ -54,13 +53,25 @@ const STREAM_V2_DOMAIN: &str = "rag-rat/stream/2";
 pub struct StreamId([u8; 32]);
 
 impl StreamId {
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+    /// The placeholder a table-sync re-adoption obligation is parked under while no stream of its
+    /// account has a directory row: the account fold writes it, and the first recorded stream
+    /// context drains it. Reserved for this purpose; derived SHA-256 stream identities are
+    /// assumed not to collide with it. The stored bytes are all-zero, and writer and reader must
+    /// both name this const.
+    pub(crate) const PRECONTEXT: Self = Self([0; 32]);
+
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
     /// By value — `StreamId` is `Copy` (clippy `wrong_self_convention` flags `to_*` on `&self`).
     pub fn to_bytes(self) -> [u8; 32] {
         self.0
+    }
+
+    /// A stored `stream_id` BLOB, or an error naming the column when it is not 32 bytes.
+    pub(crate) fn try_from_sql(bytes: Vec<u8>) -> anyhow::Result<Self> {
+        cbor::sql_fixed(bytes, "stream_id").map(Self)
     }
 }
 
@@ -83,23 +94,34 @@ impl EntryHash {
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
+
+    /// A stored `entry_hash` BLOB, or an error naming the column when it is not 32 bytes.
+    pub(crate) fn try_from_sql(bytes: Vec<u8>) -> anyhow::Result<Self> {
+        cbor::sql_fixed(bytes, "entry_hash").map(Self)
+    }
 }
 
 /// Whether a per-node override pulls a node INTO the view or drops it OUT — the per-node
 /// refinement on top of the per-kind allow-list defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, strum::EnumString, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
 pub enum NodeOverrideAction {
     Include,
     Exclude,
 }
 
 impl NodeOverrideAction {
-    /// The frozen wire token — a rename is a format change.
+    /// The frozen wire token — a rename is a format change. It is hashed into every filtered
+    /// stream id, so the encoder and [`Self::from_wire_str`] must read the same derived token.
     fn as_wire_str(self) -> &'static str {
-        match self {
-            Self::Include => "include",
-            Self::Exclude => "exclude",
-        }
+        self.into()
+    }
+
+    /// The action a wire token names, or `None` for a token this binary does not know.
+    fn from_wire_str(token: &str) -> Option<Self> {
+        token.parse().ok()
     }
 }
 
@@ -150,9 +172,7 @@ pub fn owner_stream(repo_id: &str) -> anyhow::Result<StreamId> {
 /// overrides that give one `node_id` conflicting actions.
 pub fn derive(spec: &StreamSpec) -> anyhow::Result<StreamId> {
     let bytes = canonical_spec_bytes(spec)?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&Sha256::digest(&bytes));
-    Ok(StreamId(out))
+    Ok(StreamId::from_bytes(cbor::sha256(&bytes)))
 }
 
 /// The canonical CBOR tuple the `/1` identity hashes — `[domain, repo_set, kind_allow_list | null,
@@ -162,8 +182,8 @@ fn canonical_spec_bytes(spec: &StreamSpec) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(96);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(5).expect(INFALLIBLE);
-        enc.str(STREAM_DOMAIN).expect(INFALLIBLE);
+        enc.put_array(5);
+        enc.put_str(STREAM_DOMAIN);
         encode_policy(&mut enc, &policy);
     }
     Ok(buf)
@@ -200,15 +220,15 @@ fn canonical_policy(spec: &StreamSpec) -> anyhow::Result<CanonicalPolicy> {
 /// Append the four policy fields (`repo_set, kind_allow_list|null, relation_policy|null,
 /// override_pairs`) to `enc` in the frozen order. The BYTES are identical whether they follow the
 /// `/1` header or the `/2` header+owner — the shared tail of both identities.
-fn encode_policy(enc: &mut Encoder<&mut Vec<u8>>, policy: &CanonicalPolicy) {
+fn encode_policy(enc: &mut VecEncoder<'_>, policy: &CanonicalPolicy) {
     encode_str_array(enc, &policy.repo_set);
     encode_optional_str_array(enc, policy.kind_allow_list.as_deref());
     encode_optional_str_array(enc, policy.relation_policy.as_deref());
-    enc.array(policy.overrides.len() as u64).expect(INFALLIBLE);
+    enc.put_array(policy.overrides.len() as u64);
     for entry in &policy.overrides {
-        enc.array(2).expect(INFALLIBLE);
-        enc.str(&entry.node_id).expect(INFALLIBLE);
-        enc.str(entry.action.as_wire_str()).expect(INFALLIBLE);
+        enc.put_array(2);
+        enc.put_str(&entry.node_id);
+        enc.put_str(entry.action.as_wire_str());
     }
 }
 
@@ -281,9 +301,7 @@ pub fn owner_stream_v2(repo_id: &str, account_id: AccountId) -> StreamSpecV2 {
 /// path keeps using until C3 adoption — nothing switches the live path here.
 pub fn derive_v2(spec: &StreamSpecV2) -> anyhow::Result<StreamId> {
     let bytes = canonical_spec_v2_bytes(spec)?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&Sha256::digest(&bytes));
-    Ok(StreamId(out))
+    Ok(StreamId::from_bytes(cbor::sha256(&bytes)))
 }
 
 /// The canonical CBOR tuple the `/2` identity hashes — `[domain, owner_account_id (b32), repo_set,
@@ -297,12 +315,12 @@ pub fn canonical_spec_v2_bytes(spec: &StreamSpecV2) -> anyhow::Result<Vec<u8>> {
         // `Private` is encoded by OMISSION (6 elements, byte-identical to pre-#407) so private
         // stream ids never move; a non-default mode appends a 7th tag element.
         let mode_tag = spec.access_mode.wire_tag();
-        enc.array(if mode_tag.is_some() { 7 } else { 6 }).expect(INFALLIBLE);
-        enc.str(STREAM_V2_DOMAIN).expect(INFALLIBLE);
-        enc.bytes(&spec.owner_account_id.to_bytes()).expect(INFALLIBLE);
+        enc.put_array(if mode_tag.is_some() { 7 } else { 6 });
+        enc.put_str(STREAM_V2_DOMAIN);
+        enc.put_bytes(&spec.owner_account_id.to_bytes());
         encode_policy(&mut enc, &policy);
         if let Some(tag) = mode_tag {
-            enc.u64(tag).expect(INFALLIBLE);
+            enc.put_u64(tag);
         }
     }
     Ok(buf)
@@ -375,10 +393,9 @@ fn decode_overrides(dec: &mut Decoder<'_>) -> anyhow::Result<Vec<NodeOverride>> 
     for _ in 0..len {
         anyhow::ensure!(dec.array()? == Some(2), "stream override must be a 2-element array");
         let node_id = dec.str()?.to_string();
-        let action = match dec.str()? {
-            "include" => NodeOverrideAction::Include,
-            "exclude" => NodeOverrideAction::Exclude,
-            other => anyhow::bail!("unknown stream override action `{other}`"),
+        let token = dec.str()?;
+        let Some(action) = NodeOverrideAction::from_wire_str(token) else {
+            anyhow::bail!("unknown stream override action `{token}`");
         };
         overrides.push(NodeOverride { node_id, action });
     }
@@ -408,20 +425,20 @@ fn canonical_overrides(overrides: &[NodeOverride]) -> anyhow::Result<Vec<NodeOve
     Ok(out)
 }
 
-fn encode_str_array(enc: &mut Encoder<&mut Vec<u8>>, values: &[String]) {
-    enc.array(values.len() as u64).expect(INFALLIBLE);
+fn encode_str_array(enc: &mut VecEncoder<'_>, values: &[String]) {
+    enc.put_array(values.len() as u64);
     for value in values {
-        enc.str(value).expect(INFALLIBLE);
+        enc.put_str(value);
     }
 }
 
 /// `None` → CBOR `null` (the distinguished UNFILTERED marker); `Some` → the enumerated list. The
 /// two must stay distinguishable on the wire — see the module docs.
-fn encode_optional_str_array(enc: &mut Encoder<&mut Vec<u8>>, values: Option<&[String]>) {
+fn encode_optional_str_array(enc: &mut VecEncoder<'_>, values: Option<&[String]>) {
     match values {
         Some(values) => encode_str_array(enc, values),
         None => {
-            enc.null().expect(INFALLIBLE);
+            enc.put_null();
         },
     }
 }
@@ -440,13 +457,13 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut enc = Encoder::new(&mut bytes);
-            enc.array(6).expect(INFALLIBLE);
-            enc.str(STREAM_V2_DOMAIN).expect(INFALLIBLE);
-            enc.bytes(&[0]).expect(INFALLIBLE);
-            enc.array(0).expect(INFALLIBLE);
-            enc.null().expect(INFALLIBLE);
-            enc.null().expect(INFALLIBLE);
-            enc.array(0).expect(INFALLIBLE);
+            enc.put_array(6);
+            enc.put_str(STREAM_V2_DOMAIN);
+            enc.put_bytes(&[0]);
+            enc.put_array(0);
+            enc.put_null();
+            enc.put_null();
+            enc.put_array(0);
         }
         let err = decode_spec_v2(&bytes).unwrap_err();
         assert_eq!(err.to_string(), "owner account must be 32 bytes");
@@ -505,6 +522,29 @@ mod tests {
         assert_eq!(bytes.len(), 29);
         // And the tuple obeys the module-wide canonical-CBOR floor.
         cbor::require_canonical_cbor(&bytes).expect("spec tuple is canonical CBOR");
+    }
+
+    #[test]
+    fn override_action_wire_tokens_are_frozen_on_both_sides() {
+        // Stream-identity hash input: the encoder and the decoder must agree on exactly these.
+        for (action, token) in
+            [(NodeOverrideAction::Include, "include"), (NodeOverrideAction::Exclude, "exclude")]
+        {
+            assert_eq!(action.as_wire_str(), token);
+            assert_eq!(NodeOverrideAction::from_wire_str(token), Some(action));
+        }
+        assert_eq!(NodeOverrideAction::from_wire_str("Include"), None, "tokens are case-exact");
+        let err = decode_spec_v2(&raw_v2(STREAM_V2_DOMAIN, &owner().to_bytes(), &["repo-a"], &[(
+            "mem-1", "unknown",
+        )]))
+        .unwrap_err();
+        assert_eq!(err.to_string(), "unknown stream override action `unknown`");
+    }
+
+    #[test]
+    fn the_precontext_placeholder_stays_all_zero() {
+        // Persisted in `table_sync_readoption_work.stream_id` and read back by a later binary.
+        assert_eq!(StreamId::PRECONTEXT.to_bytes(), [0; 32]);
     }
 
     #[test]
@@ -844,6 +884,19 @@ mod tests {
         let mut bytes = canonical_spec_v2_bytes(&public).unwrap();
         *bytes.last_mut().unwrap() = 0x09; // an unknown mode tag
         assert!(decode_spec_v2(&bytes).is_err(), "an unknown access-mode tag fails closed");
+    }
+
+    #[test]
+    fn stream_v2_public_read_golden_pins_the_access_mode_tag() {
+        // The 7-element form is as frozen as the 6-element one: the trailing mode tag is inside the
+        // hashed preimage, so a change to how it is written must break this.
+        let id =
+            derive_v2(&StreamSpecV2 { access_mode: AccessMode::PublicRead, ..spec_v2() }).unwrap();
+        assert_eq!(
+            hex(&id.to_bytes()),
+            "c2d68361ade6eeb991aaa94eebbe5c108ca5e311d6d6d0b524a76bc5abea3d89",
+            "stream/2 public_read golden",
+        );
     }
 
     #[test]

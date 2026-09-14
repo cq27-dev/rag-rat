@@ -4,11 +4,21 @@ mod neighbors;
 mod select;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use historical::*;
-pub(crate) use items::*;
-pub(crate) use neighbors::*;
+pub use historical::parser_failure_count;
+pub(crate) use historical::{
+    git_commits_for_paths, historical_evidence, papertrail_rationale_for_query,
+    papertrail_refs_for_paths,
+};
+pub(crate) use items::{
+    FileSection, ImportExportRow, coupling_items, file_section_items, git_commit_items,
+    import_export_items, import_export_rows, papertrail_rationale_items_for_query,
+    papertrail_ref_items,
+};
+pub(crate) use neighbors::{
+    graph_neighbors, import_export_dependents, same_file_siblings, textual_fallback,
+};
 use rusqlite::{Connection, OptionalExtension, params};
-pub(crate) use select::*;
+pub(crate) use select::{exact_symbols, has_scope_separator, reason_rank, target_names};
 use serde::Serialize;
 
 use crate::graph::{self, Direction, GraphHop, GraphResolutionMode, GraphTraversalOptions};
@@ -29,6 +39,8 @@ pub const GRAPH_SYNTACTIC_CAVEAT: &str =
 /// Wrapped as a quoted FTS5 phrase (embedded `"` doubled) so `::`, `(`, `<`, etc. in a symbol name
 /// tokenize as separators rather than parse as FTS query syntax. Semantics shift substring→token —
 /// more precise for "mentions this symbol" than a substring match.
+/// See historical’s `fts_escape` for OR-ed words and memory evidence’s
+/// `fts_token_query` for tokenized phrases.
 pub fn fts_phrase_query(needle: &str) -> Option<String> {
     if !needle.chars().any(char::is_alphanumeric) {
         return None;
@@ -651,18 +663,20 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
         LIMIT ?1
         ",
     )?;
-    rows_to_items(stmt.query_map([limit], |row| {
-        let reason: String = row.get(4)?;
-        Ok(ImpactItem {
-            path: row.get(0)?,
-            language: row.get(1)?,
-            kind: row.get(2)?,
-            symbol: row.get(3)?,
-            category: ImpactCategory::ProbableTextual.as_str().to_string(),
-            reason: reason.clone(),
-            evidence: ffi_surface_evidence(&reason),
-        })
-    })?)
+    Ok(stmt
+        .query_map([limit], |row| {
+            let reason: String = row.get(4)?;
+            Ok(ImpactItem {
+                path: row.get(0)?,
+                language: row.get(1)?,
+                kind: row.get(2)?,
+                symbol: row.get(3)?,
+                category: ImpactCategory::ProbableTextual.as_str().to_string(),
+                reason: reason.clone(),
+                evidence: ffi_surface_evidence(&reason),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn ffi_surface_evidence(reason: &str) -> Vec<String> {
@@ -727,7 +741,7 @@ pub(crate) struct SymbolTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ImpactKey {
-    category: &'static str,
+    category: ImpactCategory,
     path: String,
     symbol: Option<String>,
     reason: String,
@@ -752,7 +766,7 @@ impl ImpactSurface {
     ) {
         let reason = reason.into();
         let key = ImpactKey {
-            category: category.as_str(),
+            category,
             path: file_symbol.path.clone(),
             symbol: file_symbol.symbol.clone(),
             reason: reason.clone(),
@@ -774,8 +788,8 @@ impl ImpactSurface {
 
     fn current_paths(&self) -> Vec<String> {
         let mut paths = BTreeSet::new();
-        for item in self.items.values() {
-            if item.category != ImpactCategory::HistoricalPapertrail.as_str() {
+        for (key, item) in &self.items {
+            if key.category != ImpactCategory::HistoricalPapertrail {
                 paths.insert(item.path.clone());
             }
         }
@@ -783,17 +797,19 @@ impl ImpactSurface {
     }
 
     fn into_items(self, limit: usize) -> Vec<ImpactItem> {
-        let mut items = self.items.into_values().collect::<Vec<_>>();
-        items.sort_by_key(|item| {
+        // Category precedence is `ImpactCategory`'s declaration order (its derived `Ord`).
+        let mut items =
+            self.items.into_iter().map(|(key, item)| (key.category, item)).collect::<Vec<_>>();
+        items.sort_by_key(|(category, item)| {
             (
-                category_rank(&item.category),
+                *category,
                 reason_rank(&item.reason),
                 item.path.clone(),
                 item.symbol.clone().unwrap_or_default(),
             )
         });
         items.truncate(limit);
-        items
+        items.into_iter().map(|(_, item)| item).collect()
     }
 }
 

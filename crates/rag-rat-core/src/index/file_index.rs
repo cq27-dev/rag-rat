@@ -1,7 +1,6 @@
 //! The file → rows indexing pipeline: parse/chunk/symbol one file and write its chunk,
 //! symbol, and logical-group rows; heal a stale file in place.
 
-use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::paths::path_string;
 use rag_rat_base::time::now_ms;
@@ -83,14 +82,11 @@ impl IndexDatabase {
             let is_dirty = changes.changed.contains(path);
             let has_base_commit = !self.active_commit_sha.is_empty();
             let scope = if !has_base_commit || is_dirty {
-                FileScope::worktree(self.active_worktree_id.clone())
+                CheckoutKey::worktree(self.active_worktree_id.clone())
             } else {
-                FileScope::commit(self.active_commit_sha.clone())
+                CheckoutKey::commit(self.active_commit_sha.clone())
             };
-            self.remove_file_in_scope(path, CheckoutRef {
-                commit_sha: &scope.commit_sha,
-                worktree_id: &scope.worktree_id,
-            })?;
+            self.remove_file_in_scope(path, scope.borrowed())?;
 
             self.index_file(
                 path,
@@ -128,7 +124,7 @@ impl IndexDatabase {
         kind: TargetKind,
         modified_at_ms: i64,
         text: &str,
-        scope: &FileScope,
+        scope: &CheckoutKey,
     ) -> anyhow::Result<()> {
         // Heal path: prepare from the bytes already in hand through the SAME single-parse core the
         // full-rebuild / changed-file passes use, then route through `insert_prepared_file` in

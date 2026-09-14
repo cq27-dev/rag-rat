@@ -12,6 +12,11 @@ use crate::hooks::MigrationHooks;
 #[path = "registry_verification_tests.rs"]
 mod registry_verification_tests;
 
+/// Active commit half of the connection's checkout scope.
+pub const CONNECTION_CONTEXT_COMMIT_KEY: &str = "commit_sha";
+/// Active worktree half of the connection's checkout scope.
+pub const CONNECTION_CONTEXT_WORKTREE_KEY: &str = "worktree_id";
+
 /// The `temp.connection_context` key under which the scope view stashes the active repo id (beside
 /// `commit_sha` / `worktree_id`). [`active_repo_id`] reads it; `install_scope_view` writes it.
 pub const CONNECTION_CONTEXT_REPO_KEY: &str = "repo_id";
@@ -39,7 +44,7 @@ pub const LIVE_FILES_GENERATION_META_KEY: &str = "live_files_generation";
 /// parent moved). `repo_meta` is handled separately (its FK is to `repos`, and it moved in V039).
 /// The A1 adoption contract requires every direct-scoped table backfill in the same call as the
 /// `repos`-row rewrite.
-const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
+pub const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
     // V040 (phase A3) core tables.
     "files",
     "packages",
@@ -100,7 +105,7 @@ const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
 /// `repo_id` column), the real backfill once V042 has run (every normal open applies the full
 /// ladder). The `DIRECT_SCOPED_ADOPTION_TABLES` loop above guards on table-presence instead; a
 /// periphery table can exist without the column, so it needs the stronger column-level guard.
-const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
+pub const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
     "clone_graph_generations",
     "clone_token_df",
     "clone_refinements",
@@ -112,18 +117,18 @@ const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
     "external_symbols",
     "reconcile_attempts",
     "dream_findings",
-    "repo_memories",
-    "repo_memory_bindings",
-    "repo_memory_fts",
-    // The baseline the drain parks for a removed synced memory (#1298), keyed by the memory it
-    // belongs to; it follows the memories wherever their repo id goes.
-    "repo_memory_parked_baselines",
     // Dream-v2 siblings — repo_id-scoped like `dream_findings`; a LocalOnly→Portable adoption
     // must re-point their rows too. Guarded by `column_exists` in the re-point loop, so an older
     // partial-schema fixture (table/column absent) is a no-op.
     "memory_reality",
     "memory_note_summaries",
     "memory_model_failures",
+    "repo_memories",
+    "repo_memory_bindings",
+    "repo_memory_fts",
+    // The baseline the drain parks for a removed synced memory (#1298), keyed by the memory it
+    // belongs to; it follows the memories wherever their repo id goes.
+    "repo_memory_parked_baselines",
     // The typed node-edge set (#464, V049): `repo_id` is the OWNER repo (the source node's), so a
     // LocalOnly→Portable adoption re-points it exactly like the other periphery tables. Its
     // `target_repo_id` is a REFERENCE and is deliberately NOT re-pointed here (it may name a
@@ -342,28 +347,128 @@ fn register_repo_inner(
     // containing the id and collapses into the idempotent path).
     let real_ids = real_repo_ids(conn)?;
 
-    // Already registered under this id → idempotent; just make sure the root is recorded (and, for
-    // a LocalOnly re-registration of the same clone, that its shallow boundary is on record so
-    // a later upgrade can prove against it — self-healing for an index first registered before
-    // this gate).
+    match classify_registration(conn, identity, root, &real_ids)? {
+        Registration::Idempotent => {
+            if recording == RootRecording::Record {
+                record_repo_root(conn, &identity.repo_id, &root_str, now_ms)?;
+            }
+            persist_shallow_boundary(conn, identity)?;
+        },
+        Registration::LateMerge { owner } => {
+            merge_local_incumbent_into_registered(
+                conn, identity, &owner, &root_str, now_ms, recording,
+            )?;
+            persist_shallow_boundary(conn, identity)?;
+        },
+        Registration::Upgrade { from } => {
+            // UPGRADE HOLDS BOTH REPO LOCKS (A6, batch-4/5 P2). Writers key their per-repo
+            // advisory flock by the DERIVED repo id, and the derivation flips `local:` → portable
+            // the moment the clone is deepened — so around an upgrade the lock IDENTITY is
+            // unstable: a writer that started PRE-unshallow holds the OUTGOING `local:` lock, a
+            // post-unshallow writer holds the INCOMING portable one, and the re-point below must
+            // serialize with BOTH. Acquire the two ids' locks in the CANONICAL LEXICOGRAPHIC ORDER
+            // (`locks::canonical_lock_order`; the locks module doc owns the ordering rule, which
+            // SUPERSEDES the old role-based "incoming-then-outgoing" argument — that argument
+            // broke as soon as a second multi-lock path appeared with the roles reversed, the
+            // batch-5 fence-gap writer). Each acquisition is reentrant-instant when this thread
+            // already holds it (a CLI entry lock for either id) and BOUNDED otherwise — bounded
+            // because entry locks are taken identity-blind, so a pre-held later-sorting lock can
+            // force an out-of-order edge, and bounded out-of-order edges are what keep that
+            // topology deadlock-free (a timeout surfaces a retryable refusal instead of a hang;
+            // see the locks module doc). ROOT-PATH-KEYED LOCKS REJECTED as the alternative: two
+            // clones of the SAME repo on one machine must still serialize on repo_id, which
+            // path-keying would break. A pathless (in-memory) connection skips the locks — no
+            // cross-process writer can exist for it.
+            let _upgrade_locks = match conn.path().filter(|p| !p.is_empty()) {
+                Some(db_path) =>
+                    Some(acquire_dual_repo_locks(Path::new(db_path), &from, &identity.repo_id)?),
+                None => None,
+            };
+            adopt_in_transaction(conn, Adoption {
+                identity,
+                root_str: &root_str,
+                now_ms,
+                recording,
+                hooks,
+                upgrade_from: Some(&from),
+                adopt_placeholder: false,
+            })?;
+            // State what happened on a shallow-clone upgrade (a `local:` id re-pointed to a
+            // portable one) so the transition is legible in the log — it re-writes every scoped
+            // row and every logical id.
+            tracing::warn!(
+                old_repo_id = %from,
+                new_repo_id = %identity.repo_id,
+                "shallow-clone identity upgraded: the index was registered under a machine-local id \
+                 (`local:`) and is now re-pointed to a portable id. All scoped rows, repo_meta, \
+                 repo_roots, and logical-symbol ids were migrated in place."
+            );
+        },
+        Registration::Fresh { adopt_placeholder } => {
+            adopt_in_transaction(conn, Adoption {
+                identity,
+                root_str: &root_str,
+                now_ms,
+                recording,
+                hooks,
+                upgrade_from: None,
+                adopt_placeholder,
+            })?;
+        },
+    }
+    Ok(identity.repo_id.clone())
+}
+
+/// What registering an identity does, decided by [`classify_registration`] before anything is
+/// written. A refusal is not a variant: the classifier returns it as `Err`, so it touches nothing.
+#[derive(Debug)]
+enum Registration {
+    /// The incoming id is already registered: make sure the root is recorded and, for a LocalOnly
+    /// re-registration of the same clone, that its shallow boundary is on record so a later upgrade
+    /// can prove against it — self-healing for an index first registered before that gate.
+    Idempotent,
+    /// The LATE-upgrade merge. The incoming id is already registered, but this root is recorded
+    /// under a `local:` incumbent `owner` whose (root ∧ boundary) proof holds for the incoming
+    /// portable id: this is the SECOND shallow clone of an upstream deepening after a sibling clone
+    /// already claimed the portable id. Refusing that shape would strand it permanently (the pin
+    /// remedy re-enters the same guard), so the local id is retired into the registered one.
+    LateMerge { owner: String },
+    /// UPGRADE — the incoming id is Portable and the already-registered `local:` incumbent `from`
+    /// has a recorded shallow boundary reachable from the incoming clone's HEAD: the caller
+    /// deepened that machine-local shallow clone (`git fetch --unshallow`, our own remedy) or
+    /// opened a full clone of the same repo, so the incumbent is re-pointed onto the portable id
+    /// IN PLACE. Searching ALL registered ids — not a lone incumbent — is what makes this correct
+    /// on a CONSOLIDATED multi-repo DB (A7): only the matching repo's boundary is reachable, and
+    /// the re-point touches only that repo's rows, so every other registered repo is left alone.
+    Upgrade { from: String },
+    /// FRESH REGISTRATION — a genuinely NEW repo joining the DB. A7 makes several repos sharing one
+    /// global database the default, so a new id at an unclaimed working tree simply gets its own
+    /// `repos` row (no re-point). This is the behavior that replaces phase A's single-repo "refuse
+    /// a second real repo" invariant. `adopt_placeholder` is true only when the DB held no real
+    /// repo yet: only then is a legacy placeholder, if present, adopted as this repo's rows.
+    Fresh { adopt_placeholder: bool },
+}
+
+/// Decide what registering `identity` at `root` does. Read-only, and run under the registry lock
+/// but before any repo lock or transaction, so a refusal — returned as `Err` — touches nothing.
+/// `real_ids` is the registered set read under that lock.
+fn classify_registration(
+    conn: &Connection,
+    identity: &RepoIdentity,
+    root: &Path,
+    real_ids: &[String],
+) -> rusqlite::Result<Registration> {
+    let root_str = root.to_string_lossy();
     if real_ids.iter().any(|id| id == &identity.repo_id) {
         // Even the idempotent path must not silently map one physical root onto TWO repos: a
         // checkout whose identity changed to an ALREADY-REGISTERED id (an `[index] repo_id` pin
         // switched to an existing repo, an in-place re-clone) would otherwise record its root
         // under the second id and make `resolve_config_repo_id`'s recorded-root route
-        // non-deterministic (`LIMIT 1` over two owners). ONE exception before refusing: the
-        // LATE-upgrade merge — the owner is a `local:` incumbent whose (root ∧ boundary) proof
-        // holds for the incoming portable id, i.e. this is the SECOND shallow clone of an
-        // upstream deepening after a sibling clone already claimed the portable id. Refusing that
-        // shape would strand it permanently (the pin remedy re-enters this same guard); merging
-        // retires the local id into the registered one.
+        // non-deterministic (`LIMIT 1` over two owners). The one exception before refusing is
+        // the late merge.
         if let Some(owner) = real_root_owner(conn, &root_str, &identity.repo_id)? {
             if late_upgrade_is_proven(conn, &owner, identity, root)? {
-                merge_local_incumbent_into_registered(
-                    conn, identity, &owner, &root_str, now_ms, recording,
-                )?;
-                persist_shallow_boundary(conn, identity)?;
-                return Ok(identity.repo_id.clone());
+                return Ok(Registration::LateMerge { owner });
             }
             return Err(registry_refusal(mismatched_root_owner_error(
                 &owner,
@@ -371,94 +476,28 @@ fn register_repo_inner(
                 &root_str,
             )));
         }
-        if recording == RootRecording::Record {
-            record_repo_root(conn, &identity.repo_id, &root_str, now_ms)?;
-        }
-        persist_shallow_boundary(conn, identity)?;
-        return Ok(identity.repo_id.clone());
+        return Ok(Registration::Idempotent);
     }
-
-    // The incoming id is NOT yet registered. Three outcomes, decided BEFORE any lock or transaction
-    // so a refusal touches nothing:
-    //
-    //  (1) UPGRADE — the incoming id is Portable and some already-registered `local:` incumbent's
-    //      recorded shallow boundary is reachable from the incoming clone's HEAD: the caller
-    // deepened      that machine-local shallow clone (`git fetch --unshallow`, our own remedy)
-    // or opened a      full clone of the same repo, so re-point the incumbent onto the portable
-    // id IN PLACE      (below). Searching ALL registered ids — not a lone incumbent — is what
-    // makes this correct      on a CONSOLIDATED multi-repo DB (A7): only the matching repo's
-    // boundary is reachable, and      the re-point touches only that repo's rows, so every
-    // other registered repo is left alone.
-    //
-    //  (2) FRESH REGISTRATION — a genuinely NEW repo joining the DB. A7 makes several repos sharing
-    //      one global database the default, so a new id at an unclaimed working tree simply gets
-    // its      own `repos` row (no re-point). This is the behavior that replaces phase A's
-    // single-repo      "refuse a second real repo" invariant.
-    //
-    //  (3) REFUSAL — the incoming id is new AND its working-tree `root` is already recorded under a
-    //      DIFFERENT real repo (see [`real_root_owner`]). A physical path belongs to exactly one
-    //      repo, so this is a checkout whose identity changed WITHOUT proving an upgrade: a
-    //      re-shallowed clone (a `LocalOnly` incoming must never DOWNGRADE the portable id its root
-    //      already owns), a deepened clone whose shallow boundary was never recorded (unprovable
-    //      upgrade), or a rewritten root commit. Refuse rather than fork the repo across two ids;
-    //      the remedy is to unshallow or pin `[index] repo_id`. This generalizes the phase-A
-    //      single-repo "different real repo" / "unproven upgrade" / "no downgrade" refusals to the
-    //      multi-repo DB, keyed on the ROOT rather than a lone incumbent.
-    let upgrade_from = find_upgradeable_local_incumbent(conn, &real_ids, identity, root)?;
-    if upgrade_from.is_none()
-        && let Some(owner) = real_root_owner(conn, &root_str, &identity.repo_id)?
-    {
+    if let Some(from) = find_upgradeable_local_incumbent(conn, real_ids, identity, root)? {
+        return Ok(Registration::Upgrade { from });
+    }
+    // REFUSAL — the incoming id is new AND its working-tree `root` is already recorded under a
+    // DIFFERENT real repo (see [`real_root_owner`]). A physical path belongs to exactly one repo,
+    // so this is a checkout whose identity changed WITHOUT proving an upgrade: a re-shallowed
+    // clone (a `LocalOnly` incoming must never DOWNGRADE the portable id its root already owns),
+    // a deepened clone whose shallow boundary was never recorded (unprovable upgrade), or a
+    // rewritten root commit. Refuse rather than fork the repo across two ids; the remedy is to
+    // unshallow or pin `[index] repo_id`. This generalizes the phase-A single-repo "different
+    // real repo" / "unproven upgrade" / "no downgrade" refusals to the multi-repo DB, keyed on
+    // the ROOT rather than a lone incumbent.
+    if let Some(owner) = real_root_owner(conn, &root_str, &identity.repo_id)? {
         return Err(registry_refusal(mismatched_root_owner_error(
             &owner,
             &identity.repo_id,
             &root_str,
         )));
     }
-
-    // UPGRADE HOLDS BOTH REPO LOCKS (A6, batch-4/5 P2). Writers key their per-repo advisory flock
-    // by the DERIVED repo id, and the derivation flips `local:` → portable the moment the clone
-    // is deepened — so around an upgrade the lock IDENTITY is unstable: a writer that started
-    // PRE-unshallow holds the OUTGOING `local:` lock, a post-unshallow writer holds the INCOMING
-    // portable one, and the re-point below must serialize with BOTH. Acquire the two ids' locks
-    // in the CANONICAL LEXICOGRAPHIC ORDER (`locks::canonical_lock_order`; the locks module doc
-    // owns the ordering rule, which SUPERSEDES the old role-based "incoming-then-outgoing"
-    // argument — that argument broke as soon as a second multi-lock path appeared with the roles
-    // reversed, the batch-5 fence-gap writer). Each acquisition is reentrant-instant when this
-    // thread already holds it (a CLI entry lock for either id) and BOUNDED otherwise — bounded
-    // because entry locks are taken identity-blind, so a pre-held later-sorting lock can force an
-    // out-of-order edge, and bounded out-of-order edges are what keep that topology deadlock-free
-    // (a timeout surfaces a retryable refusal instead of a hang; see the locks module doc).
-    // ROOT-PATH-KEYED LOCKS REJECTED as the alternative: two clones of the SAME repo on one
-    // machine must still serialize on repo_id, which path-keying would break. A pathless
-    // (in-memory) connection skips the locks — no cross-process writer can exist for it.
-    let _upgrade_locks = match (&upgrade_from, conn.path().filter(|p| !p.is_empty())) {
-        (Some(local_id), Some(db_path)) =>
-            Some(acquire_dual_repo_locks(Path::new(db_path), local_id, &identity.repo_id)?),
-        _ => None,
-    };
-
-    adopt_in_transaction(conn, Adoption {
-        identity,
-        root_str: &root_str,
-        now_ms,
-        recording,
-        hooks,
-        upgrade_from: upgrade_from.as_deref(),
-        no_real_repos: real_ids.is_empty(),
-    })?;
-    // State what happened on a shallow-clone upgrade (a `local:` id re-pointed to a portable one)
-    // so the transition is legible in the log — it re-writes every scoped row and every logical
-    // id.
-    if let Some(local_id) = upgrade_from {
-        tracing::warn!(
-            old_repo_id = %local_id,
-            new_repo_id = %identity.repo_id,
-            "shallow-clone identity upgraded: the index was registered under a machine-local id \
-             (`local:`) and is now re-pointed to a portable id. All scoped rows, repo_meta, \
-             repo_roots, and logical-symbol ids were migrated in place."
-        );
-    }
-    Ok(identity.repo_id.clone())
+    Ok(Registration::Fresh { adopt_placeholder: real_ids.is_empty() })
 }
 
 /// Take the DB-global repo-registry lock for one registration (see the REGISTRY LOCK note in
@@ -492,8 +531,8 @@ fn acquire_registry_lock(
     .map(Some)
 }
 
-/// What the adoption transaction writes under: the registration itself plus the two facts the
-/// decision spine established before opening it.
+/// What the adoption transaction writes under: the registration itself plus what
+/// [`classify_registration`] decided — built from its `Upgrade` or `Fresh` outcome.
 struct Adoption<'a> {
     identity: &'a RepoIdentity,
     root_str: &'a str,
@@ -502,15 +541,15 @@ struct Adoption<'a> {
     hooks: &'a MigrationHooks,
     /// The `local:` incumbent being upgraded in place to the portable id, if any.
     upgrade_from: Option<&'a str>,
-    /// Whether the DB held no real repo before this registration — only then is a legacy
-    /// placeholder adopted.
-    no_real_repos: bool,
+    /// Whether a legacy placeholder, if present, is adopted — only when the DB held no real repo
+    /// before this registration.
+    adopt_placeholder: bool,
 }
 
 /// Insert the `repos` row and, on an upgrade or a fresh legacy adoption, re-point the source id's
 /// rows onto it — all in ONE immediate transaction (see the comments inside).
 fn adopt_in_transaction(conn: &Connection, adoption: Adoption<'_>) -> rusqlite::Result<()> {
-    let Adoption { identity, root_str, now_ms, recording, hooks, upgrade_from, no_real_repos } =
+    let Adoption { identity, root_str, now_ms, recording, hooks, upgrade_from, adopt_placeholder } =
         adoption;
     let trimmed_id = identity.repo_id.trim();
     // No real repo yet (or a `local:`-id upgrade): adopt in ONE transaction. Insert the real
@@ -570,114 +609,11 @@ fn adopt_in_transaction(conn: &Connection, adoption: Adoption<'_>) -> rusqlite::
     // skipped entirely.
     let repoint_from = match upgrade_from {
         Some(local_id) => Some(local_id),
-        None if no_real_repos && placeholder_present => Some(LEGACY_REPO_ID),
+        None if adopt_placeholder && placeholder_present => Some(LEGACY_REPO_ID),
         None => None,
     };
     if let Some(source_id) = repoint_from {
-        // Move every source-id `repo_meta` row onto the new id EXCEPT the shallow-boundary record:
-        // it describes the OLD `local:` clone's cut history and is meaningless under the portable
-        // id (which has a full history and never upgrades). Leaving it under `source_id`
-        // lets the `DELETE FROM repos WHERE repo_id = source_id` below cascade it away, so
-        // the portable id never inherits a stale boundary. Harmless no-op on the
-        // placeholder path (no such row).
-        tx.execute("UPDATE repo_meta SET repo_id = ?1 WHERE repo_id = ?2 AND key != ?3", params![
-            identity.repo_id,
-            source_id,
-            SHALLOW_BOUNDARY_META_KEY,
-        ])?;
-        // Re-point every direct-scoped table's source rows onto the real id (A3/A4 extend the
-        // A1/A2 adoption contract from `repos`/`repo_meta` to the V040 core tables and the
-        // papertrail tables, provider-neutral since V060). Runs INSIDE the same adoption
-        // transaction, keeping the insert-first ordering: on a fresh open the tables are
-        // empty and these are no-ops; on a forward-migrated DB that indexed under the
-        // placeholder (or a shallow-clone upgrade) they carry the rows onto the real id
-        // atomically with the `repos` rewrite. `git_commits` is updated here;
-        // `git_file_changes` follows via its `ON UPDATE CASCADE` FK.
-        for table in DIRECT_SCOPED_ADOPTION_TABLES {
-            // Guard on table presence: a real consolidated DB is fully migrated (every
-            // direct-scoped table exists), but the schema-bootstrap tests exercise
-            // adoption against ISOLATION fixtures that seed only the subset a given
-            // migration touches (V040 core tables OR the papertrail tables). Skipping an
-            // absent table keeps adoption correct on the full schema while staying
-            // robust to those partial fixtures — a table that does not exist has no
-            // source rows to re-point.
-            if !adoption_table_present(&tx, table)? {
-                continue;
-            }
-            // `main.`-qualified: adoption can run on a connection that already carries the
-            // temp `files` scope view (the incremental pass's bare open installs it BEFORE
-            // adopting), and an unqualified `UPDATE files` would hit that view — "cannot
-            // modify files because it is a view". The qualifier pins every re-point to the
-            // real table regardless of what temp views the connection carries.
-            tx.execute(
-                &format!("UPDATE main.{table} SET repo_id = ?1 WHERE repo_id = ?2"),
-                params![identity.repo_id, source_id],
-            )?;
-        }
-        // A5 periphery tables (clones/oracle/reconcile/memories). Their `repo_id` column lands in
-        // V042; several of these tables predate it, so a partial-schema bootstrap fixture that
-        // stops before V042 can have the table without the column. Guard each re-point with
-        // `column_exists` (no-op when the column is absent, real backfill once V042 has run — every
-        // normal open applies the full ladder) so this adoption never trips "no such column". Uses
-        // `source_id` (not the placeholder literal) so a shallow-clone upgrade re-points periphery
-        // rows off the `local:` incumbent too, exactly like the core/papertrail loop above.
-        //
-        // Lens-lane refresh for the adopted repo: `memory_reality` / `memory_note_summaries` are in
-        // this list and carry no revision triggers (they sync on overlay/1). This bare UPDATE
-        // therefore does NOT bump the memories lane directly. It does not need to:
-        // `repo_memories` is ALSO in this same list (see the array), and it KEEPS its revision
-        // trigger, so re-pointing it in this loop advances the memories lane once for the
-        // adopted `repo_id` whenever it has any memory at all — the only case where a stale
-        // verdict/summary would matter. If `repo_memories`' triggers are ever removed too,
-        // add an explicit `bump_lens_revisions` here so adoption keeps refreshing the overlay
-        // rows.
-        for table in A5_PERIPHERY_DIRECT_SCOPED_TABLES {
-            if super::column_exists(&tx, table, "repo_id")? {
-                // `main.`-qualified for the same view-shadowing reason as the core loop above.
-                tx.execute(
-                    &format!("UPDATE main.{table} SET repo_id = ?1 WHERE repo_id = ?2"),
-                    params![identity.repo_id, source_id],
-                )?;
-            }
-        }
-        // repo_node_edges (#464): the loop above re-pointed the OWNER `repo_id`; a SAME-repo
-        // `target_repo_id` must move with it (a cross-repo target names a sibling and is left
-        // alone). Edge reads self-heal `target_repo_id` from the live node, but keep the
-        // stored column honest here too. Guarded like the loop (a partial-schema fixture
-        // can lack the V049 column).
-        if super::column_exists(&tx, "repo_node_edges", "repo_id")? {
-            tx.execute(
-                "UPDATE main.repo_node_edges SET target_repo_id = ?1 WHERE target_repo_id = ?2",
-                params![identity.repo_id, source_id],
-            )?;
-        }
-        // `dream_findings.id` folds `repo_id` (the `logical_symbols.stable_id` precedent), so the
-        // periphery re-point above changed the id every finding SHOULD have — re-derive them (and
-        // the in-table `superseded_by` references) under the adopted id: the dream twin of the
-        // `realign_logical_symbol_ids` call below. Guarded like the loop above (a partial-schema
-        // bootstrap fixture can lack the table or the V042 column); idempotent.
-        if super::column_exists(&tx, "dream_findings", "repo_id")? {
-            (hooks.rederive_dream_finding_ids)(&tx)?;
-        }
-        // Move the source id's recorded roots onto the new id BEFORE the source `repos` row is
-        // deleted (its FK is `ON DELETE CASCADE`, so the roots would otherwise be dropped). A
-        // shallow-clone upgrade carries the local id's roots; the placeholder never has any.
-        tx.execute("UPDATE repo_roots SET repo_id = ?1 WHERE repo_id = ?2", params![
-            identity.repo_id,
-            source_id
-        ])?;
-        // `logical_symbols.id` is content-derived and now folds `repo_id` (A3), so re-pointing its
-        // `repo_id` above changed the id every row SHOULD have — the next `rebuild_logical_symbols`
-        // will re-derive `hash(real_repo_id ‖ key)` and dangle every pre-re-point memory/oracle
-        // handle still pointing at the source-derived id. Realign the ids (and every reference) in
-        // place NOW, before that rebuild. `logical_symbol_members` has an `ON DELETE CASCADE` FK to
-        // `logical_symbols(id)`, and adoption runs with `foreign_keys = ON`, so defer FK checks to
-        // COMMIT for this transaction (auto-resets on commit/rollback) — otherwise the parent-id
-        // UPDATE trips the child FK mid-statement. Idempotent with the V040 migration's own
-        // realign.
-        tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
-        (hooks.realign_logical_symbol_ids)(&tx)?;
-        tx.execute("DELETE FROM repos WHERE repo_id = ?1", [source_id])?;
+        repoint_scoped_rows(&tx, source_id, &identity.repo_id, hooks)?;
     }
     if recording == RootRecording::Record {
         record_repo_root(&tx, &identity.repo_id, root_str, now_ms)?;
@@ -731,7 +667,8 @@ fn acquire_dual_repo_locks(
 }
 
 /// The direct-scoped tables whose rows the LATE-upgrade merge DELETES under the retiring `local:`
-/// id (its DERIVED data): the A5 periphery list minus five authored tables moved onto the
+/// id (its DERIVED data): the leading A5 periphery entries, followed there by five authored
+/// tables moved onto the
 /// target instead. Verification results are discarded: moving them could overwrite target
 /// results checked against different inputs. The target's results survive and missing results
 /// can be regenerated. The retired `memory_summaries` stays where it lies on both paths.
@@ -782,6 +719,123 @@ fn late_upgrade_is_proven(
             .unwrap_or(false))
 }
 
+/// Re-point every row `source_id` owns onto `target_id`, then drop the `source_id` registration —
+/// the MOVE counterpart of [`merge_local_incumbent_into_registered`]'s DELETE loops. Runs inside
+/// [`adopt_in_transaction`]'s IMMEDIATE transaction, after the `target_id` `repos` row is inserted.
+/// Two orderings are load-bearing: the roots move BEFORE the source `repos` row is deleted (its FK
+/// cascades them away), and `defer_foreign_keys` is set BEFORE the logical-symbol realign (the
+/// parent-id UPDATE would otherwise trip the member FK mid-statement).
+fn repoint_scoped_rows(
+    tx: &rusqlite::Transaction<'_>,
+    source_id: &str,
+    target_id: &str,
+    hooks: &MigrationHooks,
+) -> rusqlite::Result<()> {
+    // Move every source-id `repo_meta` row onto the new id EXCEPT the shallow-boundary record:
+    // it describes the OLD `local:` clone's cut history and is meaningless under the portable
+    // id (which has a full history and never upgrades). Leaving it under `source_id`
+    // lets the `DELETE FROM repos WHERE repo_id = source_id` below cascade it away, so
+    // the portable id never inherits a stale boundary. Harmless no-op on the
+    // placeholder path (no such row).
+    tx.execute("UPDATE repo_meta SET repo_id = ?1 WHERE repo_id = ?2 AND key != ?3", params![
+        target_id,
+        source_id,
+        SHALLOW_BOUNDARY_META_KEY,
+    ])?;
+    // Re-point every direct-scoped table's source rows onto the real id (A3/A4 extend the
+    // A1/A2 adoption contract from `repos`/`repo_meta` to the V040 core tables and the
+    // papertrail tables, provider-neutral since V060). Runs INSIDE the same adoption
+    // transaction, keeping the insert-first ordering: on a fresh open the tables are
+    // empty and these are no-ops; on a forward-migrated DB that indexed under the
+    // placeholder (or a shallow-clone upgrade) they carry the rows onto the real id
+    // atomically with the `repos` rewrite. `git_commits` is updated here;
+    // `git_file_changes` follows via its `ON UPDATE CASCADE` FK.
+    for table in DIRECT_SCOPED_ADOPTION_TABLES {
+        // Guard on table presence: a real consolidated DB is fully migrated (every
+        // direct-scoped table exists), but the schema-bootstrap tests exercise
+        // adoption against ISOLATION fixtures that seed only the subset a given
+        // migration touches (V040 core tables OR the papertrail tables). Skipping an
+        // absent table keeps adoption correct on the full schema while staying
+        // robust to those partial fixtures — a table that does not exist has no
+        // source rows to re-point.
+        if !super::migrations::sqlite_object_exists(tx, "table", table)? {
+            continue;
+        }
+        // `main.`-qualified: adoption can run on a connection that already carries the
+        // temp `files` scope view (the incremental pass's bare open installs it BEFORE
+        // adopting), and an unqualified `UPDATE files` would hit that view — "cannot
+        // modify files because it is a view". The qualifier pins every re-point to the
+        // real table regardless of what temp views the connection carries.
+        tx.execute(&format!("UPDATE main.{table} SET repo_id = ?1 WHERE repo_id = ?2"), params![
+            target_id, source_id
+        ])?;
+    }
+    // A5 periphery tables (clones/oracle/reconcile/memories). Their `repo_id` column lands in
+    // V042; several of these tables predate it, so a partial-schema bootstrap fixture that
+    // stops before V042 can have the table without the column. Guard each re-point with
+    // `column_exists` (no-op when the column is absent, real backfill once V042 has run — every
+    // normal open applies the full ladder) so this adoption never trips "no such column". Uses
+    // `source_id` (not the placeholder literal) so a shallow-clone upgrade re-points periphery
+    // rows off the `local:` incumbent too, exactly like the core/papertrail loop above.
+    //
+    // Lens-lane refresh for the adopted repo: `memory_reality` / `memory_note_summaries` are in
+    // this list and carry no revision triggers (they sync on overlay/1). This bare UPDATE
+    // therefore does NOT bump the memories lane directly. It does not need to:
+    // `repo_memories` is ALSO in this same list (see the array), and it KEEPS its revision
+    // trigger, so re-pointing it in this loop advances the memories lane once for the
+    // adopted `repo_id` whenever it has any memory at all — the only case where a stale
+    // verdict/summary would matter. If `repo_memories`' triggers are ever removed too,
+    // add an explicit `bump_lens_revisions` here so adoption keeps refreshing the overlay
+    // rows.
+    for table in A5_PERIPHERY_DIRECT_SCOPED_TABLES {
+        if super::column_exists(tx, table, "repo_id")? {
+            // `main.`-qualified for the same view-shadowing reason as the core loop above.
+            tx.execute(
+                &format!("UPDATE main.{table} SET repo_id = ?1 WHERE repo_id = ?2"),
+                params![target_id, source_id],
+            )?;
+        }
+    }
+    // repo_node_edges (#464): the loop above re-pointed the OWNER `repo_id`; a SAME-repo
+    // `target_repo_id` must move with it (a cross-repo target names a sibling and is left
+    // alone). Edge reads self-heal `target_repo_id` from the live node, but keep the
+    // stored column honest here too. Guarded like the loop (a partial-schema fixture
+    // can lack the V049 column).
+    if super::column_exists(tx, "repo_node_edges", "repo_id")? {
+        tx.execute(
+            "UPDATE main.repo_node_edges SET target_repo_id = ?1 WHERE target_repo_id = ?2",
+            params![target_id, source_id],
+        )?;
+    }
+    // `dream_findings.id` folds `repo_id` (the `logical_symbols.stable_id` precedent), so the
+    // periphery re-point above changed the id every finding SHOULD have — re-derive them (and
+    // the in-table `superseded_by` references) under the adopted id: the dream twin of the
+    // `realign_logical_symbol_ids` call below. Guarded like the loop above (a partial-schema
+    // bootstrap fixture can lack the table or the V042 column); idempotent.
+    if super::column_exists(tx, "dream_findings", "repo_id")? {
+        (hooks.rederive_dream_finding_ids)(tx)?;
+    }
+    // Move the source id's recorded roots onto the new id BEFORE the source `repos` row is
+    // deleted (its FK is `ON DELETE CASCADE`, so the roots would otherwise be dropped). A
+    // shallow-clone upgrade carries the local id's roots; the placeholder never has any.
+    tx.execute("UPDATE repo_roots SET repo_id = ?1 WHERE repo_id = ?2", params![
+        target_id, source_id
+    ])?;
+    // `logical_symbols.id` is content-derived and now folds `repo_id` (A3), so re-pointing its
+    // `repo_id` above changed the id every row SHOULD have — the next `rebuild_logical_symbols`
+    // will re-derive `hash(real_repo_id ‖ key)` and dangle every pre-re-point memory/oracle
+    // handle still pointing at the source-derived id. Realign the ids (and every reference) in
+    // place NOW, before that rebuild. `logical_symbol_members` has an `ON DELETE CASCADE` FK to
+    // `logical_symbols(id)`, and adoption runs with `foreign_keys = ON`, so defer FK checks to
+    // COMMIT for this transaction (auto-resets on commit/rollback) — otherwise the parent-id
+    // UPDATE trips the child FK mid-statement. Idempotent with the V040 migration's own
+    // realign.
+    tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+    (hooks.realign_logical_symbol_ids)(tx)?;
+    tx.execute("DELETE FROM repos WHERE repo_id = ?1", [source_id])?;
+    Ok(())
+}
+
 /// LATE-upgrade merge: retire the `local:` incumbent `owner` INTO the already-registered
 /// `target_id` (the second shallow clone of an upstream whose portable id a sibling clone already
 /// claimed). Unlike the in-place upgrade, the target has LIVE data — same upstream, so the same
@@ -825,12 +879,12 @@ fn late_upgrade_is_proven(
 /// tolerate (it does converge: the proof re-holds and the merge re-runs over the already-drained
 /// rows). That is the sketched escape hatch if the stall ever bites in practice.
 ///
-/// TABLE COVERAGE: [`DIRECT_SCOPED_ADOPTION_TABLES`] + [`LATE_MERGE_DERIVED_PERIPHERY_TABLES`]
-/// were audited complete against every `repo_id`-carrying table at V044; V045 widened the github
-/// CHILD tables' keys without adding a new `repo_id` table, and V060's papertrail_* successors
-/// replaced the github_* entries in the direct list 1:1, so the disposition is unchanged. A
-/// future migration adding a NEW
-/// `repo_id`-scoped table must add it to one of these lists (or the authored-move set above).
+/// TABLE COVERAGE: every `repo_id`-carrying table has exactly one disposition on this path — the
+/// [`DIRECT_SCOPED_ADOPTION_TABLES`] or [`LATE_MERGE_DERIVED_PERIPHERY_TABLES`] DELETE loops, the
+/// authored-move set above, or a declared FK-carried or parked set. That is enforced, not audited:
+/// `every_repo_id_table_declares_a_late_merge_disposition` (and its in-place twin
+/// `every_repo_id_table_declares_an_in_place_adoption_disposition`) range over the live schema's
+/// own `repo_id` tables, so a new one fails a test until its disposition is declared.
 fn merge_local_incumbent_into_registered(
     conn: &Connection,
     identity: &RepoIdentity,
@@ -863,7 +917,7 @@ fn merge_local_incumbent_into_registered(
         identity.repo_id,
         owner
     ])?;
-    if adoption_table_present(&tx, "repo_memory_fts")? {
+    if super::migrations::sqlite_object_exists(&tx, "table", "repo_memory_fts")? {
         tx.execute("UPDATE main.repo_memory_fts SET repo_id = ?1 WHERE repo_id = ?2", params![
             identity.repo_id,
             owner
@@ -872,7 +926,7 @@ fn merge_local_incumbent_into_registered(
     // The baselines the drain parked for removed synced memories (#1298) move with the memories
     // they belong to. The key is `(repo_id, memory_id)`, so a memory parked under BOTH ids keeps
     // the owner's. Guarded for a partial-schema fixture.
-    if adoption_table_present(&tx, "repo_memory_parked_baselines")? {
+    if super::migrations::sqlite_object_exists(&tx, "table", "repo_memory_parked_baselines")? {
         tx.execute(
             "INSERT OR REPLACE INTO main.repo_memory_parked_baselines(
                  repo_id, memory_id, anchors_applied_digest, anchors_applied_targets,
@@ -901,7 +955,7 @@ fn merge_local_incumbent_into_registered(
     }
     // DERIVED data drops (cascades take the transitive children).
     for table in DIRECT_SCOPED_ADOPTION_TABLES {
-        if adoption_table_present(&tx, table)? {
+        if super::migrations::sqlite_object_exists(&tx, "table", table)? {
             tx.execute(&format!("DELETE FROM main.{table} WHERE repo_id = ?1"), [owner])?;
         }
     }
@@ -929,20 +983,6 @@ fn merge_local_incumbent_into_registered(
          over; its derived index rows were dropped and will re-derive on the next index pass."
     );
     Ok(())
-}
-
-/// Whether `table` exists in the schema (a plain or FTS5-virtual table both register in
-/// `sqlite_master` as `type = 'table'`) — the adoption loop's guard so a partial isolation
-/// fixture's absent direct-scoped table is skipped rather than tripping a `no such table` failure.
-fn adoption_table_present(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [table],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
 }
 
 /// A `SQLITE_CONSTRAINT` failure carrying `msg` — the registry's refusal shape. These are
@@ -1482,10 +1522,9 @@ pub fn is_root_already_indexed_conn(
     Ok(false)
 }
 
-/// TRIPWIRE (#571): the adoption coverage lists in this module are HAND-AUDITED against every
-/// `repo_id`-carrying table, and the audit note dates the last full pass to V044. V056
-/// (`git_change_couplings`) shipped absent from both lists with the full suite green: no test
-/// could see the omission. These tests turn the audit into a gate.
+/// TRIPWIRE (#571): the adoption coverage lists in this module are hand-written, and a hand audit
+/// is what let V056 (`git_change_couplings`) ship absent from both lists with the full suite
+/// green: no test could see the omission. These tests turn the audit into a gate.
 ///
 /// The enumeration comes from the FRESHLY BOOTSTRAPPED SCHEMA ITSELF —
 /// [`super::repo_scoped_table_names`], the same `sqlite_master` × `PRAGMA table_info` sweep the
@@ -1716,6 +1755,18 @@ mod repo_id_scope_coverage {
              matching its disposition (or, if an FK or an explicit statement already carries it, \
              to `LATE_MERGE_HANDLED_ELSEWHERE` with that reason).",
             set_names(&sets),
+        );
+    }
+
+    /// The late merge DELETEs the leading, DERIVED slice of the A5 periphery list; the rest of that
+    /// list is authored. Pinned so a derived periphery table cannot be added to one list
+    /// and not the other — re-pointed on adoption but never dropped on a late merge, or vice versa.
+    #[test]
+    fn late_merge_derived_periphery_is_the_a5_prefix() {
+        assert!(
+            A5_PERIPHERY_DIRECT_SCOPED_TABLES.starts_with(LATE_MERGE_DERIVED_PERIPHERY_TABLES),
+            "`LATE_MERGE_DERIVED_PERIPHERY_TABLES` must be the leading slice of \
+             `A5_PERIPHERY_DIRECT_SCOPED_TABLES`, in the same order",
         );
     }
 

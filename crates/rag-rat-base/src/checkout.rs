@@ -12,6 +12,16 @@ pub struct CheckoutKey {
 }
 
 impl CheckoutKey {
+    /// Rows owned by a committed base tree.
+    pub fn commit(commit_sha: String) -> Self {
+        Self { commit_sha, worktree_id: String::new() }
+    }
+
+    /// Rows owned by a worktree overlay.
+    pub fn worktree(worktree_id: String) -> Self {
+        Self { commit_sha: String::new(), worktree_id }
+    }
+
     /// The borrowed form scoped queries take.
     pub fn borrowed(&self) -> CheckoutRef<'_> {
         CheckoutRef { commit_sha: &self.commit_sha, worktree_id: &self.worktree_id }
@@ -23,4 +33,11 @@ impl CheckoutKey {
 pub struct CheckoutRef<'a> {
     pub commit_sha: &'a str,
     pub worktree_id: &'a str,
+}
+
+impl<'a> CheckoutRef<'a> {
+    /// Rows owned by a worktree overlay.
+    pub fn worktree(worktree_id: &'a str) -> Self {
+        Self { commit_sha: "", worktree_id }
+    }
 }

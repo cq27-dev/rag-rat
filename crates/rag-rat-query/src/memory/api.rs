@@ -27,6 +27,12 @@ pub const MAX_MEMORY_PAYLOAD_LEN: usize = 128 * 1024;
 /// `content_op_is_authorable`'s cross-crate test.
 pub const MAX_EDGE_ANCHOR_LEN: usize = 8 * 1024;
 
+/// The `FROM` clause pairing each memory with its bindings in the same repo — the join every
+/// by-anchor memory read starts from.
+const MEMORY_WITH_BINDINGS_FROM_SQL: &str = "FROM repo_memories
+        JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
+         AND repo_memory_bindings.repo_id = repo_memories.repo_id";
+
 pub fn memory_by_id(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<RepoMemory>> {
     // Scoped to the active repo (V042): this by-id read guards `memory_get` / `update_memory` /
     // `mark_obsolete` / `rebind_memory`, so an unscoped lookup would let any caller holding a
@@ -77,6 +83,7 @@ pub fn memories_for_chunk(
 ) -> anyhow::Result<Vec<RepoMemory>> {
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
+    let live = live_memory_status_sql("repo_memories");
     // Two binding kinds answer for one chunk, and they are not equally specific: a chunk binding
     // names THIS code, a path binding names the whole file. The caller's `limit` is a volume cap,
     // so under a shared ranking a file-level note touched today evicts the memory an author
@@ -94,17 +101,14 @@ pub fn memories_for_chunk(
         SELECT repo_memories.id AS memory_id,
                MAX(repo_memory_bindings.chunk_id IS ?1) AS binds_this_chunk,
                repo_memories.updated_at_ms AS updated_at_ms
-        FROM repo_memories
-        JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-         AND repo_memory_bindings.repo_id = repo_memories.repo_id
+        {MEMORY_WITH_BINDINGS_FROM_SQL}
         LEFT JOIN chunks ON chunks.id = ?1
         LEFT JOIN files ON files.id = chunks.file_id
-        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
+        WHERE {live}{repo_clause}
           AND (
               repo_memory_bindings.chunk_id = ?1
               OR (files.path IS NOT NULL
-                  AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
-         repo_memory_bindings.path)
+                  AND {BINDING_CURRENT_PATH}
                       = files.path)
           )
         GROUP BY repo_memories.id
@@ -126,15 +130,13 @@ pub fn memories_for_path(
 ) -> anyhow::Result<Vec<RepoMemory>> {
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
+    let live = live_memory_status_sql("repo_memories");
     let mut stmt = conn.prepare(&format!(
         "
         SELECT DISTINCT repo_memories.id AS memory_id
-        FROM repo_memories
-        JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-         AND repo_memory_bindings.repo_id = repo_memories.repo_id
-        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
-          AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
-         repo_memory_bindings.path) = ?1
+        {MEMORY_WITH_BINDINGS_FROM_SQL}
+        WHERE {live}{repo_clause}
+          AND {BINDING_CURRENT_PATH} = ?1
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?2
         "
@@ -153,22 +155,19 @@ pub fn memories_for_symbol(
     let mut candidate_ids = BTreeSet::new();
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
+    let live = live_memory_status_sql("repo_memories");
     let mut stmt = conn.prepare(&format!(
         "
         SELECT DISTINCT repo_memories.id AS memory_id
-        FROM repo_memories
-        JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-         AND repo_memory_bindings.repo_id = repo_memories.repo_id
-        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
+        {MEMORY_WITH_BINDINGS_FROM_SQL}
+        WHERE {live}{repo_clause}
           AND (
               repo_memory_bindings.logical_symbol_id = ?1
               OR repo_memory_bindings.symbol_id = ?2
-              OR IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_binding_id, \
-         repo_memory_bindings.binding_id) = ?3
+              OR {BINDING_CURRENT_BINDING_ID} = ?3
               OR (
                   repo_memory_bindings.binding_kind = 'path'
-                  AND IIF(repo_memory_bindings.resolved, repo_memory_bindings.resolved_path, \
-         repo_memory_bindings.path) = ?4
+                  AND {BINDING_CURRENT_PATH} = ?4
               )
           )
         ORDER BY repo_memories.updated_at_ms DESC
@@ -193,10 +192,8 @@ pub fn memories_for_symbol(
         let sql = format!(
             "
             SELECT DISTINCT repo_memories.id AS memory_id
-            FROM repo_memories
-            JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-             AND repo_memory_bindings.repo_id = repo_memories.repo_id
-            WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
+            {MEMORY_WITH_BINDINGS_FROM_SQL}
+            WHERE {live}{repo_clause}
               AND repo_memory_bindings.chunk_id IN ({placeholders})
             ORDER BY repo_memories.updated_at_ms DESC
             LIMIT ?
@@ -302,12 +299,13 @@ pub(crate) fn call_path_memories_for_crossed(
     let placeholders = std::iter::repeat_n("?", hashes.len()).collect::<Vec<_>>().join(",");
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
+    let live = live_memory_status_sql("repo_memories");
     let sql = format!(
         "
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_call_paths ON repo_memory_call_paths.memory_id = repo_memories.id
-        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
+        WHERE {live}{repo_clause}
           AND repo_memory_call_paths.edge_sequence_hash IN ({placeholders})
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?
@@ -337,13 +335,12 @@ pub fn memories_for_edges(
         std::iter::repeat_n("?", unique_edge_ids.len()).collect::<Vec<_>>().join(",");
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
+    let live = live_memory_status_sql("repo_memories");
     let sql = format!(
         "
         SELECT DISTINCT repo_memories.id AS memory_id
-        FROM repo_memories
-        JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-         AND repo_memory_bindings.repo_id = repo_memories.repo_id
-        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
+        {MEMORY_WITH_BINDINGS_FROM_SQL}
+        WHERE {live}{repo_clause}
           AND repo_memory_bindings.edge_id IN ({placeholders})
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?
@@ -365,12 +362,13 @@ pub fn memories_for_call_path_hash(
 ) -> anyhow::Result<Vec<RepoMemory>> {
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
+    let live = live_memory_status_sql("repo_memories");
     let mut stmt = conn.prepare(&format!(
         "
         SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_call_paths ON repo_memory_call_paths.memory_id = repo_memories.id
-        WHERE repo_memories.status IN ('active', 'stale'){repo_clause}
+        WHERE {live}{repo_clause}
           AND repo_memory_call_paths.edge_sequence_hash = ?1
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?2
@@ -411,6 +409,7 @@ pub fn memory_search_scored(
     // never surface here.
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
+    let live = live_memory_status_sql("repo_memories");
     // GROUP BY, not DISTINCT: selecting the score alongside the id makes the DISTINCT key the
     // (memory_id, bm25) PAIR, so a stray duplicate FTS row for one memory — an interrupted heal, an
     // import that inserts before its scoped DELETE — scores differently and survives it, and then
@@ -427,7 +426,7 @@ pub fn memory_search_scored(
             FROM repo_memory_fts
             JOIN repo_memories ON repo_memories.id = repo_memory_fts.memory_id
             WHERE repo_memory_fts MATCH ?1
-              AND repo_memories.status IN ('active', 'stale'){repo_clause}
+              AND {live}{repo_clause}
         )
         SELECT memory_id, MIN(bm25_rank) AS bm25_rank
         FROM scored
@@ -451,74 +450,8 @@ pub fn memory_search_scored(
 }
 
 #[cfg(test)]
-mod memory_search_dedup_tests {
-    use super::*;
-
-    /// A corpus where one memory's FTS mirror carries a stray SECOND row — what an interrupted
-    /// heal, or an import that inserts before its scoped DELETE, leaves behind. The bodies differ,
-    /// so the two rows score differently and a `DISTINCT` keyed on the id + score pair keeps both.
-    fn conn_with_duplicated_fts_row() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
-        conn.execute(
-            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
-            [],
-        )
-        .unwrap();
-        let insert_memory = |id: &str, body: &str| {
-            conn.execute(
-                "INSERT INTO repo_memories(id, kind, title, body, confidence, status,
-                        created_at_ms, updated_at_ms, source, memory_version, repo_id)
-                 VALUES (?1, 'Invariant', 'Quokkaform routing', ?2, 'high', 'active', 0, 0,
-                         'agent', 'v1', 'r')",
-                [id, body],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO repo_memory_fts(repo_id, memory_id, title, body, kind, tags)
-                 VALUES ('r', ?1, 'Quokkaform routing', ?2, 'Invariant', '')",
-                [id, body],
-            )
-            .unwrap();
-        };
-        // `m` is the strongest match by term frequency, so BOTH of its rows outrank the others.
-        insert_memory("m", "quokkaform quokkaform quokkaform");
-        for other in ["m2", "m3", "m4"] {
-            insert_memory(other, "quokkaform is pinned by the router on every rebuild");
-        }
-        // The stray duplicate mirror row for `m`, scoring differently from its real one.
-        conn.execute(
-            "INSERT INTO repo_memory_fts(repo_id, memory_id, title, body, kind, tags)
-             VALUES ('r', 'm', 'Quokkaform routing', 'quokkaform quokkaform quokkaform rebuild',
-                     'Invariant', '')",
-            [],
-        )
-        .unwrap();
-        conn
-    }
-
-    #[test]
-    fn duplicate_fts_rows_collapse_to_one_hit_per_memory() {
-        let conn = conn_with_duplicated_fts_row();
-        let hits = memory_search(&conn, "quokkaform", 10).unwrap();
-        assert_eq!(hits.len(), 4, "one hit per memory, not one per FTS row: {hits:?}");
-    }
-
-    /// The duplicate must not eat a result slot: `limit` counts distinct memories, so it has to be
-    /// applied AFTER the duplicate rows collapse, not to the raw FTS row set.
-    ///
-    /// The DISTINCTNESS of the ids is the whole claim — a row count of 3 alone is exactly what the
-    /// rejected `DISTINCT (memory_id, bm25)` shape returns, with `m` twice and one memory pushed
-    /// out.
-    #[test]
-    fn a_duplicate_fts_row_does_not_consume_a_limit_slot() {
-        let conn = conn_with_duplicated_fts_row();
-        let hits = memory_search(&conn, "quokkaform", 3).unwrap();
-        let ids: BTreeSet<&str> = hits.iter().map(|hit| hit.memory_id.as_str()).collect();
-        assert_eq!(hits.len(), 3, "the limit is spent in full: {hits:?}");
-        assert_eq!(ids.len(), 3, "limit counts distinct memories, not FTS rows: {hits:?}");
-    }
-}
+#[path = "api/memory_search_dedup_tests.rs"]
+mod memory_search_dedup_tests;
 
 /// Flat summary of one repo memory — boundary DTO for the CLI `memory list` surface.
 ///
@@ -545,6 +478,7 @@ pub fn list_memories(conn: &Connection, kind: Option<&str>) -> anyhow::Result<Ve
     // the memory_search / memories_for_* convention.
     let scope = memory_repo_scope(conn)?;
     let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
+    let live = live_memory_status_sql("m");
     let rows: Vec<MemorySummary> = if let Some(binding_kind) = kind {
         let mut stmt = conn.prepare(&format!(
             "
@@ -552,7 +486,7 @@ pub fn list_memories(conn: &Connection, kind: Option<&str>) -> anyhow::Result<Ve
                    b.binding_kind, b.binding_id
             FROM repo_memories AS m
             JOIN repo_memory_bindings AS b ON b.memory_id = m.id AND b.repo_id = m.repo_id
-            WHERE m.status IN ('active', 'stale'){repo_clause}
+            WHERE {live}{repo_clause}
               AND b.binding_kind = ?1
               AND b.rowid = (
                   SELECT b2.rowid FROM repo_memory_bindings AS b2
@@ -583,7 +517,7 @@ pub fn list_memories(conn: &Connection, kind: Option<&str>) -> anyhow::Result<Ve
                   ORDER BY b2.binding_kind, b2.binding_id
                   LIMIT 1
               )
-            WHERE m.status IN ('active', 'stale'){repo_clause}
+            WHERE {live}{repo_clause}
             ORDER BY m.updated_at_ms DESC
             "
         ))?;
@@ -672,14 +606,17 @@ pub fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>
     // hydrates them); the identity stays the authored `binding_id` the entry is listed under.
     let scope = memory_repo_scope(conn)?;
     let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "m");
+    let [b_path, b_symbol_kind, b_signature_hash, b_binding_id] =
+        ["path", "symbol_kind", "signature_hash", "binding_id"]
+            .map(|column| binding_current("b", column));
     let mut stmt = conn.prepare(&format!(
         "
         SELECT b.memory_id, b.binding_kind, b.binding_id,
-               IIF(b.resolved, b.resolved_path, b.path),
-               IIF(b.resolved, b.resolved_symbol_kind, b.symbol_kind),
-               IIF(b.resolved, b.resolved_signature_hash, b.signature_hash),
+               {b_path},
+               {b_symbol_kind},
+               {b_signature_hash},
                b.anchor_status, m.title,
-               IIF(b.resolved, b.resolved_binding_id, b.binding_id)
+               {b_binding_id}
         FROM repo_memory_bindings AS b
         JOIN repo_memories AS m ON m.id = b.memory_id AND m.repo_id = b.repo_id
         WHERE m.status = 'active'
@@ -754,13 +691,14 @@ pub fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>
     if let Some(active) = &scope
         && active != rag_rat_base::repo_identity::LEGACY_REPO_ID
     {
-        let mut stmt = conn.prepare(
+        let live = live_memory_status_sql("repo_memories");
+        let mut stmt = conn.prepare(&format!(
             "
             SELECT id, title FROM repo_memories
-            WHERE status IN ('active', 'stale') AND repo_id = ?1
+            WHERE {live} AND repo_id = ?1
             ORDER BY id
-            ",
-        )?;
+            "
+        ))?;
         let rows = stmt.query_map([rag_rat_base::repo_identity::LEGACY_REPO_ID], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -790,7 +728,7 @@ fn live_symbol_candidates(
     stored_kind: Option<&str>,
     stored_sig: Option<&str>,
 ) -> Vec<String> {
-    let short = short_symbol_name(binding_id, path);
+    let short = binding_leaf_name(binding_id, path);
     // Run the same bare-name query as relocate_symbol_by_name, but WITHOUT the hash filter —
     // we want all live symbols with this name, ranked by quality, not filtered by content.
     let mut stmt = match conn.prepare(

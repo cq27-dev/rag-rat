@@ -19,24 +19,6 @@ pub(crate) struct IndexFile {
     pub(super) worktree_id: String,
 }
 
-/// The `(commit_sha, worktree_id)` scope a heal writes a file row under: the base commit scope,
-/// or the worktree overlay for a dirty / commit-less checkout.
-#[derive(Debug, Clone)]
-pub(super) struct FileScope {
-    pub(super) commit_sha: String,
-    pub(super) worktree_id: String,
-}
-
-impl FileScope {
-    pub(super) fn commit(commit_sha: String) -> Self {
-        Self { commit_sha, worktree_id: String::new() }
-    }
-
-    pub(super) fn worktree(worktree_id: String) -> Self {
-        Self { commit_sha: String::new(), worktree_id }
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct PreparedIndexFile {
     pub(crate) file: IndexFile,

@@ -16,8 +16,8 @@ use super::apply::{self, ApplyOutcome};
 use super::registry::TableSpec;
 use super::retention::{Pin, PinKind};
 use super::row_op::{self, RowOp, StatedDelete};
-use super::scope_stream::scope_stream_id;
-use super::store::{self, AcceptOutcome};
+use super::scope_stream::{ScopeId, scope_stream_id};
+use super::store::{self, AcceptOutcome, PendingReason};
 use super::{produce, refold};
 use crate::device::DevicePublic;
 use crate::op::OpMeta;
@@ -43,8 +43,9 @@ pub(crate) struct SyncCtx<'a> {
 pub(crate) enum IngestOutcome {
     Applied,
     /// Stored and relayed, but not applied — an undecodable/unknown/out-of-scope payload. The
-    /// `&str` is the reason. Forward-compatible: the chain advanced, the payload is retained.
-    Retained(&'static str),
+    /// payload carries the typed reason. Forward-compatible: the chain advanced, the payload is
+    /// retained.
+    Retained(PendingReason),
     AlreadyPresent,
     /// The entry's chain predecessor has not arrived, so it is RETAINED and will be promoted when
     /// the predecessor is accepted. Not an error: out-of-order delivery is the normal condition on
@@ -97,7 +98,7 @@ pub(crate) fn produce_and_author(
             ctx.repo_id,
             ctx.account_id,
             ctx.incarnation_ref,
-            spec.scope_id,
+            spec.scope_id.as_db_str(),
         )?;
         for op in produce::produce_row_ops(tx, spec, ctx.repo_id, stream)? {
             let signed = store::author_row_entry(tx, stream, ctx.device.secret(), &op, ctx.now_ms)?;
@@ -244,11 +245,9 @@ pub(crate) fn process_readoption_work_for_stream(
     };
     for candidate in store::readoption_candidates(tx, stream, work.device_fingerprint, &local_hex)?
     {
-        let Some(spec) = ctx
-            .registry
-            .iter()
-            .find(|spec| spec.scope_id == context.scope_id && spec.name == candidate.table_name)
-        else {
+        let Some(spec) = ctx.registry.iter().find(|spec| {
+            spec.scope_id.as_db_str() == context.scope_id && spec.name == candidate.table_name
+        }) else {
             continue;
         };
         let op = match row_repair_op(
@@ -366,7 +365,7 @@ pub(crate) fn reauthor_chain_pins(
     refold::assert_projector_not_newer(tx)?;
     let device_hex = ctx.device.fingerprint().to_string();
     let spec_for = |table: &str| {
-        ctx.registry.iter().find(|spec| spec.scope_id == scope_id && spec.name == table)
+        ctx.registry.iter().find(|spec| spec.scope_id.as_db_str() == scope_id && spec.name == table)
     };
     let mut authored = 0;
     // Per pin: rows still to author, and whether it is stuck today.
@@ -544,14 +543,14 @@ fn row_repair_op(
     deletes_at_tail: bool,
 ) -> anyhow::Result<RowRepair> {
     let key = apply::RowKey { stream, repo_id, table: spec.name, row_pk };
-    let clock = apply::row_clock_winner_on_stream(tx, &key)?;
-    let tombstone = apply::tombstone_winner_on_stream(tx, &key)?;
+    let clock = apply::current_row_clock_on_stream(tx, &key)?;
+    let tombstone = apply::current_tombstone(tx, &key)?;
     // A live clock and a tombstone can only coexist with the clock newer: a remove raises the
     // tombstone at its own lamport, and a remove that BEATS the clock clears the clock. So a live
     // clock always owns the row, and a tombstone owns the deletion only without one.
     let (winner_lamport, identity) = match (clock, tombstone) {
-        (Some((lamport, winner)), _) if winner == winner_hex => (lamport, None),
-        (None, Some((lamport, device))) => (lamport, Some((lamport, device))),
+        (Some(clock), _) if clock.device_hex == winner_hex => (clock.lamport, None),
+        (None, Some(clock)) => (clock.lamport, Some((clock.lamport, clock.device_hex))),
         _ => return Ok(RowRepair::Skip),
     };
     // What the PHYSICAL row allows decides the repair. A live winner is carried while its row is
@@ -612,10 +611,10 @@ fn row_repair_op(
 pub(crate) fn ingest(
     tx: &Transaction<'_>,
     ctx: &SyncCtx<'_>,
-    scope_id: &str,
+    scope_id: ScopeId,
     signed_bytes: &[u8],
     pubkey: &DevicePublic,
-    advertised_floor: Option<store::AdvertisedFloor>,
+    advertised_floor: Option<store::ChainCursor>,
 ) -> anyhow::Result<IngestReport> {
     store::assert_current_incarnation(tx, ctx.account_id, ctx.repo_id, ctx.incarnation_ref)?;
     let device = pubkey.fingerprint();
@@ -669,7 +668,7 @@ pub(crate) struct IngestReport {
 #[derive(Clone, Copy)]
 struct IngestScope<'a> {
     ctx: &'a SyncCtx<'a>,
-    scope_id: &'a str,
+    scope_id: ScopeId,
     pubkey: &'a DevicePublic,
 }
 
@@ -727,7 +726,7 @@ fn ingest_one(
     tx: &Transaction<'_>,
     scope: &IngestScope<'_>,
     signed_bytes: &[u8],
-    advertised_floor: Option<store::AdvertisedFloor>,
+    advertised_floor: Option<store::ChainCursor>,
 ) -> anyhow::Result<(IngestOutcome, Option<AcceptedEntry>)> {
     let IngestScope { ctx, scope_id, pubkey } = *scope;
     // Same refusal as the producer: an older binary must not re-park, under its own version, an
@@ -742,7 +741,7 @@ fn ingest_one(
         ctx.repo_id,
         ctx.account_id,
         ctx.incarnation_ref,
-        scope_id,
+        scope_id.as_db_str(),
     )?;
     let scope_tables: Vec<&str> =
         ctx.registry.iter().filter(|s| s.scope_id == scope_id).map(|s| s.name).collect();
@@ -767,7 +766,7 @@ fn ingest_one(
                 let Some(spec) =
                     ctx.registry.iter().find(|s| s.scope_id == scope_id && s.name == op.table())
                 else {
-                    return Ok((IngestOutcome::Retained("table not in scope"), accepted));
+                    return Ok((IngestOutcome::Retained(PendingReason::TableNotInScope), accepted));
                 };
                 // NEVER apply over unsent local work. A raw local write does not advance the row
                 // clock, so the LWW comparison below cannot see it: this op would simply win and
@@ -821,7 +820,11 @@ fn ingest_one(
                             // settled already and bumps nothing.
                             ApplyOutcome::Applied
                             | ApplyOutcome::Quarantined { changed: true, .. } =>
-                                super::registry::bump_scope_lanes(tx, scope_id, ctx.repo_id)?,
+                                super::registry::bump_scope_lanes(
+                                    tx,
+                                    scope_id.as_db_str(),
+                                    ctx.repo_id,
+                                )?,
                             ApplyOutcome::Superseded
                             | ApplyOutcome::Quarantined { changed: false, .. }
                             | ApplyOutcome::Unprojectable(_) => {},
@@ -833,7 +836,7 @@ fn ingest_one(
                         deferral,
                         refold::TABLE_SYNC_PROJECTOR_VERSION,
                     )?;
-                    return Ok((IngestOutcome::Retained(deferral.as_db_str()), accepted));
+                    return Ok((IngestOutcome::Retained(deferral), accepted));
                 }
                 let outcome = match apply::apply_row_op_on_stream(
                     tx,
@@ -852,7 +855,11 @@ fn ingest_one(
                         // A restatement quarantines on one row's constraint failure after
                         // settling every other stated delete, which changed derived state.
                         if changed {
-                            super::registry::bump_scope_lanes(tx, scope_id, ctx.repo_id)?;
+                            super::registry::bump_scope_lanes(
+                                tx,
+                                scope_id.as_db_str(),
+                                ctx.repo_id,
+                            )?;
                         }
                         store::record_entry_quarantine(tx, &entry_hash, &why)?;
                         IngestOutcome::Quarantined(why)
@@ -867,15 +874,13 @@ fn ingest_one(
                             reason,
                             refold::TABLE_SYNC_PROJECTOR_VERSION,
                         )?;
-                        IngestOutcome::Retained(reason.as_db_str())
+                        IngestOutcome::Retained(reason)
                     },
                 };
                 (outcome, accepted)
             },
-            AcceptOutcome::StoredInert { reason, entry_hash, prev_hash } => (
-                IngestOutcome::Retained(reason.as_db_str()),
-                Some(AcceptedEntry { entry_hash, prev_hash }),
-            ),
+            AcceptOutcome::StoredInert { reason, entry_hash, prev_hash } =>
+                (IngestOutcome::Retained(reason), Some(AcceptedEntry { entry_hash, prev_hash })),
             // Nothing was stored by these, so none of them advances a chain and none can unblock a
             // retained successor.
             AcceptOutcome::AlreadyPresent => (IngestOutcome::AlreadyPresent, None),

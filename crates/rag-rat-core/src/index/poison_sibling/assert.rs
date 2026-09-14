@@ -10,7 +10,7 @@ use super::*;
 /// predicate pins every seeded column, so an in-place UPDATE stops matching) in one. The transitive
 /// children are matched through the poison file / logical symbol, exactly how a scoped reader would
 /// have to reach them.
-fn sibling_tripwires(conn: &Connection) -> anyhow::Result<Vec<(&'static str, String)>> {
+pub(super) fn sibling_tripwires(conn: &Connection) -> anyhow::Result<Vec<(&'static str, String)>> {
     let file_scope =
         format!("file_id IN (SELECT id FROM main.files WHERE repo_id = '{POISON_REPO_ID}')");
     let mut tripwires = vec![
@@ -241,6 +241,7 @@ fn sibling_tripwires(conn: &Connection) -> anyhow::Result<Vec<(&'static str, Str
             format!("repo_id = '{POISON_REPO_ID}' AND key = '{POISON_META_KEY}'"),
         ));
     }
+    tripwires.extend(super::seed::direct_tripwires(conn)?);
     Ok(tripwires)
 }
 

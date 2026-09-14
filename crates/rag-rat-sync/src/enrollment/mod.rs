@@ -6,6 +6,8 @@
 //! transaction. Any failure rolls all three effects back.
 
 mod error;
+#[cfg(test)]
+mod framing_tests;
 mod redeem;
 mod session;
 #[cfg(test)]

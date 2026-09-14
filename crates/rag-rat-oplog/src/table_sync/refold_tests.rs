@@ -7,7 +7,7 @@ use super::*;
 use crate::table_sync::engine::{self, IngestOutcome, SyncCtx};
 use crate::table_sync::registry::{ColumnSpec, DefaultValue, ValueType};
 use crate::table_sync::row_op::{Cell, RowOp, TypedValue};
-use crate::table_sync::scope_stream::scope_stream_id;
+use crate::table_sync::scope_stream::{ScopeId, scope_stream_id};
 use crate::{AccountId, LocalDevice};
 
 /// The physical table carries both columns; which of them a binary KNOWS is what the two specs
@@ -16,7 +16,7 @@ use crate::{AccountId, LocalDevice};
 /// over the same table, not by a different table.
 const OLD: TableSpec = TableSpec {
     name: "t_demo",
-    scope_id: "demo/1",
+    scope_id: ScopeId::new("demo/1"),
     spec_version: 1,
     pk: &[ColumnSpec::required("id", ValueType::Text)],
     columns: &[ColumnSpec::required("title", ValueType::Text)],
@@ -25,7 +25,7 @@ const OLD: TableSpec = TableSpec {
 };
 const NEW: TableSpec = TableSpec {
     name: "t_demo",
-    scope_id: "demo/1",
+    scope_id: ScopeId::new("demo/1"),
     // A LATER column set: `later_col` was added, so ops from the older spec fill it from the
     // declared default (the physical column has no DEFAULT clause, hence `Null`).
     spec_version: 2,
@@ -146,7 +146,11 @@ impl Device {
         };
         let out = entries
             .iter()
-            .map(|bytes| engine::ingest(&tx, &ctx, "demo/1", bytes, from, None).unwrap().outcome)
+            .map(|bytes| {
+                engine::ingest(&tx, &ctx, ScopeId::new("demo/1"), bytes, from, None)
+                    .unwrap()
+                    .outcome
+            })
             .collect();
         tx.commit().unwrap();
         out
@@ -219,7 +223,7 @@ fn a_parked_column_is_recovered_by_the_refold_and_then_the_producer_stays_quiet(
     // partially applied.
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ],);
     assert_eq!(b.row(), None, "nothing is written for an op we cannot fully project");
     assert_eq!(b.pending_count(), 1, "the entry is marked for replay");
@@ -257,7 +261,7 @@ const REALITY_PK: &[ColumnSpec] = &[
 ];
 const OLD_REALITY: TableSpec = TableSpec {
     name: "memory_reality",
-    scope_id: "overlay/1",
+    scope_id: ScopeId::OVERLAY,
     spec_version: 1,
     pk: REALITY_PK,
     columns: OLD_REALITY_COLS,
@@ -266,7 +270,7 @@ const OLD_REALITY: TableSpec = TableSpec {
 };
 const NEW_REALITY: TableSpec = TableSpec {
     name: "memory_reality",
-    scope_id: "overlay/1",
+    scope_id: ScopeId::OVERLAY,
     spec_version: 2,
     pk: REALITY_PK,
     columns: &[
@@ -339,15 +343,15 @@ fn refold_replay_of_a_memory_lane_row_bumps_the_memories_lens_lane() {
         let out = entries
             .iter()
             .map(|bytes| {
-                engine::ingest(&tx, &ctx, "overlay/1", bytes, &a.pubkey(), None).unwrap().outcome
+                engine::ingest(&tx, &ctx, ScopeId::OVERLAY, bytes, &a.pubkey(), None)
+                    .unwrap()
+                    .outcome
             })
             .collect();
         tx.commit().unwrap();
         out
     };
-    assert_eq!(outcomes, vec![IngestOutcome::Retained(
-        PendingReason::NewerSpecVersion.as_db_str()
-    )]);
+    assert_eq!(outcomes, vec![IngestOutcome::Retained(PendingReason::NewerSpecVersion)]);
     assert_eq!(lens_memories_revision(&b.conn), 0, "a parked entry has not applied");
 
     // Refold under the new spec applies it, and the guard advances the memories lane.
@@ -383,7 +387,7 @@ fn refold_replay_of_a_non_memory_row_leaves_the_memories_lens_lane_untouched() {
     let entries = author_wide_row(&mut a);
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ]);
 
     assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
@@ -402,7 +406,7 @@ fn absent_or_contested_incarnation_authority_keeps_retryable_refold_debt() {
     let entries = author_wide_row(&mut a);
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ]);
 
     b.conn
@@ -619,7 +623,7 @@ fn a_winner_lookup_that_lands_on_another_rows_entry_resolves_to_unknown() {
     // r1 now holds an unsent edit that happens to equal r2's published content.
     b.conn.execute("UPDATE t_demo SET title = 'shared' WHERE id = 'r1'", []).unwrap();
 
-    let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account(), [0x44; 32], ScopeId::new("demo/1"));
     let (r2_lamport, r2_device): (i64, String) = b
         .conn
         .query_row(
@@ -689,8 +693,10 @@ fn ingest_defers_an_upsert_whose_row_state_cannot_be_established() {
     b.enroll(a.pubkey().fingerprint());
     let outcomes = b.ingest(NEW_REGISTRY, "repo", &entries, &a.pubkey());
     assert!(
-        outcomes.iter().all(|outcome| *outcome
-            == IngestOutcome::Retained(PendingReason::DeferredUnresolvedWinner.as_db_str())),
+        outcomes
+            .iter()
+            .all(|outcome| *outcome
+                == IngestOutcome::Retained(PendingReason::DeferredUnresolvedWinner)),
         "each upsert is deferred rather than applied: {outcomes:?}",
     );
     assert_eq!(b.row().unwrap().0, "edited", "the possibly-unsent local edit survives");
@@ -781,7 +787,7 @@ fn the_refold_covers_every_repo_in_the_store_not_just_one() {
     // the deferred account-global gap). Each repo therefore owns a distinct physical row.
     const SCOPED_OLD: TableSpec = TableSpec {
         name: "t_scoped",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[
             ColumnSpec::required("repo_id", ValueType::Text),
@@ -793,7 +799,7 @@ fn the_refold_covers_every_repo_in_the_store_not_just_one() {
     };
     const SCOPED_NEW: TableSpec = TableSpec {
         name: "t_scoped",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[
             ColumnSpec::required("repo_id", ValueType::Text),
@@ -953,7 +959,8 @@ fn an_older_binary_refuses_to_ingest_into_a_store_a_newer_projector_folded() {
         now_ms: 0,
         local_writer: Default::default(),
     };
-    let ingested = engine::ingest(&tx, &ctx, "demo/1", &entries[0], &a.pubkey(), None);
+    let ingested =
+        engine::ingest(&tx, &ctx, ScopeId::new("demo/1"), &entries[0], &a.pubkey(), None);
     assert!(ingested.is_err(), "an older projector must not ingest into a newer store");
     assert!(
         ingested.unwrap_err().to_string().contains("newer rag-rat"),
@@ -999,7 +1006,7 @@ fn a_column_without_a_declared_default_still_parks_an_older_op() {
     // broken producer from being silently completed.
     const NO_DEFAULT: TableSpec = TableSpec {
         name: "t_demo",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 2,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[
@@ -1017,7 +1024,7 @@ fn a_column_without_a_declared_default_still_parks_an_older_op() {
     let narrow = a.produce(OLD_REGISTRY, "repo");
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(&[NO_DEFAULT], "repo", &narrow, &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::PartialAfterImage.as_db_str())
+        IngestOutcome::Retained(PendingReason::PartialAfterImage)
     ],);
     assert_eq!(b.row(), None, "nothing is invented for a column with no declared default");
 }
@@ -1131,7 +1138,7 @@ fn devices_at_different_spec_versions_converge_in_both_directions() {
         .unwrap();
     let from_new = new_dev.produce(NEW_REGISTRY, "repo");
     assert_eq!(old_dev.ingest(OLD_REGISTRY, "repo", &from_new, &new_dev.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ],);
 
     // OLDER then authors its own row; the newer peer APPLIES it, filling the column it
@@ -1171,7 +1178,7 @@ fn a_row_this_binary_cannot_read_does_not_fail_the_refold_and_is_repaired_by_it(
     // out, and no registry lint can require the `CHECK (col IN (0, 1))` that would.
     const BOOL_OLD: TableSpec = TableSpec {
         name: "t_bool",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("flag", ValueType::Bool)],
@@ -1254,7 +1261,7 @@ fn a_parked_remove_does_not_delete_a_row_this_binary_cannot_read() {
 /// (#1017), plus a local-only column a delete would take with it.
 const BOOL: TableSpec = TableSpec {
     name: "t_bool",
-    scope_id: "demo/1",
+    scope_id: ScopeId::new("demo/1"),
     spec_version: 1,
     pk: &[ColumnSpec::required("id", ValueType::Text)],
     columns: &[ColumnSpec::required("flag", ValueType::Bool)],
@@ -1289,7 +1296,7 @@ fn park_a_remove_over_an_unreadable_row(a: &mut Device, b: &mut Device) {
     let removes = a.produce(&[BOOL], "repo");
     assert_eq!(removes.len(), 1, "the local delete is authored as a Remove");
     assert_eq!(b.ingest(OLD_REGISTRY, "repo", &removes, &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::TableNotInScope.as_db_str())
+        IngestOutcome::Retained(PendingReason::TableNotInScope)
     ]);
     assert_eq!(b.pending_count(), 1);
 }
@@ -1456,7 +1463,7 @@ fn a_malformed_key_is_quarantined_rather_than_failing_the_whole_refold() {
     };
     let signed = {
         let tx = a.conn.transaction().unwrap();
-        let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
+        let stream = scope_stream_id("repo", account(), [0x44; 32], ScopeId::new("demo/1"));
         let signed = store::author_row_entry(&tx, stream, a.local.secret(), &two_key, 0).unwrap();
         tx.commit().unwrap();
         signed.signed_bytes
@@ -1465,7 +1472,7 @@ fn a_malformed_key_is_quarantined_rather_than_failing_the_whole_refold() {
     // Parked because this scope has no such table for the ingesting registry.
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(&[], "repo", &[signed], &a.pubkey()), vec![IngestOutcome::Retained(
-        PendingReason::TableNotInScope.as_db_str()
+        PendingReason::TableNotInScope
     )],);
 
     // The refold must complete — not error — and the malformed entry must be rejected durably.
@@ -1506,7 +1513,7 @@ fn a_quarantine_found_during_replay_is_recorded_rather_than_silently_cleared() {
     };
     let signed = {
         let tx = a.conn.transaction().unwrap();
-        let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
+        let stream = scope_stream_id("repo", account(), [0x44; 32], ScopeId::new("demo/1"));
         let signed = store::author_row_entry(&tx, stream, a.local.secret(), &mistyped, 0).unwrap();
         tx.commit().unwrap();
         signed.signed_bytes
@@ -1514,7 +1521,7 @@ fn a_quarantine_found_during_replay_is_recorded_rather_than_silently_cleared() {
 
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(OLD_REGISTRY, "repo", &[signed], &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ],);
 
     assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
@@ -1550,7 +1557,7 @@ fn a_terminal_payload_over_an_unsent_edit_is_quarantined_not_deferred() {
     };
     let signed = {
         let tx = a.conn.transaction().unwrap();
-        let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
+        let stream = scope_stream_id("repo", account(), [0x44; 32], ScopeId::new("demo/1"));
         let signed = store::author_row_entry(&tx, stream, a.local.secret(), &mistyped, 0).unwrap();
         tx.commit().unwrap();
         signed.signed_bytes
@@ -2196,7 +2203,11 @@ impl Opener {
         };
         let out = entries
             .iter()
-            .map(|bytes| engine::ingest(&tx, &ctx, "demo/1", bytes, from, None).unwrap().outcome)
+            .map(|bytes| {
+                engine::ingest(&tx, &ctx, ScopeId::new("demo/1"), bytes, from, None)
+                    .unwrap()
+                    .outcome
+            })
             .collect();
         tx.commit().unwrap();
         out
@@ -2240,7 +2251,7 @@ fn park_wide_entry(store: &SharedStore) {
     let opener = store.open();
     opener.enroll(peer.pubkey().fingerprint());
     assert_eq!(opener.ingest(OLD_REGISTRY, "repo", &entries, &peer.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ]);
     assert_eq!(opener.pending_count(), 1, "the fixture leaves exactly one entry parked");
 }
@@ -2468,7 +2479,7 @@ fn the_unsent_local_edit_guard_sees_the_other_openers_committed_write() {
 fn an_upgrade_replays_parked_restates_without_redelivery() {
     let mut a = Device::new();
     let mut b = Device::new();
-    let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account(), [0x44; 32], ScopeId::new("demo/1"));
     a.conn
         .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'v1', NULL)", [])
         .unwrap();
@@ -2555,7 +2566,7 @@ fn an_upgrade_replays_parked_restates_without_redelivery() {
 fn a_subset_constraint_failure_parks_the_restate_instead_of_quarantining_it() {
     let mut a = Device::new();
     let mut b = Device::new();
-    let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account(), [0x44; 32], ScopeId::new("demo/1"));
     for id in ["r1", "r2"] {
         a.conn
             .execute("INSERT INTO t_demo(id, title, later_col) VALUES (?1, 'v', NULL)", [id])
@@ -2612,7 +2623,7 @@ fn a_subset_constraint_failure_parks_the_restate_instead_of_quarantining_it() {
                 now_ms: 0,
             },
             &restated,
-            Some(store::AdvertisedFloor {
+            Some(store::ChainCursor {
                 lamport: 4,
                 entry_hash: crate::entry::decode_signed(&restated).unwrap().entry.entry_hash,
             }),

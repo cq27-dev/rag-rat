@@ -1,12 +1,13 @@
 use super::*;
 use crate::table_sync::registry::{ColumnSpec, TableSpec, ValueType};
+use crate::table_sync::scope_stream::ScopeId;
 use crate::table_sync::store::{self, record_stream_context};
 use crate::table_sync::{Cell, RowOp, TypedValue, apply, row_op};
 use crate::{AccountId, LocalDevice};
 
 const SPEC: TableSpec = TableSpec {
     name: "t_demo",
-    scope_id: "demo/1",
+    scope_id: ScopeId::new("demo/1"),
     spec_version: 1,
     pk: &[ColumnSpec::required("id", ValueType::Text)],
     columns: &[ColumnSpec::required("title", ValueType::Text)],
@@ -424,7 +425,7 @@ fn adopting_a_floor_sweeps_gapped_entries_below_it() {
             now_ms: 0,
         },
         &floor_bytes,
-        Some(store::AdvertisedFloor {
+        Some(store::ChainCursor {
             lamport: 2,
             entry_hash: EntryHash::from_bytes(<[u8; 32]>::try_from(floor_hash.as_slice()).unwrap()),
         }),
@@ -488,7 +489,7 @@ fn floor_adoption_never_regresses_a_witnessed_tip() {
             now_ms: 0,
         },
         &floor_bytes,
-        Some(store::AdvertisedFloor {
+        Some(store::ChainCursor {
             lamport: 1,
             entry_hash: EntryHash::from_bytes(<[u8; 32]>::try_from(floor_hash.as_slice()).unwrap()),
         }),
@@ -525,7 +526,7 @@ fn floor_adoption_never_regresses_a_witnessed_tip() {
             now_ms: 0,
         },
         &equivocation.signed_bytes,
-        Some(store::AdvertisedFloor { lamport: 3, entry_hash: equivocation.entry.entry_hash }),
+        Some(store::ChainCursor { lamport: 3, entry_hash: equivocation.entry.entry_hash }),
     )
     .unwrap();
     assert_eq!(
@@ -590,7 +591,7 @@ fn a_peer_whose_tip_fell_below_the_floor_re_roots_and_converges() {
             now_ms: 0,
         },
         &bytes(4).1,
-        Some(store::AdvertisedFloor {
+        Some(store::ChainCursor {
             lamport: 4,
             entry_hash: EntryHash::from_bytes(<[u8; 32]>::try_from(floor_hash.as_slice()).unwrap()),
         }),
@@ -704,7 +705,7 @@ fn a_parked_floor_entry_does_not_deadlock_the_reroot() {
             now_ms: 0,
         },
         &floor_bytes,
-        Some(store::AdvertisedFloor {
+        Some(store::ChainCursor {
             lamport: 4,
             entry_hash: EntryHash::from_bytes(<[u8; 32]>::try_from(floor_hash.as_slice()).unwrap()),
         }),

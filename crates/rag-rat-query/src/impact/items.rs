@@ -1,5 +1,63 @@
 use super::*;
 
+/// Which files import or export a symbol: its `imports`/`exports` edges matched by the resolved
+/// symbol id `?1`, or by name `?2` for an edge the resolver left unbound, ordered by file kind,
+/// path and edge kind. Both impact lanes — the structured report's and the flat surface's — read it
+/// through [`import_export_rows`].
+const IMPORT_EXPORT_DEPENDENTS_SQL: &str = "
+        SELECT files.path, files.language, files.kind, edges.from_name,
+               edges.edge_kind, edges.confidence
+        FROM edges
+        JOIN files ON files.id = edges.source_file_id
+        WHERE edges.edge_kind IN ('imports', 'exports')
+          AND (edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM name_strings WHERE \
+                                            value = ?2))
+        ORDER BY files.kind, files.path, edges.edge_kind";
+
+/// One file importing or exporting a symbol, as [`IMPORT_EXPORT_DEPENDENTS_SQL`] reads it.
+pub(crate) struct ImportExportRow {
+    pub(crate) path: String,
+    pub(crate) language: String,
+    pub(crate) kind: String,
+    pub(crate) symbol: Option<String>,
+    pub(crate) edge_kind: String,
+    pub(crate) confidence: String,
+}
+
+impl ImportExportRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            path: row.get(0)?,
+            language: row.get(1)?,
+            kind: row.get(2)?,
+            symbol: row.get(3)?,
+            edge_kind: row.get(4)?,
+            confidence: row.get(5)?,
+        })
+    }
+}
+
+/// The files importing or exporting the symbol `symbol_id` (`None` for a by-name lookup) or named
+/// `name` — at most `limit` of them when one is given.
+pub(crate) fn import_export_rows(
+    conn: &Connection,
+    symbol_id: Option<i64>,
+    name: &str,
+    limit: Option<u32>,
+) -> anyhow::Result<Vec<ImportExportRow>> {
+    let rows = match limit {
+        Some(limit) => conn
+            .prepare_cached(&format!("{IMPORT_EXPORT_DEPENDENTS_SQL}\n        LIMIT ?3"))?
+            .query_map(params![symbol_id, name, i64::from(limit)], ImportExportRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        None => conn
+            .prepare_cached(IMPORT_EXPORT_DEPENDENTS_SQL)?
+            .query_map(params![symbol_id, name], ImportExportRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    };
+    Ok(rows)
+}
+
 pub(crate) fn import_export_items(
     conn: &Connection,
     symbol_id: i64,
@@ -8,24 +66,20 @@ pub(crate) fn import_export_items(
     limit: u32,
 ) -> anyhow::Result<Vec<ImpactItem>> {
     let mut items = Vec::new();
-    let mut stmt = conn.prepare(
-        "
-        SELECT files.path, files.language, files.kind, edges.from_name,
-               edges.edge_kind, edges.confidence
-        FROM edges
-        JOIN files ON files.id = edges.source_file_id
-        WHERE edges.edge_kind IN ('imports', 'exports')
-          AND (edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM name_strings WHERE \
-         value = ?2))
-        ORDER BY files.kind, files.path, edges.edge_kind
-        LIMIT ?3
-        ",
-    )?;
     for name in std::iter::once(qualified_name).chain(names.iter().map(String::as_str)) {
-        let rows = stmt.query_map(params![symbol_id, name, i64::from(limit)], |row| {
-            impact_item_row(row, "Import/export dependents", "import_export_dependent")
-        })?;
-        items.extend(rows_to_items(rows)?);
+        let rows = import_export_rows(conn, Some(symbol_id), name, Some(limit))?;
+        // This lane labels the evidence "Import/export dependents"; the flat surface files the same
+        // rows under `ImpactCategory::DirectStructural`. Both labels are wire-visible, so each lane
+        // keeps its own.
+        items.extend(rows.into_iter().map(|row| ImpactItem {
+            path: row.path,
+            language: row.language,
+            kind: row.kind,
+            symbol: row.symbol,
+            category: "Import/export dependents".to_string(),
+            reason: "import_export_dependent".to_string(),
+            evidence: vec![format!("{} edge ({})", row.edge_kind, row.confidence)],
+        }));
         if items.len() >= usize::try_from(limit).unwrap_or(usize::MAX) {
             break;
         }
@@ -195,7 +249,7 @@ pub(crate) fn section_like_items(
             evidence: vec![format!("{match_kind} for `{needle}`")],
         })
     })?;
-    rows_to_items(rows)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub(crate) fn git_commit_items(
@@ -272,22 +326,6 @@ pub(crate) fn papertrail_rationale_items_for_query(
         usize::try_from(limit).unwrap_or(usize::MAX),
     )?;
     Ok(surface.into_items(usize::try_from(limit).unwrap_or(usize::MAX)))
-}
-
-pub(crate) fn impact_item_row(
-    row: &rusqlite::Row<'_>,
-    category: &'static str,
-    reason: &'static str,
-) -> rusqlite::Result<ImpactItem> {
-    Ok(ImpactItem {
-        path: row.get(0)?,
-        language: row.get(1)?,
-        kind: row.get(2)?,
-        symbol: row.get(3)?,
-        category: category.to_string(),
-        reason: reason.to_string(),
-        evidence: vec![format!("{} edge ({})", row.get::<_, String>(4)?, row.get::<_, String>(5)?)],
-    })
 }
 
 /// Collapse a file-granularity section (tests / docs / text fallback) to one row per file. Across

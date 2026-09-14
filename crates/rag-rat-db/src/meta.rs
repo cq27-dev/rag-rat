@@ -1,4 +1,5 @@
-//! Index key-value meta (the `index_meta` table) and the content-revision digest.
+//! Key-value meta accessors: the per-repo `repo_meta` family (including the Lens revision keys and
+//! their bumps), the global `index_meta` accessors, and the target-scope fingerprint.
 
 use rag_rat_base::config::ResolvedTarget;
 use rag_rat_base::hash::hex_sha256;
@@ -6,12 +7,6 @@ use rag_rat_base::paths::path_string;
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub mod watch_placement;
-
-/// Read one `index_meta` value.
-pub fn read_meta(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
-    conn.query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
-        .optional()
-}
 
 pub const WATCH_SHUTDOWN_RECONCILE_PENDING_META: &str = "watch_shutdown_reconcile_pending";
 /// Watch-placement failure HIGH-WATER MARK the resident watcher has seen (see `watch::placement`).
@@ -105,11 +100,11 @@ pub fn target_scope_fingerprint(targets: &[ResolvedTarget]) -> String {
     hex_sha256(input.as_bytes())
 }
 
-/// Read a per-repo meta value from the `repo_meta` table — the repo-scoped twin of
-/// [`read_meta`](crate::index::read_meta) (which reads the global `index_meta`). `repo_id` is the
-/// owning repo — the caller's active-repo scope (`IndexDatabase::active_repo_id`, or
-/// [`schema::active_repo_id`](crate::index::schema) on a free connection). Returns `None` when the
-/// key is unset for that repo.
+/// Read a per-repo meta value from the `repo_meta` table — the repo-scoped twin of [`read_meta`]
+/// (which reads the global `index_meta`). `repo_id` is the owning repo — the caller's active-repo
+/// scope (rag-rat-core's `IndexDatabase::active_repo_id`, or
+/// [`schema::active_repo_id`](crate::schema::active_repo_id) on a free connection). Returns `None`
+/// when the key is unset for that repo.
 pub fn repo_meta(
     conn: &rusqlite::Connection,
     repo_id: &str,
@@ -144,7 +139,7 @@ pub fn bump_repo_meta_high_water(
 }
 
 /// Upsert a per-repo meta value into `repo_meta` (keyed by `(repo_id, key)`). The repo-scoped twin
-/// of [`IndexDatabase::set_meta`].
+/// of rag-rat-core's `IndexDatabase::set_meta`.
 pub fn set_repo_meta(
     conn: &rusqlite::Connection,
     repo_id: &str,
@@ -161,7 +156,7 @@ pub fn set_repo_meta(
 
 /// Upsert a per-repo meta value only when it differs from the stored value — returns whether a
 /// write happened, so a no-change pass avoids dirtying a WAL page (the #63 property, mirrored from
-/// [`IndexDatabase::set_meta_if_changed`]).
+/// rag-rat-core's `IndexDatabase::set_meta_if_changed`).
 pub fn set_repo_meta_if_changed(
     conn: &rusqlite::Connection,
     repo_id: &str,
@@ -202,6 +197,12 @@ pub fn scoped_table_row_count(
         |row| row.get::<_, i64>(0),
     )?;
     Ok(u64::try_from(count).unwrap_or(0))
+}
+
+/// Read one `index_meta` value.
+pub fn read_meta(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
+        .optional()
 }
 
 pub fn set_meta(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {

@@ -378,8 +378,12 @@ fn for_each_recomputed_chunk_policy(
 fn active_scope_covers_all_live_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<bool> {
     use rag_rat_db::schema::{active_generation, connection_context_value};
     let generation = active_generation(conn)?;
-    let commit_sha = connection_context_value(conn, "commit_sha").unwrap_or_default();
-    let worktree_id = connection_context_value(conn, "worktree_id").unwrap_or_default();
+    let commit_sha =
+        connection_context_value(conn, rag_rat_db::schema::CONNECTION_CONTEXT_COMMIT_KEY)
+            .unwrap_or_default();
+    let worktree_id =
+        connection_context_value(conn, rag_rat_db::schema::CONNECTION_CONTEXT_WORKTREE_KEY)
+            .unwrap_or_default();
     // A whole-generation BARE open (`write_repo_generation_view`, e.g. the MCP read path) serves
     // EVERY live row for the repo with NO commit/worktree filter, writing both context keys empty.
     // Every scoped open — even a non-git base — carries a non-empty `worktree_id` (the root path

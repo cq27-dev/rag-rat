@@ -1139,6 +1139,45 @@ async fn a_writer_invite_redeems_over_the_wire_and_replays_for_the_same_contribu
     assert_eq!(retained, 0, "the replay-expired row is pruned");
 }
 
+#[test]
+fn a_writer_nonce_presented_to_the_pairing_flow_is_refused_as_unknown() {
+    let (conn, account, _stream, writer_ticket) = writer_fixture();
+    let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
+    let request = EnrollmentRequest {
+        nonce: writer_ticket.nonce,
+        expected_account: account,
+        ed25519_pubkey,
+        x25519_pubkey,
+        transport_node_id: [9; 32],
+        budget: generous_budget(),
+        held_entry_hashes: Vec::new(),
+    };
+    let clock_reads = std::cell::Cell::new(0);
+    let clock = || {
+        clock_reads.set(clock_reads.get() + 1);
+        NOW + 1
+    };
+    let error = redeem_invite(&conn, request, [9; 32], &clock).unwrap_err();
+    assert!(matches!(error, InviteError::Unknown), "{error}");
+    assert!(super::wire::refusal_code(&error).is_some(), "the refusal goes back on the wire");
+    assert_eq!(clock_reads.get(), 0, "the kind gate refuses before the arrival clock is read");
+
+    // The writer invite is untouched and still redeems through its own flow.
+    let grant = WriterGrantRequest {
+        nonce: writer_ticket.nonce,
+        expected_account: account,
+        contributor_account: AccountId::from_bytes([0x77; 32]),
+    };
+    redeem_writer_invite(&conn, &grant, [9; 32], &|| NOW + 1).unwrap();
+}
+
+#[test]
+fn a_transport_failure_is_never_answered_with_a_refusal_frame() {
+    let error = InviteError::Transport("enrollment dial timed out".into());
+    assert!(super::wire::refusal_code(&error).is_none());
+    assert_eq!(error.to_string(), "enrollment transport: enrollment dial timed out");
+}
+
 #[tokio::test]
 async fn the_writer_dialer_refuses_a_pairing_ticket_by_name() {
     let conn = db();
@@ -1995,4 +2034,42 @@ async fn request_length_is_capped_before_allocating_its_body() {
         matches!(error, InviteError::Malformed(message) if message.contains("request")),
         "the unauthenticated request uses its small cap"
     );
+}
+
+#[test]
+fn an_unknown_stored_role_preserves_each_flows_refusal_order() {
+    let (conn, account, _stream, ticket) = writer_fixture();
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
+    conn.execute("UPDATE sync_invites SET role = 'future_role' WHERE nonce = ?1", [ticket
+        .nonce
+        .as_slice()])
+        .unwrap();
+    let writer = WriterGrantRequest {
+        nonce: ticket.nonce,
+        expected_account: account,
+        contributor_account: AccountId::from_bytes([0x77; 32]),
+    };
+    assert!(matches!(
+        redeem_writer_invite(&conn, &writer, [9; 32], &|| NOW + 1),
+        Err(InviteError::Unknown)
+    ));
+    let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
+    let pairing = EnrollmentRequest {
+        nonce: ticket.nonce,
+        expected_account: account,
+        ed25519_pubkey,
+        x25519_pubkey,
+        transport_node_id: [9; 32],
+        budget: generous_budget(),
+        held_entry_hashes: Vec::new(),
+    };
+    conn.execute("UPDATE sync_invites SET expires_at_ms = ?1 WHERE nonce = ?2", rusqlite::params![
+        NOW,
+        ticket.nonce.as_slice()
+    ])
+    .unwrap();
+    assert!(matches!(
+        redeem_invite(&conn, pairing, [9; 32], &|| NOW + 1),
+        Err(InviteError::Expired)
+    ));
 }

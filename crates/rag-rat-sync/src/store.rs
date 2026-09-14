@@ -80,6 +80,32 @@ fn local_auth(
     Ok(LocalAuth { binding, capability })
 }
 
+/// Implement [`NodeAuth`] for an op-log store holding `conn` and `account_id` by delegating to
+/// [`local_auth`] and [`authorize_binding`]. Both methods take `now_ms` per HANDSHAKE (distinct
+/// from the store's `now_fn` ingest clock): binding freshness must track the live clock, or a
+/// reused store would mint stale bindings and never advance the replay window.
+///
+/// A macro, not a blanket `impl<T: ..> NodeAuth for T`: a blanket impl over a local trait would
+/// forbid every other `NodeAuth` impl in the crate, including the auth handshake's test fake.
+macro_rules! impl_account_node_auth {
+    ($(<$($generic:ident),*>)? for $store:ty) => {
+        impl$(<$($generic),*>)? NodeAuth for $store {
+            fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
+                local_auth(self.conn, self.account_id, local_node, now_ms)
+            }
+
+            fn authorize(
+                &self,
+                binding: &[u8],
+                remote_node: &[u8; 32],
+                now_ms: i64,
+            ) -> anyhow::Result<PeerAuthorization> {
+                authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
+            }
+        }
+    };
+}
+
 /// A [`SyncStore`] over one account's op log on a live connection. Scoped to a single account: a
 /// session syncs one account, and the hello handshake refuses a peer naming a different one. The
 /// only foreign logs it admits are those of accounts its owner granted a stream (#1280).
@@ -217,7 +243,7 @@ impl SyncStore for OplogSyncStore<'_> {
     }
 }
 
-/// A [`SyncStore`] over one account's OWN `/3` content on a live connection (phase D, #406) — the
+/// A [`SyncStore`] over one account's OWN content on a live connection (phase D, #406) — the
 /// memories themselves, where [`OplogSyncStore`] moves the account log that authorizes them.
 ///
 /// Scoped to a single account, like the account-log store: a session restores the account's own
@@ -346,43 +372,13 @@ impl SyncStore for OplogContentSyncStore<'_> {
     }
 }
 
-// Both op-log stores carry the same account-level node-authorization capability (the binding is
-// about the account + transport node, independent of whether the session moves account entries or
-// content), so both delegate to the shared helpers above.
-// Both auth methods take `now_ms` per HANDSHAKE (distinct from the store's `now_fn` ingest clock):
-// binding freshness must track the live clock, or a reused store would mint stale bindings and
-// never advance the replay window.
-impl NodeAuth for OplogSyncStore<'_> {
-    fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
-        local_auth(self.conn, self.account_id, local_node, now_ms)
-    }
+// Every op-log store carries the same account-level node-authorization capability (the binding is
+// about the account + transport node, independent of whether the session moves account entries,
+// content, or table streams), so each delegates to the shared helpers above.
+impl_account_node_auth!(for OplogSyncStore<'_>);
+impl_account_node_auth!(for OplogContentSyncStore<'_>);
 
-    fn authorize(
-        &self,
-        binding: &[u8],
-        remote_node: &[u8; 32],
-        now_ms: i64,
-    ) -> anyhow::Result<PeerAuthorization> {
-        authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
-    }
-}
-
-impl NodeAuth for OplogContentSyncStore<'_> {
-    fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
-        local_auth(self.conn, self.account_id, local_node, now_ms)
-    }
-
-    fn authorize(
-        &self,
-        binding: &[u8],
-        remote_node: &[u8; 32],
-        now_ms: i64,
-    ) -> anyhow::Result<PeerAuthorization> {
-        authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
-    }
-}
-
-/// Production adapter for current repo-scoped `/5` table streams.
+/// Production adapter for the table lane's current repo-scoped streams.
 pub struct OplogTableSyncStore<'a, F = fn() -> i64> {
     conn: &'a Connection,
     account_id: AccountId,
@@ -476,7 +472,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
             device_fingerprint: chain.device_fingerprint,
             lamport: chain.lamport,
             entry_hash: chain.entry_hash,
-            floor: chain.floor,
+            floor: chain.floor.map(|floor| (floor.lamport, floor.entry_hash)),
         })
         .collect())
     }
@@ -490,10 +486,12 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
                 device,
             )? {
                 rag_rat_oplog::TableSyncFrontier::Empty => FrontierState::Empty,
-                rag_rat_oplog::TableSyncFrontier::Accepted { lamport, entry_hash } =>
-                    FrontierState::Accepted { lamport, entry_hash },
-                rag_rat_oplog::TableSyncFrontier::Restore { lamport, entry_hash } =>
-                    FrontierState::Restore { lamport, entry_hash },
+                rag_rat_oplog::TableSyncFrontier::Accepted(
+                    rag_rat_oplog::TableSyncChainCursor { lamport, entry_hash },
+                ) => FrontierState::Accepted { lamport, entry_hash },
+                rag_rat_oplog::TableSyncFrontier::Restore(
+                    rag_rat_oplog::TableSyncChainCursor { lamport, entry_hash },
+                ) => FrontierState::Restore { lamport, entry_hash },
             },
         )
     }
@@ -508,9 +506,15 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
         let start = match start {
             ChainStart::Beginning => rag_rat_oplog::TableSyncEntryStart::Beginning,
             ChainStart::After { lamport, entry_hash } =>
-                rag_rat_oplog::TableSyncEntryStart::After { lamport, entry_hash },
+                rag_rat_oplog::TableSyncEntryStart::After(rag_rat_oplog::TableSyncChainCursor {
+                    lamport,
+                    entry_hash,
+                }),
             ChainStart::At { lamport, entry_hash } =>
-                rag_rat_oplog::TableSyncEntryStart::At { lamport, entry_hash },
+                rag_rat_oplog::TableSyncEntryStart::At(rag_rat_oplog::TableSyncChainCursor {
+                    lamport,
+                    entry_hash,
+                }),
         };
         Ok(rag_rat_oplog::table_sync_chain_entries(
             self.conn,
@@ -522,8 +526,8 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
         )?
         .into_iter()
         .map(|entry| ChainEntry {
-            lamport: entry.lamport,
-            entry_hash: entry.entry_hash,
+            lamport: entry.cursor.lamport,
+            entry_hash: entry.cursor.entry_hash,
             signed_bytes: entry.signed_bytes,
         })
         .collect())
@@ -544,7 +548,9 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
                 &rag_rat_oplog::TableSyncReceived {
                     expected_device,
                     signed_bytes,
-                    advertised_floor,
+                    advertised_floor: advertised_floor.map(|(lamport, entry_hash)| {
+                        rag_rat_oplog::TableSyncChainCursor { lamport, entry_hash }
+                    }),
                 },
                 (self.now_fn)(),
                 &self.local_writer,
@@ -556,20 +562,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
     }
 }
 
-impl<F> NodeAuth for OplogTableSyncStore<'_, F> {
-    fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
-        local_auth(self.conn, self.account_id, local_node, now_ms)
-    }
-
-    fn authorize(
-        &self,
-        binding: &[u8],
-        remote_node: &[u8; 32],
-        now_ms: i64,
-    ) -> anyhow::Result<PeerAuthorization> {
-        authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
-    }
-}
+impl_account_node_auth!(<F> for OplogTableSyncStore<'_, F>);
 
 #[cfg(test)]
 mod tests {

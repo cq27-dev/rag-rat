@@ -40,16 +40,16 @@ pub(crate) use registry::{ColumnSpec, TableSpec, ValueType};
 #[cfg(test)]
 pub(crate) use row_op::{Cell, RowOp, StatedDelete, TypedValue};
 #[cfg(test)]
-pub(crate) use scope_stream::scope_stream_id;
+pub(crate) use scope_stream::{ScopeId, scope_stream_id};
 pub(crate) use store::enqueue_readoption_work;
 #[cfg(test)]
 pub(crate) use store::{
     PendingReason, author_row_entry, mark_entry_pending, record_stream_context,
 };
 pub use transport::{
-    TableSyncChainEntry, TableSyncChainHead, TableSyncEntryStart, TableSyncFrontier,
-    TableSyncIngestOutcome, TableSyncReceived, TableSyncStream, scope_retention_budget,
-    table_sync_author_pending, table_sync_chain_entries, table_sync_chain_frontier,
-    table_sync_chain_page_after, table_sync_compact_overdue, table_sync_ingest,
-    table_sync_supported_streams, table_sync_validate_stream,
+    TableSyncChainCursor, TableSyncChainEntry, TableSyncChainHead, TableSyncEntryStart,
+    TableSyncFrontier, TableSyncIngestOutcome, TableSyncReceived, TableSyncStream,
+    scope_retention_budget, table_sync_author_pending, table_sync_chain_entries,
+    table_sync_chain_frontier, table_sync_chain_page_after, table_sync_compact_overdue,
+    table_sync_ingest, table_sync_supported_streams, table_sync_validate_stream,
 };

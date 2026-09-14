@@ -4,10 +4,22 @@ mod tests;
 mod traverse;
 use std::collections::BTreeSet;
 
-pub use predicates::*;
+pub(crate) use predicates::{
+    RESOLVED_OPERATOR_ONLY, forward_source_predicate, forward_target_filter,
+    forward_visibility_filter, oracle_seed_in_list, quoted_placeholders, resolution_label,
+    reverse_oracle_seeded_edge_ids, reverse_predicate, reverse_tier, short_name,
+    short_name_identifies_seed_alone, traversal_params, validate_edge_kinds,
+};
+// The traversal entry points, the confidence ladders and the two seed checks cross the crate
+// boundary (the engine's graph queries, its lens hops and a bootstrap test); the SQL fragment
+// builders are crate-internal.
+pub use predicates::{syntactic_seed_symbol_count, unique_symbol_name};
 use rusqlite::{Connection, params_from_iter};
 use serde::Serialize;
-pub use traverse::*;
+pub use traverse::{
+    effective_confidence_rank, normalize_confidence, oracle_overfetch_limit, traversal_summary,
+    traverse, traverse_with_options,
+};
 
 // `dispatches` (#200) and `uses_operator` ride with the call kinds so graph traversal surfaces the
 // synthesized handler hop and an operator declaration alongside its callable implementation. The

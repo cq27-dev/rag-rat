@@ -42,6 +42,7 @@ pub(super) trait VecEncoderExt {
     fn put_u32(&mut self, value: u32) -> &mut Self;
     fn put_u64(&mut self, value: u64) -> &mut Self;
     fn put_i64(&mut self, value: i64) -> &mut Self;
+    fn put_bool(&mut self, value: bool) -> &mut Self;
     fn put_null(&mut self) -> &mut Self;
 }
 
@@ -72,6 +73,10 @@ impl VecEncoderExt for VecEncoder<'_> {
 
     fn put_i64(&mut self, value: i64) -> &mut Self {
         self.i64(value).expect(INFALLIBLE)
+    }
+
+    fn put_bool(&mut self, value: bool) -> &mut Self {
+        self.bool(value).expect(INFALLIBLE)
     }
 
     fn put_null(&mut self) -> &mut Self {
@@ -143,9 +148,8 @@ fn check_canonical_item(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<(
             Ok(())
         },
         6 => check_canonical_item(bytes, pos, depth + 1), // tag: one following item
-        7 => Ok(()),                                      /* simple value (null/bool/…); floats */
-        // already rejected by the header
-        // reader
+        // Simple value (null/bool/…); floats were already rejected by the header reader.
+        7 => Ok(()),
         _ => Err(CborError::message("invalid CBOR major type")),
     }
 }
@@ -263,9 +267,20 @@ pub(super) fn fixed_bytes<const N: usize>(bytes: &[u8], field: &str) -> Result<[
         .map_err(|_| CborError::message(format!("{field} must be {N} bytes, got {}", bytes.len())))
 }
 
+/// Convert a stored BLOB to a fixed `[u8; N]`, naming `field` on a length mismatch — a stored hash
+/// or fingerprint of the wrong length is corruption at rest. The SQL-side twin of [`fixed_bytes`].
+pub(super) fn sql_fixed<const N: usize>(
+    bytes: Vec<u8>,
+    field: &'static str,
+) -> anyhow::Result<[u8; N]> {
+    <[u8; N]>::try_from(bytes).map_err(|bytes: Vec<u8>| {
+        anyhow::anyhow!("stored {field} must be {N} bytes, got {}", bytes.len())
+    })
+}
+
 /// Read a leading domain string and assert it matches `want` — a wrong/absent tag is a foreign or
-/// version-bumped object an old binary must reject, never misread. Shared by every domain-tagged
-/// decoder in `oplog`.
+/// version-bumped object an old binary must reject, never misread. Shared by the domain-tagged
+/// decoders that report a mismatch in this wording; `op` and the node binding keep their own.
 pub(super) fn expect_domain(d: &mut Decoder<'_>, want: &str) -> Result<(), CborError> {
     let got = d.str()?;
     if got == want {

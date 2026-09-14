@@ -1421,7 +1421,7 @@ fn find_callers_without_oracle_matches_heuristic_order() {
 
 /// #82 P0 regression: on a REAL committed git checkout the active context is
 /// `(commit_sha = HEAD, worktree_id = root)` — BOTH non-empty — and the indexed files are
-/// `FileScope::commit` rows `(HEAD, '')`. The old oracle scope predicate
+/// `CheckoutKey::commit` rows `(HEAD, '')`. The old oracle scope predicate
 /// `files.commit_sha = ?sha AND files.worktree_id = ?wt` matched ZERO such rows, so `oracle
 /// run` silently wrote 0 verdicts and the `Compiler` tier never surfaced. This test commits
 /// the checkout, runs the oracle, and asserts verdicts are written AND `trace_callees`
@@ -1434,7 +1434,7 @@ fn oracle_surfaces_compiler_tier_on_a_real_git_checkout() {
     }
     let root = temp_root();
     fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
-    // A real committed checkout: clean tree → files index as `FileScope::commit` (HEAD, '').
+    // A real committed checkout: clean tree → files index as `CheckoutKey::commit` (HEAD, '').
     git(&root, &["init", "-q"]);
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-q", "-m", "init"]);

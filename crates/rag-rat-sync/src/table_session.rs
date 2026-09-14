@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::auth::{AuthRole, SessionCapabilities};
+use crate::auth::{self, AuthRole, PeerCapability, SessionCapabilities};
 use crate::session::{DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES};
 use crate::table_codec::{self, TableCodecError};
 use crate::table_wire::{
@@ -73,9 +73,14 @@ pub struct TableSessionReport {
 #[derive(Debug, thiserror::Error)]
 pub enum TableSessionError {
     #[error("table-sync session transport: {0}")]
-    Codec(TableCodecError),
+    Codec(#[from] TableCodecError),
     #[error("table-sync protocol violation: {0}")]
     Protocol(String),
+    /// The peer made no progress within the idle window: it sent no frame, took none of ours, or
+    /// did not let the stream close. Distinct from [`TableSessionError::Protocol`] — a silent peer
+    /// violated nothing.
+    #[error("table-sync peer made no progress within {after:?}")]
+    Timeout { after: Duration },
     #[error("read-only peer attempted to push table entries")]
     UnauthorizedPush,
     #[error("table-sync session store: {0}")]
@@ -94,37 +99,23 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    run_table_session_with_idle_timeout(store, send, recv, role, capabilities, DEFAULT_IDLE_TIMEOUT)
-        .await
-}
-
-async fn run_table_session_with_idle_timeout<S, R, W>(
-    store: &mut S,
-    send: W,
-    recv: R,
-    role: AuthRole,
-    capabilities: SessionCapabilities,
-    idle_timeout: Duration,
-) -> Result<TableSessionReport, TableSessionError>
-where
-    S: TableSyncStore,
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
     run_table_session_with_limits(
         store,
         send,
         recv,
         role,
         capabilities,
-        idle_timeout,
         TableSessionLimits::default(),
     )
     .await
 }
 
+/// The per-session bounds of [`run_table_session_with_limits`]. The default is the session
+/// [`run_table_session`] runs: the default idle timeout and the protocol's page and session caps.
 #[derive(Clone, Copy)]
 struct TableSessionLimits {
+    /// Every frame read or write fails if the peer makes no progress within this window.
+    idle_timeout: Duration,
     chains_per_page: usize,
     chains_per_session: usize,
     entries_per_page: usize,
@@ -134,6 +125,7 @@ struct TableSessionLimits {
 impl Default for TableSessionLimits {
     fn default() -> Self {
         Self {
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             chains_per_page: MAX_TABLE_CHAINS_PER_PAGE,
             chains_per_session: MAX_TABLE_CHAINS_PER_SESSION,
             entries_per_page: MAX_TABLE_ENTRIES_PER_PAGE,
@@ -148,7 +140,6 @@ async fn run_table_session_with_limits<S, R, W>(
     mut recv: R,
     role: AuthRole,
     capabilities: SessionCapabilities,
-    idle_timeout: Duration,
     limits: TableSessionLimits,
 ) -> Result<TableSessionReport, TableSessionError>
 where
@@ -156,6 +147,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let idle_timeout = limits.idle_timeout;
     debug_assert!(limits.chains_per_page > 0);
     debug_assert!(limits.chains_per_page <= limits.chains_per_session);
     debug_assert!(limits.entries_per_page > 0);
@@ -191,8 +183,7 @@ where
                 &intersection,
                 &mut send,
                 &mut recv,
-                capabilities.local.can_push(),
-                idle_timeout,
+                capabilities.local,
                 limits,
             )
             .await?;
@@ -201,8 +192,7 @@ where
                 &intersection,
                 &mut send,
                 &mut recv,
-                capabilities.peer.can_push(),
-                idle_timeout,
+                capabilities.peer,
                 limits,
             )
             .await?;
@@ -214,8 +204,7 @@ where
                 &intersection,
                 &mut send,
                 &mut recv,
-                capabilities.peer.can_push(),
-                idle_timeout,
+                capabilities.peer,
                 limits,
             )
             .await?;
@@ -224,8 +213,7 @@ where
                 &intersection,
                 &mut send,
                 &mut recv,
-                capabilities.local.can_push(),
-                idle_timeout,
+                capabilities.local,
                 limits,
             )
             .await?;
@@ -248,8 +236,7 @@ async fn send_direction<S, R, W>(
     streams: &[ManifestItem],
     send: &mut W,
     recv: &mut R,
-    can_push: bool,
-    idle_timeout: Duration,
+    local_capability: PeerCapability,
     limits: TableSessionLimits,
 ) -> Result<(usize, bool), TableSessionError>
 where
@@ -257,6 +244,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let TableSessionLimits { idle_timeout, .. } = limits;
     let mut sent = 0;
     let mut offered_chains: usize = 0;
     let mut continuation_pending = false;
@@ -264,7 +252,7 @@ where
         let mut after_device = None;
         let mut stream_pending = false;
         loop {
-            if !can_push {
+            if !local_capability.can_push() {
                 break;
             }
             if sent >= limits.entries_per_session {
@@ -404,8 +392,7 @@ async fn receive_direction<S, R, W>(
     streams: &[ManifestItem],
     send: &mut W,
     recv: &mut R,
-    peer_can_push: bool,
-    idle_timeout: Duration,
+    peer_capability: PeerCapability,
     limits: TableSessionLimits,
 ) -> Result<(usize, usize, bool), TableSessionError>
 where
@@ -413,6 +400,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let TableSessionLimits { idle_timeout, .. } = limits;
     let mut received = 0;
     let mut newly_stored = 0;
     let mut offered_chains: usize = 0;
@@ -422,7 +410,7 @@ where
         loop {
             match read_before(recv, idle_timeout).await? {
                 TableFrame::ChainInventory { stream_id, chains } => {
-                    if !peer_can_push {
+                    if !peer_capability.can_push() {
                         return Err(TableSessionError::UnauthorizedPush);
                     }
                     let ordered_after_previous = chains.first().is_some_and(|first| {
@@ -573,11 +561,11 @@ async fn send_ack<W: AsyncWrite + Unpin>(
     idle_timeout: Duration,
 ) -> Result<(), TableSessionError> {
     write_before(send, &TableFrame::Ack, idle_timeout).await?;
-    match tokio::time::timeout(idle_timeout, send.shutdown()).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(TableSessionError::Codec(TableCodecError::Io(error))),
-        Err(_) => Err(TableSessionError::Protocol("table session timed out while closing".into())),
-    }
+    auth::within(idle_timeout, send.shutdown(), || TableSessionError::Timeout {
+        after: idle_timeout,
+    })
+    .await?
+    .map_err(|error| TableSessionError::Codec(TableCodecError::Io(error)))
 }
 
 async fn write_before<W: AsyncWrite + Unpin>(
@@ -585,10 +573,11 @@ async fn write_before<W: AsyncWrite + Unpin>(
     frame: &TableFrame,
     idle_timeout: Duration,
 ) -> Result<(), TableSessionError> {
-    match tokio::time::timeout(idle_timeout, table_codec::write_frame(send, frame)).await {
-        Ok(result) => result.map_err(TableSessionError::Codec),
-        Err(_) => Err(TableSessionError::Protocol("table session timed out while writing".into())),
-    }
+    auth::within(idle_timeout, table_codec::write_frame(send, frame), || {
+        TableSessionError::Timeout { after: idle_timeout }
+    })
+    .await?
+    .map_err(TableSessionError::Codec)
 }
 
 async fn read_ack<R: AsyncRead + Unpin>(
@@ -608,625 +597,16 @@ async fn read_before<R: AsyncRead + Unpin>(
     recv: &mut R,
     idle_timeout: Duration,
 ) -> Result<TableFrame, TableSessionError> {
-    match tokio::time::timeout(idle_timeout, table_codec::read_frame(recv)).await {
-        Ok(Ok(frame)) => Ok(frame),
-        Ok(Err(TableCodecError::Eof)) =>
+    let read = auth::within(idle_timeout, table_codec::read_frame(recv), || {
+        TableSessionError::Timeout { after: idle_timeout }
+    });
+    match read.await? {
+        Ok(frame) => Ok(frame),
+        Err(TableCodecError::Eof) =>
             Err(TableSessionError::Protocol("peer closed before table-session completion".into())),
-        Ok(Err(error)) => Err(TableSessionError::Codec(error)),
-        Err(_) => Err(TableSessionError::Protocol("table session timed out as idle".into())),
+        Err(error) => Err(TableSessionError::Codec(error)),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::{BTreeMap, HashMap};
-
-    use super::*;
-
-    #[derive(Clone)]
-    struct TestEntry {
-        device: Hash,
-        lamport: u64,
-        bytes: Vec<u8>,
-    }
-
-    #[derive(Clone)]
-    struct MemStore {
-        account: Hash,
-        supported: Vec<ManifestItem>,
-        entries: HashMap<Hash, HashMap<Hash, TestEntry>>,
-        forbidden_snapshots: HashSet<Hash>,
-        prepare_count: usize,
-    }
-
-    impl MemStore {
-        fn new(items: Vec<ManifestItem>) -> Self {
-            Self {
-                account: [7; 32],
-                supported: items,
-                entries: HashMap::new(),
-                forbidden_snapshots: HashSet::new(),
-                prepare_count: 0,
-            }
-        }
-
-        fn insert(&mut self, stream: Hash, seed: u8) {
-            self.insert_chain(stream, seed, 0, seed);
-        }
-
-        fn insert_chain(&mut self, stream: Hash, device: u8, lamport: u64, seed: u8) {
-            let mut bytes = vec![seed; 41];
-            bytes[..32].copy_from_slice(&[seed; 32]);
-            bytes[32] = device;
-            bytes[33..41].copy_from_slice(&lamport.to_be_bytes());
-            self.entries.entry(stream).or_default().insert([seed; 32], TestEntry {
-                device: [device; 32],
-                lamport,
-                bytes,
-            });
-        }
-
-        fn forbid_snapshot(&mut self, stream: Hash) {
-            self.forbidden_snapshots.insert(stream);
-        }
-    }
-
-    impl TableSyncStore for MemStore {
-        fn account_id(&self) -> Hash {
-            self.account
-        }
-
-        fn prepare(&mut self) -> anyhow::Result<()> {
-            self.prepare_count += 1;
-            Ok(())
-        }
-
-        fn supported_streams(&self) -> anyhow::Result<Vec<ManifestItem>> {
-            Ok(self.supported.clone())
-        }
-
-        fn validates(&self, item: &ManifestItem) -> anyhow::Result<bool> {
-            Ok(self.supported.contains(item))
-        }
-
-        fn chain_page(
-            &self,
-            item: &ManifestItem,
-            after_device: Option<Hash>,
-            limit: usize,
-        ) -> anyhow::Result<Vec<ChainHead>> {
-            anyhow::ensure!(
-                !self.forbidden_snapshots.contains(&item.stream_id),
-                "non-intersecting stream was snapshotted"
-            );
-            let mut chains = BTreeMap::new();
-            for (hash, entry) in self.entries.get(&item.stream_id).into_iter().flatten() {
-                let head = chains.entry(entry.device).or_insert((entry.lamport, *hash));
-                if entry.lamport > head.0 {
-                    *head = (entry.lamport, *hash);
-                }
-            }
-            Ok(chains
-                .into_iter()
-                .filter(|(device, _)| after_device.is_none_or(|after| *device > after))
-                .take(limit)
-                .map(|(device, (lamport, entry_hash))| ChainHead {
-                    floor: None,
-                    device_fingerprint: device,
-                    lamport,
-                    entry_hash,
-                })
-                .collect())
-        }
-
-        fn frontier(&self, item: &ManifestItem, device: Hash) -> anyhow::Result<FrontierState> {
-            Ok(self
-                .entries
-                .get(&item.stream_id)
-                .into_iter()
-                .flatten()
-                .filter(|(_, entry)| entry.device == device)
-                .max_by_key(|(_, entry)| entry.lamport)
-                .map_or(FrontierState::Empty, |(hash, entry)| FrontierState::Accepted {
-                    lamport: entry.lamport,
-                    entry_hash: *hash,
-                }))
-        }
-
-        fn entries(
-            &self,
-            item: &ManifestItem,
-            device: Hash,
-            start: ChainStart,
-            limit: usize,
-        ) -> anyhow::Result<Vec<ChainEntry>> {
-            if limit == 0 {
-                return Ok(Vec::new());
-            }
-            let entries = self.entries.get(&item.stream_id);
-            let (minimum, inclusive) = match start {
-                ChainStart::Beginning => (None, false),
-                ChainStart::After { lamport, entry_hash } => {
-                    if !entries.is_some_and(|entries| {
-                        entries
-                            .get(&entry_hash)
-                            .is_some_and(|entry| entry.device == device && entry.lamport == lamport)
-                    }) {
-                        anyhow::bail!("test cursor is not present")
-                    }
-                    (Some(lamport), false)
-                },
-                ChainStart::At { lamport, entry_hash } => {
-                    if !entries.is_some_and(|entries| {
-                        entries
-                            .get(&entry_hash)
-                            .is_some_and(|entry| entry.device == device && entry.lamport == lamport)
-                    }) {
-                        anyhow::bail!("test restore cursor is not present")
-                    }
-                    (Some(lamport), true)
-                },
-            };
-            let mut chain: Vec<_> =
-                entries.into_iter().flatten().filter(|(_, entry)| entry.device == device).collect();
-            chain.sort_by_key(|(_, entry)| entry.lamport);
-            Ok(chain
-                .into_iter()
-                .filter(|(_, entry)| {
-                    minimum.is_none_or(|minimum| {
-                        entry.lamport > minimum || (inclusive && entry.lamport == minimum)
-                    })
-                })
-                .take(limit)
-                .map(|(hash, entry)| ChainEntry {
-                    lamport: entry.lamport,
-                    entry_hash: *hash,
-                    signed_bytes: entry.bytes.clone(),
-                })
-                .collect())
-        }
-
-        fn ingest(
-            &mut self,
-            item: &ManifestItem,
-            expected_device: Hash,
-            bytes: &[u8],
-            _advertised_floor: Option<(u64, Hash)>,
-        ) -> anyhow::Result<Ingested> {
-            if !self.supported.contains(item) {
-                return Ok(Ingested::NoChange);
-            }
-            let hash: Hash = bytes[..32].try_into()?;
-            let device = [bytes[32]; 32];
-            let lamport = u64::from_be_bytes(bytes[33..41].try_into()?);
-            if device != expected_device {
-                return Ok(Ingested::NoChange);
-            }
-            Ok(match self.entries.entry(item.stream_id).or_default().entry(hash) {
-                std::collections::hash_map::Entry::Occupied(_) => Ingested::NoChange,
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(TestEntry { device, lamport, bytes: bytes.to_vec() });
-                    Ingested::Stored
-                },
-            })
-        }
-    }
-
-    fn item(repo: &str, stream: u8) -> ManifestItem {
-        ManifestItem {
-            repo_id: repo.into(),
-            incarnation_ref: [1; 32],
-            scope_id: "anchors/1".into(),
-            stream_id: [stream; 32],
-        }
-    }
-
-    async fn pair(a: &mut MemStore, b: &mut MemStore) -> (TableSessionReport, TableSessionReport) {
-        pair_with_limits(a, b, TableSessionLimits::default()).await
-    }
-
-    async fn pair_with_limits(
-        a: &mut MemStore,
-        b: &mut MemStore,
-        limits: TableSessionLimits,
-    ) -> (TableSessionReport, TableSessionReport) {
-        let (a, b) = try_pair_with_limits(a, b, limits).await;
-        (a.unwrap(), b.unwrap())
-    }
-
-    async fn try_pair_with_limits(
-        a: &mut MemStore,
-        b: &mut MemStore,
-        limits: TableSessionLimits,
-    ) -> (
-        Result<TableSessionReport, TableSessionError>,
-        Result<TableSessionReport, TableSessionError>,
-    ) {
-        let (a_send, b_recv) = tokio::io::duplex(1 << 20);
-        let (b_send, a_recv) = tokio::io::duplex(1 << 20);
-        tokio::join!(
-            run_table_session_with_limits(
-                a,
-                a_send,
-                a_recv,
-                AuthRole::Dialer,
-                SessionCapabilities::bidirectional(),
-                DEFAULT_IDLE_TIMEOUT,
-                limits,
-            ),
-            run_table_session_with_limits(
-                b,
-                b_send,
-                b_recv,
-                AuthRole::Acceptor,
-                SessionCapabilities::bidirectional(),
-                DEFAULT_IDLE_TIMEOUT,
-                limits,
-            ),
-        )
-    }
-
-    #[tokio::test]
-    async fn only_the_multi_repo_manifest_intersection_reconciles() {
-        let shared = item("repo-b", 2);
-        let mut a = MemStore::new(vec![item("repo-a", 1), shared.clone()]);
-        let mut b = MemStore::new(vec![shared.clone(), item("repo-c", 3)]);
-        a.insert([1; 32], 10);
-        a.insert(shared.stream_id, 20);
-        b.insert([3; 32], 30);
-        a.forbid_snapshot([1; 32]);
-        b.forbid_snapshot([3; 32]);
-
-        let (a_report, b_report) = pair(&mut a, &mut b).await;
-        assert_eq!(a_report.streams, 1);
-        assert_eq!(b_report.entries_newly_stored, 1);
-        assert_eq!(b.entries[&shared.stream_id].len(), 1);
-        assert!(!b.entries.contains_key(&[1; 32]), "repo-a never crosses into repo-c's peer");
-        assert!(!a.entries.contains_key(&[3; 32]), "repo-c never crosses into repo-a's peer");
-
-        let (again_a, again_b) = pair(&mut a, &mut b).await;
-        assert_eq!(again_a.entries_sent + again_b.entries_sent, 0);
-        assert_eq!(again_a.entries_newly_stored + again_b.entries_newly_stored, 0);
-    }
-
-    #[tokio::test]
-    async fn empty_manifests_are_a_clean_no_op() {
-        let mut a = MemStore::new(Vec::new());
-        let mut b = MemStore::new(Vec::new());
-        let (a, b) = pair(&mut a, &mut b).await;
-        assert_eq!(a, TableSessionReport::default());
-        assert_eq!(b, TableSessionReport::default());
-    }
-
-    #[tokio::test]
-    async fn read_only_sessions_do_not_prepare_local_table_authorship() {
-        use crate::auth::PeerCapability;
-
-        let mut a = MemStore::new(Vec::new());
-        let mut b = MemStore::new(Vec::new());
-        let (a_send, b_recv) = tokio::io::duplex(1024);
-        let (b_send, a_recv) = tokio::io::duplex(1024);
-        let capabilities =
-            SessionCapabilities::new(PeerCapability::ReadOnly, PeerCapability::ReadOnly);
-        let (a_result, b_result) = tokio::join!(
-            run_table_session_with_limits(
-                &mut a,
-                a_send,
-                a_recv,
-                AuthRole::Dialer,
-                capabilities,
-                DEFAULT_IDLE_TIMEOUT,
-                TableSessionLimits::default(),
-            ),
-            run_table_session_with_limits(
-                &mut b,
-                b_send,
-                b_recv,
-                AuthRole::Acceptor,
-                capabilities,
-                DEFAULT_IDLE_TIMEOUT,
-                TableSessionLimits::default(),
-            ),
-        );
-        a_result.unwrap();
-        b_result.unwrap();
-        assert_eq!(a.prepare_count, 0);
-        assert_eq!(b.prepare_count, 0);
-    }
-
-    #[tokio::test]
-    async fn capped_sessions_advance_from_durable_frontiers_until_quiet() {
-        let shared = item("repo-a", 1);
-        let mut source = MemStore::new(vec![shared.clone()]);
-        let mut destination = MemStore::new(vec![shared.clone()]);
-        for seed in 1..=5 {
-            source.insert_chain(shared.stream_id, 7, u64::from(seed), seed);
-        }
-        let limits = TableSessionLimits {
-            chains_per_page: 2,
-            chains_per_session: 8,
-            entries_per_page: 1,
-            entries_per_session: 2,
-        };
-
-        let mut moved = Vec::new();
-        let mut pending = Vec::new();
-        for _ in 0..4 {
-            let (source_report, destination_report) =
-                pair_with_limits(&mut source, &mut destination, limits).await;
-            moved.push(source_report.entries_sent);
-            pending.push(source_report.continuation_pending);
-            assert_eq!(source_report.entries_sent, destination_report.entries_newly_stored);
-        }
-        assert_eq!(moved, [2, 2, 1, 0]);
-        assert_eq!(pending, [true, true, false, false]);
-        assert_eq!(destination.entries[&shared.stream_id].len(), 5);
-    }
-
-    #[tokio::test]
-    async fn lost_completion_ack_does_not_consume_or_repeat_progress() {
-        let shared = item("repo-a", 1);
-        let mut source = MemStore::new(vec![shared.clone()]);
-        let mut destination = MemStore::new(vec![shared.clone()]);
-        source.insert(shared.stream_id, 1);
-        let limits = TableSessionLimits::default();
-        let (mut source_send, mut destination_recv) = tokio::io::duplex(4096);
-        let (mut destination_send, mut source_recv) = tokio::io::duplex(4096);
-        let streams = vec![shared];
-        let (sent, received) = tokio::join!(
-            send_direction(
-                &source,
-                &streams,
-                &mut source_send,
-                &mut source_recv,
-                true,
-                DEFAULT_IDLE_TIMEOUT,
-                limits,
-            ),
-            receive_direction(
-                &mut destination,
-                &streams,
-                &mut destination_send,
-                &mut destination_recv,
-                true,
-                DEFAULT_IDLE_TIMEOUT,
-                limits,
-            ),
-        );
-        assert_eq!(sent.unwrap(), (1, false));
-        assert_eq!(received.unwrap(), (1, 1, false));
-
-        let (source_report, destination_report) = pair(&mut source, &mut destination).await;
-        assert_eq!(source_report.entries_sent + destination_report.entries_sent, 0);
-        assert_eq!(source_report.entries_newly_stored + destination_report.entries_newly_stored, 0);
-    }
-
-    #[test]
-    fn peer_frontiers_must_be_provable_prefixes_and_restore_debt_stays_pending() {
-        let local =
-            ChainHead { device_fingerprint: [1; 32], lamport: 3, entry_hash: [3; 32], floor: None };
-        assert!(matches!(
-            chain_plan(&local, FrontierState::Accepted { lamport: 3, entry_hash: [4; 32] }),
-            Err(TableSessionError::Protocol(_))
-        ));
-        assert_eq!(
-            chain_plan(&local, FrontierState::Accepted { lamport: 4, entry_hash: [4; 32] })
-                .unwrap(),
-            ChainPlan::Complete
-        );
-        assert_eq!(
-            chain_plan(&local, FrontierState::Accepted { lamport: 2, entry_hash: [2; 32] })
-                .unwrap(),
-            ChainPlan::Send(ChainStart::After { lamport: 2, entry_hash: [2; 32] })
-        );
-        assert_eq!(
-            chain_plan(&local, FrontierState::Restore { lamport: 4, entry_hash: [4; 32] }).unwrap(),
-            ChainPlan::Pending
-        );
-    }
-
-    #[test]
-    fn a_tip_below_the_sender_floor_plans_a_reroot_not_a_suffix() {
-        let local = ChainHead {
-            device_fingerprint: [1; 32],
-            lamport: 8,
-            entry_hash: [8; 32],
-            floor: Some((4, [4; 32])),
-        };
-        assert_eq!(
-            chain_plan(&local, FrontierState::Accepted { lamport: 2, entry_hash: [2; 32] })
-                .unwrap(),
-            ChainPlan::Send(ChainStart::At { lamport: 4, entry_hash: [4; 32] }),
-            "the receiver re-roots onto the floor instead of parking on compacted predecessors"
-        );
-        // A tip AT or above the floor keeps the ordinary suffix plan.
-        assert_eq!(
-            chain_plan(&local, FrontierState::Accepted { lamport: 6, entry_hash: [6; 32] })
-                .unwrap(),
-            ChainPlan::Send(ChainStart::After { lamport: 6, entry_hash: [6; 32] })
-        );
-    }
-
-    #[tokio::test]
-    async fn local_chain_inventory_enforces_the_exact_session_ceiling() {
-        let shared = item("repo-a", 1);
-        let mut source = MemStore::new(vec![shared.clone()]);
-        let mut destination = MemStore::new(vec![shared.clone()]);
-        source.insert_chain(shared.stream_id, 1, 0, 1);
-        source.insert_chain(shared.stream_id, 2, 0, 2);
-        let limits = TableSessionLimits {
-            chains_per_page: 1,
-            chains_per_session: 2,
-            entries_per_page: 1,
-            entries_per_session: 3,
-        };
-
-        let (source_report, destination_report) =
-            pair_with_limits(&mut source, &mut destination, limits).await;
-        assert_eq!(source_report.entries_sent, 2);
-        assert_eq!(destination_report.entries_newly_stored, 2);
-
-        source.insert_chain(shared.stream_id, 3, 0, 3);
-        let (source_result, peer_result) =
-            try_pair_with_limits(&mut source, &mut destination, limits).await;
-        assert!(matches!(
-            source_result,
-            Err(TableSessionError::Store(error)) if error.to_string().contains("ceiling")
-        ));
-        assert!(peer_result.is_err());
-    }
-
-    #[tokio::test]
-    async fn peer_chain_inventory_must_advance_order_and_respect_the_session_ceiling() {
-        for devices in [vec![2, 2], vec![1, 2, 3]] {
-            let shared = item("repo-a", 1);
-            let streams = vec![shared.clone()];
-            let mut store = MemStore::new(streams.clone());
-            let limits = TableSessionLimits {
-                chains_per_page: 1,
-                chains_per_session: 2,
-                entries_per_page: 1,
-                entries_per_session: 2,
-            };
-            let (mut receiver_send, mut peer_recv) = tokio::io::duplex(4096);
-            let (mut peer_send, mut receiver_recv) = tokio::io::duplex(4096);
-            let peer = async move {
-                for device in &devices[..devices.len() - 1] {
-                    table_codec::write_frame(&mut peer_send, &TableFrame::ChainInventory {
-                        stream_id: shared.stream_id,
-                        chains: vec![ChainHead {
-                            device_fingerprint: [*device; 32],
-                            lamport: 0,
-                            entry_hash: [*device; 32],
-                            floor: None,
-                        }],
-                    })
-                    .await
-                    .unwrap();
-                    assert!(matches!(
-                        table_codec::read_frame(&mut peer_recv).await.unwrap(),
-                        TableFrame::ChainFrontiers { .. }
-                    ));
-                    table_codec::write_frame(&mut peer_send, &TableFrame::InventoryDone {
-                        stream_id: shared.stream_id,
-                    })
-                    .await
-                    .unwrap();
-                }
-                let device = devices[devices.len() - 1];
-                table_codec::write_frame(&mut peer_send, &TableFrame::ChainInventory {
-                    stream_id: shared.stream_id,
-                    chains: vec![ChainHead {
-                        device_fingerprint: [device; 32],
-                        lamport: 0,
-                        entry_hash: [device; 32],
-                        floor: None,
-                    }],
-                })
-                .await
-                .unwrap();
-            };
-            let receiver = receive_direction(
-                &mut store,
-                &streams,
-                &mut receiver_send,
-                &mut receiver_recv,
-                true,
-                DEFAULT_IDLE_TIMEOUT,
-                limits,
-            );
-            let (result, ()) = tokio::join!(receiver, peer);
-            assert!(
-                matches!(result, Err(TableSessionError::Protocol(message)) if message.contains("cap"))
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn entry_pages_must_name_a_chain_in_the_current_inventory() {
-        let shared = item("repo-a", 1);
-        let streams = vec![shared.clone()];
-        let mut store = MemStore::new(streams.clone());
-        let (mut receiver_send, mut peer_recv) = tokio::io::duplex(4096);
-        let (mut peer_send, mut receiver_recv) = tokio::io::duplex(4096);
-        let peer = async move {
-            table_codec::write_frame(&mut peer_send, &TableFrame::ChainInventory {
-                stream_id: shared.stream_id,
-                chains: vec![ChainHead {
-                    device_fingerprint: [1; 32],
-                    lamport: 0,
-                    entry_hash: [1; 32],
-                    floor: None,
-                }],
-            })
-            .await
-            .unwrap();
-            assert!(matches!(
-                table_codec::read_frame(&mut peer_recv).await.unwrap(),
-                TableFrame::ChainFrontiers { .. }
-            ));
-            table_codec::write_frame(&mut peer_send, &TableFrame::Entries {
-                stream_id: shared.stream_id,
-                device_fingerprint: [2; 32],
-                entries: vec![vec![0; 41]],
-            })
-            .await
-            .unwrap();
-        };
-        let receiver = receive_direction(
-            &mut store,
-            &streams,
-            &mut receiver_send,
-            &mut receiver_recv,
-            true,
-            DEFAULT_IDLE_TIMEOUT,
-            TableSessionLimits::default(),
-        );
-        let (result, ()) = tokio::join!(receiver, peer);
-        assert!(matches!(result, Err(TableSessionError::Protocol(_))));
-        assert!(store.entries.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_peer_that_stops_reading_cannot_block_writes_forever() {
-        let shared = item("repo-a", 1);
-        let mut store = MemStore::new(vec![shared.clone()]);
-        for seed in 1..=32 {
-            store.insert(shared.stream_id, seed);
-        }
-        let (send, _peer_recv) = tokio::io::duplex(64);
-        let (mut peer_send, recv) = tokio::io::duplex(4096);
-        let peer = async move {
-            for frame in [
-                TableFrame::Manifest(Manifest::new(vec![shared.clone()]).unwrap()),
-                TableFrame::ChainFrontiers {
-                    stream_id: shared.stream_id,
-                    frontiers: vec![ChainFrontier {
-                        device_fingerprint: [1; 32],
-                        state: FrontierState::Empty,
-                    }],
-                },
-                TableFrame::StreamDone { stream_id: shared.stream_id, continuation_pending: false },
-                TableFrame::Done,
-            ] {
-                table_codec::write_frame(&mut peer_send, &frame).await.unwrap();
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-        let (result, ()) = tokio::join!(
-            run_table_session_with_idle_timeout(
-                &mut store,
-                send,
-                recv,
-                AuthRole::Dialer,
-                SessionCapabilities::bidirectional(),
-                Duration::from_millis(20),
-            ),
-            peer,
-        );
-        assert!(matches!(
-            result,
-            Err(TableSessionError::Protocol(message)) if message.contains("timed out while writing")
-        ));
-    }
-}
+mod tests;

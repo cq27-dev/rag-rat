@@ -256,7 +256,7 @@ pub(crate) fn mark_obsolete(conn: &Connection, memory_id: &str) -> anyhow::Resul
         title: None,
         body: None,
         confidence: None,
-        status: Some("obsolete".to_string()),
+        status: Some(rag_rat_query::memory::MemoryStatus::Obsolete.as_db_str().to_string()),
         tags: None,
         payload_json: None,
     })

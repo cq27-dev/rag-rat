@@ -610,21 +610,16 @@ pub async fn advertise(params: Advertise) {
 
 /// Where a discovery request failed, so a publish can tell "definitely not stored" from "maybe
 /// stored". A fetch does not care and treats both the same.
+#[derive(Debug, thiserror::Error)]
 enum RequestError {
     /// The bi-stream never opened, so nothing reached the service — the write is definitively not
     /// stored and the caller should retry at once rather than assume it might be live.
+    #[error(transparent)]
     NotSent(anyhow::Error),
     /// The request frame may have reached the service before the failure. Since the service stores
     /// on receipt before it answers, the write may already have landed.
+    #[error(transparent)]
     MaybeSent(anyhow::Error),
-}
-
-impl std::fmt::Display for RequestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotSent(error) | Self::MaybeSent(error) => write!(f, "{error}"),
-        }
-    }
 }
 
 /// One request on its own bi-stream. The service reads a single frame, answers, and closes, so a

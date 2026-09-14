@@ -48,7 +48,7 @@ pub(crate) fn graph_neighbors(
     // operator. Graph traversal and graph metadata already require a resolved operator target;
     // impact must too.
     let resolved_operator_only = crate::graph::RESOLVED_OPERATOR_ONLY;
-    let confidence_order = crate::graph::CONFIDENCE_ORDER_SQL;
+    let confidence_order = rag_rat_db::EdgeConfidence::order_sql();
     let sql_for = |predicate: &str| {
         format!(
             "
@@ -149,7 +149,7 @@ pub(crate) fn graph_neighbors(
         // Without a `?2` the predicate cannot match on a name at all, so the name pass has nothing
         // to contribute (an id-only `Exact` predicate against a NULL id matches nothing).
         if !binds_name
-            || (resolution_mode != GraphResolutionMode::Fuzzy && !is_qualified_symbol(name))
+            || (resolution_mode != GraphResolutionMode::Fuzzy && !has_scope_separator(name))
         {
             continue;
         }
@@ -202,48 +202,23 @@ pub(crate) fn import_export_dependents(
     target_names: &[String],
     surface: &mut ImpactSurface,
 ) -> anyhow::Result<()> {
-    let mut stmt = conn.prepare(
-        "
-        SELECT files.path, files.language, files.kind, edges.from_name,
-               edges.edge_kind, edges.confidence
-        FROM edges
-        JOIN files ON files.id = edges.source_file_id
-        WHERE edges.edge_kind IN ('imports', 'exports')
-          AND (edges.to_symbol_id = ?1 OR edges.to_name_id = (SELECT id FROM name_strings WHERE \
-         value = ?2))
-        ORDER BY files.kind, files.path, edges.edge_kind
-        ",
-    )?;
     for target in targets {
-        let rows = stmt.query_map(params![target.id, target.qualified_name], import_export_row)?;
-        push_import_export_rows(rows, target.qualified_name.as_str(), surface)?;
+        let rows = import_export_rows(conn, Some(target.id), &target.qualified_name, None)?;
+        push_import_export_rows(rows, target.qualified_name.as_str(), surface);
     }
     for name in target_names {
-        let rows = stmt.query_map(params![Option::<i64>::None, name], import_export_row)?;
-        push_import_export_rows(rows, name, surface)?;
+        let rows = import_export_rows(conn, None, name, None)?;
+        push_import_export_rows(rows, name, surface);
     }
     Ok(())
 }
 
-pub(crate) fn import_export_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(String, String, String, Option<String>, String, String)> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
-}
-
 pub(crate) fn push_import_export_rows(
-    rows: rusqlite::MappedRows<
-        '_,
-        impl FnMut(
-            &rusqlite::Row<'_>,
-        )
-            -> rusqlite::Result<(String, String, String, Option<String>, String, String)>,
-    >,
+    rows: Vec<ImportExportRow>,
     target: &str,
     surface: &mut ImpactSurface,
-) -> anyhow::Result<()> {
-    for row in rows {
-        let (path, language, kind, symbol, edge_kind, confidence) = row?;
+) {
+    for ImportExportRow { path, language, kind, symbol, edge_kind, confidence } in rows {
         surface.push(
             ImpactCategory::DirectStructural,
             FileSymbol { path, language, kind, symbol },
@@ -251,7 +226,6 @@ pub(crate) fn push_import_export_rows(
             format!("{edge_kind} edge matching {target} ({confidence})"),
         );
     }
-    Ok(())
 }
 
 pub(crate) fn same_file_siblings(

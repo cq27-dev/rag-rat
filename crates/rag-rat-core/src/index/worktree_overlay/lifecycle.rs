@@ -132,29 +132,18 @@ impl IndexDatabase {
         config: &Config,
         linked_path: &Path,
     ) -> anyhow::Result<()> {
-        let Some(ResolvedOverlayScope { base_sha, worktree_id, source_root, .. }) =
+        let Some(ResolvedOverlayScope { checkout, source_root, .. }) =
             resolve_overlay_scope(config, linked_path)?
         else {
             return Ok(());
         };
-        self.set_context(CheckoutRef { commit_sha: &base_sha, worktree_id: &worktree_id })?;
-        self.storage.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> anyhow::Result<()> {
+        self.set_context(checkout.borrowed())?;
+        self.in_immediate_txn(|| {
             self.refresh_packages(&source_root)?;
-            self.resolve_overlay_edges(&worktree_id)?;
+            self.resolve_overlay_edges(&checkout.worktree_id)?;
             self.bump_lens_revisions(&[rag_rat_db::meta::LENS_SYMBOLS_REVISION_META])?;
             Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.storage.execute_batch("COMMIT")?;
-                Ok(())
-            },
-            Err(err) => {
-                let _ = self.storage.execute_batch("ROLLBACK");
-                Err(err)
-            },
-        }
+        })
     }
 
     /// The post-write finalize tail of `index_worktree_overlay`, run INSIDE its transaction — ONLY
@@ -251,6 +240,7 @@ impl IndexDatabase {
             self.refresh_packages(source_root)?;
             self.resolve_overlay_edges(worktree_id)?;
             self.sync_fts()?;
+            self.bump_lens_revisions(rag_rat_db::meta::LENS_LANE_REVISION_METAS)?;
         } else if manifest_changed {
             // A dirty `Cargo.toml` with no source-row change: the base flow's manifest signal
             // refreshes the package map even with zero indexed files, and the overlay must match so
@@ -263,10 +253,6 @@ impl IndexDatabase {
             // against the OLD manifest until an unrelated source change triggers a resolve (#659
             // review).
             self.resolve_overlay_edges(worktree_id)?;
-        }
-        if counts.any_changed() {
-            self.bump_lens_revisions(rag_rat_db::meta::LENS_LANE_REVISION_METAS)?;
-        } else if manifest_changed {
             self.bump_lens_revisions(&[rag_rat_db::meta::LENS_SYMBOLS_REVISION_META])?;
         }
         Ok(())
@@ -329,8 +315,7 @@ impl IndexDatabase {
         if self.repo_meta(OVERLAY_LOGICAL_REBUILD_PENDING_META)?.is_none() {
             return Ok(false);
         }
-        self.storage.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> anyhow::Result<bool> {
+        self.in_immediate_txn(|| {
             // RE-CHECK under the write transaction: a concurrent tail (another watcher/hook
             // process) may have rebuilt and cleared the marker between the read above and
             // BEGIN IMMEDIATE — proceeding blind would pay a second wholesale rebuild for
@@ -344,17 +329,7 @@ impl IndexDatabase {
             // so the obligation survives for the next pass to retry.
             self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
             Ok(true)
-        })();
-        match result {
-            Ok(ran) => {
-                self.storage.execute_batch("COMMIT")?;
-                Ok(ran)
-            },
-            Err(err) => {
-                let _ = self.storage.execute_batch("ROLLBACK");
-                Err(err)
-            },
-        }
+        })
     }
 
     /// The Inline entry-point exit settle (#819 review): every overlay indexing entry point
@@ -379,7 +354,9 @@ impl IndexDatabase {
     }
 
     /// Remove overlay rows of `worktree_id` whose path is no longer in the delta (the file matches
-    /// the base again), so the scope view falls back to the base row for them. Returns the count.
+    /// the base again), so the scope view falls back to the base row for them. Returns the pruned
+    /// paths: un-shadowing a base row changes what this checkout serves, so per-checkout consumers
+    /// need the paths rather than just their count (#1010).
     pub(super) fn prune_overlay_rows_not_in_delta(
         &self,
         worktree_id: &str,
@@ -404,10 +381,7 @@ impl IndexDatabase {
         let mut pruned = Vec::new();
         for path in existing {
             if !shadowing.contains(Path::new(&path)) {
-                self.remove_file_in_scope(Path::new(&path), CheckoutRef {
-                    commit_sha: "",
-                    worktree_id,
-                })?;
+                self.remove_file_in_scope(Path::new(&path), CheckoutRef::worktree(worktree_id))?;
                 pruned.push(PathBuf::from(path));
             }
         }

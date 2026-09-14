@@ -496,8 +496,11 @@ pub(crate) fn edge_id_matches_fingerprint_in_linked_worktree(
     repo_id: &str,
     fingerprint: &str,
 ) -> anyhow::Result<bool> {
-    let active_worktree =
-        rag_rat_db::schema::connection_context_value(conn, "worktree_id").unwrap_or_default();
+    let active_worktree = rag_rat_db::schema::connection_context_value(
+        conn,
+        rag_rat_db::schema::CONNECTION_CONTEXT_WORKTREE_KEY,
+    )
+    .unwrap_or_default();
     let edge = conn
         .query_row(
             "SELECT edges.id AS edge_id,
@@ -1017,7 +1020,8 @@ fn unused_working_hash(
 
 fn call_path_key_exists(conn: &Connection, memory_id: &str, hash: &str) -> rusqlite::Result<bool> {
     conn.query_row(
-        "SELECT EXISTS(
+        &format!(
+            "SELECT EXISTS(
              SELECT 1 FROM repo_memory_call_path_edges
               WHERE memory_id = ?1 AND edge_sequence_hash = ?2
              UNION ALL
@@ -1026,9 +1030,10 @@ fn call_path_key_exists(conn: &Connection, memory_id: &str, hash: &str) -> rusql
              UNION ALL
               SELECT 1 FROM repo_memory_bindings
                WHERE memory_id = ?1 AND binding_kind = 'call_path'
-                 AND IIF(resolved, resolved_binding_id, binding_id) = ?2
+                 AND {BINDING_CURRENT_BINDING_ID} = ?2
                  AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
-         )",
+         )"
+        ),
         params![memory_id, hash],
         |row| row.get::<_, i64>(0).map(|value| value != 0),
     )
@@ -1060,7 +1065,7 @@ fn move_call_path_key(
             "UPDATE repo_memory_bindings
                 SET resolved_binding_id = ?1, {BINDING_RESOLUTION_CARRY_SQL}
               WHERE memory_id = ?2 AND binding_kind = 'call_path'
-                AND IIF(resolved, resolved_binding_id, binding_id) = ?3
+                AND {BINDING_CURRENT_BINDING_ID} = ?3
                 AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)"
         ),
         params![to, memory_id, from],
@@ -1094,13 +1099,13 @@ fn load_call_path_bindings(
     memory_id: &str,
     hash: &str,
 ) -> rusqlite::Result<Vec<PersistedCallPathBinding>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT logical_symbol_id FROM repo_memory_bindings
           WHERE memory_id = ?1 AND binding_kind = 'call_path'
-            AND IIF(resolved, resolved_binding_id, binding_id) = ?2
+            AND {BINDING_CURRENT_BINDING_ID} = ?2
             AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?1)
-          ORDER BY binding_id",
-    )?;
+          ORDER BY binding_id"
+    ))?;
     let rows = stmt.query_map(params![memory_id, hash], |row| {
         Ok(PersistedCallPathBinding { logical_symbol_id: row.get(0)? })
     })?;
@@ -1232,7 +1237,7 @@ fn finalize_call_path_binding(
                     SET resolved_binding_id = ?1, logical_symbol_id = ?2,
                         {BINDING_RESOLUTION_CARRY_SQL}
                   WHERE memory_id = ?3 AND binding_kind = 'call_path'
-                    AND IIF(resolved, resolved_binding_id, binding_id) = ?4
+                    AND {BINDING_CURRENT_BINDING_ID} = ?4
                     AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?3)"
             ),
             params![new_hash, logical_symbol_id, memory_id, path.working_hash],
@@ -1240,10 +1245,12 @@ fn finalize_call_path_binding(
     }
     if !existing.is_empty() {
         conn.execute(
-            "UPDATE repo_memory_bindings SET logical_symbol_id = ?1
-              WHERE memory_id = ?2 AND binding_kind = 'call_path'
-                AND IIF(resolved, resolved_binding_id, binding_id) = ?3
-                AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)",
+            &format!(
+                "UPDATE repo_memory_bindings SET logical_symbol_id = ?1
+                  WHERE memory_id = ?2 AND binding_kind = 'call_path'
+                    AND {BINDING_CURRENT_BINDING_ID} = ?3
+                    AND repo_id = (SELECT repo_id FROM repo_memories WHERE id = ?2)"
+            ),
             params![logical_symbol_id, memory_id, new_hash],
         )?;
     }
@@ -1715,7 +1722,7 @@ pub(crate) fn relocate_chunk_by_hash(
 
 /// Strip the persisted `"{path}::"` prefix from a path-qualified `binding_id`.
 /// Falls back to last-`::` split only when `path` is absent or not a prefix of `binding_id`.
-pub(crate) fn short_symbol_name<'a>(binding_id: &'a str, path: Option<&str>) -> &'a str {
+pub(crate) fn binding_leaf_name<'a>(binding_id: &'a str, path: Option<&str>) -> &'a str {
     if let Some(path) = path
         && let Some(rest) = binding_id.strip_prefix(path)
         && let Some(name) = rest.strip_prefix("::")
@@ -1726,347 +1733,13 @@ pub(crate) fn short_symbol_name<'a>(binding_id: &'a str, path: Option<&str>) -> 
 }
 
 #[cfg(test)]
-mod call_path_remap_tests {
-    use super::*;
-
-    fn remap_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
-        conn.execute(
-            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms,
-                    commit_sha, worktree_id, repo_id, generation)
-             VALUES ('src/lib.rs', 'rust', 'source', 'sha', 0, 0, '', '', 'r', 0)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms,
-                    updated_at_ms, source, memory_version, repo_id)
-             VALUES ('m', 'Invariant', 't', 'b', 'high', 'active', 0, 0, 'agent', 'v1', 'r')",
-            [],
-        )
-        .unwrap();
-        conn
-    }
-
-    fn seed_callee(conn: &Connection, logical_id: i64, name: &str) -> i64 {
-        let qualified_name = format!("src/lib.rs::{name}");
-        conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", [&qualified_name])
-            .unwrap();
-        conn.execute(
-            "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, kind,
-                    start_byte, end_byte, start_line, end_line)
-             VALUES (1, 'rust', ?1, (SELECT id FROM name_strings WHERE value = ?2), ?1,
-                     'function', 0, 1, 1, 1)",
-            params![name, qualified_name],
-        )
-        .unwrap();
-        let symbol_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name_id, \
-             kind,
-                    variant_count, group_reason, repo_id)
-             VALUES (?1, 'rust', 'src/lib.rs', ?2,
-                     (SELECT id FROM name_strings WHERE value = ?3), 'function', 1, 'exact', 'r')",
-            params![logical_id, name, qualified_name],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, start_line, \
-             end_line)
-             VALUES (?1, ?2, 1, 1)",
-            params![logical_id, symbol_id],
-        )
-        .unwrap();
-        symbol_id
-    }
-
-    fn seed_edge(conn: &Connection, target_symbol_id: i64) -> CallPathEdge {
-        conn.execute(
-            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint,
-                    receiver_type_hint, source_file_id, source_start_line, source_end_line,
-                    to_symbol_id)
-             VALUES ('caller', 'run', 'calls_name', 'exact', 'recv', 'Worker', 1, 10, 10, ?1)",
-            [target_symbol_id],
-        )
-        .unwrap();
-        let edge_id: i64 =
-            conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
-        call_path_edge_by_id(conn, edge_id).unwrap().unwrap()
-    }
-
-    fn seed_path(
-        conn: &Connection,
-        edge: &CallPathEdge,
-        summary: &str,
-        endpoint: Option<i64>,
-        created_at_ms: i64,
-    ) -> String {
-        let hash = compute_edge_sequence_hash([edge.fingerprint.as_str()]);
-        conn.execute(
-            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id,
-                    logical_symbol_id, anchor_status, created_at_ms, repo_id)
-             VALUES ('m', 'call_path', ?1, ?2, 'current', ?3, 'r')",
-            params![hash, endpoint, created_at_ms],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO repo_memory_call_paths(memory_id, start_logical_symbol_id,
-                    edge_sequence_hash, path_summary, created_at_ms)
-             VALUES ('m', ?1, ?2, ?3, ?4)",
-            params![endpoint, hash, summary, created_at_ms],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal,
-                    edge_fingerprint, from_name, to_name, edge_kind, receiver_hint,
-                    callee_logical_symbol_id, callee_identity_known)
-             VALUES ('m', ?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
-            params![
-                hash,
-                edge.fingerprint,
-                edge.from_name,
-                edge.to_name,
-                edge.edge_kind,
-                edge.receiver_hint,
-                edge.callee_logical_symbol_id
-            ],
-        )
-        .unwrap();
-        hash
-    }
-
-    #[test]
-    fn call_path_hash_swaps_stage_every_key_before_finalization() {
-        let conn = remap_db();
-        let alpha = seed_callee(&conn, 11, "Alpha");
-        let beta = seed_callee(&conn, 22, "Beta");
-        let alpha_edge = seed_edge(&conn, alpha);
-        let beta_edge = seed_edge(&conn, beta);
-        let alpha_hash = seed_path(&conn, &alpha_edge, "alpha path", Some(11), 2);
-        let beta_hash = seed_path(&conn, &beta_edge, "beta path", Some(22), 3);
-
-        remap_call_path_callee_logical_symbol_ids(&conn, &conn, &[(11, Some(22)), (22, Some(11))])
-            .unwrap();
-
-        let alpha_summary: String = conn
-            .query_row(
-                "SELECT path_summary FROM repo_memory_call_paths
-                  WHERE memory_id = 'm' AND edge_sequence_hash = ?1",
-                [&beta_hash],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let beta_summary: String = conn
-            .query_row(
-                "SELECT path_summary FROM repo_memory_call_paths
-                  WHERE memory_id = 'm' AND edge_sequence_hash = ?1",
-                [&alpha_hash],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(alpha_summary, "alpha path");
-        assert_eq!(beta_summary, "beta path");
-        for table in
-            ["repo_memory_bindings", "repo_memory_call_paths", "repo_memory_call_path_edges"]
-        {
-            let count: i64 = conn
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE memory_id = 'm'"),
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 2, "both swapped rows survive in {table}");
-        }
-    }
-
-    #[test]
-    fn many_to_one_call_paths_converge_onto_an_existing_destination() {
-        let conn = remap_db();
-        let alpha = seed_callee(&conn, 11, "Alpha");
-        let beta = seed_callee(&conn, 22, "Beta");
-        let target = seed_callee(&conn, 33, "Target");
-        let alpha_edge = seed_edge(&conn, alpha);
-        let beta_edge = seed_edge(&conn, beta);
-        let target_edge = seed_edge(&conn, target);
-        seed_path(&conn, &alpha_edge, "alpha path", Some(11), 2);
-        seed_path(&conn, &beta_edge, "beta path", Some(22), 3);
-        let target_hash = seed_path(&conn, &target_edge, "existing target", Some(33), 4);
-
-        remap_call_path_callee_logical_symbol_ids(&conn, &conn, &[(11, Some(33)), (22, Some(33))])
-            .unwrap();
-
-        let parent: (i64, String, Option<i64>) = conn
-            .query_row(
-                "SELECT COUNT(*), path_summary, start_logical_symbol_id
-                   FROM repo_memory_call_paths WHERE memory_id = 'm' AND edge_sequence_hash = ?1",
-                [&target_hash],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(parent, (1, "existing target".to_string(), None));
-        let binding: (i64, Option<i64>) = conn
-            .query_row(
-                "SELECT COUNT(*), logical_symbol_id FROM repo_memory_bindings
-                  WHERE memory_id = 'm' AND binding_kind = 'call_path' AND binding_id = ?1",
-                [&target_hash],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(binding, (1, None));
-        let edge_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM repo_memory_call_path_edges
-                  WHERE memory_id = 'm' AND edge_sequence_hash = ?1",
-                [&target_hash],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(edge_count, 1, "the existing valid edge sequence wins deterministically");
-    }
-
-    #[test]
-    fn missing_remap_evidence_cannot_revive_through_the_old_fingerprint() {
-        let conn = remap_db();
-        let alpha = seed_callee(&conn, 11, "Alpha");
-        let edge = seed_edge(&conn, alpha);
-        let old_fingerprint = edge.fingerprint.clone();
-        seed_path(&conn, &edge, "missing edge", Some(11), 0);
-        conn.execute("DELETE FROM edges_data", []).unwrap();
-
-        remap_call_path_callee_logical_symbol_ids(&conn, &conn, &[(11, None)]).unwrap();
-        let stored: (String, Option<i64>, i64) = conn
-            .query_row(
-                "SELECT edge_fingerprint, callee_logical_symbol_id, callee_identity_known
-                   FROM repo_memory_call_path_edges WHERE memory_id = 'm'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert!(stored.0.starts_with("invalidated-call-path-remap:"));
-        assert_ne!(stored.0, old_fingerprint);
-        assert_eq!((stored.1, stored.2), (None, 1));
-
-        let replacement = seed_edge(&conn, alpha);
-        assert_eq!(replacement.fingerprint, old_fingerprint);
-        assert!(edge_by_fingerprint(&conn, &old_fingerprint).unwrap().is_some());
-        assert!(
-            edge_by_fingerprint(&conn, &stored.0).unwrap().is_none(),
-            "the invalidated persisted identity cannot match the replacement edge"
-        );
-    }
-}
+#[path = "resolve/call_path_remap_tests.rs"]
+mod call_path_remap_tests;
 
 #[cfg(test)]
-mod live_edge_match_tests {
-    use super::*;
-
-    #[test]
-    fn call_path_candidate_query_seeds_on_the_to_name_index() {
-        let conn = Connection::open_in_memory().unwrap();
-        rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
-        let sql = format!("EXPLAIN QUERY PLAN {}", live_edge_match_sql(2));
-        let mut stmt = conn.prepare(&sql).unwrap();
-        let plan = stmt
-            .query_map(
-                rusqlite::params![
-                    Option::<String>::None,
-                    "first_target",
-                    "calls_name",
-                    Option::<String>::None,
-                    Option::<i64>::None,
-                    "source",
-                    "second_target",
-                    "calls_name",
-                    "qualified::target",
-                    Option::<i64>::None,
-                ],
-                |row| row.get::<_, String>(3),
-            )
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap()
-            .join("\n");
-        assert!(plan.contains("idx_edges_to_name"), "query plan must use to-name index:\n{plan}");
-        assert!(!plan.contains("SCAN d"), "query plan must not scan edges_data:\n{plan}");
-    }
-}
+#[path = "resolve/live_edge_match_tests.rs"]
+mod live_edge_match_tests;
 
 #[cfg(test)]
-mod receiver_type_hint_fingerprint_tests {
-    use super::*;
-
-    fn base_parts<'a>(receiver_type_hint: Option<&'a str>) -> EdgeFingerprintParts<'a> {
-        EdgeFingerprintParts {
-            path: "src/lib.rs",
-            start_line: 10,
-            end_line: 10,
-            from_name: Some("caller"),
-            to_name: Some("run"),
-            edge_kind: "calls_name",
-            target_qualified_name: None,
-            receiver_hint: Some("recv"),
-            receiver_type_hint,
-            callee_logical_symbol_id: None,
-        }
-    }
-
-    #[test]
-    fn receiver_type_hint_repoint_changes_the_stable_fingerprint() {
-        // path, span, from_name, to_name, edge_kind, target_qualified_name, and receiver_hint all
-        // stay identical — only `receiver_type_hint` differs, as when Rust receiver-type inference
-        // re-points `recv.run()` from `Alpha::run` to `Beta::run` on reindex (#567). The
-        // fingerprint MUST change, or `edge_by_fingerprint`/`edge_by_id` would keep
-        // validating a call-path anchor `current` against a target it no longer resolves
-        // to.
-        let alpha = edge_fingerprint(base_parts(Some("Alpha")));
-        let beta = edge_fingerprint(base_parts(Some("Beta")));
-        assert_ne!(alpha, beta, "different receiver_type_hint must yield different fingerprints");
-    }
-
-    #[test]
-    fn resolved_callee_repoint_changes_the_stable_fingerprint() {
-        let unresolved = edge_fingerprint(base_parts(Some("Worker")));
-        let alpha = edge_fingerprint(EdgeFingerprintParts {
-            callee_logical_symbol_id: Some(11),
-            ..base_parts(Some("Worker"))
-        });
-        let beta = edge_fingerprint(EdgeFingerprintParts {
-            callee_logical_symbol_id: Some(22),
-            ..base_parts(Some("Worker"))
-        });
-        assert_ne!(unresolved, alpha, "resolution changes edge identity");
-        assert_ne!(alpha, beta, "retargeting with the same receiver hint changes edge identity");
-    }
-
-    #[test]
-    fn legacy_helper_preserves_the_pre_versioned_format() {
-        // Bindings persisted before the version line hold exactly this 8-field byte format —
-        // `legacy_edge_fingerprint` must reproduce it, and the versioned format must NEVER
-        // collide with it (hint present or not).
-        let legacy_format =
-            hex_sha256("src/lib.rs\n10\n10\ncaller\nrun\ncalls_name\n\nrecv".as_bytes());
-        assert_eq!(legacy_edge_fingerprint(base_parts(None)), legacy_format);
-        assert_eq!(legacy_edge_fingerprint(base_parts(Some("Alpha"))), legacy_format);
-        assert_ne!(edge_fingerprint(base_parts(None)), legacy_format);
-        assert_ne!(edge_fingerprint(base_parts(Some("Alpha"))), legacy_format);
-    }
-
-    #[test]
-    fn versioned_hintless_binding_is_not_masked_by_a_later_hint_gain() {
-        // A binding created AFTER the upgrade on a then-hintless edge stores the versioned
-        // hintless value. When the same call span later gains a hint (an untyped binding
-        // becomes typed), the stored value must match neither the edge's new versioned
-        // fingerprint nor its legacy compatibility shadow — the change is detected, not
-        // silently reported current.
-        let stored = edge_fingerprint(base_parts(None));
-        assert_ne!(stored, edge_fingerprint(base_parts(Some("Alpha"))));
-        assert_ne!(stored, legacy_edge_fingerprint(base_parts(Some("Alpha"))));
-    }
-}
+#[path = "resolve/receiver_type_hint_fingerprint_tests.rs"]
+mod receiver_type_hint_fingerprint_tests;

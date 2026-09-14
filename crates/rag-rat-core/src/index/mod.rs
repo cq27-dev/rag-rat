@@ -87,7 +87,6 @@ pub use lifecycle::{
 };
 pub(crate) use mem_diag::{maybe_set_sqlite_soft_heap_limit, mem_trace};
 pub use parser_failures::ParserFailure;
-use prep::FileScope;
 pub(crate) use prep::{
     IndexFile, PreparedChunk, PreparedIndexFile, canonicalize_nearest_ancestor,
     collect_changed_index_files, collect_index_files, explicit_index_files_and_changes,
@@ -99,7 +98,7 @@ pub(crate) use prep::{
 pub(crate) use query_api::CloneDeltaHint;
 pub use query_api::{
     CLONE_DELTA_MAX_FILES, CandidateCloneClass, CloneCheckInput, CloneCompleteness,
-    CloneDeltaReport, CloneEdgeReport, CloneEligibility, CloneFingerprintHealth,
+    CloneDeltaReport, CloneDeltaStatus, CloneEdgeReport, CloneEligibility, CloneFingerprintHealth,
     CloneIneligibilityReason, CloneMember, CloneSymbolSelector, ClonesForSymbolResult,
     DatabaseFileHealth, FindClonesOptions, FindClonesResult, FreelistReclaim,
     FreelistReclaimReport, GcReport, GlobalFtsStatus, GlobalStatus, ImportantSymbolsRequest,
@@ -113,6 +112,7 @@ pub use query_api::{
     RoiFactors, SearchRequest, SyncCatchUpReport, TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES,
     WalCheckpointReport, WorktreeOverlay, reclaim_freelist_at,
 };
+use rag_rat_base::checkout::CheckoutKey;
 pub use schema::RegisteredRepo;
 #[cfg(test)]
 pub(crate) use util::table_row_count;
@@ -177,7 +177,9 @@ pub struct IndexDatabase {
     /// so free-conn helpers resolve the same id via `schema::active_repo_id`. Empty only between
     /// construction and the first repo resolution.
     pub active_repo_id: String,
+    /// Commit half of the active scope; prefer `active_checkout()` when passing the pair.
     pub active_commit_sha: String,
+    /// Worktree half of the active scope; prefer `active_checkout()` when passing the pair.
     pub active_worktree_id: String,
     /// The `files.generation` this connection writes at and scopes to (A6): the repo's LIVE
     /// generation on a reader / incremental open, the WRITE generation N+1 while a full rebuild

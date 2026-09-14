@@ -1,6 +1,8 @@
 mod api;
 pub mod edges;
 pub mod evidence;
+#[cfg(test)]
+pub(crate) mod fixtures;
 mod hydrate;
 mod moniker;
 mod resolve;
@@ -31,17 +33,15 @@ pub use hydrate::{
 pub(crate) use hydrate::{
     attach_memory_children, binding_row, drive_by_memory, ids_to_memories, memory_row,
 };
-pub(crate) use moniker::{
-    MONIKER_MATCH_REASON, relocate_binding_by_moniker, validate_moniker_binding,
-};
 pub use moniker::{MonikerResolution, insert_auto_moniker_binding, resolve_moniker};
+pub(crate) use moniker::{relocate_binding_by_moniker, validate_moniker_binding};
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::time::now_ms;
 pub(crate) use resolve::{
-    RelocateMatch, call_path_edge_by_id, chunk_by_id, chunk_for_logical_symbol, chunk_for_symbol,
-    chunk_ids_for_symbol, compute_edge_sequence_hash, dir_has_files, edge_by_fingerprint,
-    edge_by_id, edge_id_matches_fingerprint_in_linked_worktree, logical_symbol_id_for_symbol,
-    relocate_chunk_by_hash, relocate_symbol_by_name, short_symbol_name, symbol_signal,
+    RelocateMatch, binding_leaf_name, call_path_edge_by_id, chunk_by_id, chunk_for_logical_symbol,
+    chunk_for_symbol, chunk_ids_for_symbol, compute_edge_sequence_hash, dir_has_files,
+    edge_by_fingerprint, edge_by_id, edge_id_matches_fingerprint_in_linked_worktree,
+    logical_symbol_id_for_symbol, relocate_chunk_by_hash, relocate_symbol_by_name, symbol_signal,
 };
 pub use resolve::{
     insert_binding, logical_symbol_id_for_chunk, remap_call_path_callee_logical_symbol_ids,
@@ -50,10 +50,9 @@ pub use resolve::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 pub use validate::{
-    AppliedTarget, AppliedTargets, RETARGETED_REASON, decode_applied_targets,
-    encode_applied_targets, is_polymorphic_node_kind, memory_id, memory_input_hash,
-    validate_confidence, validate_edge_len, validate_kind, validate_len, validate_payload,
-    validate_source, validate_status,
+    AppliedTarget, AppliedTargets, decode_applied_targets, encode_applied_targets,
+    is_polymorphic_node_kind, memory_id, memory_input_hash, validate_confidence, validate_edge_len,
+    validate_kind, validate_len, validate_payload, validate_source, validate_status,
 };
 pub(crate) use validate::{effective_fs_root, fts_query, validate_binding};
 
@@ -68,6 +67,21 @@ pub fn memory_repo_scope(conn: &Connection) -> anyhow::Result<Option<String>> {
 /// The ` AND repo_memories.repo_id = '…'` predicate for a memory read, or `""` when unscoped.
 pub(crate) fn memory_repo_scope_clause(scope: &Option<String>) -> String {
     rag_rat_db::schema::periphery_repo_scope_clause(scope, "repo_memories")
+}
+
+/// The predicate selecting the memories recall still surfaces, on the `repo_memories` row named
+/// `alias` (the table name itself where the statement does not alias it): a `stale` memory is live
+/// (its anchor drifted, not its memory), only `obsolete`/`rejected` are dead. Every memory read
+/// that attaches, lists or searches filters through this, as do the typed-edge reads and the dream
+/// queues, so reclassifying a status is one edit here.
+pub fn live_memory_status_sql(alias: &str) -> String {
+    let live = <MemoryStatus as strum::VariantArray>::VARIANTS
+        .iter()
+        .filter(|status| status.is_live())
+        .map(|status| format!("'{}'", status.as_db_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{alias}.status IN ({live})")
 }
 
 /// Escape a string for use as a SQLite `LIKE` pattern under `ESCAPE '\'`: the three special
@@ -222,6 +236,26 @@ pub const BINDING_RESOLUTION_CARRY_SQL: &str = "resolved = 1,
      resolved_moniker_tool_version = IIF(resolved, resolved_moniker_tool_version, \
                                                 moniker_tool_version)";
 
+/// The read side of [`BINDING_RESOLUTION_CARRY_SQL`]: a shadowed column's value on the
+/// `repo_memory_bindings` row named `alias` — this store's resolution when `resolved` is set (then
+/// the shadow is its view, NULL included), else the authored value. The shadowed columns are the
+/// authored identity `binding_id`, which the writer moving it assigns itself, and the six the carry
+/// names; read them only through this in SQL, or `binding_row` in Rust. A read that names the
+/// authored column directly returns the AUTHORED location of a relocated binding.
+pub(crate) fn binding_current(alias: &str, column: &str) -> String {
+    format!("IIF({alias}.resolved, {alias}.resolved_{column}, {alias}.{column})")
+}
+
+/// [`binding_current`] of `path` on the unaliased `repo_memory_bindings` table.
+pub(crate) const BINDING_CURRENT_PATH: &str = "IIF(repo_memory_bindings.resolved, \
+                                               repo_memory_bindings.resolved_path, \
+                                               repo_memory_bindings.path)";
+
+/// [`binding_current`] of `binding_id` on the unaliased `repo_memory_bindings` table.
+pub(crate) const BINDING_CURRENT_BINDING_ID: &str = "IIF(repo_memory_bindings.resolved, \
+                                                     repo_memory_bindings.resolved_binding_id, \
+                                                     repo_memory_bindings.binding_id)";
+
 impl RepoMemoryBinding {
     /// The name, fingerprint or hash the target carries on this store: the resolution where
     /// relocation moved it, the authored identity otherwise. What lookups against the index and
@@ -292,6 +326,187 @@ impl AnchorStatus {
     /// Parse a persisted token, rejecting anything outside the closed set.
     pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
         value.parse().map_err(|_| anyhow::anyhow!("unknown anchor status `{value}`"))
+    }
+}
+
+/// The closed set of `repo_memories.kind` tokens: the variant names verbatim (PascalCase).
+///
+/// [`RepoMemory::kind`] — like its `status`, `confidence` and `source`, and a binding's
+/// `relocation_reason` — stays a string for the reason [`BindingKind`] gives: a memory replicates,
+/// so a peer on a newer build can deliver a token this one does not know, and that row must still
+/// load. These enums name what this build writes and compares; the `validate_*` gates reject any
+/// other token on the write path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+pub enum MemoryKind {
+    Invariant,
+    Decision,
+    RejectedAlternative,
+    Risk,
+    BugPattern,
+    TestExpectation,
+    PerformanceNote,
+    SecurityNote,
+    FFIBoundary,
+    PlatformQuirk,
+    FollowUp,
+    OpenQuestion,
+    Obsolete,
+    // Polymorphic graph-node kinds (#465): legitimately unanchored (a Concept / standalone Task
+    // lives as a graph node with no code binding — see resolve_binding / #463).
+    Task,
+    Concept,
+}
+
+impl MemoryKind {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("invalid memory kind `{value}`"))
+    }
+
+    /// The polymorphic graph-node kinds — `Task` and `Concept` (#463/#465). They ALONE may be
+    /// created UNANCHORED (no code binding) AND may carry a structured `payload_json`; every other
+    /// kind is a plain note (anchors to code, no payload). The SINGLE source of truth for the
+    /// unanchored-create gate (`create`/`update_memory`), the payload-kind gate
+    /// (`validate_payload`), and the dream verifier's `memory_unverifiable` exemption — they must
+    /// never drift, or a create the gate allows becomes self-inflicted dream noise, or an
+    /// off-contract payload/anchor slips through.
+    pub fn is_polymorphic_node(self) -> bool {
+        matches!(self, Self::Task | Self::Concept)
+    }
+}
+
+/// The closed set of `repo_memories.status` tokens (lowercase). A string on [`RepoMemory`] for the
+/// reason [`MemoryKind`] gives.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr, strum::VariantArray,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum MemoryStatus {
+    Active,
+    Stale,
+    Obsolete,
+    Rejected,
+}
+
+impl MemoryStatus {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("invalid memory status `{value}`"))
+    }
+
+    /// Whether recall still surfaces a memory in this status — the set
+    /// [`live_memory_status_sql`] filters on. A `stale` memory is live (its anchor drifted, not its
+    /// memory), only `obsolete`/`rejected` are dead.
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Active | Self::Stale)
+    }
+}
+
+/// The closed set of `repo_memories.confidence` tokens (lowercase). A string on [`RepoMemory`] for
+/// the reason [`MemoryKind`] gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum MemoryConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl MemoryConfidence {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("invalid memory confidence `{value}`"))
+    }
+}
+
+/// The closed set of `repo_memories.source` tokens (lowercase). A string on [`RepoMemory`] for the
+/// reason [`MemoryKind`] gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum MemorySource {
+    Agent,
+    Human,
+    Imported,
+    Generated,
+}
+
+impl MemorySource {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("invalid memory source `{value}`"))
+    }
+}
+
+/// The closed set of `repo_memory_bindings.relocation_reason` tokens (kebab-case) this build
+/// stamps. [`RepoMemoryBinding::relocation_reason`] stays a string for the reason [`MemoryKind`]
+/// gives; `NULL` means the anchor never relocated or relocated via the default
+/// qualified-name/content paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "kebab-case")]
+pub enum RelocationReason {
+    /// Why a moniker relocation succeeded — persisted on `repo_memory_bindings.relocation_reason`
+    /// so `doctor`/MCP output can distinguish a semantic-identity relocate from the default
+    /// qualified-name/content paths.
+    MonikerMatch,
+    /// Why a `scip_moniker` binding's own anchor string was rewritten: its live logical symbol got
+    /// a NEW moniker from the latest run (rust-analyzer monikers embed the Cargo package
+    /// version, so a routine version bump changes every string without changing any symbol
+    /// identity). The rebind is keyed off our own content-derived logical id, not fuzzy
+    /// matching.
+    MonikerRefresh,
+    /// The `relocation_reason` the synced-memory drain stamps on a symbol binding it moved IN PLACE
+    /// to a target another store published, when the published kind or signature differs from
+    /// the row's. Its cached ids may still name the target it left: a rebind between two impls
+    /// of one type keeps the binding's identity and kind, so only the signature says it moved.
+    ///
+    /// The validator weighs a recorded kind or signature against a live handle ONLY on a row so
+    /// marked. Any other row can disagree with its handle for reasons that name no other target
+    /// — a sibling device's `anchors/1` update carrying its own checkout's view, or values
+    /// recorded before the target's kind or signature changed here — and following them there
+    /// would hand the memory to any same-named sibling that has the old kind or signature.
+    ///
+    /// The mark stands until a validation lands on a target agreeing with the recorded kind and
+    /// signature. The row is shared by every checkout of the repo, and the one validating first may
+    /// not hold the author's target: on the raw-id arm, whose candidates are the validating
+    /// checkout's own, a linked worktree that edited the target leaves the mark for the
+    /// checkout that has it (the logical arm's candidates are repo-wide, so any checkout can
+    /// answer there). That works because relocation does not refresh a marked row's recorded
+    /// kind or signature until the mark is answered. An identity match answers it outright: the
+    /// content-hash fallback clears it and restates the kind and signature, and a moniker
+    /// relocation replaces the reason with its own. (An `anchors/1` row update also moves a
+    /// binding in place, but marks nothing.)
+    Retargeted,
+}
+
+impl RelocationReason {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown relocation reason `{value}`"))
     }
 }
 
@@ -817,559 +1032,8 @@ pub(crate) struct EdgeFingerprintParts<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn binding(kind: &str, anchor_status: &str, path: Option<&str>) -> RepoMemoryBinding {
-        RepoMemoryBinding {
-            memory_id: "mem_x".to_string(),
-            binding_kind: kind.to_string(),
-            binding_id: format!("{kind}-id"),
-            resolved_binding_id: None,
-            path: path.map(str::to_string),
-            start_line: path.map(|_| 10),
-            end_line: path.map(|_| 20),
-            logical_symbol_id: Some(42),
-            symbol_id: None,
-            chunk_id: None,
-            edge_id: None,
-            commit_hash: None,
-            tracker: None,
-            project: None,
-            item_key: None,
-            symbol_kind: None,
-            signature_hash: None,
-            moniker_tool: None,
-            moniker_tool_version: None,
-            relocation_reason: None,
-            anchor_status: anchor_status.to_string(),
-            created_at_ms: 0,
-        }
-    }
-
-    fn memory(bindings: Vec<RepoMemoryBinding>) -> RepoMemory {
-        RepoMemory {
-            memory_id: "mem_x".to_string(),
-            kind: "Invariant".to_string(),
-            title: "t".to_string(),
-            body: "b".to_string(),
-            summary: None,
-            verdict: None,
-            confidence: "high".to_string(),
-            status: "active".to_string(),
-            created_by: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            source: "agent".to_string(),
-            payload_json: None,
-            source_text_hash: None,
-            input_hash: None,
-            memory_version: String::new(),
-            synced_anchor_drifted: false,
-            bindings,
-            call_paths: Vec::new(),
-            tags: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn binding_kind_and_anchor_status_tokens_are_exact_and_round_trip() {
-        let kinds = [
-            (BindingKind::LogicalSymbol, "logical_symbol"),
-            (BindingKind::Symbol, "symbol"),
-            (BindingKind::Chunk, "chunk"),
-            (BindingKind::Edge, "edge"),
-            (BindingKind::CallPath, "call_path"),
-            (BindingKind::ScipMoniker, "scip_moniker"),
-            (BindingKind::Path, "path"),
-            (BindingKind::Dir, "dir"),
-            (BindingKind::Commit, "commit"),
-            (BindingKind::Tracker, "tracker"),
-        ];
-        for (kind, token) in kinds {
-            assert_eq!(kind.as_db_str(), token);
-            assert_eq!(BindingKind::from_db_str(token).unwrap(), kind);
-        }
-        let statuses = [
-            (AnchorStatus::Current, "current"),
-            (AnchorStatus::Relocated, "relocated"),
-            (AnchorStatus::Stale, "stale"),
-            (AnchorStatus::Gone, "gone"),
-            (AnchorStatus::Pending, "pending"),
-            (AnchorStatus::Unverified, "unverified"),
-        ];
-        for (status, token) in statuses {
-            assert_eq!(status.as_db_str(), token);
-            assert_eq!(AnchorStatus::from_db_str(token).unwrap(), status);
-        }
-        assert!(BindingKind::from_db_str("repo").is_err());
-        assert!(AnchorStatus::from_db_str("Current").is_err());
-    }
-
-    #[test]
-    fn compact_header_skips_a_lagging_moniker_binding_for_the_real_anchor() {
-        // `attach_memory_children` orders bindings by `binding_kind`, so a `scip_moniker` companion
-        // (which can be `unverified`/`gone` between oracle runs, and which `split_active_stale`
-        // deliberately ignores) sorts BEFORE the real `symbol` anchor. The compact header must skip
-        // it, or an ACTIVE memory reads as stale (Codex on #194).
-        let compact = CompactRepoMemory::from(&memory(vec![
-            binding("scip_moniker", "unverified", None),
-            binding("symbol", "current", Some("src/lib.rs")),
-        ]));
-        assert_eq!(compact.binding_kind.as_deref(), Some("symbol"));
-        assert_eq!(compact.anchor_status.as_deref(), Some("current"));
-        assert_eq!(compact.path.as_deref(), Some("src/lib.rs"));
-        assert_eq!(compact.span, Some([10, 20]));
-    }
-
-    #[test]
-    fn compact_header_falls_back_to_a_moniker_only_binding_set() {
-        // A memory anchored ONLY by a moniker still gets a header (no non-moniker binding to
-        // prefer).
-        let compact =
-            CompactRepoMemory::from(&memory(vec![binding("scip_moniker", "current", None)]));
-        assert_eq!(compact.binding_kind.as_deref(), Some("scip_moniker"));
-    }
-
-    // ── dream-summary surfacing (`[memory] surface = "summary"`) ─────────────────
-
-    /// A fresh in-memory index scoped to repo `r` — the fixture for the summary-surfacing tests.
-    fn summary_conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
-        rag_rat_db::schema::apply(&c, &rag_rat_core::index::migration_hooks()).unwrap();
-        c.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .unwrap();
-        c.execute(
-            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id','r')",
-            [],
-        )
-        .unwrap();
-        c
-    }
-
-    /// A minimal `RepoMemory` with a controlled id + body (no bindings).
-    fn memory_with_body(id: &str, body: &str) -> RepoMemory {
-        RepoMemory {
-            memory_id: id.to_string(),
-            kind: "Invariant".to_string(),
-            title: "t".to_string(),
-            body: body.to_string(),
-            summary: None,
-            verdict: None,
-            confidence: "high".to_string(),
-            status: "active".to_string(),
-            created_by: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            source: "agent".to_string(),
-            payload_json: None,
-            source_text_hash: None,
-            input_hash: None,
-            memory_version: String::new(),
-            synced_anchor_drifted: false,
-            bindings: Vec::new(),
-            call_paths: Vec::new(),
-            tags: Vec::new(),
-        }
-    }
-
-    /// A body one word OVER the compaction size gate — the queue takes it, so a missing summary
-    /// means "not compacted YET", not "never will be", and the summary surfaces must defer it.
-    fn over_envelope_body() -> String {
-        vec!["word"; evidence::SUMMARY_MAX_WORDS + 1].join(" ")
-    }
-
-    /// A body WELL under the word ceiling but over the character one — the shape a word count
-    /// alone misreads: long tokens (absolute paths, URLs, a quoted stack line).
-    fn wide_token_body() -> String {
-        let path = "/home/dev/src/repo/crates/rag-rat-core/src/index/query_api/memory.rs";
-        let body = vec![path; 20].join(" ");
-        assert!(body.split_whitespace().count() <= evidence::SUMMARY_MAX_WORDS);
-        assert!(body.chars().count() > evidence::SUMMARY_MAX_CHARS);
-        body
-    }
-
-    fn seed_summary(c: &Connection, id: &str, body: &str, summary: &str) {
-        // Stamp the current content_hash (title `"t"`, matching `memory_with_body`) + the current
-        // COMPACT_PROMPT_VERSION — the hydrator gates the summary read on both (like the compaction
-        // queue's coverage check), so a mismatch drops the summary.
-        c.execute(
-            "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, \
-             prompt_version, generated_at_ms) VALUES (?1,'r',?2,?3,?4,0)",
-            params![
-                id,
-                crate::memory::evidence::note_content_hash("t", body),
-                summary,
-                crate::memory::evidence::COMPACT_PROMPT_VERSION
-            ],
-        )
-        .unwrap();
-    }
-
-    fn seed_reality(c: &Connection, id: &str, body: &str, verdict: &str, commit: Option<&str>) {
-        // Key the reality row on the memory's TRUE content_hash (title `"t"`, matching
-        // `memory_with_body`), its current evidence hash, AND the current verdict PROMPT_VERSION —
-        // the hydrator gates the marker on all three (like the queue/divergence finder), so a
-        // mismatch on any silently drops it. These test memories have no bindings/identifiers, so
-        // the evidence hash is the stable empty value `checked_inputs_hash` computes.
-        let inputs =
-            crate::memory::evidence::checked_inputs_hash(c, id, &Some("r".to_string())).unwrap();
-        c.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
-             checked_against_commit, checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
-             (?1,'r',?2,?3,?4,?5,?6,0)",
-            params![
-                id,
-                crate::memory::evidence::note_content_hash("t", body),
-                verdict,
-                commit,
-                inputs,
-                crate::memory::evidence::VERDICT_PROMPT_VERSION
-            ],
-        )
-        .unwrap();
-    }
-
-    fn evidence(memories: Vec<RepoMemory>) -> RepoMemoryEvidence {
-        RepoMemoryEvidence { direct: memories, ..Default::default() }
-    }
-
-    #[test]
-    fn summary_surface_renders_summary_and_verdict_marker() {
-        let c = summary_conn();
-        let body = "the full body worth compacting";
-        seed_summary(
-            &c,
-            "m1",
-            body,
-            "A compacted three-sentence summary. It preserves polarity. Done.",
-        );
-        seed_reality(&c, "m1", body, "diverged", None);
-
-        let compact =
-            evidence(vec![memory_with_body("m1", body)]).compact_summary_first(&c).unwrap();
-        let header = &compact.direct[0];
-        assert_eq!(
-            header.summary.as_deref(),
-            Some("A compacted three-sentence summary. It preserves polarity. Done."),
-            "the compacted summary is hydrated under the summary surface"
-        );
-        assert_eq!(
-            header.verdict.as_deref(),
-            Some("[verdict: diverged]"),
-            "the verdict marker renders"
-        );
-    }
-
-    #[test]
-    fn summary_surface_falls_back_to_title_only_without_a_summary_row() {
-        let c = summary_conn();
-        // No memory_note_summaries / memory_reality rows, and a body too long to stand in for the
-        // missing summary → summary + verdict stay None (title-only).
-        let compact = evidence(vec![memory_with_body("m1", &over_envelope_body())])
-            .compact_summary_first(&c)
-            .unwrap();
-        let header = &compact.direct[0];
-        assert_eq!(header.summary, None, "no summary row → the title stands alone");
-        assert_eq!(header.verdict, None, "no reality row → no verdict marker");
-        assert_eq!(header.title, "t", "the title is still present");
-    }
-
-    #[test]
-    fn summary_surface_misses_a_stale_summary_after_a_body_edit() {
-        let c = summary_conn();
-        // A summary exists, but for the OLD body — the current content_hash differs, so the LEFT
-        // JOIN misses and the header falls back to title-only (the summary self-invalidated). The
-        // new body is over the envelope so the fallback is title-only rather than the body itself.
-        seed_summary(
-            &c,
-            "m1",
-            "old body",
-            "A stale summary from before. It no longer applies. Ignore.",
-        );
-        let compact = evidence(vec![memory_with_body("m1", &over_envelope_body())])
-            .compact_summary_first(&c)
-            .unwrap();
-        assert_eq!(
-            compact.direct[0].summary, None,
-            "a summary keyed on a stale content_hash is not surfaced"
-        );
-    }
-
-    #[test]
-    fn verdict_marker_misses_a_stale_verdict_after_a_body_edit() {
-        let c = summary_conn();
-        // A verdict exists, but for the OLD body — the current content_hash differs, so the verdict
-        // read misses and the header carries no marker. Symmetric to the stale-summary case: a body
-        // edit self-invalidates the verdict just like the summary, so a just-edited memory never
-        // renders the PRIOR body's verdict.
-        seed_reality(&c, "m1", "old body", "diverged", None);
-        let compact =
-            evidence(vec![memory_with_body("m1", "new body")]).compact_summary_first(&c).unwrap();
-        assert_eq!(
-            compact.direct[0].verdict, None,
-            "a verdict keyed on a stale content_hash is not surfaced after a body edit"
-        );
-    }
-
-    #[test]
-    fn verdict_marker_misses_a_stale_verdict_after_a_bound_input_change() {
-        // Regression (PR #428 Codex P2): the marker is gated on `checked_inputs_hash`, not only
-        // `content_hash`. A stored verdict whose inputs hash no longer matches the memory's current
-        // bound-file inputs (a bound file changed since the check) must drop, like the divergence
-        // finder and queue treat an inputs mismatch. Seed a row with a deliberately-mismatched
-        // inputs hash — the current inputs hash for this binding-less memory is the
-        // empty-set value, which this arbitrary value is not.
-        let c = summary_conn();
-        let body = "a note whose stored verdict predates a bound-file change";
-        // Stamp the CURRENT content hash + prompt version so the only mismatch is the inputs hash —
-        // otherwise the marker would drop for the wrong reason and not exercise the inputs gate.
-        c.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
-             checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
-             ('m1','r',?1,'diverged','stale-inputs',?2,0)",
-            params![
-                crate::memory::evidence::note_content_hash("t", body),
-                crate::memory::evidence::VERDICT_PROMPT_VERSION
-            ],
-        )
-        .unwrap();
-        let compact =
-            evidence(vec![memory_with_body("m1", body)]).compact_summary_first(&c).unwrap();
-        assert_eq!(
-            compact.direct[0].verdict, None,
-            "a verdict whose checked_inputs_hash no longer matches is not surfaced"
-        );
-    }
-
-    #[test]
-    fn summary_and_marker_drop_under_an_obsolete_prompt_version() {
-        // Regression (PR #428 Codex P2): the surfacing hydrator must apply the SAME prompt-version
-        // gate the compaction queue / verification queue use. A summary from an obsolete compact
-        // prompt or a verdict from an obsolete verdict prompt must not keep showing while the
-        // memory waits behind the budget (or a model failure) for a fresh one.
-        let c = summary_conn();
-        // Over the summary envelope, so the obsolete-prompt drop leaves title-only and is not
-        // masked by the show-it-whole fallback.
-        let body = over_envelope_body();
-        let body = body.as_str();
-        let content_hash = crate::memory::evidence::note_content_hash("t", body);
-        c.execute(
-            "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, \
-             prompt_version, generated_at_ms) VALUES ('m1','r',?1,'A three sentence summary. It \
-             holds. Done.','compact-OLD',0)",
-            params![content_hash],
-        )
-        .unwrap();
-        let inputs =
-            crate::memory::evidence::checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
-        c.execute(
-            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, \
-             checked_inputs_hash, prompt_version, checked_at_ms) VALUES \
-             ('m1','r',?1,'diverged',?2,'verify-OLD',0)",
-            params![content_hash, inputs],
-        )
-        .unwrap();
-        let compact =
-            evidence(vec![memory_with_body("m1", body)]).compact_summary_first(&c).unwrap();
-        assert_eq!(
-            compact.direct[0].summary, None,
-            "a summary from an obsolete compact prompt is not surfaced"
-        );
-        assert_eq!(
-            compact.direct[0].verdict, None,
-            "a verdict from an obsolete verdict prompt is not surfaced"
-        );
-    }
-
-    #[test]
-    fn verdict_marker_current_carries_the_short_commit() {
-        let c = summary_conn();
-        let body = "b";
-        seed_summary(&c, "m1", body, "One sentence summary here. Two now. Three done.");
-        seed_reality(&c, "m1", body, "current", Some("abcdef0123456789"));
-        let compact =
-            evidence(vec![memory_with_body("m1", body)]).compact_summary_first(&c).unwrap();
-        assert_eq!(
-            compact.direct[0].verdict.as_deref(),
-            Some("[verdict: current @abcdef0]"),
-            "a current verdict carries the 7-hex short commit"
-        );
-    }
-
-    #[test]
-    fn full_surface_projection_carries_no_summary_or_verdict() {
-        // The `full` compact projection is purely mechanical — no summary/verdict, even
-        // when sibling rows exist (they are only read by `compact_summary_first`).
-        let compact = CompactRepoMemory::from(&memory_with_body("m1", "body"));
-        assert_eq!(compact.summary, None);
-        assert_eq!(compact.verdict, None);
-    }
-
-    #[test]
-    fn memory_get_returns_the_full_body_even_when_a_summary_exists() {
-        // `memory show` / `memory_show` is surface-independent: the expand path always carries the
-        // full body regardless of any compacted summary.
-        let c = summary_conn();
-        let body = "the full body that memory show must always return";
-        c.execute(
-            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
-             created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
-             ('m1','Invariant','t',?1,'high','active','agent',1,1,'agent','v1','r')",
-            [body],
-        )
-        .unwrap();
-        seed_summary(&c, "m1", body, "A short summary stands in for surfacing. Not for show. Ok.");
-        let fetched = memory_by_id(&c, "m1").unwrap().expect("memory present");
-        assert_eq!(
-            fetched.body, body,
-            "memory_get returns the full body regardless of the summary"
-        );
-    }
-
-    #[test]
-    fn apply_memory_surface_summary_defers_the_body_and_hydrates_summary_and_verdict() {
-        // The direct-query / read_chunk / grep counterpart to `compact_summary_first`: under
-        // `Summary` the full body is emptied (deferred to `memory show`) and the current-body
-        // summary + verdict marker are hydrated in its place.
-        let c = summary_conn();
-        let body = "the full body worth compacting";
-        seed_summary(&c, "m1", body, "A compacted summary in place of the body.");
-        seed_reality(&c, "m1", body, "diverged", None);
-        let mut memories = vec![memory_with_body("m1", body)];
-        apply_memory_surface(&c, &mut memories, rag_rat_base::config::MemorySurface::Summary)
-            .unwrap();
-        assert_eq!(
-            memories[0].body,
-            body_elision_marker("m1"),
-            "the deferred body is replaced by the elision marker, not blanked silently"
-        );
-        assert!(
-            memories[0].body.contains("memory_show m1"),
-            "the marker names the expand path: {}",
-            memories[0].body
-        );
-        assert_eq!(
-            memories[0].summary.as_deref(),
-            Some("A compacted summary in place of the body.")
-        );
-        assert!(
-            memories[0].verdict.as_deref().unwrap_or_default().contains("diverged"),
-            "the verdict marker is set: {:?}",
-            memories[0].verdict
-        );
-    }
-
-    #[test]
-    fn apply_memory_surface_summary_shows_an_under_envelope_body_whole_and_defers_a_longer_one() {
-        // The size gate, on both sides. A note compaction SKIPS (inside the envelope) never gets a
-        // summary row, so deferring it would leave a permanent bare title — it surfaces whole. A
-        // LONGER note with no summary row is merely uncompacted (dream disabled, never run, or
-        // behind a prompt-version bump) and must still defer: without this half, the default
-        // surface dumps every full body the moment COMPACT_PROMPT_VERSION is bumped.
-        let c = summary_conn();
-        let long = over_envelope_body();
-        // Few words, many characters — paths, URLs, a quoted stack line. The envelope is a cost
-        // bound, so the character ceiling has to hold on its own: a body the word count alone would
-        // wave through is skipped by compaction forever and then dumped whole on every attachment.
-        let wide = wide_token_body();
-        let mut memories = vec![
-            memory_with_body("m1", "some body"),
-            memory_with_body("m2", &long),
-            memory_with_body("m3", &wide),
-        ];
-        apply_memory_surface(&c, &mut memories, rag_rat_base::config::MemorySurface::Summary)
-            .unwrap();
-        assert_eq!(
-            memories[0].body, "some body",
-            "a note inside the summary envelope keeps its full body"
-        );
-        assert_eq!(
-            memories[1].body,
-            body_elision_marker("m2"),
-            "an over-envelope note with no summary row still defers its body"
-        );
-        assert_eq!(
-            memories[2].body,
-            body_elision_marker("m3"),
-            "over the character ceiling defers too, however few words the body has"
-        );
-        assert_eq!(memories[0].summary, None);
-        assert_eq!(memories[1].summary, None);
-        assert_eq!(memories[2].summary, None);
-        assert_eq!(memories[0].verdict, None);
-    }
-
-    #[test]
-    fn body_is_elided_reads_the_memory_own_marker_not_prose_quoting_it() {
-        // A memory ABOUT the elision marker quotes the marker, so its prose opens with the marker
-        // text — and under `Full` no marker is ever applied, so that body is prose and has to
-        // render as prose. Only the marker this memory's own id would produce counts as elision.
-        let c = summary_conn();
-        let prose = format!(
-            "{BODY_ELISION_PREFIX} …] is what a deferred body renders as. {}",
-            over_envelope_body()
-        );
-        let mut memories = vec![memory_with_body("m1", &prose)];
-        assert!(
-            !body_is_elided(&memories[0]),
-            "prose that merely opens with the marker text is not elided: {}",
-            memories[0].body
-        );
-        assert!(
-            !body_is_elided(&memory_with_body("m2", &body_elision_marker("m1"))),
-            "another memory's marker, quoted verbatim, is not this memory's elision"
-        );
-        apply_memory_surface(&c, &mut memories, rag_rat_base::config::MemorySurface::Summary)
-            .unwrap();
-        assert!(
-            body_is_elided(&memories[0]),
-            "a body the summary surface actually deferred still reads as elided: {}",
-            memories[0].body
-        );
-    }
-
-    #[test]
-    fn compact_summary_first_stands_an_under_envelope_body_in_for_the_missing_summary() {
-        // `CompactRepoMemory` (impact_surface) carries no body field, so a memory compaction skips
-        // would render title-only FOREVER without this fallback. Its body is inside the envelope by
-        // construction, so it costs no more than the summary it replaces. An over-envelope note
-        // with no summary row still falls back to title-only — it is waiting for a summary, not
-        // ineligible for one.
-        let c = summary_conn();
-        let long = over_envelope_body();
-        let compact = evidence(vec![
-            memory_with_body("m1", "a short note worth showing"),
-            memory_with_body("m2", &long),
-        ])
-        .compact_summary_first(&c)
-        .unwrap();
-        assert_eq!(
-            compact.direct[0].summary.as_deref(),
-            Some("a short note worth showing"),
-            "an unsummarizable note stands in its own body"
-        );
-        assert_eq!(
-            compact.direct[1].summary, None,
-            "an over-envelope note with no summary row stays title-only"
-        );
-    }
-
-    #[test]
-    fn apply_memory_surface_full_is_a_noop() {
-        // `Full` keeps the body byte-identical and never hydrates a summary, even when one exists.
-        let c = summary_conn();
-        let body = "kept verbatim in full mode";
-        seed_summary(&c, "m1", body, "would-be summary");
-        let mut memories = vec![memory_with_body("m1", body)];
-        apply_memory_surface(&c, &mut memories, rag_rat_base::config::MemorySurface::Full).unwrap();
-        assert_eq!(memories[0].body, body, "full surface keeps the body");
-        assert_eq!(memories[0].summary, None, "full surface never hydrates a summary");
-        assert_eq!(memories[0].verdict, None);
-    }
-}
+#[path = "tests.rs"]
+mod tests;
 
 /// READ-only counts of active repo-memory bindings grouped by `anchor_status`.
 /// Computed by a single GROUP BY query; does not run `memory_validate` or write anything.

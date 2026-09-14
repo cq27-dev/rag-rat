@@ -1,8 +1,7 @@
-//! Memory op-log: the op model, a deterministic projection fold, and the signed hash-chained entry
-//! envelope (phase B, layer 1).
+//! Memory op-log: the op model, a deterministic projection fold, the signed hash-chained entry
+//! envelope, and the account, content and table-sync layers built on them.
 //!
-//! A pure, in-memory primitive frozen in isolation — the op-log's ordering + integrity semantics
-//! without any transport or storage. Parts:
+//! Parts:
 //! - [`op`]: the frozen [`op::MemoryOp`] set, its canonical CBOR wire form
 //!   ([`op::encode`]/[`op::decode`]), and the known/unknown split ([`op::DecodedOp`]) that keeps a
 //!   forward-version op opaque-but-retained.
@@ -27,16 +26,19 @@
 //! - [`identity`]: the store's ONE persisted ed25519 device identity (#513) —
 //!   [`identity::local_device`] mints it from OS entropy on first use and returns it stably
 //!   thereafter, so every authored entry signs under one machine fingerprint.
+//! - [`account`]: the account and authority substrate — roster, grants, stream ownership,
+//!   content-key sealing, and the owner-bound `/3` content envelope with its candidate DAG.
+//! - [`content_projection`]: the `/3` accepted-content projection and its store-global re-fold.
+//! - [`table_sync`]: the `/5` table→log sync engine — row ops on signed per-scope streams, folded
+//!   by whole-row last-writer-wins, plus the transport seams `rag-rat-sync` drives.
 //!
-//! Nothing here is wired into the live write path yet (later increments add the append-on-mutation
-//! seam, roster/epochs, and transport) — this mirrors the `content_hash` freeze: pin the semantic
-//! primitive first, in isolation-testable form.
+//! Wired today: the memory write path authors owner-bound `/3` content, `/3` content ingest, and
+//! `/5` table-sync authoring and ingest, all consumed by `rag-rat-sync`. Not wired: the `/1`
+//! store's foreign-entry [`store::append`] (with its fork quarantine and `AppendOutcome`) has only
+//! test callers.
 
-// The authoring half is wired into the memory write path (#532), but the SYNC-TRANSPORT half —
-// `append` (receiving a foreign signed entry), the fork quarantine, `AppendOutcome`, and the C4/C5
-// authority primitives that precede their consumers (#607) — is still unconsumed frozen
-// scaffolding, so the crate keeps `allow(dead_code)` (carried over from the module's own
-// suppression before the #706-phase-8 extraction).
+// `store::append` and its receive-side scaffolding have no production caller, so the crate keeps
+// `allow(dead_code)` rather than annotating each item.
 #![allow(dead_code)]
 
 /// Migration hooks for oplog's own tests. The only migration hook oplog's schema uses is its OWN
@@ -186,10 +188,10 @@ pub use stream::{AccessMode, EntryHash, StreamId};
 // The table-sync forward-compat seam (#1001): replay entries retained but not projected when
 // they arrived. Belongs at store open, before producing — see the module docs.
 pub use table_sync::{
-    LocalWriterMemo, TABLE_SYNC_ENTRY_MAX_BYTES, TableSyncChainEntry, TableSyncChainHead,
-    TableSyncEntryStart, TableSyncFrontier, TableSyncIngestOutcome, TableSyncReceived,
-    TableSyncStream, refold_stale_table_sync_projections, scope_retention_budget,
-    table_sync_author_pending, table_sync_chain_entries, table_sync_chain_frontier,
-    table_sync_chain_page_after, table_sync_compact_overdue, table_sync_ingest,
-    table_sync_supported_streams, table_sync_validate_stream,
+    LocalWriterMemo, TABLE_SYNC_ENTRY_MAX_BYTES, TableSyncChainCursor, TableSyncChainEntry,
+    TableSyncChainHead, TableSyncEntryStart, TableSyncFrontier, TableSyncIngestOutcome,
+    TableSyncReceived, TableSyncStream, refold_stale_table_sync_projections,
+    scope_retention_budget, table_sync_author_pending, table_sync_chain_entries,
+    table_sync_chain_frontier, table_sync_chain_page_after, table_sync_compact_overdue,
+    table_sync_ingest, table_sync_supported_streams, table_sync_validate_stream,
 };

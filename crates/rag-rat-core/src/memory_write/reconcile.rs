@@ -738,8 +738,8 @@ pub(crate) fn heal_memory_oplog_ghosts(conn: &Connection, now_ms: i64) -> anyhow
 /// consolidation uses to author freshly-imported (remapped) rows into the TARGET's owner stream
 /// under the TARGET's identity (#541). The source's pre-remap signed entries are intentionally NOT
 /// carried (they are signed under the source device over pre-remap ids). Wired into consolidation
-/// by [`crate::index::consolidate::run`] (#541 Task 5), immediately after the import commits and
-/// before the legacy file is renamed away.
+/// by [`crate::index::consolidate::run`] (#541 Task 5), immediately after the import commits
+/// and before the legacy file is renamed away.
 pub(crate) fn reconcile_owner_stream_for_repo(
     conn: &Connection,
     repo_id: &str,
@@ -756,9 +756,10 @@ pub(crate) fn reconcile_owner_stream_for_repo(
     //
     // This is the BACKSTOP, not the gate. By the time control reaches here the import has already
     // committed, so failing leaves the very half-applied state the refusal exists to prevent —
-    // which is why both callers refuse BEFORE their irreversible step (`consolidate::run_inner`
-    // before importing, `sync_publish_seed` before publishing). Keep this arm so a future third
-    // caller fails loudly instead of silently skipping, and give it the same pre-check.
+    // which is why both callers refuse BEFORE their irreversible step
+    // (`consolidate::run` before importing, `sync_publish_seed` before publishing).
+    // Keep this arm so a future third caller fails loudly instead of silently skipping, and
+    // give it the same pre-check.
     //
     // (The live-write path skips silently instead, and correctly: `backfill_memory_oplog` has
     // nothing to reconcile because each mutation already authors onto the owner's stream.)

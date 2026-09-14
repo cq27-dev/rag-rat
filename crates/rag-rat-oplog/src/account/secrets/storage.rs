@@ -1127,14 +1127,14 @@ mod tests {
     #[test]
     fn late_cut_restores_a_pending_table_streams_incarnation() {
         use crate::table_sync::{
-            Cell, ColumnSpec, PendingReason, RowOp, TableSpec, TypedValue, ValueType,
+            Cell, ColumnSpec, PendingReason, RowOp, ScopeId, TableSpec, TypedValue, ValueType,
             author_row_entry, mark_entry_pending, record_stream_context,
             refold_stale_projections_against, scope_stream_id,
         };
 
         const TABLE: TableSpec = TableSpec {
             name: "t_incarnation_replay",
-            scope_id: "incarnation/1",
+            scope_id: ScopeId::new("incarnation/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("title", ValueType::Text)],
@@ -1158,8 +1158,15 @@ mod tests {
         ingest(&conn, &a_bytes);
         let stream = scope_stream_id("repo-a", account, incarnation_a, TABLE.scope_id);
         let tx = conn.transaction().unwrap();
-        record_stream_context(&tx, stream, "repo-a", account, incarnation_a, TABLE.scope_id)
-            .unwrap();
+        record_stream_context(
+            &tx,
+            stream,
+            "repo-a",
+            account,
+            incarnation_a,
+            TABLE.scope_id.as_db_str(),
+        )
+        .unwrap();
         let pending = author_row_entry(
             &tx,
             stream,

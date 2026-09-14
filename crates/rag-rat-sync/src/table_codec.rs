@@ -1,7 +1,8 @@
 //! Length-prefixed framing for the dedicated table-sync protocol.
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::codec::{self, FramingError};
 use crate::table_wire::{TableFrame, TableWireError};
 
 /// Hard frame cap, checked from the length prefix before allocating the body.
@@ -10,7 +11,7 @@ pub const MAX_TABLE_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 #[derive(Debug, thiserror::Error)]
 pub enum TableCodecError {
     #[error("table-sync stream io: {0}")]
-    Io(std::io::Error),
+    Io(#[from] std::io::Error),
     #[error("table-sync frame declared {0} bytes, over {max}", max = MAX_TABLE_FRAME_BYTES)]
     FrameTooLarge(u32),
     #[error(transparent)]
@@ -19,41 +20,35 @@ pub enum TableCodecError {
     Eof,
 }
 
+impl From<FramingError> for TableCodecError {
+    fn from(error: FramingError) -> Self {
+        match error {
+            FramingError::OverCap(len) =>
+                Self::FrameTooLarge(u32::try_from(len).unwrap_or(u32::MAX)),
+            FramingError::Eof(_) => Self::Eof,
+            FramingError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &TableFrame,
 ) -> Result<(), TableCodecError> {
-    let body = frame.encode();
-    let len = u32::try_from(body.len()).map_err(|_| TableCodecError::FrameTooLarge(u32::MAX))?;
-    if len > MAX_TABLE_FRAME_BYTES {
-        return Err(TableCodecError::FrameTooLarge(len));
-    }
-    writer.write_all(&len.to_be_bytes()).await.map_err(TableCodecError::Io)?;
-    writer.write_all(&body).await.map_err(TableCodecError::Io)
+    Ok(codec::write_framed(writer, &frame.encode(), MAX_TABLE_FRAME_BYTES).await?)
 }
 
 pub async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<TableFrame, TableCodecError> {
-    let mut len_bytes = [0; 4];
-    match reader.read_exact(&mut len_bytes).await {
-        Ok(_) => {},
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Err(TableCodecError::Eof);
-        },
-        Err(error) => return Err(TableCodecError::Io(error)),
-    }
-    let len = u32::from_be_bytes(len_bytes);
-    if len > MAX_TABLE_FRAME_BYTES {
-        return Err(TableCodecError::FrameTooLarge(len));
-    }
-    let mut body = vec![0; len as usize];
-    reader.read_exact(&mut body).await.map_err(TableCodecError::Io)?;
+    let body = codec::read_framed(reader, MAX_TABLE_FRAME_BYTES).await?;
     TableFrame::decode(&body).map_err(TableCodecError::Wire)
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::AsyncWriteExt;
+
     use super::*;
 
     #[test]

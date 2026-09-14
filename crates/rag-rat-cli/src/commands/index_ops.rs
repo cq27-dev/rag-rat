@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use rag_rat_base::config::Config;
 use rag_rat_core::IndexDatabase;
+use rag_rat_core::index::CloneDeltaStatus;
 
 use crate::cli::{DoctorArgs, IndexArgs, MaintenanceArgs, ReconcileArgs};
 use crate::render::{
@@ -733,7 +734,8 @@ fn run_maintenance_pass(
     // treadmill full rebuilds. Best-effort + resumable across passes.
     let clone_delta = db.apply_clone_graph_delta(rag_rat_core::index::CLONE_DELTA_MAX_FILES).ok();
     let clone_full_rebuild_owed = match &clone_delta {
-        Some(delta) if delta.status == "Applied" || delta.status == "Noop" =>
+        Some(delta)
+            if matches!(delta.status, CloneDeltaStatus::Applied | CloneDeltaStatus::Noop) =>
             delta.full_rebuild_owed,
         _ => true,
     };
@@ -753,7 +755,7 @@ fn run_maintenance_pass(
     // rename, or change, so relocate symbol/chunk bindings (or flag them) here rather than
     // leaving stale anchors until a manual memory_validate.
     let memory_validation = db.memory_validate().ok();
-    tracing::debug!(target: "rag_rat_core::maintenance", phase = "gc_clone_memory", gc = gc_report.is_some(), clone_delta = clone_delta.as_ref().map_or("error", |d| d.status.as_str()), clone_graph = clone_graph_report.is_some(), memory_validated = memory_validation.is_some(), "post-reconcile phases complete");
+    tracing::debug!(target: "rag_rat_core::maintenance", phase = "gc_clone_memory", gc = gc_report.is_some(), clone_delta = clone_delta.as_ref().map_or("error", |d| d.status.as_db_str()), clone_graph = clone_graph_report.is_some(), memory_validated = memory_validation.is_some(), "post-reconcile phases complete");
     // Remaining backlog for the ACTIVE embedding model from the CHEAP persisted counts
     // (`status.embedding` / `status.artifacts`, #285), NOT `reconcile_plan` — which rebuilds +
     // re-hashes EVERY chunk's embedding input (O(repo)) on every hook pass. #378 measured that plan

@@ -11,12 +11,103 @@ use rag_rat_core::index::install_scope_view;
 use rag_rat_db::schema;
 use rusqlite::{Connection, params};
 
+use super::predicates::is_qualified_symbol;
 use super::*;
 
 const COMMIT: &str = "c0ffee";
 const SCOPE: CheckoutRef<'static> = CheckoutRef { commit_sha: COMMIT, worktree_id: "" };
 const TOOL: &str = "rust-analyzer";
 const TOOL_VERSION: &str = "ra 1.0";
+
+/// `forward_visibility_filter` decides which callees an agent sees. Pin it with a truth table: a
+/// synthetic edge for every (kind, resolution, method-name) class, and for each of the eight flag
+/// combinations exactly the classes it admits — each flag withholds one population: unresolved
+/// targets, macro invocations, and unresolved calls to a common std method name.
+#[test]
+fn forward_visibility_filter_admits_exactly_its_truth_table() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE edges(id INTEGER PRIMARY KEY, edge_kind TEXT NOT NULL, to_name TEXT,
+                            to_symbol_id INTEGER, confidence TEXT, target_qualified_name TEXT)",
+    )
+    .unwrap();
+    let resolutions = [
+        ("resolved", Some(1), "Exact", Some("a::t")),
+        ("qualified", None, "Syntactic", Some("a::t")),
+        ("name_only", None, "NameOnly", None),
+    ];
+    let mut classes = Vec::new();
+    for kind in ["calls_name", "constructs", "uses_operator", "uses_macro", "references_type"] {
+        for (resolution, to_symbol_id, confidence, target) in resolutions {
+            for (name_class, to_name) in [("common", "clone"), ("plain", "frobnicate")] {
+                conn.execute(
+                    "INSERT INTO edges(edge_kind, to_name, to_symbol_id, confidence,
+                                       target_qualified_name)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![kind, to_name, to_symbol_id, confidence, target],
+                )
+                .unwrap();
+                classes.push((conn.last_insert_rowid(), kind, resolution, name_class));
+            }
+        }
+    }
+    for flags in 0..8_u8 {
+        let options = GraphTraversalOptions {
+            include_unresolved: flags & 1 != 0,
+            include_macros: flags & 2 != 0,
+            include_common_methods: flags & 4 != 0,
+            ..GraphTraversalOptions::default()
+        };
+        let admitted = conn
+            .prepare(&format!(
+                "SELECT id FROM edges WHERE ({})",
+                forward_visibility_filter(&options)
+            ))
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
+            .unwrap();
+        for &(id, kind, resolution, name_class) in &classes {
+            let resolved_target = match kind {
+                "calls_name" => resolution != "name_only",
+                "constructs" | "uses_operator" => resolution == "resolved",
+                _ => true,
+            };
+            let common_method_call =
+                kind == "calls_name" && name_class == "common" && resolution != "resolved";
+            let expected = (options.include_unresolved || resolved_target)
+                && (options.include_macros || kind != "uses_macro")
+                && (options.include_common_methods || !common_method_call);
+            assert_eq!(
+                admitted.contains(&id),
+                expected,
+                "{kind}/{resolution}/{name_class} under {options:?}"
+            );
+        }
+    }
+}
+
+/// `is_qualified_symbol` gates the by-short-name fallback (`?4`) in the non-fuzzy predicates, so a
+/// shape whose answer flips widens or narrows `find_callers`. The seed is caller-supplied, so a
+/// `file.ext:name` seed can reach it; every registered language extension counts as qualified.
+#[test]
+fn is_qualified_symbol_classifies_every_seed_shape() {
+    for (seed, qualified) in [
+        ("crates/a/src/lib.rs::Type::run", true),
+        ("module::function", true),
+        ("src/lib.rs", true),
+        ("lib.rs:run", true),
+        ("app.ts:run", true),
+        ("view.tsx:run", true),
+        ("Main.kt:run", true),
+        ("main.py:run", true),
+        ("Type.method", false),
+        ("run", false),
+    ] {
+        assert_eq!(is_qualified_symbol(seed), qualified, "{seed}");
+    }
+}
 
 fn scoped_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
@@ -478,15 +569,56 @@ fn fuzzy_reaches_a_short_name_caller_that_syntactic_cannot() {
     assert_eq!(name_only.confidence, "name_only");
 }
 
-/// The SQL ladder and the Rust ladder rank the same stored tokens in the same order. The Rust side
-/// adds the oracle `compiler` tier at 0, so every heuristic tier sits exactly one rank lower there.
+/// The SQL ladder, the Rust ladder and the PageRank weights rank the same stored tokens in the same
+/// order. The Rust side adds the oracle `compiler` tier at 0, so every heuristic tier sits exactly
+/// one rank lower there; the weight falls strictly as the rank rises.
 #[test]
 fn confidence_order_sql_agrees_with_effective_confidence_rank() {
     let conn = Connection::open_in_memory().unwrap();
-    let sql = format!("SELECT {CONFIDENCE_ORDER_SQL} FROM (SELECT ?1 AS confidence) AS edges");
+    let sql = format!(
+        "SELECT {} FROM (SELECT ?1 AS confidence) AS edges",
+        rag_rat_db::EdgeConfidence::order_sql()
+    );
+    let mut stronger_weight = f64::INFINITY;
     for token in ["Exact", "Syntactic", "NameOnly", "Ambiguous"] {
         let sql_rank: i64 = conn.query_row(&sql, [token], |row| row.get(0)).unwrap();
         let rust_rank = effective_confidence_rank(normalize_confidence(token));
         assert_eq!(sql_rank + 1, i64::from(rust_rank), "{token}");
+        let weight = crate::pagerank::confidence_factor(token);
+        assert!(weight < stronger_weight, "{token} must weigh less than the tier above it");
+        stronger_weight = weight;
+    }
+}
+
+/// Bare filenames are valid path-qualified graph seeds, including languages without a legacy
+/// extension arm. Their qualification must follow the same registry used for indexing.
+#[test]
+fn qualified_graph_seeds_cover_registered_extensions() {
+    for language in rag_rat_base::language::Language::all() {
+        for extension in language.simple_extensions() {
+            for suffix in ["run", "1-5"] {
+                let seed = format!("file.{extension}:{suffix}");
+                assert!(is_qualified_symbol(&seed), "{seed}");
+                for mode in [
+                    GraphResolutionMode::Exact,
+                    GraphResolutionMode::Syntactic,
+                    GraphResolutionMode::Fuzzy,
+                ] {
+                    let options =
+                        GraphTraversalOptions { resolution_mode: mode, ..Default::default() };
+                    let params = traversal_params(&seed, 10, &[], &options, false);
+                    assert_eq!(
+                        params[3],
+                        rusqlite::types::Value::Text(
+                            (mode == GraphResolutionMode::Fuzzy).to_string()
+                        ),
+                        "{seed}: {mode:?}"
+                    );
+                }
+            }
+        }
+    }
+    for seed in ["file.unknown:run", "Type.method", "run"] {
+        assert!(!is_qualified_symbol(seed), "{seed}");
     }
 }

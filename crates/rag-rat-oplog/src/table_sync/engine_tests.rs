@@ -5,7 +5,7 @@ use crate::table_sync::registry::{ColumnSpec, ValueType};
 
 const SPEC: TableSpec = TableSpec {
     name: "t_demo",
-    scope_id: "demo/1",
+    scope_id: ScopeId::new("demo/1"),
     spec_version: 1,
     pk: &[ColumnSpec::required("id", ValueType::Text)],
     columns: &[ColumnSpec::required("title", ValueType::Text)],
@@ -92,8 +92,9 @@ impl Device {
             now_ms: 0,
             local_writer: Default::default(),
         };
-        let out =
-            entries.iter().map(|bytes| ingest(&tx, &ctx, "demo/1", bytes, from, None).unwrap());
+        let out = entries
+            .iter()
+            .map(|bytes| ingest(&tx, &ctx, ScopeId::new("demo/1"), bytes, from, None).unwrap());
         let out = out.collect();
         tx.commit().unwrap();
         out
@@ -120,9 +121,9 @@ impl Device {
             now_ms: 0,
             local_writer: Default::default(),
         };
-        let out = entries
-            .iter()
-            .map(|bytes| ingest(&tx, &ctx, "demo/1", bytes, from, None).unwrap().outcome);
+        let out = entries.iter().map(|bytes| {
+            ingest(&tx, &ctx, ScopeId::new("demo/1"), bytes, from, None).unwrap().outcome
+        });
         let out = out.collect();
         tx.commit().unwrap();
         out
@@ -212,7 +213,7 @@ fn readoption_re_authors_a_removed_writers_row_and_uses_it_to_converge_a_fresh_r
     assert_eq!(c.title().as_deref(), Some("distilled"));
     let account = AccountId::from_bytes([42; 32]);
     remove_writer(&c.conn, account, a.pubkey().fingerprint());
-    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
     let removal_ref = [7; 32];
     {
         let tx = c.conn.transaction().unwrap();
@@ -282,7 +283,7 @@ fn readoption_waits_while_a_parked_newer_write_sits_above_the_winner() {
     let mut a = Device::new();
     let mut c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'distilled')", []).unwrap();
     let entry = a.produce();
     enroll_writer(&c.conn, account, a.pubkey().fingerprint());
@@ -350,7 +351,7 @@ fn readoption_never_authors_a_remove_while_the_physical_row_is_live() {
     let mut a = Device::new(); // creates AND deletes r1, then leaves the roster
     let mut c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
 
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'created')", []).unwrap();
     let create = a.produce();
@@ -418,7 +419,7 @@ fn a_second_removal_after_drain_re_adopts_the_devices_new_rows() {
     let mut a = Device::new(); // invited, removed, re-invited, removed again
     let mut c = Device::new(); // the current writer that holds every copy
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
 
     // Round one: A authors r1, C ingests it, A is removed, and C drains the work.
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'first')", []).unwrap();
@@ -534,7 +535,7 @@ fn the_audit_names_the_winning_entry_for_a_row_written_twice() {
     let mut a = Device::new();
     let mut c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
 
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'v1')", []).unwrap();
     let first = a.produce();
@@ -623,7 +624,7 @@ fn the_audit_skips_a_quarantined_later_write_that_never_owned_the_clock() {
     let mut a = Device::new();
     let mut c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
 
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'v1')", []).unwrap();
     let first = a.produce();
@@ -699,7 +700,7 @@ fn a_reinvited_devices_pending_removal_completes_without_reauthoring() {
     let mut a = Device::new();
     let mut c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
 
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'v')", []).unwrap();
     let entry = a.produce();
@@ -756,7 +757,7 @@ fn a_reinvited_devices_pending_removal_completes_without_reauthoring() {
 fn an_unreadable_orphan_stays_pending_until_the_cell_is_repaired() {
     const BOOL_SPEC: TableSpec = TableSpec {
         name: "t_typed",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("flag", ValueType::Bool)],
@@ -768,7 +769,7 @@ fn an_unreadable_orphan_stays_pending_until_the_cell_is_repaired() {
     let mut a = Device::new();
     let mut c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
     for device in [&a, &c] {
         device
             .conn
@@ -806,7 +807,7 @@ fn an_unreadable_orphan_stays_pending_until_the_cell_is_repaired() {
             local_writer: Default::default(),
         };
         for bytes in &entry {
-            ingest(&tx, &ctx, "demo/1", bytes, &a.pubkey(), None).unwrap();
+            ingest(&tx, &ctx, ScopeId::new("demo/1"), bytes, &a.pubkey(), None).unwrap();
         }
         tx.commit().unwrap();
     }
@@ -887,7 +888,7 @@ fn one_pass_drains_every_pending_removal_on_a_stream() {
     let mut b = Device::new();
     let mut c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
 
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'from-a')", []).unwrap();
     b.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'from-b')", []).unwrap();
@@ -1098,7 +1099,12 @@ fn a_promotion_drains_the_sibling_it_just_proved_to_be_a_fork() {
     let second = a.produce();
 
     // A second successor of the genesis, signed by the same device — an equivocation.
-    let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), [0x44; 32], "demo/1");
+    let stream = scope_stream_id(
+        "repo",
+        AccountId::from_bytes([42; 32]),
+        [0x44; 32],
+        ScopeId::new("demo/1"),
+    );
     let genesis_hash: [u8; 32] = a
         .conn
         .query_row("SELECT entry_hash FROM table_sync_entries ORDER BY lamport LIMIT 1", [], |r| {
@@ -1169,9 +1175,7 @@ fn a_promoted_entry_still_defers_to_unsent_local_work() {
     let report = b.ingest_reports(&filler, &a.pubkey());
     assert_eq!(
         report[0].promoted,
-        vec![IngestOutcome::Retained(
-            crate::table_sync::store::PendingReason::DeferredUnsentEdit.as_db_str()
-        )],
+        vec![IngestOutcome::Retained(crate::table_sync::store::PendingReason::DeferredUnsentEdit)],
         "the promoted entry defers rather than applying",
     );
     assert_eq!(b.title().as_deref(), Some("from-B"), "B's unsent edit survives promotion");
@@ -1233,7 +1237,12 @@ fn a_held_entry_behind_a_fork_is_abandoned_with_it() {
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
     let winner = a.produce();
 
-    let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), [0x44; 32], "demo/1");
+    let stream = scope_stream_id(
+        "repo",
+        AccountId::from_bytes([42; 32]),
+        [0x44; 32],
+        ScopeId::new("demo/1"),
+    );
     let genesis_hash: [u8; 32] = a
         .conn
         .query_row("SELECT entry_hash FROM table_sync_entries ORDER BY lamport LIMIT 1", [], |r| {
@@ -1307,7 +1316,12 @@ fn a_rejected_child_does_not_strand_the_valid_successor_behind_it() {
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
     let successor = a.produce();
 
-    let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), [0x44; 32], "demo/1");
+    let stream = scope_stream_id(
+        "repo",
+        AccountId::from_bytes([42; 32]),
+        [0x44; 32],
+        ScopeId::new("demo/1"),
+    );
     let genesis_hash: [u8; 32] = a
         .conn
         .query_row("SELECT entry_hash FROM table_sync_entries ORDER BY lamport LIMIT 1", [], |r| {
@@ -1381,7 +1395,12 @@ fn a_held_entry_citing_another_devices_chain_is_discarded_when_that_entry_lands(
         .unwrap();
 
     // Device C signs an entry citing A's hash — a cross-chain link.
-    let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), [0x44; 32], "demo/1");
+    let stream = scope_stream_id(
+        "repo",
+        AccountId::from_bytes([42; 32]),
+        [0x44; 32],
+        ScopeId::new("demo/1"),
+    );
     let cross = entry::sign_entry_from_op_bytes(
         c.local.secret(),
         stream,
@@ -1439,7 +1458,12 @@ fn a_foreign_citation_of_a_rejected_entry_is_abandoned_with_it() {
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r2', 'two')", []).unwrap();
     let winner = a.produce();
 
-    let stream = scope_stream_id("repo", AccountId::from_bytes([42; 32]), [0x44; 32], "demo/1");
+    let stream = scope_stream_id(
+        "repo",
+        AccountId::from_bytes([42; 32]),
+        [0x44; 32],
+        ScopeId::new("demo/1"),
+    );
     let genesis_hash: [u8; 32] = a
         .conn
         .query_row("SELECT entry_hash FROM table_sync_entries ORDER BY lamport LIMIT 1", [], |r| {
@@ -1527,7 +1551,8 @@ fn old_incarnation_offer_is_rejected_before_any_chain_or_projection_storage() {
         now_ms: 0,
         local_writer: Default::default(),
     };
-    let error = ingest(&tx, &ctx, "demo/1", &entries[0], &old.pubkey(), None).unwrap_err();
+    let error =
+        ingest(&tx, &ctx, ScopeId::new("demo/1"), &entries[0], &old.pubkey(), None).unwrap_err();
     assert!(error.to_string().contains("different stream"));
     for table in ["table_sync_entries", "table_sync_gapped_entries", "sync_row_clocks"] {
         let count: i64 =
@@ -1568,7 +1593,7 @@ fn a_removed_writer_keeps_its_unpublished_edit_behind_the_guard() {
     remove_writer(&b.conn, AccountId::from_bytes([42; 32]), b.local.fingerprint());
     a.set_title("from-A");
     assert_eq!(b.ingest_all(&a.produce(), &a.pubkey()), vec![IngestOutcome::Retained(
-        crate::table_sync::store::PendingReason::DeferredUnsentEdit.as_db_str()
+        crate::table_sync::store::PendingReason::DeferredUnsentEdit
     )]);
     assert_eq!(b.title().as_deref(), Some("unsent-B"), "the unsent local edit survives");
 }
@@ -1639,7 +1664,7 @@ fn two_devices_with_unsent_edits_converge_through_the_deferral() {
     // A authors first. B, still holding its own unsent edit, defers rather than clobbering it.
     let from_a = a.produce();
     assert_eq!(b.ingest_all(&from_a, &a.pubkey()), vec![IngestOutcome::Retained(
-        crate::table_sync::store::PendingReason::DeferredUnsentEdit.as_db_str()
+        crate::table_sync::store::PendingReason::DeferredUnsentEdit
     )],);
     assert_eq!(b.title().as_deref(), Some("from-B"), "B's edit is intact");
 
@@ -1701,7 +1726,7 @@ fn a_later_edit_supersedes_across_devices_and_both_converge() {
 fn a_scope_with_multiple_tables_routes_each_op_to_its_table() {
     const TA: TableSpec = TableSpec {
         name: "t_a",
-        scope_id: "multi/1",
+        scope_id: ScopeId::new("multi/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("v", ValueType::Text)],
@@ -1710,7 +1735,7 @@ fn a_scope_with_multiple_tables_routes_each_op_to_its_table() {
     };
     const TB: TableSpec = TableSpec {
         name: "t_b",
-        scope_id: "multi/1",
+        scope_id: ScopeId::new("multi/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("v", ValueType::Text)],
@@ -1772,7 +1797,7 @@ fn a_scope_with_multiple_tables_routes_each_op_to_its_table() {
         };
         for bytes in &entries {
             assert_eq!(
-                ingest(&tx, &ctx, "multi/1", bytes, &a_dev.secret().public(), None)
+                ingest(&tx, &ctx, ScopeId::new("multi/1"), bytes, &a_dev.secret().public(), None)
                     .unwrap()
                     .outcome,
                 IngestOutcome::Applied,
@@ -1793,7 +1818,7 @@ fn a_scope_with_multiple_tables_routes_each_op_to_its_table() {
 
 // ── re-adoption restates deletes in bounded scopes (#1295) ───────────────────────────────────
 
-const OVERLAY_SPEC: TableSpec = TableSpec { scope_id: "overlay/1", ..SPEC };
+const OVERLAY_SPEC: TableSpec = TableSpec { scope_id: ScopeId::OVERLAY, ..SPEC };
 const OVERLAY: &[TableSpec] = &[OVERLAY_SPEC];
 
 fn ctx_on<'a>(device: &'a Device, registry: &'a [TableSpec]) -> SyncCtx<'a> {
@@ -1902,7 +1927,7 @@ fn removing_a_writer_adds_the_adopters_statement_and_keeps_the_identity() {
     let a = Device::new();
     let c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "overlay/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::OVERLAY);
 
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'created')", []).unwrap();
     let create = produce_on(&a, OVERLAY);
@@ -1952,7 +1977,7 @@ fn anchors_re_adoption_keeps_the_tail_signed_remove() {
     let a = Device::new();
     let c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'created')", []).unwrap();
     let create = produce_on(&a, REGISTRY);
     ingest_on(&c, REGISTRY, &create, &a.pubkey());
@@ -1974,7 +1999,7 @@ fn anchors_re_adoption_keeps_the_tail_signed_remove() {
 fn replay_after_removal_re_arms_re_adoption() {
     const BOOL_SPEC: TableSpec = TableSpec {
         name: "t_typed",
-        scope_id: "overlay/1",
+        scope_id: ScopeId::OVERLAY,
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("flag", ValueType::Bool)],
@@ -1985,7 +2010,7 @@ fn replay_after_removal_re_arms_re_adoption() {
     let a = Device::new();
     let c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "overlay/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::OVERLAY);
     for device in [&a, &c] {
         device
             .conn
@@ -2000,7 +2025,7 @@ fn replay_after_removal_re_arms_re_adoption() {
     let delete = produce_on(&a, BOOL);
     c.conn.execute("UPDATE t_typed SET flag = 2 WHERE id = 'r1'", []).unwrap();
     assert_eq!(ingest_on(&c, BOOL, &delete, &a.pubkey()), vec![IngestOutcome::Retained(
-        store::PendingReason::DeferredUnreadableRow.as_db_str()
+        store::PendingReason::DeferredUnreadableRow
     )]);
     // A is removed while its delete is parked: A owns nothing on C, so the drain completes.
     assert_eq!(drain_removal(&c, BOOL, a.pubkey().fingerprint(), stream), Some(0));
@@ -2036,7 +2061,7 @@ fn anchors_re_adoption_holds_a_tail_signed_remove_below_a_parked_newer_write() {
     let a = Device::new();
     let c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
     a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'created')", []).unwrap();
     let create = produce_on(&a, REGISTRY);
     ingest_on(&c, REGISTRY, &create, &a.pubkey());
@@ -2077,7 +2102,7 @@ fn readopting_a_statement_carrier_preserves_actual_provenance() {
     let b = Device::new();
     let c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
-    let stream = scope_stream_id("repo", account, [0x44; 32], "overlay/1");
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::OVERLAY);
     a.conn.execute("INSERT INTO t_demo(id,title) VALUES ('r1','created')", []).unwrap();
     ingest_on(&b, OVERLAY, &produce_on(&a, OVERLAY), &a.pubkey());
     a.delete_row();
