@@ -15,7 +15,7 @@ use rag_rat_sync::{
 use rusqlite::{Connection, params};
 use zeroize::Zeroizing;
 
-use crate::cli::{self, KeepUntil, SyncArgs, SyncCommand};
+use crate::cli::{AccountIdInput, KeepUntil, SyncArgs, SyncCommand};
 use crate::{open_index, print_output};
 
 /// How long `serve` waits for the database-scoped session lock before refusing to start — kept
@@ -45,14 +45,14 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         SyncCommand::Contribute { account }
             if rag_rat_sync::InviteTicket::from_ticket_string(account).is_ok() =>
             contribute_with_ticket(config, account),
-        SyncCommand::Pull { account, peer } => pull(config, account, peer.as_deref()),
+        SyncCommand::Pull { account, peer } => pull(config, *account, peer.as_deref()),
         SyncCommand::Enable => with_repo_db(config, enable),
         SyncCommand::Publish { seed } => with_repo_db(config, |db| publish(db, seed.as_deref())),
         SyncCommand::CatchUp { target } => with_repo_db(config, |db| catch_up(db, *target)),
         SyncCommand::Whoami => with_repo_db(config, whoami),
         SyncCommand::Grant { account } => with_repo_db(config, |db| grant(db, account)),
         SyncCommand::Revoke { account, reason, keep_until } =>
-            with_repo_db(config, |db| revoke(db, account, reason, keep_until.as_deref())),
+            with_repo_db(config, |db| revoke(db, account, *reason, *keep_until)),
         SyncCommand::Grants => with_repo_db(config, grants),
         SyncCommand::Contribute { account } => with_repo_db(config, |db| contribute(db, account)),
         SyncCommand::Subscribe { account } =>
@@ -129,13 +129,12 @@ fn whoami(db: &IndexDatabase) -> anyhow::Result<()> {
     }))
 }
 
-fn grant(db: &IndexDatabase, account: &str) -> anyhow::Result<()> {
-    let grantee = cli::parse_account_id(account).map_err(anyhow::Error::msg)?;
-    let grant_id = db.sync_grant(grantee)?;
+fn grant(db: &IndexDatabase, account: &AccountIdInput) -> anyhow::Result<()> {
+    let grant_id = db.sync_grant(account.id)?;
     print_output(&serde_json::json!({
         "status": "granted",
         "repo_id": db.active_repo_id,
-        "grantee_account_id": account,
+        "grantee_account_id": account.original,
         "grant_id": grant_id,
         "role": "writer",
         "note": "the grantee may now author memories into this repo once it holds this account's log — its automatic sync pulls it when this host is in its [sync] server_peers; `sync revoke` closes it",
@@ -145,12 +144,9 @@ fn grant(db: &IndexDatabase, account: &str) -> anyhow::Result<()> {
 fn revoke(
     db: &IndexDatabase,
     account: &str,
-    reason: &str,
-    keep_until: Option<&str>,
+    reason: rag_rat_oplog::RevokeReason,
+    keep_until: Option<KeepUntil>,
 ) -> anyhow::Result<()> {
-    let keep_until = keep_until.map(KeepUntil::parse_parts).transpose()?;
-    let reason = cli::parse_revoke_reason(reason).map_err(anyhow::Error::msg)?;
-    let keep_until = keep_until.map(KeepUntil::from_parts).transpose()?;
     let (report, nodes_removed) =
         db.sync_revoke(account, reason, keep_until.map(|cut| (cut.device, cut.seq)))?;
     print_output(&serde_json::json!({
@@ -1025,8 +1021,11 @@ fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
     })
 }
 
-fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyhow::Result<()> {
-    let target = cli::parse_account_id(account_hex).map_err(anyhow::Error::msg)?;
+fn pull(
+    config: &Config,
+    target: rag_rat_oplog::AccountId,
+    peer_override: Option<&str>,
+) -> anyhow::Result<()> {
     let relay = effective_relay_url(config);
 
     // The per-database SESSION lock, held for the whole pull. Any process that opens an iroh
@@ -1445,7 +1444,11 @@ mod tests {
                 .unwrap_or_else(|err| panic!("`{hint}` must parse: {err}"));
             match cli.command {
                 Command::Sync(SyncArgs { command: SyncCommand::Pull { account, .. } }) =>
-                    assert_eq!(account, owner, "and it fetches the subscribed owner"),
+                    assert_eq!(
+                        account,
+                        rag_rat_oplog::AccountId::from_hex(&owner).unwrap(),
+                        "and it fetches the subscribed owner"
+                    ),
                 other => panic!("`{hint}` parsed as something other than a pull: {other:?}"),
             }
         }
