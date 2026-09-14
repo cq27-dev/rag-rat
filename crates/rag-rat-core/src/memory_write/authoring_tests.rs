@@ -7,7 +7,8 @@ use super::super::grants::{
     catch_up_enrolled_device_keys, enable_public_authoring, enable_sealed_authoring,
 };
 use super::super::ownership::{
-    STREAM_ACCESS_MODE_META_KEY, STREAM_SEAL_POLICY_META_KEY, owner_stream_access_mode,
+    STREAM_ACCESS_MODE_META_KEY, STREAM_SEAL_POLICY_META_KEY, access_mode_db_str,
+    access_mode_from_db_str, owner_stream_access_mode,
 };
 use super::super::reconcile::{
     ANCHOR_BACKFILL_PER_PASS, MemoryRow, backfill_memory_oplog, edge_add_op,
@@ -603,6 +604,20 @@ fn authored_durability_raises_full_then_restores_normal() {
         1,
         "the authored-durability guard must restore synchronous=NORMAL (=1) on drop"
     );
+}
+
+/// The two one-way stream intents persist as exactly these tokens, and their defaults as NO token:
+/// a `plaintext` or `private` row is not a legal encoding and must keep refusing to author.
+#[test]
+fn stream_intent_tokens_are_pinned_and_defaults_have_none() {
+    assert_eq!(StreamSealPolicy::Sealed.as_db_str(), Some("sealed"));
+    assert_eq!(StreamSealPolicy::Plaintext.as_db_str(), None);
+    assert_eq!(StreamSealPolicy::from_db_str("sealed"), Some(StreamSealPolicy::Sealed));
+    assert_eq!(StreamSealPolicy::from_db_str("plaintext"), None);
+    assert_eq!(access_mode_db_str(rag_rat_oplog::AccessMode::PublicRead), Some("public"));
+    assert_eq!(access_mode_db_str(rag_rat_oplog::AccessMode::Private), None);
+    assert_eq!(access_mode_from_db_str("public"), Some(rag_rat_oplog::AccessMode::PublicRead));
+    assert_eq!(access_mode_from_db_str("private"), None);
 }
 
 /// Both sources of signed `NodeContent` carry each column into its OWN register. `confidence` and

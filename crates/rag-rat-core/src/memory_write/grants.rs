@@ -58,7 +58,10 @@ pub(crate) fn enable_sealed_authoring(conn: &Connection, now_ms: i64) -> anyhow:
         stream_seal_policy(&tx, &repo_id, stream)? == StreamSealPolicy::Sealed,
         "sealed enable key preparation did not arm the stream ratchet"
     );
-    rag_rat_db::meta::set_repo_meta(&tx, &repo_id, STREAM_SEAL_POLICY_META_KEY, "sealed")?;
+    let sealed = StreamSealPolicy::Sealed
+        .as_db_str()
+        .context("the sealed policy always has a persisted token")?;
+    rag_rat_db::meta::set_repo_meta(&tx, &repo_id, STREAM_SEAL_POLICY_META_KEY, sealed)?;
     // Same barrier discipline as the reconcile path: settle inside this transaction so the sealed
     // re-authoring below reads completeness against a current accepted-`/3` projection.
     settle_owner_stream_in_tx(&tx, stream, now_ms)?;
@@ -123,7 +126,9 @@ pub(crate) fn enable_public_authoring(conn: &Connection, now_ms: i64) -> anyhow:
     // stream; the one-way ratchet holds even if external tooling deletes the intent row, because
     // the op-log's PublicRead StreamOwn then makes `account_is_fully_public` true and
     // re-authoring private is refused by this guard.
-    rag_rat_db::meta::set_repo_meta(&tx, &repo_id, STREAM_ACCESS_MODE_META_KEY, "public")?;
+    let public = super::ownership::access_mode_db_str(rag_rat_oplog::AccessMode::PublicRead)
+        .context("the public access mode always has a persisted token")?;
+    rag_rat_db::meta::set_repo_meta(&tx, &repo_id, STREAM_ACCESS_MODE_META_KEY, public)?;
     rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(
         &tx,
         &repo_id,
