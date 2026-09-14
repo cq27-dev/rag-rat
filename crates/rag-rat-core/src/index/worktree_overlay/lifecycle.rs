@@ -251,6 +251,7 @@ impl IndexDatabase {
             self.refresh_packages(source_root)?;
             self.resolve_overlay_edges(worktree_id)?;
             self.sync_fts()?;
+            self.bump_lens_revisions(rag_rat_db::meta::LENS_LANE_REVISION_METAS)?;
         } else if manifest_changed {
             // A dirty `Cargo.toml` with no source-row change: the base flow's manifest signal
             // refreshes the package map even with zero indexed files, and the overlay must match so
@@ -263,10 +264,6 @@ impl IndexDatabase {
             // against the OLD manifest until an unrelated source change triggers a resolve (#659
             // review).
             self.resolve_overlay_edges(worktree_id)?;
-        }
-        if counts.any_changed() {
-            self.bump_lens_revisions(rag_rat_db::meta::LENS_LANE_REVISION_METAS)?;
-        } else if manifest_changed {
             self.bump_lens_revisions(&[rag_rat_db::meta::LENS_SYMBOLS_REVISION_META])?;
         }
         Ok(())
