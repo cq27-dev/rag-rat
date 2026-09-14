@@ -722,50 +722,12 @@ fn run_maintenance_pass(
     let _lock = crate::repo_write_lock(config)?;
     tracing::debug!(target: "rag_rat_core::maintenance", phase = "lock_acquired", elapsed_ms = started.elapsed().as_millis() as u64, "write lock acquired");
 
-    // #427: the core refuses a first-time-empty registration (a post-commit/checkout hook on a repo
-    // with no `[target_bindings]` or no matching files). The hook-driven maintenance pass treats
-    // that as "nothing to index yet" and DEFERS — a later pass registers once content appears —
-    // rather than surfacing an error into the git hook. A recorded root going empty still prunes
-    // (it is not first-time, so the core does not refuse it).
-    let mut db = match IndexDatabase::index_discover_with_progress(config, render_index_progress) {
+    let mut db = match discover_or_defer(config, trigger)? {
         Ok(db) => db,
-        Err(err) if err.downcast_ref::<rag_rat_core::index::EmptyIndexRefused>().is_some() => {
-            tracing::info!(target: "rag_rat_core::maintenance", "deferred: no discoverable files (first-time empty index)");
-            return Ok(MaintenanceReport {
-                reason: Some("no discoverable files (first-time empty index)".to_owned()),
-                ..MaintenanceReport::new(trigger, HookStatus::Deferred)
-            });
-        },
-        Err(err) => return Err(err),
+        Err(report) => return Ok(*report),
     };
     tracing::debug!(target: "rag_rat_core::maintenance", phase = "index_discover", elapsed_ms = started.elapsed().as_millis() as u64, "phase complete");
-    // One-time on upgrade: re-encode any legacy f32 vector blobs to the compact int8 format (#312).
-    // Meta-gated, so this runs once and then skips the table scan cheaply on every later pass; run
-    // on the BASE index (not per-overlay) before the worktree refresh re-scopes the connection.
-    // Format-only (decode f32 → encode int8), so it's cheap — no model inference.
-    //
-    // BUDGETED, and only gets a SHARE of the budget: skipped entirely when `max_seconds == 0` (the
-    // "no embedding work" cap, mirroring `budget` below), and otherwise bounded by `started +
-    // max_seconds/2` — only HALF the window. Giving it the full window would let a multi-pass
-    // conversion consume the whole budget every pass, so `budget.next_options()` returns None and
-    // new/changed chunks go un-embedded (BM25-only) for the whole window. With the half cap the
-    // embedding reconcile always gets the rest; and `max_seconds == 1` → `max_seconds/2 == 0` → an
-    // already-expired deadline → the re-encode does nothing this pass (the embedding reconcile
-    // wins), which is correct. Resumes from the persisted cursor across passes until complete.
-    let vector_reencode = if max_seconds > 0 {
-        let deadline = started + std::time::Duration::from_secs(max_seconds / 2);
-        match db.reencode_legacy_vectors_if_needed(Some(deadline)) {
-            Ok(converted) => Some(converted),
-            Err(e) => {
-                // Don't swallow it: the gate is set only on success, so a persistent error
-                // (SQLITE_BUSY, disk full) would otherwise retry-and-fail invisibly every pass.
-                eprintln!("rag-rat: vector re-encode pass failed (will retry): {e}");
-                None
-            },
-        }
-    } else {
-        None
-    };
+    let vector_reencode = reencode_vectors_within_half_budget(&db, started, max_seconds);
     // ONE time budget for the whole pass — the per-overlay embedding reconciles AND the base
     // reconcile below — measured from `started` so discovery already counts against it. Without a
     // shared budget each overlay (each call starts its own `max_seconds` timer) plus the base could
@@ -824,57 +786,21 @@ fn run_maintenance_pass(
     // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
     // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.
     let gc_report = db.garbage_collect().ok();
-    // Clone-edge graph (#286/#473): try the cheap IN-PLACE delta first — it settles an ordinary
-    // commit's changes on this very hook pass. The FULL rebuild runs only when the delta could
-    // not settle freshness (absent generation, normalizer bump, cap crossing, huge delta, error)
-    // or the generation's accumulated df drift owes a refresh — and it stays behind the #472
-    // quiet window (shared with the watcher via per-repo meta), so a stream of commits can't
-    // treadmill full rebuilds. Best-effort + resumable across passes.
-    let clone_delta = db.apply_clone_graph_delta(rag_rat_core::index::CLONE_DELTA_MAX_FILES).ok();
-    let clone_full_rebuild_owed = match &clone_delta {
-        Some(delta)
-            if matches!(delta.status, CloneDeltaStatus::Applied | CloneDeltaStatus::Noop) =>
-            delta.full_rebuild_owed,
-        _ => true,
-    };
-    let clone_graph_report = if clone_full_rebuild_owed
-        && db
-            .clone_graph_rebuild_due(rag_rat_core::watch::CLONE_GRAPH_QUIET_MS, true)
-            .unwrap_or(false)
-    {
-        match budget.as_ref().and_then(rag_rat_core::watch::ReconcileBudget::next_options) {
-            Some(options) => db.reconcile_clone_edges_with_budget(options.max_seconds).ok(),
-            None => None,
-        }
-    } else {
-        None
-    };
+    let CloneGraphRefresh { delta: clone_delta, report: clone_graph_report } =
+        refresh_clone_graph(&db, budget.as_ref());
     // Re-anchor repo memories: post-checkout/merge/rewrite/commit are exactly when files move,
     // rename, or change, so relocate symbol/chunk bindings (or flag them) here rather than
     // leaving stale anchors until a manual memory_validate.
     let memory_validation = db.memory_validate().ok();
     tracing::debug!(target: "rag_rat_core::maintenance", phase = "gc_clone_memory", gc = gc_report.is_some(), clone_delta = clone_delta.as_ref().map_or("error", |d| d.status.as_db_str()), clone_graph = clone_graph_report.is_some(), memory_validated = memory_validation.is_some(), "post-reconcile phases complete");
-    // Remaining backlog for the ACTIVE embedding model from the CHEAP persisted counts
-    // (`status.embedding` / `status.artifacts`, #285), NOT `reconcile_plan` — which rebuilds +
-    // re-hashes EVERY chunk's embedding input (O(repo)) on every hook pass. #378 measured that plan
-    // dominating the maintenance pass (~10s on this index). Use the ACTIVE-model fields, NOT
-    // `status.fastembed`: the latter reports the FastEmbed identity when the active model is
-    // non-FastEmbed (Model2Vec / hash / embeddings-off), which would show a different model +
-    // phantom counts (PR #380 review). Only fields the cheap counts compute EXACTLY are exported;
-    // `missing`, the exact per-policy `skipped`, the failed retryable/waiting split, and the
-    // by-priority/by-policy breakdown all need the O(repo) per-chunk scan — run `reconcile --plan`
-    // (see the `remaining_backlog` comment for why `missing` in particular can't be trusted
-    // cheaply). NOTE: these counts are still UNSCOPED (all worktrees — see #360).
-    let status = db.llm_status()?;
-    let embedding = &status.embedding;
-    let artifacts = &status.artifacts;
+    let backlog = remaining_backlog(&db)?;
     tracing::info!(
         target: "rag_rat_core::maintenance",
         elapsed_ms = started.elapsed().as_millis() as u64,
-        model = %embedding.model_id,
-        current = artifacts.current,
-        stale = artifacts.stale,
-        total_chunks = artifacts.total_chunks,
+        model = %backlog.model,
+        current = backlog.current,
+        stale = backlog.stale,
+        total_chunks = backlog.total_chunks,
         "maintenance pass complete (remaining backlog is unscoped/cross-worktree, #360)"
     );
     // #573: give the git-hook write path a WAL-checkpoint owner. On a hooks/MCP-only machine (no
@@ -905,25 +831,136 @@ fn run_maintenance_pass(
             clone_graph: clone_graph_report,
             gc: gc_report,
             memory_validation,
-            remaining_backlog: BacklogSummary {
-                model: embedding.model_id.clone(),
-                current: artifacts.current,
-                stale: artifacts.stale,
-                failed: artifacts.failed,
-                blocked: artifacts.blocked,
-                total_chunks: artifacts.total_chunks,
-                // `missing` is intentionally OMITTED: `artifacts.missing` is `total - current -
-                // stale - failed - blocked` with policy-skipped chunks (generated /
-                // tiny) treated as zero, so it would report a PERMANENT backlog
-                // even after a clean reconcile (PR #380 review) — and the
-                // exact eligible-missing can't be computed without the O(repo) per-chunk scan.
-                // Coverage reads off `current`/`total_chunks`;
-                // `stale`/`failed`/`blocked` are exact remaining-work signals. The
-                // precise missing + per-policy `skipped` + by-priority breakdown live in
-                // `reconcile --plan`, along with the failed retryable/waiting split.
-            },
+            remaining_backlog: backlog,
         }),
         ..MaintenanceReport::new(trigger, HookStatus::Complete)
+    })
+}
+
+fn discover_or_defer(
+    config: &Config,
+    trigger: &str,
+) -> anyhow::Result<Result<IndexDatabase, Box<MaintenanceReport>>> {
+    // #427: the core refuses a first-time-empty registration (a post-commit/checkout hook on a repo
+    // with no `[target_bindings]` or no matching files). The hook-driven maintenance pass treats
+    // that as "nothing to index yet" and DEFERS — a later pass registers once content appears —
+    // rather than surfacing an error into the git hook. A recorded root going empty still prunes
+    // (it is not first-time, so the core does not refuse it).
+    match IndexDatabase::index_discover_with_progress(config, render_index_progress) {
+        Ok(db) => Ok(Ok(db)),
+        Err(err) if err.downcast_ref::<rag_rat_core::index::EmptyIndexRefused>().is_some() => {
+            tracing::info!(target: "rag_rat_core::maintenance", "deferred: no discoverable files (first-time empty index)");
+            Ok(Err(Box::new(MaintenanceReport {
+                reason: Some("no discoverable files (first-time empty index)".to_owned()),
+                ..MaintenanceReport::new(trigger, HookStatus::Deferred)
+            })))
+        },
+        Err(err) => Err(err),
+    }
+}
+
+fn reencode_vectors_within_half_budget(
+    db: &IndexDatabase,
+    started: Instant,
+    max_seconds: u64,
+) -> Option<usize> {
+    // One-time on upgrade: re-encode any legacy f32 vector blobs to the compact int8 format (#312).
+    // Meta-gated, so this runs once and then skips the table scan cheaply on every later pass; run
+    // on the BASE index (not per-overlay) before the worktree refresh re-scopes the connection.
+    // Format-only (decode f32 → encode int8), so it's cheap — no model inference.
+    //
+    // BUDGETED, and only gets a SHARE of the budget: skipped entirely when `max_seconds == 0` (the
+    // "no embedding work" cap, mirroring `budget` below), and otherwise bounded by `started +
+    // max_seconds/2` — only HALF the window. Giving it the full window would let a multi-pass
+    // conversion consume the whole budget every pass, so `budget.next_options()` returns None and
+    // new/changed chunks go un-embedded (BM25-only) for the whole window. With the half cap the
+    // embedding reconcile always gets the rest; and `max_seconds == 1` → `max_seconds/2 == 0` → an
+    // already-expired deadline → the re-encode does nothing this pass (the embedding reconcile
+    // wins), which is correct. Resumes from the persisted cursor across passes until complete.
+    if max_seconds > 0 {
+        let deadline = started + std::time::Duration::from_secs(max_seconds / 2);
+        match db.reencode_legacy_vectors_if_needed(Some(deadline)) {
+            Ok(converted) => Some(converted),
+            Err(e) => {
+                // Don't swallow it: the gate is set only on success, so a persistent error
+                // (SQLITE_BUSY, disk full) would otherwise retry-and-fail invisibly every pass.
+                eprintln!("rag-rat: vector re-encode pass failed (will retry): {e}");
+                None
+            },
+        }
+    } else {
+        None
+    }
+}
+
+struct CloneGraphRefresh {
+    delta: Option<rag_rat_core::index::CloneDeltaReport>,
+    report: Option<rag_rat_core::index::CloneEdgeReport>,
+}
+
+fn refresh_clone_graph(
+    db: &IndexDatabase,
+    budget: Option<&rag_rat_core::watch::ReconcileBudget>,
+) -> CloneGraphRefresh {
+    // Clone-edge graph (#286/#473): try the cheap IN-PLACE delta first — it settles an ordinary
+    // commit's changes on this very hook pass. The FULL rebuild runs only when the delta could
+    // not settle freshness (absent generation, normalizer bump, cap crossing, huge delta, error)
+    // or the generation's accumulated df drift owes a refresh — and it stays behind the #472
+    // quiet window (shared with the watcher via per-repo meta), so a stream of commits can't
+    // treadmill full rebuilds. Best-effort + resumable across passes.
+    let clone_delta = db.apply_clone_graph_delta(rag_rat_core::index::CLONE_DELTA_MAX_FILES).ok();
+    let clone_full_rebuild_owed = match &clone_delta {
+        Some(delta)
+            if matches!(delta.status, CloneDeltaStatus::Applied | CloneDeltaStatus::Noop) =>
+            delta.full_rebuild_owed,
+        _ => true,
+    };
+    let clone_graph_report = if clone_full_rebuild_owed
+        && db
+            .clone_graph_rebuild_due(rag_rat_core::watch::CLONE_GRAPH_QUIET_MS, true)
+            .unwrap_or(false)
+    {
+        match budget.and_then(rag_rat_core::watch::ReconcileBudget::next_options) {
+            Some(options) => db.reconcile_clone_edges_with_budget(options.max_seconds).ok(),
+            None => None,
+        }
+    } else {
+        None
+    };
+    CloneGraphRefresh { delta: clone_delta, report: clone_graph_report }
+}
+
+fn remaining_backlog(db: &IndexDatabase) -> anyhow::Result<BacklogSummary> {
+    // Remaining backlog for the ACTIVE embedding model from the CHEAP persisted counts
+    // (`status.embedding` / `status.artifacts`, #285), NOT `reconcile_plan` — which rebuilds +
+    // re-hashes EVERY chunk's embedding input (O(repo)) on every hook pass. #378 measured that plan
+    // dominating the maintenance pass (~10s on this index). Use the ACTIVE-model fields, NOT
+    // `status.fastembed`: the latter reports the FastEmbed identity when the active model is
+    // non-FastEmbed (Model2Vec / hash / embeddings-off), which would show a different model +
+    // phantom counts (PR #380 review). Only fields the cheap counts compute EXACTLY are exported;
+    // `missing`, the exact per-policy `skipped`, the failed retryable/waiting split, and the
+    // by-priority/by-policy breakdown all need the O(repo) per-chunk scan — run `reconcile --plan`
+    // (see the `remaining_backlog` comment for why `missing` in particular can't be trusted
+    // cheaply). NOTE: these counts are still UNSCOPED (all worktrees — see #360).
+    let status = db.llm_status()?;
+    let embedding = &status.embedding;
+    let artifacts = &status.artifacts;
+    Ok(BacklogSummary {
+        model: embedding.model_id.clone(),
+        current: artifacts.current,
+        stale: artifacts.stale,
+        failed: artifacts.failed,
+        blocked: artifacts.blocked,
+        total_chunks: artifacts.total_chunks,
+        // `missing` is intentionally OMITTED: `artifacts.missing` is `total - current -
+        // stale - failed - blocked` with policy-skipped chunks (generated /
+        // tiny) treated as zero, so it would report a PERMANENT backlog
+        // even after a clean reconcile (PR #380 review) — and the
+        // exact eligible-missing can't be computed without the O(repo) per-chunk scan.
+        // Coverage reads off `current`/`total_chunks`;
+        // `stale`/`failed`/`blocked` are exact remaining-work signals. The
+        // precise missing + per-policy `skipped` + by-priority breakdown live in
+        // `reconcile --plan`, along with the failed retryable/waiting split.
     })
 }
 
@@ -1035,6 +1072,12 @@ mod tests {
         git(&linked, &["add", "-A"]);
         git(&linked, &["commit", "-qm", "branch"]);
 
+        let sibling = root.join("sibling");
+        git(&main, &["worktree", "add", "-q", "-b", "sibling", sibling.to_str().unwrap()]);
+        std::fs::write(sibling.join("src/a.rs"), "pub fn sibling_fn() {}\n").unwrap();
+        git(&sibling, &["add", "-A"]);
+        git(&sibling, &["commit", "-qm", "sibling"]);
+
         // Run the actual CLI maintenance command (the hook entry point).
         let args = super::MaintenanceArgs {
             trigger: Some("post-merge".to_string()),
@@ -1056,6 +1099,26 @@ mod tests {
         );
 
         drop(db);
+
+        // Refresh one changed checkout again; the base and the unchanged sibling must survive.
+        std::fs::write(linked.join("src/a.rs"), "pub fn updated_linked_fn() {}\n").unwrap();
+        git(&linked, &["add", "-A"]);
+        git(&linked, &["commit", "-qm", "updated branch"]);
+        super::maintenance(&config, &args).unwrap();
+        let mut db = IndexDatabase::open_config(&config).unwrap();
+        for (checkout, expected) in
+            [(&config.root, "base_fn"), (&linked, "updated_linked_fn"), (&sibling, "sibling_fn")]
+        {
+            db.use_worktree_scope(&config.root, Some(checkout)).unwrap();
+            let names: Vec<_> =
+                db.symbols("", None, 100).unwrap().into_iter().map(|hit| hit.name).collect();
+            assert!(names.iter().any(|name| name == expected), "{checkout:?}: {names:?}");
+            for foreign in ["base_fn", "updated_linked_fn", "sibling_fn"] {
+                if foreign != expected {
+                    assert!(!names.iter().any(|name| name == foreign), "{checkout:?}: {names:?}");
+                }
+            }
+        }
     }
 
     #[test]
