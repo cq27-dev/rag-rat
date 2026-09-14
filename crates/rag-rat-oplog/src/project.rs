@@ -160,22 +160,14 @@ fn canonical_anchors(anchors: &[PortableAnchor]) -> Vec<PortableAnchor> {
 
 /// Fold entries into the converged [`ProjectedState`]. Pure, deterministic, idempotent.
 pub fn project(entries: &[Entry]) -> ProjectedState {
-    // One total order for every dimension: `(lamport, device)` ascending, then the canonical op
-    // bytes as a final tie-break so a shuffled input — even one carrying a (malformed) duplicate
-    // `(lamport, device)` — folds to byte-identical output. Walking this order ascending and
-    // overwriting each register makes the highest key win with no explicit comparison.
-    let mut ordered: Vec<(&Entry, Vec<u8>)> =
-        entries.iter().map(|entry| (entry, op::encode(&entry.op))).collect();
-    ordered.sort_by(|(a, a_bytes), (b, b_bytes)| {
-        (a.meta.lamport, a.meta.device, a_bytes).cmp(&(b.meta.lamport, b.meta.device, b_bytes))
-    });
+    let ordered = in_total_order(entries);
 
     let mut nodes: BTreeMap<NodeId, NodeAccum> = BTreeMap::new();
     let mut edges: BTreeMap<EdgeKey, EdgeAccum> = BTreeMap::new();
 
     // Dimensions are INDEPENDENT: a status op never touches content, an edge op never touches its
     // endpoints' nodes.
-    for &(entry, _) in &ordered {
+    for entry in ordered {
         match &entry.op {
             MemoryOp::NodeCreate { node_id, content } => {
                 let node = nodes.entry(node_id.clone()).or_default();
@@ -253,6 +245,32 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
         }
     }
 
+    let (live_edges, removed_edges) = split_edges(edges);
+
+    ProjectedState {
+        nodes: nodes.into_iter().filter_map(|(id, acc)| finish_node(id, acc)).collect(),
+        edges: live_edges,
+        removed_edges,
+    }
+}
+
+fn in_total_order(entries: &[Entry]) -> Vec<&Entry> {
+    // One total order for every dimension: `(lamport, device)` ascending, then the canonical op
+    // bytes as a final tie-break so a shuffled input — even one carrying a (malformed) duplicate
+    // `(lamport, device)` — folds to byte-identical output. Walking this order ascending and
+    // overwriting each register makes the highest key win with no explicit comparison.
+    let mut ordered: Vec<(&Entry, Vec<u8>)> =
+        entries.iter().map(|entry| (entry, op::encode(&entry.op))).collect();
+    ordered.sort_by(|(a, a_bytes), (b, b_bytes)| {
+        (a.meta.lamport, a.meta.device, a_bytes).cmp(&(b.meta.lamport, b.meta.device, b_bytes))
+    });
+
+    ordered.into_iter().map(|(entry, _)| entry).collect()
+}
+
+fn split_edges(
+    edges: BTreeMap<EdgeKey, EdgeAccum>,
+) -> (BTreeMap<EdgeKey, ProjectedEdge>, BTreeMap<EdgeKey, ProjectedEdge>) {
     // Split edges into live and tombstoned. `spec` is set only by an `EdgeAdd`, so `spec.is_some()`
     // means the edge was added at some point: `(present, added)` → live, `(removed, added)` →
     // tombstone, `(_, never-added)` → no row at all.
@@ -270,49 +288,44 @@ pub fn project(entries: &[Entry]) -> ProjectedState {
         }
     }
 
-    ProjectedState {
-        nodes: nodes
-            .into_iter()
-            .filter_map(|(id, acc)| {
-                // Exists iff a create was seen; existence guarantees a content register.
-                let content = acc.exists.then_some(acc.content).flatten()?;
-                let (anchors, anchors_meta) = match acc.anchors {
-                    Some((anchors, meta)) => (Some(anchors), Some(meta)),
-                    None => (None, None),
-                };
-                let source_text_hash = anchors_meta
-                    .and_then(|meta| acc.source_text_hash_by_device.get(&meta.device).cloned());
-                let anchor_scopes = anchors_meta
-                    .and_then(|meta| {
-                        let by_lamport = acc.anchor_scopes_by_device.get(&meta.device)?;
-                        // This publication's companion only: reaching back past the device's
-                        // preceding set would attach an earlier publication's scopes to a set
-                        // published without any.
-                        let preceding = acc
-                            .anchor_set_lamports_by_device
-                            .get(&meta.device)
-                            .and_then(|sets| sets.range(..meta.lamport).next_back().copied());
-                        let from = preceding.map_or(Bound::Unbounded, Bound::Excluded);
-                        by_lamport
-                            .range((from, Bound::Included(meta.lamport)))
-                            .next_back()
-                            .map(|(_, scopes)| scopes.clone())
-                    })
-                    .unwrap_or_default();
-                Some((id, ProjectedNode {
-                    content,
-                    status: acc.status.unwrap_or_default(),
-                    anchors,
-                    source_text_hash,
-                    anchor_scopes,
-                    anchors_meta,
-                    superseded_anchors: acc.superseded_anchors,
-                }))
-            })
-            .collect(),
-        edges: live_edges,
-        removed_edges,
-    }
+    (live_edges, removed_edges)
+}
+
+fn finish_node(id: NodeId, acc: NodeAccum) -> Option<(NodeId, ProjectedNode)> {
+    // Exists iff a create was seen; existence guarantees a content register.
+    let content = acc.exists.then_some(acc.content).flatten()?;
+    let (anchors, anchors_meta) = match acc.anchors {
+        Some((anchors, meta)) => (Some(anchors), Some(meta)),
+        None => (None, None),
+    };
+    let source_text_hash =
+        anchors_meta.and_then(|meta| acc.source_text_hash_by_device.get(&meta.device).cloned());
+    let anchor_scopes = anchors_meta
+        .and_then(|meta| {
+            let by_lamport = acc.anchor_scopes_by_device.get(&meta.device)?;
+            // This publication's companion only: reaching back past the device's
+            // preceding set would attach an earlier publication's scopes to a set
+            // published without any.
+            let preceding = acc
+                .anchor_set_lamports_by_device
+                .get(&meta.device)
+                .and_then(|sets| sets.range(..meta.lamport).next_back().copied());
+            let from = preceding.map_or(Bound::Unbounded, Bound::Excluded);
+            by_lamport
+                .range((from, Bound::Included(meta.lamport)))
+                .next_back()
+                .map(|(_, scopes)| scopes.clone())
+        })
+        .unwrap_or_default();
+    Some((id, ProjectedNode {
+        content,
+        status: acc.status.unwrap_or_default(),
+        anchors,
+        source_text_hash,
+        anchor_scopes,
+        anchors_meta,
+        superseded_anchors: acc.superseded_anchors,
+    }))
 }
 
 #[cfg(test)]
