@@ -121,7 +121,7 @@ pub struct SessionReport {
 pub enum SessionError {
     /// The transport failed or the peer sent an unreadable frame.
     #[error("sync session transport: {0}")]
-    Codec(CodecError),
+    Codec(#[from] CodecError),
     /// The peer opened with something other than a hello, or named a different account.
     #[error("sync session protocol violation: {0}")]
     Protocol(String),

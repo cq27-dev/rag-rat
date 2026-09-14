@@ -11,7 +11,7 @@ pub const MAX_TABLE_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 #[derive(Debug, thiserror::Error)]
 pub enum TableCodecError {
     #[error("table-sync stream io: {0}")]
-    Io(std::io::Error),
+    Io(#[from] std::io::Error),
     #[error("table-sync frame declared {0} bytes, over {max}", max = MAX_TABLE_FRAME_BYTES)]
     FrameTooLarge(u32),
     #[error(transparent)]

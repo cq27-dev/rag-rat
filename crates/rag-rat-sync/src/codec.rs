@@ -26,7 +26,7 @@ pub const MAX_FRAME_BYTES: u32 = 24 * 1024 * 1024;
 pub enum CodecError {
     /// The underlying stream failed or closed mid-frame.
     #[error("sync stream io: {0}")]
-    Io(std::io::Error),
+    Io(#[from] std::io::Error),
     /// A frame's length — declared by the peer, or of a local frame about to be written — exceeded
     /// [`MAX_FRAME_BYTES`].
     #[error("sync frame declared {0} bytes, over {max}", max = MAX_FRAME_BYTES)]
