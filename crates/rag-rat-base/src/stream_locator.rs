@@ -146,8 +146,6 @@ mod tests {
         let main = tmp.path().join("main");
         std::fs::create_dir_all(&main).unwrap();
         crate::test_git::run(&main, &["init", "-q", "."]);
-        crate::test_git::run(&main, &["config", "user.email", "t@t"]);
-        crate::test_git::run(&main, &["config", "user.name", "t"]);
         std::fs::write(main.join(STREAM_LOCATOR_FILE), format!("owner = \"{OWNER}\"\n")).unwrap();
         crate::test_git::run(&main, &["add", "-A"]);
         crate::test_git::run(&main, &["commit", "-qm", "main locator"]);

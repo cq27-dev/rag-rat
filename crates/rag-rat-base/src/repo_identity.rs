@@ -378,8 +378,6 @@ mod tests {
 
     fn init_repo(root: &Path) {
         git(root, &["init", "-q", "-b", "main"]);
-        git(root, &["config", "user.email", "t@e"]);
-        git(root, &["config", "user.name", "t"]);
     }
 
     /// All root (parentless) commit hashes reachable from HEAD, sorted — the ground truth the
