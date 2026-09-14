@@ -57,17 +57,17 @@ pub use storage::{
     content_stream_has_pending_refold, purge_legacy_lamport_violators,
     settle_pending_content_refold_for_stream_in_tx, settle_pending_content_refolds,
 };
-pub(super) use storage::{
-    ContentPromotionOutcome, accepted_chain_tails, accepted_entry_at, affected_streams_for_account,
-    finalize_affected_streams, promote_pre_verify_for_account, queue_account_changed_streams,
-};
-pub use storage::{CreatedContent, content_created_by};
+pub use storage::{ContentPromotionOutcome, CreatedContent, content_created_by};
 // The phase-D (#406) content sync read seams: offer the account's own /3 candidates to a peer
 // and dedup received ones by signed-envelope hash. Consumed by the transport crate's content
 // SyncStore, so these are plain (un-frozen) re-exports.
 pub use storage::{
     SyncContentEntry, content_entries_for_public_sync, content_entries_for_sync, content_entry_ref,
     content_signed_entry_exists, content_signed_hash,
+};
+pub(super) use storage::{
+    accepted_chain_tails, accepted_entry_at, affected_streams_for_account,
+    finalize_affected_streams, promote_pre_verify_for_account, queue_account_changed_streams,
 };
 #[cfg(test)]
 pub(super) use storage::{pre_verify_content_sweeps, reset_pre_verify_content_sweeps};

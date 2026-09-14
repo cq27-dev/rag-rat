@@ -71,10 +71,10 @@ enum PreVerifyInsert {
     AtCapacity(CapacityScope),
 }
 
-#[derive(Debug, Default, Eq, PartialEq)]
-struct PromotionOutcome {
-    scope: Option<CapacityScope>,
-    entry_hashes: Vec<AccountEntryHash>,
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct PromotionOutcome {
+    pub scope: Option<CapacityScope>,
+    pub entry_hashes: Vec<AccountEntryHash>,
 }
 
 /// The operational admission budget that prevented an otherwise valid ingest from being stored.
@@ -105,26 +105,12 @@ pub enum IngestOutcome {
     /// [`EntryStatus`] token when this refold classified it, the stored token verbatim on a
     /// redelivery (the column is unconstrained TEXT, so a token this build does not know still
     /// reports).
-    Ingested { status: String },
-    /// This entry was stored, but valid parked entries hit terminal grow-only candidate capacity.
-    /// They were removed from the unauthenticated queue; request these hashes again if capacity is
-    /// raised or storage is rebuilt under a larger operational budget.
-    IngestedWithRejectedPromotions {
+    Ingested {
         status: String,
-        scope: CapacityScope,
-        entry_hashes: Vec<AccountEntryHash>,
-    },
-    IngestedWithRejectedContentPromotions {
-        status: String,
-        scope: content::ContentCapacityScope,
-        entry_hashes: Vec<AccountEntryHash>,
-    },
-    IngestedWithRejectedAccountAndContentPromotions {
-        status: String,
-        account_scope: CapacityScope,
-        account_entry_hashes: Vec<AccountEntryHash>,
-        content_scope: content::ContentCapacityScope,
-        content_entry_hashes: Vec<AccountEntryHash>,
+        /// Parked account entries rejected at candidate capacity; retry after capacity increases.
+        account_promotions: PromotionOutcome,
+        /// Parked content entries rejected at candidate capacity; retry after capacity increases.
+        content_promotions: content::ContentPromotionOutcome,
     },
 }
 
@@ -153,7 +139,11 @@ pub fn account_ingest(
     // entire account. A different envelope for the same entry hash still follows full verification.
     if let Some(status) = stored_status_for_exact_envelope(conn, &signed.entry_hash, signed_bytes)?
     {
-        return Ok(IngestOutcome::Ingested { status });
+        return Ok(IngestOutcome::Ingested {
+            status,
+            account_promotions: PromotionOutcome::default(),
+            content_promotions: content::ContentPromotionOutcome::default(),
+        });
     }
 
     // Known-key signatures can be rejected before taking SQLite's process-wide writer lock. Stored
@@ -292,7 +282,11 @@ fn account_ingest_decoded_in_tx(
         },
         CandidateInsert::AlreadyPresent => {
             if let Some((status, _)) = entry_status(tx, &verified.entry_hash)? {
-                return Ok(IngestOutcome::Ingested { status });
+                return Ok(IngestOutcome::Ingested {
+                    status,
+                    account_promotions: PromotionOutcome::default(),
+                    content_promotions: content::ContentPromotionOutcome::default(),
+                });
             }
         },
         CandidateInsert::Inserted => {},
@@ -311,26 +305,10 @@ fn account_ingest_decoded_in_tx(
         .statuses
         .get(&verified.entry_hash)
         .map_or_else(|| "unknown".to_string(), |status| status.as_db_str().to_string());
-    Ok(match (rejected_promotions.scope, state.rejected_content_promotions.scope) {
-        (Some(account_scope), Some(content_scope)) =>
-            IngestOutcome::IngestedWithRejectedAccountAndContentPromotions {
-                status,
-                account_scope,
-                account_entry_hashes: rejected_promotions.entry_hashes,
-                content_scope,
-                content_entry_hashes: state.rejected_content_promotions.entry_hashes,
-            },
-        (Some(scope), None) => IngestOutcome::IngestedWithRejectedPromotions {
-            status,
-            scope,
-            entry_hashes: rejected_promotions.entry_hashes,
-        },
-        (None, Some(scope)) => IngestOutcome::IngestedWithRejectedContentPromotions {
-            status,
-            scope,
-            entry_hashes: state.rejected_content_promotions.entry_hashes,
-        },
-        (None, None) => IngestOutcome::Ingested { status },
+    Ok(IngestOutcome::Ingested {
+        status,
+        account_promotions: rejected_promotions,
+        content_promotions: state.rejected_content_promotions,
     })
 }
 
@@ -4597,7 +4575,11 @@ mod tests {
         let conn = db();
         let (_acct, bytes, gh) = genesis(&Dev::new(1));
         let out = account_ingest(&conn, &bytes, NOW).unwrap();
-        assert_eq!(out, IngestOutcome::Ingested { status: "accepted".into() });
+        assert_eq!(out, IngestOutcome::Ingested {
+            status: "accepted".into(),
+            account_promotions: PromotionOutcome::default(),
+            content_promotions: content::ContentPromotionOutcome::default()
+        });
         assert_eq!(status(&conn, &gh).as_deref(), Some("accepted"));
     }
 
@@ -5547,7 +5529,11 @@ mod tests {
         let (add_bytes, add_hash) =
             op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
         let out = account_ingest(&conn, &add_bytes, NOW).unwrap();
-        assert_eq!(out, IngestOutcome::Ingested { status: "accepted".into() });
+        assert_eq!(out, IngestOutcome::Ingested {
+            status: "accepted".into(),
+            account_promotions: PromotionOutcome::default(),
+            content_promotions: content::ContentPromotionOutcome::default()
+        });
         assert_eq!(status(&conn, &add_hash).as_deref(), Some("accepted"));
     }
 
@@ -5742,7 +5728,11 @@ mod tests {
         let annex = sign_account_entry(&founder.secret, &header, &manifest).unwrap();
         assert_eq!(
             account_ingest(&conn, &annex.signed_bytes, NOW + 1).unwrap(),
-            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+            IngestOutcome::Ingested {
+                status: "retained_unfolded".into(),
+                account_promotions: PromotionOutcome::default(),
+                content_promotions: content::ContentPromotionOutcome::default()
+            },
             "an annex entry is stored and retained, never folded and never rejected",
         );
 
@@ -5809,7 +5799,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             account_ingest(&conn, &forward.signed_bytes, NOW + 2).unwrap(),
-            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+            IngestOutcome::Ingested {
+                status: "retained_unfolded".into(),
+                account_promotions: PromotionOutcome::default(),
+                content_promotions: content::ContentPromotionOutcome::default()
+            },
             "an unknown annex tag is retained, never rejected",
         );
     }
@@ -5841,7 +5835,11 @@ mod tests {
         let retained = sign_account_entry(&founder.secret, &base, &[0x81, 0x01]).unwrap();
         assert_eq!(
             account_ingest(&conn, &retained.signed_bytes, NOW + 1).unwrap(),
-            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+            IngestOutcome::Ingested {
+                status: "retained_unfolded".into(),
+                account_promotions: PromotionOutcome::default(),
+                content_promotions: content::ContentPromotionOutcome::default()
+            },
         );
         // Empty the projection so the read walks the log; the stranger's answer has to get
         // past the retained entry (the founder's genesis short-circuits before it).
@@ -5922,7 +5920,11 @@ mod tests {
             let retained = sign_account_entry(&founder.secret, &header, &[0x81, 0x01]).unwrap();
             assert_eq!(
                 account_ingest(&conn, &retained.signed_bytes, NOW + 1).unwrap(),
-                IngestOutcome::Ingested { status: "retained_unfolded".into() },
+                IngestOutcome::Ingested {
+                    status: "retained_unfolded".into(),
+                    account_promotions: PromotionOutcome::default(),
+                    content_promotions: content::ContentPromotionOutcome::default()
+                },
                 "{label}: the entry is retained, never rejected — that half is the forward-compat \
                  promise and must not regress either",
             );
@@ -6011,7 +6013,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             account_ingest(&conn, &other_tag.signed_bytes, NOW + 3).unwrap(),
-            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+            IngestOutcome::Ingested {
+                status: "retained_unfolded".into(),
+                account_promotions: PromotionOutcome::default(),
+                content_promotions: content::ContentPromotionOutcome::default()
+            },
             "a sealed NON-snapshot annex entry is still retained",
         );
     }
@@ -7122,10 +7128,13 @@ mod tests {
             &device_add(&trigger_device, DeviceRole::Member),
         );
         let outcome = account_ingest(&conn, &trigger_bytes, NOW + 1).unwrap();
-        assert_eq!(outcome, IngestOutcome::IngestedWithRejectedPromotions {
+        assert_eq!(outcome, IngestOutcome::Ingested {
             status: "forked".into(),
-            scope: CapacityScope::CandidateGlobal,
-            entry_hashes: vec![pending_hash],
+            account_promotions: PromotionOutcome {
+                scope: Some(CapacityScope::CandidateGlobal),
+                entry_hashes: vec![pending_hash]
+            },
+            content_promotions: content::ContentPromotionOutcome::default(),
         },);
         assert!(!PRE_VERIFY.contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
         assert_eq!(status(&conn, &trigger_hash), Some("forked".into()));
@@ -7138,12 +7147,18 @@ mod tests {
         let founder = Dev::new(1);
         let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
         assert_eq!(account_ingest(&conn, &genesis_bytes, NOW).unwrap(), IngestOutcome::Ingested {
-            status: "accepted".into()
+            status: "accepted".into(),
+            account_promotions: PromotionOutcome::default(),
+            content_promotions: content::ContentPromotionOutcome::default(),
         },);
         seed_candidate_rows(&conn, account_id, founder.fp, 1, CANDIDATES_PER_ACCOUNT_MAX - 1);
         assert_eq!(
             account_ingest(&conn, &genesis_bytes, NOW + 1).unwrap(),
-            IngestOutcome::Ingested { status: "accepted".into() },
+            IngestOutcome::Ingested {
+                status: "accepted".into(),
+                account_promotions: PromotionOutcome::default(),
+                content_promotions: content::ContentPromotionOutcome::default()
+            },
         );
 
         let mut forged_envelope = genesis_bytes.clone();
@@ -7169,7 +7184,11 @@ mod tests {
 
         assert_eq!(
             account_ingest(&conn, &genesis_bytes, NOW + 1).unwrap(),
-            IngestOutcome::Ingested { status: "accepted".into() },
+            IngestOutcome::Ingested {
+                status: "accepted".into(),
+                account_promotions: PromotionOutcome::default(),
+                content_promotions: content::ContentPromotionOutcome::default()
+            },
         );
         assert_eq!(status(&conn, &genesis_hash), Some("accepted".into()));
     }
@@ -7188,7 +7207,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             account_ingest(&conn, &genesis_bytes, NOW + 1).unwrap(),
-            IngestOutcome::Ingested { status: "future_status".into() },
+            IngestOutcome::Ingested {
+                status: "future_status".into(),
+                account_promotions: PromotionOutcome::default(),
+                content_promotions: content::ContentPromotionOutcome::default()
+            },
         );
     }
 
@@ -7972,7 +7995,11 @@ mod tests {
         let sealed = sign_account_entry(&founder.secret, &sealed_header, &opaque).unwrap();
         assert_eq!(
             account_ingest(&conn, &sealed.signed_bytes, NOW).unwrap(),
-            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+            IngestOutcome::Ingested {
+                status: "retained_unfolded".into(),
+                account_promotions: PromotionOutcome::default(),
+                content_promotions: content::ContentPromotionOutcome::default()
+            },
         );
 
         let future_header = AccountEntryHeader {
@@ -7986,7 +8013,11 @@ mod tests {
         let future = sign_account_entry(&founder.secret, &future_header, &opaque).unwrap();
         assert_eq!(
             account_ingest(&conn, &future.signed_bytes, NOW).unwrap(),
-            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+            IngestOutcome::Ingested {
+                status: "retained_unfolded".into(),
+                account_promotions: PromotionOutcome::default(),
+                content_promotions: content::ContentPromotionOutcome::default()
+            },
         );
         assert_eq!(status(&conn, &sealed.entry_hash).as_deref(), Some("retained_unfolded"));
         assert_eq!(status(&conn, &future.entry_hash).as_deref(), Some("retained_unfolded"));
@@ -8210,7 +8241,11 @@ mod tests {
         let signed = sign_account_entry(&founder.secret, &header, &[0x80]).unwrap();
         assert_eq!(
             account_ingest(&conn, &signed.signed_bytes, NOW).unwrap(),
-            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+            IngestOutcome::Ingested {
+                status: "retained_unfolded".into(),
+                account_promotions: PromotionOutcome::default(),
+                content_promotions: content::ContentPromotionOutcome::default()
+            },
         );
     }
 

@@ -780,7 +780,11 @@ mod tests {
         // S4: the ingest-returned status is the secrets pass's verdict, not the `retained_unfolded`
         // baseline the main loop wrote.
         let outcome = ingest(&conn, &bytes);
-        assert_eq!(outcome, IngestOutcome::Ingested { status: "accepted".into() });
+        assert_eq!(outcome, IngestOutcome::Ingested {
+            status: "accepted".into(),
+            account_promotions: Default::default(),
+            content_promotions: Default::default()
+        });
         assert_eq!(status(&conn, &hash), ("accepted".to_string(), None));
         assert_eq!(accepted_flag(&conn, &hash), 1);
     }
@@ -811,7 +815,11 @@ mod tests {
         // the owner-only gate rejects it (WrongSubject → invalid_owner).
         let wrap = wrap_op(account, stream_id, &member, 0x20);
         let (bytes, hash) = wrap_entry(account, &member, 0, None, Some(genesis_hash), &wrap);
-        assert_eq!(ingest(&conn, &bytes), IngestOutcome::Ingested { status: "rejected".into() });
+        assert_eq!(ingest(&conn, &bytes), IngestOutcome::Ingested {
+            status: "rejected".into(),
+            account_promotions: Default::default(),
+            content_promotions: Default::default()
+        });
         assert_eq!(
             status(&conn, &hash),
             ("rejected".to_string(), Some("invalid_owner".to_string()))

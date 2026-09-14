@@ -70,7 +70,7 @@ pub use content::{
     content_stream_has_pending_refold, decode_content_signed, purge_legacy_lamport_violators,
     settle_pending_content_refold_for_stream_in_tx, settle_pending_content_refolds,
 };
-pub use content::{CreatedContent, content_created_by};
+pub use content::{ContentPromotionOutcome, CreatedContent, content_created_by};
 // The envelope sign/verify primitives take `&DeviceSecret`/`&DevicePublic` (`pub(crate)`
 // types), so they stay off the crate-root glob — account-internal consumers reach them through
 // `content`.
@@ -135,10 +135,10 @@ pub use secrets::{
 #[allow(unused_imports, reason = "C6 authoring seam is frozen before transport wiring lands")]
 pub use snapshot::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub use storage::{
-    CapacityScope, IngestOutcome, StreamGrantListing, SyncAccountEntry, account_effective_count,
-    account_entries_for_enrollment, account_entries_for_sync, account_entry_ref,
-    account_holds_effective_public_writer_grant, account_ingest, account_is_fully_public,
-    account_signed_entry_exists, account_signed_hash, auth_len_freshness,
+    CapacityScope, IngestOutcome, PromotionOutcome, StreamGrantListing, SyncAccountEntry,
+    account_effective_count, account_entries_for_enrollment, account_entries_for_sync,
+    account_entry_ref, account_holds_effective_public_writer_grant, account_ingest,
+    account_is_fully_public, account_signed_entry_exists, account_signed_hash, auth_len_freshness,
     backfill_authority_projection, effective_writer_grant, effective_writer_grantees,
     ever_granted_accounts, grant_effective_for_device, grant_effective_in_snapshot,
     open_writer_grants, owned_streams_for_account, owner_control_authority,

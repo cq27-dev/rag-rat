@@ -83,10 +83,10 @@ pub enum ContentIngestOutcome {
     Ingested { status: String },
 }
 
-#[derive(Debug, Default)]
-pub(in crate::account) struct ContentPromotionOutcome {
-    pub(in crate::account) scope: Option<ContentCapacityScope>,
-    pub(in crate::account) entry_hashes: Vec<AccountEntryHash>,
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ContentPromotionOutcome {
+    pub scope: Option<ContentCapacityScope>,
+    pub entry_hashes: Vec<AccountEntryHash>,
 }
 
 /// Ingest one REMOTE, untrusted `/3` content envelope: resolve its roster key, verify the
@@ -3844,14 +3844,14 @@ mod tests {
 
         let outcome =
             super::super::super::storage::account_ingest(&conn, &roster.signed_bytes, 2).unwrap();
-        assert_eq!(
-            outcome,
-            super::super::super::storage::IngestOutcome::IngestedWithRejectedContentPromotions {
-                status: "accepted".into(),
-                scope: ContentCapacityScope::CandidateAuthor,
+        assert_eq!(outcome, super::super::super::storage::IngestOutcome::Ingested {
+            status: "accepted".into(),
+            account_promotions: Default::default(),
+            content_promotions: ContentPromotionOutcome {
+                scope: Some(ContentCapacityScope::CandidateAuthor),
                 entry_hashes: vec![signed.entry_hash],
-            }
-        );
+            },
+        });
         assert_eq!(
             conn.query_row("SELECT count(*) FROM content_pre_verify", [], |row| row
                 .get::<_, i64>(0))
