@@ -8,6 +8,31 @@ use crate::{ReadChunk, SearchHit};
 
 const FULL_GRAPH_NOTE: &str = "Call graph is tree-sitter/syntactic, not compiler-resolved.";
 
+/// The edge kinds a chunk's graph summary counts and lists as calls. It is NOT the traversal's
+/// `graph::CALL_EDGE_KINDS` (`calls_name`, `constructs`, `dispatches`, `uses_operator`): this set
+/// adds `uses_macro` and leaves out the synthesized `dispatches` hop, so a chunk's `caller_count`
+/// and `find_callers` count different populations. The counts and the lists below all splice it,
+/// which is what keeps each count honest about its list.
+const GRAPH_META_CALL_EDGE_KINDS: &str =
+    "('calls_name', 'constructs', 'uses_operator', 'uses_macro')";
+
+/// A caller edge of the symbol bound as `?1`, or bound by its short name `?2`: resolved to the
+/// symbol, or unresolved with that name. `count_callers` and `callers` both splice it, so
+/// `caller_count` (and thus the `truncated` flag) counts the population the list draws from.
+const CALLER_OF_SYMBOL_OR_NAME: &str = "(edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL \
+                                        AND edges.to_name_id = (SELECT id FROM name_strings WHERE \
+                                        value = ?2)))";
+
+/// The callees a chunk's summary surfaces: unresolved name-only calls resolve to nothing in-repo
+/// and are pure noise there, so they are dropped, while a call may retain a qualified syntactic
+/// target. (Operator declarations must resolve to an indexed symbol — the separate
+/// `RESOLVED_OPERATOR_ONLY` guard.) `count_callees` and `callees` both splice it, so
+/// `callee_count` (and thus the `truncated` flag) reflects the callees actually surfaced. Valid
+/// wherever the edges table is named or aliased `edges`.
+const SURFACED_CALLEE_ONLY: &str = "(edges.edge_kind != 'calls_name' OR edges.to_symbol_id IS NOT \
+                                    NULL OR (edges.confidence = 'Syntactic' AND \
+                                    edges.target_qualified_name IS NOT NULL))";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphMetaMode {
     None,
@@ -261,10 +286,9 @@ fn count_callers(conn: &Connection, symbol: &PrimarySymbol) -> anyhow::Result<u6
         SELECT COUNT(DISTINCT COALESCE(edges.from_symbol_id, -edges.id))
         FROM edges
         JOIN files source_files ON source_files.id = edges.source_file_id
-        WHERE edges.edge_kind IN ('calls_name', 'constructs', 'uses_operator', 'uses_macro')
+        WHERE edges.edge_kind IN {GRAPH_META_CALL_EDGE_KINDS}
           AND {RESOLVED_OPERATOR_ONLY}
-          AND (edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL AND edges.to_name_id = \
-             (SELECT id FROM name_strings WHERE value = ?2)))
+          AND {CALLER_OF_SYMBOL_OR_NAME}
         ",
         ))?
         .query_row(params![symbol.id, symbol.name], |row| row.get::<_, i64>(0))?;
@@ -272,20 +296,17 @@ fn count_callers(conn: &Connection, symbol: &PrimarySymbol) -> anyhow::Result<u6
 }
 
 fn count_callees(conn: &Connection, symbol_id: i64) -> anyhow::Result<u64> {
-    // Mirror the filter in `callees()` so `callee_count` (and thus the `truncated` flag) reflects
-    // the callees actually surfaced — not the unresolved name-only std calls we hide.
+    // The kind set and filters `callees()` splices, so `callee_count` (and thus the `truncated`
+    // flag) reflects the callees actually surfaced — not the unresolved name-only std calls we
+    // hide.
     let count = conn
         .prepare_cached(&format!(
             "
         SELECT COUNT(DISTINCT COALESCE(CAST(to_symbol_id AS TEXT), to_name))
         FROM edges
         WHERE from_symbol_id = ?1
-          AND edge_kind IN ('calls_name', 'constructs', 'uses_operator', 'uses_macro')
-          AND (
-              edge_kind != 'calls_name'
-              OR to_symbol_id IS NOT NULL
-              OR (confidence = 'Syntactic' AND target_qualified_name IS NOT NULL)
-          )
+          AND edge_kind IN {GRAPH_META_CALL_EDGE_KINDS}
+          AND {SURFACED_CALLEE_ONLY}
           AND {RESOLVED_OPERATOR_ONLY}
         ",
         ))?
@@ -367,10 +388,9 @@ fn callers(
         LEFT JOIN chunks source_chunks ON source_chunks.file_id = edges.source_file_id
           AND source_symbols.start_byte >= source_chunks.start_byte
           AND source_symbols.start_byte < source_chunks.end_byte
-        WHERE edges.edge_kind IN ('calls_name', 'constructs', 'uses_operator', 'uses_macro')
+        WHERE edges.edge_kind IN {GRAPH_META_CALL_EDGE_KINDS}
           AND {RESOLVED_OPERATOR_ONLY}
-          AND (edges.to_symbol_id = ?1 OR (edges.to_symbol_id IS NULL AND edges.to_name_id = \
-         (SELECT id FROM name_strings WHERE value = ?2)))
+          AND {CALLER_OF_SYMBOL_OR_NAME}
         ORDER BY
           {CONFIDENCE_ORDER_SQL},
           source_files.path,
@@ -432,15 +452,8 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
           AND source_symbols.start_byte >= source_chunks.start_byte
           AND source_symbols.start_byte < source_chunks.end_byte
         WHERE edges.from_symbol_id = ?1
-          AND edges.edge_kind IN ('calls_name', 'constructs', 'uses_operator', 'uses_macro')
-          -- Drop unresolved name-only calls and operator declarations: they resolve to nothing
-          -- in-repo and are pure noise in a chunk's callee summary. Calls may retain qualified
-          -- syntactic targets; operator declarations must resolve to an indexed symbol.
-          AND (
-              edges.edge_kind != 'calls_name'
-              OR edges.to_symbol_id IS NOT NULL
-              OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT NULL)
-          )
+          AND edges.edge_kind IN {GRAPH_META_CALL_EDGE_KINDS}
+          AND {SURFACED_CALLEE_ONLY}
           AND {RESOLVED_OPERATOR_ONLY}
         ORDER BY
           {CONFIDENCE_ORDER_SQL},
@@ -567,4 +580,128 @@ fn collect_rows<T>(
         out.push(row?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use rag_rat_base::checkout::CheckoutRef;
+    use rag_rat_core::index::install_scope_view;
+    use rag_rat_db::schema;
+
+    use super::*;
+
+    const SCOPE: CheckoutRef<'static> = CheckoutRef { commit_sha: "c0ffee", worktree_id: "" };
+
+    fn add_symbol(conn: &Connection, file_id: i64, name: &str) -> i64 {
+        let qualified = format!("a.rs::{name}");
+        conn.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", [&qualified])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte,
+                                 end_byte, signature, docs)
+             VALUES (?1, 'rust', ?2, (SELECT id FROM name_strings WHERE value = ?3),
+                     'function', 0, 10, NULL, NULL)",
+            params![file_id, name, qualified],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// One `edge_kind` edge at a distinct call-site span; `to` NULL is the unresolved case, which
+    /// only its `to_name` can match.
+    fn add_edge(
+        conn: &Connection,
+        file_id: i64,
+        from: i64,
+        to: Option<i64>,
+        to_name: &str,
+        edge_kind: &str,
+        span: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, from_symbol_id, to_symbol_id, to_name,
+                               target_qualified_name, edge_kind, confidence,
+                               source_start_byte, source_end_byte,
+                               callee_start_byte, callee_end_byte)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8, ?7, ?8)",
+            params![
+                file_id,
+                from,
+                to,
+                to_name,
+                edge_kind,
+                if to.is_some() { "Exact" } else { "NameOnly" },
+                span,
+                span + 5,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn primary(id: i64, name: &str) -> PrimarySymbol {
+        PrimarySymbol {
+            id,
+            name: name.to_string(),
+            public: GraphSymbol {
+                id,
+                name: name.to_string(),
+                qualified_name: format!("a.rs::{name}"),
+                kind: "function".to_string(),
+                symbol_path: format!("a.rs::{name}"),
+            },
+        }
+    }
+
+    /// A chunk's `caller_count` / `callee_count` decide its `truncated` flags, so each must count
+    /// exactly the population its list draws from. Every call kind contributes an admitted edge,
+    /// and the filtered ones cover each exclusion — an unresolved name-only call, an unresolved
+    /// (built-in) operator, and a `dispatches` hop outside the summary's kind set.
+    #[test]
+    fn caller_and_callee_counts_agree_with_their_lists() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn, &rag_rat_core::index::migration_hooks()).unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms,
+                               commit_sha, worktree_id)
+             VALUES ('a.rs', 'rust', 'source', 'sha', 0, 0, 'c0ffee', '')",
+            [],
+        )
+        .unwrap();
+        let file = conn.last_insert_rowid();
+        let [focus, called, built, operator, dispatched] =
+            ["focus", "called", "built", "operator", "dispatched"]
+                .map(|name| add_symbol(&conn, file, name));
+        add_edge(&conn, file, focus, Some(called), "called", "calls_name", 10);
+        add_edge(&conn, file, focus, None, "unbound", "calls_name", 20);
+        add_edge(&conn, file, focus, Some(built), "built", "constructs", 30);
+        add_edge(&conn, file, focus, Some(operator), "operator", "uses_operator", 40);
+        add_edge(&conn, file, focus, None, "+", "uses_operator", 50);
+        add_edge(&conn, file, focus, None, "println", "uses_macro", 60);
+        add_edge(&conn, file, focus, Some(dispatched), "dispatched", "dispatches", 70);
+
+        let [target, by_call, by_name, by_macro, by_operator, by_dispatch] =
+            ["target", "by_call", "by_name", "by_macro", "by_operator", "by_dispatch"]
+                .map(|name| add_symbol(&conn, file, name));
+        add_edge(&conn, file, by_call, Some(target), "target", "calls_name", 110);
+        add_edge(&conn, file, by_name, None, "target", "constructs", 120);
+        add_edge(&conn, file, by_macro, None, "target", "uses_macro", 130);
+        add_edge(&conn, file, by_operator, None, "target", "uses_operator", 140);
+        add_edge(&conn, file, by_dispatch, Some(target), "target", "dispatches", 150);
+        install_scope_view(&conn, SCOPE).unwrap();
+
+        let callee_list = callees(&conn, focus, 100).unwrap();
+        let mut surfaced =
+            callee_list.iter().map(|callee| callee.target.as_str()).collect::<Vec<_>>();
+        surfaced.sort_unstable();
+        assert_eq!(surfaced, ["built", "called", "operator", "println"]);
+        assert_eq!(count_callees(&conn, focus).unwrap(), 4);
+
+        let target = primary(target, "target");
+        let caller_list = callers(&conn, &target, 100).unwrap();
+        let mut sources =
+            caller_list.iter().map(|caller| caller.symbol_path.as_str()).collect::<Vec<_>>();
+        sources.sort_unstable();
+        assert_eq!(sources, ["a.rs::by_call", "a.rs::by_macro", "a.rs::by_name"]);
+        assert_eq!(count_callers(&conn, &target).unwrap(), 3);
+    }
 }
