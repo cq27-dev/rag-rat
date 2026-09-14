@@ -975,7 +975,7 @@ async fn pulling_a_contributors_account_lands_its_memory_in_the_owners_repo() {
     )
     .unwrap();
     let effects = crate::drain_synced_memory(&owner).unwrap();
-    assert!(effects.nodes_written >= 1, "the memory materialized: {effects:?}");
+    assert!(effects.nodes_written >= 1, "the memory materialized");
     let title: String = owner
         .query_row("SELECT title FROM repo_memories WHERE repo_id = 'repo-a'", [], |row| row.get(0))
         .unwrap();
