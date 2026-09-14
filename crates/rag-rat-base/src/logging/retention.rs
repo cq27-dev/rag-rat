@@ -92,8 +92,8 @@ pub(super) fn sweep_retention(log: &LogConfig) {
 /// The pid of a rag-rat per-process log named `<role>-<pid>-<start_ms>.log` (`role` may itself
 /// contain `-`, e.g. `cli-reconcile`). Returns `None` for any file that is not one of ours — the
 /// naming filter that keeps the sweep off unrelated `*.log` files.
-fn rag_rat_log_pid(name: &str) -> Option<u32> {
-    if !(name.starts_with("mcp-") || name.starts_with("hook-") || name.starts_with("cli-")) {
+pub(super) fn rag_rat_log_pid(name: &str) -> Option<u32> {
+    if !super::Role::owns_log_name(name) {
         return None;
     }
     let stem = name.strip_suffix(".log")?;
