@@ -16,11 +16,6 @@ pub(crate) fn discover_and_store_refs(
     for parsed in parse_tracker_refs(&branch, &ctx.trackers) {
         refs.push(parsed.into_ref(RefSourceKind::Branch, None, None, branch.clone()));
     }
-    if ctx.trackers.is_empty() {
-        for parsed in parse_refs(&branch, None) {
-            refs.push(parsed.into_ref(RefSourceKind::Branch, None, None, branch.clone()));
-        }
-    }
     let mut unique = BTreeSet::new();
     // Collapse duplicates keeping the STRONGEST claim per identity: one commit body saying
     // "Refs #5. Fixes #5" must dedupe to the CLOSING ref, or the closer is silently dropped
@@ -210,16 +205,6 @@ pub(crate) fn discover_commit_refs(
                     text.clone(),
                 ));
             }
-            if trackers.is_empty() {
-                for parsed in parse_refs(&text, None) {
-                    out.push(parsed.into_ref(
-                        RefSourceKind::Commit,
-                        None,
-                        Some(hash.clone()),
-                        text.clone(),
-                    ));
-                }
-            }
         }
     }
     Ok(())
@@ -245,16 +230,6 @@ pub(crate) fn discover_file_refs(
                     None,
                     line.trim().to_string(),
                 ));
-            }
-            if trackers.is_empty() {
-                for parsed in parse_refs(line, None) {
-                    out.push(parsed.into_ref(
-                        RefSourceKind::File,
-                        Some(path.clone()),
-                        None,
-                        line.trim().to_string(),
-                    ));
-                }
             }
         }
     }
