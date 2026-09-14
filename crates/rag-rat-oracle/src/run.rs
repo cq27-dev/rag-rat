@@ -196,11 +196,11 @@ pub(crate) fn run_in_tx(
             continue;
         };
 
-        // Call-site drift gates (#82 / #83): the disk bytes, the indexed callee range, and the
-        // production and pre-spawn snapshots must all describe the same document — see
-        // `DriftGates::call_site_is_pinned`. A drifted document is skipped and tallied, never
-        // joined across mismatched coordinate spaces.
-        if !gates.call_site_is_pinned(&candidate.source_path, &candidate.file_sha) {
+        // Call-site drift gates (#82 / #83): the candidate's callee range was recorded against
+        // `file_sha`, so the document must be pinned to it — see `DriftGates::is_pinned`. A
+        // drifted document is skipped and tallied, never joined across mismatched coordinate
+        // spaces.
+        if !gates.is_pinned(&candidate.source_path, &candidate.file_sha) {
             report.skipped_drifted += 1;
             drifted_paths.insert(candidate.source_path.clone());
             continue;
@@ -326,124 +326,67 @@ struct DriftGates<'a> {
 }
 
 impl DriftGates<'_> {
+    /// The one TOCTOU rule every drift gate applies: `path` is pinned to `indexed` — the indexed
+    /// content the ranges or spans the join maps onto were recorded against — when
+    ///
+    /// - **index-vs-disk**: its disk bytes, which the `.scip` offsets were converted against, ARE
+    ///   `indexed`. If they disagree the file drifted between the index build and now, and joining
+    ///   the two byte spaces yields a silently-wrong verdict. A file with no computed hash
+    ///   (unreadable) produced no occurrences and is never pinned.
+    /// - **scip-vs-disk** (#82): for a tool-driven run, the disk hash captured at production still
+    ///   matches disk. Index-vs-disk alone cannot see a document the watcher reindexed in the
+    ///   lock-free window after the tool built the `.scip` against the OLD content — the index and
+    ///   the disk are then both the NEW content.
+    /// - **pre-spawn** (#83): for a tool-driven run, `indexed` still equals the snapshot taken
+    ///   BEFORE the spawn. The two post-exit legs cannot see inside the subprocess: a file edited
+    ///   mid-run and reindexed before the join leaves all three hashes on the NEW content while the
+    ///   `.scip` describes the old bytes; this leg asserts no reindex across the whole spawn → join
+    ///   window.
+    ///
+    /// A pre-built `--scip` has neither snapshot, so only the index-vs-disk leg applies to it.
+    fn is_pinned(&self, path: &str, indexed: &str) -> bool {
+        let disk = self.disk(path);
+        disk == Some(indexed) && self.snapshots_pinned(path, disk, Some(indexed))
+    }
+
+    /// The two tool-driven legs of [`Self::is_pinned`], on their own: the production snapshot
+    /// names `disk` and the pre-spawn snapshot names `indexed`. Vacuous for a pre-built `--scip`.
+    fn snapshots_pinned(&self, path: &str, disk: Option<&str>, indexed: Option<&str>) -> bool {
+        self.production_sha
+            .is_none_or(|production| production.get(path).map(String::as_str) == disk)
+            && self
+                .pre_spawn_sha
+                .is_none_or(|pre_spawn| pre_spawn.get(path).map(String::as_str) == indexed)
+    }
+
     fn disk(&self, path: &str) -> Option<&str> {
         self.disk_sha.get(path).map(String::as_str)
     }
 
-    /// Whether a candidate's CALL-SITE document is pinned: its disk bytes are the indexed
-    /// `file_sha` its callee range was recorded against and, for a tool-driven run, also the
-    /// production and pre-spawn snapshots.
-    fn call_site_is_pinned(&self, path: &str, file_sha: &str) -> bool {
-        let disk = self.disk(path);
-        // Content-integrity gate (finding 2): the occurrence byte ranges in `occurrences` were
-        // derived from the document's CURRENT disk bytes, but this candidate's callee byte range
-        // was recorded against `file_sha` (the indexed content). If those disagree, the file
-        // drifted between the index build and now — joining the two byte spaces yields a
-        // silently-wrong verdict. Skip the candidate and tally it as drifted so `eval` can
-        // warn. A file with no computed hash (unreadable) already produced no occurrences,
-        // so it never reaches here.
-        if disk != Some(file_sha) {
-            return false;
-        }
-
-        // scip-vs-disk gate (#82 TOCTOU): the index-vs-disk check above only proves the EDGE and
-        // the disk agree — both could be the NEW content the watcher reindexed in the
-        // lock-free window after the tool built the `.scip` against the OLD content. For a
-        // tool-driven run we also hold the disk hash captured at production time; require
-        // it to still match disk, so the `.scip`'s occurrence offsets describe the very
-        // bytes the join reads. A drifted document is skipped (tallied as drifted), exactly
-        // like index-vs-disk drift. A pre-built `--scip` (`production_sha == None`) has no
-        // production moment to pin, so it keeps the index-vs-disk gate only.
-        if let Some(production_sha) = self.production_sha
-            && production_sha.get(path).map(String::as_str) != disk
-        {
-            return false;
-        }
-
-        // Pre-spawn gate, CALL-SITE side (#83): the two gates above only prove the edge, the
-        // disk, and the post-exit production snapshot agree — all three can be the NEW content
-        // when a file was edited DURING the subprocess and the watcher reindexed it before the
-        // join, while the `.scip` still describes the old bytes. Requiring the join-time indexed
-        // sha (`candidate.file_sha`) to equal the snapshot taken BEFORE the spawn asserts no
-        // reindex happened across the entire spawn → join window.
-        if let Some(pre_spawn) = self.pre_spawn_sha
-            && pre_spawn.get(path).map(String::as_str) != Some(file_sha)
-        {
-            return false;
-        }
-        true
+    fn indexed(&self, path: &str) -> Option<&str> {
+        self.indexed_shas.get(path).map(String::as_str)
     }
 
-    /// Whether a verdict's DEFINITION document is pinned: an indexed def document's disk bytes
-    /// are still its indexed content, the production snapshot still matches the disk bytes the
-    /// def offsets were converted against, and the pre-spawn snapshot the indexed sha the def
-    /// maps onto.
+    /// Whether a verdict's DEFINITION document is pinned. The resolved symbol comes from
+    /// converting the `.scip` def occurrence's offsets against the def file's disk bytes and
+    /// mapping that range onto its indexed symbol spans, so a def file drifted or reindexed in
+    /// the window resolves the wrong symbol (a mis-targeted `Upgrade`/`Contradict`, or a false
+    /// external) — an indexed def document is held to the full [`Self::is_pinned`] rule.
+    ///
+    /// A def document this checkout does NOT index maps onto no spans at all (the verdict is
+    /// external), so it has no indexed content to drift from and keeps only the snapshot legs:
+    /// requiring index-vs-disk there would reclassify every such external verdict as drifted.
     fn definition_is_pinned(&self, def_path: &str) -> bool {
-        // Index-vs-disk gate, DEFINITION side: the def occurrence's offsets were converted against
-        // the def file's disk bytes and are then mapped onto its INDEXED symbol spans, so the two
-        // must describe the same content — the check the moniker pass and the live pass make on
-        // the same documents. It is the only def-side gate a pre-built `--scip` has (both
-        // snapshots are `None` there). A def document this checkout does not index maps onto no
-        // spans at all (the verdict is external), so there is no indexed coordinate space for it
-        // to drift from.
-        if let Some(indexed) = self.indexed_shas.get(def_path)
-            && self.disk(def_path) != Some(indexed.as_str())
-        {
-            return false;
+        match self.indexed(def_path) {
+            Some(indexed) => self.is_pinned(def_path, indexed),
+            None => self.snapshots_pinned(def_path, self.disk(def_path), None),
         }
-
-        // scip-vs-disk gate, DEFINITION side (#82 TOCTOU, def-document variant). The call-site gate
-        // above only pins the document the occurrence lives in. But an in-corpus verdict also
-        // depends on the DEFINITION document: the resolved symbol comes from converting the `.scip`
-        // def occurrence's offsets against the def file's join-time disk bytes, then mapping that
-        // byte range to a current indexed symbol. If the watcher reindexed the DEF file in the
-        // lock-free window, that conversion lands on the wrong bytes and resolves the wrong symbol
-        // (a mis-targeted `Upgrade`/`Contradict`, or a false external when it maps to
-        // nothing). Pin the def document the same way — its hash is already in the
-        // production snapshot. An external symbol with no in-corpus definition entry has no
-        // def document to pin, so it's unaffected.
-        if let Some(production_sha) = self.production_sha
-            && production_sha.get(def_path).map(String::as_str) != self.disk(def_path)
-        {
-            return false;
-        }
-
-        // Pre-spawn gate, DEFINITION side (#83): the same mid-subprocess hole applies to the
-        // resolved symbol's defining document — a def file edited during the subprocess and
-        // reindexed before the join resolves the byte-converted def range against the wrong
-        // symbol while every post-exit gate passes. The join-time indexed sha of the def file
-        // must equal the pre-spawn snapshot.
-        if let Some(pre_spawn) = self.pre_spawn_sha
-            && pre_spawn.get(def_path).map(String::as_str)
-                != self.indexed_shas.get(def_path).map(String::as_str)
-        {
-            return false;
-        }
-        true
     }
 
-    /// The moniker pass's definition gate, on its own operands: the indexed spans the moniker
-    /// maps against must match the disk bytes directly, and both snapshots are compared to disk.
+    /// The moniker pass's definition gate: the moniker is anchored to an indexed symbol, so an
+    /// unindexed def document is never pinned.
     fn moniker_definition_is_pinned(&self, def_path: &str) -> bool {
-        let disk = self.disk(def_path);
-        if disk.is_none() || self.indexed_shas.get(def_path).map(String::as_str) != disk {
-            return false;
-        }
-        if let Some(production_sha) = self.production_sha
-            && production_sha.get(def_path).map(String::as_str) != disk
-        {
-            return false;
-        }
-        // Pre-spawn gate (#83): same mid-subprocess discipline as the verdict join — a def file
-        // reindexed during the subprocess maps the moniker to the wrong symbol while every
-        // post-exit gate passes. (`disk` equals the join-time indexed sha here, per the first
-        // check above.)
-        if let Some(pre_spawn) = self.pre_spawn_sha
-            && pre_spawn.get(def_path).map(String::as_str) != disk
-        {
-            return false;
-        }
-        true
+        self.indexed(def_path).is_some_and(|indexed| self.is_pinned(def_path, indexed))
     }
 }
 
