@@ -1,7 +1,8 @@
 //! The binding-scoped HTTP client: async `reqwest` over rustls, driven through the rate governor
-//! on every request. Provider-neutral — URL building, pagination, and payload mapping stay in the
-//! per-provider clients built on top; this layer owns admission, quota-header recording,
-//! `429`/`Retry-After` backoff, and the sync pass's wall-clock cap.
+//! on every request. URL building, pagination, and payload mapping stay in the per-provider
+//! clients built on top; this layer owns admission, quota-header recording, `429`/`Retry-After`
+//! backoff, the sync pass's wall-clock cap, and each provider's quota quirks — declared once as
+//! data in [`ProviderQuirks`], never as provider tests in the request loop.
 
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -120,7 +121,7 @@ pub(crate) struct Transport {
     /// stay inside it.
     bound_host: String,
     bound_port: Option<u16>,
-    is_github: bool,
+    quirks: ProviderQuirks,
     pass_deadline_ms: i64,
     request_timeout_ms: i64,
     backoff_base_ms: i64,
@@ -183,7 +184,7 @@ impl Transport {
             auth_header,
             bound_host,
             bound_port,
-            is_github: params.provider.eq_ignore_ascii_case("github"),
+            quirks: quirks_for(params.provider),
             pass_deadline_ms,
             request_timeout_ms: i64::try_from(params.options.request_timeout_s)
                 .unwrap_or(i64::MAX)
@@ -269,7 +270,7 @@ impl Transport {
             // Drain the body on every path — a rate-limited reply carries one too, and leaving
             // it unread can abort the connection.
             let body = response.text().await?;
-            let conditional_not_modified = self.is_github
+            let conditional_not_modified = self.quirks.conditional_304_is_free
                 && self.auth_header.is_some()
                 && status == 304
                 && extra_headers
@@ -278,20 +279,24 @@ impl Transport {
             if conditional_not_modified {
                 self.governor.refund_admission();
             }
-            let github_secondary = self.is_github && is_github_secondary_limit(status, &body);
-            if !is_rate_limited(status, &headers, now) && !github_secondary {
+            let secondary_limited =
+                self.quirks.secondary_limit.is_some_and(|is_secondary| is_secondary(status, &body));
+            if !is_rate_limited(status, &headers, now) && !secondary_limited {
                 return Ok(TransportResponse { status, headers, body });
             }
             let retry_after_ms =
-                retry_after_ms(&headers, now).or_else(|| github_secondary.then_some(60_000));
+                retry_after_ms(&headers, now).or_else(|| secondary_limited.then_some(60_000));
             let delay_ms = backoff_delay_ms(attempt, retry_after_ms, self.backoff_base_ms);
             attempt += 1;
             let resume_at_ms = now.saturating_add(delay_ms);
-            // GitHub secondary/abuse limits cover REST as a whole, while primary quota windows
-            // remain lane-specific. Other providers retain the conservative lane-local hold.
-            let shared_github_hold = self.is_github
-                && (github_secondary || status == 429 || headers.contains_key(header::RETRY_AFTER));
-            if shared_github_hold {
+            // Where the provider declares it, secondary limits and 429/Retry-After holds cover
+            // every lane of the (provider, host, token) while primary quota windows
+            // stay lane-specific; otherwise the conservative lane-local hold applies.
+            let hold_spans_lanes = self.quirks.retry_hold_spans_lanes
+                && (secondary_limited
+                    || status == 429
+                    || headers.contains_key(header::RETRY_AFTER));
+            if hold_spans_lanes {
                 self.retry_hold.record(resume_at_ms);
             } else {
                 self.governor.record_hold(resume_at_ms);
@@ -404,7 +409,8 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
 
 /// Whether a response is a rate-limit signal. `429` always; GitHub reports its primary limit as
 /// `403` + `x-ratelimit-remaining: 0` and its secondary limits as `403` + `Retry-After`, so
-/// those count too — still pure header semantics, no provider branching.
+/// those count too. Pure header semantics — a limit recognizable only from the body is a
+/// [`ProviderQuirks::secondary_limit`].
 fn is_rate_limited(status: u16, headers: &HeaderMap, now_ms: i64) -> bool {
     match status {
         429 => true,
@@ -413,6 +419,43 @@ fn is_rate_limited(status: u16, headers: &HeaderMap, now_ms: i64) -> bool {
                 || QuotaSnapshot::from_headers(headers, now_ms)
                     .is_some_and(|quota| quota.remaining == 0),
         _ => false,
+    }
+}
+
+/// Provider quota behavior the transport honors, resolved once per binding by [`quirks_for`] —
+/// the only place the provider id is inspected. Each field names WHAT differs, so a new provider
+/// declares its quirks here instead of adding a provider test to the request loop.
+#[derive(Debug, Clone, Copy)]
+struct ProviderQuirks {
+    /// An authenticated conditional request answered `304 Not Modified` costs no quota, so its
+    /// governor admission is refunded.
+    conditional_304_is_free: bool,
+    /// Recognizes a secondary / abuse rate limit from the reply's status and body; such a reply
+    /// backs off like a primary limit (60 s when it carries no `Retry-After`).
+    secondary_limit: Option<fn(u16, &str) -> bool>,
+    /// Retry holds (secondary limits, `429`, `Retry-After`) apply to every quota lane of the
+    /// binding's (provider, host, token), not only the lane that saw them.
+    retry_hold_spans_lanes: bool,
+}
+
+impl ProviderQuirks {
+    const GITHUB: Self = Self {
+        conditional_304_is_free: true,
+        secondary_limit: Some(is_github_secondary_limit),
+        retry_hold_spans_lanes: true,
+    };
+    const GENERIC: Self = Self {
+        conditional_304_is_free: false,
+        secondary_limit: None,
+        retry_hold_spans_lanes: false,
+    };
+}
+
+fn quirks_for(provider: &str) -> ProviderQuirks {
+    if provider.eq_ignore_ascii_case("github") {
+        ProviderQuirks::GITHUB
+    } else {
+        ProviderQuirks::GENERIC
     }
 }
 
