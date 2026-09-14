@@ -27,16 +27,20 @@ pub(crate) const ALIGN_AGGREGATE_CELLS_BUDGET: u64 = 100_000_000;
 /// re-descent). Threaded by `&mut` so the parent [`align_to_anchor`] and each
 /// [`emit_matched_statement_redescent`] recursion draw from the SAME budget.
 ///
-/// Each lane charges `|anchor.seq| · |member.seq|` BEFORE an exact `lcs_align`; once the cumulative
-/// charge exceeds the budget, [`Self::is_exhausted`] latches and every subsequent member /
-/// statement takes the skip-and-sample path instead of running exact DP. The cutover is consumed in
-/// the existing deterministic member/statement order, so the truncation point — and therefore the
-/// whole degraded output — is byte-identical for a given class.
+/// The latch is `spent > budget`: `spent` only ever grows and nothing charges an exhausted budget,
+/// so once a charge crosses the cap every later check sees it exhausted. Two lanes, two
+/// disciplines, both owned here:
+/// - the fidelity lane ([`align::class_fidelity`]) checks [`Self::is_exhausted`] and then
+///   [`Self::charge_and_run`]s the pair — the pair that crosses the cap still runs exactly;
+/// - the template lane asks [`Self::reserve`] "may I run this member?" — the member whose charge
+///   crosses the cap is skipped, and an exhausted budget is never charged again.
 ///
-/// The fidelity lane ([`align::class_fidelity`]) draws from its own instance the same way, so both
-/// LCS lanes share one check-after-charge discipline.
+/// Either way `spent` exceeds the cap by at most one pair. The cutover is consumed in the existing
+/// deterministic member/statement order, so the truncation point — and therefore the whole
+/// degraded output — is byte-identical for a given class.
 pub(crate) struct CellBudget {
-    /// Cumulative `Σ |a|·|b|` charged over the exact `lcs_align` calls run so far.
+    /// Cumulative `Σ |a|·|b|` charged so far: every exact `lcs_align` run, plus (template lane
+    /// only) the one member whose charge crossed the cap.
     spent: u64,
     /// The cap; `spent > budget` means exhausted.
     budget: u64,
@@ -61,8 +65,8 @@ impl CellBudget {
     }
 
     /// Decrement the shared allowance by everything this class charged. `spent` can exceed the
-    /// per-class cap by at most "one pair" (charge-then-check), but never the global remaining
-    /// beyond saturation, so subsequent classes correctly see a smaller (or zero) allowance.
+    /// per-class cap by at most one pair, but never the global remaining beyond saturation, so
+    /// subsequent classes correctly see a smaller (or zero) allowance.
     pub(crate) fn settle(self, remaining: &mut u64) {
         *remaining = remaining.saturating_sub(self.spent);
     }
@@ -71,14 +75,26 @@ impl CellBudget {
         self.spent
     }
 
-    /// `true` once `spent` has exceeded the cap. Latches: `spent` only grows.
     pub(crate) fn is_exhausted(&self) -> bool {
         self.spent > self.budget
     }
 
-    /// Charge `cells` against the budget BEFORE running the exact DP. A pair already charged still
-    /// runs exactly (the bound is "budget + one pair").
+    /// Charge `cells` for an exact DP the caller runs regardless (it checked
+    /// [`Self::is_exhausted`] first). The pair that crosses the cap still runs, so the bound is
+    /// "budget + one pair".
     pub(crate) fn charge_and_run(&mut self, cells: u64) {
         self.spent = self.spent.saturating_add(cells);
+    }
+
+    /// May the caller run an exact DP of `cells`? An exhausted budget answers `false` WITHOUT
+    /// charging, so skipped work never drains the shared allowance. Otherwise `cells` is charged
+    /// and the answer is whether the budget still holds — the member whose charge crosses the cap
+    /// is charged but skipped.
+    pub(crate) fn reserve(&mut self, cells: u64) -> bool {
+        if self.is_exhausted() {
+            return false;
+        }
+        self.spent = self.spent.saturating_add(cells);
+        !self.is_exhausted()
     }
 }

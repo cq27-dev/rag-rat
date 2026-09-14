@@ -61,7 +61,12 @@ pub const NORM_VERSION: i64 = 4;
 /// the OLD (broken) template, so the bump invalidates those rows; they recompute with the corrected
 /// payload on the next refine. Display-only — scoring/coverage SEMANTICS are unchanged; this is the
 /// cache-freshness discipline, not a behavior change to the over-claim contract.
-pub(crate) const ALIGNMENT_VERSION: i64 = 3;
+///
+/// `4`: the template lane stops charging its cell budget for members it skips once the budget is
+/// exhausted. A budget-exhausting class used to drain the shared cross-class allowance by the cells
+/// of every skipped member, so later classes in the same pass degraded (and latched
+/// `lcs_sampled`) earlier than the allowance intends; their cached templates move.
+pub(crate) const ALIGNMENT_VERSION: i64 = 4;
 /// Smallest normalized-token count a symbol must reach to be fingerprinted (skip trivial getters).
 pub const MIN_TOKENS: usize = 20;
 

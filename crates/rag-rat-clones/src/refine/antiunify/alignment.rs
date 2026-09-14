@@ -98,14 +98,12 @@ pub(super) fn align_to_anchor_with_budget(
             sampled = true;
             continue;
         }
-        // Aggregate cell budget: charge `|anchor|·|member|` BEFORE the exact DP. Once the running
-        // charge exceeds the shared budget, this AND every remaining member take the
-        // skip-and-sample path — same all-gap / `aligned[m]=false` / `sampled` machinery as
-        // the per-member length skip, so the rest of the pipeline (fixedness / indel /
-        // recover) excludes them. A member already charged still runs exactly
-        // (check-after-charge → bound is "budget + one pair").
-        budget.charge_and_run((spine_len as u64) * (member.seq.len() as u64));
-        if budget.is_exhausted() {
+        // Aggregate cell budget: reserve `|anchor|·|member|` BEFORE the exact DP. The member whose
+        // charge crosses the shared budget, AND every remaining member, take the skip-and-sample
+        // path — same all-gap / `aligned[m]=false` / `sampled` machinery as the per-member length
+        // skip, so the rest of the pipeline (fixedness / indel / recover) excludes them. Only the
+        // crossing member is charged; the ones after it are not.
+        if !budget.reserve((spine_len as u64) * (member.seq.len() as u64)) {
             col_map.push(vec![None; spine_len]);
             member_inserts.push(BTreeMap::new());
             sampled = true;

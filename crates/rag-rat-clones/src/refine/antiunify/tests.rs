@@ -2267,8 +2267,8 @@ fn align_to_anchor_aggregate_budget_caps_template_lane() {
     // value, so a small budget hits the SAME code path far cheaper).
     //
     // 20 members, each 10 tokens. The anchor sorts first (struct_hash "a"); every non-anchor is
-    // 10 tokens → 10·10 = 100 cells per star-align. With a 250-cell budget the running Σ
-    // exceeds it after 3 charged aligns (300 > 250), so the rest are skipped.
+    // 10 tokens → 10·10 = 100 cells per star-align. With a 250-cell budget the third charge
+    // crosses it (300 > 250), so that member and the rest are skipped.
     let per_member = 10usize;
     let member_count = 20usize;
     let tiny_budget: u64 = 250;
@@ -2306,9 +2306,9 @@ fn align_to_anchor_aggregate_budget_caps_template_lane() {
         "aggregate budget must cap exact aligns below all {non_anchor_total} non-anchor members, \
          ran {aligned_non_anchor}"
     );
-    // Budget-implied bound: ⌈budget / cells_per_align⌉ + 1 (the align that trips it still
-    // runs). cells_per_align = per_member² = 100.
-    let max_aligned = tiny_budget / ((per_member as u64) * (per_member as u64)) + 1;
+    // Budget-implied bound: ⌊budget / cells_per_align⌋ (the align that trips it is skipped).
+    // cells_per_align = per_member² = 100.
+    let max_aligned = tiny_budget / ((per_member as u64) * (per_member as u64));
     assert!(
         aligned_non_anchor as u64 <= max_aligned,
         "exact aligns ({aligned_non_anchor}) must not exceed the budget-implied bound \
@@ -2331,6 +2331,31 @@ fn align_to_anchor_aggregate_budget_caps_template_lane() {
         elapsed < std::time::Duration::from_secs(1),
         "budget-capped template align must be fast, took {elapsed:?}"
     );
+}
+
+/// Once the template lane's budget is exhausted, skipped members are NOT charged: `spent` stops at
+/// the charge that crossed the cap, so settling it never drains the shared cross-class allowance
+/// for work that never ran.
+#[test]
+fn align_budget_stops_charging_once_exhausted() {
+    let per_member = 10usize;
+    let mut members = vec![synthetic_member(1, "a", per_member)];
+    for m in 1..20 {
+        members.push(synthetic_member(1 + m as i64, &format!("b{m:02}"), per_member));
+    }
+    let members = canonical(members);
+    let anchor_idx = resolve_anchor_idx(&members, None);
+
+    let mut budget = CellBudget::new(250);
+    let alignment = align_to_anchor_with_budget(&members, anchor_idx, &mut budget);
+
+    // Two aligns run (100 + 100); the third charge crosses the cap (300 > 250) and is skipped; the
+    // sixteen members after it charge nothing.
+    assert_eq!(alignment.aligned.iter().filter(|&&a| a).count(), 3, "anchor + two exact aligns");
+    assert_eq!(alignment.spent_cells, 300, "skipped members must not be charged");
+    let mut remaining = 1_000;
+    budget.settle(&mut remaining);
+    assert_eq!(remaining, 700, "settle drains only the cells actually charged");
 }
 
 /// The matched-statement re-descent draws from the SAME per-class budget as the parent
