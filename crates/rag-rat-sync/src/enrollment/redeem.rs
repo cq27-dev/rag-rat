@@ -408,7 +408,15 @@ pub fn redeem_invite(
         conn,
         request.nonce,
         now_ms,
-        |invite| ensure_expected_account(&request, invite),
+        |invite| {
+            // A writer nonce presented to the pairing flow is as unknown as a random one, refused
+            // ahead of the account check exactly as the grant flow refuses a pairing nonce, so
+            // neither flow reveals which one a guessed nonce belongs to.
+            if matches!(invite.kind(), Ok(StoredInviteKind::Writer)) {
+                return Err(InviteError::Unknown);
+            }
+            ensure_expected_account(&request, invite)
+        },
         |conn, invite, at_ms| screen_invite(conn, &request, invite, at_ms),
     )? {
         LockedRedemption::Replay(receipt) => return Ok((receipt, empty_catch_up(&request))),
@@ -417,8 +425,8 @@ pub fn redeem_invite(
     let LockedInvite { ref tx, account_id, commit_ms, .. } = locked;
     let role = match locked.invite.kind()? {
         StoredInviteKind::Pairing(role) => role,
-        // A writer token remains outside the pairing role domain.
-        StoredInviteKind::Writer => DeviceRole::from_db_str(StoredInviteKind::Writer.as_db_str())?,
+        // Refused after each row load above; kept as the same refusal rather than a panic.
+        StoredInviteKind::Writer => return Err(InviteError::Unknown),
     };
     let fingerprint = DeviceFingerprint::from_bytes(Sha256::digest(request.ed25519_pubkey).into());
     // Release THIS invite's reservation under the writer lock, then RE-MEASURE the mandatory

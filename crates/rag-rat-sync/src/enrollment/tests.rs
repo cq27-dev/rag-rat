@@ -1140,6 +1140,38 @@ async fn a_writer_invite_redeems_over_the_wire_and_replays_for_the_same_contribu
 }
 
 #[test]
+fn a_writer_nonce_presented_to_the_pairing_flow_is_refused_as_unknown() {
+    let (conn, account, _stream, writer_ticket) = writer_fixture();
+    let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
+    let request = EnrollmentRequest {
+        nonce: writer_ticket.nonce,
+        expected_account: account,
+        ed25519_pubkey,
+        x25519_pubkey,
+        transport_node_id: [9; 32],
+        budget: generous_budget(),
+        held_entry_hashes: Vec::new(),
+    };
+    let clock_reads = std::cell::Cell::new(0);
+    let clock = || {
+        clock_reads.set(clock_reads.get() + 1);
+        NOW + 1
+    };
+    let error = redeem_invite(&conn, request, [9; 32], &clock).unwrap_err();
+    assert!(matches!(error, InviteError::Unknown), "{error}");
+    assert!(super::wire::refusal_code(&error).is_some(), "the refusal goes back on the wire");
+    assert_eq!(clock_reads.get(), 0, "the kind gate refuses before the arrival clock is read");
+
+    // The writer invite is untouched and still redeems through its own flow.
+    let grant = WriterGrantRequest {
+        nonce: writer_ticket.nonce,
+        expected_account: account,
+        contributor_account: AccountId::from_bytes([0x77; 32]),
+    };
+    redeem_writer_invite(&conn, &grant, [9; 32], &|| NOW + 1).unwrap();
+}
+
+#[test]
 fn a_transport_failure_is_never_answered_with_a_refusal_frame() {
     let error = InviteError::Transport("enrollment dial timed out".into());
     assert!(super::wire::refusal_code(&error).is_none());
