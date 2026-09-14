@@ -297,8 +297,9 @@ fn replay_pending_entry(
             return repark(tx, pending, PendingReason::UnknownOpKind),
         Err(_) => return repark(tx, pending, PendingReason::UndecodablePayload),
     };
-    let Some(spec) =
-        registry.iter().find(|s| s.scope_id == context.scope_id && s.name == op.table())
+    let Some(spec) = registry
+        .iter()
+        .find(|s| s.scope_id.as_db_str() == context.scope_id && s.name == op.table())
     else {
         return repark(tx, pending, PendingReason::TableNotInScope);
     };
