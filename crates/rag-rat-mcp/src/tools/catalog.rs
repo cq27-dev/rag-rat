@@ -310,11 +310,12 @@ fn declare_worktree_property(schema: &mut Value) {
 /// coverage test can tell a missing arm from an `EmptyArgs` tool (both render `{"type":"object"}`).
 fn arg_schema(name: &str) -> Option<Value> {
     Some(match name {
-        "semantic_search"
-        | "commit_search"
+        "semantic_search" => schema_for::<SearchArgs>(),
+        "commit_search"
         | "commits_touching_query"
         | "papertrail_issue_search"
-        | "rationale_search" => schema_for::<SearchArgs>(),
+        | "memory_search" => schema_for::<QueryArgs>(),
+        "rationale_search" => schema_for::<RationaleSearchArgs>(),
         "symbol_lookup" => schema_for::<SymbolArgs>(),
         // Pure selector args, no `include` — these resolve via select_symbol (source-only) and
         // don't honor a generated opt-in, so they must not advertise one (#202 review).
@@ -339,7 +340,6 @@ fn arg_schema(name: &str) -> Option<Value> {
         "memory_create" => schema_for::<MemoryCreateArgs>(),
         "memory_rebind" => schema_for::<MemoryRebindArgs>(),
         "memory_update" => schema_for::<MemoryUpdateArgs>(),
-        "memory_search" => schema_for::<MemorySearchArgs>(),
         "memory_for_symbol" => schema_for::<MemoryForSymbolArgs>(),
         "memory_for_path" => schema_for::<MemoryForPathArgs>(),
         "memory_for_call_path" => schema_for::<MemoryForCallPathArgs>(),

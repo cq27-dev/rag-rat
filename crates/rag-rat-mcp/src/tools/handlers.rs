@@ -163,7 +163,7 @@ pub(crate) fn call_tool_with_db(
             )?)
         },
         "commit_search" => {
-            let args: SearchArgs = serde_json::from_value(arguments)?;
+            let args: QueryArgs = serde_json::from_value(arguments)?;
             json!(db.commit_search(&args.query, args.limit)?)
         },
         "git_history_for_path" => {
@@ -175,7 +175,7 @@ pub(crate) fn call_tool_with_db(
             git_history_for_symbol_tool(db, args)?
         },
         "commits_touching_query" => {
-            let args: SearchArgs = serde_json::from_value(arguments)?;
+            let args: QueryArgs = serde_json::from_value(arguments)?;
             json!(db.commits_touching_query(&args.query, args.limit)?)
         },
         "git_blame_chunk" => {
@@ -199,7 +199,7 @@ pub(crate) fn call_tool_with_db(
             value
         },
         "papertrail_issue_search" => {
-            let args: SearchArgs = serde_json::from_value(arguments)?;
+            let args: QueryArgs = serde_json::from_value(arguments)?;
             json!(db.papertrail_issue_search(&args.query, args.limit)?)
         },
         "papertrail_refs_for_path" => {
@@ -207,9 +207,9 @@ pub(crate) fn call_tool_with_db(
             json!(db.papertrail_refs_for_path(&args.path, args.limit)?)
         },
         "rationale_search" => {
-            let args: SearchArgs = serde_json::from_value(arguments)?;
+            let args: RationaleSearchArgs = serde_json::from_value(arguments)?;
             let mut value = json!(db.rationale_search(&args.query, args.limit)?);
-            if !included(&args.include, SearchInclude::Fallback, false) {
+            if !included(&args.include, RationaleInclude::Fallback, false) {
                 keep_literal_tracker_refs_if_present(&mut value);
             }
             value
@@ -273,7 +273,7 @@ pub(crate) fn call_tool_with_db(
             json!(edges)
         },
         "memory_search" => {
-            let args: MemorySearchArgs = serde_json::from_value(arguments)?;
+            let args: QueryArgs = serde_json::from_value(arguments)?;
             json!(db.memory_search(&args.query, args.limit, memory_surface)?)
         },
         "memory_for_symbol" => {
