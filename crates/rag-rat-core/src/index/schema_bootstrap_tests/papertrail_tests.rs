@@ -46,7 +46,7 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
     let db = IndexDatabase::rebuild(&config).unwrap();
     let ctx = test_gh_ctx();
 
-    let invalid = papertrail::block_on(papertrail::sync_issue::<MockGitHubClient>(
+    let invalid = papertrail::block_on(papertrail::ref_sync::sync_issue::<MockGitHubClient>(
         db.storage.connection(),
         std::path::Path::new("."),
         "not-a-ref",
@@ -58,16 +58,17 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
     .to_string();
     assert!(invalid.contains("invalid tracker item reference"), "{invalid}");
 
-    let missing_client = papertrail::block_on(papertrail::sync_issue::<MockGitHubClient>(
-        db.storage.connection(),
-        std::path::Path::new("."),
-        "cq27-dev/rag-rat#42",
-        None,
-        false,
-        &ctx,
-    ))
-    .unwrap_err()
-    .to_string();
+    let missing_client =
+        papertrail::block_on(papertrail::ref_sync::sync_issue::<MockGitHubClient>(
+            db.storage.connection(),
+            std::path::Path::new("."),
+            "cq27-dev/rag-rat#42",
+            None,
+            false,
+            &ctx,
+        ))
+        .unwrap_err()
+        .to_string();
     assert!(missing_client.contains("requires a client"), "{missing_client}");
 
     papertrail::store_ref(db.storage.connection(), &papertrail::PapertrailRef {
@@ -83,7 +84,7 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
     })
     .unwrap();
 
-    let live = papertrail::block_on(papertrail::sync_issue(
+    let live = papertrail::block_on(papertrail::ref_sync::sync_issue(
         db.storage.connection(),
         std::path::Path::new("."),
         "cq27-dev/rag-rat#42",
@@ -106,7 +107,7 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
         }],
         ..papertrail::PapertrailContext::default()
     };
-    let explicit_without_github_binding = papertrail::block_on(papertrail::sync_issue(
+    let explicit_without_github_binding = papertrail::block_on(papertrail::ref_sync::sync_issue(
         db.storage.connection(),
         std::path::Path::new("."),
         "cq27-dev/rag-rat#43",
@@ -118,7 +119,7 @@ fn manual_sync_validates_client_and_routes_only_the_requested_github_identity() 
     assert_eq!(explicit_without_github_binding.synced_items, 5);
     assert_eq!(explicit_without_github_binding.failed_refs, 0);
 
-    let offline = papertrail::block_on(papertrail::sync_issue::<MockGitHubClient>(
+    let offline = papertrail::block_on(papertrail::ref_sync::sync_issue::<MockGitHubClient>(
         db.storage.connection(),
         std::path::Path::new("."),
         "cq27-dev/rag-rat#43",
@@ -161,7 +162,7 @@ fn rationale_lookup_keeps_self_contained_github_refs_without_a_binding() {
         source_text: "cq27-dev/rag-rat#42".to_string(),
     };
     papertrail::store_ref(db.storage.connection(), &reference).unwrap();
-    papertrail::block_on(papertrail::sync_refs(
+    papertrail::block_on(papertrail::ref_sync::sync_refs(
         db.storage.connection(),
         &MockGitHubClient,
         &[],
@@ -1342,11 +1343,11 @@ fn migration_060_backfills_papertrail_from_the_legacy_github_tables() {
     )
     .unwrap();
     assert!(
-        papertrail::papertrail_ref_synced(&conn, &migrated_ref("1")).unwrap(),
+        papertrail::ref_sync::papertrail_ref_synced(&conn, &migrated_ref("1")).unwrap(),
         "a successful legacy sync keeps its item and remains skippable"
     );
     assert!(
-        !papertrail::papertrail_ref_synced(&conn, &migrated_ref("3")).unwrap(),
+        !papertrail::ref_sync::papertrail_ref_synced(&conn, &migrated_ref("3")).unwrap(),
         "a failed legacy sync must remain retryable after its partial item is removed"
     );
     let failed_children: i64 = conn
