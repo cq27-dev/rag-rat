@@ -13,6 +13,9 @@
 //! Deletes and the resurrection guard use the same row clock plus a per-row tombstone; a losing op
 //! never touches the published hash, so an unsent local edit is never silently marked as sent.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{OptionalExtension, Transaction, params_from_iter};
 
@@ -1006,6 +1009,85 @@ pub(crate) enum RowDoubt {
     /// unsent edit this guard exists to protect. The confidence split alone is the wrong axis: it
     /// is the OP KIND that decides whether the convergence argument applies at all.
     DeferExceptUnprovableRemoval,
+    /// Nothing here is unsent, because nothing here can ever be sent: the local device has never
+    /// been enrolled on the account as a writer (a read-only enrolment, a store with no identity
+    /// yet). Whatever it holds locally — a raw edit, a row a migration seeded, a summary it
+    /// regenerated for itself — is derived state the writers' rows override, and a received row
+    /// is applied on the merits. Holding it back would park every update to that row for good:
+    /// the deferral's only redeemer is the producer, and a device that cannot author has none.
+    ///
+    /// "Never enrolled" (per the stored account log), not "not currently effective": applying
+    /// over local state cannot be undone, and effectiveness is a projection a contested roster
+    /// fold rebuilds without the device — a removed or transiently-uneffective writer keeps the
+    /// guard, since what it edited can still be published once it authors again.
+    NothingUnsent,
+}
+
+impl RowDoubt {
+    /// The doubt a caller acts on for a row received on `account`: `when_writer` if the local
+    /// device (`None` on a store without an identity) was ever enrolled there as a writer, else
+    /// [`RowDoubt::NothingUnsent`].
+    pub(crate) fn for_local_device(
+        memo: &LocalWriterMemo,
+        tx: &Transaction<'_>,
+        account: crate::AccountId,
+        device: Option<crate::op::DeviceFingerprint>,
+        when_writer: RowDoubt,
+    ) -> anyhow::Result<RowDoubt> {
+        let writer = match device {
+            Some(device) => memo.ever_writer(tx, account, device)?,
+            None => false,
+        };
+        Ok(if writer { when_writer } else { RowDoubt::NothingUnsent })
+    }
+}
+
+/// "Was the local device ever a writer on this account", memoised across the entries of a sync
+/// pass. On a device that never was a writer the roster projection is silent by construction, so
+/// the answer comes from a walk of the stored control log, which must not run once per received
+/// row: a sync session ingests one entry per call, so the session's table store owns the memo
+/// and hands a clone (shared) to each call, and the refold pass owns one of its own.
+///
+/// The memo cannot go stale. The control log is append-only, so its row count for the account
+/// is a version of everything the answer depends on: a cached `false` is reused only while the
+/// count is unchanged (one indexed count per lookup), and re-derived otherwise. That covers an
+/// enrolment ingested on ANOTHER connection while this pass is in flight — the resident host
+/// accepts account and table sessions concurrently — and it is what lets a `true` be reused
+/// without checking at all, since it can only ever have been made truer.
+#[derive(Clone, Default)]
+pub struct LocalWriterMemo(
+    Arc<Mutex<HashMap<(crate::AccountId, crate::op::DeviceFingerprint), Answer>>>,
+);
+
+/// A memoised answer and the control-log length it was derived at.
+#[derive(Clone, Copy)]
+struct Answer {
+    control_len: u64,
+    writer: bool,
+}
+
+impl LocalWriterMemo {
+    pub(crate) fn ever_writer(
+        &self,
+        tx: &Transaction<'_>,
+        account: crate::AccountId,
+        device: crate::op::DeviceFingerprint,
+    ) -> anyhow::Result<bool> {
+        let mut memo = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let known = memo.get(&(account, device)).copied();
+        if known.is_some_and(|known| known.writer) {
+            return Ok(true);
+        }
+        let control_len = crate::account::held_control_log_len(tx, account)?;
+        if let Some(known) = known
+            && known.control_len == control_len
+        {
+            return Ok(known.writer);
+        }
+        let writer = crate::account::device_ever_enrolled_as_writer(tx, account, device)?;
+        memo.insert((account, device), Answer { control_len, writer });
+        Ok(writer)
+    }
 }
 
 /// Everything that must be settled BEFORE `op` is handed to [`apply_row_op`], in the order it has
@@ -1033,6 +1115,9 @@ pub(crate) fn pre_apply(
         PayloadVerdict::Rejected(_) => return Ok(PreApply::Apply),
         PayloadVerdict::RowDecides(_) => {},
     }
+    if doubt == RowDoubt::NothingUnsent {
+        return Ok(PreApply::Apply);
+    }
     let Some(deferral) = unsent_work_blocking_replay(tx, spec, repo_id, stream, op)? else {
         return Ok(PreApply::Apply);
     };
@@ -1046,6 +1131,7 @@ pub(crate) fn pre_apply(
         RowDoubt::DeferExceptUnprovableRemoval if unprovable_removal => PreApply::Apply,
         RowDoubt::DeferOnAnyDoubt | RowDoubt::DeferExceptUnprovableRemoval =>
             PreApply::Park(deferral),
+        RowDoubt::NothingUnsent => unreachable!("returned before the row was read"),
     })
 }
 

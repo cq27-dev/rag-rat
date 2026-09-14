@@ -81,8 +81,9 @@ const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
 ];
 
 /// The periphery tables that gain a `repo_id` column in the phase-A5 periphery-scoping migration
-/// (V042, `apply_repo_id_periphery_scoping`) — plus the V045 dream-v2 verification siblings
-/// (`memory_reality` / `memory_summaries` / `memory_model_failures`), repo_id-scoped from birth —
+/// (V042, `apply_repo_id_periphery_scoping`) — plus the dream-v2 verification siblings
+/// (`memory_reality` / `memory_note_summaries` / `memory_model_failures`), repo_id-scoped from
+/// birth —
 /// and therefore also need their [`LEGACY_REPO_ID`] placeholder rows re-pointed at the real id when
 /// [`register_repo`] adopts a legacy DB — the A5 continuation of the A1/A3 adoption contract.
 /// `repo_memory_fts` is the standalone FTS mirror of `repo_memories` (its `repo_id` snapshots the
@@ -117,7 +118,7 @@ const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
     // must re-point their rows too. Guarded by `column_exists` in the re-point loop, so an older
     // partial-schema fixture (table/column absent) is a no-op.
     "memory_reality",
-    "memory_summaries",
+    "memory_note_summaries",
     "memory_model_failures",
     // The typed node-edge set (#464, V049): `repo_id` is the OWNER repo (the source node's), so a
     // LocalOnly→Portable adoption re-points it exactly like the other periphery tables. Its
@@ -617,8 +618,8 @@ fn adopt_in_transaction(conn: &Connection, adoption: Adoption<'_>) -> rusqlite::
         // `source_id` (not the placeholder literal) so a shallow-clone upgrade re-points periphery
         // rows off the `local:` incumbent too, exactly like the core/papertrail loop above.
         //
-        // Lens-lane refresh for the adopted repo: `memory_reality` / `memory_summaries` are in this
-        // list, and V107 dropped their revision triggers (they sync on overlay/1). This bare UPDATE
+        // Lens-lane refresh for the adopted repo: `memory_reality` / `memory_note_summaries` are in
+        // this list and carry no revision triggers (they sync on overlay/1). This bare UPDATE
         // therefore does NOT bump the memories lane directly. It does not need to:
         // `repo_memories` is ALSO in this same list (see the array), and it KEEPS its revision
         // trigger, so re-pointing it in this loop advances the memories lane once for the
@@ -730,8 +731,9 @@ fn acquire_dual_repo_locks(
 /// onto the target id instead — `repo_memories`, `repo_memory_bindings`, `repo_memory_fts`,
 /// `repo_memory_parked_baselines`, and `repo_node_edges`. The remaining three are the dream-v2
 /// verification siblings
-/// (`memory_reality`, `memory_summaries`, `memory_model_failures`): this merge neither moves nor
-/// deletes them (parked pending a ruling — see `LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED`).
+/// (`memory_reality`, `memory_note_summaries`, `memory_model_failures`): this merge neither moves
+/// nor deletes them (parked pending a ruling — see `LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED`).
+/// The retired `memory_summaries` is left where it lies on both paths.
 /// Children fall via `ON DELETE CASCADE` (`clone_edges`/`clone_subblock_postings` off
 /// `clone_graph_generations`, `logical_symbol_members` off `logical_symbols` — deleted via
 /// [`DIRECT_SCOPED_ADOPTION_TABLES`]).
@@ -1517,6 +1519,15 @@ mod repo_id_scope_coverage {
         ),
     ];
 
+    /// `(table, why)` — a `repo_id` table whose rows the in-place adoption deliberately LEAVES
+    /// under the retiring id. Distinct from [`ADOPTION_HANDLED_ELSEWHERE`], where something else
+    /// settles the rows: here nothing does, on purpose, and the reason must say why that is safe.
+    const ADOPTION_ABANDONED_TABLES: &[(&str, &str)] = &[(
+        "memory_summaries",
+        "retired (#1319): nothing on a current binary reads it, so a re-point would only make the \
+         producer author sync entries for rows nobody reads; they stay under the retiring id",
+    )];
+
     /// `(table, why)` — a `repo_id` table whose disposition is settled somewhere OTHER than the
     /// two DELETE loops of [`merge_local_incumbent_into_registered`]: an AUTHORED move onto the
     /// target id, or an FK that drops it with a deleted parent.
@@ -1581,8 +1592,10 @@ mod repo_id_scope_coverage {
     ];
 
     /// `(table, what is unresolved)` — the dream-v2 verification siblings on the LATE-MERGE path
-    /// only. They are in [`A5_PERIPHERY_DIRECT_SCOPED_TABLES`], so the in-place adoption re-points
-    /// them; the merge neither moves nor deletes them, and no FK reaches them. Since the memories
+    /// only. The live ones are in [`A5_PERIPHERY_DIRECT_SCOPED_TABLES`], so the in-place adoption
+    /// re-points them (the retired `memory_summaries` is abandoned on that path too, see
+    /// [`ADOPTION_ABANDONED_TABLES`]); the merge neither moves nor deletes them, and no FK reaches
+    /// them. Since the memories
     /// they annotate DO move onto the target id, their verdicts/summaries are left behind under
     /// the retiring id — where a per-active-repo gc sweep never reaches. Parked pending a ruling
     /// (move with the memories, or drop as derived like `dream_findings`).
@@ -1590,8 +1603,10 @@ mod repo_id_scope_coverage {
         ("memory_reality", "keyed `(repo_id, memory_id)`; neither moved nor deleted"),
         (
             "memory_summaries",
-            "keyed `(repo_id, memory_id, content_hash)`; neither moved nor deleted",
+            "retired (#1319), keyed `(repo_id, memory_id, content_hash)`; neither moved nor \
+             deleted",
         ),
+        ("memory_note_summaries", "keyed `(repo_id, memory_id)`; neither moved nor deleted"),
         ("memory_model_failures", "keyed `(repo_id, memory_id, pass)`; neither moved nor deleted"),
     ];
 
@@ -1606,7 +1621,7 @@ mod repo_id_scope_coverage {
     /// Floor on the number of `repo_id`-scoped tables [`scoped_tables`] must see — a bootstrap that
     /// produced a near-empty schema would enumerate nothing, and "every enumerated table is
     /// declared" is vacuously true over an empty set: the coverage tests would go green precisely
-    /// when they check nothing. The live count is 51, so the floor leaves room for a retired table
+    /// when they check nothing. The live count is 52, so the floor leaves room for a retired table
     /// without going soft.
     const MIN_REPO_SCOPED_TABLES: usize = 40;
 
@@ -1653,6 +1668,7 @@ mod repo_id_scope_coverage {
             ("DIRECT_SCOPED_ADOPTION_TABLES", DIRECT_SCOPED_ADOPTION_TABLES.to_vec()),
             ("A5_PERIPHERY_DIRECT_SCOPED_TABLES", A5_PERIPHERY_DIRECT_SCOPED_TABLES.to_vec()),
             ("ADOPTION_HANDLED_ELSEWHERE", table_names(ADOPTION_HANDLED_ELSEWHERE)),
+            ("ADOPTION_ABANDONED_TABLES", table_names(ADOPTION_ABANDONED_TABLES)),
             ("TABLE_SYNC_UNRESOLVED", table_names(TABLE_SYNC_UNRESOLVED)),
         ]
     }

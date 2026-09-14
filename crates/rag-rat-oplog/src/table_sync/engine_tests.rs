@@ -25,7 +25,21 @@ impl Device {
         seed_incarnation(&conn);
         conn.execute_batch("CREATE TABLE t_demo(id TEXT PRIMARY KEY, title TEXT) STRICT;").unwrap();
         let local = crate::local_device(&conn, 0).unwrap();
+        // The device models a writer: what it edits locally is unsent work until it authors.
+        enroll_writer(&conn, AccountId::from_bytes([42; 32]), local.fingerprint());
         Self { conn, local }
+    }
+
+    /// This device's one enrolment becomes read-only: it has never been a writer, so nothing
+    /// it holds is unsent.
+    fn make_read_only(&self) {
+        self.conn
+            .execute(
+                "UPDATE account_roster_history SET role = 'read_only' WHERE device_fingerprint = \
+                 ?1",
+                [self.local.fingerprint().to_bytes().as_slice()],
+            )
+            .unwrap();
     }
 
     fn pubkey(&self) -> DevicePublic {
@@ -51,6 +65,7 @@ impl Device {
             device: &self.local,
             registry: REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let out = produce_and_author(&tx, &ctx).unwrap();
         tx.commit().unwrap();
@@ -73,6 +88,7 @@ impl Device {
             device: &self.local,
             registry: REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let out =
             entries.iter().map(|bytes| ingest(&tx, &ctx, "demo/1", bytes, from, None).unwrap());
@@ -100,6 +116,7 @@ impl Device {
             device: &self.local,
             registry: REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let out = entries
             .iter()
@@ -221,6 +238,7 @@ fn readoption_re_authors_a_removed_writers_row_and_uses_it_to_converge_a_fresh_r
             device: &c.local,
             registry: REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let processed = process_readoption_work_for_stream(&tx, &ctx, stream).unwrap();
         tx.commit().unwrap();
@@ -301,6 +319,7 @@ fn readoption_waits_while_a_parked_newer_write_sits_above_the_winner() {
             device: &c.local,
             registry: REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let processed = process_readoption_work_for_stream(&tx, &ctx, stream).unwrap();
         tx.commit().unwrap();
@@ -371,6 +390,7 @@ fn readoption_never_authors_a_remove_while_the_physical_row_is_live() {
             device: &c.local,
             registry: REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         assert_eq!(
             process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(),
@@ -428,6 +448,7 @@ fn a_second_removal_after_drain_re_adopts_the_devices_new_rows() {
             device: &c.local,
             registry: REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         assert_eq!(process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(), Some(1));
         tx.commit().unwrap();
@@ -467,6 +488,7 @@ fn a_second_removal_after_drain_re_adopts_the_devices_new_rows() {
             device: &c.local,
             registry: REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         // r1's clock winner is C after round one; only r2 is still orphaned under A.
         assert_eq!(
@@ -547,6 +569,7 @@ fn the_audit_names_the_winning_entry_for_a_row_written_twice() {
             device: &c.local,
             registry: REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         assert_eq!(process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(), Some(1));
         tx.commit().unwrap();
@@ -655,6 +678,7 @@ fn the_audit_skips_a_quarantined_later_write_that_never_owned_the_clock() {
             device: &c.local,
             registry: REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         assert_eq!(process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(), Some(1));
         tx.commit().unwrap();
@@ -704,6 +728,7 @@ fn a_reinvited_devices_pending_removal_completes_without_reauthoring() {
             device: &c.local,
             registry: REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         assert_eq!(process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(), Some(0));
         tx.commit().unwrap();
@@ -759,6 +784,7 @@ fn an_unreadable_orphan_stays_pending_until_the_cell_is_repaired() {
             device: &a.local,
             registry: BOOL_REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let out = produce_and_author(&tx, &ctx).unwrap();
         tx.commit().unwrap();
@@ -775,6 +801,7 @@ fn an_unreadable_orphan_stays_pending_until_the_cell_is_repaired() {
             device: &c.local,
             registry: BOOL_REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         for bytes in &entry {
             ingest(&tx, &ctx, "demo/1", bytes, &a.pubkey(), None).unwrap();
@@ -808,6 +835,7 @@ fn an_unreadable_orphan_stays_pending_until_the_cell_is_repaired() {
             device: &c.local,
             registry: BOOL_REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         assert_eq!(
             process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(),
@@ -833,6 +861,7 @@ fn an_unreadable_orphan_stays_pending_until_the_cell_is_repaired() {
             device: &c.local,
             registry: BOOL_REGISTRY,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         assert_eq!(
             process_readoption_work_for_stream(&tx, &ctx, stream).unwrap(),
@@ -887,6 +916,7 @@ fn one_pass_drains_every_pending_removal_on_a_stream() {
         device: &c.local,
         registry: REGISTRY,
         now_ms: 0,
+        local_writer: Default::default(),
     };
     while store::has_pending_readoption_work(&tx, account, stream).unwrap() {
         process_readoption_work_for_stream(&tx, &ctx, stream).unwrap();
@@ -1493,6 +1523,7 @@ fn old_incarnation_offer_is_rejected_before_any_chain_or_projection_storage() {
         device: &current.local,
         registry: REGISTRY,
         now_ms: 0,
+        local_writer: Default::default(),
     };
     let error = ingest(&tx, &ctx, "demo/1", &entries[0], &old.pubkey(), None).unwrap_err();
     assert!(error.to_string().contains("different stream"));
@@ -1502,6 +1533,42 @@ fn old_incarnation_offer_is_rejected_before_any_chain_or_projection_storage() {
         assert_eq!(count, 0, "old history must not enter {table}");
     }
     tx.rollback().unwrap();
+}
+
+/// A read-only replica can never author, so a raw local row of its own — one a migration seeded,
+/// or a summary it regenerated for itself — is not unsent work and must not hold a received row
+/// back: the deferral's only redeemer is the producer, and this device has none. The received
+/// row applies on the merits.
+#[test]
+fn a_read_only_replica_never_holds_a_received_row_back_for_its_own_edits() {
+    let mut a = Device::new();
+    let mut b = Device::new();
+    b.make_read_only();
+    a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'base')", []).unwrap();
+    b.ingest_all(&a.produce(), &a.pubkey());
+    b.set_title("local-only");
+    a.set_title("from-A");
+    assert_eq!(b.ingest_all(&a.produce(), &a.pubkey()), vec![IngestOutcome::Applied]);
+    assert_eq!(b.title().as_deref(), Some("from-A"), "the writer's row overrides the local one");
+    assert!(b.produce().is_empty(), "and a read-only device authors nothing");
+}
+
+/// A REMOVED writer is not a read-only one: its enrolment can come back (a re-invite, or a
+/// contested roster fold resolving), and what it edited is then publishable — so the guard holds
+/// and the edit survives, exactly as on an effective writer.
+#[test]
+fn a_removed_writer_keeps_its_unpublished_edit_behind_the_guard() {
+    let mut a = Device::new();
+    let mut b = Device::new();
+    a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'base')", []).unwrap();
+    b.ingest_all(&a.produce(), &a.pubkey());
+    b.set_title("unsent-B");
+    remove_writer(&b.conn, AccountId::from_bytes([42; 32]), b.local.fingerprint());
+    a.set_title("from-A");
+    assert_eq!(b.ingest_all(&a.produce(), &a.pubkey()), vec![IngestOutcome::Retained(
+        crate::table_sync::store::PendingReason::DeferredUnsentEdit.as_db_str()
+    )]);
+    assert_eq!(b.title().as_deref(), Some("unsent-B"), "the unsent local edit survives");
 }
 
 #[test]
@@ -1678,6 +1745,7 @@ fn a_scope_with_multiple_tables_routes_each_op_to_its_table() {
             device: &a_dev,
             registry: MULTI,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let e = produce_and_author(&tx, &ctx).unwrap();
         tx.commit().unwrap();
@@ -1698,6 +1766,7 @@ fn a_scope_with_multiple_tables_routes_each_op_to_its_table() {
             device: &b_dev,
             registry: MULTI,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         for bytes in &entries {
             assert_eq!(

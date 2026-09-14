@@ -18,9 +18,9 @@
 //!
 //! The v2 verification pass (`verify`) also exposes [`verification_queue`] and [`evidence_pack`] —
 //! the deterministic substrate the phase-B model verdict pass consumes (churn-skip queue + a
-//! citation-checkable evidence pack), reading the `memory_reality` / `memory_summaries` sibling
-//! tables (V046+). Those sibling tables hold DERIVED, regenerable data, which is what preserves
-//! dream's "never mutates a `repo_memories` row" invariant even as verification lands.
+//! citation-checkable evidence pack), reading the `memory_reality` / `memory_note_summaries`
+//! sibling tables (V046+). Those sibling tables hold DERIVED, regenerable data, which is what
+//! preserves dream's "never mutates a `repo_memories` row" invariant even as verification lands.
 
 mod compact;
 mod failure;
@@ -199,7 +199,7 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> anyhow::Result<DreamR
 ///     then reads to derive `memory_divergence` findings (so a fresh `diverged` verdict opens a
 ///     finding in the same run);
 ///   - the COMPACTION pass (gated only on a supplied [`CompactPass`] — `--compact` is independent
-///     of `--verify`) rewrites un-summarized memories into `memory_summaries`.
+///     of `--verify`) rewrites un-summarized memories into `memory_note_summaries`.
 ///
 /// Both are budget-capped churn-skip passes over derived sibling tables; NEITHER writes a
 /// `repo_memories` column. `None`/`None` is exactly [`dream_run`]: pass 0 only, still 100%
@@ -217,8 +217,9 @@ pub fn dream_run_with_passes(
     {
         verdict::run_verdict_pass(conn, pass, opts.now_ms)?;
     }
-    // Compaction is independent of the verify findings (it writes `memory_summaries`, read only by
-    // the surfacing layer), so it is gated on its own supplied pass, not on `opts.verify`.
+    // Compaction is independent of the verify findings (it writes `memory_note_summaries`, read
+    // only by the surfacing layer), so it is gated on its own supplied pass, not on
+    // `opts.verify`.
     if let Some(pass) = compact_pass {
         compact::run_compact_pass(conn, pass, opts.now_ms)?;
     }
@@ -228,8 +229,8 @@ pub fn dream_run_with_passes(
 /// #767 review: run ONE model-pass entry's writes in ONE IMMEDIATE transaction with the `rag-rat
 /// rm` removal tombstone re-checked INSIDE it. A `dream --verify/--compact` process that opened
 /// its scoped connection before `rm` keeps that stale scope; the passes UPSERT `memory_reality` /
-/// `memory_summaries` / `memory_model_failures` (all repo-scoped, no FK to `repos`) per entry in
-/// autocommit, so without this a post-purge write survives a removal that reported success — the
+/// `memory_note_summaries` / `memory_model_failures` (all repo-scoped, no FK to `repos`) per entry
+/// in autocommit, so without this a post-purge write survives a removal that reported success — the
 /// findings sync's own guard then refuses, but the already-written rows remain. This transaction
 /// and rm's purge are both IMMEDIATE, so they serialize on the SQLite write lock and the tombstone
 /// state read here is stable for the wrapped writes: set → rm committed first, fail closed; unset
@@ -259,14 +260,14 @@ pub(crate) fn removal_guarded_write_tx(
 /// Advance the per-repo Lens lanes a dream overlay write feeds — the aggregate enrichment clock and
 /// the memories lane — for a registered repo.
 ///
-/// This is the explicit replacement for the `memory_reality` / `memory_summaries` revision triggers
-/// V107 dropped: those tables sync on `overlay/1`, and a trigger firing on a whole-row-LWW apply is
-/// a device-local side effect the sync apply must not have. Instead the dream write advances the
-/// lanes here and the sync apply advances them at its own site (`table_sync` transport), so the
-/// only lane movement is the one the code chooses. Call it on the SAME connection as the write
-/// (inside [`removal_guarded_write_tx`]) so Lens's same-transaction invariant holds. Gated on repo
-/// registration to match the dropped triggers (which fired only for a known repo) and to avoid
-/// phantom `repo_meta` rows under the `'__unassigned__'` sentinel.
+/// This is the explicit replacement for the `memory_reality` / `memory_note_summaries` revision
+/// triggers V107 dropped: those tables sync on `overlay/1`, and a trigger firing on a whole-row-LWW
+/// apply is a device-local side effect the sync apply must not have. Instead the dream write
+/// advances the lanes here and the sync apply advances them at its own site (`table_sync`
+/// transport), so the only lane movement is the one the code chooses. Call it on the SAME
+/// connection as the write (inside [`removal_guarded_write_tx`]) so Lens's same-transaction
+/// invariant holds. Gated on repo registration to match the dropped triggers (which fired only for
+/// a known repo) and to avoid phantom `repo_meta` rows under the `'__unassigned__'` sentinel.
 pub(crate) fn bump_memory_lens_lanes(conn: &Connection, repo_id: &str) -> rusqlite::Result<()> {
     if rag_rat_db::schema::repo_id_is_registered(conn, repo_id)? {
         rag_rat_db::meta::bump_lens_revisions(conn, repo_id, &[
@@ -446,8 +447,8 @@ pub(crate) mod tests {
         };
         let before = snap(&c);
         // Run with the verification pass ON so the new pass-0 reads/writes are covered by the
-        // invariant (memory_reality / memory_summaries writes are ALLOWED; repo_memories must stay
-        // byte-identical).
+        // invariant (memory_reality / memory_note_summaries writes are ALLOWED; repo_memories must
+        // stay byte-identical).
         let report = dream_run(&c, DreamOptions {
             now_ms: 1000,
             limit: 10,

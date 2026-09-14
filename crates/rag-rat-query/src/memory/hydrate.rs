@@ -463,13 +463,13 @@ pub fn current_dream_state(
     use rag_rat_db::schema;
 
     let content_hash = crate::memory::evidence::note_content_hash(title, body);
-    let scope = schema::periphery_repo_scope(conn, "memory_summaries")?;
-    let summary_clause = schema::periphery_repo_scope_clause(&scope, "memory_summaries");
+    let scope = schema::periphery_repo_scope(conn, "memory_note_summaries")?;
+    let summary_clause = schema::periphery_repo_scope_clause(&scope, "memory_note_summaries");
     let summary = conn
         .query_row(
             &format!(
-                "SELECT summary FROM memory_summaries WHERE memory_id = ?1 AND content_hash = ?2 \
-                 AND prompt_version = ?3{summary_clause}"
+                "SELECT summary FROM memory_note_summaries WHERE memory_id = ?1 AND content_hash \
+                 = ?2 AND prompt_version = ?3{summary_clause}"
             ),
             params![memory_id, content_hash, crate::memory::evidence::COMPACT_PROMPT_VERSION],
             |row| row.get(0),
@@ -510,9 +510,10 @@ pub fn current_dream_state(
 
 /// The dream summary + verdict marker for a memory's CURRENT note (title+body) — the `[memory]
 /// surface = "summary"` hydration (dream v2 passes 1 & 2). Returns `(summary, verdict_marker)`:
-///   - `summary` is the `memory_summaries.summary` keyed on the memory's current `content_hash`
-///     (repo-scoped); a title OR body edit changes the key, so a stale summary self-invalidates and
-///     this misses (title-only fallback) until the compaction pass regenerates it.
+///   - `summary` is the `memory_note_summaries.summary` whose `content_hash` is the memory's
+///     current one (repo-scoped); a title OR body edit changes that hash, so the stored row no
+///     longer matches and this misses (title-only fallback) until the compaction pass regenerates
+///     it.
 ///   - `verdict_marker` is a plain-text marker derived from the memory's `memory_reality` verdict
 ///     for the CURRENT note (`[verdict: diverged]` / `[verdict: current @<short-commit>]`), keyed
 ///     on `content_hash` exactly like the summary: a title or body edit changes the key, so a stale

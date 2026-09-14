@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+use super::apply::LocalWriterMemo;
 use super::engine::{self, IngestOutcome, SyncCtx};
 use super::registry::{SYNCABLE_TABLES, TableSpec, scope_lens_metas};
 use super::scope_stream::scope_stream_id;
@@ -168,6 +169,7 @@ pub fn table_sync_author_pending(
             device: &device,
             registry: SYNCABLE_TABLES,
             now_ms,
+            local_writer: Default::default(),
         };
         // INVARIANT: the account fold enqueues re-adoption work for EVERY stream in
         // table_sync_streams, while this drain only walks repo-scoped specs' streams. The two
@@ -207,7 +209,7 @@ pub fn table_sync_author_pending(
 /// `retain` argument to [`table_sync_compact_overdue`].
 ///
 /// `anchors/1` is fully retained (durable memory anchors — every entry is history worth keeping).
-/// `overlay/1` is the first bounded scope: its per-edit `Remove`+insert churn on `memory_summaries`
+/// `overlay/1` is the first bounded scope: the regeneration churn of its summary and verdict rows
 /// would grow a chain without limit, so each device chain keeps [`OVERLAY_ACCEPTED_RETENTION`]
 /// accepted entries. An unknown scope defaults to full retention.
 pub const OVERLAY_ACCEPTED_RETENTION: u64 = 256;
@@ -283,6 +285,7 @@ fn compact_overdue_against(
             device: &device,
             registry,
             now_ms,
+            local_writer: Default::default(),
         });
         // A store compacted before the pin rule may have dropped the entries carrying live rows
         // below its floor: peers that folded only the retained suffix never received those rows.
@@ -475,24 +478,32 @@ pub fn table_sync_chain_entries(
     accepted_chain_entries(conn, stream.stream_id, device_fingerprint, start, limit)
 }
 
+/// One received table-sync entry as the session hands it to [`table_sync_ingest`]: the chain it
+/// was paged from, its bytes, and the floor the peer advertised for that chain.
+pub struct TableSyncReceived<'a> {
+    pub expected_device: [u8; 32],
+    pub signed_bytes: &'a [u8],
+    pub advertised_floor: Option<(u64, [u8; 32])>,
+}
+
 /// Feed one untrusted signed envelope through the existing table-sync authority, chain and payload
 /// gates. Invalid/stale routes are skipped before a transaction can write any table-sync state.
 pub fn table_sync_ingest(
     conn: &Connection,
     account_id: AccountId,
     stream: &TableSyncStream,
-    expected_device: [u8; 32],
-    signed_bytes: &[u8],
+    received: &TableSyncReceived<'_>,
     now_ms: i64,
-    advertised_floor: Option<(u64, [u8; 32])>,
+    local_writer: &LocalWriterMemo,
 ) -> anyhow::Result<TableSyncIngestOutcome> {
     ingest_against(
         conn,
         &IngestRoute { account_id, stream, registry: SYNCABLE_TABLES },
-        crate::op::DeviceFingerprint::from_bytes(expected_device),
-        signed_bytes,
+        crate::op::DeviceFingerprint::from_bytes(received.expected_device),
+        received.signed_bytes,
         now_ms,
-        advertised_floor,
+        received.advertised_floor,
+        local_writer,
     )
 }
 
@@ -805,6 +816,7 @@ fn ingest_against(
     signed_bytes: &[u8],
     now_ms: i64,
     advertised_floor: Option<(u64, [u8; 32])>,
+    local_writer: &LocalWriterMemo,
 ) -> anyhow::Result<TableSyncIngestOutcome> {
     let IngestRoute { account_id, stream, registry } = *route;
     if !validate_stream_against(conn, account_id, stream, registry)? {
@@ -842,6 +854,7 @@ fn ingest_against(
         device: &local,
         registry: &registry,
         now_ms,
+        local_writer: local_writer.clone(),
     };
     let report = engine::ingest(
         &tx,
@@ -967,7 +980,8 @@ mod tests {
                     crate::op::DeviceFingerprint::from_bytes([0; 32]),
                     &[0],
                     0,
-                    None
+                    None,
+                    &Default::default(),
                 )
                 .unwrap(),
                 TableSyncIngestOutcome::NoChange,
@@ -1520,10 +1534,13 @@ mod tests {
                     destination,
                     account,
                     &route,
-                    heads[0].device_fingerprint,
-                    &entry.signed_bytes,
+                    &TableSyncReceived {
+                        expected_device: heads[0].device_fingerprint,
+                        signed_bytes: &entry.signed_bytes,
+                        advertised_floor: None,
+                    },
                     3,
-                    None,
+                    &Default::default(),
                 )
                 .unwrap();
             }
@@ -1680,6 +1697,7 @@ mod tests {
             device: &local,
             registry: &[REPO_SPEC],
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let authored = engine::produce_and_author(&tx, &ctx).unwrap();
         tx.commit().unwrap();
@@ -1712,7 +1730,8 @@ mod tests {
                 crate::op::DeviceFingerprint::from_bytes([0; 32]),
                 &authored[0],
                 1,
-                None
+                None,
+                &Default::default(),
             )
             .unwrap(),
             TableSyncIngestOutcome::NoChange,
@@ -1724,7 +1743,8 @@ mod tests {
                 crate::op::DeviceFingerprint::from_bytes(author),
                 &authored[0],
                 1,
-                None
+                None,
+                &Default::default(),
             )
             .unwrap(),
             TableSyncIngestOutcome::Stored,
@@ -1736,7 +1756,8 @@ mod tests {
                 crate::op::DeviceFingerprint::from_bytes(author),
                 &authored[0],
                 2,
-                None
+                None,
+                &Default::default(),
             )
             .unwrap(),
             TableSyncIngestOutcome::NoChange,
@@ -1758,7 +1779,8 @@ mod tests {
                 crate::op::DeviceFingerprint::from_bytes(author),
                 &authored[0],
                 1,
-                None
+                None,
+                &Default::default(),
             )
             .unwrap(),
             TableSyncIngestOutcome::NoChange,
@@ -1830,6 +1852,7 @@ mod tests {
             device: &local,
             registry: &[REPO_SPEC],
             now_ms: 0,
+            local_writer: Default::default(),
         };
         engine::produce_and_author(&tx, &ctx).unwrap();
         tx.commit().unwrap();
@@ -1917,6 +1940,7 @@ mod tests {
                     &entry.signed_bytes,
                     1,
                     floor,
+                    &Default::default(),
                 )
                 .unwrap();
             }

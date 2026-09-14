@@ -739,6 +739,81 @@ mod tests {
         conn
     }
 
+    /// The unsent-work guard's "ever a writer" fact must survive the roster projection being
+    /// rebuilt without the enrolment (what a contested fold does), which only the stored log can
+    /// promise: the founder and a member stay writers with the projection emptied, a read-only
+    /// enrolment never is, and current effectiveness is a different question that does not.
+    #[test]
+    fn a_writer_enrolment_outlives_the_roster_projection() {
+        let conn = db();
+        let account = bootstrap::local_account(&conn, NOW).expect("mint local account");
+        let founder = local_device(&conn, NOW).unwrap().fingerprint();
+        let member = DeviceSecret::from_seed(&[0x71; 32]);
+        let reader = DeviceSecret::from_seed(&[0x73; 32]);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        for (device, seed, role) in
+            [(&member, 0x72, ops::DeviceRole::Member), (&reader, 0x74, ops::DeviceRole::ReadOnly)]
+        {
+            author_device_add_in_tx(
+                &tx,
+                EnrollingDevice {
+                    ed25519_pubkey: device.public().to_bytes(),
+                    x25519_pubkey: DeviceX25519Secret::from_seed(&[seed; 32]).public().to_bytes(),
+                    label: None,
+                },
+                role,
+                NOW,
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let ever = |fp| storage::device_ever_enrolled_as_writer(&conn, account, fp).unwrap();
+        let now = |fp| storage::device_is_effective_writer(&conn, account, fp).unwrap();
+        let stranger = DeviceSecret::from_seed(&[0x75; 32]).public().fingerprint();
+        assert!(ever(founder) && ever(member.public().fingerprint()));
+        assert!(!ever(reader.public().fingerprint()) && !ever(stranger));
+        assert!(now(founder) && now(member.public().fingerprint()));
+
+        conn.execute("DELETE FROM account_roster_history WHERE account_id = ?1", [account
+            .to_bytes()
+            .as_slice()])
+            .unwrap();
+        assert!(ever(founder) && ever(member.public().fingerprint()), "the log still says so");
+        assert!(!ever(reader.public().fingerprint()) && !ever(stranger));
+        assert!(!now(founder) && !now(member.public().fingerprint()), "effectiveness is gone");
+    }
+
+    /// A memoised "never a writer" is invalidated by the enrolment that makes it wrong, however
+    /// it arrives — the control-log length is the version, not the memo's lifetime.
+    #[test]
+    fn a_memoised_non_writer_becomes_a_writer_the_moment_its_enrolment_lands() {
+        let conn = db();
+        let account = bootstrap::local_account(&conn, NOW).expect("mint local account");
+        let joiner = DeviceSecret::from_seed(&[0x71; 32]);
+        let memo = crate::table_sync::LocalWriterMemo::default();
+        let ask = |memo: &crate::table_sync::LocalWriterMemo| {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Deferred).unwrap();
+            memo.ever_writer(&tx, account, joiner.public().fingerprint()).unwrap()
+        };
+        assert!(!ask(&memo));
+        assert!(!ask(&memo), "and the cached answer is reused");
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_add_in_tx(
+            &tx,
+            EnrollingDevice {
+                ed25519_pubkey: joiner.public().to_bytes(),
+                x25519_pubkey: DeviceX25519Secret::from_seed(&[0x72; 32]).public().to_bytes(),
+                label: None,
+            },
+            ops::DeviceRole::Member,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(ask(&memo), "the same memo sees the enrolment");
+    }
+
     /// Count the account's `StreamOwn` candidate rows — the idempotency witness. Gated on
     /// `log_id == CONTROL_LOG` (S-f): a fresh-numbered secrets tag colliding with the 6 number must
     /// not inflate this witness.

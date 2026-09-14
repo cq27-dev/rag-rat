@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 125;
+pub const LATEST_SCHEMA_VERSION: u32 = 126;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -1095,6 +1095,14 @@ additive_migrations! {
          ops authored concurrently with a revoking cut and parked auth_len_ahead behind the ops it \
          condemned are re-judged with the cut vouching for them (#1301)",
     ) => MigrationFn::Plain(migrations::apply_refold_for_concurrent_cut_vouch);
+    MIGRATION_126_ID, MIGRATION_126_CHECKSUM, MIGRATION_126_DESCRIPTION = (
+        "126_memory_note_summaries",
+        "sha256:rag-rat-memory-note-summaries-v126",
+        "Add memory_note_summaries, the summary of a memory's current note keyed (repo_id, \
+         memory_id) with content_hash as a synced column, seeded with each memory's newest row from \
+         memory_summaries, so a regeneration syncs as one upsert instead of a delete plus an insert \
+         (#1319); memory_summaries stays for the entries that name it",
+    ) => MigrationFn::Plain(migrations::apply_memory_note_summaries);
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

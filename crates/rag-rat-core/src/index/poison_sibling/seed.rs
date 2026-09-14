@@ -428,16 +428,20 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
          VALUES (?1, ?2, ?3, 0)",
         params![POISON_MEMORY_ID, POISON_REPO_ID, format!("{POISON_PREFIX}bodyhash")],
     )?;
-    conn.execute(
-        "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, generated_at_ms)
-         VALUES (?1, ?2, ?3, ?4, 0)",
-        params![
-            POISON_MEMORY_ID,
-            POISON_REPO_ID,
-            format!("{POISON_PREFIX}bodyhash"),
-            format!("{POISON_PREFIX}summary")
-        ],
-    )?;
+    for table in ["memory_summaries", "memory_note_summaries"] {
+        conn.execute(
+            &format!(
+                "INSERT INTO {table}(memory_id, repo_id, content_hash, summary, generated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, 0)"
+            ),
+            params![
+                POISON_MEMORY_ID,
+                POISON_REPO_ID,
+                format!("{POISON_PREFIX}bodyhash"),
+                format!("{POISON_PREFIX}summary")
+            ],
+        )?;
+    }
     conn.execute(
         "INSERT INTO memory_model_failures(memory_id, repo_id, pass, content_hash, model_id, \
          prompt_version, reason, failed_at_ms)
@@ -622,6 +626,7 @@ fn clear_sibling(conn: &Connection) -> anyhow::Result<()> {
          DELETE FROM reconcile_attempts WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM memory_reality WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM memory_summaries WHERE repo_id = '{POISON_REPO_ID}';
+         DELETE FROM memory_note_summaries WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM memory_model_failures WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM dream_findings WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM clone_refinements WHERE repo_id = '{POISON_REPO_ID}';

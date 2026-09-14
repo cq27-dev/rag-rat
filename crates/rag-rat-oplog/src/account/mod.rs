@@ -146,4 +146,7 @@ pub use storage::{
     roster_content_authority, stream_access_mode, stream_grants_for_owner, stream_owner_account,
     stream_owner_effective, verify_enrollment_device_add,
 };
-pub(crate) use storage::{device_is_effective_writer, stored_device_pubkeys};
+pub(crate) use storage::{
+    device_ever_enrolled_as_writer, device_is_effective_writer, held_control_log_len,
+    stored_device_pubkeys,
+};

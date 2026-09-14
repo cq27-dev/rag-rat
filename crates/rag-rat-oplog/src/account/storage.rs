@@ -1414,6 +1414,8 @@ pub fn auth_len_freshness(
 /// The control-log rows held for `account_id` — what [`auth_len_freshness`] measures a cited
 /// length against. A refold that checks many entries reads it once per account and compares each
 /// citation with [`fold::AuthorityFreshness::of`], rather than counting the log per citation.
+/// Held rows are never deleted, so it also versions what [`device_ever_enrolled_as_writer`]
+/// derives from: an answer computed at one length stays exact while the length is unchanged.
 pub fn held_control_log_len(conn: &Connection, account_id: AccountId) -> anyhow::Result<u64> {
     let held: i64 = conn.query_row(
         "SELECT COUNT(*) FROM account_entries WHERE account_id = ?1 AND log_id = ?2",
@@ -2836,6 +2838,80 @@ pub(crate) fn device_is_effective_writer(
         params![account_id.to_bytes().as_slice(), fingerprint.to_bytes().as_slice()],
         |row| row.get::<_, bool>(0),
     )?)
+}
+
+/// Whether `fingerprint` was EVER enrolled on `account_id` as a writer (`Member`/`Owner`) — the
+/// fact the table-sync unsent-work guard keys on. That guard decides something that cannot be
+/// undone (a received row is applied over local state on the strength of "nothing here could ever
+/// be authored"), so its answer must never flip back to false once true. Nothing in the roster
+/// projection is monotone: every fold rebuilds it from scratch, and a contested fold drops the
+/// device's enrolment outright rather than closing it. The projection is consulted first because
+/// it is indexed and answers the common case; when it is silent the STORED account log decides —
+/// a genesis this device authored, or a `DeviceAdd` naming it `Member`/`Owner`, whatever the fold
+/// currently makes of either. Stored entries are never removed, so the answer stays true. A
+/// read-only enrolment resolves false on both paths; a device re-enrolled read-only after being a
+/// writer resolves true, which is the right side to err on (its earlier edits may be unpublished).
+/// So does a stored-but-rejected `DeviceAdd` naming the device — that only keeps the guard on a
+/// device it need not protect (rows park, nothing is lost), never the reverse. What the log has
+/// not seen it cannot vouch for: a device enrolled AFTER its local rows were applied over was
+/// not a writer at that moment, and that decision is not revisited.
+///
+/// Retained control entries (a future `op_version`, a sealed `crypto_suite`, an unknown tag) are
+/// stored undecodable by design and skipped, as `verify_stored_snapshots` skips them: they never
+/// fold into the roster, so none of them could have made the device a writer.
+pub(crate) fn device_ever_enrolled_as_writer(
+    conn: &Connection,
+    account_id: AccountId,
+    fingerprint: DeviceFingerprint,
+) -> anyhow::Result<bool> {
+    let projected: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM account_roster_history
+             WHERE account_id = ?1 AND device_fingerprint = ?2 AND role IN ('member', 'owner')
+         )",
+        params![account_id.to_bytes().as_slice(), fingerprint.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if projected {
+        return Ok(true);
+    }
+    // Entry-type tags are per log: the secrets log reuses tag 1, so gate on the control log.
+    let mut stmt = conn.prepare(
+        "SELECT entry_type, device_fingerprint, signed_bytes FROM account_entries
+         WHERE account_id = ?1 AND log_id = ?2 AND entry_type IN (?3, ?4)",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            account_id.to_bytes().as_slice(),
+            fold::CONTROL_LOG,
+            ops::entry_type::ACCOUNT_GENESIS,
+            ops::entry_type::DEVICE_ADD
+        ],
+        |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)),
+    )?;
+    for row in rows {
+        let (entry_type, author, signed_bytes) = row?;
+        // A genesis enrols its author as the founding owner; the header names that device.
+        if entry_type == ops::entry_type::ACCOUNT_GENESIS {
+            if author.as_slice() == fingerprint.to_bytes() {
+                return Ok(true);
+            }
+            continue;
+        }
+        let entry = envelope::decode_account_signed(&signed_bytes)?;
+        if !is_current_control_plaintext(&entry.header) {
+            continue;
+        }
+        if let Ok(DecodedAccountOp::Known(AccountOp::DeviceAdd {
+            device_fingerprint, role, ..
+        })) = ops::decode(entry.header.entry_type, &entry.payload)
+            && device_fingerprint == fingerprint
+            && matches!(role, DeviceRole::Member | DeviceRole::Owner)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The x25519 key the ONE accepted enrollment entry at `roster_ref` certifies for `fingerprint`
@@ -5748,6 +5824,45 @@ mod tests {
             IngestOutcome::Ingested { status: "retained_unfolded".into() },
             "an unknown annex tag is retained, never rejected",
         );
+    }
+
+    /// The unsent-work guard reads the control log for enrolments, and the log keeps entries it
+    /// cannot decode (a future `op_version`, a sealed payload, an unknown tag). Those must be
+    /// skipped, not surfaced: the read backs every received row on a non-writer device, so an
+    /// error here would fail table sync outright for as long as the entry is stored — forever.
+    #[test]
+    fn an_undecodable_retained_control_entry_does_not_fail_the_writer_enrolment_read() {
+        let conn = db();
+        let founder = Dev::new(0x91);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let base = AccountEntryHeader {
+            account_id,
+            log_id: fold::CONTROL_LOG,
+            device_fingerprint: founder.fp,
+            seq: 1,
+            prev_hash: Some(genesis_hash),
+            parent_ref: Some(genesis_hash),
+            entry_type: ops::entry_type::DEVICE_ADD,
+            op_version: fold::SUPPORTED_OP_VERSION + 1,
+            crypto_suite: 0,
+            key_id: None,
+            auth_len: 1,
+            authority_ref: Some(genesis_hash),
+        };
+        let retained = sign_account_entry(&founder.secret, &base, &[0x81, 0x01]).unwrap();
+        assert_eq!(
+            account_ingest(&conn, &retained.signed_bytes, NOW + 1).unwrap(),
+            IngestOutcome::Ingested { status: "retained_unfolded".into() },
+        );
+        // Empty the projection so the read walks the log; the stranger's answer has to get
+        // past the retained entry (the founder's genesis short-circuits before it).
+        conn.execute("DELETE FROM account_roster_history WHERE account_id = ?1", [account_id
+            .to_bytes()
+            .as_slice()])
+            .unwrap();
+        assert!(device_ever_enrolled_as_writer(&conn, account_id, founder.fp).unwrap());
+        assert!(!device_ever_enrolled_as_writer(&conn, account_id, Dev::new(0x92).fp).unwrap());
     }
 
     /// TRIPWIRE (#809): a retained entry on the CONTROL log quarantines the rest of its own chain.
