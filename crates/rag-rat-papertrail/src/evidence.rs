@@ -231,12 +231,7 @@ pub(crate) fn attach_records(
     let mut cache: std::collections::HashMap<RecordKey, Option<DistilledRecord>> =
         std::collections::HashMap::new();
     for hit in evidence.iter_mut() {
-        let key = RecordKey {
-            tracker: hit.tracker.clone(),
-            project: hit.project.clone(),
-            item_kind: hit.item_kind.clone(),
-            item_key: hit.item_key.clone(),
-        };
+        let key = RecordKey::for_evidence(hit);
         let record = match cache.get(&key) {
             Some(cached) => cached.clone(),
             None => {
@@ -260,24 +255,20 @@ pub(crate) fn attach_records(
 /// (tracker + project + item_kind + item_key) so records with the same number in different projects
 /// a single repo mirrors never collide. Call after [`attach_records`]; input is in rank order.
 pub(crate) fn coalesce_pairs(evidence: &mut Vec<PapertrailEvidence>) {
-    type ThreadKey = (String, String, String, String);
-    let raw_key = |e: &PapertrailEvidence| -> ThreadKey {
-        (e.tracker.clone(), e.project.clone(), e.item_kind.clone(), e.item_key.clone())
-    };
-    let canonical_key = |r: &DistilledRecord| -> ThreadKey {
-        (r.tracker.clone(), r.project.clone(), r.item_kind.clone(), r.item_key.clone())
-    };
     // The representative thread for each record is the FIRST (best-ranked) hit that carried it.
-    let mut representative: std::collections::HashMap<ThreadKey, ThreadKey> =
+    let mut representative: std::collections::HashMap<RecordKey, RecordKey> =
         std::collections::HashMap::new();
     for hit in evidence.iter() {
         if let Some(record) = &hit.record {
-            representative.entry(canonical_key(record)).or_insert_with(|| raw_key(hit));
+            representative
+                .entry(RecordKey::for_record(record))
+                .or_insert_with(|| RecordKey::for_evidence(hit));
         }
     }
     evidence.retain(|hit| match &hit.record {
-        Some(record) =>
-            representative.get(&canonical_key(record)).is_none_or(|rep| *rep == raw_key(hit)),
+        Some(record) => representative
+            .get(&RecordKey::for_record(record))
+            .is_none_or(|rep| *rep == RecordKey::for_evidence(hit)),
         None => true,
     });
 }
