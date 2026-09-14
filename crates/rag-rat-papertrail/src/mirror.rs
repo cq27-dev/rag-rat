@@ -1294,9 +1294,16 @@ fn delete_item(
     // change request also drops the text-tier closing edges it minted (provider-attested edges
     // outlive their text sources by design).
     conn.execute(
-        "DELETE FROM papertrail_refs WHERE repo_id=?1 AND source_kind='item' AND source_text = ?2 \
-         || ':' || ?3 || ':' || ?4 || ':' || ?5",
-        params![repo_id, binding.provider.as_db_str(), binding.project, kind.as_db_str(), key],
+        "DELETE FROM papertrail_refs WHERE repo_id=?1 AND source_kind=?6 AND source_text = ?2 || \
+         ':' || ?3 || ':' || ?4 || ':' || ?5",
+        params![
+            repo_id,
+            binding.provider.as_db_str(),
+            binding.project,
+            kind.as_db_str(),
+            key,
+            RefSourceKind::Item.as_db_str(),
+        ],
     )?;
     // `_`/`%` are LIKE wildcards and provider project strings can contain `_` — escape the
     // identity so `foo_bar/repo` never matches `fooxbar/repo`'s mined comment rows.
@@ -1308,9 +1315,9 @@ fn delete_item(
         like_escape(key)
     );
     conn.execute(
-        "DELETE FROM papertrail_refs WHERE repo_id=?1 AND source_kind='comment' AND source_text \
-         LIKE ?2 ESCAPE '\\'",
-        params![repo_id, like_prefix],
+        "DELETE FROM papertrail_refs WHERE repo_id=?1 AND source_kind=?3 AND source_text LIKE ?2 \
+         ESCAPE '\\'",
+        params![repo_id, like_prefix, RefSourceKind::Comment.as_db_str()],
     )?;
 
     conn.execute(
@@ -1362,7 +1369,7 @@ fn prune_unseen_item_comments(
     for comment_id in stale {
         conn.execute(
             "DELETE FROM papertrail_fts WHERE repo_id=?1 AND tracker=?2 AND project=?3 AND
-             item_kind=?4 AND item_key=?5 AND comment_id=?6 AND doc_kind='comment'",
+             item_kind=?4 AND item_key=?5 AND comment_id=?6 AND doc_kind=?7",
             params![
                 repo_id,
                 binding.provider.as_db_str(),
@@ -1370,13 +1377,14 @@ fn prune_unseen_item_comments(
                 kind.as_db_str(),
                 key,
                 comment_id,
+                DocKind::Comment.as_db_str(),
             ],
         )?;
         // #702: a pruned comment takes its mined refs with it (exact identity — the source will
         // never be re-mined to replace the set once its row is gone).
         conn.execute(
-            "DELETE FROM papertrail_refs WHERE repo_id=?1 AND source_kind='comment' AND \
-             source_text = ?2 || ':' || ?3 || ':' || ?4 || ':' || ?5 || ':' || ?6",
+            "DELETE FROM papertrail_refs WHERE repo_id=?1 AND source_kind=?7 AND source_text = ?2 \
+             || ':' || ?3 || ':' || ?4 || ':' || ?5 || ':' || ?6",
             params![
                 repo_id,
                 binding.provider.as_db_str(),
@@ -1384,6 +1392,7 @@ fn prune_unseen_item_comments(
                 kind.as_db_str(),
                 key,
                 comment_id,
+                RefSourceKind::Comment.as_db_str(),
             ],
         )?;
         conn.execute(

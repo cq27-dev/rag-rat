@@ -107,15 +107,22 @@ pub(crate) fn evidence_for_commit_refs(
         "
         SELECT tracker, project, item_key, item_kind
         FROM papertrail_refs
-        WHERE source_kind = 'commit'
+        WHERE source_kind = ?4
           AND source_commit LIKE ?1
           AND repo_id = ?3
-        ORDER BY ref_kind = 'closing' DESC, id DESC
+        ORDER BY ref_kind = ?5 DESC, id DESC
         LIMIT ?2
         ",
     )?;
     let commit_like = format!("{commit_hash}%");
-    let refs = stmt.query_map(params![commit_like, i64::from(limit), repo_id], |row| {
+    let args = params![
+        commit_like,
+        i64::from(limit),
+        repo_id,
+        RefSourceKind::Commit.as_db_str(),
+        RefKind::Closing.as_db_str(),
+    ];
+    let refs = stmt.query_map(args, |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,

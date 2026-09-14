@@ -14,7 +14,9 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::distill_status::{EffectiveStatusInputs, effective_status};
-use crate::{DistillEdgeKind, EpistemicStatus, FixEdgeSource, OutcomeStatus, ThreadShape};
+use crate::{
+    AnchorKind, DistillEdgeKind, EpistemicStatus, FixEdgeSource, OutcomeStatus, ThreadShape,
+};
 
 /// A thread's natural identity — the key of a `papertrail_distill` row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -198,7 +200,7 @@ pub fn records_for_symbol(
            ON record.repo_id = anchor.repo_id AND record.tracker = anchor.tracker
           AND record.project = anchor.project AND record.item_kind = anchor.item_kind
           AND record.item_key = anchor.item_key
-         WHERE anchor.repo_id = ?1 AND anchor.anchor_kind = 'symbol' AND anchor.selected = 1
+         WHERE anchor.repo_id = ?1 AND anchor.anchor_kind = ?5 AND anchor.selected = 1
            AND anchor.logical_symbol_id = ?2 AND record.fix_edge_source = ?3
          GROUP BY anchor.tracker, anchor.project, anchor.item_kind, anchor.item_key
          ORDER BY MAX(record.distilled_at_ms) DESC, anchor.tracker, anchor.project,
@@ -206,7 +208,13 @@ pub fn records_for_symbol(
          LIMIT ?4",
     )?;
     let keys = stmt.query_map(
-        params![repo_id, token, FixEdgeSource::Provider.as_db_str(), i64::try_from(limit)?],
+        params![
+            repo_id,
+            token,
+            FixEdgeSource::Provider.as_db_str(),
+            i64::try_from(limit)?,
+            AnchorKind::Symbol.as_db_str(),
+        ],
         |row| {
             Ok(RecordKey {
                 tracker: row.get(0)?,
@@ -251,39 +259,48 @@ pub fn records_for_path(
              SELECT id FROM files WHERE path = ?2
          )
          SELECT anchor.tracker, anchor.project, anchor.item_kind, anchor.item_key,
-                MIN(CASE WHEN anchor.anchor_kind = 'symbol' THEN symbol.start_line END) AS line
+                MIN(CASE WHEN anchor.anchor_kind = ?4 THEN symbol.start_line END) AS line
          FROM papertrail_distill_anchors anchor
          JOIN papertrail_distill record
            ON record.repo_id = anchor.repo_id AND record.tracker = anchor.tracker
           AND record.project = anchor.project AND record.item_kind = anchor.item_kind
           AND record.item_key = anchor.item_key
          LEFT JOIN logical_symbol_members member
-           ON anchor.anchor_kind = 'symbol'
+           ON anchor.anchor_kind = ?4
           AND anchor.logical_symbol_id = 'sym_' || format('%x', member.logical_symbol_id)
          LEFT JOIN symbols symbol
            ON symbol.id = member.symbol_id AND symbol.file_id IN (SELECT id FROM requested)
          WHERE anchor.repo_id = ?1 AND anchor.selected = 1
            AND EXISTS (SELECT 1 FROM requested)
            AND (
-               (anchor.anchor_kind = 'file' AND anchor.file_path = ?2)
-               OR (anchor.anchor_kind = 'symbol' AND anchor.resolved = 1 AND symbol.id IS NOT NULL)
+               (anchor.anchor_kind = ?5 AND anchor.file_path = ?2)
+               OR (anchor.anchor_kind = ?4 AND anchor.resolved = 1 AND symbol.id IS NOT NULL)
            )
          GROUP BY anchor.tracker, anchor.project, anchor.item_kind, anchor.item_key
          ORDER BY MAX(record.distilled_at_ms) DESC, anchor.tracker, anchor.project,
                   anchor.item_kind, anchor.item_key
          LIMIT ?3",
     )?;
-    let keys = stmt.query_map(params![repo_id, path, i64::try_from(limit)?], |row| {
-        Ok((
-            RecordKey {
-                tracker: row.get(0)?,
-                project: row.get(1)?,
-                item_kind: row.get(2)?,
-                item_key: row.get(3)?,
-            },
-            row.get::<_, Option<i64>>(4)?,
-        ))
-    })?;
+    let keys = stmt.query_map(
+        params![
+            repo_id,
+            path,
+            i64::try_from(limit)?,
+            AnchorKind::Symbol.as_db_str(),
+            AnchorKind::File.as_db_str(),
+        ],
+        |row| {
+            Ok((
+                RecordKey {
+                    tracker: row.get(0)?,
+                    project: row.get(1)?,
+                    item_kind: row.get(2)?,
+                    item_key: row.get(3)?,
+                },
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        },
+    )?;
     let mut records = Vec::new();
     for key in keys {
         let (key, line) = key?;

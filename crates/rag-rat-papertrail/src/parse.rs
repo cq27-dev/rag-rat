@@ -522,6 +522,10 @@ pub(crate) fn ref_kind(previous: &str) -> RefKind {
         RefKind::Unknown
     }
 }
+/// The coarse keyword label written to `papertrail_fts.classification` — the one persisted token
+/// this crate writes with no enum. Deliberately untyped: the column also carries `other`, which
+/// only the V045 schema rebuild writes, and `PapertrailEvidence.classification` reads it back as a
+/// string for the eval harness (it is not a read surface).
 pub(crate) fn classify_text(text: &str) -> String {
     let text = text.to_ascii_lowercase();
     if text.contains("decided") || text.contains("decision") || text.contains("we will") {
