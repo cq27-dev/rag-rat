@@ -5,6 +5,11 @@
 //! even parsed — the transport-level half of "bounded frames, no amplification". This layer is
 //! transport-agnostic: it runs over an iroh bi-stream in production and over an in-memory duplex in
 //! tests, so the session logic is exercised without the network.
+//!
+//! [`write_framed`] and [`read_framed`] are the one implementation of that layout; every lane's
+//! codec (account and content here, [`crate::table_codec`], and the discovery client's
+//! [`crate::discovery::wire`]) wraps them with its own cap and error type. The enrollment exchange
+//! alone frames by hand, because it gives every chunk of a body its own progress deadline.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -33,18 +38,77 @@ pub enum CodecError {
     Eof,
 }
 
+/// A length-prefixed frame that could not be moved, before any lane decodes its body. Each lane
+/// maps it onto its own error type.
+#[derive(Debug)]
+pub(crate) enum FramingError {
+    /// A body length over the frame cap: a local body refused before any byte is written, or a
+    /// peer's length prefix refused before the body is allocated.
+    OverCap(usize),
+    /// The stream ended cleanly before the next length prefix.
+    Eof(std::io::Error),
+    /// The stream failed, or closed mid-frame.
+    Io(std::io::Error),
+}
+
+impl From<FramingError> for CodecError {
+    fn from(error: FramingError) -> Self {
+        match error {
+            FramingError::OverCap(len) =>
+                Self::FrameTooLarge(u32::try_from(len).unwrap_or(u32::MAX)),
+            FramingError::Eof(_) => Self::Eof,
+            FramingError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
+/// Write `body` as one frame: a 4-byte big-endian length prefix, then the body. A body longer than
+/// `max` is refused before any byte is written, so no length prefix is ever truncated or sent for a
+/// frame the peer would refuse.
+pub(crate) async fn write_framed<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    body: &[u8],
+    max: u32,
+) -> Result<(), FramingError> {
+    let len = u32::try_from(body.len())
+        .ok()
+        .filter(|len| *len <= max)
+        .ok_or(FramingError::OverCap(body.len()))?;
+    w.write_all(&len.to_be_bytes()).await.map_err(FramingError::Io)?;
+    w.write_all(body).await.map_err(FramingError::Io)
+}
+
+/// Read one frame's body, refusing a length prefix over `max` BEFORE allocating: the length is
+/// peer-supplied, so trusting it is a trivial memory-exhaustion lever.
+pub(crate) async fn read_framed<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max: u32,
+) -> Result<Vec<u8>, FramingError> {
+    let mut prefix = [0u8; 4];
+    r.read_exact(&mut prefix).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            FramingError::Eof(error)
+        } else {
+            FramingError::Io(error)
+        }
+    })?;
+    let len = u32::from_be_bytes(prefix);
+    if len > max {
+        return Err(FramingError::OverCap(len as usize));
+    }
+    let mut body = vec![0u8; len as usize];
+    r.read_exact(&mut body).await.map_err(FramingError::Io)?;
+    Ok(body)
+}
+
 /// Write one frame: a 4-byte big-endian length prefix, then the CBOR body.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     frame: &Frame,
 ) -> Result<(), CodecError> {
-    let body = frame.encode();
     // Local frames are built within the caps, so this only fires on a programmer bug, not a wire
     // condition — but guard rather than truncate a silently-huge length prefix.
-    let len = u32::try_from(body.len()).map_err(|_| CodecError::FrameTooLarge(u32::MAX))?;
-    w.write_all(&len.to_be_bytes()).await.map_err(CodecError::Io)?;
-    w.write_all(&body).await.map_err(CodecError::Io)?;
-    Ok(())
+    Ok(write_framed(w, &frame.encode(), u32::MAX).await?)
 }
 
 /// Read one frame, or [`CodecError::Eof`] if the stream ends cleanly before the next length prefix.
@@ -60,18 +124,7 @@ pub async fn read_frame_within<R: AsyncRead + Unpin>(
     r: &mut R,
     max_bytes: u32,
 ) -> Result<Frame, CodecError> {
-    let mut len_buf = [0u8; 4];
-    match r.read_exact(&mut len_buf).await {
-        Ok(_) => {},
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(CodecError::Eof),
-        Err(e) => return Err(CodecError::Io(e)),
-    }
-    let len = u32::from_be_bytes(len_buf);
-    if len > max_bytes {
-        return Err(CodecError::FrameTooLarge(len));
-    }
-    let mut body = vec![0u8; len as usize];
-    r.read_exact(&mut body).await.map_err(CodecError::Io)?;
+    let body = read_framed(r, max_bytes).await?;
     Ok(Frame::decode(&body)?)
 }
 
