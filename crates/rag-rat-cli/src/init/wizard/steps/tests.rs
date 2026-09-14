@@ -1288,9 +1288,9 @@ fn integration_blocks_unresolved_foreign_hook_conflicts() {
     let dir = tempfile::tempdir().unwrap();
     rag_rat_base::test_git::run(dir.path(), &["init", "-q"]);
     let gp = git_paths(dir.path()).unwrap();
-    std::fs::create_dir_all(&gp.hooks_dir).unwrap();
+    std::fs::create_dir_all(gp.hooks_dir()).unwrap();
     let hook = MANAGED_HOOKS[0].as_trigger();
-    std::fs::write(gp.hooks_dir.join(hook), "#!/bin/sh\necho custom\n").unwrap();
+    std::fs::write(gp.hooks_dir().join(hook), "#!/bin/sh\necho custom\n").unwrap();
     let scan = scan_repo(dir.path()).unwrap();
     let mut draft = WizardDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
     draft.hooks.git = true;

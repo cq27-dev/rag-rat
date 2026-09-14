@@ -1,4 +1,7 @@
-use super::*;
+use rag_rat_core::index::IndexProgress;
+use rag_rat_core::search::lexical::SearchHit;
+
+use crate::commands::output_format;
 
 #[cfg(feature = "eval")]
 pub(crate) fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {

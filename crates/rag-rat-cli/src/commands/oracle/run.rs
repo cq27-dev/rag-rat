@@ -10,7 +10,8 @@ use rag_rat_base::config::Config;
 use rag_rat_core::IndexDatabase;
 
 use crate::cli::{OracleArgs, OracleCommand, OracleReportArgs, OracleRunArgs, OracleStatusArgs};
-use crate::{open_index, print_output};
+use crate::open_index;
+use crate::render::print_output;
 
 pub(crate) fn oracle(config: &Config, args: &OracleArgs) -> anyhow::Result<()> {
     match &args.command {

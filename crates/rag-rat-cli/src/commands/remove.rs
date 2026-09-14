@@ -277,7 +277,7 @@ fn clean_on_disk_footprint(roots: &[String], removed_repo_id: &str) -> CleanupRe
         // non-git-worktree `Err` is a silent no-op).
         if let Ok(git) = git_paths(dir) {
             for &hook in MANAGED_HOOKS {
-                let path = git.hooks_dir.join(hook.as_trigger());
+                let path = git.hooks_dir().join(hook.as_trigger());
                 if !seen_hooks.insert(path.clone()) {
                     continue;
                 }

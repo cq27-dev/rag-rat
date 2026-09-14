@@ -547,7 +547,7 @@ mod base_candidates_for_tests {
     use std::fs;
 
     use super::*;
-    use crate::init::{default_dirs, scan_repo};
+    use crate::init::scan::{default_dirs, scan_repo};
 
     #[test]
     fn defaults_outside_top_32_are_unioned_in_and_tagged_default() {

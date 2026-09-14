@@ -1,6 +1,6 @@
 //! CLI command handlers, one cohesive module per domain. This `mod.rs` is the curated index: it
 //! declares the sibling command modules and re-exports the `pub(crate)` surface `main` dispatches
-//! to (and that `init` reaches via the crate-root `commands::*` glob). Add a new command's handler
+//! to. Add a new command's handler
 //! to the module that owns its domain, then export it here — never grow this file into a handler
 //! junk drawer again.
 

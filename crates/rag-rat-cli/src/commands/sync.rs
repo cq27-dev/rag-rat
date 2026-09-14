@@ -16,7 +16,8 @@ use rusqlite::{Connection, params};
 use zeroize::Zeroizing;
 
 use crate::cli::{AccountIdInput, KeepUntil, SyncArgs, SyncCommand};
-use crate::{open_index, print_output};
+use crate::open_index;
+use crate::render::print_output;
 
 /// How long `serve` waits for the database-scoped session lock before refusing to start — kept
 /// short so a second `serve` (or a running device sync) fails fast rather than hanging.
@@ -531,7 +532,7 @@ fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::R
             listening["invite_role"] = serde_json::json!(role);
             listening["invite_expires_at_ms"] = serde_json::json!(ticket.expires_at_ms);
         }
-        crate::print_output(&listening)?;
+        print_output(&listening)?;
 
         // The database-scoped session lock taken at startup is still held for this whole loop
         // (released only when serve exits), keeping this database's node identity singular. A
@@ -853,7 +854,7 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
         // dial the wrong relay unless the operator also points `relay_url` at the inviter's.
         let inviter = rag_rat_sync::node_id_to_string(&ticket.inviter_node_id)
             .unwrap_or_else(|_| hash::hex_lower(&ticket.inviter_node_id));
-        crate::print_output(&serde_json::json!({
+        print_output(&serde_json::json!({
             "status": "joined",
             "account_id": hash::hex_lower(&account_id.to_bytes()),
             "account_entries_restored": account_report.entries_newly_stored,
@@ -984,7 +985,7 @@ fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
         db.sync_contribute(&owner_hex)?;
         let effects = rag_rat_core::drain_synced_memory(conn)?;
         db.fold_wal();
-        crate::print_output(&serde_json::json!({
+        print_output(&serde_json::json!({
             "status": "contributing",
             "repo_id": db.active_repo_id,
             "owner_account_id": owner_hex,
@@ -1136,7 +1137,7 @@ fn pull(
         } else {
             "already up to date with this account"
         };
-        crate::print_output(&serde_json::json!({
+        print_output(&serde_json::json!({
             "status": "pulled",
             "account_id": hash::hex_lower(&target.to_bytes()),
             "peer": peer_id,

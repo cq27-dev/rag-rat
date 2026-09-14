@@ -34,18 +34,18 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
     let git = git_paths(&config.root)?;
     match args.action {
         HookAction::Install => {
-            fs::create_dir_all(&git.hooks_dir)?;
+            fs::create_dir_all(git.hooks_dir())?;
             let mut installed = Vec::new();
             for &hook in MANAGED_HOOKS {
-                install_hook(&git.hooks_dir, hook)?;
+                install_hook(git.hooks_dir(), hook)?;
                 installed.push(hook.as_trigger());
             }
             print_output(&serde_json::json!({
                 "status": "installed",
-                "repo_root": git.worktree_root,
-                "git_dir": git.git_dir,
-                "git_common_dir": git.git_common_dir,
-                "hooks_dir": git.hooks_dir,
+                "repo_root": git.worktree_root(),
+                "git_dir": git.git_dir(),
+                "git_common_dir": git.git_common_dir(),
+                "hooks_dir": git.hooks_dir(),
                 "hooks": installed,
             }))
         },
@@ -53,7 +53,7 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
             let mut removed = Vec::new();
             let mut kept = Vec::new();
             for &hook in MANAGED_HOOKS {
-                let path = git.hooks_dir.join(hook.as_trigger());
+                let path = git.hooks_dir().join(hook.as_trigger());
                 if !path.exists() {
                     continue;
                 }
@@ -66,7 +66,7 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
             }
             print_output(&serde_json::json!({
                 "status": "uninstalled",
-                "hooks_dir": git.hooks_dir,
+                "hooks_dir": git.hooks_dir(),
                 "removed": removed,
                 "kept_unmanaged": kept,
             }))
@@ -75,7 +75,7 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
             let hooks = MANAGED_HOOKS
                 .iter()
                 .map(|hook| {
-                    let path = git.hooks_dir.join(hook.as_trigger());
+                    let path = git.hooks_dir().join(hook.as_trigger());
                     let managed = is_rag_rat_hook(&path).unwrap_or(false);
                     serde_json::json!({
                         "name": hook.as_trigger(),
@@ -86,10 +86,10 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
                 })
                 .collect::<Vec<_>>();
             print_output(&serde_json::json!({
-                "repo_root": git.worktree_root,
-                "git_dir": git.git_dir,
-                "git_common_dir": git.git_common_dir,
-                "hooks_dir": git.hooks_dir,
+                "repo_root": git.worktree_root(),
+                "git_dir": git.git_dir(),
+                "git_common_dir": git.git_common_dir(),
+                "hooks_dir": git.hooks_dir(),
                 "hooks": hooks,
             }))
         },

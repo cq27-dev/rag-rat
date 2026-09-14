@@ -1,4 +1,8 @@
-use super::*;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::fs_atomic::write_atomic;
+use crate::{DEFAULT_MAINTENANCE_SECONDS, HOOK_MARKER};
 
 // Variant names mirror Git’s installed trigger tokens, including their shared `post-` prefix.
 #[allow(clippy::enum_variant_names)]
@@ -25,6 +29,29 @@ impl ManagedHook {
 
     pub(crate) fn changes_files(self) -> bool {
         matches!(self, Self::PostCheckout | Self::PostMerge)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct GitPaths {
+    worktree_root: PathBuf,
+    git_dir: PathBuf,
+    git_common_dir: PathBuf,
+    hooks_dir: PathBuf,
+}
+
+impl GitPaths {
+    pub(crate) fn worktree_root(&self) -> &Path {
+        &self.worktree_root
+    }
+    pub(crate) fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+    pub(crate) fn git_common_dir(&self) -> &Path {
+        &self.git_common_dir
+    }
+    pub(crate) fn hooks_dir(&self) -> &Path {
+        &self.hooks_dir
     }
 }
 
