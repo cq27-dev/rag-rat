@@ -1,3 +1,5 @@
+//! The local FastEmbed (ONNX Runtime) embedder for the registry's fastembed models.
+
 use rag_rat_base::embedding_models::{BGE_SMALL_MODEL_ID, JINA_CODE_MODEL_ID};
 
 use crate::providers::Embedder;
